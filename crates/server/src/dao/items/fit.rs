@@ -29,6 +29,14 @@ pub(crate) async fn modules(ex: &(impl Executor + ?Sized), ship: i64) -> Result<
                  AND (flag_id BETWEEN $2 AND $3 OR flag_id BETWEEN $4 AND $5 OR flag_id BETWEEN $6 AND $7)",
         &[&ship, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST]).await?.iter().map(Module::from_row).collect())
 }
+
+/// Owned hulls containing online fitting items, in hull lock order.
+pub(crate) async fn owner_online_ships(ex: &(impl Executor + ?Sized), owner: i64) -> Result<Vec<i64>, Error> {
+    Ok(ex.query("SELECT DISTINCT h.item_id AS ship_id FROM game.items h JOIN game.items m ON m.location_id = h.item_id AND m.owner_id = h.owner_id
+                 WHERE h.owner_id = $1 AND m.online AND (m.flag_id BETWEEN $2 AND $3 OR m.flag_id BETWEEN $4 AND $5 OR m.flag_id BETWEEN $6 AND $7)
+                 ORDER BY h.item_id",
+        &[&owner, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST]).await?.iter().map(|row| row.get("ship_id")).collect())
+}
 pub(crate) async fn charges(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<Charge>, Error> {
     Ok(ex.query("SELECT flag_id, type_id FROM game.module_charges WHERE ship_id = $1", &[&ship]).await?.iter().map(Charge::from_row).collect())
 }

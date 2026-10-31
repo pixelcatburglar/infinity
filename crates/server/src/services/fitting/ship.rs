@@ -32,6 +32,7 @@ async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     if let Some(old) = c.session.int("shipid") {
         crate::services::combat::save_condition(&c.db, old).await?;
     }
+    crate::services::effects::online::reconcile_ship(c, char_id, ship_id).await?;
     crate::services::combat::load_docked_condition(&c.db, &c.world, char_id, ship_id).await?;
     crate::dao::characters::selection::set_ship(&c.db, char_id, ship_id).await.map_err(db_err)?;
     info!(user = c.login.user_id, "character {char_id} boarded ship {ship_id}");

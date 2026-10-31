@@ -28,6 +28,26 @@ fn supplement_only_empty_lists_and_preserve_webifier_row() {
 }
 
 #[test]
+fn fitting_effects_supply_client_ship_modifiers_without_duplication() {
+    for (name, expected) in [
+        ("online", vec![(2, 49, 50), (2, 15, 30)]),
+        ("launcherFitted", vec![(3, 101, 47)]),
+        ("turretFitted", vec![(3, 102, 47)]),
+        ("rigSlot", vec![(3, 1154, 47), (2, 1152, 1153)]),
+    ] {
+        let mut e = effect(name);
+        supplement(&mut e);
+        let actual: Vec<_> = e.modifiers.iter().map(|m| {
+            assert_eq!((m.func.as_str(), m.domain.as_str()), ("ItemModifier", "shipID"));
+            (m.op, m.modified, m.modifying)
+        }).collect();
+        assert_eq!(actual, expected);
+        supplement(&mut e);
+        assert_eq!(e.modifiers.len(), expected.len());
+    }
+}
+
+#[test]
 fn falloff_rows_resolve_their_raw_source_attributes() {
     for (name, expected) in [
         ("remoteWebifierFalloff", vec![ATTR_SPEED_FACTOR]),

@@ -9,8 +9,8 @@
 //! Loot rights and suspect flags are not implemented.
 //! Item capacity and contents are read from one game-item statement snapshot.
 //! Successful inventory moves queue item-move events after their writes.
-//! Departing fitted weapons reconcile persisted banks after the guarded move commits;
-//! running cycles stop after commit and finish their current cycle normally.
+//! Departing online modules are offlined transactionally; bank and cycle effects
+//! are dispatched after commit and running cycles finish normally.
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -211,16 +211,26 @@ pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallE
 }
 
 
-async fn free_slot_core(db: &(impl Executor + ?Sized), sde: &Sde, ship: i64, module_type: i32) -> Result<Option<i32>, CallError> {
-    // (slot effect, ship slot-count attribute, first flag, max slots)
-    const SLOTS: [(i32, i32, i32, i32); 5] = [(11, 12, 11, 8), (13, 13, 19, 8), (12, 14, 27, 8), (2663, 1137, 92, 8), (3772, 1367, 125, 8)];
-    let effects = sde.types.effects(module_type);
-    let Some(&(_, count_attr, first, max)) = SLOTS.iter().find(|s| effects.iter().any(|effect| effect.effect_id == s.0)) else { return Ok(None) };
-    let count = inventory_dao::type_id(db, ship).await.map_err(db_err)?
-        .and_then(|type_id| sde.types.attribute(type_id, count_attr)).unwrap_or(0.0);
-    let used: Vec<i32> = inventory_dao::slot_flags(db, ship).await.map_err(db_err)?
-        .into_iter().map(|r| r.flag_id).collect();
-    Ok((first..first + (count as i32).min(max)).find(|f| !used.contains(f)))
+enum MoveEffect {
+    Bank(super::combat::banks::BankStop),
+    Online(super::effects::online::OnlineChanged),
+}
+
+impl From<super::effects::online::OnlineChanged> for MoveEffect {
+    fn from(change: super::effects::online::OnlineChanged) -> Self { Self::Online(change) }
+}
+
+fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, c: &Client, target: i64) -> Result<T, CallError> {
+    use crate::db::outbox::Effect;
+    for entry in outbox.into_entries() {
+        match entry {
+            Effect::Operation(MoveEffect::Bank(stop)) => super::combat::banks::apply_stop(stop),
+            Effect::Operation(MoveEffect::Online(change)) => super::effects::online::apply_online_changed(change),
+            Effect::Notification(notification) => super::effects::online::dispatch_notification(gm::route_target(notification, target, c.session.int("charid")), c)?,
+            Effect::Event(event) => crate::lua::on_event(event),
+        }
+    }
+    Ok(value)
 }
 
 
@@ -288,12 +298,17 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
     }
     let db = c.db.clone();
     let sde = c.sde.clone();
+    let active_ship = c.session.int("shipid");
+    let station = c.session.int("stationid");
+    let policy = super::effects::online::OnlinePolicy::from_client(c)?;
     db.transaction(
-        move |tx, outbox: &mut Outbox<super::combat::banks::BankStop>| {
+        move |tx, outbox: &mut Outbox<MoveEffect>| {
             let item = item.clone();
             let sde = sde.clone();
+            let policy = policy.clone();
             Box::pin(async move {
-                let destination_fitting = flag == FLAG_AUTOFIT || is_fitting_flag(flag);
+                let destination_fitting = is_fitting_flag(flag) || (flag == FLAG_AUTOFIT
+                    && (item.category_id == i64::from(crate::consts::CATEGORY_MODULE) || item.category_id == i64::from(crate::consts::CATEGORY_SUBSYSTEM)));
                 let source_fitting = is_fitting_flag(item.flag_id);
                 let mut locks = Vec::new();
                 if source_fitting { locks.push(item.location_id); }
@@ -306,19 +321,40 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                         return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
                     }
                 }
-                let flag = if flag == FLAG_AUTOFIT { free_slot_core(tx, &sde, location, item.type_id).await?.unwrap_or(FLAG_CARGO) } else { flag };
+                if destination_fitting {
+                    let hull = load_items(tx, &sde, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+                    if hull.owner_id != owner || hull.category_id != i64::from(CATEGORY_SHIP) || !hull.singleton
+                        || (active_ship != Some(location) && !(station == Some(hull.location_id) && hull.flag_id == FLAG_HANGAR)) {
+                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
+                }
+                let flag = if flag == FLAG_AUTOFIT && destination_fitting {
+                    super::effects::fitting::free_slot(tx, sde.clone(), owner, location, item.item_id, item.type_id).await?
+                        .ok_or_else(|| notify_error(messages::fitting::SLOTS))?
+                } else if flag == FLAG_AUTOFIT { FLAG_CARGO } else { flag };
                 let take = if is_fitting_flag(flag) { Some(1) } else { qty }
                     .filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
                 let departure = source_fitting && take.is_none() && (item.location_id != location || item.flag_id != flag || item.owner_id != owner);
-                let before = if departure { Some(super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?) } else { None };
-                let master = if departure { super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await? } else { item.item_id };
+                let leaving_fit = departure && (item.location_id != location || !is_fitting_flag(flag) || item.owner_id != owner);
+                let online = leaving_fit && item.category_id == i64::from(crate::consts::CATEGORY_MODULE)
+                    && crate::dao::items::dogma::online(tx, item.location_id).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item.item_id);
+                if online {
+                    super::effects::online::set_online_core(tx, &sde, &policy, outbox, item.location_id, item.item_id, false).await?;
+                }
+                let before = if departure && !online { Some(super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?) } else { None };
+                let master = if departure && !online { super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await? } else { item.item_id };
                 let moved_id = move_core(tx, &sde, outbox, &item, owner, location, flag, take).await?;
+                if is_fitting_flag(flag) {
+                    super::effects::fitting::validate_fit(tx, sde.clone(), owner, location, moved_id).await?;
+                }
                 if let Some(before) = before {
                     if super::combat::banks::remove_member(tx, item.location_id, item.item_id, master, false).await? {
-                        for stop in super::combat::banks::changes(tx, item.location_id, before).await? { outbox.operation(stop); }
+                        for stop in super::combat::banks::changes(tx, item.location_id, before).await? { outbox.operation(MoveEffect::Bank(stop)); }
                         outbox.notify_client("OnWeaponBanksChanged", vec![Value::Int(item.location_id), super::combat::banks(tx, item.location_id).await?]);
                     }
                 }
+                if departure { super::effects::online::reconcile_core(tx, &sde, outbox, item.owner_id, item.location_id).await?; }
+                if is_fitting_flag(flag) { super::effects::online::reconcile_core(tx, &sde, outbox, owner, location).await?; }
                 if take.is_some() || item.location_id != location || item.flag_id != flag || item.owner_id != owner || (is_fitting_flag(flag) && !item.singleton) {
                     outbox.event(crate::lua::events::GameEvent::ItemsMoved {
                         char_id, item_id: moved_id, from_location_id: item.location_id,
@@ -328,7 +364,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 Ok(Some(moved_id))
             })
         },
-        |value, outbox| async move { super::combat::banks::dispatch(value, outbox, c) },
+        |value, outbox| async move { dispatch_move(value, outbox, c, char_id) },
     ).await
 }
 
@@ -348,7 +384,7 @@ async fn move_core<X: Send>(
         Ok(id)
     } else {
         let singleton = item.singleton || fitting;
-        if !inventory_dao::move_item(tx, item, location, flag, owner, singleton, fitting).await.map_err(db_err)? {
+        if !inventory_dao::move_item(tx, item, location, flag, owner, singleton).await.map_err(db_err)? {
             return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
         }
         let mut change = vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))];

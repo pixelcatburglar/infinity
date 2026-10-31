@@ -10,7 +10,7 @@
 //! add a receiving drone fit when the in-space drone runtime exists.
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
+use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILLS, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, EFFECT_SKILL, TYPE_CHARACTER};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
@@ -18,12 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::consts::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, FLAG_IMPLANT};
-/// SDE dgmAttributeTypes: requiredSkill1 through requiredSkill6.
-const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
 /// SDE invCategories: Implant, exempt from stacking penalties.
 const CATEGORY_IMPLANT: i32 = 20;
-/// SDE invCategories: Subsystem, exempt from stacking penalties.
-const CATEGORY_SUBSYSTEM: i32 = 32;
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 /// SDE dogma effect category: active.
@@ -257,6 +253,32 @@ impl Fit {
         Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None })
     }
 
+    /// Include a prospective fitted item with its persisted dogma overrides.
+    pub(crate) async fn include_module(&mut self, db: &(impl crate::db::executor::Executor + ?Sized), item: i64, type_id: i32) -> Result<(), CallError> {
+        if self.nodes.contains_key(&Key::Module(item)) { return Ok(()); }
+        let mut overrides: Vec<_> = crate::dao::items::dogma::overrides_for(db, &[item]).await.map_err(db_err)?
+            .into_iter().map(|r| (r.attribute_id, r.value)).collect();
+        overrides.sort_by_key(|v| v.0);
+        self.nodes.insert(Key::Module(item), Node {
+            type_id, data_position: self.sde.types.position(type_id), location: Location::Ship,
+            online: false, active: false, overloaded: false, projected_effect: None,
+            charge_type: None, level: None, overrides, charge_values: Vec::new(),
+        });
+        self.memo.get_mut().unwrap().clear();
+        Ok(())
+    }
+
+    /// Change a prospective module state and invalidate all dependent values.
+    pub(crate) fn set_module_online(&mut self, item: i64, online: bool) -> bool {
+        let Some(node) = self.nodes.get_mut(&Key::Module(item)) else { return false };
+        if node.online != online {
+            node.online = online;
+            if !online { node.active = false; }
+            self.memo.get_mut().unwrap().clear();
+        }
+        true
+    }
+
     /// Load the selected character ship and one owned drone, including launched drones.
     pub(crate) async fn drone(db: &Db, sde: Arc<Sde>, char_id: i64, drone_item: i64) -> Result<Fit, CallError> {
         use crate::dao::items::loading::{load_items, ItemQuery};
@@ -430,6 +452,11 @@ fn projected_value(node: &Node, data: Option<&TypeData>, meta: Option<&Attribute
 fn effect_running(source: Key, node: &Node, effect_id: i32, category: i32, domain: &str) -> bool {
     if matches!(source, Key::Projected(_)) {
         return node.projected_effect == Some(effect_id) && domain == "targetID";
+    }
+    // The SDE categorizes online as active, but the client's OnlineEffect
+    // lifecycle applies its modifiers while the module is online, not active.
+    if effect_id == EFFECT_ONLINE as i32 {
+        return node.online;
     }
     match category {
         EFFECT_CATEGORY_PASSIVE => true,

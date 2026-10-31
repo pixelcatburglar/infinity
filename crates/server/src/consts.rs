@@ -76,6 +76,8 @@ pub const CATEGORY_ENTITY: i32 = 11;
 pub const CATEGORY_SKILL: i32 = 16;
 /// SDE invCategories: Drone.
 pub const CATEGORY_DRONE: i32 = 18;
+/// SDE invCategories: Subsystem.
+pub const CATEGORY_SUBSYSTEM: i32 = 32;
 /// SDE invTypes: Hacking skill.
 pub const SKILL_HACKING: i32 = 21718;
 /// SDE invTypes: Archaeology skill.
@@ -104,6 +106,42 @@ pub const ATTR_SKILL_TIME_CONSTANT: i32 = 275;
 pub const ATTR_SKILL_POINTS: i32 = 276;
 /// SDE dgmAttributeTypes: skillLevel.
 pub const ATTR_SKILL_LEVEL: i32 = 280;
+/// Client dogma/const.py: requiredSkill1 through requiredSkill6.
+pub const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
+/// Client dogma/const.py: requiredSkill1Level through requiredSkill6Level.
+pub const ATTR_REQUIRED_SKILL_LEVELS: [i32; 6] = [277, 278, 279, 1286, 1287, 1288];
+/// Client dogma/const.py: attributeCpu.
+pub const ATTR_CPU: i32 = 50;
+/// Client dogma/const.py: attributeCpuLoad.
+pub const ATTR_CPU_LOAD: i32 = 49;
+/// Client dogma/const.py: attributeCpuOutput.
+pub const ATTR_CPU_OUTPUT: i32 = 48;
+/// Client dogma/const.py: attributePower.
+pub const ATTR_POWER: i32 = 30;
+/// Client dogma/const.py: attributePowerLoad.
+pub const ATTR_POWER_LOAD: i32 = 15;
+/// Client dogma/const.py: attributePowerOutput.
+pub const ATTR_POWER_OUTPUT: i32 = 11;
+/// Client dogma/const.py: attributeTurretSlotsLeft.
+pub const ATTR_TURRET_SLOTS_LEFT: i32 = 102;
+/// Client dogma/const.py: attributeLauncherSlotsLeft.
+pub const ATTR_LAUNCHER_SLOTS_LEFT: i32 = 101;
+/// Client dogma/const.py: attributeUpgradeLoad.
+pub const ATTR_UPGRADE_LOAD: i32 = 1152;
+/// Client dogma/const.py: attributeUpgradeCost.
+pub const ATTR_UPGRADE_COST: i32 = 1153;
+/// Client dogma/const.py: attributeUpgradeCapacity.
+pub const ATTR_UPGRADE_CAPACITY: i32 = 1132;
+/// Client dogma/const.py: attributeUpgradeSlotsLeft.
+pub const ATTR_UPGRADE_SLOTS_LEFT: i32 = 1154;
+/// Client dogma/const.py: attributeSlots.
+pub const ATTR_SLOTS: i32 = 47;
+/// Client dogma/const.py: effectTurretFitted.
+pub const EFFECT_TURRET_FITTED: i32 = 42;
+/// Client dogma/const.py: effectLauncherFitted.
+pub const EFFECT_LAUNCHER_FITTED: i32 = 40;
+/// Client dogma/const.py: effectRigSlot.
+pub const EFFECT_RIG_SLOT: i32 = 2663;
 
 /// SDE dgmAttributeTypes: damageMultiplier.
 pub const ATTR_DAMAGE_MULTIPLIER: i32 = 64;

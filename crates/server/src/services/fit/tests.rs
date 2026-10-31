@@ -168,6 +168,23 @@ fn item_and_location_domains_select_correct_nodes() {
 }
 
 #[test]
+fn online_effect_uses_online_state_despite_active_category() {
+    use super::{effect_running, Key, Location, EFFECT_ONLINE};
+    let mut module = fixture_node(Location::Ship);
+    let online = EFFECT_ONLINE as i32;
+    assert!(effect_running(Key::Module(1), &module, online, 1, "shipID"));
+    assert!(!effect_running(Key::Module(1), &module, 42, 1, "itemID"));
+    module.online = false;
+    module.active = true;
+    assert!(!effect_running(Key::Module(1), &module, online, 1, "shipID"));
+    assert!(effect_running(Key::Module(1), &module, 42, 1, "itemID"));
+
+    module.projected_effect = Some(online);
+    assert!(effect_running(Key::Projected(1), &module, online, 1, "targetID"));
+    assert!(!effect_running(Key::Projected(1), &module, online, 1, "shipID"));
+}
+
+#[test]
 fn projected_web_and_overload_gate_use_production_selection() {
     use super::{effect_running, modifier_applies, Key, Location};
     let mut module = fixture_node(Location::Ship);

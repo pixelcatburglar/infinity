@@ -15,6 +15,7 @@ pub(crate) mod weapons;
 pub(crate) mod hacking;
 pub(crate) mod lifecycle;
 pub(crate) mod online;
+pub(crate) mod fitting;
 mod repair;
 mod mining;
 mod capacitor;

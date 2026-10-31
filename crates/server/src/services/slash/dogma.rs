@@ -3,11 +3,14 @@
 //! overrides live in game.item_attributes and follow singleton item identity.
 //! Owned drone queries evaluate the owner's fit; no drone gameplay RPC is provided.
 //! Incoming drone projections require the in-space drone runtime.
+//! Hull and fitted-module overrides reconcile online resources atomically.
 //! Charges, characters, structures, NPCs and stacked items are not supported.
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
 use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER};
 use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
+use crate::db::outbox::Outbox;
+use crate::services::effects::online::{self, OnlineChanged};
 use marshal::Value;
 
 /// SDE invCategories: Starbase.
@@ -91,6 +94,7 @@ fn current_projection(s: &mut crate::space::System, ship: i64, revision: u64) ->
 
 pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let (target, action) = parse(args).ok_or_else(|| slash_error(messages::gm::GM_DOGMA_USAGE.into()))?;
+    let _lock = if matches!(action, Action::Query(_) | Action::List) { None } else { Some(crate::services::market::lock().await) };
     let ship = c.session.int("shipid");
     let modules = if let Some(ship) = ship { fit_dao::modules(&c.db, ship).await.map_err(db_err)? } else { Vec::new() };
     let id = match target {
@@ -136,7 +140,7 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     let mut key = if matches!(action, Action::Query(_)) && item.category_id == i64::from(CATEGORY_DRONE) {
         drone_key
     } else if Some(id) == ship { Some(Key::Ship) } else if modules.iter().any(|m| m.item_id == id) { Some(Key::Module(id)) } else { None };
-    if key.is_none() && matches!(action, Action::Query(_)) {
+    if key.is_none() && item.category_id != i64::from(CATEGORY_DRONE) {
         let candidate = if item.category_id == i64::from(crate::consts::CATEGORY_SHIP) { id }
             else if item.category_id == i64::from(CATEGORY_MODULE) { item.location_id } else { 0 };
         let hull = if candidate == id { Some(item.clone()) } else {
@@ -162,6 +166,12 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
             return Err(slash_error(messages::gm::GM_DOGMA_ACTIVE_CYCLE.into()));
         }
     }
+    let cascade_ship = if matches!(action, Action::Query(_)) { None }
+        else if item.category_id == i64::from(crate::consts::CATEGORY_SHIP) { Some(id) }
+        else if item.category_id == i64::from(CATEGORY_MODULE) && crate::services::inventory::is_fitting_flag(item.flag_id) {
+            let hull = load_items(&c.db, &c.sde, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next();
+            hull.filter(|h| h.owner_id == item.owner_id && h.category_id == i64::from(crate::consts::CATEGORY_SHIP) && h.singleton).map(|h| h.item_id)
+        } else { None };
     let rows = dao::overrides(&c.db, id).await.map_err(db_err)?;
     let old_override = rows.iter().find(|r| r.attribute_id == attr).map(|r| r.value);
     if matches!(action, Action::Reset(_)) && old_override.is_none() { return Ok(messages::gm::gm_dogma_noop(id, attr)); }
@@ -178,15 +188,36 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     } else { None };
     let old_base = old_fit.as_ref().zip(key).map(|(fit, key)| fit.base(key, attr)).unwrap_or(old_override.unwrap_or(fallback));
     let old_effective = old_fit.as_ref().zip(key).map(|(fit, key)| fit.value(key, attr));
-    match action {
-        Action::Set(_, value) => {
-            if !dao::set_override(&c.db, id, attr, value).await.map_err(db_err)? {
-                return Err(slash_error(messages::gm::GM_DOGMA_SINGLETON.into()));
-            }
-        }
-        Action::Reset(_) => dao::clear_override(&c.db, id, attr).await.map_err(db_err)?,
-        Action::Query(_) => {},
-        Action::List => unreachable!(),
+    if !matches!(action, Action::Query(_)) {
+        let db = c.db.clone();
+        let sde = c.sde.clone();
+        let owner = item.owner_id;
+        let value = if let Action::Set(_, value) = action { Some(value) } else { None };
+        let client = &*c;
+        db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                if let Some(hull) = cascade_ship {
+                    if !crate::dao::items::ship::lock_reload_ship(tx, hull).await.map_err(db_err)? {
+                        return Err(slash_error(messages::gm::GM_DOGMA_FORBIDDEN_TARGET.into()));
+                    }
+                    let target = load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
+                        .ok_or_else(|| slash_error(messages::gm::GM_DOGMA_FORBIDDEN_TARGET.into()))?;
+                    if target.owner_id != owner || !target.singleton || (id != hull && (target.location_id != hull || !crate::services::inventory::is_fitting_flag(target.flag_id))) {
+                        return Err(slash_error(messages::gm::GM_DOGMA_FORBIDDEN_TARGET.into()));
+                    }
+                }
+                if let Some(value) = value {
+                    if !dao::set_override(tx, id, attr, value).await.map_err(db_err)? {
+                        return Err(slash_error(messages::gm::GM_DOGMA_SINGLETON.into()));
+                    }
+                } else {
+                    dao::clear_override(tx, id, attr).await.map_err(db_err)?;
+                }
+                if let Some(hull) = cascade_ship { online::reconcile_core(tx, &sde, outbox, owner, hull).await?; }
+                Ok(())
+            })
+        }, |(), outbox| async move { online::dispatch_changed((), outbox, client) }).await?;
     }
     let changed = !matches!(action, Action::Query(_));
     let new_fit = if changed && key.is_some() {
@@ -203,8 +234,8 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
         if let (Some(old), Some(new), Some(key)) = (old_fit.as_ref(), new_fit.as_ref(), key) {
             let before = propulsion::kinematics(old);
             let after = propulsion::kinematics(new);
-            if before != after && c.session.int("stationid").is_none() {
-                if let (Some(system), Some(ship), Some(revision)) = (c.session.int("solarsystemid"), ship, new.projection_revision()) {
+            if before != after {
+                if let (Some(system), Some(ship), Some(revision)) = (fit_system, fit_ship, new.projection_revision()) {
                     c.world.post(system, move |s| {
                         if current_projection(s, ship, revision) {
                             s.queue_projection_kinematics(ship, revision, after);
@@ -212,9 +243,9 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
                     });
                 }
             }
-            let entry = notify::attribute_change(char_id, Value::Int(id), attr, Value::Float(new.value(key, attr)), Value::Float(old.value(key, attr)));
-            c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::list([entry])]);
-            if key == Key::Ship && new.type_has_attribute(key, attr) { crate::services::dogma::brain::update(c).await?; }
+            let entry = notify::attribute_change(fit_pilot, Value::Int(id), attr, Value::Float(new.value(key, attr)), Value::Float(old.value(key, attr)));
+            c.world.notify_pilot(fit_pilot, "OnModuleAttributeChanges", vec![Value::list([entry])]);
+            if fit_pilot == char_id && key == Key::Ship && new.type_has_attribute(key, attr) { crate::services::dogma::brain::update(c).await?; }
         }
     }
     let overridden = match action { Action::Set(..) => true, Action::Reset(_) => false, _ => old_override.is_some() };

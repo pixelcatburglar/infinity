@@ -2,7 +2,7 @@
 //! Mirrors clientDogmaLocation and godma; effect metadata comes from the SDE.
 //! Subject authorization is shared by activation, deactivation, analyzers and online changes.
 //! Projected effects require a locked, present target and use transient system state;
-//! later-wave behavior families are refused and resource fitting policy is not implemented.
+//! Later-wave behavior families are refused; fitting limits use the shared policy.
 //! Accepted running activations cancel arrival jump cloak; online changes are not cycles.
 //! Offlining a bank member destroys the whole persisted bank; unfit removes a slave
 //! or destroys a master's bank. Committed changes stop affected cycles after the
@@ -615,6 +615,9 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if matches.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {effect_name}"))); }
     drop(matches);
     let id = row.effect_id;
+    // Fitting mutations and non-online activation share this lock through registration and FX queuing.
+    // Online activation takes it inside set_online instead.
+    let _lock = if id != EFFECT_ONLINE as i32 { Some(crate::services::market::lock().await) } else { None };
     let mut module = subject(c, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
     let Some(effect) = registry::resolve(cx.world.sde(), id) else {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
@@ -623,8 +626,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER || !registry::activation_in_scope(module.category_id, module.group_id, kind) || !effect.manually_activatable() {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
     }
-    // Bank reads and activation are serialized by the single live session; concurrent
-    // entry points would need to serialize the final bank read and registration with mutations.
+    // Bank selection is serialized with fitting mutations by the shared lock above.
     if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
         let master = crate::services::combat::targeting_charges::master_for_member(&c.db, cx.ship_id, item_id).await?;
         if master != item_id {
@@ -654,17 +656,6 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
     let activation = Activation { effect: effect.clone(), module: Module { id: item_id, type_id: module.type_id, flag: module.flag_id }, target };
-    on_activate(&cx, &fit, &activation).await?;
-    if matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Neutralizer | EffectKind::Nosferatu) {
-        let t = target.unwrap_or(0);
-        let ship = cx.ship_id;
-        let (own_type, victim) = cx.world.with(cx.system_id, move |s| {
-            (s.ball(ship).map(|b| b.type_id).unwrap_or(0), s.ball(t).and_then(|b| b.char_id))
-        }).await.unwrap_or((0, None));
-        if let Some(victim) = victim {
-            super::super::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, own_type, module.type_id, victim, t).await?;
-        }
-    }
     if state().active.contains_key(&item_id) {
         return Ok(Value::None);
     }
@@ -675,6 +666,24 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         for slave in bank(&cx.db, cx.ship_id, item_id).await?.into_iter().skip(1) {
             let m = subject(c, cx.ship_id, slave, id, true).await?;
             modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
+        }
+    }
+    let masters: Vec<i64> = state().active.iter().filter(|(_, active)| active.char_id == cx.char_id && !active.forced_inactive).map(|(&id, _)| id).collect();
+    let mut active = Vec::new();
+    for master in masters { active.extend(bank(&cx.db, cx.ship_id, master).await?); }
+    active.sort_unstable();
+    active.dedup();
+    let activating: Vec<i64> = modules.iter().map(|module| module.id).collect();
+    super::fitting::validate_active(&cx.db, c.sde.clone(), &fit, cx.ship_id, &active, &activating).await?;
+    on_activate(&cx, &fit, &activation).await?;
+    if matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Neutralizer | EffectKind::Nosferatu) {
+        let t = target.unwrap_or(0);
+        let ship = cx.ship_id;
+        let (own_type, victim) = cx.world.with(cx.system_id, move |s| {
+            (s.ball(ship).map(|b| b.type_id).unwrap_or(0), s.ball(t).and_then(|b| b.char_id))
+        }).await.unwrap_or((0, None));
+        if let Some(victim) = victim {
+            super::super::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, own_type, module.type_id, victim, t).await?;
         }
     }
     let other = loaded(&cx.db, cx.ship_id, module.flag_id).await?.map(|(type_id, _)| charge_key(cx.ship_id, module.flag_id, type_id));
