@@ -83,7 +83,7 @@ async fn stale_move_snapshot_is_refused_without_changing_item() {
     };
     let original_owner = snapshot.owner_id;
     snapshot.owner_id = original_owner.wrapping_add(1);
-    assert!(!inventory_dao::move_item(&tx, &snapshot, snapshot.location_id, snapshot.flag_id, snapshot.owner_id, snapshot.singleton, false).await.expect("guarded move"));
+    assert!(!inventory_dao::move_item(&tx, &snapshot, snapshot.location_id, snapshot.flag_id, snapshot.owner_id, snapshot.singleton).await.expect("guarded move"));
     let row = tx.query_one("SELECT owner_id FROM game.items WHERE item_id = $1", &[&snapshot.item_id]).await.expect("item remains");
     assert_eq!(row.get::<_, i64>("owner_id"), original_owner);
     tx.rollback().await.expect("rollback");
@@ -196,7 +196,7 @@ async fn move_item_authorizes_sources_and_destinations() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let type_id = sde.types.iter().next().unwrap().type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id != Some(crate::consts::CATEGORY_MODULE) && t.category_id != Some(crate::consts::CATEGORY_SUBSYSTEM)).unwrap().type_id;
     let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
     let wreck_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_WRECK)).unwrap().type_id;
     let container_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
@@ -282,12 +282,12 @@ async fn move_item_authorizes_sources_and_destinations() {
     assert!(move_item(&mut client, &hangar, corp_item, None, None, None).await.is_ok());
     let moved = load_items(&db, &client.sde, ItemQuery::Id(corp_item)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, station, FLAG_HANGAR));
-    assert!(move_item(&mut client, &Container::Item(own_ship), own, None, Some(FLAG_FITTING_FIRST), None).await.is_ok());
-    let moved = load_items(&db, &client.sde, ItemQuery::Id(own)).await.unwrap().pop().unwrap();
-    assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, own_ship, FLAG_FITTING_FIRST));
-    assert!(move_item(&mut client, &hangar, own, None, None, None).await.is_ok());
-    let moved = load_items(&db, &client.sde, ItemQuery::Id(own)).await.unwrap().pop().unwrap();
-    assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, station, FLAG_HANGAR));
+    db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&own_ship]).await.unwrap();
+    let before = move_fingerprint(&db).await;
+    client.outbox.clear();
+    assert!(move_item(&mut client, &Container::Item(own_ship), own, None, Some(FLAG_FITTING_FIRST), None).await.is_err());
+    assert_eq!(move_fingerprint(&db).await, before);
+    assert!(client.outbox.is_empty());
     client.session.apply(vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
     let ball = |id, x| crate::space::Ball {
         id, type_id: 1, owner_id: me, corp_id: 1, alliance_id: 0, char_id: None,

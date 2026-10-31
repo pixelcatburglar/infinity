@@ -3,7 +3,7 @@
 //! supplies the target's ship and inventory. Modules are not brought online.
 
 use super::*;
-use crate::db::outbox::{Effect, Notification};
+use crate::db::outbox::Notification;
 
 pub(super) fn available(item: &Item, target: i64, type_id: i32, ship: i64, station: Option<i64>) -> bool {
     item.owner_id == target && item.type_id == type_id && item.quantity > 0
@@ -21,7 +21,7 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
-        move |tx, outbox: &mut Outbox| {
+        move |tx, outbox: &mut Outbox<MoveEffect>| {
             let sde = sde.clone();
             Box::pin(async move {
                 let refuse = || notify_error(messages::gm::GM_FIT_REFUSED);
@@ -42,7 +42,6 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                 sources.retain(|item| available(item, target, type_id, ship, station));
                 if item_id.is_some() && sources.iter().map(|item| i64::from(item.quantity)).sum::<i64>() < i64::from(quantity) { return Err(refuse()); }
                 for _ in 0..quantity {
-                    let flag = free_slot_core(tx, &sde, ship, type_id).await?.ok_or_else(refuse)?;
                     let item = if let Some(item) = sources.first().cloned() {
                         item
                     } else {
@@ -50,8 +49,11 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                         notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
                         load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?
                     };
+                    let flag = super::super::effects::fitting::free_slot(tx, sde.clone(), target, ship, item.item_id, type_id).await?.ok_or_else(|| notify_error(messages::fitting::SLOTS))?;
                     let take = (!item.singleton && item.quantity > 1).then_some(1);
-                    move_core(tx, &sde, outbox, &item, target, ship, flag, take).await?;
+                    let moved = move_core(tx, &sde, outbox, &item, target, ship, flag, take).await?;
+                    super::super::effects::fitting::validate_fit(tx, sde.clone(), target, ship, moved).await?;
+                    super::super::effects::online::reconcile_core(tx, &sde, outbox, target, ship).await?;
                     if !sources.is_empty() {
                         if take.is_some() { sources[0].quantity -= 1; } else { sources.remove(0); }
                     }
@@ -59,7 +61,7 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                 Ok(quantity as usize)
             })
         },
-        |value, outbox| async move { dispatch_target(value, outbox, c, target) },
+        |value, outbox| async move { dispatch_move(value, outbox, c, target) },
     ).await
 }
 
@@ -70,21 +72,10 @@ pub(super) fn route_target(notification: Notification, target: i64, current: Opt
     }
 }
 
-fn dispatch_target<T>(value: T, outbox: Outbox, c: &mut Client, target: i64) -> Result<T, CallError> {
-    let world = c.world.clone();
-    for entry in outbox.into_entries() {
-        match entry {
-            Effect::Notification(notification) => route_target(notification, target, c.session.int("charid")).dispatch(&world, Some(&mut *c))?,
-            Effect::Operation(never) => match never {},
-            Effect::Event(event) => crate::lua::on_event(event),
-        }
-    }
-    Ok(value)
-}
 
 /// Unload selected modules and their bank's charges in one transaction.
 pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64, mut ids: Vec<i64>, destination: i64, flag: i32) -> Result<usize, CallError> {
-    use super::super::effects::online::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
+    use super::super::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
     let _lock = super::super::market::lock().await;
     let policy = OnlinePolicy::from_client(c)?;
     if policy.owner != owner { return Err(notify_error(messages::gm::GM_FIT_REFUSED)); }
@@ -138,19 +129,10 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
                 for module in &modules {
                     move_core(tx, &sde, outbox, module, owner, destination, flag, None).await?;
                 }
+                super::super::effects::online::reconcile_core(tx, &sde, outbox, owner, ship).await?;
                 Ok(modules.len())
             })
         },
-        |value, outbox| async move {
-            let world = c.world.clone();
-            for entry in outbox.into_entries() {
-                match entry {
-                    Effect::Operation(change) => apply_online_changed(change),
-                    Effect::Notification(notification) => route_target(notification, owner, c.session.int("charid")).dispatch(&world, Some(&mut *c))?,
-                    Effect::Event(event) => crate::lua::on_event(event),
-                }
-            }
-            Ok(value)
-        },
+        |value, outbox| async move { dispatch_changed(value, outbox, c) },
     ).await
 }

@@ -8,6 +8,7 @@ pub(crate) mod bounty;
 pub(crate) mod combat;
 pub(crate) mod contacts;
 pub(crate) mod effects;
+pub(crate) mod fitting;
 pub(crate) mod gm;
 pub(crate) mod repair;
 pub(crate) mod scheduler;
@@ -15,6 +16,19 @@ pub(crate) mod lua;
 pub(crate) mod loyalty;
 pub(crate) mod standings;
 pub(crate) mod trade;
+
+// Client fitting and online UserError catalogue keys.
+pub(crate) const MSG_FITTING_HAS_SKILL_PREREQUISITES: &str = "FittingHasSkillPrerequisites";
+pub(crate) const MSG_ONLINE_HAS_SKILL_PREREQUISITES: &str = "OnlineHasSkillPrerequisites";
+pub(crate) const MSG_NOT_ENOUGH_CPU: &str = "NotEnoughCpu";
+pub(crate) const MSG_NOT_ENOUGH_POWER: &str = "NotEnoughPower";
+pub(crate) const MSG_CANT_FIT_TOO_MANY_BY_GROUP: &str = "CantFitTooManyByGroup";
+pub(crate) const MSG_CANT_FIT_TOO_MANY_BY_TYPE: &str = "CantFitTooManyByType";
+pub(crate) const MSG_CANNOT_ONLINE_REACHED_MAX_GROUP_ONLINE: &str = "CannotOnlineReachedMaxGroupOnline";
+pub(crate) const MSG_EFFECT_CROWDED_OUT: &str = "EffectCrowdedOut";
+pub(crate) const MSG_MODULE_NOT_POWERED: &str = "ModuleNotPowered";
+pub(crate) const MSG_NO_SUITABLE_SLOTS_FOR_THIS_SUBSYSTEM: &str = "NoSuitableSlotsForThisSubSystem";
+pub(crate) const MSG_CANNOT_FIT_SUBSYSTEM_NOT_SHIP: &str = "CannotFitSubSystemNotShip";
 
 /// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.
 pub(crate) const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";

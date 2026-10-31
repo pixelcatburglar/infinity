@@ -93,7 +93,7 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     let mut outbox = Outbox::default();
     assert!(set_levels(&tx, &mut outbox, &sde, character, &[(target, 0)]).await.is_ok());
     assert_changed_batch(outbox, character, &[other, target]);
-    let mut outbox = Outbox::default();
+    let mut outbox: Outbox = Outbox::default();
     let skills = training::current(&tx, character).await.expect("read skills");
     let completed = skills.iter().find(|s| s.type_id == other).expect("completed skill");
     assert_eq!((completed.level, completed.skill_points), (1, 250));
@@ -160,7 +160,7 @@ async fn database_gm_set_queues_only_completed_training_event_once() {
     done.dest_sp = 1415;
     queue::insert(&tx, character, &done).await.expect("insert completed training");
 
-    let mut outbox = Outbox::default();
+    let mut outbox: Outbox = Outbox::default();
     assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)]).await.is_ok(), "grant level");
     assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)]).await.is_ok(), "repeat grant");
     tx.rollback().await.expect("rollback without dispatch");

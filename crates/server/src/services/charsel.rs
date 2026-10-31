@@ -3,7 +3,7 @@
 //! Uses character, account, item and skill DAOs and SDE starting data; appearance is stored without interpretation.
 //! Slot counts, name limits, starting ISK and deletion delay are operator policies.
 //! Selecting a character registers process-local presence; appearance editing is not interpreted here.
-//! Selection restores the active ship's persisted condition before entering the game.
+//! Selection reconciles the active fit before restoring the ship's persisted condition.
 //! Successful selection and logoff hand off lifecycle events after session changes.
 //! First selection serializes rookie ship grants on the character row and grants a
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
@@ -211,6 +211,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         super::skills::starting::grant_starting_skills(c, char_id, race).await?;
     }
     characters::selection::logoff(&c.db, char_id).await.map_err(db_err)?;
+    super::effects::online::reconcile_ship(c, char_id, ship).await?;
     if station.is_some() {
         super::combat::load_docked_condition(&c.db, &c.world, char_id, ship).await?;
     }

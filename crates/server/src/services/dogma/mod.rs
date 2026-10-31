@@ -7,7 +7,7 @@
 //! volume and radius fall back to typed SDE type columns: this is server schema
 //! behavior, not a validated client fallback. Effective fitting is the subset in
 //! `services/fit.rs`, not a complete implementation of client dogma.
-//! Module online changes use the shared effects lifecycle; fitting resource policy is unsupported.
+//! Module online changes and resource reconciliation use the shared effects policy.
 //! Character brains compile passive skills and active implant and booster modifiers; structure effects
 //! and implant/booster injection or expiry are unsupported.
 //! Brain versions are in-memory and reset when the server restarts.
@@ -150,12 +150,12 @@ async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError>
 
 /// Set fitted modules online and notify the controlling client after commit.
 pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallError> {
-    use super::effects::online::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
-    use crate::db::outbox::{Effect, Outbox};
+    use super::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
+    use crate::db::outbox::Outbox;
+    let _lock = super::market::lock().await;
     let policy = OnlinePolicy::from_client(c)?;
     let db = c.db.clone();
     let sde = c.sde.clone();
-    let world = c.world.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
@@ -175,16 +175,7 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
                 Ok(count)
             })
         },
-        |count, outbox| async move {
-            for entry in outbox.into_entries() {
-                match entry {
-                    Effect::Operation(change) => apply_online_changed(change),
-                    Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
-                    Effect::Event(event) => crate::lua::on_event(event),
-                }
-            }
-            Ok(count)
-        },
+        |count, outbox| async move { dispatch_changed(count, outbox, c) },
     ).await
 }
 
@@ -192,6 +183,8 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
 /// active (clientDogmaLocation.MakeShipActive). instanceCache rows follow dgmAttributesByIdx:
 /// [itemID, isOnline, damage, charge, skillPoints, armorDamage, shieldCharge, isIncapacitated].
 pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
+    let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+    super::effects::online::reconcile_ship(c, owner, ship_id).await?;
     let items = load_items(&c.db, &c.sde, ItemQuery::LocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let instance = |key: Value, online: bool| {
@@ -218,6 +211,8 @@ pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
 /// The active ship and everything fitted in it.
 async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let Some(ship_id) = c.session.int("shipid") else { return Ok(vec![]) };
+    let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+    super::effects::online::reconcile_ship(c, owner, ship_id).await?;
     let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let mut out = Vec::new();

@@ -8,6 +8,9 @@ use crate::{
     space::{Ball, WarpState, World, MODE_STOP},
 };
 
+/// Client dogma.const.attributeMaxGroupActive.
+const MAX_GROUP_ACTIVE: i32 = 763;
+
 fn ball(id: i64, type_id: i32, owner: i64, pilot: Option<i64>) -> Ball {
     Ball { id, type_id, owner_id: owner, corp_id: 1, alliance_id: -1, char_id: pilot,
         signature_radius: None, mode: MODE_STOP, radius: 100.0, mass: 1e6, max_vel: 0.0,
@@ -102,6 +105,39 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         assert!(call(&mut client, "Activate", &args(ids[3])).await.is_err());
         { let st = state(); assert!(!st.active.contains_key(&ids[0]) && !st.active.contains_key(&ids[3])); }
         d.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1 AND slave_id=$2", &[&ship,&ids[3]]).await.unwrap();
+        for &id in &ids[..3] { dogma::set_override(&d, id, MAX_GROUP_ACTIVE, 2.0).await.unwrap(); }
+        match call(&mut client, "Activate", &args(ids[1])).await {
+            Err(crate::services::CallError::User { msg, dict }) => {
+                assert_eq!(msg, crate::messages::MSG_EFFECT_CROWDED_OUT);
+                assert!(dict.iter().any(|(key, value)| key == "module" && *value == Value::Int(i64::from(gun))));
+                assert!(dict.iter().any(|(key, value)| key == "count" && *value == Value::Int(2)));
+            }
+            _ => panic!("expected EffectCrowdedOut"),
+        }
+        {
+            let st = state();
+            for id in &ids[..3] {
+                assert!(!st.active.contains_key(id));
+                assert!(!st.activation_generation.contains_key(id));
+            }
+        }
+        assert!(w.after(1, 200).await);
+        while let Ok((name, payload)) = notifications.try_recv() {
+            assert!(name != "OnGodmaShipEffect" || payload.get(1).and_then(Value::as_int) != Some(effect_id)
+                || payload.get(3).and_then(Value::as_int) != Some(1)
+                || !payload.first().and_then(Value::as_int).is_some_and(|id| ids[..3].contains(&id)));
+        }
+        while let Ok(batch) = events.try_recv() {
+            for event in batch {
+                let Value::Tuple(envelope) = event else { continue };
+                let Some(Value::Tuple(call)) = envelope.get(1) else { continue };
+                if call.first() != Some(&Value::str("OnSpecialFX")) { continue; }
+                let Some(Value::Tuple(args)) = call.get(1) else { continue };
+                assert!(args.get(7).and_then(Value::as_int) != Some(1)
+                    || !args.get(1).and_then(Value::as_int).is_some_and(|id| ids[..3].contains(&id)));
+            }
+        }
+        for &id in &ids[..3] { dogma::clear_override(&d, id, MAX_GROUP_ACTIVE).await.unwrap(); }
         call(&mut client, "Activate", &args(ids[1])).await.ok().expect("activate slave");
         let stop = { let st = state();
             assert!(!st.active.contains_key(&ids[1]) && !st.active.contains_key(&ids[2]));
@@ -143,6 +179,71 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
             while state().active.contains_key(&ids[0]) { assert!(w.after(1, 100).await); }
         }).await.expect("master cycle retirement");
         for i in 0..3 { assert_eq!(loaded(&d, ship, FLAG_HI_SLOT_FIRST + i).await.ok().unwrap(), Some((ammo, 2))); }
+        // A competing forced offline commits while activation is waiting for the shared lock.
+        while notifications.try_recv().is_ok() {}
+        while events.try_recv().is_ok() {}
+        let policy = super::super::super::online::OnlinePolicy::from_client(&client).ok().expect("derive online policy");
+        let lock = crate::services::market::lock().await;
+        let activation_args = args(ids[0]);
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let activation = tokio::spawn(async move {
+            let _ = started.send(());
+            let result = call(&mut client, "Activate", &activation_args).await;
+            (client, result)
+        });
+        waiting.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let completed_before_offline = activation.is_finished();
+        let master = ids[0];
+        let sde = w.sde().clone();
+        let dispatch_world = w.clone();
+        let offline = d.transaction(
+            move |tx, outbox: &mut crate::db::outbox::Outbox<super::super::super::online::OnlineChanged>| {
+                let policy = policy.clone();
+                let sde = sde.clone();
+                Box::pin(async move {
+                    super::super::super::online::set_online_core(tx, &sde, &policy, outbox, ship, master, false).await
+                })
+            },
+            move |changed, outbox| async move {
+                for entry in outbox.into_entries() {
+                    match entry {
+                        crate::db::outbox::Effect::Operation(change) => super::super::super::online::apply_online_changed(change),
+                        crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&dispatch_world, None)?,
+                        crate::db::outbox::Effect::Event(event) => crate::lua::on_event(event),
+                    }
+                }
+                Ok(changed)
+            },
+        ).await;
+        drop(lock);
+        let (client, activation_result) = activation.await.unwrap();
+        assert!(offline.ok().expect("forced offline transaction"));
+        assert!(!completed_before_offline, "activation bypassed the fitting lock");
+        assert!(activation_result.is_err(), "offline module activated");
+        {
+            let st = state();
+            for id in &ids[..3] {
+                assert!(!st.active.contains_key(id));
+                assert!(!st.activation_generation.contains_key(id));
+            }
+        }
+        assert!(w.after(1, 200).await);
+        while let Ok((name, payload)) = notifications.try_recv() {
+            assert!(name != "OnGodmaShipEffect" || payload.get(1).and_then(Value::as_int) != Some(effect_id)
+                || payload.get(3).and_then(Value::as_int) != Some(1)
+                || !payload.first().and_then(Value::as_int).is_some_and(|id| ids[..3].contains(&id)));
+        }
+        while let Ok(batch) = events.try_recv() {
+            for event in batch {
+                let Value::Tuple(envelope) = event else { continue };
+                let Some(Value::Tuple(call)) = envelope.get(1) else { continue };
+                if call.first() != Some(&Value::str("OnSpecialFX")) { continue; }
+                let Some(Value::Tuple(args)) = call.get(1) else { continue };
+                assert!(args.get(7).and_then(Value::as_int) != Some(1)
+                    || !args.get(1).and_then(Value::as_int).is_some_and(|id| ids[..3].contains(&id)));
+            }
+        }
         combat::reset(&client);
         w.unobserve(character);
     }).await;

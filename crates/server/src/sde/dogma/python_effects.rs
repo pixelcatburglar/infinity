@@ -5,6 +5,7 @@
 use super::{Effect, Modifier};
 use crate::consts::{ATTR_ACTIVATION_BLOCKED, ATTR_ACTIVATION_BLOCKED_STRENGTH, ATTR_AOE_CLOUD_SIZE, ATTR_ARMOR_DAMAGE_AMOUNT, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, ATTR_DAMAGE_MULTIPLIER, ATTR_EM_DAMAGE, ATTR_EXPLOSION_DELAY, ATTR_EXPLOSIVE_DAMAGE, ATTR_FALLOFF, ATTR_KINETIC_DAMAGE, ATTR_MASS, ATTR_MAX_LOCKED_TARGETS, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_MAX_VELOCITY, ATTR_RATE_OF_FIRE, ATTR_SCAN_RESOLUTION, ATTR_SHIELD_BONUS, ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, ATTR_SIGNATURE_RADIUS, ATTR_SPEED_FACTOR, ATTR_SPEED_FACTOR_INTERIM, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, ATTR_THERMAL_DAMAGE, ATTR_WARP_SCRAMBLE_STATUS};
 use crate::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP, ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, ATTR_TRACKING_SPEED};
+use crate::consts::{ATTR_CPU, ATTR_CPU_LOAD, ATTR_POWER, ATTR_POWER_LOAD, ATTR_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, ATTR_UPGRADE_COST, ATTR_UPGRADE_LOAD, ATTR_UPGRADE_SLOTS_LEFT};
 
 /// Client dogma/const.py: attributeAoeCloudSizeBonus.
 const ATTR_AOE_CLOUD_SIZE_BONUS: i32 = 848;
@@ -92,6 +93,7 @@ const ATTR_TRACKING_SPEED_BONUS: i32 = 767;
 /// Client dogma/const.py modifier operations.
 const PRE_MUL: i32 = 0;
 const MOD_ADD: i32 = 2;
+const MOD_SUB: i32 = 3;
 const POST_MUL: i32 = 4;
 const POST_PERCENT: i32 = 6;
 const POST_ASSIGN: i32 = 7;
@@ -162,6 +164,23 @@ struct Row { func: &'static str, domain: &'static str, op: i32, modified: i32, m
 pub(super) fn supplement(effect: &mut Effect) {
     if !effect.modifiers.is_empty() { return; }
     let rows: &[Row] = match effect.name.as_deref() {
+        // eve/common/script/dogma/online.py: OnlineEffect.
+        Some("online") => &[
+            Row { func: "ItemModifier", domain: "shipID", op: MOD_ADD, modified: ATTR_CPU_LOAD, modifying: ATTR_CPU, skill: None },
+            Row { func: "ItemModifier", domain: "shipID", op: MOD_ADD, modified: ATTR_POWER_LOAD, modifying: ATTR_POWER, skill: None },
+        ],
+        // eve/common/script/dogma/fitting.py: LauncherFittedEffect and TurretFittedEffect.
+        Some("launcherFitted") => &[
+            Row { func: "ItemModifier", domain: "shipID", op: MOD_SUB, modified: ATTR_LAUNCHER_SLOTS_LEFT, modifying: ATTR_SLOTS, skill: None },
+        ],
+        Some("turretFitted") => &[
+            Row { func: "ItemModifier", domain: "shipID", op: MOD_SUB, modified: ATTR_TURRET_SLOTS_LEFT, modifying: ATTR_SLOTS, skill: None },
+        ],
+        // eve/common/script/dogma/fitting.py: UpgradeFittedEffect.
+        Some("rigSlot") => &[
+            Row { func: "ItemModifier", domain: "shipID", op: MOD_SUB, modified: ATTR_UPGRADE_SLOTS_LEFT, modifying: ATTR_SLOTS, skill: None },
+            Row { func: "ItemModifier", domain: "shipID", op: MOD_ADD, modified: ATTR_UPGRADE_LOAD, modifying: ATTR_UPGRADE_COST, skill: None },
+        ],
         // eve/common/script/dogma/pythonEffects/remoteWebifierFalloff.py: BaseRemoteWebifierFalloff.
         Some("remoteWebifierFalloff" | "remoteWebifierEntity" | "npcBehaviorWebifier") => &[
             Row { func: "ItemModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_MAX_VELOCITY, modifying: ATTR_SPEED_FACTOR_INTERIM, skill: None },
