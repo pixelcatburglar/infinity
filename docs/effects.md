@@ -23,6 +23,27 @@ per process. A GM with the existing slash role can use `/effects unsupported`
 to list recorded pairs. The process-local list resets on restart and is not an
 inventory of every unsupported SDE effect.
 
+## Fitting and online resources
+
+The shared fitting policy validates inventory moves and online transitions with
+the same Fit evaluator. Fitting checks structural constraints, including rack
+and slot availability, hardpoints, calibration, hull restrictions, fitted
+group and type limits, and skill prerequisites. CPU and power shortages do not
+prevent an offline fit: they refuse the online transition, using effective
+output and load with the prospective module online. Numeric client-side fitting
+warnings without corresponding UserErrors use the server's existing
+`CustomNotify` fallback.
+
+The online mutation core owns the database transition, weapon-bank changes and
+the outbox for effect and attribute notifications. Legal ship priming makes no
+online-state changes. Priming and boarding reconcile legacy overfits; GM dogma
+overrides and skill losses also reconcile affected hulls. The cascade compares
+the CPU and power load/output ratios, chooses the worse resource, and offlines
+its largest contributing ordinary module before service modules, breaking
+remaining ties by item ID. It reloads the effective fit after each offline so
+lost online bonuses can cause further changes. Notifications and bank stops
+are dispatched only after commit.
+
 ## Behaviour status
 
 | Kind or family | Status |
@@ -217,3 +238,28 @@ a later family does not implement or enable that family's activation.
    wire behaviour in the existing separate test files. Update this document
    when support changes. Protocol and gameplay changes also need real-client
    verification.
+
+## Fitting enforcement
+
+`services/effects/fitting.rs` owns the shared fitting, onlining, activation and
+resource-cascade policy. It reads effective values through `Fit` and its
+modifier table rather than calculating a separate set of fitting attributes.
+Structural fitting checks include hull and rack restrictions, slot occupancy,
+skills, turret and launcher hardpoints, rig size and calibration, and fitted
+group and type limits. CPU and power-grid availability are checked when a module
+is brought online, not merely when it is fitted.
+
+`services/effects/online.rs` owns the guarded online-state mutation. It queues
+effect and attribute notifications and any weapon-bank changes in the outbox,
+which dispatches after the transaction commits. Reconciliation reloads Fit
+after each module is offlined. It chooses the resource with the worst load-to-output
+ratio, choosing CPU on a tie; among online modules consuming that resource it
+chooses ordinary modules before service modules, then highest resource usage,
+then highest item ID. A legal load requires no state writes or notification
+pushes.
+
+The policy is invoked by fitting and unfitting, online changes, ship load,
+boarding and character selection, GM fitting and dogma overrides, and skill loss.
+Where the client presents a fitting warning only as a UI label rather than a
+catalogue error, the server uses a localized `CustomNotify` fallback. This
+description does not claim real-client verification.
