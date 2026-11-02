@@ -4,7 +4,7 @@
 //! `eve/client/script/remote/michelle.py:491-532` and
 //! `eve/client/script/parklife/autopilot.py:260-261,329-332`.
 //! Sources are typed SDE, including races, bloodlines and NPC characters, and selected native
-//! projections, including compression mappings, type lists and dynamic item definitions, via `dao::sde`.
+//! projections, including compression mappings, type lists, graphic locations and dynamic item definitions, via `dao::sde`.
 //! Celestial collision radii are resolved here for the wire and placement callers.
 //! Typed dogma_effect_modifiers and build_info are intentionally unused: modifiers come from dogma_effects instead.
 //! Native blueprints and stationoperations are unused under the typed-table ruling.
@@ -15,6 +15,7 @@ pub(crate) mod dogma;
 pub(crate) mod dungeons;
 pub(crate) mod dynamic_items;
 pub(crate) mod factions;
+pub(crate) mod graphic_locations;
 pub(crate) mod industry;
 pub(crate) mod localization;
 pub(crate) mod map;
@@ -37,6 +38,7 @@ pub(crate) struct Sde {
     pub(crate) dynamic_items: dynamic_items::DynamicItems,
     pub(crate) map: map::Map,
     pub(crate) missions: missions::Missions,
+    pub(crate) graphic_locations: graphic_locations::GraphicLocations,
     pub(crate) dungeons: dungeons::Dungeons,
     pub(crate) factions: factions::Factions,
     pub(crate) npc_corporations: corporations::NpcCorporations,
@@ -56,13 +58,14 @@ impl Sde {
 
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
         let started = Instant::now();
-        let (mut types, dogma, map, factions, npc_corporations, localization, wrecks, industry, store, missions, mut dungeons, characters, dynamic_rows) = tokio::try_join!(
+        let (mut types, dogma, map, factions, npc_corporations, localization, wrecks, industry, store, missions, mut dungeons, characters, graphic_locations, dynamic_rows) = tokio::try_join!(
             types::Types::load(db), dogma::Dogma::load(db), map::Map::load(db),
             factions::Factions::load(db), corporations::NpcCorporations::load(db), localization::Localization::load(db), wrecks::Wrecks::load(db),
             async { industry::Industry::load(db).await.map_err(anyhow::Error::from) },
             async { store::Store::load(db).await.map_err(anyhow::Error::from) },
             missions::Missions::load(db), dungeons::Dungeons::load(db),
             characters::Characters::load(db),
+            graphic_locations::GraphicLocations::load(db),
             async { crate::dao::sde::dynamic_items::load(db).await.map_err(anyhow::Error::from) },
         )?;
         let (compression, typelists) = tokio::try_join!(compression::Compression::load(db, &types), typelists::TypeLists::load(db, &types))?;
@@ -70,7 +73,7 @@ impl Sde {
         types.index_modifiers(&dogma);
         dungeons.index_map(&map);
         tracing::info!(types = types.len(), dogma_attributes = dogma.attribute_count(), dogma_effects = dogma.effect_count(), systems = map.systems().count(), stations = map.stations().count(), celestials = map.all_celestials().count(), factions = factions.len(), npc_corporations = npc_corporations.len(), localization = localization.len(), elapsed_ms = started.elapsed().as_millis(), "SDE loaded");
-        Ok(Self { types, compression, dogma, dynamic_items, map, factions, npc_corporations, localization, wrecks, industry, store, missions, dungeons, characters, typelists })
+        Ok(Self { types, compression, dogma, dynamic_items, map, graphic_locations, factions, npc_corporations, localization, wrecks, industry, store, missions, dungeons, characters, typelists })
     }
     /// Mirrors the client's non-tradable and soulbound type-list checks.
     pub(crate) fn is_tradable(&self, type_id: i32) -> bool {

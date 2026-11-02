@@ -5,6 +5,8 @@
 //! data come from the SDE; locations are persisted in game tables.
 //! Ship shield, armor and hull condition are persisted in item dogma overrides.
 //! Selected and unpiloted persistent hulls share fitted ball construction.
+//! NPC undocks use static graphic exit channels and fitted ship movement values;
+//! locator rotations and Upwell-specific undock behavior are not modeled.
 //!
 //! Movement commands apply at destiny boundaries; jump and docking waits and arrival cloak
 //! expiry use the actor tick. During the four-second jump wait, the source ballpark
@@ -538,6 +540,7 @@ fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
 
 pub(crate) mod balls;
 mod ship;
+mod undock_point;
 mod beyonce;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
