@@ -83,7 +83,7 @@ jobs:
             if [[ "$PLATFORM" == windows ]]; then suffix=".exe"; fi
             cp "target/$TARGET/release/$binary$suffix" package/
           done < binaries.txt
-          cp README.md package/
+          cp -R README.md docs package/
           shopt -s nullglob
           licenses=(LICENSE* LICENCE* COPYING*)
           if (( ${#licenses[@]} )); then cp "${licenses[@]}" package/; fi
