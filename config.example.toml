@@ -21,6 +21,9 @@ auto_register_role = "player"       # default role for auto-registration: "playe
 
 [logging]
 filter = "info,infinity_server=debug"   # env: RUST_LOG; existing tracing EnvFilter fallback
+dir = ""                                # env: LOG_DIR; empty disables file logging
+rotation = "daily"                      # minutely, hourly, daily, or never
+keep_files = 14                         # maximum retained server log files; at least 1; ignored with never
 
 [database]
 # A nonempty libpq connection string or URL wins over the individual fields.

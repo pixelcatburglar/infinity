@@ -1,4 +1,6 @@
-//! Deployment settings and their defaults. Connection credentials are never formatted in errors.
+//! Deployment settings and their defaults, including optional rotating server logs.
+//! Connection credentials are never formatted in errors. These settings do not mirror
+//! client modules or use tables; logging does not support size-based rotation.
 
 use std::time::Duration;
 
@@ -156,11 +158,33 @@ impl DevelopmentConfig {
 pub struct LoggingConfig {
     /// Existing tracing filter fallback; RUST_LOG overrides it.
     pub filter: String,
+    /// Empty disables file logging; LOG_DIR overrides it.
+    pub dir: String,
+    /// Time-based rotation interval.
+    pub rotation: String,
+    /// Maximum number of retained server log files.
+    pub keep_files: usize,
 }
 impl Default for LoggingConfig {
-    fn default() -> Self { Self { filter: "info,infinity_server=debug".into() } }
+    fn default() -> Self {
+        Self {
+            filter: "info,infinity_server=debug".into(),
+            dir: String::new(),
+            rotation: "daily".into(),
+            keep_files: 14,
+        }
+    }
 }
-impl LoggingConfig { pub fn validate(&self) -> Result<()> { Ok(()) } }
+impl LoggingConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.rotation.as_str(), "minutely" | "hourly" | "daily" | "never"),
+            "logging.rotation must be minutely, hourly, daily or never: {:?}", self.rotation
+        );
+        anyhow::ensure!(self.keep_files >= 1, "logging.keep_files must be at least 1: {}", self.keep_files);
+        Ok(())
+    }
+}
 
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]

@@ -20,6 +20,7 @@ mod gateway;
 mod handshake;
 mod images;
 mod live_sessions;
+mod logging;
 mod macho;
 mod lua;
 mod messages;
@@ -52,9 +53,7 @@ fn startup_call_error(error: services::CallError) -> anyhow::Error {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::load()?);
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cfg.logging.filter)?)
-        .init();
+    let _logging_guards = logging::init(&cfg.logging)?;
     info!(source = cfg.source(), "configuration loaded");
     config::init_game(cfg.game_config())?;
     let db = db::Db::connect(&cfg.database).await?;

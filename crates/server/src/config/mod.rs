@@ -175,6 +175,7 @@ impl Config {
         override_env!("BOOT_CODENAME", config.server.boot_codename);
         override_env!("BOOT_REGION", config.server.boot_region);
         override_env!("RUST_LOG", config.logging.filter);
+        override_env!("LOG_DIR", config.logging.dir);
         override_env!("DATABASE_HOST", config.database.host);
         override_env!("DATABASE_PORT", config.database.port);
         override_env!("DATABASE_USER", config.database.user);
