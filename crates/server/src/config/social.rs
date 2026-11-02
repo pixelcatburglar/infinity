@@ -242,6 +242,8 @@ pub struct SpaceConfig {
     pub position_snapshot_secs: i64,
     /// Server policy: mailbox depth above which a space actor logs a warning.
     pub mailbox_budget: i64,
+    /// Server policy: optional sphere collisions; detailed collision shapes are unavailable.
+    pub collisions: bool,
 }
 
 impl Default for SpaceConfig {
@@ -249,6 +251,7 @@ impl Default for SpaceConfig {
         Self {
             position_snapshot_secs: 30,
             mailbox_budget: 10000,
+            collisions: false,
         }
     }
 }

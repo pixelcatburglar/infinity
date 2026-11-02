@@ -62,7 +62,7 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
     let endpoint = b.pos;
     let midpoint = b.position_at(2_500);
     let mut bytes = Vec::new();
-    b.write(&mut bytes);
+    b.write(&mut bytes, true);
     for elapsed in [0, 100, 500, 900, 1000, 900, 100, 500, 0, 1000] {
         let actual = b.position_at(2_000 + elapsed);
         let expected = if elapsed == 0 { b.old_pos } else if elapsed == 1000 { endpoint } else {
@@ -76,7 +76,7 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
     let mut materialized = b.clone();
     materialized.pos = b.position_at(3_000);
     let mut sampled_bytes = Vec::new();
-    materialized.write(&mut sampled_bytes);
+    materialized.write(&mut sampled_bytes, true);
     assert_eq!(bytes, sampled_bytes);
     s.tick(2_500);
     assert_eq!(s.sampled_ball(1).unwrap().pos, s.sample_position(1).unwrap());
@@ -412,6 +412,7 @@ fn constant_target_integration_is_step_size_independent() {
 
 #[test]
 fn timers_fire_by_deadline_not_insertion_order_without_firing_early() {
+    crate::tests::init_config();
     let mut s = System::default();
     let fired = Arc::new(Mutex::new(Vec::new()));
     s.tick(1000);
@@ -431,6 +432,7 @@ fn timers_fire_by_deadline_not_insertion_order_without_firing_early() {
 
 #[test]
 fn same_due_timers_fire_in_scheduling_order_including_nested_schedule() {
+    crate::tests::init_config();
     let mut s = System::default();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let first = fired.clone();
@@ -461,19 +463,21 @@ fn timer_for_removed_ball_is_harmless_and_other_timers_still_fire() {
 
 #[test]
 fn future_timer_allows_cold_skip_until_due() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.schedule(1000, |s| assert_eq!(s.ms, 1000));
-    assert!(s.is_cold());
+    assert!(s.is_cold(true));
     s.tick(100);
     assert_eq!(s.ms, 100);
-    assert!(s.is_cold());
+    assert!(s.is_cold(true));
     s.tick(1000);
     assert!(s.timers.is_empty());
-    assert!(s.is_cold());
+    assert!(s.is_cold(true));
 }
 
 #[test]
 fn absolute_deadlines_preserve_cadence_and_tie_order() {
+    crate::tests::init_config();
     let mut s = System::default();
     let result = Arc::new(Mutex::new(Vec::new()));
     let first = result.clone();

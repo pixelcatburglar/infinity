@@ -139,6 +139,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
 
 #[test]
 fn cycle_deadlines_and_deactivation() {
+    crate::tests::init_config();
     let mut s = System::default();
     let completed = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));

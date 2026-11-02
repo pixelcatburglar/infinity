@@ -39,6 +39,7 @@ fn live_drone_candidate_uses_item_location_and_rejects_bay_or_non_singletons() {
 
 #[test]
 fn late_gm_snapshot_requests_refresh_without_overwriting_newer_projection() {
+    crate::tests::init_config();
     use crate::space::{Ball, System, WarpState, MODE_STOP};
     use std::sync::Arc;
 

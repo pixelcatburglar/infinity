@@ -73,6 +73,7 @@ fn ball(id: i64, pilot: i64) -> space::Ball {
 
 #[test]
 fn actor_identity_visibility_and_command_fence() {
+    crate::tests::init_config();
     let st = setup();
     let order = snapshot(&st, 3, 103).unwrap();
     let mut s = space::System::new(1, std::sync::Arc::default(), 1000);
@@ -109,6 +110,7 @@ fn actor_identity_visibility_and_command_fence() {
 
 #[test]
 fn character_target_is_current_visible_fleet_pilot_at_commit() {
+    crate::tests::init_config();
     let mut st = setup();
     let mut order = snapshot(&st, 3, 103).unwrap();
     target(&mut order, 5, 105);
@@ -134,6 +136,7 @@ fn character_target_is_current_visible_fleet_pilot_at_commit() {
 
 #[test]
 fn revision_and_scramble_preserve_single_arrival_callback() {
+    crate::tests::init_config();
     use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
     let st = setup();
     let order = snapshot(&st, 3, 103).unwrap();

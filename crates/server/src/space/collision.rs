@@ -1,12 +1,24 @@
-//! Legacy sphere collision prediction and response for transient destiny balls.
-//! Mirrors carbonengine Ballpark::Gradient/Potential and Collision.cpp as consumed
-//! by the client destiny ballpark. Inputs are actor-owned ball state, not database
-//! records. Miniballs, force fields, collision callbacks and bump events are absent.
-//!
-//! Authoritative geometry and wire currently provide scalar spheres only;
-//! upgrade both together, then add shape-discriminator fixtures.
+//! Optional legacy sphere collision prediction and response. Mirrors
+//! carbonengine destiny Ballpark::Gradient, Ballpark::Potential and
+//! Collision.cpp as consumed by client destiny. Inputs are actor-owned ball
+//! state; no database records are used. The restart-only policy defaults off
+//! because detailed shape data is unavailable; enabled collisions use one
+//! sphere per ball. Nonmassive balls do not occlude native
+//! CheckVisibility queries (carbonengine destiny Ballpark.cpp:5299-5346).
+//! No shipped client caller of CheckVisibility was found. Miniballs, force
+//! fields, collision callbacks and bump events are absent.
 
 use super::*;
+
+pub(crate) fn enabled() -> bool { crate::config::game().space.collisions }
+
+pub(super) fn massive(ball: &Ball, collisions: bool) -> bool {
+    ball.massive && (ball.mode == MODE_MISSILE || collisions)
+}
+
+pub(super) fn reset_event(ship: i64, stamp: i64, collisions: bool) -> Option<Value> {
+    (!collisions).then(|| event(stamp, "SetBallMassive", vec![Value::Int(ship), Value::Bool(false)]))
+}
 
 /// Ballpark::Potential collision acceleration multiplier.
 const RESPONSE_SCALE: f64 = 0.85;
@@ -27,13 +39,13 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    fn new(b: &Ball) -> Self {
+    fn new(b: &Ball, collisions: bool) -> Self {
         let mass = if b.free { b.mass * b.agility as f64 } else { CELESTIAL_STATIC_MASS };
         let acceleration = b.segment_acceleration.unwrap_or_default();
         let time_factor = integration_factor(mass, DESTINY_FRICTION);
         let endpoint = integrate(b.pos, b.vel, acceleration, mass, DESTINY_FRICTION, time_factor, 1.0).0;
         Self { id: b.id, mode: b.mode, follow: b.follow_id, launcher: b.launcher,
-            free: b.free, massive: b.massive, cloak: b.cloak, radius: b.radius as f64,
+            free: b.free, massive: massive(b, collisions), cloak: b.cloak, radius: b.radius as f64,
             mass: b.mass, effective_mass: mass, pos: b.pos, vel: b.vel, acceleration,
             endpoint, time_factor }
     }
@@ -49,19 +61,20 @@ fn eligible(me: &Snapshot, other: &Snapshot) -> bool {
 }
 
 /// Shared cold/evolution gate: native overlap includes exact tangency.
-pub(super) fn stationary_contact(balls: &HashMap<i64, Ball>) -> bool {
-    balls.values().filter(|b| b.free && b.massive && b.mode == MODE_STOP && b.vel == [0.0; 3])
+pub(super) fn stationary_contact(balls: &HashMap<i64, Ball>, collisions: bool) -> bool {
+    if !collisions { return false; }
+    balls.values().filter(|b| b.free && massive(b, collisions) && b.mode == MODE_STOP && b.vel == [0.0; 3])
         .any(|me| balls.values().any(|other| {
-            if me.id == other.id || !other.massive || other.cloak != 0 || other.mode == MODE_MISSILE { return false; }
+            if me.id == other.id || !massive(other, collisions) || other.cloak != 0 || other.mode == MODE_MISSILE { return false; }
             let delta = sub(me.pos, other.pos);
             let radius = me.radius as f64 + other.radius as f64;
             dot(delta, delta) <= radius * radius
         }))
 }
 
-pub(super) fn freeze(scratch: &mut Vec<Snapshot>, balls: &HashMap<i64, Ball>) {
+pub(super) fn freeze(scratch: &mut Vec<Snapshot>, balls: &HashMap<i64, Ball>, collisions: bool) {
     scratch.clear();
-    scratch.extend(balls.values().map(Snapshot::new));
+    scratch.extend(balls.values().map(|ball| Snapshot::new(ball, collisions)));
     scratch.sort_unstable_by_key(|b| b.id);
 }
 

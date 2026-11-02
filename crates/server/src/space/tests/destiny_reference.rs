@@ -86,6 +86,7 @@ fn compare_position(actual: V3, expected: V3, context: &str) {
 }
 
 pub(super) fn replay(name: &str, fixture_data: &str, balls: Vec<Ball>, stream_ticks: &[i64], streams: bool, setup: impl FnOnce(&mut System)) {
+    crate::tests::init_config();
     let ids: BTreeSet<_> = balls.iter().map(|ball| ball.id).collect();
     assert_eq!(ids.len(), balls.len(), "{name}: duplicate initial ball IDs");
     let rows = fixture(name, fixture_data, &ids, stream_ticks);
@@ -102,7 +103,7 @@ pub(super) fn replay(name: &str, fixture_data: &str, balls: Vec<Ball>, stream_ti
                 if let Some(expected) = row.get("stream") {
                     let expected = expected.as_str().unwrap();
                     let mut bytes = Vec::new();
-                    ball.write(&mut bytes);
+                    ball.write(&mut bytes, true);
                     let mut actual = String::with_capacity(bytes.len() * 2);
                     for byte in bytes { write!(&mut actual, "{byte:02x}").unwrap(); }
                     if actual != expected {
@@ -134,6 +135,7 @@ fn replay_scenario(scenario: &Scenario, streams: bool) {
 #[test] fn align_stream() { replay_scenario(&ALIGN, true); }
 
 pub(super) fn replay_fractions(name: &str, fixture: &str, balls: Vec<Ball>, setup: impl FnOnce(&mut System)) {
+    crate::tests::init_config();
     let mut lines = fixture.lines();
     assert_eq!(lines.next(), Some(format!("# {name}-fractions: carbonengine destiny reference interpolation").as_str()), "{name}: invalid fraction fixture header");
     let ids: BTreeSet<_> = balls.iter().map(|ball| ball.id).collect();

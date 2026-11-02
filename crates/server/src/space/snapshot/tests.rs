@@ -98,7 +98,7 @@ fn no_pilots_keep_cold_skip_and_no_deadline() {
     let mut s = System::default();
     s.insert(ball(1, None, 0.0));
     s.tick(seconds_to_ms(crate::config::game().space.position_snapshot_secs as f64) as i64);
-    assert!(s.is_cold());
+    assert!(s.is_cold(true));
     assert_eq!(s.snapshot_due, 0);
     assert!(changed(&s).is_empty());
 }

@@ -83,6 +83,7 @@ fn warp_threshold_uses_unadjusted_distance_and_keeps_long_warp_events() {
 
 #[test]
 fn stale_warp_snapshot_has_no_side_effects_and_can_retry() {
+    crate::tests::init_config();
     let mut s = space::System::new(0, std::sync::Arc::default(), 12_345);
     let mut b = ship();
     b.cloak = 1;
