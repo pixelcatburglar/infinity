@@ -71,3 +71,12 @@ other contracts retain their escrow for issuer reclamation.
 | sharedSettingsMgr | GetStoredSharedSetting | handled | `crates/server/src/services/settings_sharing/shared_settings_mgr.rs` |
 
 Authenticated players can forward permanent item-filter and fleet-broadcast snapshots to any other signed-in player. Links are not private and cannot be revoked or expired. Payloads use JSON as a YAML subset, with a lowercase SHA-256 digest of the exact encoded UTF-8 bytes.
+
+## Exploration
+
+| service | method | status | handler file |
+|---|---|---|---|
+| scanMgr | GetSystemScanMgr | handled | `crates/server/src/services/exploration/scan_mgr.rs` |
+| scanMgr | QAScanSites | handled | `crates/server/src/services/exploration/scan_mgr.rs` |
+
+QA-role accounts can select exploration targets for full-certainty results. Signature authorization persists per character and is shared with ordinary scanning and warp and bookmark checks.

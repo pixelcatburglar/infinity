@@ -14,6 +14,7 @@ pub(crate) mod corporations;
 pub(crate) mod drones;
 pub(crate) mod effects;
 pub(crate) mod dynamic_items;
+pub(crate) mod exploration;
 pub(crate) mod fitting;
 pub(crate) mod fleets;
 pub(crate) mod gm;

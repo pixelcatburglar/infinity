@@ -4,6 +4,28 @@
 
 use super::*;
 
+/// Persist a batch before publishing any in-memory authorization.
+pub(super) async fn complete_scans(db: &Db, char_id: i64, site_ids: &[i64]) -> Result<(), CallError> {
+    let mut ids = site_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ids = Arc::new(ids);
+    db.transaction(|tx, _: &mut ()| {
+        let ids = Arc::clone(&ids);
+        Box::pin(async move {
+            for &id in ids.iter() {
+                crate::dao::exploration::mark_scanned(tx, char_id, id).await.map_err(db_err)?;
+            }
+            Ok::<(), CallError>(())
+        })
+    }, |(), ()| async { Ok(()) }).await?;
+    state().scanned.extend(ids.iter().map(|&id| (char_id, id)));
+    Ok(())
+}
+
 
 // ---------------------------------------------------------------- the sensor overlay
 
@@ -203,12 +225,21 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
         let job_world = world.clone();
         world.post(system, move |s| s.defer(async move {
         let sites = system_sites(system);
-        let mut results = vec![];
-        let mut reported = HashSet::new();
+        let mut candidates = vec![];
+        let mut complete = vec![];
         for s in &sites {
-            // Anomalies and anything already scanned down are always exact; without
-            // probes the ship's own scanner only feels signatures faintly.
-            let known = s.kind == Kind::Anomaly || is_scanned(&db, char_id, s.id).await.unwrap_or(false);
+            // Anomalies and already authorized signatures are exact without probes.
+            let known = if s.kind == Kind::Anomaly {
+                true
+            } else {
+                match is_scanned(&db, char_id, s.id).await {
+                    Ok(known) => known,
+                    Err(e) => {
+                        warn!("reading scan authorization for {}: {}", s.target, err_text(e));
+                        continue;
+                    }
+                }
+            };
             let (c, spread) = if known {
                 (1.0, 0.0)
             } else if scanning.is_empty() {
@@ -219,10 +250,24 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
             if c <= 0.0 {
                 continue;
             }
-            if c >= 1.0 && s.kind == Kind::Signature {
-                if let Err(e) = mark_scanned(&db, char_id, s.id).await {
-                    warn!("scan of {}: {}", s.target, err_text(e));
-                }
+            let newly_complete = !known && c >= 1.0 && s.kind == Kind::Signature;
+            if newly_complete {
+                complete.push(s.id);
+            }
+            candidates.push((s, c, spread, newly_complete));
+        }
+        let committed = match complete_scans(&db, char_id, &complete).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("scan completion failed: {}", err_text(e));
+                false
+            }
+        };
+        let mut results = vec![];
+        let mut reported = HashSet::new();
+        for (s, c, spread, newly_complete) in candidates {
+            if newly_complete && !committed {
+                continue;
             }
             reported.insert(s.target.clone());
             results.push(result_value(s, c, spread));
@@ -320,3 +365,5 @@ pub(super) async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
             .collect(),
     ))
 }
+
+#[cfg(test)] mod tests;

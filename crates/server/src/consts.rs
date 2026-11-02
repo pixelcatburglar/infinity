@@ -6,6 +6,8 @@
 //! not belong here. Shared gateway protocol units are included. This module
 //! provides no data lookup or runtime state.
 pub mod dogma;
+/// `carbon/common/script/sys/serviceConst.py`: ROLE_QA.
+pub const ROLE_QA: i64 = 4_503_599_627_370_496;
 /// Client inventorycommon.const.categoryImplant.
 pub const CATEGORY_IMPLANT: i32 = 20;
 /// Client inventorycommon.const.groupBooster.
