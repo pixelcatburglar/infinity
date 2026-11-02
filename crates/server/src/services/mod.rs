@@ -52,7 +52,7 @@ mod npe;
 mod offices;
 pub(crate) mod online_status;
 mod orgs;
-mod mining;
+pub(crate) mod mining;
 mod missions;
 pub(crate) mod ship;
 pub(crate) mod skills;

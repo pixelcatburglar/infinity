@@ -178,6 +178,7 @@ async fn contact_claimed(db: &Db, world: &Arc<World>, system: i64, drone: &Drone
             let task = tokio::spawn(async move {
                 let repeat = match &delivery {
                     Some(crate::services::mining::DeliveryOutcome::Delivered(receipt)) => Some(receipt.repeat()),
+                    Some(crate::services::mining::DeliveryOutcome::NoYield) => Some(true),
                     _ => None,
                 };
                 let completed = world.with(system, move |s| {
