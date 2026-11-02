@@ -3,8 +3,53 @@
 
 use super::*;
 
+// eve/client/script/ui/inflight/scannerFiles/scanResults.py:result_menu selects
+// result.id (str); eve/client/script/parklife/scanSvc.py:QAScanSites sends one
+// tuple of those strings. probescanning/scanHandler.py:InjectResults consumes
+// result objects with id, certainty, data/pos tuples and optional metadata.
+async fn qa_scan_sites(c: &Client, call: &Call<'_>) -> CallResult {
+    if c.login.role & crate::consts::ROLE_QA == 0 {
+        return Err(notify_error(messages::exploration::QA_REQUIRED));
+    }
+    let char_id = c.session.int("charid").filter(|id| *id > 0)
+        .ok_or_else(|| notify_error(messages::exploration::SPACE_REQUIRED))?;
+    let system = c.session.int("solarsystemid").filter(|id| *id > 0)
+        .ok_or_else(|| notify_error(messages::exploration::SPACE_REQUIRED))?;
+    let [Value::Tuple(values)] = call.args else {
+        return Err(notify_error(messages::exploration::INVALID_TARGETS));
+    };
+    if !matches!(call.kwargs, Value::Dict(items) if items.is_empty()) {
+        return Err(notify_error(messages::exploration::INVALID_TARGETS));
+    }
+    let mut targets = HashSet::new();
+    for value in values {
+        let target = match value {
+            Value::Bytes(bytes) => std::str::from_utf8(bytes).ok(),
+            Value::Unicode(text) => Some(text.as_str()),
+            _ => None,
+        }.ok_or_else(|| notify_error(messages::exploration::INVALID_TARGETS))?;
+        targets.insert(target);
+    }
+    if targets.is_empty() {
+        return Ok(Value::list([]));
+    }
+    ensure_loaded(&c.db, &c.world, system).await?;
+    let now = filetime_now();
+    let mut sites: Vec<Site> = state().sites.values()
+        .filter(|site| site.system == system && targets.contains(site.target.as_str())
+            && !site.wormhole.as_ref().is_some_and(|w| now - w.born > filetime_ticks_from_seconds(minutes_to_seconds(w.life_minutes) as i64)))
+        .cloned().collect();
+    sites.sort_by_key(|site| site.id);
+    let ids: Vec<i64> = sites.iter().filter(|site| site.kind == Kind::Signature).map(|site| site.id).collect();
+    complete_scans(&c.db, char_id, &ids).await?;
+    state().reported.entry((char_id, system)).or_default().extend(sites.iter().map(|site| site.target.clone()));
+    Ok(Value::list(sites.iter().map(|site| result_value(site, 1.0, 0.0))))
+}
+
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match (call.service, call.method) {
+        ("scanMgr", "GetSystemScanMgr") => Some(Ok(c.bind("scanMgr", Value::None))),
+        ("scanMgr", "QAScanSites") => Some(qa_scan_sites(c, call).await),
         ("scanMgr", "SignalTrackerRegister") => {
             let system = c.session.int("solarsystemid")?;
             if let Err(e) = crate::services::mining::ensure_fields(&c.db, &c.world, system).await {
@@ -46,3 +91,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         _ => None,
     }
 }
+
+#[cfg(test)] mod tests;

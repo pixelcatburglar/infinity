@@ -17,8 +17,9 @@
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
 //! back in space when their system is loaded again. Startup moves legacy exploration and
 //! mission sites out of planets, along with exploration overlays and asteroids.
-//! Scan completion, probe recovery, site respawns and warp-exit callbacks are transient;
-//! pending work does not survive cancellation or restart.
+//! Per-character signature completion persists in `game.exploration_scanned`; QA
+//! selected scans share this authorization. Probe and scan timing, recovery, site
+//! respawns and warp-exit callbacks are transient; pending work does not survive restart.
 //! Probe charges are consumed atomically before transient probes are created.
 //! Probe origins, directional scans and wormhole range use actor-time sampled positions.
 //!
@@ -31,6 +32,7 @@
 //! - dogmaIM.LaunchProbes(launcherID, count) -> OnNewProbe(probe) per probe.
 //! - bound scanMgr.RequestScans(probes | None) -> OnSystemScanStarted(start, ms, probes),
 //!   then OnSystemScanStopped(probeIDs, results, absentTargetIDs).
+//! - bound scanMgr.QAScanSites((targetID, ...)) -> selected full-certainty results for QA.
 //! - bound scanMgr.ConeScan(angle, range, x, y, z) -> [record(id, typeID, groupID)].
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
 
@@ -365,13 +367,6 @@ async fn is_scanned(db: &Db, char_id: i64, site_id: i64) -> Result<bool, CallErr
     Ok(found)
 }
 
-async fn mark_scanned(db: &Db, char_id: i64, site_id: i64) -> Result<(), CallError> {
-    if !state().scanned.insert((char_id, site_id)) {
-        return Ok(());
-    }
-    crate::dao::exploration::mark_scanned(db, char_id, site_id).await.map_err(db_err)?;
-    Ok(())
-}
 
 
 
@@ -615,7 +610,7 @@ pub(super) async fn gm_wormhole(c: &mut Client) -> Result<String, CallError> {
         }
     };
     let w = site.wormhole.clone().ok_or_else(|| gm_error(messages::GM_NOT_WORMHOLE))?;
-    mark_scanned(&c.db, char_id, site.id).await?;
+    complete_scans(&c.db, char_id, &[site.id]).await?;
     ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
     super::ship::teleport(c, site.system, [site.pos[0] + 6000.0, site.pos[1], site.pos[2]]).await?;
     Ok(messages::gm_wormhole_result(&site.target, w.type_id, site.system, w.dest_system, w.dest_class))
@@ -626,9 +621,8 @@ pub(super) async fn gm_scan_all(c: &mut Client) -> Result<String, CallError> {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Err(gm_error(messages::GM_UNDOCK_FIRST)) };
     ensure_loaded(&c.db, &c.world, system).await?;
     let sites = system_sites(system);
-    for s in sites.iter().filter(|s| s.kind == Kind::Signature) {
-        mark_scanned(&c.db, char_id, s.id).await?;
-    }
+    let ids: Vec<i64> = sites.iter().filter(|s| s.kind == Kind::Signature).map(|s| s.id).collect();
+    complete_scans(&c.db, char_id, &ids).await?;
     let results: Vec<Value> = sites.iter().map(|s| result_value(s, 1.0, 0.0)).collect();
     state().reported.insert((char_id, system), sites.iter().map(|s| s.target.clone()).collect());
     c.notify("OnSystemScanStopped", vec![Value::list([]), Value::List(results), Value::list([])]);
