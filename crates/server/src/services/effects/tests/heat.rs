@@ -152,7 +152,7 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         let Value::Dict(instances) = &state[0] else { panic!("instance bootstrap mapping") };
         let (_, module_row) = instances.iter().find(|(id, _)| id.as_int() == Some(f.module)).unwrap();
         assert_eq!(module_row.items().unwrap()[2].as_float(), Some(hp));
-        assert!(online::set_online(&mut c, f.ship, f.module, true).await.is_err());
+        assert!(online::set_online(&services::identity::Identity::of_client(&c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, f.ship, f.module, true, |notification| online::dispatch_notification(notification, &c)).await.is_err());
         assert!(w.after(SYSTEM, 300).await);
         let mut adds = 0;
         let mut removes = 0;
@@ -193,7 +193,7 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         assert!(call(&mut c, "repairSvc", "RepairItemsInStation", &[ids, Value::Float(cost)], Some(&bind)).await.is_err());
         assert_eq!(wallets::balance(&d, f.character).await.ok().unwrap(), repaired_balance);
         assert_eq!(Fit::load(&d, sde.clone(), f.character, f.ship).await.ok().unwrap().value(Key::Module(f.module), ATTR_HULL_DAMAGE), 0.0);
-        online::set_online(&mut c, f.ship, f.module, true).await.ok().expect("online after repair");
+        online::set_online(&services::identity::Identity::of_client(&c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, f.ship, f.module, true, |notification| online::dispatch_notification(notification, &c)).await.ok().expect("online after repair");
         assert!(dogma::online(&d, f.ship).await.unwrap().iter().any(|m| m.item_id == f.module));
     }).await;
     {

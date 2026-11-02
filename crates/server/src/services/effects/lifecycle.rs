@@ -23,6 +23,7 @@ use crate::services::combat::targeting_charges::{bank, charge_key, loaded};
 use crate::services::fit::{Fit, Key};
 use crate::services::items::load_items;
 use crate::services::{db_err, notify_error, user_error, Call, CallError, CallResult};
+use crate::services::identity::Identity;
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::client::{filetime_now, Client};
 use crate::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_CAPACITOR_NEED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, FLAG_HANGAR};
@@ -444,7 +445,7 @@ pub(super) async fn subject_valid(cx: &Ctx, module: &Module, effect: &Effect) ->
 }
 
 pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
-    let policy = OnlinePolicy::from_client(c)?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     Ok(subject_core(&c.db, &c.sde, &policy, ship, item_id, effect, require_online).await?.1)
 }
 
@@ -492,7 +493,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         EffectKind::Online => {
             super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::online::set_online(c, cx.ship_id, item_id, true).await;
+            return super::online::set_online(&Identity::of_client(c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, cx.ship_id, item_id, true, |notification| super::online::dispatch_notification(notification, c)).await;
         }
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
         EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
@@ -590,7 +591,7 @@ pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
         || !registry::activation_in_scope(module.category_id, module.group_id, kind) {
         return Err(unsupported::refusal(Some(id), &name, module.type_id));
     }
-    if kind == EffectKind::Online { return super::online::set_online(c, cx.ship_id, item_id, false).await; }
+    if kind == EffectKind::Online { return super::online::set_online(&Identity::of_client(c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, cx.ship_id, item_id, false, |notification| super::online::dispatch_notification(notification, c)).await; }
     if let Some(stop) = state().active.get(&item_id) {
         stop_generation(&stop.stop);
     }

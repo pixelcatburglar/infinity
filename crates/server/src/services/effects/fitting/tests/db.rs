@@ -92,7 +92,7 @@ async fn fitting_online_priming_and_slash() {
         assert!((fit.value(Key::Ship, ATTR_CPU_LOAD) - offline_load - need).abs() < 1e-6);
         fit.set_module_online(f.modules[0], false);
         assert!((fit.value(Key::Ship, ATTR_CPU_LOAD) - offline_load).abs() < 1e-6);
-        match services::effects::online::set_online(&mut client, f.ship, f.modules[0], true).await {
+        match services::effects::online::set_online(&services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, f.ship, f.modules[0], true, |notification| services::effects::online::dispatch_notification(notification, &client)).await {
             Err(CallError::User { msg, dict }) => {
                 assert_eq!(msg, "NotEnoughCpu");
                 for (key, value) in [("moduleName", Value::tuple([Value::Int(4), Value::Int(i64::from(module_type))])), ("moduleType", Value::Int(i64::from(module_type))), ("require", Value::Float(need)), ("remaining", Value::Float(0.0)), ("total", Value::Float(0.0))] {
@@ -108,7 +108,7 @@ async fn fitting_online_priming_and_slash() {
         assert!(item_dogma::set_override(&test_db, f.modules[0], ATTR_POWER, 10.0).await.unwrap());
         let power_fit = Fit::load(&test_db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
         let power_need = power_fit.value(Key::Module(f.modules[0]), ATTR_POWER);
-        match services::effects::online::set_online(&mut client, f.ship, f.modules[0], true).await {
+        match services::effects::online::set_online(&services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, f.ship, f.modules[0], true, |notification| services::effects::online::dispatch_notification(notification, &client)).await {
             Err(CallError::User { msg, dict }) => {
                 assert_eq!(msg, "NotEnoughPower");
                 for (key, value) in [("moduleName", Value::tuple([Value::Int(4), Value::Int(i64::from(module_type))])), ("moduleType", Value::Int(i64::from(module_type))), ("require", Value::Float(power_need)), ("remaining", Value::Float(0.0)), ("total", Value::Float(0.0))] {
@@ -127,7 +127,7 @@ async fn fitting_online_priming_and_slash() {
         assert_eq!(row.get::<_, i32>("flag_id"), crate::consts::FLAG_CARGO);
         assert!(events.try_recv().is_err());
         assert!(item_dogma::set_override(&test_db, f.ship, ATTR_CPU_OUTPUT, need).await.unwrap());
-        services::effects::online::set_online(&mut client, f.ship, f.modules[0], true).await.ok().expect("exact CPU boundary");
+        services::effects::online::set_online(&services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, f.ship, f.modules[0], true, |notification| services::effects::online::dispatch_notification(notification, &client)).await.ok().expect("exact CPU boundary");
         while events.try_recv().is_ok() {}
         let legal_before = fixture::fingerprint(&test_db).await.unwrap();
         services::dogma::ship_state(&client, f.ship).await.ok().unwrap();

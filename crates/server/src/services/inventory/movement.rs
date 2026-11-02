@@ -8,6 +8,7 @@
 use super::*;
 use super::reachability::{Endpoint, Reachability};
 use crate::consts::{CORP_HANGAR_DIVISIONS, IX_FLAG, IX_SINGLETON, IX_OWNER_ID};
+use crate::services::identity::Identity;
 
 const FLAG_AUTOFIT: i32 = 0;
 
@@ -104,7 +105,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
     let sde = c.sde.clone();
     let active_ship = c.session.int("shipid");
     let container = container.clone();
-    let policy = super::super::effects::online::OnlinePolicy::from_client(c)?;
+    let policy = super::super::effects::online::OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     db.transaction(
         move |tx, outbox: &mut Outbox<MoveEffect>| {
             let item = item.clone();

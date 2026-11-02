@@ -178,7 +178,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
         state.active.insert(f.modules[0], services::combat::ActiveModule { char_id: f.owner, stop: stop.clone(), forced_inactive: false });
         state.activation_generation.insert(f.modules[0], stop.clone());
     }
-    let policy = online::OnlinePolicy::from_client(client).ok().unwrap();
+    let policy = online::OnlinePolicy::from_identity(&services::identity::Identity::of_client(client), client.notify_tx.clone()).ok().unwrap();
     let scenario_sde = sde.clone();
     while events.try_recv().is_ok() {}
     let rollback: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<OnlineChanged>| {

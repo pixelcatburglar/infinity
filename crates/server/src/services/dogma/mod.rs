@@ -19,6 +19,7 @@ pub(crate) mod brain;
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use super::{combat, exploration, fit, skills};
+use super::identity::Identity;
 use crate::client::{filetime_now, short, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -168,7 +169,7 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
     use super::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
     use crate::db::outbox::Outbox;
     let _lock = super::market::lock().await;
-    let policy = OnlinePolicy::from_client(c)?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
@@ -395,7 +396,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            super::effects::online::set_online(c, ship, module, online).await
+            super::effects::online::set_online(&Identity::of_client(c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, ship, module, online, |notification| super::effects::online::dispatch_notification(notification, c)).await
         }
         _ => {
             warn!(

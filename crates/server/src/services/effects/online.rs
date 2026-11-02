@@ -10,6 +10,7 @@ use crate::db::{executor::Executor, outbox::{Effect as OutboxEffect, Outbox}};
 use crate::messages;
 use crate::sde::Sde;
 use crate::services::{db_err, notify_error, CallError, CallResult};
+use crate::services::identity::Identity;
 use crate::space::NotifyTx;
 use marshal::Value;
 use tracing::info;
@@ -30,12 +31,13 @@ pub(in crate::services) struct OnlineChanged {
 }
 
 impl OnlinePolicy {
-    pub(in crate::services) fn from_client(c: &Client) -> Result<Self, CallError> {
+    pub(in crate::services) fn from_identity(identity: &Identity, sender: NotifyTx) -> Result<Self, CallError> {
+        if identity.char_id == 0 { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
         Ok(Self {
-            owner: c.session.int("charid").ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?,
-            active_ship: c.session.int("shipid"),
-            station: c.session.int("stationid"),
-            notify: c.notify_tx.clone(),
+            owner: identity.char_id,
+            active_ship: identity.ship_id,
+            station: identity.station_id,
+            notify: sender,
         })
     }
 }
@@ -204,12 +206,15 @@ pub(in crate::services) async fn reconcile_ship(
     ).await
 }
 
-/// Change online state for an authorized fitted module, including docked hangar ships.
-pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: bool) -> CallResult {
+/// Change online state for an authorized fitted module; login_user comes from the owning account and is read only by the module-online/offline info log.
+pub(crate) async fn set_online(
+    identity: &Identity, db: &crate::db::Db, sde: &Arc<Sde>, sender: NotifyTx, login_user: i64,
+    ship: i64, item_id: i64, online: bool,
+    notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError> + Send,
+) -> CallResult {
     let _lock = crate::services::market::lock().await;
-    let policy = OnlinePolicy::from_client(c)?;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
+    let policy = OnlinePolicy::from_identity(identity, sender)?;
+    let sde = sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let policy = policy.clone();
@@ -217,8 +222,8 @@ pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: 
             Box::pin(async move { set_online_core(tx, &sde, &policy, outbox, ship, item_id, online).await })
         },
         |changed, outbox| async move {
-            dispatch_changed((), outbox, c)?;
-            if changed { info!(user = c.login.user_id, "module {item_id} {}", if online { "online" } else { "offline" }); }
+            dispatch_entries((), outbox, notify)?;
+            if changed { info!(user = login_user, "module {item_id} {}", if online { "online" } else { "offline" }); }
             Ok(Value::None)
         },
     ).await
