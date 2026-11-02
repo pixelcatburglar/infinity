@@ -35,6 +35,7 @@
 - Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
 - In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.
 - Fleet bubble broadcasts and fleet warp treat a whole solar system as one grid, because the server keeps one ballpark per system.
+- Shared item-filter and fleet-broadcast links are permanent and public: anyone signed in who has the whole link can open it, and a link cannot be made private, revoked or set to expire. Overview profile links are not supported.
 - A pilot who changes corporation or alliance gains or loses access to shared bookmark folders at once, but a shared folder the client already shows stays in its list until the pilot logs in again.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
