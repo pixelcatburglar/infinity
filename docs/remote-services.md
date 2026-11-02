@@ -37,3 +37,11 @@ NPC station and solar-system data comes from static data; alliance sovereignty i
 | corpMiningLedger | GetObserverLedger | fixed | `crates/server/src/services/fixed.rs` |
 
 Corporate mining observers and structure ledger history are unsupported; their queries return empty lists. Personal mining history is unchanged.
+
+## Fleets
+
+| service | method | status | handler file |
+|---|---|---|---|
+| fleetObjectHandler | Reconnect | handled | `crates/server/src/services/fleets/fleet_object_handler.rs` |
+
+A disconnected member's fleet seat is kept for `fleets.reconnect_timeout_secs` (120 seconds by default, at most 120) so the client can rejoin automatically; seats do not survive a server restart.
