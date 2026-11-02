@@ -44,3 +44,22 @@ fn surface_offset_includes_radius() {
         assert!((actual - expected).abs() < expected * 1e-12, "{actual} != {expected}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn item_locking_dispatch_returns_empty_collections() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 1).await;
+    let kwargs = Value::Dict(vec![]);
+    let location_args = [Value::Int(1)];
+    for (method, args, expected) in [
+        ("GetItemsByLocation", &location_args[..], Value::Dict(vec![])),
+        ("GetLockedItemLocations", &[][..], Value::reduce("__builtin__.set", vec![Value::list([])], None)),
+    ] {
+        let call = Call { service: "itemLocking", method, args, kwargs: &kwargs, bound: false, bind_params: None };
+        let reply = dispatch(&mut client, &call).await.unwrap();
+        assert_eq!(reply, expected);
+        assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), expected);
+    }
+}

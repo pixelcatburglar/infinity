@@ -1,7 +1,7 @@
 //! Constant replies for unmodelled remote services.
 //! Mirrors client remote-service calls; no database or state is accessed.
 //! Stateful and argument-dependent services are handled by their feature modules;
-//! personal contact label management is unsupported.
+//! personal contact label management and corporation item lockdown votes are unsupported.
 
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
@@ -93,6 +93,10 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         }
 
         // ---- corporations ----
+        // eve/client/script/ui/services/corporation/itemLocking.py:59 caches an itemID-to-row mapping for membership checks.
+        ("itemLocking", "GetItemsByLocation") => Value::Dict(vec![]),
+        // eve/client/script/ui/services/corporation/itemLocking.py:73-77 caches and mutates the set of locations containing locked items.
+        ("itemLocking", "GetLockedItemLocations") => Value::reduce("__builtin__.set", vec![Value::list([])], None),
         ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
         // A player character's corporation, or an NPC's (agents) from the SDE.
         ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
