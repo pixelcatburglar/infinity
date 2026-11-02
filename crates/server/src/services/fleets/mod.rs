@@ -1,10 +1,9 @@
 //! Fleets (fleetObjectHandler, bound per fleet; eve/client/script/parklife/fleetSvc.py).
 //!
-//! Fleets and their preferences, invitations and advertisements live only in process memory;
-//! an empty fleet disappears and a pilot who logs off leaves. Creating one (`CreateFleet`
-//! then `Init`) makes the creator its leader, above its initial wing and squad. Members
-//! carry fleet identity in their sessions, including for fleet chat, and receive lifecycle
-//! notifications. Boosts and access to foreign fleet hangars are not supported.
+//! Fleets, reservations, preferences and advertisements live only in process memory and
+//! do not survive restart. Disconnected members retain their seats for the configured
+//! reconnect window; explicit departure and expiry remove them. Creating one (`CreateFleet`
+//! then `Init`) makes the creator its leader. Boosts and foreign hangars are unsupported.
 
 use super::{keyval, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::Client;
@@ -14,6 +13,7 @@ use marshal::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 use tracing::info;
 
 /// Client evefleet.const fleet leader role.
@@ -42,6 +42,13 @@ const FIRST_FLEET_ID: i64 = 1;
 static NEXT_ID: AtomicI64 = AtomicI64::new(FIRST_FLEET_ID);
 
 #[derive(Clone)]
+struct ReconnectState {
+    generation: u64,
+    deadline: Instant,
+    offered_session: Option<i64>,
+}
+
+#[derive(Clone)]
 struct Member {
     wing: i64,
     squad: i64,
@@ -51,6 +58,9 @@ struct Member {
     opt_outs: MemberOptOuts,
     watchlist: Vec<i64>,
     damage_updates: bool,
+    reconnect: Option<ReconnectState>,
+    active_session: Option<i64>,
+    recovered_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -68,7 +78,7 @@ impl Default for MemberOptOuts {
 
 impl Member {
     fn new(wing: i64, squad: i64, role: i64, job: i64, ship_type: i64) -> Self {
-        Self { wing, squad, role, job, ship_type, opt_outs: MemberOptOuts::default(), watchlist: Vec::new(), damage_updates: false }
+        Self { wing, squad, role, job, ship_type, opt_outs: MemberOptOuts::default(), watchlist: Vec::new(), damage_updates: false, reconnect: None, active_session: None, recovered_generation: None }
     }
 }
 
@@ -109,6 +119,7 @@ struct Wing {
 
 struct Fleet {
     creator: i64,
+    creator_session: Option<i64>,
     initialized: bool,
     options: FleetOptions,
     members: HashMap<i64, Member>,
@@ -123,7 +134,7 @@ struct Fleet {
 
 impl Fleet {
     fn new(creator: i64, wings: Vec<Wing>) -> Self {
-        Self { creator, initialized: false, options: FleetOptions::default(), members: HashMap::new(), wings, motd: String::new(), invites: HashMap::new(), max_members: MAX_MEMBERS, join_requests: HashMap::new(), advert: None }
+        Self { creator, creator_session: None, initialized: false, options: FleetOptions::default(), members: HashMap::new(), wings, motd: String::new(), invites: HashMap::new(), max_members: MAX_MEMBERS, join_requests: HashMap::new(), advert: None }
     }
 
     fn rename_structure(&mut self, id: i64, name: &str, wing: bool) -> bool {
@@ -142,31 +153,47 @@ struct State {
     fleets: HashMap<i64, Fleet>,
     /// Pilot -> fleet.
     of: HashMap<i64, i64>,
+    generation: u64,
 }
 
 impl State {
     fn can_create(&self, char_id: i64) -> bool {
-        !self.of.contains_key(&char_id) && !self.fleets.values().any(|f| f.creator == char_id && !f.initialized)
+        self.of.get(&char_id).is_none_or(|&id| self.has_member(id, char_id) && !self.is_member(id, char_id)) && !self.fleets.values().any(|f| f.creator == char_id && !f.initialized)
     }
 
-    fn clear_departing(&mut self, char_id: i64) {
+    fn clear_pending(&mut self, char_id: i64) {
         self.fleets.retain(|_, f| f.initialized || f.creator != char_id);
-        for fleet in self.fleets.values_mut() { fleet.invites.remove(&char_id); }
-        self.clear_member_references(char_id);
+        for fleet in self.fleets.values_mut() {
+            fleet.invites.remove(&char_id);
+            fleet.join_requests.remove(&char_id);
+        }
+    }
+
+    fn clear_disconnected_pending(&mut self, char_id: i64, sid: i64) {
+        // A replacement connection owns its shell; an older cleanup cannot remove it.
+        self.fleets.retain(|_, f| f.initialized || f.creator != char_id || f.creator_session.is_some_and(|owner| owner != sid));
+        for fleet in self.fleets.values_mut() {
+            fleet.invites.remove(&char_id);
+            fleet.join_requests.remove(&char_id);
+        }
     }
 
     fn clear_member_references(&mut self, char_id: i64) {
         for fleet in self.fleets.values_mut() {
-            fleet.join_requests.remove(&char_id);
             for member in fleet.members.values_mut() {
                 member.watchlist.retain(|&id| id != char_id);
             }
         }
     }
 
-    fn is_member(&self, fleet_id: i64, char_id: i64) -> bool {
+    fn has_member(&self, fleet_id: i64, char_id: i64) -> bool {
         self.of.get(&char_id) == Some(&fleet_id)
             && self.fleets.get(&fleet_id).is_some_and(|fleet| fleet.members.contains_key(&char_id))
+    }
+
+    fn is_member(&self, fleet_id: i64, char_id: i64) -> bool {
+        self.has_member(fleet_id, char_id)
+            && self.fleets[&fleet_id].members[&char_id].reconnect.is_none()
     }
 
     fn initialize(&mut self, fleet_id: i64, char_id: i64, ship_type: i64) -> Option<Member> {
@@ -175,6 +202,7 @@ impl State {
         if fleet.creator != char_id || fleet.initialized { return None; }
         let member = Member::new(NONE_ID, NONE_ID, ROLE_LEADER, JOB_CREATOR, ship_type);
         fleet.initialized = true;
+        fleet.creator_session = None;
         fleet.members.insert(char_id, member.clone());
         self.of.insert(char_id, fleet_id);
         Some(member)
@@ -188,7 +216,7 @@ fn state() -> MutexGuard<'static, State> {
 
 pub(crate) fn same_fleet(a: i64, b: i64) -> bool {
     let state = state();
-    state.of.get(&a).is_some_and(|fleet| state.of.get(&b) == Some(fleet))
+    state.of.get(&a).is_some_and(|&fleet| state.is_member(fleet, a) && state.is_member(fleet, b))
 }
 
 fn next_id() -> i64 {
@@ -221,8 +249,10 @@ fn wings_value(f: &Fleet) -> Value {
 
 /// Tell everyone in the fleet (but `except`).
 fn broadcast(world: &World, f: &Fleet, except: Option<i64>, event: &str, args: Vec<Value>) {
-    for ch in f.members.keys().filter(|ch| Some(**ch) != except) {
-        world.notify_pilot(*ch, event, args.clone());
+    for (ch, member) in &f.members {
+        if Some(*ch) != except && member.reconnect.is_none() {
+            world.notify_pilot(*ch, event, args.clone());
+        }
     }
 }
 
@@ -240,37 +270,6 @@ fn session_pairs(fleet: Option<i64>, m: Option<&Member>) -> Vec<Value> {
 /// The fleet a bound call is for.
 fn bound_fleet(call: &Call<'_>) -> i64 {
     call.bind_params.and_then(|p| p.as_int().or_else(|| p.items().and_then(|t| t.first()?.as_int()))).unwrap_or(0)
-}
-
-/// Remove a member (leaving, kicked or logged off); an empty fleet goes away and a
-/// leaderless one passes the lead on.
-fn remove_member_from(st: &mut State, world: &World, fleet_id: i64, char_id: i64) {
-    if !st.is_member(fleet_id, char_id) { return; }
-    st.clear_member_references(char_id);
-    st.of.remove(&char_id);
-    let Some(f) = st.fleets.get_mut(&fleet_id) else { return };
-    let Some(old) = f.members.remove(&char_id) else { return };
-    world.notify_pilot(char_id, "__session", session_pairs(None, None));
-    world.notify_pilot(char_id, "OnFleetLeave", vec![Value::Int(char_id)]);
-    broadcast(world, f, None, "OnFleetLeave", vec![Value::Int(char_id)]);
-    if f.members.is_empty() {
-        st.fleets.remove(&fleet_id);
-        info!("fleets: {fleet_id} disbanded");
-        return;
-    }
-    if old.role == ROLE_LEADER {
-        if let Some((&next, m)) = f.members.iter_mut().next() {
-            let before = m.clone();
-            m.role = ROLE_LEADER;
-            m.job |= JOB_CREATOR;
-            m.wing = NONE_ID;
-            m.squad = NONE_ID;
-            let after = m.clone();
-            world.notify_pilot(next, "__session", session_pairs(Some(fleet_id), Some(&after)));
-            broadcast(world, f, None, "OnFleetMemberChanged", changed(next, fleet_id, &before, &after, false));
-            fleet_proxy::leader_changed(world, f, next);
-        }
-    }
 }
 
 fn changed(char_id: i64, fleet_id: i64, before: &Member, after: &Member, only: bool) -> Vec<Value> {
@@ -291,15 +290,6 @@ fn changed(char_id: i64, fleet_id: i64, before: &Member, after: &Member, only: b
     ]
 }
 
-/// A pilot logged off: they leave their fleet.
-pub fn logged_off(world: &World, char_id: i64) {
-    let mut st = state();
-    st.clear_departing(char_id);
-    if let Some(f) = st.of.get(&char_id).copied() {
-        remove_member_from(&mut st, world, f, char_id);
-    }
-}
-
 fn is_leader(f: &Fleet, char_id: i64) -> bool {
     f.members.get(&char_id).is_some_and(|m| m.role == ROLE_LEADER)
 }
@@ -310,6 +300,7 @@ pub(crate) mod damage;
 mod fleet_mgr;
 mod fleet_object_handler;
 mod fleet_proxy;
+pub(crate) mod lifecycle;
 pub(super) mod warp;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

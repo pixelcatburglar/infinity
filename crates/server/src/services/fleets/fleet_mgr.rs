@@ -31,7 +31,7 @@ pub(super) fn update_watchlist(st: &mut State, me: i64, method: &str, args: &[Va
             Some(value) => Some(ids(value).ok_or_else(invalid)?),
         }
     };
-    if requested.iter().chain(full.iter().flatten()).any(|&id| id == me || !st.is_member(fleet_id, id)) { return Err(invalid()); }
+    if requested.iter().chain(full.iter().flatten()).any(|&id| id == me || !st.has_member(fleet_id, id)) { return Err(invalid()); }
     let member = st.fleets.get_mut(&fleet_id).and_then(|f| f.members.get_mut(&me)).ok_or_else(invalid)?;
     let mut next = member.watchlist.clone();
     let mut added = Vec::new();
@@ -60,7 +60,8 @@ pub(super) fn update_watchlist(st: &mut State, me: i64, method: &str, args: &[Va
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.method {
         "ForceLeaveFleet" => {
-            logged_off(&c.world, c.session.int("charid").unwrap_or(0));
+            lifecycle::leave(&c.world, c.session.int("charid").unwrap_or(0));
+            set_own_session(c, &session_pairs(None, None));
             Some(Ok(Value::None))
         }
         "AddToWatchlist" | "RemoveFromWatchlist" | "RegisterForDamageUpdates" => {

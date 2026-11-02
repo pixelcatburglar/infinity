@@ -67,7 +67,6 @@ mod universe;
 pub(crate) mod wallets;
 pub(crate) mod wars;
 
-pub use fleets::logged_off as fleet_logged_off;
 pub(crate) use combat::recover_pending_reloads;
 pub use exploration::unbury_sites;
 

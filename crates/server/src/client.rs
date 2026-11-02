@@ -275,6 +275,10 @@ impl Client {
     /// The character leaves the game (disconnect, or logging off to character selection):
     /// out of its ballpark, and its ship out of space with its position remembered.
     pub async fn leave_world(&mut self) -> Result<()> {
+        if let Some(char_id) = self.session.int("charid") {
+            services::fleets::lifecycle::disconnect(&self.world, char_id, self.session.sid);
+            self.change_session(vec![("fleetid", Value::None), ("wingid", Value::None), ("squadid", Value::None), ("fleetrole", Value::None)]);
+        }
         services::combat::reset(self);
         let mut failure = None;
         if let Some(ship) = self.session.int("shipid") {
@@ -310,7 +314,6 @@ impl Client {
         }
         self.world.unobserve(self.login.client_id);
         if let Some(char_id) = self.session.int("charid") {
-            services::fleet_logged_off(&self.world, char_id);
             services::drones::settings::logged_off(char_id);
             self.world.unregister_pilot(char_id);
             self.chat.disconnect_character(char_id);

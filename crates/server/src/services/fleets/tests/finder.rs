@@ -68,6 +68,9 @@ fn stale_leader_withdrawal_and_capacity_refuse_snapshot() {
     f.members.insert(1, Member::new(NONE_ID, NONE_ID, ROLE_LEADER, JOB_NONE, 0));
     f.advert = Some(ad.clone());
     assert!(capacity(&f, &ad));
+    f.members.get_mut(&1).unwrap().reconnect = Some(ReconnectState { generation: 1, deadline: Instant::now(), offered_session: None });
+    assert!(!still_current(&f, 1, 1, &ad));
+    f.members.get_mut(&1).unwrap().reconnect = None;
     assert!(still_current(&f, 1, 1, &ad));
     f.members.insert(2, Member::new(1, 1, ROLE_MEMBER, JOB_NONE, 0));
     assert!(!capacity(&f, &ad));

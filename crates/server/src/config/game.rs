@@ -92,6 +92,8 @@ pub struct GameConfig {
     pub salvage: SalvageConfig,
     /// Exploration policy.
     pub exploration: world::ExplorationConfig,
+    /// Fleet seat retention policy.
+    pub fleets: social::FleetsConfig,
     /// Corporations policy.
     pub corporations: social::CorporationsConfig,
     /// Contracts policy.
@@ -127,6 +129,7 @@ impl GameConfig {
         self.mining.validate()?;
         self.salvage.validate()?;
         self.exploration.validate()?;
+        self.fleets.validate()?;
         self.corporations.validate()?;
         self.contracts.validate()?;
         self.clones.validate()?;

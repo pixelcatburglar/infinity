@@ -3,6 +3,8 @@ use super::*;
 mod broadcasts;
 mod finder;
 mod watchlist;
+mod reconnect;
+mod reconnect_protocol;
 
 #[test]
 fn initialization_requires_creator_and_is_single_use() {
@@ -62,7 +64,7 @@ fn departing_member_references_are_removed_across_fleets() {
     }
     state.clear_member_references(7);
     for fleet in state.fleets.values() {
-        assert!(!fleet.join_requests.contains_key(&7));
+        assert!(fleet.join_requests.contains_key(&7));
         assert!(fleet.join_requests.contains_key(&8));
         assert_eq!(fleet.members.values().next().unwrap().watchlist, vec![8]);
     }
@@ -79,7 +81,7 @@ fn creation_and_departure_clean_uninitialized_and_pending_state() {
     other.invites.insert(1, (0, 0, ROLE_MEMBER));
     other.join_requests.insert(1, Value::None);
     st.fleets.insert(20, other);
-    st.clear_departing(1);
+    st.clear_pending(1);
     assert!(st.can_create(1));
     assert!(!st.fleets.contains_key(&10));
     assert!(!st.fleets[&20].invites.contains_key(&1));

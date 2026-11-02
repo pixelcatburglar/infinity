@@ -73,6 +73,33 @@ fn trade_timeout_is_parsed_and_must_be_positive() {
 }
 
 #[test]
+fn fleet_reconnect_policy_defaults_boundaries_and_snapshot() {
+    let fixture = Fixture::new();
+    fixture.write("");
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!(defaults.fleets.reconnect_timeout_secs, 120);
+    for value in [1, 120] {
+        fixture.write(&format!("[fleets]\nreconnect_timeout_secs = {value}"));
+        let config = Config::load_with(&fixture.path(), |_| None).unwrap();
+        assert_eq!(config.fleets.reconnect_timeout_secs, value);
+        assert_eq!(config.game_config().fleets.reconnect_timeout_secs, value);
+    }
+    fixture.write("[fleets]\nreconnect_timeout_secs = 42");
+    let custom = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!(custom.game_config().fleets.reconnect_timeout_secs, 42);
+    let mut expected = defaults.clone();
+    expected.fleets.reconnect_timeout_secs = 42;
+    assert!(custom == expected);
+    assert!(custom != defaults);
+    for value in [0, 121] {
+        let error = load_error(&format!("[fleets]\nreconnect_timeout_secs = {value}"));
+        assert!(error.contains("fleets.reconnect_timeout_secs"), "{error}");
+        assert!(error.contains("client stops reconnecting after two minutes"), "{error}");
+    }
+    assert!(load_error("[fleets]\nunknown = 1").contains("unknown"));
+}
+
+#[test]
 fn map_policy_defaults_custom_bounds_and_overflow() {
     let fixture = Fixture::new();
     fixture.write("");

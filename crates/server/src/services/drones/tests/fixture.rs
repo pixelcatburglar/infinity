@@ -123,7 +123,7 @@ impl Fixture {
 
     pub(in crate::services) async fn cleanup(self) {
         let owners: Vec<i64> = self.db.query("SELECT character_id FROM game.characters WHERE user_id=$1", &[&self.account]).await.unwrap().iter().map(|row| row.get("character_id")).collect();
-        for &owner in &owners { crate::services::fleet_logged_off(&self.world, owner); }
+        for &owner in &owners { crate::services::fleets::lifecycle::leave(&self.world, owner); }
         let ids: Vec<i64> = self.world.with(self.system, |s| s.balls().map(|b| b.id).collect()).await.unwrap();
         for id in ids { self.world.remove_ball(self.system, id).await; crate::services::combat::forget_gm_spawn(&self.world, id); crate::services::combat::forget_ship(id); }
         crate::services::combat::reset(&self.client);

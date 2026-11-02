@@ -44,6 +44,19 @@ fn current_topology_and_consent_fence_snapshot() {
     assert!(!current(&st, &order, 4, position));
 }
 
+#[test]
+fn reservations_remove_warp_authority_and_commit_consent() {
+    let mut st = setup();
+    let order = snapshot(&st, 3, 103).unwrap();
+    let position = order.members.iter().find(|(id, _)| *id == 4).unwrap().1;
+    let reservation = ReconnectState { generation: 1, deadline: Instant::now(), offered_session: None };
+    st.fleets.get_mut(&100).unwrap().members.get_mut(&4).unwrap().reconnect = Some(reservation.clone());
+    assert!(!ids(&snapshot(&st, 3, 103).unwrap()).contains(&4));
+    assert!(!current(&st, &order, 4, position));
+    st.fleets.get_mut(&100).unwrap().members.get_mut(&3).unwrap().reconnect = Some(reservation);
+    assert!(snapshot(&st, 3, 103).is_none());
+}
+
 fn ball(id: i64, pilot: i64) -> space::Ball {
     space::Ball {
         id, type_id: 1, owner_id: pilot, corp_id: 1, alliance_id: -1,
