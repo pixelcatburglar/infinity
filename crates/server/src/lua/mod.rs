@@ -1,12 +1,13 @@
-//! Sandboxed Lua RPC, intercept, command and post-commit event extensions.
+//! Sandboxed Lua RPC, intercept, command, post-commit event and periodic extensions.
 //! Scripts use client, world and DAO facades and a typed persistent store.
-//! Events carry scalar facts without a client context or synchronous reply.
+//! Events and process-local ticks carry no client context or synchronous reply.
 
 pub mod host;
 pub mod events;
 pub mod value;
 mod registry;
 mod reload;
+mod runner;
 mod vm;
 
 use std::{future::Future, sync::{OnceLock, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
@@ -26,15 +27,10 @@ pub async fn start(config: &Config, db: &Db, sde: &Arc<Sde>, world: &Arc<World>)
     let resources = host::Resources { db: db.clone(), sde: sde.clone(), world: world.clone(), store_value_limit_bytes: config.lua.store_value_limit_bytes };
     let host = reload::Host::new(config.lua.clone(), resources).await?;
     HOST.set(host).map_err(|_| anyhow::anyhow!("Lua host already initialized"))?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     EVENTS.set(tx).map_err(|_| anyhow::anyhow!("Lua event runner already initialized"))?;
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let host = HOST.get().expect("initialized Lua host");
-            let registry = host.snapshot();
-            invoke_event(&registry, &host.config, &event).await;
-        }
-    });
+    let host = HOST.get().expect("initialized Lua host");
+    tokio::spawn(runner::run(host.config.clone(), host.subscribe(), rx));
     ENABLED.store(true, Ordering::Release);
     Ok(())
 }
@@ -119,7 +115,8 @@ pub async fn command(c: &mut Client, name: &str, args: &[String]) -> Option<Resu
                 entries.extend(registry.claims.commands.iter().map(|(name, cmd)| format!("{}: /{}", cmd.handler.script, name)));
                 entries.extend(registry.claims.intercepts.iter().map(|((svc, method), h)| format!("{}: intercept {}::{}", h.script, svc, method)));
                 entries.extend(registry.claims.events.iter().flat_map(|(event, handlers)| handlers.iter().map(move |h| format!("{}: event {}", h.script, event))));
-                entries.extend(registry.claims.scripts.iter().map(|name| format!("script: {name}")));
+                entries.extend(registry.claims.ticks.iter().map(|tick| format!("{}: tick {} interval_ms={} skipped={}", tick.handler.script, tick.name, tick.interval.as_millis(), tick.skipped.load(Ordering::Relaxed))));
+                entries.extend(registry.claims.scripts.iter().map(|name| format!("script: {name} root={}", registry.claims.script_roots[name].display())));
                 entries.sort();
                 entries.push(format!("memory={} MiB, time={} ms, instructions={}, interval={}", host.config.memory_limit_mb, host.config.call_budget_ms, host.config.call_budget_instructions, host.config.instruction_hook_interval));
                 Ok(crate::messages::gm::lua_list(&entries.join("\n")))
@@ -162,26 +159,30 @@ impl Drop for HookGuard {
 async fn invoke_event(registry: &Registry, config: &crate::config::lua::LuaConfig, event: &events::GameEvent) {
     let Some(handlers) = registry.claims.events.get(event.kind()) else { return };
     for handler in handlers {
-        let future = async {
-            let deadline = Instant::now() + Duration::from_millis(config.call_budget_ms);
-            let invocation = vm::budgeted_invocation(&registry.lua, handler.function.clone(), config, deadline)?;
-            let payload = event.to_lua(&registry.lua)?;
-            let call = invocation.function.call_async::<()>(payload);
-            tokio::pin!(call);
-            let _guard = HookGuard(invocation.hook_thread);
-            tokio::select! {
-                biased;
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(mlua::Error::runtime("Lua execution budget exceeded")),
-                result = &mut call => result,
-            }
-        };
-        let mut future = std::pin::pin!(future);
-        let result = std::future::poll_fn(|cx| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-            Ok(result) => result,
-            Err(_) => std::task::Poll::Ready(Err(mlua::Error::runtime("Lua runtime panic"))),
-        }).await;
+        let result = invoke_no_context(registry, config, handler, event.to_lua(&registry.lua).map(mlua::Value::Table)).await;
         if let Err(error) = result { tracing::warn!(script = %handler.script, event = event.kind(), "Lua event handler failed: {error}"); }
     }
+}
+
+async fn invoke_no_context(registry: &Registry, config: &crate::config::lua::LuaConfig, handler: &Handler, argument: mlua::Result<mlua::Value>) -> mlua::Result<()> {
+    let future = async {
+        let deadline = Instant::now() + Duration::from_millis(config.call_budget_ms);
+        let timeout = tokio::time::Instant::now() + Duration::from_millis(config.call_budget_ms);
+        let invocation = vm::budgeted_invocation(&registry.lua, handler.function.clone(), config, deadline)?;
+        let call = invocation.function.call_async::<()>(argument?);
+        tokio::pin!(call);
+        let _guard = HookGuard(invocation.hook_thread);
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(timeout) => Err(vm::budget_exceeded()),
+            result = &mut call => result,
+        }
+    };
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+        Ok(result) => result,
+        Err(_) => std::task::Poll::Ready(Err(mlua::Error::runtime("Lua runtime panic"))),
+    }).await
 }
 
 #[cfg(test)]

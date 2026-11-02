@@ -1,19 +1,37 @@
 //! Builds a generation in an isolated Lua 5.4 VM. Scripts use separate globals,
-//! text-only modules under the configured root and invocation-local budgets.
+//! text-only modules under each configured root and invocation-local budgets.
 //! Native modules, binary chunks and script-created coroutines are not supported.
 
 use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
 use anyhow::{Context, Result};
 use mlua::{chunk::ChunkMode, Function, HookTriggers, Lua, Table, Thread, VmState};
 use crate::config::lua::LuaConfig;
-use super::{host, registry::{Claims, Command, Handler, Registry}, value};
+use super::{host, registry::{Claims, Command, Handler, Registry, Tick}, value};
+
+/// The space actor loop cadence is 100 ms (space/actor.rs).
+const MIN_TICK_INTERVAL_MS: u64 = 100;
+#[derive(Debug)]
+struct BudgetExceeded;
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Lua execution budget exceeded")
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
+pub(super) fn budget_exceeded() -> mlua::Error {
+    mlua::Error::external(BudgetExceeded)
+}
+
 
 fn install_budget(thread: &Thread, maximum: u64, interval: u64, deadline: Instant) -> mlua::Result<()> {
     let count = AtomicU64::new(0);
     thread.set_hook(HookTriggers::new().every_nth_instruction(interval as u32), move |_, _| {
         let instructions = count.fetch_add(interval, Ordering::Relaxed).saturating_add(interval);
         if instructions >= maximum || Instant::now() >= deadline {
-            return Err(mlua::Error::runtime("Lua execution budget exceeded"));
+            return Err(budget_exceeded());
         }
         Ok(VmState::Continue)
     })
@@ -60,6 +78,36 @@ fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
         if name == "string" { copy.set("dump", mlua::Value::Nil)?; }
         env.set(name, copy)?;
     }
+    let is_budget = lua.create_function(|_, value: mlua::Value| {
+        Ok(matches!(value, mlua::Value::Error(error) if error.downcast_ref::<BudgetExceeded>().is_some()))
+    })?;
+    let factory: Function = lua.load(r#"
+        return function(pcall, xpcall, pack, unpack, raise, is_budget, kind)
+            local function finish(...)
+                local results = pack(...)
+                if not results[1] and is_budget(results[2]) then raise(results[2], 0) end
+                return unpack(results, 1, results.n)
+            end
+            return function(f, ...) return finish(pcall(f, ...)) end,
+                function(f, handler, ...)
+                    if kind(handler) ~= "function" then return xpcall(f, handler, ...) end
+                    return finish(xpcall(f, function(err)
+                        if is_budget(err) then return err end
+                        local ok, result = pcall(handler, err)
+                        if ok or is_budget(result) then return result end
+                        raise(result, 0)
+                    end, ...))
+                end
+        end
+    "#).eval()?;
+    let table: Table = globals.get("table")?;
+    let (pcall, xpcall): (Function, Function) = factory.call((
+        globals.get::<Function>("pcall")?, globals.get::<Function>("xpcall")?,
+        table.get::<Function>("pack")?, table.get::<Function>("unpack")?,
+        globals.get::<Function>("error")?, is_budget, globals.get::<Function>("type")?,
+    ))?;
+    env.set("pcall", pcall)?;
+    env.set("xpcall", xpcall)?;
     let os: Table = globals.get("os")?;
     let safe_os = lua.create_table()?;
     for name in ["time", "clock", "date", "difftime"] { safe_os.set(name, os.get::<mlua::Value>(name)?)?; }
@@ -139,6 +187,32 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
         claims.commands.insert(name, command);
         Ok(())
     })?)?;
+    let tick_claims = claims.clone();
+    let tick_script = script.clone();
+    let tick_open = open.clone();
+    register.set("tick", lua.create_function(move |_, spec: Table| {
+        if !tick_open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
+        let name = match spec.get::<mlua::Value>("name")? {
+            mlua::Value::String(name) => name.to_str()?.to_owned(),
+            _ => return Err(mlua::Error::runtime("tick name must be a string")),
+        };
+        if name.is_empty() { return Err(mlua::Error::runtime("tick name must not be empty")); }
+        let milliseconds = match spec.get::<mlua::Value>("interval_ms")? {
+            mlua::Value::Integer(value) if value >= MIN_TICK_INTERVAL_MS as i64 => value as u64,
+            _ => return Err(mlua::Error::runtime(format!("tick interval_ms must be an integer of at least {MIN_TICK_INTERVAL_MS}"))),
+        };
+        let interval = Duration::from_millis(milliseconds);
+        if Instant::now().checked_add(interval).is_none() || tokio::time::Instant::now().checked_add(interval).is_none() {
+            return Err(mlua::Error::runtime("tick interval exceeds timer range"));
+        }
+        let function: Function = spec.get("fn")?;
+        let mut claims = tick_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        if claims.ticks.iter().any(|tick| tick.handler.script == tick_script && tick.name == name) {
+            return Err(mlua::Error::runtime(format!("duplicate tick {name} in {tick_script}")));
+        }
+        claims.ticks.push(Tick { handler: Handler { script: tick_script.clone(), function }, name, interval, skipped: AtomicU64::new(0) });
+        Ok(())
+    })?)?;
     register.set("event", lua.create_function(move |_, (name, function): (String, Function)| {
         if !open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
         if !super::events::known_kind(&name) { return Err(mlua::Error::runtime(format!("unsupported event {name}"))); }
@@ -148,19 +222,34 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
     env.set("register", register)
 }
 
+fn discover(config: &LuaConfig) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf, String)>> {
+    let mut scripts = Vec::new();
+    let mut names = std::collections::HashMap::new();
+    for dir in std::iter::once(&config.scripts_dir).chain(config.mod_dirs.iter()) {
+        let root = Path::new(dir).canonicalize().context("canonicalizing Lua scripts directory")?;
+        let mut paths = std::fs::read_dir(&root)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
+        paths.sort();
+        for path in paths {
+            if path.extension().is_none_or(|e| e != "lua") { continue; }
+            let path = path.canonicalize()?;
+            anyhow::ensure!(path.starts_with(&root), "Lua script escapes scripts directory");
+            let script = path.file_stem().and_then(|s| s.to_str()).context("invalid Lua script name")?.to_owned();
+            anyhow::ensure!(!script.is_empty() && script.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'), "invalid Lua script name {script}");
+            if let Some(previous) = names.insert(script.clone(), path.clone()) {
+                anyhow::bail!("duplicate Lua script {script}: {} and {}", previous.display(), path.display());
+            }
+            scripts.push((root.clone(), path, script));
+        }
+    }
+    Ok(scripts)
+}
+
 pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry> {
-    let root = Path::new(&config.scripts_dir).canonicalize().context("canonicalizing Lua scripts directory")?;
+    let scripts = discover(config)?;
     let lua = Lua::new();
     lua.set_memory_limit(config.memory_limit_mb * 1024 * 1024)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
-    let mut paths = std::fs::read_dir(&root)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
-    paths.sort();
-    for path in paths {
-        if path.extension().is_none_or(|e| e != "lua") { continue; }
-        let path = path.canonicalize()?;
-        anyhow::ensure!(path.starts_with(&root), "Lua script escapes scripts directory");
-        let script = path.file_stem().and_then(|s| s.to_str()).context("invalid Lua script name")?.to_owned();
-        anyhow::ensure!(!script.is_empty() && script.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'), "invalid Lua script name {script}");
+    for (root, path, script) in scripts {
         let env = environment(&lua, &root)?;
         value::register(&lua, &env)?;
         let settings = config.scripts.get(&script).cloned().unwrap_or_default();
@@ -178,6 +267,7 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
         open.store(false, Ordering::Release);
         result.with_context(|| format!("loading script {script}"))?;
         env.set("register", mlua::Value::Nil)?;
+        claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?.script_roots.insert(script.clone(), root);
         claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?.scripts.push(script);
     }
     let claims = std::mem::take(&mut *claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?);
@@ -193,6 +283,9 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
     }
     for (event, handlers) in &claims.events {
         for handler in handlers { tracing::info!(script = %handler.script, event, "Lua event claim"); }
+    }
+    for tick in &claims.ticks {
+        tracing::info!(script = %tick.handler.script, name = %tick.name, interval_ms = tick.interval.as_millis(), "Lua tick claim");
     }
     Ok(Registry { lua, claims, overrides: Mutex::new(Default::default()) })
 }

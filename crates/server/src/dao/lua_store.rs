@@ -8,6 +8,22 @@ pub(crate) async fn get(ex: &(impl Executor + ?Sized), script: &str, key: &str) 
     Ok(ex.query_opt("SELECT value::text AS value FROM game.lua_store WHERE script = $1 AND key = $2", &[&script, &key]).await?.map(|row| row.get("value")))
 }
 
+pub(crate) struct StoreRow {
+    pub key: String,
+    pub value: String,
+}
+
+impl StoreRow {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self { key: row.get("key"), value: row.get("value") }
+    }
+}
+
+pub(crate) async fn get_many(ex: &(impl Executor + ?Sized), script: &str, keys: &[String]) -> Result<Vec<StoreRow>, db::Error> {
+    Ok(ex.query("SELECT key, value::text AS value FROM game.lua_store WHERE script = $1 AND key = ANY($2)", &[&script, &keys]).await?
+        .into_iter().map(|row| StoreRow::from_row(&row)).collect())
+}
+
 pub(crate) async fn set(ex: &(impl Executor + ?Sized), script: &str, key: &str, value: &str) -> Result<(), db::Error> {
     ex.execute("INSERT INTO game.lua_store (script, key, value) VALUES ($1, $2, $3::text::jsonb) ON CONFLICT (script, key) DO UPDATE SET value = EXCLUDED.value", &[&script, &key, &value]).await?;
     Ok(())

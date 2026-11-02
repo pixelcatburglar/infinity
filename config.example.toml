@@ -70,6 +70,7 @@ drain_secs = 10                     # bounded shutdown drain
 [lua]
 enabled = true                      # Load Lua scripts; false disables the VM.
 scripts_dir = "crates/server/lua"   # Directory containing the Lua scripts.
+mod_dirs = []                       # Additional independent Lua script roots.
 memory_limit_mb = 64                # Maximum memory for the Lua VM, in MiB.
 call_budget_ms = 50                 # Maximum wall-clock time per call.
 call_budget_instructions = 5000000  # Maximum Lua instructions per call.

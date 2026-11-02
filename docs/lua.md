@@ -1,12 +1,38 @@
 # Lua extensions
 
-The server loads `.lua` files from `lua.scripts_dir` at startup. The default is
-`crates/server/lua`, relative to the server working directory. Set `[lua] enabled
-= false` to disable Lua entirely. Only trusted operators should install scripts:
+The server loads top-level `.lua` files from `lua.scripts_dir` at startup. The
+default is `crates/server/lua`, relative to the server working directory.
+`[lua].mod_dirs` defaults to `[]` and adds independent script roots; entries
+must not be empty. The primary root is loaded first, followed by the configured
+roots, with top-level files sorted within each root. Each root uses the same
+loading rules: subdirectories can contain text modules for `require`, but are
+not loaded as scripts. `require` is confined to the canonical root of the
+calling script and cannot resolve modules from another root.
+
+Script names are file stems and must be unique across all roots. Duplicate names
+fail startup or reload, reporting both source paths. Settings and persistent
+store namespaces remain keyed by script name, not by root. Set `[lua] enabled =
+false` to disable Lua entirely. Only trusted operators should install scripts:
 they can call the exposed game APIs. Each file gets its own global environment,
-configuration table and persistent store. `require` only resolves text modules
-inside the canonical scripts directory. Native libraries, `io`, `debug`, binary
-chunks and unrestricted operating-system access are unavailable.
+configuration table and persistent store. Native libraries, `io`, `debug`,
+binary chunks, script-created coroutines and unrestricted operating-system
+access are unavailable.
+
+The available base globals include `assert`, `error`, `ipairs`, `next`, `pairs`,
+`pcall`, `xpcall`, `select`, `tonumber`, `tostring`, `type`, `rawequal`,
+`rawget`, `rawlen`, `rawset`, `setmetatable`, `_VERSION` and `_G`. The
+`math`, `string` (without `dump`), `table` and `utf8` libraries are available;
+`os` exposes only `time`, `clock`, `date` and `difftime`.
+`collectgarbage` permits only `"count"`. Modules use the same environment.
+
+`pcall` and `xpcall` preserve ordinary Lua protected-call behavior, including
+multiple return values and `xpcall`'s error handler, and support asynchronous
+host calls. Typed instruction and time execution-budget failures are rethrown:
+they cannot be caught by either function, and an `xpcall` handler cannot
+intercept them. `require` also propagates these failures. Ordinary allocator
+memory-limit errors may be caught with normal Lua semantics, but the memory cap
+remains enforced for subsequent allocations. These protected calls do not
+expose coroutine, native-library or additional operating-system access.
 
 ## Registration
 
@@ -27,6 +53,13 @@ register.intercept("exampleSvc", "RestrictedMethod", function(ctx, args, kwargs)
     end
     return true
 end)
+register.tick{
+    name = "maintenance",
+    interval_ms = 100,
+    fn = function(now_ms)
+        log.debug("Tick at " .. now_ms)
+    end,
+}
 ```
 
 RPC handlers receive the invocation context and typed tuple/dictionary wire
@@ -111,6 +144,29 @@ The event queue is best-effort and process-local, not durable across a restart.
 Each event snapshots the registry when processing starts, retaining that generation
 for all its handlers even if a reload occurs.
 
+## Periodic ticks
+
+`register.tick` registers a process-local periodic handler while the top-level
+script loads. Its nonempty `name` must be unique within that script, and
+`interval_ms` must be an integer of at least 100 ms. The first invocation occurs
+after one interval, not immediately. The callback receives Unix time in
+milliseconds as `now_ms`; it receives no `ctx`, so context-dependent mutators
+are unavailable.
+
+Ticks are not durable and do not survive a process restart. The runner executes
+events and ticks sequentially, with the existing independent instruction and
+time budgets for each invocation. Missed intervals are skipped rather than
+queued or replayed; skip batches are warned and their counts appear in
+`/lua list`. Split work that exceeds the budget into bounded chunks, keeping a
+cursor between invocations; persist the cursor in `store` if it must survive
+restarts.
+
+On a successful reload, the runner adopts the replacement generation, retires
+the old schedules and starts the new schedules. An already-running invocation
+may finish within its existing budget; after the runner adopts the replacement,
+no old tick callback starts. A failed reload leaves the current generation and
+its schedules intact.
+
 ## Wire values and context
 
 Construct wire values with `eve.none`, `eve.int(n)`, `eve.float(n)`,
@@ -135,10 +191,21 @@ finishes or is cancelled and must never be stored for later use.
 
 ## Persistence and configuration
 
-`store.get(key)`, `store.set(key, value)`, `store.delete(key)` and
-`store.keys(prefix)` operate only on the current script's keys. Values may be
-booleans, finite numbers, UTF-8 strings, nested string-keyed tables or contiguous
-1-based arrays. Nil is not a stored value. Mixed or sparse keys, cycles, functions,
+`store.get(key)`, `store.get_many(keys)`, `store.set(key, value)`,
+`store.delete(key)` and `store.keys(prefix)` operate only on the current
+script's keys. `store.get_many` takes a dense 1-based array of string keys and
+returns a key-to-typed-value table in the same namespace as `store.get`.
+Missing keys are absent from the table (indexing them returns nil). The read
+uses one database statement, including for an empty array; decoding, size
+limits and errors match `store.get`. For example:
+
+```lua
+local values = store.get_many({"cursor", "enabled"})
+local cursor = values["cursor"] -- nil if absent
+```
+
+Values may be booleans, finite numbers, UTF-8 strings, nested string-keyed
+tables or contiguous 1-based arrays. Nil is not a stored value. Mixed or sparse keys, cycles, functions,
 userdata and non-finite numbers are rejected. An empty Lua table is stored as an
 object. Nesting is limited to 64 levels; the encoded value cannot exceed
 `lua.store_value_limit_bytes` (default 65536). Keys are returned in sorted order.
@@ -228,10 +295,12 @@ reported, and the script is not resumed after its deadline.
 Defaults are 64 MiB VM memory, 50 ms and 5,000,000 instructions per call, with
 an instruction hook every 1000 instructions. Configure these with
 `memory_limit_mb`, `call_budget_ms`, `call_budget_instructions` and
-`instruction_hook_interval` under `[lua]`. `/lua list` shows RPC and command
-claims, events, intercepts and limits; `/lua reload` builds a fresh registry and
-swaps it only on success. In-flight handlers retain their old registry; Lua
-globals reset, but stored values survive. The shipped `/motd` command is GM-only:
+`instruction_hook_interval` under `[lua]`. `/lua list` shows each script's
+canonical root, RPC and command claims, events, intercepts, ticks with their
+intervals and skip counts, and limits; `/lua reload` builds a fresh registry and
+swaps it only on success. In-flight
+handlers retain their old registry; Lua globals reset, but stored values survive.
+The shipped `/motd` command is GM-only:
 `/motd set <text>` saves a message and `/motd` reads it. `CharacterSelected`
 sends the saved message to the registered pilot on both docked and space logins.
 
