@@ -39,6 +39,7 @@ pub(crate) mod npe;
 pub(crate) mod offices;
 pub(crate) mod orgs;
 pub(crate) mod sde;
+pub(crate) mod shared_settings;
 pub(crate) mod skills;
 pub(crate) mod slash;
 pub(crate) mod store;

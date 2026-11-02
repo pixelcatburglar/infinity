@@ -62,3 +62,12 @@ The callback receives a fixed `None` reply only to complete the call; it does no
 
 Authorized GMs can advance outstanding deadlines. Auctions with bids settle normally;
 other contracts retain their escrow for issuer reclamation.
+
+## Shared settings
+
+| service | method | status | handler file |
+|---|---|---|---|
+| sharedSettingsMgr | StoreSettingLinkAndGetID | handled | `crates/server/src/services/settings_sharing/shared_settings_mgr.rs` |
+| sharedSettingsMgr | GetStoredSharedSetting | handled | `crates/server/src/services/settings_sharing/shared_settings_mgr.rs` |
+
+Authenticated players can forward permanent item-filter and fleet-broadcast snapshots to any other signed-in player. Links are not private and cannot be revoked or expired. Payloads use JSON as a YAML subset, with a lowercase SHA-256 digest of the exact encoded UTF-8 bytes.

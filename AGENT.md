@@ -250,6 +250,7 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
 | Probes (temporary) | 9,600,000,000,000 | `exploration::NEXT_PROBE_ID` |
 | Asteroids | 9,700,000,000,000 | `game.asteroid_seq` |
 | Missiles in flight (temporary) | 9,800,000,000,000 | `combat::MISSILE_ID_START` |
+| Shared setting links | 9,950,000,000,000 to 9,999,999,999,999 | `game.shared_setting_links_sq_id_seq` |
 
 ### Logging
 

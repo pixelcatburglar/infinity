@@ -56,6 +56,7 @@ Some keys switch behaviour on or off rather than set a number:
 | `mining.ledger_retention_days` / `.ledger_maintenance_secs` | `90` / `3600` | How many days of personal mining ledger history are kept (90 is the client's chart range), and how often older entries are deleted. Both must be positive. Deleted history does not come back if the retention is raised later. |
 | `map.history_retention_hours` / `.maintenance_secs` | `48` / `3600` | How many hours of star-map jump and kill history are kept, and how often older events are deleted. The retention must be at least 24, the longest window the client asks for, and the interval positive. Visits are never deleted. |
 | `fleets.reconnect_timeout_secs` | `120` | How long a member who disconnects or logs off keeps their fleet seat for the client's automatic rejoin. Must be between 1 and 120, the client's own reconnect limit. |
+| `shared_settings.max_payload_bytes` / `.max_nesting_depth` | `262144` / `64` | The largest shared item-filter or fleet-broadcast link the server stores, in bytes of encoded text, and how deeply its data may nest. Both must be positive, and the depth at most 64. |
 
 ## Logs
 

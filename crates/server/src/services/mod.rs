@@ -56,6 +56,7 @@ mod orgs;
 pub(crate) mod mining;
 mod missions;
 pub(crate) mod ship;
+mod settings_sharing;
 pub(crate) mod skills;
 pub(crate) mod standings;
 mod slash;
@@ -350,6 +351,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         _ => {
             if let Some(r) = alert::dispatch(c, call).await { return r; }
             if let Some(r) = event_log::dispatch(c, call).await { return r; }
+            if let Some(r) = settings_sharing::dispatch(c, call).await { return r; }
             if call.service == "invbroker" {
                 if let Some(r) = inventory::broker(c, call).await {
                     return r;
