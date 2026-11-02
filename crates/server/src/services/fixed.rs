@@ -121,8 +121,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("lookupSvc", _) => Value::list([]),
 
         // ---- mail, notifications, contracts ----
-        // labelID -> KeyVal(labelID, name, color); the static labels are added client-side
-        ("mailingListsMgr", "GetJoinedLists") => Value::Dict(vec![]),
         // Client-side settings blobs (yaml); nothing reads them back yet.
         ("charMgr", "SaveCharacterSetting") => Value::None,
 
@@ -274,7 +272,6 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
 pub(super) fn social_early(call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {
         ("notificationMgr", "LogNotificationInteraction") => Ok(Value::None),
-        ("mailingListsMgr", "Create") => Err(notify_error(crate::messages::MAILING_LISTS_UNSUPPORTED)),
         ("calendarMgr", "CreateAllianceEvent" | "EditAllianceEvent") => Err(notify_error(crate::messages::ALLIANCE_EVENTS_UNSUPPORTED)),
         _ => return None,
     })

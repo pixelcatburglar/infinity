@@ -505,6 +505,42 @@ CREATE TABLE IF NOT EXISTS game.mail_labels (
     PRIMARY KEY (char_id, label_id)
 );
 
+-- Mailing-list metadata, membership and entity access (dao/mailing_lists.rs).
+CREATE SEQUENCE IF NOT EXISTS game.mailing_lists_list_id_seq
+    START WITH 9900000000000 MAXVALUE 9949999999999 NO CYCLE;
+CREATE TABLE IF NOT EXISTS game.mailing_lists (
+    list_id bigint PRIMARY KEY DEFAULT nextval('game.mailing_lists_list_id_seq'),
+    name_key text NOT NULL,
+    display_name text NOT NULL,
+    owner_id bigint NOT NULL REFERENCES game.characters(character_id),
+    default_access smallint NOT NULL CHECK (default_access IN (0, 1)),
+    default_member_access smallint NOT NULL CHECK (default_member_access IN (0, 1)),
+    welcome_title text,
+    welcome_body text,
+    created_at bigint NOT NULL,
+    deleted_at bigint,
+    CHECK ((welcome_title IS NULL) = (welcome_body IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS mailing_lists_active_name_idx
+    ON game.mailing_lists (name_key) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS game.mailing_list_members (
+    list_id bigint NOT NULL REFERENCES game.mailing_lists(list_id),
+    character_id bigint NOT NULL REFERENCES game.characters(character_id),
+    member_access smallint NOT NULL CHECK (member_access IN (0, 1, 2)),
+    joined_at bigint NOT NULL,
+    PRIMARY KEY (list_id, character_id)
+);
+CREATE INDEX IF NOT EXISTS mailing_list_members_character_idx
+    ON game.mailing_list_members (character_id, list_id);
+-- Entity kinds: 1 character, 2 corporation, 3 alliance.
+CREATE TABLE IF NOT EXISTS game.mailing_list_access (
+    list_id bigint NOT NULL REFERENCES game.mailing_lists(list_id),
+    entity_id bigint NOT NULL,
+    entity_kind smallint NOT NULL CHECK (entity_kind IN (1, 2, 3)),
+    access smallint NOT NULL CHECK (access IN (0, 1)),
+    PRIMARY KEY (list_id, entity_id)
+);
+
 -- Notifications; data is the YAML mapping the client's formatter for type_id reads.
 CREATE TABLE IF NOT EXISTS game.notifications (
     notification_id bigserial PRIMARY KEY,

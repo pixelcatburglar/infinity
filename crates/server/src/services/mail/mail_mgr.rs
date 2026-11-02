@@ -1,9 +1,9 @@
 //! `mailMgr`, mirroring `eve/client/script/ui/services/mail/mailSvc.py`.
 //! Uses the mail DAO's message, status and label tables and character membership.
 //! Sending commits message, status and reply/forward writes together before notifications.
-//! Mailing lists are not supported.
+//! Alliance mail delivery is not supported.
 use super::super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
-use super::{delivery, STATUS_READ};
+use super::{delivery, text_argument, MAX_RECIPIENTS, STATUS_READ};
 use crate::client::Client;
 use crate::dao::mail::{self, LabelAction, Selector};
 use crate::db::Db;
@@ -57,14 +57,37 @@ async fn sync(c: &Client, last_id: i64) -> CallResult {
 
 /// `SendMail(toCharacterIDs, toListID, toCorpOrAllianceID, title, body, isReplyTo, isForwardedFrom)` -> messageID.
 async fn send(c: &Client, call: &Call<'_>) -> CallResult {
-    let me = c.session.int("charid").unwrap_or(0);
-    let to_chars = value_id_list(call.args.first());
-    let to_list = call.args.get(1).and_then(|v| v.as_int());
-    let to_corp = call.args.get(2).and_then(|v| v.as_int());
-    let title = call.args.get(3).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let body = call.args.get(4).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let (reply_to, forwarded_from) = (call.args.get(5).and_then(|v| v.as_int()).unwrap_or(0), call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0));
-    let input = delivery::SendMail { to_chars, to_list, to_corp, title, body, reply_to, forwarded_from };
+    let invalid = || notify_error(messages::mail::INVALID_ARGUMENT);
+    let me = c.session.int("charid").filter(|id| *id > 0)
+        .ok_or_else(|| notify_error(messages::mail::SELECT_CHARACTER))?;
+    if call.args.len() != 7 || !(matches!(call.kwargs, Value::None) || matches!(call.kwargs, Value::Dict(v) if v.is_empty())) { return Err(invalid()); }
+    let values = match &call.args[0] {
+        Value::List(values) | Value::Tuple(values) => values,
+        _ => return Err(invalid()),
+    };
+    if values.len() > MAX_RECIPIENTS { return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS)); }
+    let to_chars = values.iter().map(|v| match v {
+        Value::Int(id) if *id > 0 => Ok(*id),
+        _ => Err(invalid()),
+    }).collect::<Result<Vec<_>, _>>()?;
+    let optional_id = |v: &Value| match v {
+        Value::None => Ok(None),
+        Value::Int(id) if *id > 0 => Ok(Some(*id)),
+        _ => Err(invalid()),
+    };
+    let nonnegative_id = |v: &Value| match v {
+        Value::Int(id) if *id >= 0 => Ok(*id),
+        _ => Err(invalid()),
+    };
+    let input = delivery::SendMail {
+        to_chars,
+        to_list: optional_id(&call.args[1])?,
+        to_corp: optional_id(&call.args[2])?,
+        title: text_argument(&call.args[3])?,
+        body: text_argument(&call.args[4])?,
+        reply_to: nonnegative_id(&call.args[5])?,
+        forwarded_from: nonnegative_id(&call.args[6])?,
+    };
     delivery::send_mail(&c.db, &c.world, me, c.session.int("corpid"), input).await.map(Value::Int)
 }
 
@@ -90,7 +113,7 @@ async fn set_bits(db: &Db, me: i64, which: Selector, ids: &[i64], bits: i32, on:
     Ok(())
 }
 
-/// Messages a selector covers: listed ids, a label, a mailing list (none), or all.
+/// Messages a selector covers: listed ids, a label, a mailing list, or all.
 fn selector(method: &str) -> Selector {
     if method.ends_with("ByLabel") {
         Selector::Label
@@ -137,6 +160,13 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     let me = c.session.int("charid").unwrap_or(0);
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let db = &c.db;
+    if call.service == "mailMgr" && matches!(call.method, "MarkAsReadByList" | "MarkAsUnreadByList" | "MoveToTrashByList") {
+        if me <= 0 { return Some(Err(notify_error(messages::mail::SELECT_CHARACTER))); }
+        if call.args.len() != 1 || !matches!(call.args.first(), Some(Value::Int(id)) if *id > 0)
+            || !(matches!(call.kwargs, Value::None) || matches!(call.kwargs, Value::Dict(v) if v.is_empty())) {
+            return Some(Err(notify_error(messages::mail::INVALID_ARGUMENT)));
+        }
+    }
     Some(match (call.service, call.method) {
         ("mailMgr", "SyncMail") => sync(c, int(1).unwrap_or(0)).await,
         ("mailMgr", "GetMailHeaders") => {
@@ -149,15 +179,15 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("mailMgr", "SendMail") => send(c, call).await,
         ("mailMgr", "GetBody") => body(c, int(0).unwrap_or(0), call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1))).await,
         ("mailMgr", m @ ("MarkAsRead" | "MarkAsReadByLabel" | "MarkAsReadByList" | "MarkAllAsRead")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") || m.ends_with("ByList") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_READ, true).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MarkAsUnread" | "MarkAsUnreadByLabel" | "MarkAsUnreadByList" | "MarkAllAsUnread")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") || m.ends_with("ByList") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_READ, false).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MoveToTrash" | "MoveToTrashByLabel" | "MoveToTrashByList" | "MoveAllToTrash")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") || m.ends_with("ByList") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_TRASHED, true).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MoveFromTrash" | "MoveAllFromTrash")) => {

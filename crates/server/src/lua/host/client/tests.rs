@@ -136,7 +136,8 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
             assert(not pcall(dao.standings.set, ctx, me, other, 0/0))
             assert(dao.standings.get(me, other) == 2.5)
             assert(not pcall(dao.mail.send, ctx, {}, "title", "body"))
-            local message = dao.mail.send(ctx, {recipient, other}, string.rep("x", 4096), "body")
+            assert(not pcall(dao.mail.send, ctx, {recipient, other}, string.rep("x", 4096), "body"))
+            local message = dao.mail.send(ctx, {recipient, other}, "x", "body")
             assert(message and message > 0)
             assert(dao.items.create(ctx, me, me, flag, type_id, 2) == nil)
             assert(dao.items.create(ctx, me, me, flag, type_id, 3) == nil)
@@ -167,8 +168,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         let message = match values.front() { Some(mlua::Value::Integer(id)) if *id > 0 => *id, _ => panic!("missing message id") };
         let headers = crate::dao::mail::headers(&test_db, fixture.chars[0], &vec![message]).await.unwrap();
         assert_eq!(headers.len(), 1);
-        let limit = usize::try_from(crate::config::game().mail.title_max_len).unwrap();
-        assert_eq!(headers[0].title, "x".repeat(limit.min(4096)));
+        assert_eq!(headers[0].title, "x");
         assert_eq!(headers[0].to_character_ids, format!("{},{}", fixture.chars[1], fixture.chars[2]));
         for (character, status, label) in [(fixture.chars[0], 1, 2), (fixture.chars[1], 0, 1), (fixture.chars[2], 0, 1)] {
             let rows = crate::dao::mail::statuses(&test_db, character).await.unwrap();

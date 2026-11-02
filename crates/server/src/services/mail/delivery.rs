@@ -1,19 +1,19 @@
-//! Shared mail delivery, mirroring `eve/client/script/ui/services/mail/mailSvc.py`.
-//! Uses the mail DAO's message and status tables and character membership.
+//! Shared ordinary and automated mail delivery, mirroring `eve/client/script/ui/services/mail/mailSvc.py`.
+//! Uses mail message/status tables and active character, corporation and mailing-list membership.
 //! Message, status and reply/forward writes commit together before notifications.
-//! Mailing lists are not supported.
+//! Alliance delivery is not supported.
 
 use super::super::{db_err, notify_error, CallError};
-use super::STATUS_READ;
+use super::{mailing_lists, MAX_BODY, MAX_RECIPIENTS, MAX_TITLE, STATUS_AUTOMATED, STATUS_READ};
 use crate::client::filetime_now;
 use crate::consts::FILETIME_MINUTE;
-use crate::dao::mail;
-use crate::db::Db;
-use crate::db::outbox::{dispatch_world, Outbox};
+use crate::dao::{characters, mail};
+use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}, Db};
 use crate::messages;
 use crate::space::World;
 use marshal::Value;
-use tracing::info;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Client appConst.mailStatusMask replied bit.
 const STATUS_REPLIED: i32 = 2;
@@ -25,13 +25,6 @@ const LABEL_INBOX: i32 = 1;
 const LABEL_SENT: i32 = 2;
 /// Client appConst.mailLabel corporation bit.
 const LABEL_CORPORATION: i32 = 4;
-/// Client appConst.mailMaxRecipients.
-const MAX_RECIPIENTS: usize = 50;
-
-/// Player members of a corporation.
-async fn corp_members(db: &Db, corp: i64) -> Result<Vec<i64>, CallError> {
-    crate::dao::characters::members::active_ids(db, corp).await.map_err(db_err)
-}
 
 pub(crate) struct SendMail {
     pub to_chars: Vec<i64>,
@@ -43,84 +36,115 @@ pub(crate) struct SendMail {
     pub forwarded_from: i64,
 }
 
-pub(crate) async fn send_mail(db: &Db, world: &World, me: i64, corpid: Option<i64>, input: SendMail) -> Result<i64, CallError> {
-    let SendMail { to_chars, to_list, to_corp, title, body, reply_to, forwarded_from } = input;
-    let title = title.chars().take(usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX)).collect::<String>();
-    if to_list.is_some() {
-        return Err(notify_error(messages::MAILING_LISTS_UNSUPPORTED));
+pub(super) struct Delivery {
+    pub sender: i64,
+    pub to_chars: Vec<i64>,
+    pub to_list: Option<i64>,
+    pub to_corp: Option<i64>,
+    pub title: String,
+    pub body: String,
+    pub sent: i64,
+    pub recipients: Vec<i64>,
+    pub automated: bool,
+}
+
+pub(super) fn validate_content(title: &str, body: &str) -> Result<(), CallError> {
+    let configured = usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX);
+    if title.chars().count() > configured.min(MAX_TITLE) || body.chars().count() > MAX_BODY {
+        return Err(notify_error(messages::mail::INVALID_CONTENT));
     }
-    if to_chars.is_empty() && to_corp.is_none() {
+    Ok(())
+}
+
+/// Insert one message and its deduplicated status rows in the caller's transaction.
+pub(super) async fn deliver(ex: &(impl Executor + ?Sized), outbox: &mut Outbox, input: &Delivery) -> Result<i64, CallError> {
+    deliver_to(ex, outbox, input, &input.recipients).await
+}
+
+async fn deliver_to(ex: &(impl Executor + ?Sized), outbox: &mut Outbox, input: &Delivery, group: &[i64]) -> Result<i64, CallError> {
+    let to_text = input.to_chars.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let id = mail::insert_message(ex, input.sender, &to_text, input.to_list, input.to_corp, &input.title, &input.body, input.sent).await.map_err(db_err)?;
+    let mut recipients: BTreeSet<i64> = group.iter().copied().collect();
+    recipients.extend(input.to_chars.iter().copied());
+    if !input.automated {
+        recipients.insert(input.sender);
+    }
+    // mailSvc.py:OnMailSent derives labels from the explicit header and category, not expansion.
+    let rows: Vec<_> = recipients.iter().map(|&ch| {
+        let explicit = input.to_chars.contains(&ch);
+        let mut labels = if explicit { LABEL_INBOX } else { 0 };
+        if input.to_corp.is_some() { labels |= LABEL_CORPORATION; }
+        if !input.automated && ch == input.sender { labels |= LABEL_SENT; }
+        let status = if input.automated { STATUS_AUTOMATED } else if ch == input.sender && !explicit && input.to_list.is_none() && input.to_corp.is_none() { STATUS_READ } else { 0 };
+        (ch, status, labels)
+    }).collect();
+    mail::insert_statuses(ex, id, &rows).await.map_err(db_err)?;
+    let explicit = Value::list(input.to_chars.iter().copied().map(Value::Int));
+    for ch in recipients {
+        if !input.automated && ch == input.sender { continue; }
+        outbox.notify_pilot(ch, "OnMailSent", vec![
+            Value::Int(id), Value::Int(input.sender), Value::Int(input.sent), explicit.clone(),
+            input.to_list.map(Value::Int).unwrap_or(Value::None),
+            input.to_corp.map(Value::Int).unwrap_or(Value::None),
+            Value::unicode(input.title.as_str()),
+            Value::Int(if input.automated { STATUS_AUTOMATED as i64 } else { 0 }),
+        ]);
+    }
+    Ok(id)
+}
+
+pub(crate) async fn send_mail(db: &Db, world: &World, me: i64, _corpid: Option<i64>, mut input: SendMail) -> Result<i64, CallError> {
+    if me <= 0 { return Err(notify_error(messages::mail::SELECT_CHARACTER)); }
+    if input.to_chars.len() > MAX_RECIPIENTS { return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS)); }
+    if input.to_chars.iter().any(|id| *id <= 0) || input.to_list.is_some_and(|id| id <= 0) || input.to_corp.is_some_and(|id| id <= 0) || input.reply_to < 0 || input.forwarded_from < 0 || (input.to_list.is_some() && input.to_corp.is_some()) {
+        return Err(notify_error(messages::mail::INVALID_ARGUMENT));
+    }
+    if input.to_chars.is_empty() && input.to_list.is_none() && input.to_corp.is_none() {
         return Err(notify_error(messages::MAIL_RECIPIENT_REQUIRED));
     }
-    if to_chars.len() > MAX_RECIPIENTS {
-        return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS));
-    }
-    if let Some(corp) = to_corp {
-        if corpid != Some(corp) {
-            return Err(notify_error(messages::MAIL_ONLY_TO_OWN_CORPORATION));
-        }
-    }
+    validate_content(&input.title, &input.body)?;
+    input.to_chars.sort_unstable();
+    input.to_chars.dedup();
     let sent = filetime_now() / FILETIME_MINUTE * FILETIME_MINUTE;
-    let to_text = to_chars.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-    // Everyone involved gets a status row; the sender's starts read.
-    let mut boxes: Vec<(i64, i32, i32)> = vec![];
-    for ch in &to_chars {
-        boxes.push((*ch, 0, LABEL_INBOX));
-    }
-    if let Some(corp) = to_corp {
-        for ch in corp_members(db, corp).await? {
-            match boxes.iter_mut().find(|b| b.0 == ch) {
-                Some(b) => b.2 |= LABEL_CORPORATION,
-                None => boxes.push((ch, 0, LABEL_CORPORATION)),
-            }
-        }
-    }
-    match boxes.iter_mut().find(|b| b.0 == me) {
-        Some(b) => b.2 |= LABEL_SENT,
-        None => boxes.push((me, STATUS_READ, LABEL_SENT)),
-    }
-    // Stable sorting preserves which status wins for duplicate recipients.
-    let mut sorted_boxes = boxes.clone();
-    sorted_boxes.sort_by_key(|b| b.0);
-    let mut originals = [(reply_to, STATUS_REPLIED), (forwarded_from, STATUS_FORWARDED)];
+    let mut originals = [(input.reply_to, STATUS_REPLIED), (input.forwarded_from, STATUS_FORWARDED)];
     originals.sort_by_key(|(id, _)| *id);
-    let to_list_value = Value::list(to_chars.iter().map(|i| Value::Int(*i)));
-    let inputs = std::sync::Arc::new((to_text, title, body, boxes, sorted_boxes, to_list_value));
-    let id = db.transaction(
+    let delivery = Arc::new(Delivery {
+        sender: me, to_chars: input.to_chars, to_list: input.to_list, to_corp: input.to_corp,
+        title: input.title, body: input.body, sent, recipients: Vec::new(), automated: false,
+    });
+    db.transaction(
         |tx, outbox: &mut Outbox| {
-            let inputs = std::sync::Arc::clone(&inputs);
+            let input = Arc::clone(&delivery);
             Box::pin(async move {
-                let (to_text, title, body, boxes, sorted_boxes, to_list_value) = &*inputs;
-                let id = mail::insert_message(tx, me, to_text, to_corp, title, body, sent).await.map_err(db_err)?;
-                for (ch, status, labels) in sorted_boxes {
-                    mail::insert_status(tx, id, *ch, *status, *labels).await.map_err(db_err)?;
+                if input.to_list.is_none() && characters::lookup::find(tx, "", Some(me)).await.map_err(db_err)?.is_none() {
+                    return Err(notify_error(messages::mail::SELECT_CHARACTER));
                 }
-                for (original, bit) in originals {
-                    if original > 0 {
-                        mail::mark_original(tx, original, me, bit).await.map_err(db_err)?;
+                for &ch in &input.to_chars {
+                    if characters::lookup::find(tx, "", Some(ch)).await.map_err(db_err)?.is_none() {
+                        return Err(notify_error(messages::mail::INVALID_MEMBER));
                     }
                 }
-                for (ch, _, _) in boxes.iter().filter(|b| b.0 != me) {
-                    outbox.notify_pilot(
-                        *ch,
-                        "OnMailSent",
-                        vec![
-                            Value::Int(id),
-                            Value::Int(me),
-                            Value::Int(sent),
-                            to_list_value.clone(),
-                            Value::None,
-                            to_corp.map(Value::Int).unwrap_or(Value::None),
-                            Value::unicode(title.as_str()),
-                            Value::Int(0),
-                        ],
-                    );
+                let recipients = if let Some(list_id) = input.to_list {
+                    let list = crate::dao::mailing_lists::get_for_update(tx, list_id).await.map_err(db_err)?
+                        .ok_or_else(|| notify_error(messages::mail::LIST_NOT_FOUND))?;
+                    mailing_lists::authorize_sender(tx, &list, me).await?;
+                    crate::dao::mailing_lists::recipient_ids(tx, list_id).await.map_err(db_err)?
+                } else if let Some(corp) = input.to_corp {
+                    if characters::crimewatch::corporation(tx, me).await.map_err(db_err)? != Some(corp) {
+                        return Err(notify_error(messages::MAIL_ONLY_TO_OWN_CORPORATION));
+                    }
+                    characters::members::active_ids(tx, corp).await.map_err(db_err)?
+                } else { Vec::new() };
+                let id = deliver_to(tx, outbox, &input, &recipients).await?;
+                for (original, bit) in originals {
+                    if original > 0 { mail::mark_original(tx, original, me, bit).await.map_err(db_err)?; }
                 }
                 Ok(id)
             })
         },
         |id, outbox| async move { dispatch_world(id, outbox, world) },
-    ).await?;
-    info!("mail: {me} sent message {id} to {} recipients", inputs.3.len() - 1);
-    Ok(id)
+    ).await
 }
+
+#[cfg(test)]
+mod tests;
