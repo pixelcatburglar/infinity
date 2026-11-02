@@ -1,4 +1,4 @@
-//! Static-data projections used to construct immutable startup datasets from typed SDE and selected native sources, including compression mappings and type lists.
+//! Static-data projections used to construct immutable startup datasets from typed SDE and selected native sources, including compression mappings, type lists and graphic locations.
 //! This DAO has no direct client mirror; consumers include
 //! `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`,
 //! `dogma/effects/modifiers.py:8-140`, `dogma/const.py:7-51`,
@@ -12,6 +12,7 @@ pub(crate) mod dogma;
 pub(crate) mod dungeons;
 pub(crate) mod dynamic_items;
 pub(crate) mod factions;
+pub(crate) mod graphic_locations;
 pub(crate) mod industry;
 pub(crate) mod localization;
 pub(crate) mod map;

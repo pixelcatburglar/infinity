@@ -78,6 +78,42 @@ pub const TYPE_CHARACTER: i32 = 1373;
 pub const TYPE_SOLAR_SYSTEM: i32 = 5;
 /// SDE invTypes: Capsule.
 pub const TYPE_CAPSULE: i32 = 670;
+/// Client `inventorycommon/const.py` groupBattleship.
+pub const GROUP_BATTLESHIP: i32 = 27;
+/// Client `inventorycommon/const.py` groupIndustrial.
+pub const GROUP_INDUSTRIAL: i32 = 28;
+/// Client `inventorycommon/const.py` groupTitan.
+pub const GROUP_TITAN: i32 = 30;
+/// Client `inventorycommon/const.py` groupTransportShip.
+pub const GROUP_TRANSPORT_SHIP: i32 = 380;
+/// Client `inventorycommon/const.py` groupEliteBattleship.
+pub const GROUP_ELITE_BATTLESHIP: i32 = 381;
+/// Client `inventorycommon/const.py` groupDreadnought.
+pub const GROUP_DREADNOUGHT: i32 = 485;
+/// Client `inventorycommon/const.py` groupFreighter.
+pub const GROUP_FREIGHTER: i32 = 513;
+/// Client `inventorycommon/const.py` groupCarrier.
+pub const GROUP_CARRIER: i32 = 547;
+/// Client `inventorycommon/const.py` groupSupercarrier.
+pub const GROUP_SUPERCARRIER: i32 = 659;
+/// Client `inventorycommon/const.py` groupCapitalIndustrialShip.
+pub const GROUP_CAPITAL_INDUSTRIAL_SHIP: i32 = 883;
+/// Client `inventorycommon/const.py` groupBlackOps.
+pub const GROUP_BLACK_OPS: i32 = 898;
+/// Client `inventorycommon/const.py` groupMarauders.
+pub const GROUP_MARAUDERS: i32 = 900;
+/// Client `inventorycommon/const.py` groupJumpFreighter.
+pub const GROUP_JUMP_FREIGHTER: i32 = 902;
+/// Client `inventorycommon/const.py` groupIndustrialCommandShip.
+pub const GROUP_INDUSTRIAL_COMMAND_SHIP: i32 = 941;
+/// Client `inventorycommon/const.py` groupBlockadeRunner.
+pub const GROUP_BLOCKADE_RUNNER: i32 = 1202;
+/// Client `inventorycommon/const.py` groupForceAux.
+pub const GROUP_FORCE_AUX: i32 = 1538;
+/// Client `inventorycommon/const.py` groupLancerDreadnought.
+pub const GROUP_LANCER_DREADNOUGHT: i32 = 4594;
+/// Client `inventorycommon/const.py` groupCommandCarrier.
+pub const GROUP_COMMAND_CARRIER: i32 = 5120;
 /// SDE invGroups: Planet.
 pub const GROUP_PLANET: i32 = 7;
 /// SDE invGroups: Asteroid Belt.

@@ -1,4 +1,6 @@
-//! The ship client service, mirroring the client ship service; uses SDE celestials and game locations. Space movement is handled by beyonce.
+//! The ship client service; `ballparkCommon/docking.py` defines NPC undock channels
+//! and initial velocity. Station graphics and celestial data come from the SDE;
+//! ship locations persist in game tables. Upwell undocking is not modeled.
 //! Successful undocking hands off a lifecycle event after the session changes.
 use super::*;
 
@@ -8,16 +10,15 @@ async fn undock(c: &mut Client) -> CallResult {
     };
     let st = required(c.sde.map.celestial(station), "station celestial")?;
     let spos: [f64; 3] = [required(st.x, "station x")?, required(st.y, "station y")?, required(st.z, "station z")?];
-    // Leave along a fixed per-station heading.
-    let a = (station % 360) as f64 * std::f64::consts::PI / 180.0;
-    let dir = [a.cos(), 0.0, a.sin()];
-    let dist = f64::from(c.sde.celestial_radius(st)) + 2500.0;
-    let pos = [spos[0] + dir[0] * dist, spos[1], spos[2] + dir[2] * dist];
-    let mut ball = ship_ball(c, ship, pos).await?;
-    ball.vel = [dir[0] * ball.max_vel as f64, 0.0, dir[2] * ball.max_vel as f64];
+    let station_type = i32::try_from(required(st.type_id, "station type")?)
+        .map_err(|_| CallError::Internal(anyhow::anyhow!("invalid SDE station type")))?;
+    let mut ball = ship_ball(c, ship, spos).await?;
+    let group = c.sde.types.get(ball.type_id).and_then(|ty| ty.group_id);
+    undock_point::prepare(&mut ball, c.sde.graphic_locations.get(station_type), group, spos,
+        c.sde.celestial_radius(st), crate::space::collision::enabled(), crate::services::rand01);
     let _lock = crate::services::market::lock().await;
     crate::services::trade::on_leave_locked(c).await?;
-    item_dao::undock(&c.db, ship, system, pos).await.map_err(db_err)?;
+    item_dao::undock(&c.db, ship, system, ball.pos).await.map_err(db_err)?;
     character_dao::undock(&c.db, c.session.int("charid").unwrap_or(0), system).await.map_err(db_err)?;
     c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     info!(user = c.login.user_id, "ship {ship} undocked from {station} into {system}");
