@@ -4,6 +4,7 @@
 //! Slot counts, name limits, starting ISK and deletion delay are operator policies.
 //! Selecting a character registers process-local presence; appearance editing is not interpreted here.
 //! Selection reconciles the active fit before restoring the ship's persisted condition.
+//! Ships restored in space arrive with the actor-managed restoring cloak and timer.
 //! Successful selection and logoff hand off lifecycle events after session changes.
 //! First selection serializes rookie ship grants on the character row and grants a
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
@@ -192,7 +193,7 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
     Ok(ship_id)
 }
 
-/// Push the docked-in-station session for `char_id` (eveSessions.GetSessionValuesFromRowset).
+/// Select a character and restore its station or space session (eveSessions.GetSessionValuesFromRowset).
 async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError> {
     let r = characters::selection::selected(&c.db, char_id, c.login.user_id).await.map_err(db_err)?
         .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
@@ -220,6 +221,19 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     let corp = r.corporation_id;
     let roles = r.roles;
     let alliance = r.alliance_id;
+    let cloak_until = if let Some(s) = space_ship.as_ref().filter(|_| station.is_none()) {
+        let type_id = items::inventory::type_id(&c.db, ship).await.map_err(db_err)?
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing SDE ship item")))?;
+        let vessel = items::space_ships::FreeShip {
+            item_id: ship, type_id, owner_id: char_id, corporation_id: corp,
+            alliance_id: alliance.unwrap_or(-1), pos: [s.x.unwrap(), s.y.unwrap(), s.z.unwrap()],
+        };
+        let security = super::crimewatch::security_status(&c.db, char_id).await?;
+        let ball = super::ship::balls::piloted(&c.db, c.sde.clone(), &vessel, char_id, security).await?.install();
+        Some(super::ship::arrive_cloaked(c, system, ball).await?)
+    } else {
+        None
+    };
     c.change_session(vec![
         ("charid", int(char_id)),
         ("corpid", int(corp)),
@@ -241,10 +255,8 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         ("regionid", int(r.region_id)),
         ("shipid", int(ship)),
     ]);
-    if station.is_none() {
-        let pos = space_ship.as_ref().map(|s| [s.x.unwrap(), s.y.unwrap(), s.z.unwrap()]).unwrap_or([0.0; 3]);
-        let ball = super::ship::ship_ball(c, ship, pos).await?;
-        c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+    if let Some(cloak_until) = cloak_until {
+        super::ship::notify_jump_cloak(c, ship, cloak_until);
     }
     super::online_status::presence_changed(&c.db, &c.world, char_id, true).await;
     let role = c.session.int("role").unwrap_or(0);
