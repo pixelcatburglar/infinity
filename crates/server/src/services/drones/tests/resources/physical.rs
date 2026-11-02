@@ -49,6 +49,13 @@ async fn quantities(f: &Fixture, rock: i64, ore: i32) -> Result<(i64, i64)> {
     Ok((remaining, held))
 }
 
+fn expected(intent: &PendingMining, remaining: i64) -> Result<i64> {
+    let result = mining::rounding::mining_result(intent.inputs, intent.unit_volume, remaining, intent.draws)
+        .map_err(|error| anyhow!("{error}"))?;
+    ensure!(result.wasted_quantity == 0 && result.critical_hit_quantity == 0, "fixture produced waste or critical yield");
+    Ok((result.normal_quantity + result.critical_hit_quantity).min(remaining - result.wasted_quantity))
+}
+
 async fn command(f: &mut Fixture, id: i64, method: &str, target: Option<i64>) -> Result<()> {
     let mut args = vec![Value::list([Value::Int(id)])];
     if let Some(target) = target { args.push(Value::Int(target)); }
@@ -127,9 +134,22 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         ensure!(locked, "rock did not lock: {}", state(&f, id, rock).await);
         let initial = quantities(&f, rock, ore).await?;
         let baseline = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
+        f.set(id, MINING_AMOUNT, 0.0).await;
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
+        let zero = pending(&f, id, rock, "zero-yield intent").await?;
+        ensure!(expected(&zero, initial.0)? == 0, "zero-yield intent was not zero");
+        let mut resumed = false;
+        for _ in 0..600 {
+            if f.world.with(f.system, move |s| s.drone(id).is_some_and(|d| d.order == DroneOrder::Mine(rock) && d.pending.is_none())).await.context("system stopped")? { resumed = true; break; }
+            tick(&f).await?;
+        }
+        ensure!(resumed, "zero-yield contact did not resume mining: {}", state(&f, id, rock).await);
+        ensure!(quantities(&f, rock, ore).await? == initial, "zero-yield contact changed inventory");
+        ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == baseline, "zero-yield contact recorded a fact");
+        while let Ok((event, _)) = rx.try_recv() { ensure!(event != "OnOreMined", "zero-yield contact emitted ore notice"); }
+        f.set(id, MINING_AMOUNT, volume * 2.0).await;
         let first = pending(&f, id, rock, "full-hold intent").await?;
-        ensure!(first.rock == rock && first.units > 0 && first.waste_units == 0, "unexpected mining intent");
+        ensure!(first.rock == rock && expected(&first, initial.0)? > 0, "unexpected mining intent");
         let travelled = f.world.with(f.system, move |s| s.sample_position(id).zip(s.sample_position(ship))
             .map(|(drone, ship)| dist(drone, ship))).await.context("system stopped")?.context("drone or ship missing after mining")?;
         ensure!(travelled >= 7_000.0, "mining intent did not follow the physical journey: ship distance {travelled}");
@@ -149,6 +169,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let second = pending(&f, id, rock, "delivery intent").await?;
         ensure!(quantities(&f, rock, ore).await? == initial, "second intent mutated inventory");
+        let second_units = expected(&second, initial.0)?;
         let mut delivered = false;
         for _ in 0..600 { if quantities(&f, rock, ore).await? != initial { delivered = true; break; } tick(&f).await?; }
         ensure!(delivered, "contact did not deliver: {}", state(&f, id, rock).await);
@@ -159,10 +180,10 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         }
         ensure!(completed, "committed contact did not release the intent: {}", state(&f, id, rock).await);
         let after = quantities(&f, rock, ore).await?;
-        ensure!(initial.0 - after.0 == second.units && after.1 - initial.1 == second.units, "delivery differs from pending units");
+        ensure!(initial.0 - after.0 == second_units && after.1 - initial.1 == second_units, "delivery differs from pending result");
         let first_logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
         ensure!(first_logs.len() == baseline.len() + 1, "contact did not record exactly one fact");
-        ensure!((first_logs[0].type_id, first_logs[0].solar_system_id, first_logs[0].quantity, first_logs[0].quantity_wasted) == (ore, f.system, second.units, 0), "contact fact differs from delivery");
+        ensure!((first_logs[0].type_id, first_logs[0].solar_system_id, first_logs[0].quantity, first_logs[0].quantity_wasted) == (ore, f.system, second_units, 0), "contact fact differs from delivery");
         command(&mut f, id, "CmdReturnHome", None).await?;
         let mut notices = 0;
         for _ in 0..100 { while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { notices += 1; } } if notices > 0 { break; } tick(&f).await?; }
@@ -184,6 +205,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         f.set(f.ship, ATTR_DRONE_CAPACITY, 1_000_000.0).await;
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let third = pending(&f, id, rock, "bay-delivery intent").await?;
+        let third_units = expected(&third, after.0)?;
         command(&mut f, id, "CmdReturnBay", None).await?;
         let mut bay = false;
         for _ in 0..600 {
@@ -193,10 +215,10 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         }
         ensure!(bay, "pending return did not reach bay: {}", state(&f, id, rock).await);
         let returned = quantities(&f, rock, ore).await?;
-        ensure!(after.0 - returned.0 == third.units && returned.1 - after.1 == third.units, "return did not join mining delivery with bay move");
+        ensure!(after.0 - returned.0 == third_units && returned.1 - after.1 == third_units, "return did not join mining delivery with bay move");
         let returned_logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
         ensure!(returned_logs.len() == first_logs.len() + 1, "bay return did not record exactly one fact");
-        ensure!((returned_logs[0].type_id, returned_logs[0].solar_system_id, returned_logs[0].quantity, returned_logs[0].quantity_wasted) == (ore, f.system, third.units, 0), "bay fact differs from delivery");
+        ensure!((returned_logs[0].type_id, returned_logs[0].solar_system_id, returned_logs[0].quantity, returned_logs[0].quantity_wasted) == (ore, f.system, third_units, 0), "bay fact differs from delivery");
         let mut return_notices = 0;
         for _ in 0..100 {
             while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { return_notices += 1; } }

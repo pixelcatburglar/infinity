@@ -20,8 +20,6 @@ pub(in crate::space) struct DroneBrain {
     end_at: Option<i64>,
     contact_queued: bool,
     contact_claimed: Option<u64>,
-    mining_carry: f64,
-    pending_carry: f64,
     kinematics: Option<crate::services::effects::propulsion::Kinematics>,
     announced: bool,
 }
@@ -78,7 +76,7 @@ impl System {
         self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
         self.snapshot_positions.insert(id, (self.snapshot_generation, pos));
         if self.snapshot_due == 0 { self.snapshot_due = self.ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND)); }
-        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, contact_queued: false, contact_claimed: None, mining_carry: 0.0, pending_carry: 0.0, kinematics: None, announced });
+        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, contact_queued: false, contact_claimed: None, kinematics: None, announced });
     }
     fn notify_drone(&self, d: &DroneRecord) {
         if self.drones.get(&d.id).is_none_or(|b| !b.announced) { return; }
@@ -130,7 +128,6 @@ impl System {
         b.record.order = order;
         b.record.target = match order { DroneOrder::Engage(t) | DroneOrder::Mine(t) => Some(t), DroneOrder::ReturnBay => Some(controller), _ => None };
         if order != DroneOrder::ReturnBay { b.record.pending = None; }
-        if b.record.pending.is_none() { b.pending_carry = 0.0; }
         b.record.state = match order { DroneOrder::ReturnBay | DroneOrder::ReturnHome => DRONE_STATE_DEPARTING, DroneOrder::Engage(_) | DroneOrder::Mine(_) => DRONE_STATE_APPROACHING, _ => DRONE_STATE_IDLE };
         b.locked = false; b.lock_at = 0; b.cycle_at = 0; b.end_at = None; b.contact_queued = false;
         let record = b.record.clone();
@@ -187,24 +184,14 @@ impl System {
         self.remove_projections_from(id);
         let b = self.drones.get_mut(&id).unwrap();
         b.record.generation = self::generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.state = DRONE_STATE_IDLE; b.record.pending = None;
-        b.pending_carry = 0.0;
         b.locked = false; b.end_at = None; b.contact_queued = false;
         let d = b.record.clone(); self.notify_drone(&d); self.drone_stop(id);
     }
-    pub(crate) fn drone_mining_carry(&self, id: i64, generation: u64) -> Option<f64> {
-        self.drone_current(id, generation).then(|| self.drones[&id].mining_carry)
-    }
-    pub(crate) fn drone_fraction(&mut self, id: i64, generation: u64, carry: f64) -> bool {
-        let Some(DroneOrder::Mine(target)) = self.drone(id).map(|d| d.order) else { return false };
-        if !carry.is_finite() || carry < 0.0 || !self.drone_valid(id, target, generation) { return false; }
-        self.drones.get_mut(&id).unwrap().mining_carry = carry;
-        true
-    }
-    pub(crate) fn drone_pending(&mut self, id: i64, generation: u64, pending: PendingMining, carry_after: f64) -> bool {
-        if !carry_after.is_finite() || carry_after < 0.0 || !self.drone_valid(id, pending.rock, generation)
+    pub(crate) fn drone_pending(&mut self, id: i64, generation: u64, pending: PendingMining) -> bool {
+        if !self.drone_valid(id, pending.rock, generation)
             || !matches!(self.drones[&id].record.order, DroneOrder::Mine(target) if target == pending.rock) { return false; }
         let Some(controller) = self.drones[&id].record.controller else { return false };
-        let b = self.drones.get_mut(&id).unwrap(); b.record.pending = Some(pending); b.pending_carry = carry_after; b.contact_queued = false; b.end_at = None; b.locked = false; b.lock_at = 0;
+        let b = self.drones.get_mut(&id).unwrap(); b.record.pending = Some(pending); b.contact_queued = false; b.end_at = None; b.locked = false; b.lock_at = 0;
         self.drone_follow(id, controller, DRONE_SCOOP_RANGE); true
     }
     pub(crate) fn drone_claim_contact(&mut self, id: i64, generation: u64) -> Option<DroneRecord> {
@@ -223,7 +210,7 @@ impl System {
         if let Some(b) = self.drones.get_mut(&id).filter(|b| b.contact_claimed == Some(generation)) {
             b.contact_claimed = None;
             if b.record.controller.is_none() {
-                b.record.pending = None; b.mining_carry = 0.0; b.pending_carry = 0.0;
+                b.record.pending = None;
             }
         }
     }
@@ -232,7 +219,6 @@ impl System {
         let Some(b) = self.drones.get_mut(&id) else { return };
         if !current && b.contact_claimed != Some(generation) { return; }
         if b.record.pending.take().is_none() { return; }
-        b.mining_carry = b.pending_carry; b.pending_carry = 0.0;
         b.contact_queued = false;
         if !current { return; }
         let d = b.record.clone();
@@ -247,7 +233,6 @@ impl System {
         self.set_ball_owner(id, OWNER_UNOWNED);
         let b = self.drones.get_mut(&id).unwrap();
         b.record.owner = OWNER_UNOWNED; b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.pending = None; b.record.state = DRONE_STATE_IDLE; b.locked = false;
-        b.mining_carry = 0.0; b.pending_carry = 0.0;
         self.notify_pilot(d.owner, "OnDroneStateChange", crate::services::effects::notify::drone_state(id, None, None, DRONE_STATE_IDLE, d.spec.type_id, None, None));
         self.notify_pilot(d.owner, "OnDroneActivityChange", crate::services::effects::notify::drone_activity(id, None, None));
         self.drone_stop(id);
@@ -261,7 +246,7 @@ impl System {
             let b = self.drones.get_mut(&id).unwrap();
             b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.state = DRONE_STATE_IDLE; b.locked = false; b.end_at = None; b.contact_queued = false;
             if b.contact_claimed.is_none() {
-                b.record.pending = None; b.mining_carry = 0.0; b.pending_carry = 0.0;
+                b.record.pending = None;
             }
             let d = b.record.clone(); self.notify_drone(&d);
             if was_controlled { self.notify_pilot(d.owner, "OnDroneControlLost", crate::services::effects::notify::drone_control_lost(id)); }

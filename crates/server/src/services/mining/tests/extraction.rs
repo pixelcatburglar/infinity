@@ -47,7 +47,6 @@ impl MiningFixture {
     }
 
     async fn cleanup(self) {
-        state().carry.remove(&self.module);
         state().rocks.remove(&self.rock);
         self.f.world.remove_ball(self.f.system, self.rock).await;
         crate::dao::asteroids::delete(&self.f.db, self.rock).await.unwrap();
@@ -58,15 +57,13 @@ impl MiningFixture {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Result<()> {
-    let m = MiningFixture::new(10, 0.25).await;
+    let m = MiningFixture::new(10, 1.0).await;
     let result: anyhow::Result<()> = async {
         let fit = m.fit().await?;
         let (notify, mut direct) = tokio::sync::mpsc::unbounded_channel();
         let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
         m.f.world.register_pilot(m.f.owner, pilot);
         let before = m.snapshot().await?;
-        let carry = m.volume * 0.125;
-        state().carry.insert(m.module, carry);
         let other_type = m.f.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_MODULE) && t.type_id != m.module_type).unwrap().type_id;
         let changes = [
             "UPDATE game.items SET online=false WHERE item_id=$1",
@@ -80,19 +77,19 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
             let rejected = m.extract(&fit, &notify).await;
             m.f.db.execute("UPDATE game.items SET online=true,location_id=$2,flag_id=$3,owner_id=$4,singleton=true WHERE item_id=$1", &[&m.module, &m.f.ship, &FLAG_HI_SLOT_FIRST, &m.f.owner]).await?;
             anyhow::ensure!(!rejected?, "stale module accepted: {sql}");
-            anyhow::ensure!(m.snapshot().await? == before && state().carry.get(&m.module).copied() == Some(carry), "stale module changed resources: {sql}");
+            anyhow::ensure!(m.snapshot().await? == before, "stale module changed resources: {sql}");
             anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "stale module emitted notification: {sql}");
         }
         m.f.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&m.module, &other_type]).await?;
         let type_result = m.extract(&fit, &notify).await;
         m.f.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&m.module, &m.module_type]).await?;
-        anyhow::ensure!(!type_result? && m.snapshot().await? == before && state().carry.get(&m.module).copied() == Some(carry), "changed type accepted");
+        anyhow::ensure!(!type_result? && m.snapshot().await? == before, "changed type accepted");
         m.f.db.execute("UPDATE game.items SET singleton=false WHERE item_id=$1", &[&m.f.ship]).await?;
         let hull_result = m.extract(&fit, &notify).await;
         m.f.db.execute("UPDATE game.items SET singleton=true WHERE item_id=$1", &[&m.f.ship]).await?;
-        anyhow::ensure!(!hull_result? && m.snapshot().await? == before && state().carry.get(&m.module).copied() == Some(carry), "invalid hull accepted");
+        anyhow::ensure!(!hull_result? && m.snapshot().await? == before, "invalid hull accepted");
         m.f.db.execute("DELETE FROM game.items WHERE item_id=$1", &[&m.module]).await?;
-        anyhow::ensure!(!m.extract(&fit, &notify).await? && m.snapshot().await? == before && state().carry.get(&m.module).copied() == Some(carry), "missing module accepted");
+        anyhow::ensure!(!m.extract(&fit, &notify).await? && m.snapshot().await? == before, "missing module accepted");
         anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "refusal emitted notification");
         Ok(())
     }.await;
@@ -102,32 +99,83 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
-async fn fractional_cycles_commit_only_valid_progress() -> anyhow::Result<()> {
-    let m = MiningFixture::new(10, 0.25).await;
+async fn fixed_rounding_commits_only_positive_yield() -> anyhow::Result<()> {
+    let m = MiningFixture::new(10, 1.0).await;
     let result: anyhow::Result<()> = async {
-        let fit = m.fit().await?;
-        anyhow::ensure!((fit.value(Key::Module(m.module), ATTR_MINING_AMOUNT) - m.volume * 0.25).abs() < m.volume * 1e-9, "unexpected effective yield");
-        let (notify, mut direct) = tokio::sync::mpsc::unbounded_channel();
+        let before = m.snapshot().await?;
+        let mut pending = fixed_intent(m.rock, m.ore, m.volume, 0.5);
+        let (owner, ship, system) = (m.f.owner, m.f.ship, m.f.system);
+        for (draw, expected) in [(0.75, false), (0.25, true)] {
+            pending.draws.normal_round = draw;
+            let sde = m.f.sde.clone();
+            let (delivered, entries) = m.f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| {
+                let sde = sde.clone();
+                let pending = pending.clone();
+                Box::pin(async move {
+                    let outcome = deliver(tx, outbox, &sde, owner, ship, system, 1, &pending, (FLAG_CARGO, pending.unit_volume * 10.0)).await?;
+                    Ok(matches!(outcome, DeliveryOutcome::Delivered(_)))
+                })
+            }, |delivered, outbox: crate::db::outbox::Outbox| async move {
+                Ok::<_, CallError>((delivered, outbox.into_entries()))
+            }).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            anyhow::ensure!(delivered == expected, "unexpected rounding outcome");
+            if expected {
+                anyhow::ensure!(m.snapshot().await? == (Some(9), 1, before.2 + 1), "one-unit delivery incorrect");
+                let logs = crate::dao::mining_ledger::list(&m.f.db, owner, i64::MIN, i64::MAX).await?;
+                anyhow::ensure!((logs[0].type_id, logs[0].quantity, logs[0].quantity_wasted) == (m.ore, 1, 0), "one-unit ledger incorrect");
+                use crate::db::outbox::{Effect, Notification};
+                anyhow::ensure!(matches!(&entries[..], [Effect::Notification(Notification::Pilot { event: item, .. }), Effect::Notification(Notification::Pilot { event: ore, .. })] if item == "OnItemChange" && ore == "OnOreMined"), "delivery outbox incorrect");
+            } else {
+                anyhow::ensure!(m.snapshot().await? == before && entries.is_empty(), "zero yield changed resources or outbox");
+            }
+        }
+        Ok(())
+    }.await;
+    m.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn critical_yield_uses_locked_quantity_across_rollback() -> anyhow::Result<()> {
+    let m = MiningFixture::new(3, 1.0).await;
+    let result: anyhow::Result<()> = async {
+        let before = m.snapshot().await?;
+        let mut pending = fixed_intent(m.rock, m.ore, m.volume, 10.0);
+        pending.inputs.crit_probability = 1.0;
+        pending.inputs.crit_quantity_multiplier = 0.5;
+        pending.draws.crit_round = 0.25;
+        let calculated = rounding::mining_result(pending.inputs, pending.unit_volume, 3, pending.draws).unwrap();
+        anyhow::ensure!((calculated.normal_quantity, calculated.critical_hit_quantity) == (3, 2), "critical yield did not use locked quantity");
         let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
         m.f.world.register_pilot(m.f.owner, pilot);
-        let before = m.snapshot().await?;
-        anyhow::ensure!(m.extract(&fit, &notify).await?, "first fractional cycle refused");
-        anyhow::ensure!((state().carry.get(&m.module).copied().unwrap() - m.volume * 0.25).abs() < m.volume * 1e-9, "first carry incorrect");
-        m.f.db.execute("UPDATE game.items SET online=false WHERE item_id=$1", &[&m.module]).await?;
-        anyhow::ensure!(!m.extract(&fit, &notify).await?, "offline zero-yield cycle accepted");
-        m.f.db.execute("UPDATE game.items SET online=true WHERE item_id=$1", &[&m.module]).await?;
-        anyhow::ensure!(m.snapshot().await? == before && (state().carry.get(&m.module).copied().unwrap() - m.volume * 0.25).abs() < m.volume * 1e-9, "refusal changed fractional progress");
-        for _ in 0..2 { anyhow::ensure!(m.extract(&fit, &notify).await?, "fractional cycle refused"); }
-        anyhow::ensure!(m.snapshot().await? == before && notices.try_recv().is_err(), "zero-yield cycle delivered ore");
-        let full = crate::dao::items::transfers::insert(&m.f.db, m.ore, m.f.owner, m.f.ship, FLAG_CARGO, 10).await?;
-        anyhow::ensure!(!m.extract(&fit, &notify).await?, "full hold accepted");
-        anyhow::ensure!((state().carry.get(&m.module).copied().unwrap() - m.volume * 0.75).abs() < m.volume * 1e-9, "full hold consumed carry");
-        anyhow::ensure!(direct.try_recv().is_ok() && notices.try_recv().is_err(), "full hold notices incorrect");
-        m.f.db.execute("DELETE FROM game.items WHERE item_id=$1", &[&full]).await?;
-        anyhow::ensure!(m.extract(&fit, &notify).await?, "whole-unit cycle refused");
-        anyhow::ensure!(m.snapshot().await? == (Some(9), 1, before.2 + 1), "whole-unit delivery incorrect");
-        anyhow::ensure!(state().carry.get(&m.module).copied().unwrap().abs() < m.volume * 1e-9, "whole-unit carry incorrect");
-        anyhow::ensure!(notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnItemChange") && notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnOreMined") && notices.try_recv().is_err(), "delivery notices incorrect");
+        let (owner, ship, system) = (m.f.owner, m.f.ship, m.f.system);
+        for rollback in [true, false] {
+            let sde = m.f.sde.clone();
+            let world = m.f.world.clone();
+            let outcome: Result<(), CallError> = m.f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| {
+                let sde = sde.clone();
+                let pending = pending.clone();
+                Box::pin(async move {
+                    assert!(matches!(deliver(tx, outbox, &sde, owner, ship, system, 1, &pending, (FLAG_CARGO, pending.unit_volume * 10.0)).await?, DeliveryOutcome::Delivered(_)));
+                    if rollback { return Err(CallError::Internal(anyhow::anyhow!("injected rollback"))); }
+                    Ok(())
+                })
+            }, |(), outbox| async move {
+                crate::db::outbox::dispatch_world((), outbox, &world)
+            }).await;
+            if rollback {
+                anyhow::ensure!(outcome.is_err() && m.snapshot().await? == before && notices.try_recv().is_err(), "rollback changed resources or sent notices");
+            } else {
+                outcome.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                anyhow::ensure!(m.snapshot().await? == (Some(0), 3, before.2 + 1), "committed delivery incorrect");
+                let (first, _) = notices.try_recv()?;
+                let (event, args) = notices.try_recv()?;
+                anyhow::ensure!(first == "OnItemChange" && event == "OnOreMined" && notices.try_recv().is_err(), "delivery notices incorrect");
+                let Some(Value::Dict(fields)) = args.first() else { anyhow::bail!("missing ore notice fields") };
+                anyhow::ensure!(fields.iter().any(|(key, value)| *key == Value::str("amountCritBonus") && *value == Value::Int(2)), "critical notice incorrect");
+            }
+        }
         Ok(())
     }.await;
     m.cleanup().await;
@@ -151,8 +199,6 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
     let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
     m.f.world.register_pilot(m.f.owner, pilot);
     let before = m.snapshot().await?;
-    let carry = m.volume * 0.125;
-    state().carry.insert(m.module, carry);
     let config = crate::config::tests::test_database().to_pg_config()?;
     let (observer, observer_connection) = config.connect(tokio_postgres::NoTls).await?;
     let observer_task = tokio::spawn(async move { observer_connection.await });
@@ -206,7 +252,7 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
         anyhow::ensure!(m.f.world.ball(m.f.system, m.rock).await.is_none(), "depleted rock remains in actor");
         anyhow::ensure!(notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnItemChange") && notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnOreMined") && notices.try_recv().is_err(), "cancelled delivery notices incorrect");
     } else {
-        anyhow::ensure!(m.snapshot().await? == before && state().carry.get(&m.module).copied() == Some(carry), "stale raced extraction changed resources or carry");
+        anyhow::ensure!(m.snapshot().await? == before, "stale raced extraction changed resources");
         anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "stale raced extraction emitted notices");
     }
     Ok(())

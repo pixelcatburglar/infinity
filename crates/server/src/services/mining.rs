@@ -14,9 +14,13 @@
 //! mining hold, or the cargo hold of ships without one, and tells the client
 //! (OnOreMined -> notifications.oreMinedNotificationAdapter, OnItemChange).
 //! Extraction range uses ship and rock positions sampled at the same system-actor time.
-//! Laser extraction revalidates the online fitted module under row locks; fractional
-//! carry is published only after commit. An owned task completes committed depletion
-//! updates even if the initiating cycle is cancelled; carry remains in memory only.
+//! Laser extraction revalidates the online fitted module under row locks. Per-cycle
+//! rounding is randomized as in `packages/mining/__init__.py`, with no fraction carry.
+//! Attribute 3154 is percentage points, compared as in `mining/__init__.py:54`.
+//! Completed cycles use clamp_factor=1 and server efficiency=1; partial cycles are
+//! not delivered. Critical and waste consumption retain server-policy caps, which the
+//! client shared formula does not specify. An owned task completes committed depletion
+//! updates even if the initiating cycle is cancelled.
 //! Each delivered extraction appends a personal fact to game.character_mining_ledger in
 //! the caller's transaction, before post-commit notices. The client refreshes its
 //! personal ledger normally; corporate observers are unsupported.
@@ -31,6 +35,7 @@ mod ledger;
 pub(crate) mod retention;
 mod mining_scan_mgr;
 mod reprocessing_svc;
+pub(crate) mod rounding;
 use super::fit::{Fit, Key};
 use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
@@ -56,6 +61,8 @@ const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
 /// SDE invCategories: asteroid resources.
 const CATEGORY_ASTEROID: i32 = 25;
 const SKILL_SCRAPMETAL: i32 = 12196;
+/// Inclusive waste check maximum from `mining/__init__.py:54`.
+const WASTE_CHECK_MAX: u32 = 100;
 
 
 // ---------------------------------------------------------------- fields
@@ -80,8 +87,6 @@ struct Rock {
 struct State {
     rocks: HashMap<i64, Rock>,
     loaded: HashSet<i64>,
-    /// Fraction of an ore unit each module has mined toward its next one (m3).
-    carry: HashMap<i64, f64>,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -312,11 +317,6 @@ pub fn is_rock(id: i64) -> bool {
 
 // ---------------------------------------------------------------- extraction
 
-fn whole_units(amount: f64, carry: f64, volume: f64) -> (i64, f64) {
-    let total = amount + carry;
-    let units = (total / volume).floor() as i64;
-    (units, total - units as f64 * volume)
-}
 
 fn extraction_amounts(units: i64, waste: i64, available: i64, room: i64) -> (i64, i64) {
     let taken = units.max(0).min(available.max(0)).min(room.max(0));
@@ -331,12 +331,16 @@ pub(crate) fn yield_values(fit: &Fit, key: Key) -> [f64; 5] {
 }
 
 /// A source's fitted yield is an intent until a transaction commits it.
-pub(crate) fn yield_intent(values: [f64; 5], carry: f64, target: i64, type_id: i32, volume: f64) -> (crate::space::drone::PendingMining, f64) {
-    let [amount, crit_chance, crit_bonus, waste_chance, waste_multiplier] = values;
-    let crit = if rand01() < crit_chance { amount * crit_bonus } else { 0.0 };
-    let waste = if rand01() < waste_chance { amount * waste_multiplier } else { 0.0 };
-    let (units, carry) = whole_units(amount + crit, carry, volume);
-    (crate::space::drone::PendingMining { rock: target, type_id, units, waste_units: (waste / volume).floor().max(0.0) as i64, crit_units: (crit / volume).floor().max(0.0) as i64 }, carry)
+pub(crate) fn yield_intent(values: [f64; 5], target: i64, type_id: i32, unit_volume: f64) -> crate::space::drone::PendingMining {
+    let [volume, crit_probability, crit_quantity_multiplier, waste_probability, waste_volume_multiplier] = values;
+    crate::space::drone::PendingMining {
+        rock: target, type_id, unit_volume,
+        inputs: rounding::MiningInputs { clamp_factor: 1.0, volume, waste_volume_multiplier, waste_probability, crit_quantity_multiplier, crit_probability, efficiency: 1.0 },
+        draws: rounding::MiningDraws {
+            waste_check: (rand01() * f64::from(WASTE_CHECK_MAX + 1)) as u32,
+            normal_round: rand01(), waste_round: rand01(), crit_check: rand01(), crit_round: rand01(),
+        },
+    }
 }
 
 pub(crate) fn rock_type(target: i64, system: i64) -> Option<i32> {
@@ -371,7 +375,10 @@ pub(crate) fn destination(fit: &Fit) -> (i32, f64) {
 pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), outbox: &mut crate::db::outbox::Outbox, sde: &crate::sde::Sde, owner: i64, ship: i64, system: i64, source: i64, pending: &crate::space::drone::PendingMining, (flag, capacity): (i32, f64)) -> Result<DeliveryOutcome, CallError> {
     let Some(available) = crate::dao::asteroids::lock(ex, system, pending.rock, pending.type_id).await.map_err(db_err)? else { return Ok(DeliveryOutcome::Missing) };
     if available <= 0 { return Ok(DeliveryOutcome::Depleted { rock: pending.rock }); }
-    if pending.units <= 0 { return Ok(DeliveryOutcome::NoYield); }
+    let result = rounding::mining_result(pending.inputs, pending.unit_volume, available, pending.draws)
+        .map_err(|error| CallError::Internal(anyhow::anyhow!("{error}")))?;
+    let units = result.normal_quantity.saturating_add(result.critical_hit_quantity);
+    if units <= 0 { return Ok(DeliveryOutcome::NoYield); }
     let t = sde.types.get(pending.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", pending.type_id)))?;
     let volume = t.volume.unwrap_or(1.0).max(0.01);
     let used: f64 = crate::dao::items::mining::rows(ex, ship, flag).await.map_err(db_err)?.iter()
@@ -379,7 +386,7 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
     let room = ((capacity - used) / volume).floor().max(0.0) as i64;
     let stack = crate::dao::items::transfers::stack(ex, ship, flag, pending.type_id, owner).await.map_err(db_err)?;
     let stack_room = stack.as_ref().map_or(i64::from(i32::MAX), |r| i64::from(i32::MAX - r.quantity));
-    let (taken, wasted) = extraction_amounts(pending.units, pending.waste_units, available, room.min(stack_room));
+    let (taken, wasted) = extraction_amounts(units, result.wasted_quantity, available, room.min(stack_room));
     if taken <= 0 { return Ok(DeliveryOutcome::Full { flag }); }
     let removed = taken + wasted;
     if !crate::dao::asteroids::take(ex, pending.rock, available, removed).await.map_err(db_err)? {
@@ -406,10 +413,10 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
     outbox.notify_pilot(owner, "OnOreMined", vec![Value::dict([
         ("oreType", Value::Int(pending.type_id as i64)), ("quantity_added", Value::Int(taken)),
         ("quantity_removed", Value::Int(taken)), ("hasRewards", Value::Bool(false)),
-        ("amountWasted", Value::Int(wasted)), ("amountCritBonus", Value::Int(pending.crit_units.max(0).min(taken))),
+        ("amountWasted", Value::Int(wasted)), ("amountCritBonus", Value::Int(result.critical_hit_quantity.max(0).min(taken))),
         ("itemID", Value::Int(pending.rock)), ("moduleItemID", Value::Int(source)),
     ])]);
-    Ok(DeliveryOutcome::Delivered(Delivery { rock: pending.rock, left: available - removed, removed, full: taken < pending.units.min(available) }))
+    Ok(DeliveryOutcome::Delivered(Delivery { rock: pending.rock, left: available - removed, removed, full: taken < units.min(available) }))
 }
 
 /// Apply only committed results to the space cache and observers.
@@ -452,8 +459,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     tokio::spawn(async move {
         let result: Result<bool, CallError> = async {
             let _lock = super::market::lock().await;
-            let carry = state().carry.get(&module).copied().unwrap_or(0.0);
-            let (pending, carry_after) = yield_intent(values, carry, target, type_id, volume);
+            let pending = yield_intent(values, target, type_id, volume);
             let sde = world.sde().clone();
             let result = db.transaction(
                 |tx, outbox: &mut crate::db::outbox::Outbox| {
@@ -473,9 +479,6 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
                 |value, outbox| {
                     let world = world.clone();
                     async move {
-                        if matches!(&value, DeliveryOutcome::NoYield | DeliveryOutcome::Delivered(_)) {
-                            state().carry.insert(module, carry_after);
-                        }
                         crate::db::outbox::dispatch_world(value, outbox, &world)
                     }
                 },

@@ -4,6 +4,14 @@ use crate::services::drones::tests::fixture::Fixture;
 
 mod extraction;
 
+fn fixed_intent(rock: i64, type_id: i32, unit_volume: f64, units: f64) -> crate::space::drone::PendingMining {
+    crate::space::drone::PendingMining {
+        rock, type_id, unit_volume,
+        inputs: rounding::MiningInputs { clamp_factor: 1.0, volume: unit_volume * units, waste_volume_multiplier: 0.0, waste_probability: 0.0, crit_quantity_multiplier: 0.0, crit_probability: 0.0, efficiency: 1.0 },
+        draws: rounding::MiningDraws { waste_check: 0, normal_round: 0.5, waste_round: 0.5, crit_check: 0.5, crit_round: 0.5 },
+    }
+}
+
 #[test]
 fn field_volume_sampling_uses_half_open_range() {
     crate::tests::init_config();
@@ -57,12 +65,6 @@ fn output_overflow_is_a_typed_refusal() {
     }
 }
 
-#[test]
-fn fractional_yield_carries_between_cycles() {
-    let (units, carry) = whole_units(0.5, 0.0, 1.0);
-    assert_eq!((units, carry), (0, 0.5));
-    assert_eq!(whole_units(0.5, carry, 1.0), (1, 0.0));
-}
 
 #[test]
 fn extraction_caps_rock_and_never_wastes_when_full() {
@@ -72,16 +74,6 @@ fn extraction_caps_rock_and_never_wastes_when_full() {
     assert_eq!(extraction_amounts(10, 5, 20, 4), (4, 5));
 }
 
-#[test]
-fn shared_yield_keeps_fraction_explicit() {
-    let values = [0.5, 0.0, 0.0, 0.0, 0.0];
-    let (first, carry) = yield_intent(values, 0.0, 7, 8, 1.0);
-    assert_eq!((first.units, carry), (0, 0.5));
-    let (second, next) = yield_intent(values, carry, 7, 8, 1.0);
-    assert_eq!((second.units, next), (1, 0.0));
-    let (retry, retry_carry) = yield_intent(values, carry, 7, 8, 1.0);
-    assert_eq!((retry.units, retry_carry), (1, 0.0));
-}
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -115,7 +107,7 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
         .next()
         .expect("SDE must provide an ore and cargo and mining-hold fits supporting full and one-unit boundaries");
     let rock = crate::dao::asteroids::insert(&tx, 103, 104, ore.type_id, 5, 1.0, [0.0; 3]).await.unwrap();
-    let mut pending = crate::space::drone::PendingMining { rock, type_id: ore.type_id, units: 2, waste_units: 0, crit_units: 0 };
+    let mut pending = fixed_intent(rock, ore.type_id, volume, 2.0);
     let baseline = crate::dao::mining_ledger::list(&tx, 101, i64::MIN, i64::MAX).await.unwrap().len();
     let mut delivered_count = 0;
     for (mining_hold, fit) in [false, true].into_iter().zip(fits) {
@@ -142,7 +134,7 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
     let hull = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)).unwrap();
     let fit = Fit::for_space_type(sde.clone(), hull.type_id, Vec::new());
     let mut outbox = crate::db::outbox::Outbox::default();
-    pending.units = 0;
+    pending.inputs.volume = 0.0;
     assert!(matches!(deliver(&tx, &mut outbox, &sde, 101, 105, 103, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::NoYield));
     tx.execute("UPDATE game.asteroids SET quantity = 0 WHERE asteroid_id = $1", &[&rock]).await.unwrap();
     assert!(matches!(deliver(&tx, &mut outbox, &sde, 101, 105, 103, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::Depleted { rock: r } if r == rock));
@@ -181,7 +173,7 @@ async fn zero_row_retry_reconciles_suppressed_delivery_callback() {
     delivered(&db, &world, system, 101, Delivery { rock: other, left: 7, removed: 1, full: false }).await.ok().unwrap();
     assert_eq!(state().rocks.get(&other).unwrap().quantity, 3);
     state().rocks.remove(&other);
-    let pending = crate::space::drone::PendingMining { rock, type_id: ore.type_id, units: 1, waste_units: 0, crit_units: 0 };
+    let pending = fixed_intent(rock, ore.type_id, ore.volume.unwrap(), 1.0);
     let mut outbox = crate::db::outbox::Outbox::default();
     assert!(matches!(deliver(&db, &mut outbox, &sde, 101, ship, system, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::Delivered(_)));
     assert_eq!(rock_type(rock, system), Some(ore.type_id));
@@ -242,7 +234,6 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
     assert_eq!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap(), logs);
     state().rocks.remove(&rock);
-    state().carry.remove(&module);
     crate::dao::asteroids::delete(&f.db, rock).await.unwrap();
     f.cleanup().await;
 }
@@ -259,7 +250,9 @@ async fn delivery_rollback_restores_all_resource_types_and_suppresses_dispatch()
             let rock = crate::dao::asteroids::insert(&f.db, f.system, f.system, type_id, 5, 1.0, [0.0; 3]).await?;
             rocks.push(rock);
             let before = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
-            let pending = crate::space::drone::PendingMining { rock, type_id, units: 3, waste_units: 10, crit_units: 0 };
+            let mut pending = fixed_intent(rock, type_id, volume, 3.0);
+            pending.inputs.waste_probability = 100.0;
+            pending.inputs.waste_volume_multiplier = 10.0;
             let dispatched = AtomicBool::new(false);
             let sde = f.sde.clone();
             let owner = f.owner;

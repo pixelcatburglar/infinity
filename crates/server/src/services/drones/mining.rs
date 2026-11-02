@@ -19,10 +19,8 @@ pub(crate) async fn finish_cycle(_db: &Db, world: &Arc<World>, system: i64, dron
         let Some((source, rock)) = s.ball(id).zip(s.ball(target)) else { return };
         let Some((a, b)) = s.sample_position(id).zip(s.sample_position(target)) else { return };
         if dist(a, b) - f64::from(source.radius) - f64::from(rock.radius) > range { return; }
-        let Some(carry) = s.drone_mining_carry(id, generation) else { return };
-        let (pending, carry_after) = mining::yield_intent(values, carry, target, type_id, volume);
-        if pending.units == 0 { s.drone_fraction(id, generation, carry_after); }
-        else { s.drone_pending(id, generation, pending, carry_after); }
+        let pending = mining::yield_intent(values, target, type_id, volume);
+        s.drone_pending(id, generation, pending);
     }).await;
     Ok(())
 }

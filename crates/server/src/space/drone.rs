@@ -5,14 +5,14 @@
 //! scanResolution (564) rows; both dogma defaults are zero. Zero range adds
 //! no drone-local lock limit, and zero scan resolution locks immediately in
 //! action range. Owner control and action range remain enforced.
-//! Mining fractions and undelivered intents are transient actor state; only a committed
-//! delivery advances the fraction accompanying a whole-unit intent.
+//! Undelivered mining intents are transient actor state.
 //! Automatic aggression is server policy: focus fire selects the lowest eligible
 //! aggressor; otherwise sorted idle drones distribute round-robin by target ID.
 //! The client names these preferences but does not specify a selection algorithm.
 //! Salvage and reconnect commands are not supported by the drone services.
 
 use super::*;
+use crate::services::mining::rounding::{MiningDraws, MiningInputs};
 mod core;
 pub(super) mod automatic;
 pub(super) use core::{DroneBrain, Reservation};
@@ -37,9 +37,9 @@ pub(crate) struct DroneSpec {
 pub(crate) struct PendingMining {
     pub rock: i64,
     pub type_id: i32,
-    pub units: i64,
-    pub waste_units: i64,
-    pub crit_units: i64,
+    pub inputs: MiningInputs,
+    pub unit_volume: f64,
+    pub draws: MiningDraws,
 }
 
 #[derive(Clone)]

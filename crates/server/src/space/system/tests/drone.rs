@@ -224,8 +224,9 @@ fn zero_targeting_attributes_and_positive_shared_lock() {
 }
 
 #[test]
-fn mining_fraction_survives_rejected_and_failed_pending_delivery() {
+fn raw_mining_pending_lifecycle() {
     use crate::space::drone::PendingMining;
+    use crate::services::mining::rounding::{MiningDraws, MiningInputs};
     let mut s = setup();
     let mut target = ball(40, None, 20.0);
     target.signature_radius = Some(1.0);
@@ -237,22 +238,23 @@ fn mining_fraction_survives_rejected_and_failed_pending_delivery() {
     assert!(s.drone_order(30, 20, 10, DroneOrder::Mine(40)));
     s.tick(1100);
     let generation = s.drone(30).unwrap().generation;
-    let pending = PendingMining { rock: 40, type_id: 1, units: 1, waste_units: 0, crit_units: 0 };
-    assert!(s.drone_fraction(30, generation, 0.5));
-    assert!(!s.drone_fraction(30, generation.wrapping_add(1), 0.0));
-    assert!(!s.drone_pending(30, generation.wrapping_add(1), pending.clone(), 0.0));
-    assert_eq!(s.drone_mining_carry(30, generation), Some(0.5));
-    assert!(s.drone_pending(30, generation, pending.clone(), 0.0));
-    s.drone_idle(30, generation);
-    let idle = s.drone(30).unwrap().generation;
-    assert_eq!(s.drone_mining_carry(30, idle), Some(0.5));
+    let pending = PendingMining {
+        rock: 40, type_id: 1, unit_volume: 2.0,
+        inputs: MiningInputs { clamp_factor: 0.5, volume: 3.0, waste_volume_multiplier: 0.2, waste_probability: 4.0, crit_quantity_multiplier: 0.3, crit_probability: 0.4, efficiency: 0.9 },
+        draws: MiningDraws { waste_check: 7, normal_round: 0.1, waste_round: 0.2, crit_check: 0.3, crit_round: 0.4 },
+    };
+    assert!(!s.drone_pending(30, generation.wrapping_add(1), pending.clone()));
+    assert!(s.drone_pending(30, generation, pending.clone()));
+    let stored = s.drone(30).unwrap().pending.unwrap();
+    assert_eq!(format!("{stored:?}"), format!("{pending:?}"));
+    s.drone_delivered(30, generation, true);
+    assert!(s.drone(30).unwrap().pending.is_none());
+    assert_eq!(s.drone(30).unwrap().order, DroneOrder::Mine(40));
     assert!(s.drone_order(30, 20, 10, DroneOrder::Mine(40)));
     s.tick(1200);
     let next = s.drone(30).unwrap().generation;
-    assert!(s.drone_pending(30, next, pending, 0.0));
-    s.drone_delivered(30, next, true);
-    assert_eq!(s.drone_mining_carry(30, next), Some(0.0));
+    assert_ne!(generation, next);
+    assert!(s.drone_pending(30, next, pending));
     s.drone_controller_lost(10);
-    let lost = s.drone(30).unwrap().generation;
-    assert_eq!(s.drone_mining_carry(30, lost), Some(0.0));
+    assert!(s.drone(30).unwrap().pending.is_none());
 }
