@@ -1,6 +1,6 @@
 # AGENT.md: development handbook
 
-These rules apply to anyone changing this repository, coding agents and humans alike. Read this file before making a change, and follow it for every change. [README.md](README.md) covers setup and operation.
+These rules apply to anyone changing this repository, coding agents and humans alike. Read this file before making a change, and follow it for every change. [README.md](README.md) introduces the project; setup, operation, features and development are documented under [docs/](docs/).
 
 ## 1. Non-negotiables
 
@@ -33,7 +33,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
 
 ## 2. Build, test, run
 
-The server crate embeds `crates/server/proto/eve_protos.desc` at compile time; it is committed (see README).
+The server crate embeds `crates/server/proto/eve_protos.desc` at compile time; it is committed (see `docs/setup.md`).
 
 | Task | Command |
 |---|---|
@@ -282,6 +282,7 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
 
 - Make one logical change per commit.
 - Start the message with a short imperative summary line. Use the body to explain why, and which client behaviour the change matches.
-- Update the module `//!` docs, the README (features, limitations, configuration) and this handbook when behaviour or workflow changes.
+- Update the module `//!` docs, the matching guide under `docs/` (features, limitations, configuration, GM commands, development) and this handbook when behaviour or workflow changes.
+- `README.md` is only the project introduction: a summary, the quick start and the list of documents. Feature details, limitations, configuration, operation and development go in `docs/`, never in the README.
 - Do not commit generated or local artifacts: `target/`, logs, client files, editor or tool state.
 - A pull request merges only when CI passes (see Build, test, run).

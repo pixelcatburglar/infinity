@@ -1,0 +1,53 @@
+# Known limitations
+
+- The new player tutorial (AIR NPE) cannot run. Its dungeon layouts and behaviour trees never shipped with the client, so new characters start in their school's station.
+- [Remote service coverage](remote-services.md) lists the client calls that get a fixed answer instead of the feature, or are out of scope. QA starter-system overrides are not provided, so QA character creation uses the normal starter-system allocation, and the legacy petition window offers no character choices before a character is selected.
+- Not supported:
+  - wars declared by one side, which need a war headquarters structure; war allies and surrender; sovereignty, and alliance capital systems and prime time
+  - wallet journals; votes on a new CEO, war, share issue, expulsion or item locks, and acting on a vote's result; dividends paid equally to members
+  - reactions and industry at player structures; NPC stations offer no reaction facility in the client
+  - moon mining observers and the corporation tab of the mining ledger, which stays empty; the personal mining ledger works
+  - fleet boosts, loading a saved fleet setup, removing unqualified members when arranging a wing by ship type, fleet warp to a bookmark, and cynosural beacon broadcasts
+  - beacon counts and faction-warfare kills on the star map
+  - in chat: password-protected channels, granting channel access to a whole corporation or alliance, taking over ownership of a system channel, and the local chat blackout in null-security space
+  - access groups owned by a corporation, and access lists for structures
+  - clone-grade and clone-implant restrictions and planetary colony extraction rules: every character is treated as Omega, and implants stay with the character rather than a jump clone
+  - phone-number binding and its rewards, an external NetEase account service: the binding-success callback is answered but no binding is recorded
+  - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
+  - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
+  - the GM bounty reimbursement and bounty cache calls
+  - drone salvage, and reconnecting to drones whose control was lost; a lost drone stays its owner's and comes back with Return to Drone Bay, and an abandoned drone can be scooped
+  - labels for personal contacts
+  - LP store offers that cost Analysis Kredits: they are listed, but buying one is refused
+  - nanite repair paste, heat repair while tethered, NPC overload, and repairs at structures
+  - mutating items that are fitted, damaged, deployed in space, in a ship maintenance bay or owned by a corporation, and mutaplasmids that need extra inputs; mutated items cannot be renewed or reset
+  - automatic compression, and compression at stations and structures; turning automatic compression on or off is refused with a message
+  - survey scan results pushed by the scanner: the mining overlay gets them through its own scan call
+  - corporation mining ledgers for moon-drilling structures
+  - loot rights: any pilot whose ship is within a wreck's or cargo container's operational distance (2,500 m unless its type sets another) can take from it, and taking from someone else's does not make the pilot a suspect
+  - moving items through another pilot's fleet hangar or ship maintenance bay, and control towers
+  - boarding a ship in space that someone else owns, and taking over its contents
+  - wrecks, insurance payouts and killmails for an unpiloted ship destroyed in space; the ship and its contents are deleted
+- An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
+- Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100). Drones with no targeting range or scan resolution in the static data lock at once within control range.
+- The personal mining ledger starts with mining done after this version is installed.
+- A corporation at war that joins an alliance keeps its war, but the war no longer applies to its pilots, who now fight as the alliance, as the client also shows. The corporation's own CEO or directors can still retract it.
+- Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
+- In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.
+- Fleet bubble broadcasts and fleet warp treat a whole solar system as one grid, because the server keeps one ballpark per system.
+- A pilot who changes corporation or alliance gains or loses access to shared bookmark folders at once, but a shared folder the client already shows stays in its list until the pilot logs in again.
+- Some runtime state lives only in memory and is lost when the server restarts:
+  - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
+  - everything spawned into space except ships (NPCs, wrecks, scheduled effects);
+  - drone orders and control, the drone settings the client sends before each launch, and ore a mining drone is carrying back;
+  - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
+- A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
+- A ship's position in space is saved when its pilot leaves the game, and every 30 seconds while it moves. A crash therefore loses at most the last 30 seconds of movement.
+- A ship's shield charge and its armor and hull damage are saved when it docks, jumps through a gate or wormhole, or is swapped, when its pilot logs off, and with the periodic and shutdown position saves, including ships that are not moving. Damage to an unpiloted ship in space is saved as it happens. Armor and hull damage survive a restart, and shields recharge from the time they were saved. A crash can lose condition changes made since the last periodic save.
+- Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) first stops starting scheduled jobs and gives the running ones up to `scheduler.drain_secs` to finish, then saves the position and condition of every ship in space before it exits. The server waits at most 10 seconds for these writes.
+- Collisions use one sphere per ship or celestial, as the client does by default, not the rendered shape: a ship can bump into empty space near a station, or pass through parts of it that stick out of its sphere. Undocking uses a fixed heading and clearance rather than the station's undock points, so a very large ship can still start overlapping the station. Dynamic orientation, formations and destiny's rarer ball modes are not implemented.
+- Ships have no orientation of their own. A micro jump or a bomb goes along the ship's velocity, or along its last commanded heading when it is stopped, or along a fixed default direction when it has neither.
+- Balances are stored with up to 36 digits (ISK: 34 integer digits and 2 decimal places; PLEX: 36 integer digits), and the server works with the full value. The client is sent at most the largest balance it displays without scientific notation: 1,000,000,000,000,000,000 ISK for a character wallet, 9,223,372,036,854,774,784 ISK for a corporation wallet, and 99,999,999,999,999 PLEX. ISK reaches the client as a double, so above about 45 trillion ISK it can no longer show every cent.
+- Injector diminishing returns are calculated per unit from the character's skill-point total, rounded down; one non-diminishing charge exempts one large or small injector, not a mini injector.
+- A booster lasts its type's duration with the modifiers the static data defines. The current data defines no skill modifier for booster duration, so Biology does not lengthen boosters. A booster consumed before boosters had an expiry keeps an unknown expiry.
+- A `/dogma` override changes every value the server computes. The client's fitting window and HUD show it only for an attribute the ship's hull type has; for a module, or a ship attribute the hull type lacks, they keep showing the type's value, while Show Info in space shows the new one. The command's reply says so.
