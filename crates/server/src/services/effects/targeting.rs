@@ -1,9 +1,9 @@
 //! Automatic and passive acquisition through the shared combat targeting path.
 //! Passive targeting mirrors dogma/pythonEffects/migratedeffects.py AddTargetEx.
-//! Candidates are current incoming locks; no unrelated nearby ships are targeted.
+//! Candidates are current incoming locks from combat's shared targeter query; no unrelated nearby ships are targeted.
 use super::{lifecycle::{Cycle, CycleOutcome, Module}, registry::Effect, EffectKind};
 use crate::messages;
-use crate::services::{combat::{state, Ctx}, combat::targeting_charges::{add_target_for_cycle, targeters_of}, fit::Fit, user_error, CallError};
+use crate::services::{combat::{self, state, Ctx}, combat::targeting_charges::add_target_for_cycle, fit::Fit, user_error, CallError};
 use std::sync::{Arc, atomic::Ordering};
 
 pub(super) async fn validate(cx: &Ctx, _fit: &Fit, _module: &Module, effect: &Effect, target: Option<i64>) -> Result<(), CallError> {
@@ -26,15 +26,7 @@ pub(super) async fn start(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<Cyc
         let target = cycle.target.ok_or_else(|| user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]))?;
         add_target_for_cycle(cx, target, true, master, cycle.stop.clone()).await?;
     } else {
-        let ship = cx.ship_id;
-        let incoming = targeters_of(ship);
-        let candidates = cx.world.with(cx.system_id, move |s| {
-            let mut candidates = s.hostiles_targeting(ship);
-            candidates.extend(incoming.into_iter().filter_map(|pilot| s.pilot_ball(pilot).map(|ball| ball.id)));
-            candidates.sort_unstable();
-            candidates.dedup();
-            candidates
-        }).await.unwrap_or_default();
+        let candidates = combat::targeters(&cx.world, cx.system_id, cx.ship_id).await;
         for target in candidates {
             if cycle.stop.load(Ordering::Relaxed) || !state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &cycle.stop)) { break; }
             let _ = add_target_for_cycle(cx, target, false, master, cycle.stop.clone()).await;

@@ -18,6 +18,59 @@ fn npc_zero_falloff_hits_inside_optimal() {
 }
 
 #[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn targeters_maps_live_pilots_and_merges_npc_ball_ids() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let world = World::new(db, sde, 1);
+    let system = -482_000;
+    let ship = -482_001;
+    let (pilot_a, pilot_b, stale, victim_pilot) = (-482_011, -482_012, -482_013, -482_014);
+    let (ball_a, ball_b, npc) = (-482_021, -482_023, -482_022);
+    let test_world = world.clone();
+    let result = tokio::spawn(async move {
+        for (id, pilot) in [(ship, victim_pilot), (ball_a, pilot_a), (ball_b, pilot_b)] {
+            let mut ball = remote_repair_db::ball(id, 1, pilot);
+            ball.signature_radius = Some(1.0);
+            test_world.add_ship(system, ball).await.unwrap();
+        }
+        let mut npc_ball = remote_repair_db::ball(npc, 1, 1);
+        npc_ball.char_id = None;
+        test_world.add_ship(system, npc_ball).await.unwrap();
+        {
+            let mut st = state();
+            for pilot in [pilot_a, pilot_b, stale] {
+                st.targets.insert(pilot, HashSet::from([ship]));
+            }
+        }
+        test_world.with(system, move |s| {
+            for id in [npc, ball_a] {
+                let mut brain = crate::space::NpcBrain::new(None, crate::space::NpcConfig {
+                    fly_range: 1.0, aggro_range: 1e9, rate_of_fire_ms: 1e9,
+                    scan_resolution: 1.0, repairs: (0.0, 0.0, 1000.0),
+                }, Arc::new(|_| Box::pin(async {})));
+                brain.target = Some((ship, victim_pilot, 0));
+                brain.announced = true;
+                assert!(s.add_npc(id, brain));
+            }
+        }).await.unwrap();
+        assert_eq!(targeters(&test_world, system, ship).await, vec![ball_b, npc, ball_a]);
+        assert!(targeters(&test_world, system - 1, ship).await.is_empty());
+    }).await;
+    {
+        let mut st = state();
+        for pilot in [pilot_a, pilot_b, stale] {
+            st.targets.remove(&pilot);
+        }
+    }
+    for id in [ball_a, ball_b, npc, ship] {
+        world.remove_ball(system, id).await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn npc_projected_weapon_attributes_change_application() {
     use crate::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,

@@ -30,6 +30,7 @@
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Explicit lock removal also removes the matching outgoing projected effects.
+//! The shared incoming-targeter query combines player locks and NPC hostiles as ball IDs.
 //! Ship condition is persisted in game.item_attributes, with shield recharge time on
 //! the shield override; capacitor and in-flight effects remain runtime-only.
 //! Space damage, repair and GM condition changes serialize with final condition saves;
@@ -262,6 +263,18 @@ pub async fn banks(db: &(impl Executor + ?Sized), ship: i64) -> Result<Value, Ca
         }
     }
     Ok(Value::Dict(by_master.into_iter().map(|(m, s)| (Value::Int(m), Value::List(s))).collect()))
+}
+
+pub(super) async fn targeters(world: &World, system: i64, ship: i64) -> Vec<i64> {
+    let incoming = targeters_of(ship);
+    let candidates = world.with(system, move |s| {
+        let mut candidates = s.hostiles_targeting(ship);
+        candidates.extend(incoming.into_iter().filter_map(|pilot| s.pilot_ball(pilot).map(|ball| ball.id)));
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    }).await.unwrap_or_default();
+    candidates
 }
 
 pub fn ship_condition(ship: i64) -> Option<(f64, f64, f64)> {
