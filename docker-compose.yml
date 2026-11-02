@@ -33,6 +33,7 @@ services:
       CONFIG: /config.toml
       DATABASE_URL: postgres://infinity:infinity@db/infinity
       RUST_LOG: ${RUST_LOG:-info,infinity_server=debug}
+      # LOG_DIR: /data/logs
       # Pilots in space per solar system before stargate jumps queue; 0 = no limit.
       SYSTEM_CAPACITY: ${SYSTEM_CAPACITY:-0}
     command: ["infinity-server"]
@@ -45,6 +46,7 @@ services:
     volumes:
       - ./config.example.toml:/config.toml:ro
       - images:/data/images
+      # - ./logs:/data/logs
     depends_on:
       db:
         condition: service_healthy

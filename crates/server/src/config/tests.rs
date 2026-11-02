@@ -237,6 +237,40 @@ fn deployment_environment_wins_but_game_environment_is_ignored() {
 }
 
 #[test]
+fn logging_defaults_and_rotation_validation() {
+    let fixture = Fixture::new();
+    let defaults = Config::load_with(&fixture.path(), |_| None).expect("loading defaults");
+    assert_eq!(defaults.logging.dir, "");
+    assert_eq!(defaults.logging.rotation, "daily");
+    assert_eq!(defaults.logging.keep_files, 14);
+
+    for rotation in ["minutely", "hourly", "daily", "never"] {
+        fixture.write(&format!("[logging]\nrotation = '{rotation}'\nkeep_files = 1\n"));
+        Config::load_with(&fixture.path(), |_| None).expect("supported rotation");
+    }
+    let error = load_error("[logging]\nrotation = 'weekly'");
+    assert!(error.contains("logging.rotation") && error.contains("weekly"), "{error}");
+    for rotation in ["daily", "never"] {
+        let error = load_error(&format!("[logging]\nrotation = '{rotation}'\nkeep_files = 0"));
+        assert!(error.contains("logging.keep_files") && error.contains('0'), "{error}");
+    }
+}
+
+#[test]
+fn logging_directory_environment_overrides_file_including_empty() {
+    let fixture = Fixture::new();
+    fixture.write("[logging]\ndir = 'file-logs'\n");
+    let from_file = Config::load_with(&fixture.path(), |_| None).expect("loading file directory");
+    assert_eq!(from_file.logging.dir, "file-logs");
+    for dir in ["environment-logs", ""] {
+        let config = Config::load_with(&fixture.path(), |key| {
+            (key == "LOG_DIR").then(|| dir.to_owned())
+        }).expect("loading directory override");
+        assert_eq!(config.logging.dir, dir);
+    }
+}
+
+#[test]
 fn missing_file_matches_complete_example_and_defaults() {
     let fixture = Fixture::new();
     let missing = Config::load_with(&fixture.path(), |_| None).expect("missing file uses defaults");
