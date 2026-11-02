@@ -596,6 +596,12 @@ pub(crate) const MSG_CHAR_NAME_INVALID: &str = "CharNameInvalid";
 pub(crate) const MSG_COMBINE_SKILL_INJECTOR_TOO_FEW_INJECTORS: &str = "CombineSkillInjectorTooFewInjectors";
 /// Client `eve/client/script/ui/services/skillsvc.py:774-776` skillbook validation.
 pub(crate) const MSG_ITEM_NOT_A_SKILL: &str = "ItemNotASkill";
+/// Client characterskills/common/purchase.py: duplicate purchase request.
+pub(crate) const MSG_SKILL_PURCHASE_UNKNOWN_ERROR: &str = "SkillPurchaseUnknownError";
+/// Client characterskills/common/purchase.py: skill unavailable for purchase.
+pub(crate) const MSG_SKILL_UNAVAILABLE_FOR_PURCHASE: &str = "SkillUnavailableForPurchase";
+/// Client characterskills/common/purchase.py: skill already learned.
+pub(crate) const MSG_CHARACTER_ALREADY_KNOWS_SKILL: &str = "CharacterAlreadyKnowsSkill";
 /// Client message `ConContractNotFound`.
 pub(crate) const MSG_CON_CONTRACT_NOT_FOUND: &str = "ConContractNotFound";
 /// Client message `ConContractNotOutstanding`.

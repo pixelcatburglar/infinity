@@ -22,6 +22,16 @@ fn assembly_requires_every_requested_list() {
 }
 
 #[test]
+fn purchase_list_is_required_at_startup() {
+    let ids = HashSet::from(REQUIRED_LISTS);
+    let error = match TypeLists::from_rows(&ids, vec![list(NON_TRADABLE_LIST), list(SOULBOUND_LIST)]) {
+        Ok(_) => panic!("missing purchase list was accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains(&TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE.to_string()));
+}
+
+#[test]
 fn membership_obeys_client_precedence() {
     let lists = TypeLists([(1, list(1))].into_iter().collect());
     assert!(lists.contains(1, 3, None, Some(20)));

@@ -22,6 +22,7 @@ mod history;
 mod free_points;
 pub(crate) mod books;
 mod learning;
+mod purchase;
 mod trading;
 mod respec;
 #[cfg(test)]
