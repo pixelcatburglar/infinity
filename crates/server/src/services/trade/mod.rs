@@ -47,9 +47,9 @@ pub(crate) async fn on_leave(c: &Client) -> Result<(), CallError> {
 }
 
 /// The caller holds the economy lock through the subsequent departure.
-pub(crate) async fn on_leave_locked(c: &Client) -> Result<(), CallError> {
-    let Some(char_id) = c.session.int("charid") else { return Ok(()) };
-    settle::leave_locked(&c.db, &c.world, c.sde.clone(), char_id).await
+pub(crate) async fn on_leave_locked(db: &crate::db::Db, world: &World, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64) -> Result<(), CallError> {
+    if char_id == 0 { return Ok(()); }
+    settle::leave_locked(db, world, sde.clone(), char_id).await
 }
 
 pub(crate) async fn recover(db: &crate::db::Db, world: &World, sde: std::sync::Arc<crate::sde::Sde>) -> Result<(), CallError> {

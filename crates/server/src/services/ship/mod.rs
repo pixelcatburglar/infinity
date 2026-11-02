@@ -82,7 +82,8 @@ fn f(v: Option<&Value>) -> f64 {
 
 /// Construct the selected ship using its pilot's fit and live projections.
 pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
-    balls::selected(c, ship_id, pos).await
+    balls::selected(&Identity::of_client(c), &c.db, &c.world, &c.sde,
+        c.session.int("solarsystemid"), c.session.int("allianceid"), ship_id, pos).await
 }
 
 /// Refuse docking and gate jumps while the pilot's weapons timer runs (crimewatch).

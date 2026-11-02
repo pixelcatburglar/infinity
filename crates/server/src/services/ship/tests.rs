@@ -274,8 +274,8 @@ async fn headless_docking_returns_session_and_event() {
         station.pos = [3551.0, 0.0, 0.0];
         station.old_pos = station.pos;
         w.with(system, move |s| { s.insert(vessel); s.insert(station); }).await.unwrap();
-        let identity = Identity { char_id: character, ship_id: Some(hull) };
-        let missing_ship = Identity { char_id: character, ship_id: None };
+        let identity = Identity { char_id: character, ship_id: Some(hull), corp_id: 0, station_id: None, system_id: None };
+        let missing_ship = Identity { char_id: character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
         for (pilot, space_system) in [(&identity, None), (&missing_ship, Some(system)), (&identity, Some(system))] {
             assert!(matches!(dock(pilot, &d, &w, space_system, station_id, None::<&mut Client>).await,
                 Err(CallError::User { msg, .. }) if msg == messages::MSG_DOCKING_REQUEST_DENIED));
@@ -343,9 +343,99 @@ async fn headless_docking_returns_session_and_event() {
         vessel.old_vel = vessel.vel;
         vessel.segment_acceleration = None;
         w.with(system, move |s| s.insert(vessel)).await.unwrap();
-        let no_character = Identity { char_id: 0, ship_id: Some(hull) };
+        let no_character = Identity { char_id: 0, ship_id: Some(hull), corp_id: 0, station_id: None, system_id: None };
         let change = dock(&no_character, &d, &w, Some(system), station_id, None::<&mut Client>).await.ok().unwrap();
         assert!(change.event.is_none());
+    }).await;
+    world.remove_ball(system, hull).await;
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
+    use std::{future::{poll_fn, Future}, sync::Arc, task::Poll};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let station = sde.map.stations().find(|s| s.solar_system_id.is_some() && sde.map.celestial(s.station_id)
+        .is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some())).expect("station celestial");
+    let (station_id, system) = (station.station_id, station.solar_system_id.unwrap());
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,$3) RETURNING character_id", &[&account, &station_id, &system]).await.unwrap().get("character_id");
+    let hull = crate::dao::items::creation::rookie_ship(&db, TYPE_CAPSULE, character, station_id, FLAG_HANGAR).await.unwrap();
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    let d = db.clone();
+    let w = world.clone();
+    let result = tokio::spawn(async move {
+        let identity = Identity { char_id: character, ship_id: Some(hull), corp_id: 1, station_id: Some(station_id), system_id: Some(system) };
+        for missing in [
+            Identity { station_id: None, ..identity },
+            Identity { system_id: None, ..identity },
+            Identity { ship_id: None, ..identity },
+        ] {
+            assert!(matches!(ship::undock(&missing, &d, &w, &sde, None, None).await,
+                Err(CallError::User { msg, .. }) if msg == messages::MSG_CANT_UNDOCK_NOT_IN_STATION));
+        }
+        let expected = balls::selected(&identity, &d, &w, &sde, None, None, hull, [0.0; 3]).await.expect("load headless undock ball");
+        let undocked = ship::undock(&identity, &d, &w, &sde, None, None).await.expect("headless undock");
+        assert_eq!(undocked.change.updates, vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
+        assert!(matches!(undocked.change.event, Some(GameEvent::Undocked { char_id, ship_id, station_id: st, system_id }) if (char_id, ship_id, st, system_id) == (character, hull, station_id, system)));
+        let waiting = crate::services::market::lock();
+        tokio::pin!(waiting);
+        assert!(poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+        let row = d.query_one("SELECT location_id, flag_id, x, y, z FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+        assert_eq!((row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (system, 0));
+        let position = [row.get::<_, f64>("x"), row.get::<_, f64>("y"), row.get::<_, f64>("z")];
+        let row = d.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+        assert_eq!((row.get::<_, Option<i64>>("station_id"), row.get::<_, i64>("solar_system_id")), (None, system));
+        let ball = w.with(system, move |s| s.ball(hull).cloned()).await.unwrap().unwrap();
+        assert_eq!(ball.pos, position);
+        assert_eq!((ball.mass, ball.max_vel, ball.agility, ball.signature_radius), (expected.mass, expected.max_vel, expected.agility, expected.signature_radius));
+        drop(undocked.economy);
+        drop(waiting.await);
+        w.remove_ball(system, hull).await;
+        item_dao::dock(&d, hull, station_id, FLAG_HANGAR).await.unwrap();
+        character_dao::dock(&d, character, station_id, system).await.unwrap();
+        let expected_space = balls::selected(&identity, &d, &w, &sde, Some(system), None, hull, [0.0; 3]).await.expect("load RPC undock ball");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, address) = listener.accept().await.unwrap();
+        let cfg = Arc::new(crate::config::Config::default());
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
+        let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
+        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde.clone(), chat, w.clone(), login);
+        client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("stationid", Value::Int(station_id)), ("solarsystemid2", Value::Int(system)), ("solarsystemid", Value::Int(system))]);
+        let call = Call { service: "ship", method: "Undock", args: &[], kwargs: &Value::None, bound: false, bind_params: None };
+        crate::services::dispatch(&mut client, &call).await.expect("dispatch undock RPC");
+        assert_eq!(client.session.int("stationid"), None);
+        assert_eq!(client.session.int("solarsystemid"), Some(system));
+        assert!(client.outbox.iter().any(|packet| packet.command == crate::macho::cmd::SESSIONCHANGENOTIFICATION));
+        let rpc_ball = w.with(system, move |s| s.ball(hull).cloned()).await.unwrap().unwrap();
+        assert_eq!((rpc_ball.mass, rpc_ball.max_vel, rpc_ball.agility, rpc_ball.signature_radius), (expected_space.mass, expected_space.max_vel, expected_space.agility, expected_space.signature_radius));
+        w.remove_ball(system, hull).await;
+        item_dao::dock(&d, hull, station_id, FLAG_HANGAR).await.unwrap();
+        assert!(d.query_opt("SELECT character_id FROM game.characters WHERE character_id=$1", &[&0i64]).await.expect("check anonymous character").is_none());
+        let missing_bloodline = crate::dao::characters::attributes::bloodline(&d, 0).await.expect_err("anonymous character has no bloodline");
+        let before = d.query_one("SELECT location_id, flag_id, x, y, z FROM game.items WHERE item_id=$1", &[&hull]).await.expect("read docked hull before anonymous undock");
+        let anonymous = Identity { char_id: 0, ..identity };
+        match ship::undock(&anonymous, &d, &w, &sde, None, None).await {
+            Err(CallError::Internal(error)) => assert_eq!(error.to_string(), missing_bloodline.to_string(), "anonymous undock must fail loading the missing character's bloodline"),
+            Err(error) => panic!("anonymous undock returned unexpected error: {error:?}"),
+            Ok(_) => panic!("anonymous undock unexpectedly succeeded without a character"),
+        }
+        let after = d.query_one("SELECT location_id, flag_id, x, y, z FROM game.items WHERE item_id=$1", &[&hull]).await.expect("read docked hull after anonymous undock");
+        assert_eq!((after.get::<_, i64>("location_id"), after.get::<_, i32>("flag_id")), (station_id, FLAG_HANGAR));
+        for column in ["x", "y", "z"] {
+            assert_eq!(after.get::<_, Option<f64>>(column), before.get::<_, Option<f64>>(column));
+        }
+        let row = d.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&character]).await.expect("read character after anonymous undock");
+        assert_eq!((row.get::<_, Option<i64>>("station_id"), row.get::<_, i64>("solar_system_id")), (None, system));
+        assert!(w.with(system, move |s| s.ball(hull).is_none()).await.expect("inspect system after anonymous undock"));
     }).await;
     world.remove_ball(system, hull).await;
     db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();

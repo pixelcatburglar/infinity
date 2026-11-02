@@ -5,12 +5,12 @@
 //! Unpiloted hulls have no pilot or security status.
 
 use std::sync::Arc;
-use crate::client::Client;
 use crate::consts::dogma::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS};
 use crate::dao::items::space_ships::FreeShip;
 use crate::db::executor::Executor;
+use crate::db::Db;
 use crate::sde::Sde;
-use crate::services::{combat, crimewatch, db_err, fit::{Fit, Key}, CallError};
+use crate::services::{combat, crimewatch, db_err, fit::{Fit, Key}, identity::Identity, CallError};
 use crate::space::{self, now_ms, Ball, MODE_STOP};
 use marshal::Value;
 
@@ -36,18 +36,19 @@ impl PreparedShip {
     }
 }
 
-pub(super) async fn selected(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
-    let type_id = super::required(crate::dao::items::inventory::type_id(&c.db, ship_id).await.map_err(db_err)?, "ship item")?;
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let fit = if let Some(system) = c.session.int("solarsystemid") {
-        Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
+pub(super) async fn selected(identity: &Identity, db: &Db, world: &space::World, sde: &Arc<Sde>,
+    space_system: Option<i64>, alliance_id: Option<i64>, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
+    let type_id = super::required(crate::dao::items::inventory::type_id(db, ship_id).await.map_err(db_err)?, "ship item")?;
+    let char_id = identity.char_id;
+    let fit = if let Some(system) = space_system {
+        Fit::load_in_space(db, world, system, char_id, ship_id).await?
     } else {
-        Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
+        Fit::load(db, sde.clone(), char_id, ship_id).await?
     };
-    let security = crimewatch::security_status(&c.db, char_id).await?;
-    let health = combat::load_condition_with_fit(&c.db, ship_id, &fit).await?;
-    build(&c.sde, ship_id, type_id, char_id, c.session.int("corpid").unwrap_or(0),
-        c.session.int("allianceid").unwrap_or(-1), Some(char_id), pos, &fit, health, Some(security))
+    let security = crimewatch::security_status(db, char_id).await?;
+    let health = combat::load_condition_with_fit(db, ship_id, &fit).await?;
+    build(sde, ship_id, type_id, char_id, identity.corp_id,
+        alliance_id.unwrap_or(-1), Some(char_id), pos, &fit, health, Some(security))
 }
 
 /// Prepare an unpiloted persistent ship without publishing its condition.
