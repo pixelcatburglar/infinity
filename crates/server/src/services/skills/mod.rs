@@ -21,6 +21,7 @@ pub(crate) mod gm;
 mod history;
 mod free_points;
 pub(crate) mod books;
+mod learning;
 mod trading;
 mod respec;
 #[cfg(test)]

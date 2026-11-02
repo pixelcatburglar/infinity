@@ -1,15 +1,12 @@
 //! Atomic book injection and start-training for skillsvc.py and dogmaIM.
 //! Uses startup SDE prerequisites and game items, skills, history and queue.
-use super::{db_err, requirements::requirements, trading::{consume, refusal, source}, training, CallError};
-use crate::{client::{filetime_now, Client}, consts::CATEGORY_SKILL, dao::skills::{history, trading, training as skill_dao}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{effects::online::{self, OnlineChanged}, user_error}};
+use super::{db_err, learning, requirements::requirements, trading::{consume, refusal, source}, training, CallError};
+use crate::{client::{filetime_now, Client}, consts::CATEGORY_SKILL, dao::skills::training as skill_dao, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{effects::online::{self, OnlineChanged}, user_error}};
 use marshal::Value;
 use std::{collections::{BTreeSet, HashMap}, sync::Arc};
 
 async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, ids: &[i64], now: i64, start: Option<i64>) -> Result<Value, CallError> {
-    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-    let progress = super::completion::advance_tx(tx, outbox, sde, char_id, now).await?;
-    let accrued = training::in_training_sp(tx, char_id, now).await?;
-    skill_dao::write_skills(tx, char_id, &training::plan_skills(&[], accrued)).await.map_err(db_err)?;
+    let progress = learning::begin_tx(tx, outbox, sde, char_id, now).await?;
     let known: HashMap<_, _> = skill_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| (s.type_id, s.level)).collect();
     let mut types = BTreeSet::new();
     let mut items = Vec::new();
@@ -26,10 +23,7 @@ async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChan
     for item in items {
         consume(tx, outbox, item, 1).await?;
     }
-    for &type_id in &types {
-        if !trading::learn(tx, char_id, type_id).await.map_err(db_err)? { return Err(refusal()); }
-        history::append(tx, char_id, type_id, super::history::INJECTED, 0, now).await.map_err(db_err)?;
-    }
+    learning::learn_tx(tx, char_id, &types, now).await?;
     let changed: Vec<_> = types.into_iter().collect();
     if start.is_some() {
         let type_id = *changed.first().ok_or_else(refusal)?;
