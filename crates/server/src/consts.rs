@@ -112,6 +112,8 @@ pub const CATEGORY_STARBASE: i32 = 23;
 pub const CATEGORY_STRUCTURE: i32 = 65;
 /// SDE invCategories: Skill.
 pub const CATEGORY_SKILL: i32 = 16;
+/// evetypes/const.py: skills available for direct purchase.
+pub const TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE: i64 = 93;
 /// SDE invCategories: Drone.
 pub const CATEGORY_DRONE: i32 = 18;
 /// Mass of most published 5 m³ drones in the static data; used when a drone type has no positive mass.

@@ -4,6 +4,7 @@
 //! History, remaps and augmentations are persisted; penalties remain fixed answers.
 //! `CharStartTrainingSkill` accepts an accessible unlearned book item and its
 //! location (`skillsvc.py:763-767`); learned skills have no item identity here.
+//! Direct skill purchases use imported availability and prices without prerequisites.
 //! Injector diminishing and rounding are server policy, not a native algorithm.
 use super::*;
 use super::attributes::character_attributes;
@@ -43,6 +44,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         (SKILL_HANDLER, "ApplyFreeSkillPoints") => super::free_points::apply(c, me, call.args).await,
         (SKILL_HANDLER, "CharStartTrainingSkill") => super::books::start_training(c, me, call.args).await,
+        (SKILL_HANDLER, "PurchaseSkills") => super::purchase::purchase(c, me, call.args, call.kwargs).await,
         (SKILL_HANDLER, "GetSkillPoints") => match crate::dao::skills::training::total(&c.db, me).await
         {
             Ok(points) => Ok(Value::Int(points)),

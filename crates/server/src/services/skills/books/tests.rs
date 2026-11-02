@@ -1,6 +1,6 @@
 //! Real skillbook settlement and rollback coverage.
 use super::*;
-use crate::dao::skills::queue;
+use crate::dao::skills::{history, queue};
 use crate::services::tests::{client, fixture};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 

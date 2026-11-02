@@ -118,3 +118,11 @@ Epic-arc availability follows the selected character's active missions and unloc
 | mailMgr | MarkAsReadByList | handled | `crates/server/src/services/mail/mail_mgr.rs` |
 | mailMgr | MarkAsUnreadByList | handled | `crates/server/src/services/mail/mail_mgr.rs` |
 | mailMgr | MoveToTrashByList | handled | `crates/server/src/services/mail/mail_mgr.rs` |
+
+## Skills
+
+| service | method | status | handler file |
+|---|---|---|---|
+| skillHandler | PurchaseSkills | handled | `crates/server/src/services/skills/purchase.rs` |
+
+The bound skill handler returns the bought type IDs in request order and sends the same committed skill updates as skillbook injection. Skills in the client's hidden skill groups cannot be bought.

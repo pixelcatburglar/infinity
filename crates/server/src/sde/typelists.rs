@@ -1,20 +1,23 @@
-//! Trade restriction and compressor type lists from `sde_native.typelist`.
+//! Trade restriction, direct skill purchase and compressor type lists from `sde_native.typelist`.
 //! Membership follows `evetypes/__init__.py:GetTypeIDsFromTypeList`; other lists are not loaded.
-//! Startup fails if any requested trade or compressor list is missing.
+//! Startup fails if any requested trade, purchase or compressor list is missing.
 use std::collections::{HashMap, HashSet};
-use crate::{consts::dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, dao::sde::typelists as dao, db::Db};
+use crate::{consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE}, dao::sde::typelists as dao, db::Db};
 use super::types::Types;
 
 /// inventoryrestrictions/common/checks.py: non-tradable type list.
 const NON_TRADABLE_LIST: i64 = 36;
 /// inventoryrestrictions/common/checks.py: soulbound type list.
 const SOULBOUND_LIST: i64 = 142;
+/// Startup lists required by inventoryrestrictions/common/checks.py trade restrictions
+/// and evetypes/const.py direct skill purchase availability.
+const REQUIRED_LISTS: [i64; 3] = [NON_TRADABLE_LIST, SOULBOUND_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE];
 
 pub(crate) struct TypeLists(HashMap<i64, dao::TypeList>);
 
 impl TypeLists {
     pub(crate) async fn load(db: &Db, types: &Types) -> anyhow::Result<Self> {
-        let mut ids = HashSet::from([NON_TRADABLE_LIST, SOULBOUND_LIST]);
+        let mut ids = HashSet::from(REQUIRED_LISTS);
         for value in types.iter().filter_map(|ty| ty.attribute(ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST)) {
             anyhow::ensure!(value.is_finite() && value > 0.0 && value.fract() == 0.0 && value < i64::MAX as f64, "invalid compressor type-list attribute: {value}");
             ids.insert(value as i64);
