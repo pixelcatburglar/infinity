@@ -16,7 +16,7 @@ async fn list_shows_script_roots() {
         let extra = task_dir.join("extra");
         std::fs::create_dir(&primary).unwrap();
         std::fs::create_dir(&extra).unwrap();
-        std::fs::write(primary.join("primary.lua"), "").unwrap();
+        std::fs::write(primary.join("primary.lua"), "register.tick{name='heartbeat', interval_ms=100, fn=function(now) end}").unwrap();
         std::fs::write(extra.join("extra.lua"), "").unwrap();
         let world = World::new(db.clone(), sde.clone(), 1);
         let mut config = Config::default();
@@ -33,6 +33,7 @@ async fn list_shows_script_roots() {
         let list = command(&mut client, "lua", &["list".into()]).await.unwrap().unwrap();
         assert!(list.contains(&format!("script: primary root={}", primary.canonicalize().unwrap().display())));
         assert!(list.contains(&format!("script: extra root={}", extra.canonicalize().unwrap().display())));
+        assert!(list.contains("primary: tick heartbeat interval_ms=100 skipped=0"));
         drop(peer);
     }).await;
     std::fs::remove_dir_all(&dir).unwrap();

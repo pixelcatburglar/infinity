@@ -74,6 +74,7 @@ fn retained_registration_is_closed_for_all_claims() -> mlua::Result<()> {
         "saved.command{name='other', help='', gm=false, fn=function() end}",
         "saved.event('BallparkBound', function() end)",
         "saved.intercept('s', 'm', function() end)",
+        "saved.tick{name='late', interval_ms=100, fn=function() end}",
     ] {
         assert!(lua.load(expression).set_environment(env.clone()).exec().unwrap_err().to_string().contains("registration is closed"));
     }
@@ -99,6 +100,31 @@ fn event_and_intercept_registration_validate_claims() -> mlua::Result<()> {
     assert!(lua.load("register.intercept('*','m', function() end)").set_environment(a).exec().is_err());
     let error = lua.load("register.intercept('s','m', function() end)").set_environment(b).exec().unwrap_err().to_string();
     assert!(error.contains("first") && error.contains("second"));
+    Ok(())
+}
+
+#[test]
+fn tick_registration_validates_and_scopes_names() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let claims = Arc::new(Mutex::new(Claims::default()));
+    let a = lua.create_table()?;
+    let b = lua.create_table()?;
+    register_claims(&lua, &a, claims.clone(), "first".into(), Arc::new(AtomicBool::new(true)))?;
+    register_claims(&lua, &b, claims.clone(), "second".into(), Arc::new(AtomicBool::new(true)))?;
+    for spec in [
+        "name='', interval_ms=100, fn=function() end",
+        "name='a', interval_ms=99, fn=function() end",
+        "name='a', interval_ms=100.5, fn=function() end",
+        "name='a', interval_ms='100', fn=function() end",
+        "name='a', interval_ms=100, fn=1",
+    ] {
+        assert!(lua.load(format!("register.tick{{{spec}}}")).set_environment(a.clone()).exec().is_err(), "{spec}");
+    }
+    let source = "register.tick{name='a', interval_ms=100, fn=function() end}";
+    lua.load(source).set_environment(a.clone()).exec()?;
+    assert!(lua.load(source).set_environment(a).exec().is_err());
+    lua.load(source).set_environment(b).exec()?;
+    assert_eq!(claims.lock().unwrap().ticks.len(), 2);
     Ok(())
 }
 

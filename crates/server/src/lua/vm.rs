@@ -6,7 +6,10 @@ use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Orderin
 use anyhow::{Context, Result};
 use mlua::{chunk::ChunkMode, Function, HookTriggers, Lua, Table, Thread, VmState};
 use crate::config::lua::LuaConfig;
-use super::{host, registry::{Claims, Command, Handler, Registry}, value};
+use super::{host, registry::{Claims, Command, Handler, Registry, Tick}, value};
+
+/// The space actor loop cadence is 100 ms (space/actor.rs).
+const MIN_TICK_INTERVAL_MS: u64 = 100;
 
 fn install_budget(thread: &Thread, maximum: u64, interval: u64, deadline: Instant) -> mlua::Result<()> {
     let count = AtomicU64::new(0);
@@ -139,6 +142,32 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
         claims.commands.insert(name, command);
         Ok(())
     })?)?;
+    let tick_claims = claims.clone();
+    let tick_script = script.clone();
+    let tick_open = open.clone();
+    register.set("tick", lua.create_function(move |_, spec: Table| {
+        if !tick_open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
+        let name = match spec.get::<mlua::Value>("name")? {
+            mlua::Value::String(name) => name.to_str()?.to_owned(),
+            _ => return Err(mlua::Error::runtime("tick name must be a string")),
+        };
+        if name.is_empty() { return Err(mlua::Error::runtime("tick name must not be empty")); }
+        let milliseconds = match spec.get::<mlua::Value>("interval_ms")? {
+            mlua::Value::Integer(value) if value >= MIN_TICK_INTERVAL_MS as i64 => value as u64,
+            _ => return Err(mlua::Error::runtime(format!("tick interval_ms must be an integer of at least {MIN_TICK_INTERVAL_MS}"))),
+        };
+        let interval = Duration::from_millis(milliseconds);
+        if Instant::now().checked_add(interval).is_none() || tokio::time::Instant::now().checked_add(interval).is_none() {
+            return Err(mlua::Error::runtime("tick interval exceeds timer range"));
+        }
+        let function: Function = spec.get("fn")?;
+        let mut claims = tick_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        if claims.ticks.iter().any(|tick| tick.handler.script == tick_script && tick.name == name) {
+            return Err(mlua::Error::runtime(format!("duplicate tick {name} in {tick_script}")));
+        }
+        claims.ticks.push(Tick { handler: Handler { script: tick_script.clone(), function }, name, interval, skipped: AtomicU64::new(0) });
+        Ok(())
+    })?)?;
     register.set("event", lua.create_function(move |_, (name, function): (String, Function)| {
         if !open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
         if !super::events::known_kind(&name) { return Err(mlua::Error::runtime(format!("unsupported event {name}"))); }
@@ -209,6 +238,9 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
     }
     for (event, handlers) in &claims.events {
         for handler in handlers { tracing::info!(script = %handler.script, event, "Lua event claim"); }
+    }
+    for tick in &claims.ticks {
+        tracing::info!(script = %tick.handler.script, name = %tick.name, interval_ms = tick.interval.as_millis(), "Lua tick claim");
     }
     Ok(Registry { lua, claims, overrides: Mutex::new(Default::default()) })
 }
