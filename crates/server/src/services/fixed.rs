@@ -2,6 +2,10 @@
 //! Mirrors client remote-service calls; no database or state is accessed.
 //! Stateful and argument-dependent services are handled by their feature modules;
 //! personal contact label management and corporation item lockdown votes are unsupported.
+//! `eve/client/script/ui/services/ccSvc.py` uses an empty QA starter-system list
+//! to retain ordinary allocation; QA overrides are unavailable.
+//! `eve/client/script/ui/shared/neocom/petitionWindow.py` receives no character
+//! choices before selection; this does not implement the rest of petitions.
 
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
@@ -213,6 +217,11 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
         ("machoNet", "GetServiceInfo") => Ok(Value::Dict(vec![])),
         ("air_npe", "is_air_npe_enabled") => Ok(Value::Bool(false)),
 
+        // ccSvc.py:_QAPickStarterSystem sorts the IDs and uses normal allocation when empty.
+        ("charUnboundMgr", "GetQAStarterSystemIDs") => Ok(Value::list([])),
+        // petitionWindow.py:CategoryScreen iterates characterID and characterName before selection.
+        ("charUnboundMgr", "GetCharacterInfo") => Ok(Value::list([])),
+
         ("subscriptionMgr", "GetCloneGrade") => Ok(Value::Int(1)), // CLONE_STATE_OMEGA
         ("subscriptionMgr", "GetSubscriptionTime") => Ok(Value::Int(FAR_FUTURE)),
 
@@ -277,3 +286,6 @@ pub(super) fn fleets(call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     }))
 }
+
+#[cfg(test)]
+mod tests;

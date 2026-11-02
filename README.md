@@ -54,6 +54,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 ## Known limitations
 
 - The new player tutorial (AIR NPE) cannot run. Its dungeon layouts and behaviour trees never shipped with the client, so new characters start in their school's station.
+- [Remote service coverage](docs/remote-services.md) lists the client calls that get a fixed answer instead of the feature, or are out of scope. QA starter-system overrides are not provided, so QA character creation uses the normal starter-system allocation, and the legacy petition window offers no character choices before a character is selected.
 - Not supported:
   - wars declared by one side, which need a war headquarters structure; war allies and surrender; sovereignty, and alliance capital systems and prime time
   - wallet journals; votes on a new CEO, war, share issue, expulsion or item locks, and acting on a vote's result; dividends paid equally to members
