@@ -80,3 +80,22 @@ async fn character_selection_fixed_dispatch_without_selected_character() {
         assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), Value::list([]));
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn corporate_mining_ledger_fixed_dispatch_returns_empty_lists() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 1).await;
+    let kwargs = Value::Dict(vec![]);
+    let stale_structure_args = [Value::Int(1)];
+    for (method, args) in [
+        ("GetObserversWithMiningEvents", &[][..]),
+        ("GetObserverLedger", &stale_structure_args[..]),
+    ] {
+        let call = Call { service: "corpMiningLedger", method, args, kwargs: &kwargs, bound: false, bind_params: None };
+        let reply = dispatch(&mut client, &call).await.unwrap();
+        assert_eq!(reply, Value::list([]));
+        assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), Value::list([]));
+    }
+}

@@ -28,3 +28,12 @@ The QA starter-system override list is empty; normal starter-system allocation i
 | stationSvc | GetSystemsForAlliance | out-of-scope | — |
 
 NPC station and solar-system data comes from static data; alliance sovereignty is not supported.
+
+## Mining ledger
+
+| service | method | status | handler file |
+|---|---|---|---|
+| corpMiningLedger | GetObserversWithMiningEvents | fixed | `crates/server/src/services/fixed.rs` |
+| corpMiningLedger | GetObserverLedger | fixed | `crates/server/src/services/fixed.rs` |
+
+Corporate mining observers and structure ledger history are unsupported; their queries return empty lists. Personal mining history is unchanged.

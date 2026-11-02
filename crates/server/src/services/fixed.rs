@@ -6,6 +6,8 @@
 //! to retain ordinary allocation; QA overrides are unavailable.
 //! `eve/client/script/ui/shared/neocom/petitionWindow.py` receives no character
 //! choices before selection; this does not implement the rest of petitions.
+//! Corporate mining observers and structure ledger history are not modelled;
+//! their queries return empty lists.
 
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
@@ -221,6 +223,12 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
         ("charUnboundMgr", "GetQAStarterSystemIDs") => Ok(Value::list([])),
         // petitionWindow.py:CategoryScreen iterates characterID and characterName before selection.
         ("charUnboundMgr", "GetCharacterInfo") => Ok(Value::list([])),
+
+        // ledgerSvc.py:LedgerSvc.GetStructuresForCorpData reads solarSystemID, itemID and itemName.
+        ("corpMiningLedger", "GetObserversWithMiningEvents") => Ok(Value::list([])),
+        // ledgerSvc.py:LedgerSvc.GetCorpData forwards rows to ledgerEntry.py:GetLedgerEntriesCorp;
+        // ledgerEntry.py:_GetDataForEntry reads eventDate, corporationID, characterID, typeID and quantity.
+        ("corpMiningLedger", "GetObserverLedger") => Ok(Value::list([])),
 
         ("subscriptionMgr", "GetCloneGrade") => Ok(Value::Int(1)), // CLONE_STATE_OMEGA
         ("subscriptionMgr", "GetSubscriptionTime") => Ok(Value::Int(FAR_FUTURE)),
