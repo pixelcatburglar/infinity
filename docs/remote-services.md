@@ -80,3 +80,13 @@ Authenticated players can forward permanent item-filter and fleet-broadcast snap
 | scanMgr | QAScanSites | handled | `crates/server/src/services/exploration/scan_mgr.rs` |
 
 QA-role accounts can select exploration targets for full-certainty results. Signature authorization persists per character and is shared with ordinary scanning and warp and bookmark checks.
+
+## Missions and agents
+
+| service | method | status | handler file |
+|---|---|---|---|
+| epicArcStatus | AgentHasEpicMissionsForCharacter | handled | `crates/server/src/services/missions/epic_arc_status.rs` |
+| agentMgr | GetPlausibleMissionIDs | fixed | `crates/server/src/services/fixed.rs` |
+| agentMgr | GetMessagesForEpicArcMissions | handled | `crates/server/src/services/missions/agent_mgr.rs` |
+
+Epic-arc availability follows the selected character's active missions and unlocked progress; replay support is unchanged. The QA mission-selection tool is unavailable and receives no candidates.

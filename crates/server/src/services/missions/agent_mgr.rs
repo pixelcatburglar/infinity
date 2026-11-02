@@ -2,6 +2,8 @@
 //! Successful acceptance queues an event after the existing state and cargo writes.
 //! Courier and trade cargo objectives use packaged item volume from the loaded SDE,
 //! matching `agentinteraction/objectivesteps.py`; unsupported mission kinds have no cargo objective.
+//! Epic arc journal messages mirror `evemissions.common.epic_arcs_data` and use
+//! the loaded SDE journal rows.
 use super::*;
 // ---------------------------------------------------------------- client shapes
 
@@ -194,6 +196,22 @@ async fn journal(c: &Client, agent_id: Option<i64>) -> CallResult {
     }
     // (missions, research)
     Ok(Value::tuple([Value::List(rows), Value::list([])]))
+}
+
+/// {messageType: {missionID: messageID}} for every epic arc journal message
+/// (evemissions.common.epic_arcs_data MESSAGE_*). The epic arc controller asks once per
+/// mission node; the projected data is shared and the wire value is built per call.
+async fn epic_arc_messages(c: &Client) -> CallResult {
+    let mut by_type: Vec<(String, Vec<(Value, Value)>)> = vec![];
+    for r in c.sde.missions.journal() {
+        let kind = r.key.clone();
+        let entry = (Value::Int(i64::from(r.mission_id)), Value::Int(r.message_id.expect("epic arc journal message_id is NULL")));
+        match by_type.last_mut() {
+            Some((k, list)) if *k == kind => list.push(entry),
+            _ => by_type.push((kind, vec![entry])),
+        }
+    }
+    Ok(Value::Dict(by_type.into_iter().map(|(k, list)| (Value::str(k), Value::Dict(list))).collect()))
 }
 
 /// A mission message `(messageID, contentID)`, or `fallback` text when the mission has none.
@@ -440,6 +458,9 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
+    if call.method == "GetMessagesForEpicArcMissions" {
+        return Some(epic_arc_messages(c).await);
+    }
     // The bound agent: Moniker('agentMgr', agentID).
     let bound_agent = if call.bound { call.bind_params.and_then(|p| p.as_int()).and_then(agent) } else { None };
     let Some(agent) = bound_agent else {
@@ -522,3 +543,6 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         }
     })
 }
+
+#[cfg(test)]
+mod tests;
