@@ -83,7 +83,7 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
     let f = fixture::create(&db).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
-        let (mut c, _peer) = client(test_db.clone(), f.character).await;
+        let (c, _peer) = client(test_db.clone(), f.character).await;
         let reqs = |id| crate::services::skills::requirements::requirements(&c.sde, id).collect::<Vec<_>>();
         let mut ids: Vec<_> = c.sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_SKILL)).map(|t| t.type_id).collect();
         ids.sort_unstable();
@@ -113,7 +113,7 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
             Value::Dict(vec![(Value::Int(1), pair)]),
         ];
         for input in malformed {
-            check_error(save_queue(&mut c, f.character, &input, true, true).await, m::MSG_QUEUE_INVALID_POSITION, None);
+            check_error(save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.sde, &input, true, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await, m::MSG_QUEUE_INVALID_POSITION, None);
             assert_eq!(snapshot(&test_db, f.character, &job).await, before);
             assert!(c.outbox.is_empty());
         }
@@ -170,7 +170,7 @@ async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
     let f = fixture::create(&db).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
-        let (mut c, _peer) = client(test_db.clone(), f.character).await;
+        let (c, _peer) = client(test_db.clone(), f.character).await;
         let mut ids: Vec<_> = c.sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_SKILL)).map(|t| t.type_id).collect();
         ids.sort_unstable();
         let count = MAX_QUEUE_ENTRIES / MAX_SKILL_LEVEL as usize;
@@ -194,7 +194,7 @@ async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
             }
         }
         assert_eq!(entries.len(), MAX_QUEUE_ENTRIES);
-        save_queue(&mut c, f.character, &queue(&entries), true, false).await.unwrap_or_else(|_| panic!("150-entry queue rejected"));
+        save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.sde, &queue(&entries), true, false, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("150-entry queue rejected"));
         let rows = crate::dao::skills::queue::list(&test_db, f.character).await.unwrap();
         assert_eq!(rows.len(), MAX_QUEUE_ENTRIES);
         let active = crate::dao::skills::queue::active(&test_db, f.character).await.unwrap().unwrap();
@@ -206,7 +206,7 @@ async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
         assert_eq!(Some(due), active.end_time);
         let before = snapshot(&test_db, f.character, &job).await;
         entries.push((entries.len() as i64, i64::from(ids[count]), 1));
-        check_error(save_queue(&mut c, f.character, &queue(&entries), true, true).await, m::MSG_QUEUE_TOO_MANY, Some(("num", Value::Int(MAX_QUEUE_ENTRIES as i64))));
+        check_error(save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.sde, &queue(&entries), true, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await, m::MSG_QUEUE_TOO_MANY, Some(("num", Value::Int(MAX_QUEUE_ENTRIES as i64))));
         assert_eq!(snapshot(&test_db, f.character, &job).await, before);
         assert!(c.outbox.is_empty());
     }).await;

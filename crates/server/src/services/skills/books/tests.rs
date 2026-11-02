@@ -181,7 +181,7 @@ async fn overdue_completion_is_merged_with_book_injection_and_start() {
             _ => None,
         }).collect();
         assert_eq!(notices.len(), 1);
-        assert_eq!(*notices[0], vec![training::queue_list_db(&db, f.character).await.unwrap_or_else(|_| panic!("queue list failed"))]);
+        assert_eq!(*notices[0], vec![super::super::skill_handler::queue_value(&rows)]);
         let hist = history::list(&db, f.character, 50).await.unwrap();
         assert_eq!(hist.len(), 2);
         assert!(hist.iter().any(|h| h.event_type_id == super::super::history::TRAINING_COMPLETE && h.absolute_points == points));

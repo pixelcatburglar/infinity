@@ -13,6 +13,25 @@ use crate::client::short;
 use marshal::Value;
 use tracing::warn;
 
+pub(super) fn queue_value(rows: &[crate::dao::skills::queue::QueueEntry]) -> Value {
+    let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
+    Value::List(
+        rows.iter()
+            .map(|r| {
+                keyval([
+                    ("queuePosition", Value::Int(r.position as i64)),
+                    ("trainingTypeID", Value::Int(r.type_id as i64)),
+                    ("trainingToLevel", Value::Int(r.to_level as i64)),
+                    ("trainingStartSP", Value::Int(r.start_sp)),
+                    ("trainingDestinationSP", Value::Int(r.dest_sp)),
+                    ("trainingStartTime", opt(r.start_time)),
+                    ("trainingEndTime", opt(r.end_time)),
+                ])
+            })
+            .collect(),
+    )
+}
+
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = c.session.int("charid").unwrap_or(0);
     let r = match (call.service, call.method) {
@@ -25,14 +44,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Ok(points) => points,
                 Err(e) => return Some(Err(db_err(e))),
             };
-            queue_list(c, me).await.map(|q| Value::tuple([q, Value::Int(free)]))
+            queue_list(&crate::services::identity::Identity::of_client(c), &c.db).await.map(|q| Value::tuple([queue_value(&q), Value::Int(free)]))
         }
-        (SKILL_HANDLER, "GetSkillQueue") => queue_list(c, me).await,
+        (SKILL_HANDLER, "GetSkillQueue") => queue_list(&crate::services::identity::Identity::of_client(c), &c.db).await.map(|q| queue_value(&q)),
         (SKILL_HANDLER, "SaveNewQueue") => {
             let activate = call.kwargs.get("activate").or_else(|| call.args.get(1)).map(|v| v.as_int() != Some(0)).unwrap_or(true);
-            save_queue(c, me, call.args.first().unwrap_or(&Value::None), activate, true).await.map(|()| Value::None)
+            save_queue(&crate::services::identity::Identity::of_client(c), &c.db, &c.sde, call.args.first().unwrap_or(&Value::None), activate, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.map(|()| Value::None)
         }
-        (SKILL_HANDLER, "AbortTraining") => match save_queue(c, me, &Value::Dict(vec![]), false, false).await {
+        (SKILL_HANDLER, "AbortTraining") => match save_queue(&crate::services::identity::Identity::of_client(c), &c.db, &c.sde, &Value::Dict(vec![]), false, false, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await {
             Ok(()) => Ok(Value::None),
             Err(e) => Err(e),
         },

@@ -3,7 +3,7 @@
 //! Persists game.skills, game.skill_queue, game.items, skill history and game.jobs;
 //! one job per character uses the shared planner and reconciles fitted resources.
 //! Legacy boosters without expiry have no scheduled deadline.
-use super::{db_err, timeline, training::{queue_list_db, skill_info}, CallError};
+use super::{db_err, timeline, training::skill_info, CallError};
 use crate::{client::{filetime_now, BRAIN_REFRESH}, consts::{IX_LOCATION_ID, LOCATION_JUNKYARD}, dao::{items::{brain, loading::{Item, ItemQuery}}, skills::{queue, training}}, db::{executor::Executor, outbox::Outbox, Db}, scheduler::{self, Job}, sde::Sde, services::effects::online::{self, OnlineChanged}, space::World};
 use marshal::Value;
 use std::{collections::{BTreeMap, BTreeSet}, future::Future, pin::Pin, sync::Arc};
@@ -123,7 +123,7 @@ pub(super) async fn finish_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor
         if !infos.is_empty() { outbox.notify_pilot(char_id, "OnServerSkillsChanged", vec![Value::Dict(infos), Value::None, Value::Int(now)]); }
     }
     if !types.is_empty() || progress.brain_changed { outbox.notify_pilot(char_id, BRAIN_REFRESH, vec![]); }
-    if progress.queue_changed { outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]); }
+    if progress.queue_changed { outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![super::skill_handler::queue_value(&queue::list(tx, char_id).await.map_err(db_err)?)]); }
     if progress.boosters_changed { outbox.notify_pilot(char_id, "OnServerBoostersChanged", vec![]); }
     Ok(())
 }

@@ -123,7 +123,7 @@ pub(crate) fn dispatch_notification(notification: crate::db::outbox::Notificatio
     }
 }
 
-fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError>) -> Result<T, CallError> {
+pub(in crate::services) fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError>) -> Result<T, CallError> {
     for entry in outbox.into_entries() {
         match entry {
             OutboxEffect::Operation(change) => apply_online_changed(change),
