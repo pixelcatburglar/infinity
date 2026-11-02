@@ -102,10 +102,14 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
     // A task boundary ensures cleanup also runs when an assertion or Lua call panics.
     let result = tokio::spawn(async move {
         let sde = Arc::new(crate::sde::Sde::load(&test_db).await.unwrap());
-        let type_id = sde.types.iter().find(|t| t.type_id > 0).expect("SDE must contain a type").type_id;
+        let station = sde.map.stations().find(|s| s.solar_system_id.is_some()).expect("SDE station");
+        let (station_id, system_id) = (station.station_id, station.solar_system_id.unwrap());
+        let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_SHIP)).expect("published SDE ship").type_id;
+        let type_id = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_CHARGE)).expect("published SDE charge").type_id;
+        let source = crate::dao::items::creation::rookie_ship(&test_db, ship_type, fixture.chars[0], station_id, crate::consts::FLAG_HANGAR).await.unwrap();
+        let destination = crate::dao::items::creation::rookie_ship(&test_db, ship_type, fixture.chars[0], station_id, crate::consts::FLAG_HANGAR).await.unwrap();
         let world = crate::space::World::new(test_db.clone(), sde.clone(), 1);
-        let (tx, mut notifications) = mpsc::unbounded_channel();
-        world.register_pilot(fixture.chars[0], tx);
+        let (sender_tx, mut notifications) = mpsc::unbounded_channel();
         let (tx, mut recipient_notifications) = mpsc::unbounded_channel();
         world.register_pilot(fixture.chars[1], tx);
         let cfg = Arc::new(crate::config::Config::default());
@@ -115,7 +119,8 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "test".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
         let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), chat, world, login);
-        client.change_session(vec![("charid", Value::Int(fixture.chars[0]))]);
+        client.notify_tx = sender_tx;
+        client.change_session(vec![("charid", Value::Int(fixture.chars[0])), ("stationid", Value::Int(station_id)), ("solarsystemid", Value::Int(system_id)), ("solarsystemid2", Value::Int(system_id))]);
         let lua = Lua::new();
         crate::lua::value::register(&lua, &lua.globals()).unwrap();
         super::super::dao::register(&lua, &lua.globals(), &test_db, &sde).unwrap();
@@ -123,7 +128,9 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         lua.globals().set("recipient", fixture.chars[1]).unwrap();
         lua.globals().set("other", fixture.chars[2]).unwrap();
         lua.globals().set("type_id", type_id).unwrap();
-        lua.globals().set("flag", crate::consts::FLAG_HANGAR).unwrap();
+        lua.globals().set("source", source).unwrap();
+        lua.globals().set("destination", destination).unwrap();
+        lua.globals().set("flag", crate::consts::FLAG_CARGO).unwrap();
         let script = r#"
             local ctx = ...
             assert(dao.wallets.balance(me) == 0)
@@ -139,27 +146,37 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
             assert(not pcall(dao.mail.send, ctx, {recipient, other}, string.rep("x", 4096), "body"))
             local message = dao.mail.send(ctx, {recipient, other}, "x", "body")
             assert(message and message > 0)
-            assert(dao.items.create(ctx, me, me, flag, type_id, 2) == nil)
-            assert(dao.items.create(ctx, me, me, flag, type_id, 3) == nil)
+            assert(dao.items.create(ctx, me, source, flag, type_id, 2) == nil)
+            assert(dao.items.create(ctx, me, source, flag, type_id, 3) == nil)
             local owned = dao.items.by_owner(me)
-            local located = dao.items.by_location(me)
-            assert(#owned == 1 and #located == 1)
-            assert(owned[1].item_id == located[1].item_id and owned[1].quantity == 5)
+            local located = dao.items.by_location(source)
+            assert(#owned == 3 and #located == 1)
+            local stack = located[1].item_id
+            assert(located[1].quantity == 5)
             assert(dao.items.create(ctx, other, other, flag, type_id, 1) == nil)
             local foreign = dao.items.by_owner(other)[1].item_id
             assert(dao.items.delete(ctx, foreign) == nil)
             assert(#dao.items.by_owner(other) == 1)
-            ctx:change_session({shipid = eve.int(owned[1].item_id)})
-            assert(dao.items.delete(ctx, owned[1].item_id) == nil)
-            assert(#dao.items.by_owner(me) == 1)
-            assert(not pcall(dao.items.move, ctx, owned[1].item_id, other, nil, nil))
+            ctx:change_session({shipid = eve.int(stack)})
+            assert(dao.items.delete(ctx, stack) == nil)
+            assert(#dao.items.by_owner(me) == 3)
+            assert(not pcall(dao.items.move, ctx, stack, other, nil, nil))
+            assert(not pcall(dao.items.move, ctx, stack, destination, nil, nil))
             ctx:change_session({shipid = eve.int(0)})
-            local moved = dao.items.move(ctx, owned[1].item_id, other, nil, 2)
-            assert(moved and moved ~= owned[1].item_id)
-            assert(#dao.items.by_owner(me) == 2)
+            local moved = dao.items.move(ctx, stack, destination, nil, 2)
+            assert(moved and moved ~= stack)
+            assert(#dao.items.by_owner(me) == 4)
+            local remaining = dao.items.by_location(source)
+            local transferred = dao.items.by_location(destination)
+            assert(#remaining == 1 and remaining[1].item_id == stack and remaining[1].quantity == 3)
+            assert(#transferred == 1 and transferred[1].item_id == moved and transferred[1].quantity == 2)
             assert(dao.items.delete(ctx, moved) == nil)
-            assert(dao.items.delete(ctx, owned[1].item_id) == nil)
-            assert(#dao.items.by_owner(me) == 0)
+            assert(dao.items.delete(ctx, stack) == nil)
+            assert(#dao.items.by_owner(me) == 2)
+            assert(#dao.items.by_location(source) == 0 and #dao.items.by_location(destination) == 0)
+            local hulls = dao.items.by_owner(me)
+            assert(#hulls == 2)
+            assert((hulls[1].item_id == source and hulls[2].item_id == destination) or (hulls[1].item_id == destination and hulls[2].item_id == source))
             return message
         "#;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -177,6 +194,8 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         assert_eq!(notifications.try_recv().unwrap().0, "OnAccountChange");
         assert_eq!(notifications.try_recv().unwrap().0, "OnAccountChange");
         assert_eq!(notifications.try_recv().unwrap().0, "OnStandingSet");
+        assert_eq!(notifications.try_recv().unwrap().0, "OnItemChange");
+        assert_eq!(notifications.try_recv().unwrap().0, "OnItemChange");
         assert!(notifications.try_recv().is_err(), "refused mutations must not notify");
         assert_eq!(recipient_notifications.try_recv().unwrap().0, "OnMailSent");
         let rollback_world = client.world.clone();
@@ -198,7 +217,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
                 if broadcast_id.as_text().as_deref() == Some("OnItemChange") { item_notices += 1; }
             }
         }
-        assert_eq!(item_notices, 7, "only committed creates, split moves and owned deletes notify");
+        assert_eq!(item_notices, 5, "only committed creates and owned deletes notify directly");
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let gate_db = test_db.clone();
