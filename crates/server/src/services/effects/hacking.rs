@@ -4,8 +4,10 @@
 //! hacking service. Timers run on the solar-system actor.
 //! Accepted analyzer activation cancels arrival jump cloak after validation.
 
-use crate::client::{filetime_now, Client};
+use crate::client::filetime_now;
 use crate::consts::dogma::EFFECT_HACKING;
+use crate::sde::Sde;
+use crate::services::effects::online::OnlinePolicy;
 use crate::messages;
 use crate::services::{combat, notify_error, CallResult};
 use crate::space::{ms_to_seconds, seconds_to_ms};
@@ -14,12 +16,9 @@ use marshal::Value;
 use super::{lifecycle, notify, registry, EffectKind};
 
 /// Validate the actual item before emitting an analyzer effect.
-pub(crate) async fn start_effect(c: &mut Client, module: i64, target: i64, duration_ms: f64) -> CallResult {
-    let Some(cx) = combat::ctx(c) else {
-        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-    };
-    lifecycle::subject(c, cx.ship_id, module, EFFECT_HACKING, true).await?;
-    if registry::kind(&c.sde, EFFECT_HACKING) != Some(EffectKind::Hacking) {
+pub(in crate::services) async fn start_effect(cx: combat::Ctx, sde: &Sde, policy: &OnlinePolicy, module: i64, target: i64, duration_ms: f64) -> CallResult {
+    lifecycle::subject(&cx.db, sde, policy, cx.ship_id, module, EFFECT_HACKING, true).await?;
+    if registry::kind(sde, EFFECT_HACKING) != Some(EffectKind::Hacking) {
         return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
     }
     let ship = cx.ship_id;

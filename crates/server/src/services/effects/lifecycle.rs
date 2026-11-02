@@ -34,6 +34,7 @@ use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tracing::{debug, info, warn};
+use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::sde::Sde;
 use super::online::OnlinePolicy;
@@ -444,9 +445,8 @@ pub(super) async fn subject_valid(cx: &Ctx, module: &Module, effect: &Effect) ->
     }
 }
 
-pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
-    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
-    Ok(subject_core(&c.db, &c.sde, &policy, ship, item_id, effect, require_online).await?.1)
+pub(super) async fn subject(db: &Db, sde: &Sde, policy: &OnlinePolicy, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
+    Ok(subject_core(db, sde, policy, ship, item_id, effect, require_online).await?.1)
 }
 
 /// Activate(itemID, effectName, targetID, repeat)
@@ -466,7 +466,8 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     // Fitting mutations and non-online activation share this lock through registration and FX queuing.
     // Online activation takes it inside set_online instead.
     let _lock = if id != EFFECT_ONLINE as i32 { Some(crate::services::market::lock().await) } else { None };
-    let mut module = subject(c, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
+    let mut module = subject(&c.db, &c.sde, &policy, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
     let Some(effect) = registry::resolve(cx.world.sde(), id) else {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
     };
@@ -479,7 +480,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
         let master = crate::services::combat::targeting_charges::master_for_member(&c.db, cx.ship_id, item_id).await?;
         if master != item_id {
-            module = subject(c, cx.ship_id, master, id, true).await?;
+            module = subject(&c.db, &c.sde, &policy, cx.ship_id, master, id, true).await?;
             if !registry::activation_in_scope(module.category_id, module.group_id, kind) {
                 return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
             }
@@ -489,7 +490,14 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     match kind {
         EffectKind::Hacking => {
             super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::super::hacking::start(c, item_id, target).await;
+            let identity = Identity::of_client(c);
+            let db = c.db.clone();
+            let world = c.world.clone();
+            let sde = c.sde.clone();
+            let space_system = c.session.int("solarsystemid");
+            let sender = c.notify_tx.clone();
+            let login_user = c.login.user_id;
+            return super::super::hacking::start(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, target, |notification| notification.dispatch(&world, Some(&mut *c))).await;
         }
         EffectKind::Online => {
             super::cloak::before_activate(&cx, item_id, kind).await?;
@@ -520,7 +528,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];
     if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
         for slave in bank(&cx.db, cx.ship_id, item_id).await?.into_iter().skip(1) {
-            let m = subject(c, cx.ship_id, slave, id, true).await?;
+            let m = subject(&c.db, &c.sde, &policy, cx.ship_id, slave, id, true).await?;
             modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
         }
     }
@@ -585,7 +593,8 @@ pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if rows.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {name}"))); }
     let id = row.effect_id;
     drop(rows);
-    let module = subject(c, cx.ship_id, item_id, id, false).await?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
+    let module = subject(&c.db, &c.sde, &policy, cx.ship_id, item_id, id, false).await?;
     let Some(kind) = registry::kind(&c.sde, id) else { return Err(unsupported::refusal(Some(id), &name, module.type_id)) };
     if !c.sde.types.effects(module.type_id).iter().any(|effect| effect.effect_id == id)
         || !registry::activation_in_scope(module.category_id, module.group_id, kind) {

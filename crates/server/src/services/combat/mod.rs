@@ -54,6 +54,7 @@ use super::inventory::{notify_item_change, notify_item_removed};
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
 use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
+use super::identity::Identity;
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
 use crate::consts::{ACCOUNT_CASH, dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_QUANTITY, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_FALLOFF, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_EM_DAMAGE, dogma::ATTR_THERMAL_DAMAGE, dogma::ATTR_KINETIC_DAMAGE, dogma::ATTR_EXPLOSIVE_DAMAGE};
@@ -166,20 +167,25 @@ pub(super) struct Ctx {
 }
 
 impl Ctx {
+    pub(super) fn from_identity(identity: &Identity, db: &Db, world: &Arc<World>, space_system: Option<i64>, sender: NotifyTx) -> Option<Self> {
+        if identity.char_id == 0 { return None; }
+        Some(Self {
+            db: db.clone(),
+            world: world.clone(),
+            notify: sender,
+            char_id: identity.char_id,
+            ship_id: identity.ship_id?,
+            system_id: space_system?,
+        })
+    }
+
     pub(super) fn notify(&self, event: &str, args: Vec<Value>) {
         let _ = self.notify.send((event.to_string(), args));
     }
 }
 
 pub(super) fn ctx(c: &Client) -> Option<Ctx> {
-    Some(Ctx {
-        db: c.db.clone(),
-        world: c.world.clone(),
-        notify: c.notify_tx.clone(),
-        char_id: c.session.int("charid")?,
-        ship_id: c.session.int("shipid")?,
-        system_id: c.session.int("solarsystemid")?,
-    })
+    Ctx::from_identity(&Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), c.notify_tx.clone())
 }
 
 

@@ -15,12 +15,15 @@
 
 use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::db::{Db, outbox::Notification};
+use crate::sde::Sde;
+use crate::services::{combat, effects::online::OnlinePolicy, identity::Identity};
 use crate::consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::messages;
-use crate::space::{dist, metres_to_km};
+use crate::space::{dist, metres_to_km, NotifyTx, World};
 use marshal::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::info;
 
 // hackingcommon.hackingConstants
@@ -437,10 +440,16 @@ fn games() -> MutexGuard<'static, HashMap<i64, Game>> {
 }
 
 /// Activate(analyzerID, 'doHacking', containerID): open a game on the container.
-pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResult {
-    let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
+/// `login_user` is the owning account used only for the hacking-start info log.
+pub async fn start(
+    identity: &Identity, db: &Db, world: &Arc<World>, sde: &Arc<Sde>, space_system: Option<i64>,
+    sender: NotifyTx, login_user: i64, module: i64, target: Option<i64>,
+    mut notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
+) -> CallResult {
+    let Some(cx) = combat::Ctx::from_identity(identity, db, world, space_system, sender.clone()) else {
         return Ok(Value::None);
     };
+    let (system, ship, char_id) = (cx.system_id, cx.ship_id, cx.char_id);
     let Some(container) = target else { return Err(CallError::User { msg: messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT.into(), dict: vec![] }) };
     let Some(site) = super::exploration::hack_target(container) else {
         return Err(notify_error(messages::ANALYZER_TARGET_MUST_BE_DATA_OR_RELIC));
@@ -448,8 +457,8 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if site.hacked {
         return Err(notify_error(messages::HACK_CONTAINER_ALREADY_HACKED));
     }
-    let Some(module_type) = crate::dao::items::hacking::analyzer(&c.db, module, ship).await.map_err(db_err)? else { return Ok(Value::None) };
-    let attr = |id, default| c.sde.types.attribute(module_type, id).unwrap_or(default);
+    let Some(module_type) = crate::dao::items::hacking::analyzer(db, module, ship).await.map_err(db_err)? else { return Ok(Value::None) };
+    let attr = |id, default| sde.types.attribute(module_type, id).unwrap_or(default);
     let skill = analyzer_skill(attr(ATTR_REQUIRED_SKILL_1, 0.0))?;
     let range = attr(ATTR_MAX_RANGE, 6000.0);
     let duration = attr(ATTR_DURATION, 5000.0);
@@ -457,7 +466,7 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if skill != needed {
         return Err(notify_error(if site.relic { messages::RELIC_CONTAINER_REQUIRES_RELIC_ANALYZER } else { messages::DATA_CONTAINER_REQUIRES_DATA_ANALYZER }));
     }
-    let Some(gap) = c.world.with(system, move |s| {
+    let Some(gap) = world.with(system, move |s| {
         let (me, can) = (s.ball(ship)?, s.ball(container)?);
         Some(dist(s.sample_position(ship)?, s.sample_position(container)?) - me.radius as f64 - can.radius as f64)
     }).await.flatten() else {
@@ -466,7 +475,7 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if gap > range {
         return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
-    let level = crate::dao::skills::levels::level(&c.db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
+    let level = crate::dao::skills::levels::level(db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
     let coherence = (attr(ATTR_VIRUS_COHERENCE, 40.0) + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
     let strength = attr(ATTR_VIRUS_STRENGTH, 20.0).round() as i64;
     let slots = attr(ATTR_VIRUS_SLOTS, 3.0).round().clamp(1.0, 6.0) as usize;
@@ -494,11 +503,12 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     virus.push((Value::str("inventory"), Value::List(game.inventory.iter().map(Ue::created_value).collect())));
     ev.push(event(EVENT_VIRUS_CREATED, Value::Dict(virus)));
     ev.push(event(EVENT_GAME_START, Value::dict([("moduleTypeID", Value::Int(module_type as i64))])));
-    super::effects::hacking::start_effect(c, module, container, duration).await?;
+    let policy = OnlinePolicy::from_identity(identity, sender)?;
+    super::effects::hacking::start_effect(cx, sde, &policy, module, container, duration).await?;
     games().insert(char_id, game);
-    super::exploration::set_container_state(&c.world, system, container, 1).await;
-    info!(user = c.login.user_id, "hacking {container} (tier {}, virus {coherence}/{strength}, {slots} slots)", site.tier);
-    c.notify("OnHackingTurnComplete", vec![Value::List(ev)]);
+    super::exploration::set_container_state(world, system, container, 1).await;
+    info!(user = login_user, "hacking {container} (tier {}, virus {coherence}/{strength}, {slots} slots)", site.tier);
+    notify(Notification::DirectClient { event: "OnHackingTurnComplete".into(), args: vec![Value::List(ev)] })?;
     Ok(Value::None)
 }
 

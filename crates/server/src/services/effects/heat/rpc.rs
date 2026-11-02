@@ -7,6 +7,8 @@ use crate::dao::items::loading::{Item, ItemQuery};
 use crate::messages;
 use crate::services::{combat, db_err, fit::{Fit, Key}, items::load_items, market, notify_error, Call, CallError, CallResult};
 use crate::services::effects::{lifecycle::{self, Module}, registry, unsupported};
+use crate::services::effects::online::OnlinePolicy;
+use crate::services::identity::Identity;
 use marshal::Value;
 use std::collections::BTreeSet;
 
@@ -78,7 +80,8 @@ async fn handle(c: &mut Client, args: &[Value], rack: bool, start: bool) -> Call
         .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     let anchor_effect = overload_effect(c, &anchor_item).filter(|id| requested.is_none_or(|requested| requested == *id))
         .ok_or_else(|| notify_error(messages::heat::INVALID_OVERLOAD))?;
-    lifecycle::subject(c, cx.ship_id, anchor, anchor_effect, start).await?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
+    lifecycle::subject(&c.db, &c.sde, &policy, cx.ship_id, anchor, anchor_effect, start).await?;
     let family = super::rack_index(anchor_item.flag_id).ok_or_else(|| notify_error(messages::heat::INVALID_RACK))?;
     let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
     if start { check_start(c, &anchor_item, &fit, family)?; }
@@ -101,7 +104,7 @@ async fn handle(c: &mut Client, args: &[Value], rack: bool, start: bool) -> Call
         let item = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
             .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
         let effect = overload_effect(c, &item).ok_or_else(|| notify_error(messages::heat::INVALID_OVERLOAD))?;
-        let item = lifecycle::subject(c, cx.ship_id, id, effect, start).await?;
+        let item = lifecycle::subject(&c.db, &c.sde, &policy, cx.ship_id, id, effect, start).await?;
         if super::rack_index(item.flag_id) != Some(family) { return Err(notify_error(messages::heat::INVALID_RACK)); }
         if start { check_start(c, &item, &fit, family)?; }
         modules.push((Module { id, type_id: item.type_id, flag: item.flag_id }, effect));
