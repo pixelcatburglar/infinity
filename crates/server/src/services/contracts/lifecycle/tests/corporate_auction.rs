@@ -30,7 +30,7 @@ async fn corporate_auction_refunds_and_settles_captured_divisions() {
         let balance = |corp, key| rows.iter().find(|r| r.get::<_, i64>("corporation_id") == corp && r.get::<_, i32>("account_key") == key).unwrap().get::<_, f64>("balance");
         assert_eq!(balance(bidder.id, ACCOUNT_CASH + 1), 1000000.0);
         assert_eq!(balance(bidder.id, ACCOUNT_CASH + 2), 999970.0);
-        assert_eq!(balance(issuer.id, ACCOUNT_CASH + 1), 1000030.0);
+        assert_eq!(balance(issuer.id, ACCOUNT_CASH + 1), 980030.0);
         assert_eq!(balance(issuer.id, ACCOUNT_CASH + 2), 1000000.0);
         let contract = db.query_one("SELECT acceptor_id,acceptor_wallet_key,status FROM game.contracts WHERE contract_id=$1", &[&id]).await.unwrap();
         assert_eq!(contract.get::<_, i64>("acceptor_id"), bidder.id);

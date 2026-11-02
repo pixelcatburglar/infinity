@@ -25,6 +25,9 @@ pub(crate) struct Contract {
     pub(crate) price: f64,
     pub(crate) reward: f64,
     pub(crate) collateral: f64,
+    pub(crate) paid_deposit: f64,
+    pub(crate) auction_tax_rate: f64,
+    pub(crate) auction_tax_maximum: f64,
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) volume: f64,
@@ -40,7 +43,7 @@ pub(crate) struct Contract {
 pub(super) const CONTRACT_SELECT: &str = "SELECT c.contract_id, c.type, c.issuer_id, c.issuer_corp_id, c.assignee_id, c.acceptor_id,
         c.start_station_id, c.end_station_id, c.for_corp, c.issuer_wallet_key, c.acceptor_wallet_key,
         c.issuer_hangar_flag, c.issuer_source_location,
-        c.price, c.reward, c.collateral, c.title, c.description, c.volume, c.num_days, c.status,
+        c.price, c.reward, c.collateral, c.paid_deposit, c.auction_tax_rate, c.auction_tax_maximum, c.title, c.description, c.volume, c.num_days, c.status,
         c.date_issued, c.date_expired, c.date_accepted, c.date_completed, c.package_id
     FROM game.contracts c";
 
@@ -54,6 +57,8 @@ impl Contract {
             issuer_source_location: r.get("issuer_source_location"),
             start: r.get("start_station_id"), end: r.get("end_station_id"),
             price: r.get("price"), reward: r.get("reward"), collateral: r.get("collateral"), title: r.get("title"),
+            paid_deposit: r.get("paid_deposit"), auction_tax_rate: r.get("auction_tax_rate"),
+            auction_tax_maximum: r.get("auction_tax_maximum"),
             description: r.get("description"), volume: r.get("volume"), num_days: r.get("num_days"), status: r.get("status"),
             issued: r.get("date_issued"), expires: r.get("date_expired"), accepted: r.get("date_accepted"),
             completed: r.get("date_completed"), package: r.get("package_id"),

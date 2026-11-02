@@ -13,8 +13,13 @@
 //!
 //! Escrowed items stay in game.items, located at -contractID. An expired or rejected
 //! contract waits for its issuer to delete it and take the escrow back; expired auctions
-//! with bids settle on their own. Contracts cost no fees; corporation custody uses
-//! authorized office divisions or station Deliveries.
+//! with bids settle on their own. Public listings pay broker fees and deposits at creation;
+//! exchanges also pay sales tax then, while auctions pay tax on the winning amount at sale.
+//! Private listings pay only the minimum broker fee. Deposits are refunded when taken, not
+//! on deletion or later courier completion or failure. Auction tax rate and cap and the paid
+//! deposit are persisted; legacy listings default to zero. Corporate payments and refunds use
+//! the captured wallet division. Wallet journals and faction-warfare fee upgrades are unsupported;
+//! corporation custody uses authorized office divisions or station Deliveries.
 //! Corporation-assigned contracts are available to current members acting personally;
 //! corporate courier completion requires current membership and actual package custody.
 //! Contract lifecycle mutations guard the previous persisted status and commit atomically;
@@ -27,6 +32,7 @@
 //! propagate to the scheduler for retry.
 
 mod custody;
+mod fees;
 mod ownership;
 mod lifecycle;
 mod lists;

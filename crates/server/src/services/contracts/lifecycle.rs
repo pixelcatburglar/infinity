@@ -29,7 +29,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         return Err(notify_error(messages::CONTRACT_TYPE_REQUIRED));
     }
     let (price, reward, collateral) = (money("price"), money("reward"), money("collateral"));
-    if price < 0.0 || reward < 0.0 || collateral < 0.0 {
+    if !price.is_finite() || !reward.is_finite() || !collateral.is_finite() || price < 0.0 || reward < 0.0 || collateral < 0.0 {
         return Err(notify_error(messages::CONTRACT_AMOUNT_NEGATIVE));
     }
     let start = station(&c.sde, int("startStationID"))?;
@@ -141,13 +141,20 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
     }
     let escrow_isk = if kind == TYPE_AUCTION { 0.0 } else { reward };
+    let skill_rows = crate::dao::skills::levels::levels_of(db, me, &[crate::consts::SKILL_ACCOUNTING, crate::consts::SKILL_BROKER_RELATIONS]).await.map_err(db_err)?;
+    let skill = |id| skill_rows.iter().find(|row| row.type_id == id).map_or(0, |row| row.level.clamp(0, crate::consts::dogma::MAX_SKILL_LEVEL));
+    let fees = super::fees::calculate(kind, assignee != 0, price, reward, minutes, skill(crate::consts::SKILL_ACCOUNTING), skill(crate::consts::SKILL_BROKER_RELATIONS));
+    let creation_fee = fees.brokers_fee + fees.deposit + if kind == TYPE_ITEM_EXCHANGE { fees.sales_tax } else { 0.0 };
     let mut created = vec![];
     for group in groups {
-        ownership::debit(db, outbox, owner, escrow_isk).await?;
+        ownership::debit(db, outbox, owner, escrow_isk + creation_fee).await?;
         let id = contract_dao::insert(db, &contract_dao::NewContract {
             kind, issuer: me, issuer_corp: corp, assignee, start: start_id, end: end_id,
             price, reward, collateral, title, description, num_days,
             status: STATUS_OUTSTANDING, issued: now, expires: expiry_time(now, minutes),
+            paid_deposit: fees.deposit,
+            auction_tax_rate: if kind == TYPE_AUCTION { fees.sales_tax_rate } else { 0.0 },
+            auction_tax_maximum: if kind == TYPE_AUCTION { fees.sales_tax_maximum } else { 0.0 },
             for_corp, issuer_wallet_key: wallet_key, issuer_hangar_flag: source.flag, issuer_source_location: source.location,
         }).await.map_err(db_err)?;
         for (item_id, qty) in group {
@@ -297,6 +304,8 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     if !contract_dao::accept_exchange(db, id, STATUS_OUTSTANDING, owner.id, wallet_key, now, STATUS_FINISHED, now).await.map_err(db_err)? {
                         return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
                     }
+                    ownership::credit(db, outbox, k.issuer_owner(), k.paid_deposit).await?;
+                    k.paid_deposit = 0.0;
                     k.acceptor = owner.id;
                     k.acceptor_wallet_key = wallet_key;
                     k.accepted = now;
@@ -319,6 +328,8 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     if !contract_dao::accept_courier(db, id, STATUS_OUTSTANDING, owner.id, wallet_key, now, STATUS_IN_PROGRESS, wrap).await.map_err(db_err)? {
                         return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
                     }
+                    ownership::credit(db, outbox, k.issuer_owner(), k.paid_deposit).await?;
+                    k.paid_deposit = 0.0;
                     k.acceptor = owner.id;
                     k.acceptor_wallet_key = wallet_key;
                     k.accepted = now;
@@ -516,9 +527,13 @@ async fn settle<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, o
     let roots = escrowed_ids(db, k.id).await?;
     custody::hand_over(db, sde, outbox, &roots, custody::receiving(winner.id, k.start), -k.id).await?;
     ownership::credit(db, outbox, k.issuer_owner(), amount).await?;
+    ownership::credit(db, outbox, k.issuer_owner(), k.paid_deposit).await?;
+    ownership::debit(db, outbox, k.issuer_owner(), super::fees::sales_tax_amount(amount, k.auction_tax_rate, k.auction_tax_maximum)).await?;
     k.acceptor = winner.id;
     k.acceptor_wallet_key = winner.wallet_key;
     set_status(db, k, STATUS_FINISHED, now).await?;
+    contract_dao::clear_deposit(db, k.id).await.map_err(db_err)?;
+    k.paid_deposit = 0.0;
     ownership::tell(db, outbox, k.issuer_owner().id, "OnContractCompleted", k.id).await?;
     ownership::tell(db, outbox, winner.id, "OnContractCompleted", k.id).await?;
     Ok(())

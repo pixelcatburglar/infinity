@@ -28,6 +28,7 @@ async fn new_contract(db: &Db, issuer: i64, corp: i64, station: i64, corporate: 
         issuer_hangar_flag: if corporate { FLAG_CORP_DELIVERIES } else { FLAG_HANGAR },
         issuer_source_location: station, assignee, start: station, end: station,
         price: 0.0, reward: 0.0, collateral: 0.0, title: "fixture", description: "fixture",
+        paid_deposit: 0.0, auction_tax_rate: 0.0, auction_tax_maximum: 0.0,
         num_days: 1, status: STATUS_OUTSTANDING, issued: filetime_now(), expires,
     }).await.unwrap()
 }

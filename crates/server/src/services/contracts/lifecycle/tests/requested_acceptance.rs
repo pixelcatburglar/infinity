@@ -25,6 +25,7 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
     let id = contract_dao::insert(&db, &contract_dao::NewContract {
         kind: TYPE_ITEM_EXCHANGE, issuer: issuer.character, issuer_corp: 1, assignee: 0, start: station, end: 0,
         price: 1.0, reward: 0.0, collateral: 0.0, title: "", description: "", num_days: 0,
+        paid_deposit: 0.0, auction_tax_rate: 0.0, auction_tax_maximum: 0.0,
         status: STATUS_OUTSTANDING, issued: 0, expires: i64::MAX,
         for_corp: false, issuer_wallet_key: ACCOUNT_CASH, issuer_hangar_flag: FLAG_HANGAR, issuer_source_location: station,
     }).await.unwrap();

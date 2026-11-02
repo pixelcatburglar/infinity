@@ -51,7 +51,7 @@ async fn guarded_transitions_and_auction_errors_preserve_atomic_state() {
         let row = db.query_one("SELECT owner_id,location_id,flag_id FROM game.items WHERE item_id=$1", &[&root]).await.unwrap();
         assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (buyer.id, start, f::DELIVERIES));
         let balance: f64 = db.query_one("SELECT balance::float8 AS balance FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$2", &[&issuer.id, &(ACCOUNT_CASH + 1)]).await.unwrap().get("balance");
-        assert_eq!(balance, 1_000_050.0);
+        assert_eq!(balance, 990_050.0);
         let before_issuer = f::fingerprint(&db, issuer).await;
         let before_buyer = f::fingerprint(&db, buyer).await;
         assert!(matches!(complete(&seller, id, STATUS_FAILED).await, Err(CallError::User { .. })));
@@ -76,12 +76,12 @@ async fn guarded_transitions_and_auction_errors_preserve_atomic_state() {
 
         let root = transfers::insert(&db, kind, issuer.id, start, f::DELIVERIES, 1).await.unwrap();
         let deleted = f::id(create(&seller, &f::payload(TYPE_ITEM_EXCHANGE, start, 0, f::DELIVERIES, root, 0.0, 0.0, 0.0)).await);
-        assert!(delete_one(&seller, deleted).await.is_ok());
+        { let _guard = lock().await; assert!(delete_one(&seller, deleted).await.is_ok()); }
         while buyer_rx.try_recv().is_ok() {}
         let before_issuer = f::fingerprint(&db, issuer).await;
         let before_buyer = f::fingerprint(&db, buyer).await;
         while owner_rx.try_recv().is_ok() {}
-        assert!(matches!(delete_one(&seller, deleted).await, Err(CallError::User { .. })));
+        { let _guard = lock().await; assert!(matches!(delete_one(&seller, deleted).await, Err(CallError::User { .. }))); }
         assert_eq!(f::fingerprint(&db, issuer).await, before_issuer);
         assert_eq!(f::fingerprint(&db, buyer).await, before_buyer);
         assert!(buyer_rx.try_recv().is_err());
