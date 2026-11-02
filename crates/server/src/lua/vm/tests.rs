@@ -223,3 +223,65 @@ fn bundled_motd_uses_current_command_and_notification_protocol() -> mlua::Result
     assert_eq!(value::from_lua(notification.get(4)?)?, marshal::Value::dict([("notify", marshal::Value::unicode("测试 公告"))]));
     Ok(())
 }
+
+#[test]
+fn roots_are_ordered_and_duplicate_names_report_both_paths() {
+    let dir = std::env::temp_dir().join(format!("lua-roots-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let primary = dir.join("primary");
+    let extra = dir.join("extra");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir(&extra).unwrap();
+    std::fs::write(primary.join("z.lua"), "").unwrap();
+    std::fs::write(primary.join("a.lua"), "").unwrap();
+    std::fs::write(extra.join("b.lua"), "").unwrap();
+    let config = LuaConfig { scripts_dir: primary.to_string_lossy().into_owned(), mod_dirs: vec![extra.to_string_lossy().into_owned()], ..Default::default() };
+    let scripts = discover(&config).unwrap();
+    assert_eq!(scripts.iter().map(|(_, _, name)| name.as_str()).collect::<Vec<_>>(), ["a", "z", "b"]);
+    assert_eq!(scripts[0].0, primary.canonicalize().unwrap());
+    assert_eq!(scripts[2].0, extra.canonicalize().unwrap());
+    std::fs::write(extra.join("a.lua"), "").unwrap();
+    let error = discover(&config).unwrap_err().to_string();
+    assert!(error.contains(&primary.join("a.lua").display().to_string()));
+    assert!(error.contains(&extra.join("a.lua").display().to_string()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn requires_are_isolated_by_root_and_reject_escape() -> mlua::Result<()> {
+    let dir = std::env::temp_dir().join(format!("lua-modules-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let first = dir.join("first");
+    let second = dir.join("second");
+    std::fs::create_dir_all(first.join("lib")).unwrap();
+    std::fs::create_dir_all(second.join("lib")).unwrap();
+    std::fs::write(first.join("lib/shared.lua"), "return 'first'").unwrap();
+    std::fs::write(second.join("lib/shared.lua"), "return 'second'").unwrap();
+    let lua = Lua::new();
+    let a = environment(&lua, &first.canonicalize().unwrap())?;
+    let b = environment(&lua, &second.canonicalize().unwrap())?;
+    assert_eq!(lua.load("return require('lib.shared')").set_environment(a.clone()).eval::<String>()?, "first");
+    assert_eq!(lua.load("return require('lib.shared')").set_environment(b.clone()).eval::<String>()?, "second");
+    assert!(lua.load("return require('../second/lib/shared')").set_environment(a).eval::<String>().is_err());
+    assert!(lua.load("return require('missing')").set_environment(b).eval::<String>().is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn require_and_script_symlinks_cannot_escape_their_root() -> mlua::Result<()> {
+    use std::os::unix::fs::symlink;
+    let dir = std::env::temp_dir().join(format!("lua-escape-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let outside = dir.join("outside.lua");
+    std::fs::write(&outside, "return 42").unwrap();
+    symlink(&outside, root.join("escape.lua")).unwrap();
+    let lua = Lua::new();
+    let env = environment(&lua, &root.canonicalize().unwrap())?;
+    let require: Function = env.get("require")?;
+    assert!(require.call::<mlua::Value>("escape").is_err());
+    let config = LuaConfig { scripts_dir: root.to_string_lossy().into_owned(), ..Default::default() };
+    assert!(discover(&config).unwrap_err().to_string().contains("escapes"));
+    std::fs::remove_dir_all(dir).unwrap();
+    Ok(())
+}

@@ -1,5 +1,5 @@
 //! Builds a generation in an isolated Lua 5.4 VM. Scripts use separate globals,
-//! text-only modules under the configured root and invocation-local budgets.
+//! text-only modules under each configured root and invocation-local budgets.
 //! Native modules, binary chunks and script-created coroutines are not supported.
 
 use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -148,19 +148,34 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
     env.set("register", register)
 }
 
+fn discover(config: &LuaConfig) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf, String)>> {
+    let mut scripts = Vec::new();
+    let mut names = std::collections::HashMap::new();
+    for dir in std::iter::once(&config.scripts_dir).chain(config.mod_dirs.iter()) {
+        let root = Path::new(dir).canonicalize().context("canonicalizing Lua scripts directory")?;
+        let mut paths = std::fs::read_dir(&root)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
+        paths.sort();
+        for path in paths {
+            if path.extension().is_none_or(|e| e != "lua") { continue; }
+            let path = path.canonicalize()?;
+            anyhow::ensure!(path.starts_with(&root), "Lua script escapes scripts directory");
+            let script = path.file_stem().and_then(|s| s.to_str()).context("invalid Lua script name")?.to_owned();
+            anyhow::ensure!(!script.is_empty() && script.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'), "invalid Lua script name {script}");
+            if let Some(previous) = names.insert(script.clone(), path.clone()) {
+                anyhow::bail!("duplicate Lua script {script}: {} and {}", previous.display(), path.display());
+            }
+            scripts.push((root.clone(), path, script));
+        }
+    }
+    Ok(scripts)
+}
+
 pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry> {
-    let root = Path::new(&config.scripts_dir).canonicalize().context("canonicalizing Lua scripts directory")?;
+    let scripts = discover(config)?;
     let lua = Lua::new();
     lua.set_memory_limit(config.memory_limit_mb * 1024 * 1024)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
-    let mut paths = std::fs::read_dir(&root)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
-    paths.sort();
-    for path in paths {
-        if path.extension().is_none_or(|e| e != "lua") { continue; }
-        let path = path.canonicalize()?;
-        anyhow::ensure!(path.starts_with(&root), "Lua script escapes scripts directory");
-        let script = path.file_stem().and_then(|s| s.to_str()).context("invalid Lua script name")?.to_owned();
-        anyhow::ensure!(!script.is_empty() && script.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'), "invalid Lua script name {script}");
+    for (root, path, script) in scripts {
         let env = environment(&lua, &root)?;
         value::register(&lua, &env)?;
         let settings = config.scripts.get(&script).cloned().unwrap_or_default();
@@ -178,6 +193,7 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
         open.store(false, Ordering::Release);
         result.with_context(|| format!("loading script {script}"))?;
         env.set("register", mlua::Value::Nil)?;
+        claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?.script_roots.insert(script.clone(), root);
         claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?.scripts.push(script);
     }
     let claims = std::mem::take(&mut *claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?);

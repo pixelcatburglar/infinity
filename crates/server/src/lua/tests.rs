@@ -3,6 +3,7 @@ use super::*;
 mod acceptance;
 mod budget;
 mod fixture;
+mod roots;
 
 #[tokio::test]
 async fn event_handlers_continue_in_order_after_errors_and_budget_exhaustion() -> mlua::Result<()> {

@@ -119,7 +119,7 @@ pub async fn command(c: &mut Client, name: &str, args: &[String]) -> Option<Resu
                 entries.extend(registry.claims.commands.iter().map(|(name, cmd)| format!("{}: /{}", cmd.handler.script, name)));
                 entries.extend(registry.claims.intercepts.iter().map(|((svc, method), h)| format!("{}: intercept {}::{}", h.script, svc, method)));
                 entries.extend(registry.claims.events.iter().flat_map(|(event, handlers)| handlers.iter().map(move |h| format!("{}: event {}", h.script, event))));
-                entries.extend(registry.claims.scripts.iter().map(|name| format!("script: {name}")));
+                entries.extend(registry.claims.scripts.iter().map(|name| format!("script: {name} root={}", registry.claims.script_roots[name].display())));
                 entries.sort();
                 entries.push(format!("memory={} MiB, time={} ms, instructions={}, interval={}", host.config.memory_limit_mb, host.config.call_budget_ms, host.config.call_budget_instructions, host.config.instruction_hook_interval));
                 Ok(crate::messages::gm::lua_list(&entries.join("\n")))
