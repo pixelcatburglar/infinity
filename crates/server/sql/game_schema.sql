@@ -1313,3 +1313,34 @@ CREATE TABLE IF NOT EXISTS game.killmail_wars (
     CHECK (attacker_side <> defender_side)
 );
 CREATE INDEX IF NOT EXISTS killmail_wars_war_idx ON game.killmail_wars (war_id, kill_id DESC);
+
+-- Client alert and crash telemetry (dao/client_errors.rs).
+CREATE TABLE IF NOT EXISTS game.client_errors (
+    error_id bigserial PRIMARY KEY,
+    stack_hash bigint NOT NULL UNIQUE,
+    stack_key text NOT NULL,
+    mode text NOT NULL,
+    log_mode char(1) NOT NULL CHECK (log_mode IN ('B', 'D')),
+    first_user_id bigint,
+    first_char_id bigint,
+    traceback text NOT NULL,
+    first_seen timestamptz NOT NULL DEFAULT now(),
+    last_seen timestamptz NOT NULL DEFAULT now(),
+    occurrences bigint NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS game.client_error_reports (
+    report_id bigserial PRIMARY KEY,
+    error_id bigint NOT NULL REFERENCES game.client_errors,
+    user_id bigint,
+    char_id bigint,
+    count bigint NOT NULL,
+    reported_at timestamptz NOT NULL,
+    arguments text
+);
+CREATE TABLE IF NOT EXISTS game.client_crashes (
+    crash_id bigserial PRIMARY KEY,
+    user_id bigint,
+    char_id bigint,
+    received_at timestamptz NOT NULL DEFAULT now(),
+    crash text NOT NULL
+);

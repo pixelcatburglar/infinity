@@ -42,6 +42,12 @@ fn load_error(contents: &str) -> String {
     }
 }
 #[test]
+fn client_error_mode_rejects_unknown_values() {
+    assert_eq!(Config::default().telemetry.client_error_log_mode, "B");
+    assert!(load_error("[telemetry]\nclient_error_log_mode = 'X'").contains("telemetry.client_error_log_mode"));
+}
+
+#[test]
 fn gm_spawn_policy_rejects_invalid_limits() {
     let mut config = Config::default();
     assert!(config.validate().is_ok());

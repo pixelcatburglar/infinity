@@ -206,6 +206,7 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `logging.filter` | `RUST_LOG` | `info,infinity_server=debug` | Log filter |
 | `logging.dir` | `LOG_DIR` | empty | Also write the server log to files in this directory (empty = stdout only); see Logs below |
 | `logging.rotation` / `.keep_files` | | `daily` / `14` | When a new log file starts (`minutely`, `hourly`, `daily` or `never`), and how many files are kept, the current one included; at least 1, and ignored with `never` |
+| `telemetry.client_error_log_mode` | | `B` | How the client reports repeats of an error it has uploaded once: `B` counts them, `D` also sends each player's count and the trace's `Arguments:` part. Applies to errors first seen after the change; see Client error reports below |
 | `lua.enabled` | | `true` | Load the Lua scripts. With `false` no Lua VM is created and no call is claimed by a script. |
 | `lua.scripts_dir` | | `crates/server/lua` | Directory the scripts are loaded from, relative to the working directory |
 | `lua.memory_limit_mb`, `.call_budget_ms`, `.call_budget_instructions`, `.instruction_hook_interval` | | `64`, `50`, `5000000`, `1000` | Lua VM memory, and the time and instructions one call may use (counted every `instruction_hook_interval` instructions). A call over budget fails; a game change it already started still completes. |
@@ -232,6 +233,15 @@ Some keys switch behaviour on or off rather than set a number:
 ### Logs
 
 The server always logs to stdout, which is what `docker compose logs` shows. With `logging.dir` set (for example `dir = "logs"`, or `LOG_DIR=logs`) it also writes the same lines, filtered the same way and without colour codes, to files in that directory, created at start; a directory it cannot create stops the start with an error. Files are named in UTC: `server.YYYY-MM-DD.log` daily, with `-HH` added hourly and `-HH-MM` added minutely, and `server.log` with `never`. Rotation is by time only: `keep_files` limits the number of files, not their size, and a `never` file grows without limit. A graceful stop writes out the last lines. In Docker, uncomment `LOG_DIR` and the logs volume in `docker-compose.yml` to keep the files on the host. Logs can contain player information: keep them private and out of commits (`logs/` is ignored by Git).
+
+### Client error reports
+
+The client uploads the traceback of each exception the server has not seen before, and afterwards only reports how often it happens again. The server keeps one row per stack in `game.client_errors`: the first traceback (its last 64 KiB), when it was first and last seen, and the number of occurrences. In `D` mode each player's repeats go to `game.client_error_reports`. The crash notes a client sends at its next login go to `game.client_crashes`. With `logging.dir` set, each new traceback is also written in full (its last 1 MiB) to `client-errors` files next to the server files, named, rotated and kept the same way (`client-errors.YYYY-MM-DD.log` daily), while the server log gets one line per new error. To switch one error between counts and details, set its `log_mode` to `B` or `D`; the client picks the change up at its next report, normally within 15 minutes. A report that is malformed or over a limit (1024 records per call, 64 KiB per argument or crash text) is refused whole, and repeats that name another account's player are skipped. The first traceback for a stack is kept, so a modified client could send a false one first; delete that error's report rows and then the error row, and the next client to hit it uploads it again. Client performance statistics and the client's HTTP bug reports are not collected. Tracebacks contain file paths, local variables and session state from the player's machine: keep the database and the log files private.
+
+```sql
+SELECT error_id, mode, log_mode, occurrences, last_seen, left(traceback, 200)
+FROM game.client_errors ORDER BY occurrences DESC LIMIT 20;
+```
 
 ## Database
 

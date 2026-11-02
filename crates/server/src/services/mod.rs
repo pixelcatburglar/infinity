@@ -14,6 +14,7 @@
 
 mod access_groups;
 mod agency;
+mod alert;
 mod alliances;
 mod bills;
 mod bookmarks;
@@ -34,6 +35,7 @@ pub(crate) mod drones;
 mod dynamic_items;
 pub(crate) mod effects;
 mod exploration;
+mod event_log;
 pub(crate) mod fit;
 mod fixed;
 pub(crate) mod fleets;
@@ -346,6 +348,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         ("dogmaIM", _) => dogma::dispatch(c, call).await,
 
         _ => {
+            if let Some(r) = alert::dispatch(c, call).await { return r; }
+            if let Some(r) = event_log::dispatch(c, call).await { return r; }
             if call.service == "invbroker" {
                 if let Some(r) = inventory::broker(c, call).await {
                     return r;

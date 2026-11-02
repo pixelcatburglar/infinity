@@ -208,11 +208,6 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {
         ("machoNet", "GetServiceInfo") => Ok(Value::Dict(vec![])),
         ("air_npe", "is_air_npe_enabled") => Ok(Value::Bool(false)),
-        // (errorID, logMode): a known error ID means "don't send me the trace".
-        ("alert", "BeanCount") => Ok(Value::tuple([Value::Int(1), s("B")])), // LOGGING_BATCHED
-        ("alert", "SendClientStackTraceAlert") => Ok(Value::tuple([Value::Int(1), s("B")])),
-        // (changes {errorHash: logMode}, flooded)
-        ("alert", "GetLogModeForError") => Ok(Value::tuple([Value::Dict(vec![]), Value::list([])])),
 
         ("subscriptionMgr", "GetCloneGrade") => Ok(Value::Int(1)), // CLONE_STATE_OMEGA
         ("subscriptionMgr", "GetSubscriptionTime") => Ok(Value::Int(FAR_FUTURE)),
@@ -236,7 +231,6 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
         ("pingService", "Ping") => Ok(Value::None),
         // {solarSystemID: slotKey} of alternative load systems; empty = load where the character is.
         ("populationCap", "GetCharacterLoadSlot") => Ok(Value::Dict(vec![])),
-        ("eventLog", _) => Ok(Value::None),
 
         // {raceID: {solarSystemID: population}}; empty = no starter system is capped.
         ("populationCap", "GetCharacterCreationSystemPopulations") => Ok(Value::Dict(vec![])),
