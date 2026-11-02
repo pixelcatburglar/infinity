@@ -4,6 +4,34 @@
 use anyhow::Result;
 use serde::Deserialize;
 
+/// Client ceiling from evefleet/const.py RECONNECT_TIMEOUT: two minutes.
+const FLEET_RECONNECT_CEILING_SECS: u64 = 120;
+
+/// Server policy for retaining disconnected fleet seats.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FleetsConfig {
+    /// Seat retention in seconds, capped by the client's reconnect window.
+    pub reconnect_timeout_secs: u64,
+}
+
+impl Default for FleetsConfig {
+    fn default() -> Self {
+        Self { reconnect_timeout_secs: FLEET_RECONNECT_CEILING_SECS }
+    }
+}
+
+impl FleetsConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=FLEET_RECONNECT_CEILING_SECS).contains(&self.reconnect_timeout_secs),
+            "fleets.reconnect_timeout_secs={} must be between 1 and {}: the client stops reconnecting after two minutes",
+            self.reconnect_timeout_secs, FLEET_RECONNECT_CEILING_SECS
+        );
+        Ok(())
+    }
+}
+
 /// Corporations configuration.
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]

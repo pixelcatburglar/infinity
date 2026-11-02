@@ -71,7 +71,7 @@ pub(super) fn normalize(input: &Value, created: i64) -> Option<Value> {
     for name in ["public_allowedEntities", "public_disallowedEntities", "membergroups_allowedEntities", "membergroups_disallowedEntities"] { set(&mut result, name, Value::list([])); }
     Some(result)
 }
-fn current_leader(f: &Fleet) -> Option<i64> { f.members.iter().find_map(|(id, m)| (m.role == ROLE_LEADER).then_some(*id)) }
+fn current_leader(f: &Fleet) -> Option<i64> { f.members.iter().find_map(|(id, m)| (m.role == ROLE_LEADER && m.reconnect.is_none()).then_some(*id)) }
 pub(super) fn capacity(f: &Fleet, ad: &Value) -> bool {
     let limit = field(ad, "advertJoinLimit").and_then(Value::as_int).map(|n| n as usize).unwrap_or(MAX_MEMBERS);
     f.members.len() < f.max_members.min(limit)
@@ -160,7 +160,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     if call.service != "fleetProxy" { return None; }
     let me = c.session.int("charid").unwrap_or(0);
     let applicant = match ChatSession::from_session(&c.session) { Some(s) => s, None => return Some(Err(invalid())) };
-    let own = || state().of.get(&me).copied();
+    let own = || { let st = state(); st.of.get(&me).copied().filter(|id| st.is_member(*id, me)) };
     Some(match call.method {
         "GetAvailableFleetAds" => {
             let ids: Vec<i64> = state().fleets.keys().copied().collect();
@@ -245,7 +245,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let approval = boolean(field(&ad, "joinNeedsApproval"), false).unwrap_or(false) || !auto;
             {
                 let mut st = state();
-                if st.of.contains_key(&me) || c.world.chat_session(leader).as_ref() != Some(&session) || ChatSession::from_session(&c.session).as_ref() != Some(&applicant) { return Some(Err(unavailable())); }
+                if st.of.get(&me).is_some_and(|&old| old == id || st.is_member(old, me)) || c.world.chat_session(leader).as_ref() != Some(&session) || ChatSession::from_session(&c.session).as_ref() != Some(&applicant) { return Some(Err(unavailable())); }
                 let Some(f) = st.fleets.get_mut(&id) else { return Some(Err(unavailable())) };
                 if !still_current(f, leader, count, &ad) { return Some(Err(unavailable())); }
                 if approval {

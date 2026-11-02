@@ -213,6 +213,9 @@ max_run_secs = 2592000              # existing maximum industry run duration
 max_runs = 1000000                  # existing hard maximum industry runs
 history_days = 90                   # server completed-job history retention
 
+[fleets]
+reconnect_timeout_secs = 120        # server seat-retention policy, 1..=120; client stops reconnecting after two minutes
+
 [corporations]
 min_management_skill_level = 1      # existing minimum Corporation Management skill level
 initial_shares = 1000               # founding and one-time NULL-total startup backfill; later changes do not alter issued totals

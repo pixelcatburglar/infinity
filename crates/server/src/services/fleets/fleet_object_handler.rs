@@ -11,25 +11,57 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     match (call.service, call.method) {
         ("fleetObjectHandler", "CreateFleet") if !call.bound => {
             let mut st = state();
-            if c.session.int("fleetid").is_some() || !st.can_create(me) {
+            if me <= 0 || c.session.int("fleetid").is_some() || !st.can_create(me) {
                 return Some(Err(CallError::User { msg: messages::MSG_FLEET_ERROR.into(), dict: vec![] }));
             }
+            if let Some(old) = st.of.get(&me).copied() {
+                lifecycle::remove_member_from(&mut st, &world, old, me);
+            }
+            st.clear_pending(me);
             let id = next_id();
             let (wing, squad) = (next_id(), next_id());
-            st.fleets.insert(id, Fleet::new(me, vec![Wing { id: wing, name: messages::fleets::FLEET_INITIAL_WING_NAME.into(), squads: vec![Squad { id: squad, name: messages::fleets::FLEET_INITIAL_SQUAD_NAME.into() }] }]));
+            let mut fleet = Fleet::new(me, vec![Wing { id: wing, name: messages::fleets::FLEET_INITIAL_WING_NAME.into(), squads: vec![Squad { id: squad, name: messages::fleets::FLEET_INITIAL_SQUAD_NAME.into() }] }]);
+            fleet.creator_session = Some(c.session.sid);
+            st.fleets.insert(id, fleet);
             drop(st);
             return Some(Ok(c.bind("fleetObjectHandler", Value::Int(id))));
         }
         _ => {}
     }
     let fleet_id = bound_fleet(call);
+    if call.service != "fleetObjectHandler" { return None; }
     if !call.bound {
         return None;
+    }
+    if call.method == "Reconnect" {
+        if me <= 0 || fleet_id <= 0 || !call.args.is_empty() || !(matches!(call.kwargs, Value::None) || matches!(call.kwargs, Value::Dict(v) if v.is_empty())) {
+            return Some(Err(notify_error(messages::fleets::INVALID_REQUEST)));
+        }
+        let leader = {
+            let st = state();
+            st.fleets.get(&fleet_id).and_then(|f| f.members.iter().find_map(|(&id, m)| (m.role == ROLE_LEADER).then_some(id)))
+        };
+        let name = if let Some(id) = leader { crate::dao::characters::routing::character_name(&c.db, id).await.ok().flatten().unwrap_or_default() } else { String::new() };
+        let mut st = state();
+        if !st.has_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+        let f = st.fleets.get_mut(&fleet_id).unwrap();
+        let leader = f.members.iter().find_map(|(&id, m)| (m.role == ROLE_LEADER).then_some(id)).unwrap_or(0);
+        let member = f.members.get_mut(&me).unwrap();
+        if member.reconnect.is_none() {
+            return Some(if member.active_session == Some(c.session.sid) && member.recovered_generation.is_some() { Ok(Value::None) } else { Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)) });
+        }
+        let reservation = member.reconnect.as_mut().unwrap();
+        if Instant::now() >= reservation.deadline { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))); }
+        if reservation.offered_session == Some(c.session.sid) { return Some(Ok(Value::None)); }
+        if reservation.offered_session.is_some() { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))); }
+        reservation.offered_session = Some(c.session.sid);
+        c.notify("OnFleetInvite", invite_args(fleet_id, leader, &name, true));
+        return Some(Ok(Value::None));
     }
     if call.method != "Init" {
         let st = state();
         let permitted = if matches!(call.method, "AcceptInvite" | "RejectInvite") {
-            st.fleets.get(&fleet_id).is_some_and(|f| f.invites.contains_key(&me))
+            st.fleets.get(&fleet_id).is_some_and(|f| f.invites.contains_key(&me) || f.members.get(&me).is_some_and(|m| m.reconnect.as_ref().is_some_and(|r| r.offered_session == Some(c.session.sid)) || (call.method == "AcceptInvite" && m.active_session == Some(c.session.sid) && m.recovered_generation.is_some())))
         } else {
             st.is_member(fleet_id, me)
         };
@@ -44,8 +76,14 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 Ok(rows) => rows.first().and_then(|r| r.type_id).map(i64::from).unwrap_or(0),
                 Err(e) => return Some(Err(CallError::Internal(e.into()))),
             };
-            let Some(member) = state().initialize(fleet_id, me, ship_type) else {
-                return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)));
+            let member = {
+                let mut st = state();
+                let Some(mut member) = st.initialize(fleet_id, me, ship_type) else {
+                    return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)));
+                };
+                member.active_session = Some(c.session.sid);
+                st.fleets.get_mut(&fleet_id).unwrap().members.insert(me, member.clone());
+                member
             };
             let pairs = session_pairs(Some(fleet_id), Some(&member));
             set_own_session(c, &pairs);
@@ -101,23 +139,52 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "Invite" => invite(c, fleet_id, int(0).unwrap_or(0), int(1), int(2), int(3)).await,
         // AcceptInvite(shipTypeID)
         "AcceptInvite" => {
+            let recovery = {
+                let st = state();
+                let member = st.fleets.get(&fleet_id).and_then(|f| f.members.get(&me));
+                if member.is_some_and(|m| m.reconnect.is_none() && m.active_session == Some(c.session.sid) && m.recovered_generation.is_some()) {
+                    return Some(Ok(Value::None));
+                }
+                member.and_then(|m| m.reconnect.as_ref()).filter(|r| r.offered_session == Some(c.session.sid) && Instant::now() < r.deadline).map(|r| r.generation)
+            };
             let ship_type = match crate::dao::characters::routing::fleet_member_locations(&c.db, &[me]).await {
                 Ok(rows) => rows.first().and_then(|r| r.type_id).map(i64::from).unwrap_or(0),
                 Err(e) => return Some(Err(CallError::Internal(e.into()))),
             };
             let joined = {
                 let mut st = state();
-                if st.of.contains_key(&me) { return Some(Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET_SELF))); }
-                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::fleets::FLEET_NOT_FOUND))) };
-                let Some(&(wing, squad, role)) = f.invites.get(&me) else { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))) };
-                if f.members.len() >= f.max_members { return Some(Err(notify_error(messages::fleets::FLEET_FULL))); }
-                let m = Member::new(wing, squad, role, JOB_NONE, ship_type);
-                if !super::arrangement::valid_slot(f, me, &m) { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
-                f.invites.remove(&me);
-                f.members.insert(me, m.clone());
-                broadcast(&world, f, Some(me), "OnFleetJoin", vec![member_value(me, &m)]);
-                st.of.insert(me, fleet_id);
-                m
+                if let Some(generation) = recovery {
+                    if !st.has_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))); }
+                    let f = st.fleets.get_mut(&fleet_id).unwrap();
+                    let m = f.members.get_mut(&me).unwrap();
+                    if m.reconnect.is_none() && m.active_session == Some(c.session.sid) && m.recovered_generation == Some(generation) { return Some(Ok(Value::None)); }
+                    if !m.reconnect.as_ref().is_some_and(|r| r.generation == generation && r.offered_session == Some(c.session.sid) && Instant::now() < r.deadline) {
+                        return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED)));
+                    }
+                    m.reconnect = None;
+                    m.active_session = Some(c.session.sid);
+                    m.recovered_generation = Some(generation);
+                    m.ship_type = ship_type;
+                    let m = m.clone();
+                    broadcast(&world, f, Some(me), "OnFleetJoin", vec![member_value(me, &m)]);
+                    st.clear_pending(me);
+                    m
+                } else {
+                    if st.of.get(&me).is_some_and(|&old| old == fleet_id || st.is_member(old, me)) { return Some(Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET_SELF))); }
+                    let Some(f) = st.fleets.get(&fleet_id) else { return Some(Err(notify_error(messages::fleets::FLEET_NOT_FOUND))) };
+                    let Some(&(wing, squad, role)) = f.invites.get(&me) else { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))) };
+                    if f.members.len() >= f.max_members { return Some(Err(notify_error(messages::fleets::FLEET_FULL))); }
+                    let mut m = Member::new(wing, squad, role, JOB_NONE, ship_type);
+                    if !super::arrangement::valid_slot(f, me, &m) { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
+                    m.active_session = Some(c.session.sid);
+                    if let Some(old) = st.of.get(&me).copied() { lifecycle::remove_member_from(&mut st, &world, old, me); }
+                    st.clear_pending(me);
+                    let f = st.fleets.get_mut(&fleet_id).unwrap();
+                    f.members.insert(me, m.clone());
+                    broadcast(&world, f, Some(me), "OnFleetJoin", vec![member_value(me, &m)]);
+                    st.of.insert(me, fleet_id);
+                    m
+                }
             };
             let pairs = session_pairs(Some(fleet_id), Some(&joined));
             set_own_session(c, &pairs);
@@ -127,6 +194,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         // RejectInvite(busy)
         "RejectInvite" => {
             let mut st = state();
+            if st.has_member(fleet_id, me) && st.fleets[&fleet_id].members[&me].reconnect.as_ref().is_some_and(|r| r.offered_session == Some(c.session.sid) && Instant::now() < r.deadline) {
+                lifecycle::remove_member_from(&mut st, &world, fleet_id, me);
+                return Some(Ok(Value::None));
+            }
             if let Some(f) = st.fleets.get_mut(&fleet_id) {
                 if f.invites.remove(&me).is_some() {
                     broadcast(&world, f, None, "OnFleetJoinReject", vec![Value::Int(me), Value::None]);
@@ -161,12 +232,13 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let mut st = state();
             if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             lifecycle::remove_member_from(&mut st, &world, fleet_id, me);
+            set_own_session(c, &session_pairs(None, None));
             Ok(Value::None)
         }
         "KickMember" => {
             let target = int(0).unwrap_or(0);
             let mut st = state();
-            let allowed = st.is_member(fleet_id, me) && st.is_member(fleet_id, target) && st.fleets.get(&fleet_id).is_some_and(|f| is_leader(f, me));
+            let allowed = st.is_member(fleet_id, me) && st.has_member(fleet_id, target) && st.fleets.get(&fleet_id).is_some_and(|f| is_leader(f, me));
             if !allowed {
                 return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_REMOVE_MEMBER)));
             }
@@ -177,7 +249,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let mut st = state();
             if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             let members: Vec<i64> = match st.fleets.get(&fleet_id) {
-                Some(f) if is_leader(f, me) => f.members.keys().copied().collect(),
+                Some(f) if is_leader(f, me) => f.members.keys().copied().filter(|&id| id != me).chain(std::iter::once(me)).collect(),
                 _ => return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_DISBAND))),
             };
             for ch in members {
@@ -195,7 +267,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 let Some(ids) = values.iter().map(Value::as_int).collect() else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
                 ids
             } else { vec![int(0).unwrap_or(0)] };
-            if ids.iter().any(|id| !st.is_member(fleet_id, *id)) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET_TARGET))); }
+            if ids.iter().any(|id| !st.has_member(fleet_id, *id)) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET_TARGET))); }
             let f = st.fleets.get_mut(&fleet_id).unwrap();
             let transfer = !mass && (call.method == "MakeLeader" || int(3) == Some(ROLE_LEADER)) && ids[0] != me;
             if !is_leader(f, me) && !(f.options.free_move && !mass && ids == [me] && call.method == "MoveMember") {
@@ -414,9 +486,13 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     })
 }
 
-pub(super) fn notify_invite(world: &World, fleet_id: i64, inviter: i64, target: i64, name: &str) {
+fn invite_args(fleet_id: i64, inviter: i64, name: &str, auto_accept: bool) -> Vec<Value> {
     let question = messages::fleets::fleet_invitation(name);
-    world.notify_pilot(target, "OnFleetInvite", vec![Value::Int(fleet_id), Value::Int(inviter), Value::str(messages::MSG_CUSTOM_QUESTION), Value::dict([("header", Value::unicode(messages::fleets::FLEET_INVITATION_HEADER)), ("question", Value::unicode(question))])]);
+    vec![Value::Int(fleet_id), Value::Int(inviter), Value::str(messages::MSG_CUSTOM_QUESTION), Value::dict([("header", Value::unicode(messages::fleets::FLEET_INVITATION_HEADER)), ("question", Value::unicode(question)), ("autoAccept", Value::Bool(auto_accept))])]
+}
+
+pub(super) fn notify_invite(world: &World, fleet_id: i64, inviter: i64, target: i64, name: &str) {
+    world.notify_pilot(target, "OnFleetInvite", invite_args(fleet_id, inviter, name, false));
 }
 
 pub(super) async fn invite(c: &mut Client, fleet_id: i64, target: i64, wing: Option<i64>, squad: Option<i64>, role: Option<i64>) -> CallResult {
@@ -428,7 +504,7 @@ pub(super) async fn invite(c: &mut Client, fleet_id: i64, target: i64, wing: Opt
             return Err(notify_error(messages::fleets::INVALID_REQUEST));
         }
         if !st.is_member(fleet_id, me) { return Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)); }
-        if st.of.contains_key(&target) { return Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET)); }
+        if st.of.get(&target).is_some_and(|&old| old == fleet_id || st.is_member(old, target)) { return Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET)); }
         let f = st.fleets.get_mut(&fleet_id).unwrap();
         if !is_leader(f, me) { return Err(notify_error(messages::fleets::LEADER_REQUIRED)); }
         if f.members.len() >= f.max_members { return Err(notify_error(messages::fleets::FLEET_FULL)); }

@@ -23,12 +23,13 @@ fn in_scope(commander: Position, member: Position) -> bool {
 }
 fn snapshot(st: &State, commander: i64, ship: i64) -> Option<Order> {
     let fleet = *st.of.get(&commander)?;
+    if !st.is_member(fleet, commander) { return None; }
     let f = st.fleets.get(&fleet)?;
     let position = Position::from(f.members.get(&commander)?);
     if !matches!(position.role, ROLE_LEADER | ROLE_WING_COMMANDER | ROLE_SQUAD_COMMANDER) { return None; }
     let mut members: Vec<_> = f.members.iter().filter_map(|(&id, m)| {
         let p = Position::from(m);
-        (st.of.get(&id) == Some(&fleet) && m.opt_outs.accepts_fleet_warp && in_scope(position, p)).then_some((id, p))
+        (st.is_member(fleet, id) && m.opt_outs.accepts_fleet_warp && in_scope(position, p)).then_some((id, p))
     }).collect();
     members.sort_by_key(|(id, _)| (*id == commander, *id));
     Some(Order { fleet, commander, ship, position, members, target: None })

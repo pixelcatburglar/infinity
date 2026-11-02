@@ -11,6 +11,7 @@ fn subscriptions_validate_membership_deduplicate_and_disable_without_erasing_lis
     st.fleets.insert(10, fleet);
     let list = |ids: &[i64]| Value::list(ids.iter().copied().map(Value::Int));
     let update = super::super::fleet_mgr::update_watchlist;
+    st.fleets.get_mut(&10).unwrap().members.get_mut(&2).unwrap().reconnect = Some(ReconnectState { generation: 1, deadline: Instant::now(), offered_session: None });
     assert!(update(&mut st, 1, "AddToWatchlist", &[list(&[2, 2, 3]), Value::None]).is_ok());
     assert_eq!(st.fleets[&10].members[&1].watchlist, vec![2, 3]);
     assert!(update(&mut st, 1, "AddToWatchlist", &[list(&[4]), Value::None]).is_err());
@@ -22,6 +23,8 @@ fn subscriptions_validate_membership_deduplicate_and_disable_without_erasing_lis
     assert_eq!(st.fleets[&10].members[&1].watchlist, vec![3, 2]);
     assert!(update(&mut st, 1, "RemoveFromWatchlist", &[Value::Int(3), Value::None]).is_ok());
     assert_eq!(st.fleets[&10].members[&1].watchlist, vec![2]);
+    st.fleets.get_mut(&10).unwrap().members.get_mut(&1).unwrap().reconnect = Some(ReconnectState { generation: 2, deadline: Instant::now(), offered_session: None });
+    assert!(update(&mut st, 1, "AddToWatchlist", &[list(&[2]), Value::None]).is_err());
 }
 
 #[test]

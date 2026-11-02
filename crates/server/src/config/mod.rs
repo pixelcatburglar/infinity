@@ -48,6 +48,7 @@ pub struct Config {
     pub salvage: game::SalvageConfig,
     pub exploration: game::world::ExplorationConfig,
     pub industry: game::economy::IndustryConfig,
+    pub fleets: game::social::FleetsConfig,
     pub corporations: game::social::CorporationsConfig,
     pub contracts: game::social::ContractsConfig,
     pub clones: game::social::ClonesConfig,
@@ -90,6 +91,7 @@ impl PartialEq for Config {
             && self.salvage == other.salvage
             && self.exploration == other.exploration
             && self.industry == other.industry
+            && self.fleets == other.fleets
             && self.corporations == other.corporations
             && self.contracts == other.contracts
             && self.clones == other.clones
@@ -234,6 +236,7 @@ impl Config {
             salvage: self.salvage.clone(),
             exploration: self.exploration.clone(),
             industry: self.industry.clone(),
+            fleets: self.fleets.clone(),
             corporations: self.corporations.clone(),
             contracts: self.contracts.clone(),
             clones: self.clones.clone(),

@@ -52,7 +52,7 @@ pub(super) fn apply(f: &mut Fleet, changes: Vec<(i64, Member)>) -> Option<Vec<(i
 pub(super) fn publish(world: &World, fleet_id: i64, f: &Fleet, changes: Vec<(i64, Member, Member)>) {
     let only = f.members.len() == 1;
     for (id, before, after) in changes {
-        world.notify_pilot(id, "__session", session_pairs(Some(fleet_id), Some(&after)));
+        if after.reconnect.is_none() { world.notify_pilot(id, "__session", session_pairs(Some(fleet_id), Some(&after))); }
         broadcast(world, f, None, "OnFleetMemberChanged", changed(id, fleet_id, &before, &after, only));
     }
 }
