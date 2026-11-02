@@ -65,6 +65,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - in chat: password-protected channels, granting channel access to a whole corporation or alliance, taking over ownership of a system channel, and the local chat blackout in null-security space
   - access groups owned by a corporation, and access lists for structures
   - clone-grade and clone-implant restrictions and planetary colony extraction rules: every character is treated as Omega, and implants stay with the character rather than a jump clone
+  - phone-number binding and its rewards, an external NetEase account service: the binding-success callback is answered but no binding is recorded
   - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
