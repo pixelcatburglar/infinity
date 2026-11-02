@@ -133,6 +133,7 @@ Any other tag starts nothing.
 4. `retail::cached_call` answers first. Do not shadow a captured retail answer unless you replace it on purpose.
 5. If a feature isn't modelled but the client needs an answer, add an empty but well-formed constant answer to `services/fixed.rs`, in the function for its position in the dispatch chain, with a comment saying what the client reads from it.
 6. Unhandled calls log `UNHANDLED <service>::<method>` and return `None`. Make that line go away by handling the call. Never suppress the warning.
+7. Game rules that a caller without a client connection also runs (a Lua script, a scheduled job) take a `services::identity::Identity` and the resources they use (`Db`, `World`, `Sde`), not `&mut Client`. Session changes go back to the caller as a return value, and notifications go out through a dispatch function the caller passes in or come back with the result. The RPC arm builds the identity with `Identity::of_client(c)` and applies both. Never build a stand-in `Client` or copy a rule for a caller without one.
 
 ### Lua scripts
 
