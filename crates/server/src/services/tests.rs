@@ -99,3 +99,18 @@ async fn corporate_mining_ledger_fixed_dispatch_returns_empty_lists() {
         assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), Value::list([]));
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn mobile_binding_callback_dispatch_returns_none() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 1).await;
+    let kwargs = Value::Dict(vec![]);
+    for aeid in ["fictional-aeid-one", "fictional-aeid-two"] {
+        let args = [Value::str(aeid)];
+        let call = Call { service: "mobileCollectMgr", method: "MobileBindSucceed", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+        let reply = dispatch(&mut client, &call).await.unwrap();
+        assert_eq!(reply, Value::None);
+    }
+}
