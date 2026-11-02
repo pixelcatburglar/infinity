@@ -47,6 +47,7 @@ async fn requested_nested_active_blueprints_refuse_personal_and_corporate_accept
                 for_corp: false, issuer_wallet_key: ACCOUNT_CASH, issuer_hangar_flag: FLAG_HANGAR,
                 issuer_source_location: station_id, assignee: 0, start: station_id, end: 0,
                 price: 10.0, reward: 0.0, collateral: 0.0, title: "", description: "", num_days: 1,
+                paid_deposit: 0.0, auction_tax_rate: 0.0, auction_tax_maximum: 0.0,
                 status: STATUS_OUTSTANDING, issued: filetime_now(), expires: i64::MAX,
             }).await.unwrap();
             contract_dao::insert_requested_item(&db, id, root_type, 1).await.unwrap();

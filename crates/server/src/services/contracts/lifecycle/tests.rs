@@ -7,6 +7,7 @@ mod corporate_fixture;
 mod corporate_edges;
 mod requested_active;
 mod transitions;
+mod fees;
 
 #[test]
 fn volume_sum_preserves_sql_zero_and_nonempty_values() {

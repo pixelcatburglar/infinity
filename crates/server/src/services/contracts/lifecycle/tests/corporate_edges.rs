@@ -238,7 +238,7 @@ async fn courier_failure_uses_current_custody_and_missing_package_destroys_desce
             }
         }
         let balance: f64 = db.query_one("SELECT balance::float8 AS balance FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$2", &[&issuer.id, &(ACCOUNT_CASH + 1)]).await.unwrap().get("balance");
-        assert_eq!(balance, 1_000_150.0);
+        assert_eq!(balance, 970_150.0);
     }).await;
     f::cleanup(&db, issuer).await;
     f::cleanup(&db, buyer).await;

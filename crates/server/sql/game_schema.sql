@@ -1262,6 +1262,10 @@ ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS issuer_hangar_flag integer N
 ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS issuer_source_location bigint;
 UPDATE game.contracts SET issuer_source_location = start_station_id WHERE issuer_source_location IS NULL;
 ALTER TABLE game.contracts ALTER COLUMN issuer_source_location SET NOT NULL;
+-- dao/contracts: paid listing deposit and creation-time auction tax snapshot.
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS paid_deposit double precision NOT NULL DEFAULT 0.0;
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS auction_tax_rate double precision NOT NULL DEFAULT 0.0;
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS auction_tax_maximum double precision NOT NULL DEFAULT 0.0;
 ALTER TABLE game.contract_bids ADD COLUMN IF NOT EXISTS wallet_key integer NOT NULL DEFAULT 1000;
 
 -- dao/wars and dao/killmails/wars: durable mutual wars and immutable kill classification.
