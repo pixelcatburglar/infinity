@@ -36,7 +36,7 @@ async fn broker_standings_placement_and_repricing() {
         assert_eq!(station_broker_rate(&test_db, &c.sde, f.character, -1, 0.015).await.unwrap(), 0.015);
         test_db.execute("UPDATE game.characters SET balance=2000000 WHERE character_id=$1", &[&f.character]).await.unwrap();
         let item: i64 = test_db.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1,$2,$3,$4,2,false) RETURNING item_id", &[&sell_type, &f.character, &station_id, &FLAG_HANGAR]).await.unwrap().get("item_id");
-        assert!(place_sell(&c, item, station_id, sell_type as i64, 1_000_000.0, 1, 1).await.unwrap());
+        assert!(place_sell(&Identity::of_client(&c), &c.db, &c.world, &c.sde, item, station_id, sell_type as i64, 1_000_000.0, 1, 1).await.unwrap());
         assert_eq!(balance(&test_db, f.character).await.unwrap(), 1_986_900.0);
         let remaining: i32 = test_db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&item]).await.unwrap().get("quantity");
         assert_eq!(remaining, 1);
