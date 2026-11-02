@@ -1,7 +1,7 @@
 //! Item volumes for packaged stacks and assembled items, mirroring
 //! `inventorycommon/util.py:30-59` and its `inventorycommon/const.py` overrides.
-//! Type, group and raw volume come from the loaded SDE. Plastic wraps use their
-//! stored encoded quantity; creating or repairing that encoding is not supported here.
+//! Type, group and raw volume come from the loaded SDE. Plastic wrap quantity
+//! encoding is supported here; persistence is the contract DAO and caller's concern.
 
 mod overrides;
 
@@ -12,6 +12,26 @@ use super::CallError;
 const WRAP_VOLUME_SCALE: f64 = 100.0;
 /// Client `GetItemVolume`: volume unavailable sentinel is not multiplied.
 const UNAVAILABLE_VOLUME: f64 = -1.0;
+
+/// Logical item count, independent of singleton wire quantity encoding.
+pub(super) fn stack_size(singleton: bool, quantity: i64) -> i64 {
+    if singleton { 1 } else { quantity }
+}
+
+/// Encode a plastic wrap volume for the client `inventorycommon/util.py:45-48`
+/// decoder. Rounding up and the minimum magnitude are server representation choices;
+/// the i32 representation supports at most 21,474,836.47 m³. Courier creation
+/// separately enforces the client's 1,200,000 m³ limit.
+pub(super) fn encode_wrap_quantity(volume: f64) -> Result<i32, super::CallError> {
+    if !volume.is_finite() || volume < 0.0 {
+        return Err(anyhow::anyhow!("invalid plastic wrap volume {volume}").into());
+    }
+    let magnitude = (volume * WRAP_VOLUME_SCALE).ceil().max(1.0);
+    if magnitude > i32::MAX as f64 {
+        return Err(anyhow::anyhow!("plastic wrap volume exceeds encoded range").into());
+    }
+    Ok(-(magnitude as i32))
+}
 
 pub(super) fn item_volume(sde: &Sde, type_id: i32, singleton: bool, quantity: i64, qty: Option<i64>) -> Result<f64, CallError> {
     let ty = sde.types.get(type_id).ok_or_else(|| anyhow::anyhow!("missing SDE type {type_id}"))?;
@@ -39,7 +59,7 @@ fn calculate(type_id: i32, group_id: Option<i32>, raw_volume: f64, singleton: bo
     if volume == UNAVAILABLE_VOLUME {
         return Ok(volume);
     }
-    let count = qty.unwrap_or(if singleton { 1 } else { quantity });
+    let count = qty.unwrap_or(stack_size(singleton, quantity));
     Ok(volume * if count < 0 { 1 } else { count } as f64)
 }
 

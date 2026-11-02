@@ -9,6 +9,7 @@ mod requested_active;
 mod transitions;
 mod fees;
 mod volume;
+mod wrap;
 
 
 #[test]

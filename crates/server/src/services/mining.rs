@@ -396,7 +396,9 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
     let quantity = taken as i32;
     let (item_id, total, change) = match stack {
         Some(r) => {
-            crate::dao::items::transfers::add(ex, r.item_id, quantity).await.map_err(db_err)?;
+            if !crate::dao::items::transfers::add(ex, r.item_id, quantity).await.map_err(db_err)? {
+                return Err(CallError::Internal(anyhow::anyhow!("mining stack transfer guard failed")));
+            }
             (r.item_id, r.quantity + quantity, (IX_STACK_SIZE, Value::Int(r.quantity as i64)))
         }
         None => {

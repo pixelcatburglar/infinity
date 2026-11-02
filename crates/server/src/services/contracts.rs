@@ -10,6 +10,7 @@
 //!   station; delivering the wrap to their hangar at the end station hands the goods to the
 //!   issuer there and pays out reward and collateral. A failed courier contract pays the
 //!   collateral to the issuer and leaves the goods with the acceptor, where the wrap is.
+//!   The singleton wrap's negative quantity encodes its contract volume in hundredths.
 //!
 //! Escrowed items stay in game.items, located at -contractID. An expired or rejected
 //! contract waits for its issuer to delete it and take the escrow back; expired auctions
@@ -65,6 +66,8 @@ use tracing::info;
 const TYPE_ITEM_EXCHANGE: i32 = 1;
 const TYPE_AUCTION: i32 = 2;
 const TYPE_COURIER: i32 = 3;
+/// `eve/common/script/util/contractscommon.py:36`, checked by `createContractWnd.py:1371-1372`.
+const MAX_COURIER_VOLUME: f64 = 1_200_000.0;
 // contractscommon.CONTYPE_*
 const CONTYPE_AUCTION_AND_ITEM_EXCHANGE: i64 = 10;
 const CONTYPE_ALL: i64 = 11;

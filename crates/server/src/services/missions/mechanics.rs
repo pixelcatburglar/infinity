@@ -172,20 +172,24 @@ async fn goods_at(c: &Client, station: i64, type_id: i32) -> Result<Vec<crate::d
 }
 
 pub(super) async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i32)) -> Result<bool, CallError> {
-    Ok(goods_at(c, station, type_id).await?.iter().map(|i| i.quantity as i64).sum::<i64>() >= qty as i64)
+    Ok(goods_at(c, station, type_id).await?.iter().map(|i| crate::services::item_volume::stack_size(i.singleton, i64::from(i.quantity))).sum::<i64>() >= qty as i64)
 }
 
 /// Take delivered goods using guarded item changes, retaining inventory notification order.
 async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut crate::db::outbox::Outbox<X>, me: i64, station: i64, ship: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
     use crate::dao::items::{loading::ItemQuery, quantities::{self, QuantityChange}};
     let items = crate::services::items::load_items(db, sde, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)?;
+    if qty <= 0 { return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR)); }
     let mut left = qty;
     let mut changes = std::collections::BTreeMap::new();
     for item in &items {
         if left <= 0 { break; }
-        let take = item.quantity.min(left);
+        let available = crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity));
+        let take = available.min(i64::from(left)).max(0) as i32;
+        if take == 0 { continue; }
         left -= take;
-        changes.insert(item.item_id, QuantityChange::new(item, (item.quantity > take).then_some(item.quantity - take)));
+        let remaining = if item.singleton || i64::from(take) == available { None } else { Some(item.quantity - take) };
+        changes.insert(item.item_id, QuantityChange::new(item, remaining));
     }
     if left > 0 || !quantities::apply(db, &changes).await.map_err(db_err)? {
         return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));

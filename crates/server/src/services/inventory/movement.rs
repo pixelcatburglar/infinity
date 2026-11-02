@@ -185,7 +185,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 if take.is_some() || item.location_id != location || item.flag_id != flag || item.owner_id != owner || (is_fitting_flag(flag) && !item.singleton) {
                     outbox.event(crate::lua::events::GameEvent::ItemsMoved {
                         char_id, item_id: moved_id, from_location_id: item.location_id,
-                        to_location_id: location, quantity: take.map_or(item.quantity, |q| q as i32),
+                        to_location_id: location, quantity: take.map_or(crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity)) as i32, |q| q as i32),
                     });
                 }
                 Ok(Some(moved_id))

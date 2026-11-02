@@ -598,6 +598,8 @@ pub(crate) const MSG_ITEM_NOT_A_SKILL: &str = "ItemNotASkill";
 pub(crate) const MSG_CON_CONTRACT_NOT_FOUND: &str = "ConContractNotFound";
 /// Client message `ConContractNotOutstanding`.
 pub(crate) const MSG_CON_CONTRACT_NOT_OUTSTANDING: &str = "ConContractNotOutstanding";
+/// Client message `ConExceedsMaxVolume`.
+pub(crate) const MSG_CON_EXCEEDS_MAX_VOLUME: &str = "ConExceedsMaxVolume";
 /// Client message `ConfirmRepackageSomethingWithUpgrades`.
 pub(crate) const MSG_CONFIRM_REPACKAGE_SOMETHING_WITH_UPGRADES: &str = "ConfirmRepackageSomethingWithUpgrades";
 /// Client message `CorpBulletinHasBeenEdited`.

@@ -184,6 +184,15 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
             contract_dao::insert_requested_item(db, id, *type_id, *qty).await.map_err(db_err)?;
         }
         let volume = volume(db, &sde, id).await?;
+        if kind == TYPE_COURIER {
+            if volume > MAX_COURIER_VOLUME {
+                return Err(user_error(messages::MSG_CON_EXCEEDS_MAX_VOLUME, vec![
+                    ("max".into(), Value::Float(MAX_COURIER_VOLUME)),
+                    ("vol".into(), Value::Float(volume)),
+                ]));
+            }
+            crate::services::item_volume::encode_wrap_quantity(volume)?;
+        }
         contract_dao::update_volume(db, id, volume).await.map_err(db_err)?;
         ownership::tell(db, outbox, assignee, "OnContractAssigned", id).await?;
         created.push(Value::Int(id));
@@ -319,7 +328,8 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                 TYPE_COURIER => {
                     ownership::debit(db, outbox, owner, k.collateral).await?;
                     let dest = custody::receiving(owner.id, k.start);
-                    let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, owner.id, dest.location, dest.flag, &messages::contract_package_name(id)).await.map_err(db_err)?;
+                    let quantity = crate::services::item_volume::encode_wrap_quantity(k.volume)?;
+                    let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, owner.id, dest.location, dest.flag, quantity, &messages::contract_package_name(id)).await.map_err(db_err)?;
                     let item = load_items(db, &sde, ItemQuery::Id(wrap)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
                     if for_corp {
                         super::super::inventory::notify_corp_item_change(db, outbox, &item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;

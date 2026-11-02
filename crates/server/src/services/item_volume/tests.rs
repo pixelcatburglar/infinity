@@ -34,3 +34,27 @@ fn plastic_wrap_uses_stored_quantity_and_rejects_nonpositive_volume() {
     assert!(calculate(TYPE_PLASTIC_WRAP, None, 1.0, true, 1, None).is_err());
     assert!(calculate(TYPE_PLASTIC_WRAP, None, 1.0, true, i64::MIN, None).is_ok());
 }
+
+#[test]
+fn logical_stack_size_ignores_singleton_encoding() {
+    assert_eq!(stack_size(false, 42), 42);
+    assert_eq!(stack_size(true, 1), 1);
+    assert_eq!(stack_size(true, crate::consts::BLUEPRINT_COPY_QUANTITY), 1);
+    assert_eq!(stack_size(true, -500_000), 1);
+}
+
+#[test]
+fn wrap_encoding_rounds_up_and_has_a_minimum() {
+    assert_eq!(encode_wrap_quantity(5000.0).unwrap(), -500_000);
+    assert_eq!(encode_wrap_quantity(1.001).unwrap(), -101);
+    assert_eq!(encode_wrap_quantity(0.0).unwrap(), -1);
+    assert_eq!(encode_wrap_quantity(f64::MIN_POSITIVE).unwrap(), -1);
+    assert_eq!(encode_wrap_quantity(21_474_836.47).unwrap(), -i32::MAX);
+}
+
+#[test]
+fn wrap_encoding_rejects_invalid_and_out_of_range_volume() {
+    for volume in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 21_474_836.48, f64::MAX] {
+        assert!(matches!(encode_wrap_quantity(volume), Err(CallError::Internal(_))));
+    }
+}

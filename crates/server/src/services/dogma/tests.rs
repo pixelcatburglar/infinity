@@ -24,3 +24,21 @@ fn overload_active_effect_has_godma_environment_shape() {
     assert_eq!(fields[8], Value::Int(ONLINE_EFFECT_DURATION));
     assert_eq!(fields[9], Value::Int(ONLINE_EFFECT_REPEAT));
 }
+
+#[test]
+fn item_row_preserves_type_aware_wire_quantity() {
+    let mut item = Item {
+        item_id: 1, type_id: TYPE_PLASTIC_WRAP, owner_id: 2, location_id: 3,
+        flag_id: 4, quantity: -500_000, singleton: true, group_id: 5,
+        category_id: 6, custom_info: None,
+    };
+    let descriptor = item_descriptor();
+    assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(-500_000)));
+    item.type_id = TYPE_CHARACTER;
+    assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(SINGLETON_QUANTITY)));
+    item.quantity = BLUEPRINT_COPY_QUANTITY as i32;
+    assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(BLUEPRINT_COPY_QUANTITY)));
+    item.singleton = false;
+    item.quantity = 42;
+    assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(42)));
+}

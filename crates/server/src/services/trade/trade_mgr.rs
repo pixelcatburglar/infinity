@@ -60,7 +60,7 @@ async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<Tra
     for item in &items {
         if item.owner_id != me || item.location_id != source || item.flag_id != FLAG_HANGAR { return Err(notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR)); }
         if Some(item.item_id) == ship { return Err(user_error(messages::trade::MSG_PEOPLE_ABOARD_SHIP, vec![])); }
-        if let Some(q) = quantity { if q < 1 || q > i64::from(item.quantity) || (item.singleton && q != 1) { return Err(notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR)); } }
+        if let Some(q) = quantity { if q < 1 || q > crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity)) || (item.singleton && q != 1) { return Err(notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR)); } }
     }
     let tree_ids = trades::descendants(ex, ids).await.map_err(db_err)?;
     let tree = load_items(ex, sde, ItemQuery::Ids(&tree_ids)).await.map_err(db_err)?;
@@ -75,7 +75,7 @@ async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<Tra
     }
     let mut staged = Vec::new();
     for item in &items {
-        let q = quantity.unwrap_or(i64::from(item.quantity));
+        let q = quantity.unwrap_or(crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity)));
         let id = if !item.singleton && q < i64::from(item.quantity) {
             let mut changes = BTreeMap::new();
             changes.insert(item.item_id, QuantityChange::new(item, Some(item.quantity - q as i32)));

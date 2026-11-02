@@ -361,6 +361,29 @@ CREATE TABLE IF NOT EXISTS game.contract_bids (
 );
 CREATE INDEX IF NOT EXISTS contract_bids_contract_idx ON game.contract_bids (contract_id, amount DESC);
 
+-- services/contracts: inventorycommon/const.py typePlasticWrap (3468);
+-- inventorycommon/util.py:45-48 decodes negative quantity as hundredths of m³.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM game.items i JOIN game.contracts c ON c.package_id = i.item_id
+        WHERE i.type_id = 3468 AND i.singleton AND i.quantity >= 0
+          AND CASE WHEN c.volume = 'NaN'::double precision OR c.volume < 0
+                         OR c.volume > 21474837.0 THEN true
+                   ELSE ceil(c.volume * 100.0) > 2147483647 END
+    ) THEN
+        RAISE EXCEPTION 'invalid or out-of-range legacy plastic wrap contract volume';
+    END IF;
+    UPDATE game.items i
+    SET quantity = -greatest(1, ceil(c.volume * 100.0)::integer)
+    FROM game.contracts c
+    WHERE c.package_id = i.item_id AND i.type_id = 3468 AND i.singleton AND i.quantity >= 0;
+
+    UPDATE game.items i SET quantity = -1
+    WHERE i.type_id = 3468 AND i.singleton AND i.quantity >= 0
+      AND NOT EXISTS (SELECT 1 FROM game.contracts c WHERE c.package_id = i.item_id);
+END $$;
+
 -- Blueprint research state; a blueprint without a row is ME 0 / TE 0. runs is -1 for an
 -- original. Copies are singleton items of quantity -2.
 CREATE TABLE IF NOT EXISTS game.blueprints (

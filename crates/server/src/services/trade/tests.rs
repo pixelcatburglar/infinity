@@ -5,6 +5,7 @@ use crate::services::{item_descriptor, keyval};
 use marshal::Value;
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
+mod wrap;
 
 fn trade() -> Trade {
     Trade { id: 100, station: 1, a: 2, b: 3, money_a: 1.25, money_b: 0.0, accepted_a: false, accepted_b: false, state: "open".into(), updated_at: 0 }
