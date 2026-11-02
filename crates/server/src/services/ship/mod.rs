@@ -160,9 +160,23 @@ const JUMP_DELAY_MS: u64 = 4000;
 const LOCAL_CHAT_INVITE_DELAY_MS: u64 = 2000;
 /// Existing server timing for stopping the wormhole effects.CloakRegardless effect.
 const WORMHOLE_EFFECT_STOP_DELAY_MS: u64 = 3000;
-/// The arrival cloak lasts this long unless the pilot moves first (s).
+/// Arrival cloak duration in seconds (`appConst.invulnerabilityRestoring`).
 const JUMP_CLOAK_SECONDS: i64 = 60;
 const UE_LOCID: i64 = 3;
+
+/// Install an arriving ship with the actor-managed restoring cloak.
+pub(super) async fn arrive_cloaked(c: &mut Client, system: i64, mut ball: Ball) -> Result<i64, CallError> {
+    let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND;
+    ball.cloak = CLOAK_RESTORE;
+    ball.cloak_until = cloak_until;
+    c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+    Ok(cloak_until)
+}
+
+/// Send the restoring cloak timer after the arrival session change.
+pub(super) fn notify_jump_cloak(c: &mut Client, ship: i64, cloak_until: i64) {
+    c.notify("OnJumpCloakUpdated", vec![Value::Int(ship), Value::Int(cloak_until), Value::Int(JUMP_CLOAK_SECONDS * FILETIME_SECOND)]);
+}
 
 /// CmdStargateJump(fromStargateID, toStargateID, shipID): leave through the gate and
 /// arrive, cloaked, next to its destination gate in the neighbouring system.
@@ -239,11 +253,8 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     c.world.unobserve(c.login.client_id);
     item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
-    let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND;
-    let mut ball = ship_ball(c, ship, pos).await?;
-    ball.cloak = CLOAK_RESTORE;
-    ball.cloak_until = cloak_until;
-    c.world.add_ship(dest_system, ball).await.map_err(CallError::Internal)?;
+    let ball = ship_ball(c, ship, pos).await?;
+    let cloak_until = arrive_cloaked(c, dest_system, ball).await?;
     // The client rebinds its remote ballpark for the new system, which sends SetState.
     c.change_session(vec![
         ("solarsystemid", Value::Int(dest_system)),
@@ -251,8 +262,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         ("constellationid", Value::Int(constellation)),
         ("regionid", Value::Int(region)),
     ]);
-    // Arrival cloak: crimewatch timer now, lapse after JUMP_CLOAK_SECONDS unless broken.
-    c.notify("OnJumpCloakUpdated", vec![Value::Int(ship), Value::Int(cloak_until), Value::Int(JUMP_CLOAK_SECONDS * FILETIME_SECOND)]);
+    notify_jump_cloak(c, ship, cloak_until);
     // The client leaves the old Local itself; the new one arrives as an invite, sent once
     // the session change has had time to land.
     let chat = c.chat.clone();

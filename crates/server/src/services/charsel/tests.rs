@@ -87,3 +87,79 @@ async fn rookie_grants_are_persistent_and_atomic() {
     assert!(rookie_fit::for_ship(-1).is_none());
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn space_selection_restores_cloak_before_session_and_without_map_telemetry() {
+    use std::sync::Arc;
+    use crate::{config::{Config, deployment::DatabaseConfig}, conn::Conn, db::Db, handshake::Login, macho::{self, Address}, sde::Sde, space::{World, CLOAK_RESTORE}};
+    crate::tests::init_config();
+    let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let row = sde.map.systems().find(|s| s.constellation_id.is_some() && s.region_id.is_some()).unwrap();
+    let (system, constellation, region) = (row.solar_system_id, row.constellation_id.unwrap(), row.region_id.unwrap());
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id,constellation_id,region_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,NULL,$2,$3,$4) RETURNING character_id", &[&account, &system, &constellation, &region]).await.unwrap().get("character_id");
+    let pos = [1234.0, 5678.0, 9012.0];
+    let ship = items::creation::positioned(&db, crate::consts::TYPE_CAPSULE, character, system, pos).await.unwrap();
+    characters::selection::set_ship(&db, character, ship).await.unwrap();
+    let selected = characters::selection::selected(&db, character, account).await.unwrap().unwrap();
+    let (corp, alliance) = (selected.corporation_id, selected.alliance_id);
+    let events: i64 = db.query_one("SELECT count(*) AS count FROM game.map_events", &[]).await.unwrap().get("count");
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, addr) = listener.accept().await.unwrap();
+    let login = Login { user_id: account, user_name: account.to_string(), role: 0, client_id: account, session_id: account, language_id: "EN".into() };
+    let cfg = Arc::new(Config::default());
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
+    let mut c = Client::new(Conn::new(stream, addr), cfg, db.clone(), sde, chat, world.clone(), login);
+    let w = world.clone();
+    let result = tokio::spawn(async move {
+        assert_eq!(c.session.int("charid"), None);
+        let mut previous_expiry = 0;
+        for _ in 0..2 {
+            c.outbox.clear();
+            let start = crate::client::filetime_now();
+            select_character(&mut c, character).await.unwrap();
+            let ball = w.with(system, move |s| s.pilot_ball(character).cloned()).await.unwrap().unwrap();
+            assert_eq!((ball.id, ball.type_id, ball.char_id, ball.owner_id, ball.corp_id, ball.alliance_id),
+                (ship, crate::consts::TYPE_CAPSULE, Some(character), character, corp, alliance.unwrap_or(-1)));
+            assert_eq!(ball.pos, pos);
+            let fit = crate::services::fit::Fit::load(&c.db, c.sde.clone(), character, ship).await.unwrap();
+            let fitted_speed = fit.value(crate::services::fit::Key::Ship, crate::consts::dogma::ATTR_MAX_VELOCITY);
+            if fitted_speed > 0.0 { assert_eq!(ball.max_vel, fitted_speed as f32); }
+            assert_eq!(ball.cloak, CLOAK_RESTORE);
+            assert!(ball.cloak_until >= start + 60 * FILETIME_SECOND);
+            assert!(ball.cloak_until > previous_expiry);
+            previous_expiry = ball.cloak_until;
+            assert_eq!(c.session.int("charid"), Some(character));
+            assert_eq!(c.session.int("corpid"), Some(corp));
+            assert_eq!(c.session.int("allianceid"), alliance);
+            assert_eq!(c.session.int("shipid"), Some(ship));
+            assert_eq!(c.session.int("stationid"), None);
+            assert_eq!(c.session.int("solarsystemid"), Some(system));
+            assert_eq!(c.session.int("solarsystemid2"), Some(system));
+            assert_eq!(c.session.int("constellationid"), Some(constellation));
+            assert_eq!(c.session.int("regionid"), Some(region));
+            let session = c.outbox.iter().position(|p| p.command == macho::cmd::SESSIONCHANGENOTIFICATION).unwrap();
+            let timer = c.outbox.iter().position(|p| matches!(&p.destination, Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnJumpCloakUpdated"))).unwrap();
+            assert!(session < timer);
+            let envelope = c.outbox[timer].body[0].items().unwrap();
+            let payload = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();
+            assert_eq!(payload, Value::tuple([Value::Int(1), Value::tuple([Value::Int(ship), Value::Int(ball.cloak_until), Value::Int(60 * FILETIME_SECOND)])]));
+            log_off(&mut c).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }).await;
+    assert_eq!(db.query_one("SELECT count(*) AS count FROM game.map_events", &[]).await.unwrap().get::<_, i64>("count"), events);
+    assert!(db.query("SELECT 1 FROM game.map_visits WHERE character_id=$1", &[&character]).await.unwrap().is_empty());
+    world.remove_ball(system, ship).await;
+    db.execute("DELETE FROM game.skills WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&ship]).await.unwrap();
+    db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    result.unwrap();
+}
