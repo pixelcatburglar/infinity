@@ -20,3 +20,6 @@ pub(super) fn starting_levels(sde: &crate::sde::Sde, race_id: i32) -> impl Itera
     sde.characters.race(race_id as i64).into_iter().flat_map(|race| &race.skills)
         .map(|skill| (skill.type_id, skill.level))
 }
+
+#[cfg(test)]
+mod tests;

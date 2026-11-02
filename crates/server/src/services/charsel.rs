@@ -240,14 +240,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let school_id = arg_int(call, 7);
             let appearance = marshal::dumps(call.args.get(5).unwrap_or(&Value::None));
             let portrait = marshal::dumps(call.args.get(6).unwrap_or(&Value::None));
-            let created = creation::create(&c.db, &c.sde, c.login.user_id, &NewPilot {
-                name: &name, race: race_id, bloodline: bloodline_id, gender: gender_id,
-                ancestry: ancestry_id, school: school_id, appearance: &appearance, portrait: &portrait,
+            let created = creation::create(&c.db, &c.sde, c.login.user_id, NewPilot {
+                name, race: race_id, bloodline: bloodline_id, gender: gender_id,
+                ancestry: ancestry_id, school: school_id, appearance, portrait,
                 balance: crate::config::game().characters.starting_isk,
             }).await?;
             let char_id = created.char_id;
-            let station = created.station_id;
-            info!(user = c.login.user_id, "created character {name:?} ({char_id}) in station {station}");
             Ok(Value::Int(char_id))
         }
         _ => {
