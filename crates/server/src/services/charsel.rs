@@ -10,30 +10,16 @@
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
 
 use crate::dao::{accounts, characters, items, skills};
+use super::character::creation::{self, NewPilot, NAME_VALID};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ACCOUNT_CASH, FALLBACK_ROOKIE_SHIP, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::lua::events::GameEvent;
 use crate::messages;
-use anyhow::Context;
 use marshal::Value;
 use tracing::{info, warn};
 
-/// Client chooseNameSection.py valid-name result.
-const NAME_VALID: i64 = 1;
-/// Client chooseNameSection.py short-name result.
-const NAME_TOO_SHORT: i64 = -1;
-/// Client chooseNameSection.py long-name result.
-const NAME_TOO_LONG: i64 = -2;
-/// Client chooseNameSection.py illegal-character result.
-const NAME_ILLEGAL_CHARACTER: i64 = -5;
-/// Client chooseNameSection.py too-many-spaces result.
-const NAME_TOO_MANY_SPACES: i64 = -6;
-/// Client chooseNameSection.py consecutive-spaces result.
-const NAME_CONSECUTIVE_SPACES: i64 = -7;
-/// Client chooseNameSection.py unavailable-name result.
-const NAME_UNAVAILABLE: i64 = -101;
 /// SDE chrRaces: Caldari, used when the creation argument is missing.
 const FALLBACK_RACE_ID: i64 = 1;
 /// SDE chrBloodlines: Deteis, used when the creation argument is missing.
@@ -47,54 +33,6 @@ const RANDOM_NAME_SUFFIX_COUNT: usize = 900;
 
 fn arg_int(call: &Call<'_>, i: usize) -> Option<i64> {
     call.args.get(i).and_then(|v| v.as_int())
-}
-
-fn name_shape_code(name: &str) -> i64 {
-    let policy = &crate::config::game().characters;
-    let n = name.chars().count() as u128;
-    if n < policy.name_min_len as u128 {
-        return NAME_TOO_SHORT;
-    }
-    if n > policy.name_max_len as u128 {
-        return NAME_TOO_LONG;
-    }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '\'') {
-        return NAME_ILLEGAL_CHARACTER;
-    }
-    if name.contains("  ") {
-        return NAME_CONSECUTIVE_SPACES;
-    }
-    if name.matches(' ').count() as u128 > policy.name_max_spaces as u128 {
-        return NAME_TOO_MANY_SPACES;
-    }
-    NAME_VALID
-}
-
-async fn name_code(c: &Client, name: &str) -> Result<i64, CallError> {
-    let code = name_shape_code(name);
-    if code != NAME_VALID {
-        return Ok(code);
-    }
-    let taken = characters::creation::name_taken(&c.db, name).await.map_err(db_err)?;
-    Ok(if taken { NAME_UNAVAILABLE } else { NAME_VALID })
-}
-
-/// (school corporation, station, solar system, constellation, region) for a new character.
-async fn starting_location(c: &Client, school_id: Option<i64>, race_id: i64) -> Result<(i64, i64, i64, i64, i64), CallError> {
-    let school = match school_id {
-        Some(id) => c.sde.characters.school(id),
-        None => c.sde.characters.schools_for_race(race_id as i32).next(),
-    }.context("no starting station for school/race")?;
-    let stations = || school.starting_stations.iter().filter_map(|&id| c.sde.map.station(id));
-    let count = stations().count();
-    let station = stations().nth((super::rand01() * count as f64) as usize).context("no starting station for school/race")?;
-    Ok((
-        school.corporation_id.context("school has no corporation")?,
-        station.station_id,
-        station.solar_system_id.context("starting station has no solar system")?,
-        station.constellation_id.context("starting station has no constellation")?,
-        station.region_id.context("starting station has no region")?,
-    ))
 }
 
 async fn character_rows(c: &Client) -> Result<Vec<Value>, CallError> {
@@ -184,7 +122,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     };
     let has_skills = skills::selection::has_skills(&c.db, char_id).await.map_err(db_err)?;
     if !has_skills {
-        super::skills::starting::grant_starting_skills(c, char_id, race).await?;
+        super::skills::starting::grant_starting_skills(&c.db, &c.sde, char_id, race).await?;
     }
     characters::selection::logoff(&c.db, char_id).await.map_err(db_err)?;
     super::effects::online::reconcile_ship(c, char_id, ship).await?;
@@ -303,14 +241,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         // gatekeeper cohorts (feature flags) the user belongs to.
         "GetCohortsForUser" => Ok(Value::list([])),
 
-        "ValidateNameEx" => Ok(Value::Int(name_code(c, &trimmed_arg_text(call, 0)).await?)),
+        "ValidateNameEx" => Ok(Value::Int(creation::name_code(&c.db, &trimmed_arg_text(call, 0)).await?)),
         "GetValidRandomName" => {
             const FIRST: [&str; 12] = [messages::RANDOM_FIRST_AREN, messages::RANDOM_FIRST_KAEL, messages::RANDOM_FIRST_SORA, messages::RANDOM_FIRST_VEYRA, messages::RANDOM_FIRST_TOMA, messages::RANDOM_FIRST_ILSA, messages::RANDOM_FIRST_DARO, messages::RANDOM_FIRST_MIRA, messages::RANDOM_FIRST_LUKAS, messages::RANDOM_FIRST_NADIA, messages::RANDOM_FIRST_JOREN, messages::RANDOM_FIRST_TESSA];
             const LAST: [&str; 12] = [messages::RANDOM_LAST_VALE, messages::RANDOM_LAST_OKARO, messages::RANDOM_LAST_THORNE, messages::RANDOM_LAST_KASSEN, messages::RANDOM_LAST_RUUN, messages::RANDOM_LAST_HALVIK, messages::RANDOM_LAST_MOREAU, messages::RANDOM_LAST_SANDOR, messages::RANDOM_LAST_IKONEN, messages::RANDOM_LAST_DRAKE, messages::RANDOM_LAST_ARVEL, messages::RANDOM_LAST_CASTOR];
             for _ in 0..RANDOM_NAME_ATTEMPTS {
                 let r = crate::handshake::rand_i64() as usize;
                 let name = messages::random_character_name(FIRST[r % FIRST.len()], LAST[(r / FIRST.len()) % LAST.len()], RANDOM_NAME_SUFFIX_START + (r / (FIRST.len() * LAST.len())) % RANDOM_NAME_SUFFIX_COUNT);
-                if name_code(c, &name).await? == NAME_VALID {
+                if creation::name_code(&c.db, &name).await? == NAME_VALID {
                     return Ok(Value::unicode(name));
                 }
             }
@@ -320,10 +258,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         // (name, raceID, bloodlineID, genderID, ancestryID, appearance, portrait, schoolID, ?, qaStarterSystemID)
         "CreateCharacterWithDoll" => {
             let name = trimmed_arg_text(call, 0);
-            let code = name_code(c, &name).await?;
-            if code != NAME_VALID {
-                return Err(CallError::User { msg: messages::MSG_CHAR_NAME_INVALID.into(), dict: vec![] });
-            }
             let race_id = arg_int(call, 1).unwrap_or(FALLBACK_RACE_ID);
             let bloodline_id = arg_int(call, 2).unwrap_or(FALLBACK_BLOODLINE_ID);
             let gender_id = arg_int(call, 3).unwrap_or(0);
@@ -331,14 +265,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let school_id = arg_int(call, 7);
             let appearance = marshal::dumps(call.args.get(5).unwrap_or(&Value::None));
             let portrait = marshal::dumps(call.args.get(6).unwrap_or(&Value::None));
-            let (corp, station, system, constellation, region) = starting_location(c, school_id, race_id).await?;
-            let char_id = characters::creation::create(&c.db, &characters::creation::NewCharacter {
-                user_id: c.login.user_id, name: &name, race_id: race_id as i32, bloodline_id: bloodline_id as i32,
-                gender_id: gender_id as i32, ancestry_id: ancestry_id.map(|v| v as i32), school_id: school_id.map(|v| v as i32),
-                corporation_id: corp, station_id: station, solar_system_id: system, constellation_id: constellation, region_id: region,
-                appearance: &appearance, portrait: &portrait, balance: crate::config::game().characters.starting_isk,
-            }).await.map_err(db_err)?;
-            super::skills::starting::grant_starting_skills(c, char_id, race_id as i32).await?;
+            let created = creation::create(&c.db, &c.sde, c.login.user_id, &NewPilot {
+                name: &name, race: race_id, bloodline: bloodline_id, gender: gender_id,
+                ancestry: ancestry_id, school: school_id, appearance: &appearance, portrait: &portrait,
+                balance: crate::config::game().characters.starting_isk,
+            }).await?;
+            let char_id = created.char_id;
+            let station = created.station_id;
             info!(user = c.login.user_id, "created character {name:?} ({char_id}) in station {station}");
             Ok(Value::Int(char_id))
         }

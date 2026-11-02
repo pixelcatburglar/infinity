@@ -1,15 +1,94 @@
 use super::*;
 use crate::consts::{FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
 
-#[test]
-fn name_shape_checks_configured_boundaries_and_spacing() {
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn creation_dispatch_defers_ship_until_selection() {
+    use crate::{config::deployment::DatabaseConfig, db::Db};
     crate::tests::init_config();
-    let policy = &crate::config::game().characters;
-    assert_eq!(name_shape_code(&"a".repeat((policy.name_min_len - 1) as usize)), NAME_TOO_SHORT);
-    assert_eq!(name_shape_code(&"a".repeat(policy.name_min_len as usize)), NAME_VALID);
-    assert_eq!(name_shape_code(&"a".repeat((policy.name_max_len + 1) as usize)), NAME_TOO_LONG);
-    assert_eq!(name_shape_code("A  B"), NAME_CONSECUTIVE_SPACES);
-    assert_eq!(name_shape_code(&format!("A{}", " B".repeat((policy.name_max_spaces + 1) as usize))), NAME_TOO_MANY_SPACES);
+    let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES (nextval('game.accounts_user_id_seq')::text, ''::bytea, 0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let (mut c, _peer) = crate::services::tests::client(db.clone(), 0).await;
+    c.login.user_id = account;
+    c.session.apply(vec![("userid", Value::Int(account)), ("charid", Value::None)]);
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let race = FALLBACK_RACE_ID;
+        let school = c.sde.characters.schools_for_race(race as i32)
+            .find(|s| s.corporation_id.is_some() && s.starting_stations.iter().any(|&id| c.sde.map.station(id).is_some())).unwrap();
+        let school_id = school.school_id;
+        let stations = school.starting_stations.clone();
+        let name = format!("Pilot{account}");
+        let appearance = Value::str("appearance");
+        let portrait = Value::str("portrait");
+        let kwargs = Value::Dict(vec![]);
+        let args = vec![Value::unicode(name.clone()), Value::Int(race), Value::Int(FALLBACK_BLOODLINE_ID),
+            Value::Int(1), Value::None, appearance.clone(), portrait.clone(), Value::Int(school_id)];
+        let invalid = vec![Value::unicode("!")];
+        let invalid_call = Call { service: "charUnboundMgr", method: "CreateCharacterWithDoll", args: &invalid, kwargs: &kwargs, bound: false, bind_params: None };
+        assert!(matches!(crate::services::dispatch(&mut c, &invalid_call).await,
+            Err(CallError::User { msg, .. }) if msg == messages::MSG_CHAR_NAME_INVALID));
+        assert!(test_db.query("SELECT character_id FROM game.characters WHERE user_id=$1", &[&account]).await.unwrap().is_empty());
+        let call = Call { service: "charUnboundMgr", method: "CreateCharacterWithDoll", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+        let char_id = crate::services::dispatch(&mut c, &call).await.unwrap().as_int().unwrap();
+        let row = test_db.query_one("SELECT name, race_id, school_id, station_id, appearance, portrait, ship_id FROM game.characters WHERE character_id=$1 AND user_id=$2", &[&char_id, &account]).await.unwrap();
+        assert_eq!(row.get::<_, String>("name"), name);
+        assert_eq!(row.get::<_, i32>("race_id"), race as i32);
+        assert_eq!(row.get::<_, Option<i32>>("school_id"), Some(school_id as i32));
+        let station: i64 = row.get::<_, Option<i64>>("station_id").unwrap();
+        assert!(stations.contains(&station));
+        assert_eq!(row.get::<_, Vec<u8>>("appearance"), marshal::dumps(&appearance));
+        assert_eq!(row.get::<_, Vec<u8>>("portrait"), marshal::dumps(&portrait));
+        assert_eq!(row.get::<_, Option<i64>>("ship_id"), None);
+        let mut expected: Vec<_> = c.sde.characters.race(race).unwrap().skills.iter().map(|s| (s.type_id, s.level)).collect();
+        let mut actual: Vec<_> = test_db.query("SELECT type_id, level FROM game.skills WHERE character_id=$1", &[&char_id]).await.unwrap()
+            .iter().map(|r| (r.get::<_, i32>("type_id"), r.get::<_, i32>("level"))).collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(test_db.query("SELECT item_id FROM game.items WHERE owner_id=$1", &[&char_id]).await.unwrap().is_empty());
+        let select_args = vec![Value::Int(char_id)];
+        let select = Call { service: "charUnboundMgr", method: "SelectCharacterID", args: &select_args, kwargs: &kwargs, bound: false, bind_params: None };
+        crate::services::dispatch(&mut c, &select).await.unwrap();
+        let ship = c.session.int("shipid").unwrap();
+        let ships = test_db.query("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3", &[&char_id, &station, &FLAG_HANGAR]).await.unwrap();
+        assert_eq!(ships.len(), 1);
+        assert_eq!(ships[0].get::<_, i64>("item_id"), ship);
+        crate::services::dispatch(&mut c, &select).await.unwrap();
+        assert_eq!(c.session.int("shipid"), Some(ship));
+        assert_eq!(test_db.query("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3", &[&char_id, &station, &FLAG_HANGAR]).await.unwrap().len(), 1);
+        let item_ids: Vec<i64> = test_db.query("SELECT item_id FROM game.items WHERE owner_id=$1 ORDER BY item_id", &[&char_id]).await.unwrap()
+            .iter().map(|r| r.get("item_id")).collect();
+        let skill_count = test_db.query("SELECT type_id FROM game.skills WHERE character_id=$1", &[&char_id]).await.unwrap().len();
+        assert!(matches!(crate::services::dispatch(&mut c, &invalid_call).await,
+            Err(CallError::User { msg, .. }) if msg == messages::MSG_CHAR_NAME_INVALID));
+        let ids = test_db.query("SELECT character_id FROM game.characters WHERE user_id=$1", &[&account]).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].get::<_, i64>("character_id"), char_id);
+        let after_items: Vec<i64> = test_db.query("SELECT item_id FROM game.items WHERE owner_id=$1 ORDER BY item_id", &[&char_id]).await.unwrap()
+            .iter().map(|r| r.get("item_id")).collect();
+        assert_eq!(after_items, item_ids);
+        assert_eq!(test_db.query("SELECT type_id FROM game.skills WHERE character_id=$1", &[&char_id]).await.unwrap().len(), skill_count);
+    }).await;
+    let chars = db.query("SELECT character_id FROM game.characters WHERE user_id=$1", &[&account]).await.unwrap();
+    for row in chars {
+        let character: i64 = row.get("character_id");
+        let items = db.query("SELECT item_id FROM game.items WHERE owner_id=$1", &[&character]).await.unwrap();
+        for item in &items {
+            let id: i64 = item.get("item_id");
+            db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&id]).await.unwrap();
+        }
+        db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&character]).await.unwrap();
+        for item in &items {
+            let id: i64 = item.get("item_id");
+            db.execute("DELETE FROM game.items WHERE location_id=$1 AND owner_id=$2", &[&id, &character]).await.unwrap();
+        }
+        db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&character]).await.unwrap();
+        db.execute("DELETE FROM game.skills WHERE character_id=$1", &[&character]).await.unwrap();
+        db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+    }
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    result.unwrap();
 }
 
 /// SDE dgmAttributeTypes: lowSlots, medSlots and hiSlots.

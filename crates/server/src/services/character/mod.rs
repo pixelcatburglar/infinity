@@ -15,6 +15,7 @@ pub(super) mod home_station;
 mod account;
 mod station;
 pub(super) mod provisioning;
+pub(super) mod creation;
 
 fn char_id(c: &Client) -> i64 { c.session.int("charid").unwrap_or(0) }
 
