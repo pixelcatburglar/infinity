@@ -112,13 +112,14 @@ pub(in crate::services) fn apply_online_changed(change: OnlineChanged) {
     for stop in change.bank_stops { crate::services::combat::banks::apply_stop(stop); }
     if !change.clear_heat.is_empty() { super::heat::clear_modules(change.ship, &change.clear_heat); }
 }
-pub(in crate::services) fn dispatch_notification(notification: crate::db::outbox::Notification, c: &Client) -> Result<(), CallError> {
+/// Crate-visible so the Lua host move adapter can deliver its notifications.
+pub(crate) fn dispatch_notification(notification: crate::db::outbox::Notification, world: &crate::space::World, sender: &NotifyTx, current_character: Option<i64>) -> Result<(), CallError> {
     match notification {
-        crate::db::outbox::Notification::Pilot { char_id, event, args } if c.session.int("charid") == Some(char_id) => {
-            let _ = c.notify_tx.send((event, args));
+        crate::db::outbox::Notification::Pilot { char_id, event, args } if current_character == Some(char_id) => {
+            let _ = sender.send((event, args));
             Ok(())
         }
-        notification => notification.dispatch_sender(&c.world, &c.notify_tx),
+        notification => notification.dispatch_sender(world, sender),
     }
 }
 
@@ -134,7 +135,7 @@ fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl
 }
 
 pub(in crate::services) fn dispatch_changed<T>(value: T, outbox: Outbox<OnlineChanged>, c: &Client) -> Result<T, CallError> {
-    dispatch_entries(value, outbox, |notification| dispatch_notification(notification, c))
+    dispatch_entries(value, outbox, |notification| dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid")))
 }
 
 pub(in crate::services) fn dispatch_changed_world<T>(value: T, outbox: Outbox<OnlineChanged>, world: &crate::space::World) -> Result<T, CallError> {

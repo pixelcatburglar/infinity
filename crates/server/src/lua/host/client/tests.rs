@@ -164,7 +164,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         "#;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let invocation = crate::lua::vm::budgeted_invocation(&lua, lua.load(script).into_function().unwrap(), &crate::config::lua::LuaConfig::default(), deadline.into_std()).unwrap();
-        let values = invoke(&mut client, &lua, invocation, vec![], deadline).await.unwrap_or_else(|_| panic!("mutation invocation failed"));
+        let values = invoke(&mut client, &lua, invocation, vec![], deadline).await.unwrap_or_else(|error| panic!("mutation invocation failed: {error:?}"));
         let message = match values.front() { Some(mlua::Value::Integer(id)) if *id > 0 => *id, _ => panic!("missing message id") };
         let headers = crate::dao::mail::headers(&test_db, fixture.chars[0], &vec![message]).await.unwrap();
         assert_eq!(headers.len(), 1);

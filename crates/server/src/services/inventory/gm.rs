@@ -63,7 +63,7 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                 Ok(quantity as usize)
             })
         },
-        |value, outbox| async move { dispatch_move(value, outbox, c, target) },
+        |value, outbox| async move { dispatch_move(value, outbox, |n| super::super::effects::online::dispatch_notification(route_target(n, target, c.session.int("charid")), &c.world, &c.notify_tx, c.session.int("charid"))) },
     ).await
 }
 

@@ -507,7 +507,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let login_user = c.login.user_id;
             let notify = |notification| match notification {
                 notification @ crate::db::outbox::Notification::DirectClient { .. } => notification.dispatch(&world, Some(&mut *c)),
-                notification => super::effects::online::dispatch_notification(notification, c),
+                notification => super::effects::online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid")),
             };
             if call.method == "Activate" {
                 lifecycle::activate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, target, repeat, notify).await

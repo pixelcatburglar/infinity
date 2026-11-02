@@ -6,6 +6,9 @@
 
 use super::*;
 use crate::consts::{CARGO_CONTAINER_GROUPS, GROUP_WRECK};
+use crate::db::Db;
+use crate::services::identity::Identity;
+use crate::space::World;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -42,17 +45,17 @@ fn in_range(gap: Option<f64>, operational_distance: Option<f64>) -> bool {
 }
 
 impl Reachability {
-    pub(super) async fn capture(c: &Client, endpoints: &[Endpoint]) -> Result<Self, CallError> {
-        let character = c.session.int("charid");
-        let station = c.session.int("stationid");
-        let ship = c.session.int("shipid");
-        let system = c.session.int("solarsystemid");
-        let corporation = c.session.int("corpid");
+    pub(super) async fn capture(identity: &Identity, db: &Db, world: &World, space_system: Option<i64>, endpoints: &[Endpoint]) -> Result<Self, CallError> {
+        let character = (identity.char_id != 0).then_some(identity.char_id);
+        let station = identity.station_id;
+        let ship = identity.ship_id;
+        let system = space_system;
+        let corporation = (identity.corp_id != 0).then_some(identity.corp_id);
         let mut candidates = HashSet::new();
         let mut ancestry = HashMap::new();
         for endpoint in endpoints {
             if ancestry.contains_key(&endpoint.location) { continue; }
-            let rows = crate::dao::items::deliveries::ancestry(&c.db, endpoint.location).await.map_err(db_err)?;
+            let rows = crate::dao::items::deliveries::ancestry(db, endpoint.location).await.map_err(db_err)?;
             candidates.insert(endpoint.location);
             candidates.extend(rows.iter().map(|row| row.item_id));
             ancestry.insert(endpoint.location, rows);
@@ -60,7 +63,7 @@ impl Reachability {
         let mut gaps = HashMap::new();
         if station.is_none() {
             if let (Some(system), Some(ship), Some(character)) = (system, ship, character) {
-                gaps = c.world.with(system, move |s| {
+                gaps = world.with(system, move |s| {
                     let mut gaps = HashMap::new();
                     if s.pilot_ball(character).is_none_or(|pilot| pilot.id != ship) { return gaps; }
                     let (Some(pilot), Some(pilot_pos)) = (s.ball(ship), s.sample_position(ship)) else { return gaps };

@@ -362,7 +362,7 @@ async fn merge_operations(c: &mut Client, container: &Container, source_containe
     let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
     let snapshots = load_items(&c.db, &c.sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
     let endpoints: Vec<_> = snapshots.iter().map(|item| Endpoint { location: item.location_id, flag: item.flag_id }).collect();
-    let reach = Reachability::capture(c, &endpoints).await?;
+    let reach = Reachability::capture(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), &endpoints).await?;
     let container = container.clone();
     let db = c.db.clone();
     let sde = c.sde.clone();
@@ -434,7 +434,7 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
     let snapshots = stack_items(&c.db, &c.sde, container, flag).await?;
     let mut endpoints = vec![endpoint];
     endpoints.extend(snapshots.iter().map(|item| Endpoint { location: item.location_id, flag: item.flag_id }));
-    let reach = Reachability::capture(c, &endpoints).await?;
+    let reach = Reachability::capture(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), &endpoints).await?;
     let container = container.clone();
     let db = c.db.clone();
     let sde = c.sde.clone();
@@ -629,13 +629,13 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
             let qty = call.kwargs.get("qty").or_else(|| call.kwargs.get("quantity")).and_then(|v| v.as_int());
-            movement::move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, qty).await.map(|id| id.map(Value::Int).unwrap_or(Value::None))
+            movement::move_item(&super::identity::Identity::of_client(c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &container, item_id, call.args.get(1).and_then(Value::as_int), flag, qty, |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.map(|id| id.map(Value::Int).unwrap_or(Value::None))
         }
         // MultiAdd(itemIDs, sourceID, flag=)
         "MultiAdd" => {
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
             for item_id in value_id_list(call.args.first()) {
-                movement::move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, None).await?;
+                movement::move_item(&super::identity::Identity::of_client(c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &container, item_id, call.args.get(1).and_then(Value::as_int), flag, None, |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await?;
             }
             Ok(Value::None)
         }

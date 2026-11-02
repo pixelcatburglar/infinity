@@ -115,7 +115,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     let race = r.race_id;
     let super::presence::Prepared { ship_id: ship, cloak_until } = super::presence::prepare(
         &c.db, &c.world, &c.sde, char_id, &r,
-        |n| super::effects::online::dispatch_notification(n, c),
+        |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid")),
     ).await?;
     let int = Value::Int;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);

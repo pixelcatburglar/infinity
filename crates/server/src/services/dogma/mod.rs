@@ -200,7 +200,7 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
 /// [itemID, isOnline, damage, charge, skillPoints, armorDamage, shieldCharge, isIncapacitated].
 pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
     let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    super::effects::online::reconcile_ship(&c.db, &c.sde, owner, ship_id, |n| super::effects::online::dispatch_notification(n, c)).await?;
+    super::effects::online::reconcile_ship(&c.db, &c.sde, owner, ship_id, |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await?;
     ship_state_core(c, ship_id).await
 }
 
@@ -244,7 +244,7 @@ pub(crate) async fn ship_state_core(c: &Client, ship_id: i64) -> Result<Value, C
 async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let Some(ship_id) = c.session.int("shipid") else { return Ok(vec![]) };
     let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    super::effects::online::reconcile_ship(&c.db, &c.sde, owner, ship_id, |n| super::effects::online::dispatch_notification(n, c)).await?;
+    super::effects::online::reconcile_ship(&c.db, &c.sde, owner, ship_id, |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await?;
     let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let mut out = Vec::new();
@@ -396,7 +396,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            super::effects::online::set_online(&Identity::of_client(c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, ship, module, online, |notification| super::effects::online::dispatch_notification(notification, c)).await
+            super::effects::online::set_online(&Identity::of_client(c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, ship, module, online, |notification| super::effects::online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid"))).await
         }
         _ => {
             warn!(

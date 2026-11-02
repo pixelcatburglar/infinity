@@ -47,7 +47,7 @@ async fn deliveries_roles_listing_and_take() {
         assert_eq!(may_view_corp_hangar(&db, actor.character, corp, FLAG_CORP_DELIVERIES).await.ok().unwrap(), view);
         assert_eq!(may_take_corp_hangar(&db, actor.character, corp, FLAG_CORP_DELIVERIES).await.ok().unwrap(), take);
         assert_eq!(list(&client, &deliveries, None).await.ok().unwrap().len(), usize::from(view));
-        if !take { assert!(movement::move_item(&mut client, &hangar, id, Some(station), None, None).await.is_err()); }
+        if !take { assert!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err()); }
         assert!(!may_view_corp_hangar(&db, actor.character, corp + 1, FLAG_CORP_DELIVERIES).await.ok().unwrap());
     }
     assert!(may_take_corp_hangar(&db, ceo.character, corp, FLAG_CORP_DELIVERIES).await.ok().unwrap());
@@ -97,7 +97,7 @@ async fn deliveries_roles_listing_and_take() {
     let merge_call = Call { service: INVENTORY, method: "MultiMerge", args: &merge_args, kwargs: &kwargs, bound: true, bind_params: Some(&direct) };
     assert!(inventory(&mut client, &merge_call).await.is_err());
     assert!(trash_items(&mut client, &[id]).await.is_err());
-    assert!(movement::move_item(&mut client, &hangar, id, Some(station), None, None).await.is_err());
+    assert!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_DIRECTOR]).await.unwrap();
     let (actor_tx, mut actor_rx) = tokio::sync::mpsc::unbounded_channel();
     client.notify_tx = actor_tx;
@@ -153,8 +153,8 @@ async fn deliveries_roles_listing_and_take() {
     let multi_args = [Value::list([Value::Int(id)]), Value::Int(station)];
     let multi_call = Call { service: INVENTORY, method: "MultiAdd", args: &multi_args, kwargs: &kwargs, bound: true, bind_params: Some(&params) };
     assert!(inventory(&mut client, &multi_call).await.is_err());
-    assert!(movement::move_item(&mut client, &deliveries, id, None, None, None).await.is_err());
-    assert!(movement::move_item(&mut client, &hangar, id, Some(station), Some(FLAG_CORP_DELIVERIES), None).await.is_err());
+    assert!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &deliveries, id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
+    assert!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), Some(FLAG_CORP_DELIVERIES), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     let root = crate::dao::items::transfers::insert(&db, type_id, corp, station, FLAG_CORP_DELIVERIES, 1).await.unwrap();
     let child = crate::dao::items::transfers::insert(&db, type_id, corp, root, FLAG_CARGO, 1).await.unwrap();
     let nested = crate::dao::items::transfers::insert(&db, type_id, corp, child, FLAG_CARGO, 1).await.unwrap();
@@ -182,7 +182,7 @@ async fn deliveries_roles_listing_and_take() {
     assert!(nested_recipients.contains(&ceo.character));
     assert!(!nested_recipients.contains(&outsider.character));
     assert!(trash_items(&mut client, &[root]).await.is_err());
-    assert_eq!(movement::move_item(&mut client, &hangar, id, Some(station), None, None).await.ok().unwrap(), Some(id));
+    assert_eq!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().unwrap(), Some(id));
     let moved = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (actor.character, station, FLAG_HANGAR));
     let notice = ceo_rx.try_recv().unwrap();
@@ -192,7 +192,7 @@ async fn deliveries_roles_listing_and_take() {
     let notices: Vec<_> = std::iter::from_fn(|| actor_rx.try_recv().ok()).collect();
     assert!(notices.iter().any(|(event, args)| event == "OnItemChange" && args[0] == Item { location_id: LOCATION_JUNKYARD, ..row.clone() }.row()));
     assert!(notices.iter().any(|(event, args)| event == "OnItemChange" && args[0] == moved.row()));
-    assert_eq!(movement::move_item(&mut client, &hangar, root, Some(station), None, None).await.ok().unwrap(), Some(root));
+    assert_eq!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, root, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().unwrap(), Some(root));
     for (id, parent) in [(child, root), (nested, child), (leaf, nested)] {
         let item = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
         assert_eq!((item.owner_id, item.location_id, item.flag_id), (actor.character, parent, FLAG_CARGO));

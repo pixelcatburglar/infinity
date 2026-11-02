@@ -173,7 +173,7 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
                 }
             }
         }).await.expect("per-gun firing FX");
-        set_online(&crate::services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, ids[1], false, |notification| super::super::super::online::dispatch_notification(notification, &client)).await.ok().expect("offline slave");
+        set_online(&crate::services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, ids[1], false, |notification| super::super::super::online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("offline slave");
         assert!(charges::banks(&d, ship).await.unwrap().is_empty());
         assert!(stop.load(Ordering::Relaxed));
         tokio::time::timeout(std::time::Duration::from_secs(40), async {

@@ -3,7 +3,7 @@
 //! client and releases the old one in `ProcessSessionChange`. The character ID
 //! comes from the session, not the database; this snapshot carries no transport
 //! state or roles.
-//! A character ID of zero means no character.
+//! Character and corporation IDs of zero mean the respective identity is absent.
 
 use crate::client::Client;
 use crate::session::Session;
