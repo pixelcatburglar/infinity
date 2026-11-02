@@ -1,8 +1,8 @@
 //! Persistence for mail and notifications, mirroring the data used by
 //! `eve/client/script/ui/services/mail/mailSvc.py` and `notificationSvc.py`.
 //! Uses `game.mail_messages`, `game.mail_status`, `game.mail_labels` and
-//! `game.notifications`. Mailing lists are not supported; protocol values and
-//! delivery effects remain in the services.
+//! `game.notifications`. List recipients are stored on messages; protocol values
+//! and delivery effects remain in the services.
 
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
@@ -104,16 +104,27 @@ pub(crate) async fn statuses(ex: &impl Executor, me: i64) -> Result<Vec<Status>,
     Ok(ex.query("SELECT message_id, status_mask::bigint, label_mask::bigint FROM game.mail_status WHERE char_id = $1", &[&me])
         .await?.iter().map(Status::from_row).collect())
 }
-pub(crate) async fn insert_message(ex: &impl Executor, me: i64, to_text: &str, to_corp: Option<i64>, title: &str, body: &str, sent: i64) -> Result<i64, Error> {
+pub(crate) async fn insert_message(ex: &(impl Executor + ?Sized), me: i64, to_text: &str, to_list: Option<i64>, to_corp: Option<i64>, title: &str, body: &str, sent: i64) -> Result<i64, Error> {
     let row = ex.query_one(
-        "INSERT INTO game.mail_messages (sender_id, to_character_ids, to_corp_or_alliance_id, title, body, sent_date)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING message_id",
-        &[&me, &to_text, &to_corp, &title, &body, &sent],
+        "INSERT INTO game.mail_messages (sender_id, to_character_ids, to_list_id, to_corp_or_alliance_id, title, body, sent_date)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING message_id",
+        &[&me, &to_text, &to_list, &to_corp, &title, &body, &sent],
     ).await?;
     Ok(MessageId::from_row(&row).message_id)
 }
-pub(crate) async fn insert_status(ex: &impl Executor, id: i64, ch: i64, status: i32, labels: i32) -> Result<u64, Error> {
-    ex.execute("INSERT INTO game.mail_status (message_id, char_id, status_mask, label_mask) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", &[&id, &ch, &status, &labels]).await
+pub(crate) async fn insert_statuses(ex: &(impl Executor + ?Sized), id: i64, rows: &[(i64, i32, i32)]) -> Result<u64, Error> {
+    let (mut characters, mut statuses, mut labels) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()));
+    for &(character, status, label) in rows {
+        characters.push(character);
+        statuses.push(status);
+        labels.push(label);
+    }
+    ex.execute(
+        "INSERT INTO game.mail_status (message_id, char_id, status_mask, label_mask)
+         SELECT $1, char_id, status_mask, label_mask FROM unnest($2::bigint[], $3::integer[], $4::integer[])
+         AS rows(char_id, status_mask, label_mask) ORDER BY char_id ON CONFLICT DO NOTHING",
+        &[&id, &characters, &statuses, &labels],
+    ).await
 }
 pub(crate) async fn mark_original(ex: &impl Executor, original: i64, me: i64, bit: i32) -> Result<u64, Error> {
     ex.execute("UPDATE game.mail_status SET status_mask = status_mask | $3 WHERE message_id = $1 AND char_id = $2", &[&original, &me, &bit]).await
@@ -129,7 +140,8 @@ pub(crate) enum Selector { Ids, Label, List, All }
 pub(crate) async fn set_bits(ex: &impl Executor, me: i64, which: Selector, ids: &[i64], bits: i32, on: bool, trashed: i32) -> Result<u64, Error> {
     let (which, mask) = match which {
         Selector::Label => ("label_mask & ($2::bigint[])[1]::int <> 0 AND status_mask & $4::int = 0", Some(trashed)),
-        Selector::List => ("false AND $2::bigint[] IS NOT NULL", None),
+        Selector::List if bits == trashed => ("message_id IN (SELECT message_id FROM game.mail_messages WHERE to_list_id = ($2::bigint[])[1])", None),
+        Selector::List => ("message_id IN (SELECT message_id FROM game.mail_messages WHERE to_list_id = ($2::bigint[])[1]) AND status_mask & $4::int = 0", Some(trashed)),
         Selector::All => ("$2::bigint[] IS NOT NULL", None),
         Selector::Ids => ("message_id = ANY($2)", None),
     };

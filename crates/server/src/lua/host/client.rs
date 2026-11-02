@@ -31,7 +31,7 @@ pub(super) enum Mutation {
     Create { owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32 },
     Move { container: crate::services::inventory::Container, item: i64, flag: Option<i32>, quantity: Option<i64> },
     Delete { item: i64 },
-    Mail(crate::services::mail::mail_mgr::SendMail),
+    Mail(crate::services::mail::delivery::SendMail),
     Standing { character: i64, from: i64, value: f64 },
 }
 
@@ -142,7 +142,7 @@ async fn apply_mutation(c: &mut Client, operation: Mutation) -> Result<Option<i6
         Mutation::Move { container, item, flag, quantity } => inventory::movement::move_item(c, &container, item, None, flag, quantity).await,
         Mutation::Delete { item } => { inventory::trash_items(c, &[item]).await?; Ok(None) }
         Mutation::Mail(input) => {
-            let id = crate::services::mail::mail_mgr::send_mail(&c.db, &c.world, c.session.int("charid").unwrap_or(0), c.session.int("corpid"), input).await?;
+            let id = crate::services::mail::delivery::send_mail(&c.db, &c.world, c.session.int("charid").unwrap_or(0), c.session.int("corpid"), input).await?;
             Ok(Some(id))
         }
         Mutation::Wallet { character, amount, credit } => {

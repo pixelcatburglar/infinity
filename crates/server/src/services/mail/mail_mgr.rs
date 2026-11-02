@@ -1,37 +1,20 @@
 //! `mailMgr`, mirroring `eve/client/script/ui/services/mail/mailSvc.py`.
 //! Uses the mail DAO's message, status and label tables and character membership.
 //! Sending commits message, status and reply/forward writes together before notifications.
-//! Mailing lists are not supported.
+//! Alliance mail delivery is not supported.
 use super::super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
-use crate::consts::FILETIME_MINUTE;
+use super::{delivery, text_argument, MAX_RECIPIENTS, STATUS_READ};
+use crate::client::Client;
 use crate::dao::mail::{self, LabelAction, Selector};
 use crate::db::Db;
-use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
-use crate::space::World;
 use marshal::Value;
 use std::io::Write;
-use tracing::info;
 
-/// Client appConst.mailStatusMask read bit.
-const STATUS_READ: i32 = 1;
-/// Client appConst.mailStatusMask replied bit.
-const STATUS_REPLIED: i32 = 2;
-/// Client appConst.mailStatusMask forwarded bit.
-const STATUS_FORWARDED: i32 = 4;
 /// Client appConst.mailStatusMask trashed bit.
 const STATUS_TRASHED: i32 = 8;
-/// Client appConst.mailLabel inbox bit.
-const LABEL_INBOX: i32 = 1;
-/// Client appConst.mailLabel sent bit.
-const LABEL_SENT: i32 = 2;
-/// Client appConst.mailLabel corporation bit.
-const LABEL_CORPORATION: i32 = 4;
 /// Client appConst mail labels: lowest bit free for custom labels.
 const FIRST_CUSTOM_LABEL: i32 = 16;
-/// Client appConst.mailMaxRecipients.
-const MAX_RECIPIENTS: usize = 50;
 /// Server mail policy: first custom-label bit position.
 const FIRST_CUSTOM_LABEL_BIT: u32 = 4;
 /// Server mail policy: exclusive upper custom-label bit position.
@@ -71,115 +54,43 @@ async fn sync(c: &Client, last_id: i64) -> CallResult {
     ]))
 }
 
-/// Player members of a corporation.
-async fn corp_members(db: &Db, corp: i64) -> Result<Vec<i64>, CallError> {
-    crate::dao::characters::members::active_ids(db, corp).await.map_err(db_err)
-}
 
 /// `SendMail(toCharacterIDs, toListID, toCorpOrAllianceID, title, body, isReplyTo, isForwardedFrom)` -> messageID.
 async fn send(c: &Client, call: &Call<'_>) -> CallResult {
-    let me = c.session.int("charid").unwrap_or(0);
-    let to_chars = value_id_list(call.args.first());
-    let to_list = call.args.get(1).and_then(|v| v.as_int());
-    let to_corp = call.args.get(2).and_then(|v| v.as_int());
-    let title = call.args.get(3).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let body = call.args.get(4).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let (reply_to, forwarded_from) = (call.args.get(5).and_then(|v| v.as_int()).unwrap_or(0), call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0));
-    let input = SendMail { to_chars, to_list, to_corp, title, body, reply_to, forwarded_from };
-    send_mail(&c.db, &c.world, me, c.session.int("corpid"), input).await.map(Value::Int)
+    let invalid = || notify_error(messages::mail::INVALID_ARGUMENT);
+    let me = c.session.int("charid").filter(|id| *id > 0)
+        .ok_or_else(|| notify_error(messages::mail::SELECT_CHARACTER))?;
+    if call.args.len() != 7 || !(matches!(call.kwargs, Value::None) || matches!(call.kwargs, Value::Dict(v) if v.is_empty())) { return Err(invalid()); }
+    let values = match &call.args[0] {
+        Value::List(values) | Value::Tuple(values) => values,
+        _ => return Err(invalid()),
+    };
+    if values.len() > MAX_RECIPIENTS { return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS)); }
+    let to_chars = values.iter().map(|v| match v {
+        Value::Int(id) if *id > 0 => Ok(*id),
+        _ => Err(invalid()),
+    }).collect::<Result<Vec<_>, _>>()?;
+    let optional_id = |v: &Value| match v {
+        Value::None => Ok(None),
+        Value::Int(id) if *id > 0 => Ok(Some(*id)),
+        _ => Err(invalid()),
+    };
+    let nonnegative_id = |v: &Value| match v {
+        Value::Int(id) if *id >= 0 => Ok(*id),
+        _ => Err(invalid()),
+    };
+    let input = delivery::SendMail {
+        to_chars,
+        to_list: optional_id(&call.args[1])?,
+        to_corp: optional_id(&call.args[2])?,
+        title: text_argument(&call.args[3])?,
+        body: text_argument(&call.args[4])?,
+        reply_to: nonnegative_id(&call.args[5])?,
+        forwarded_from: nonnegative_id(&call.args[6])?,
+    };
+    delivery::send_mail(&c.db, &c.world, me, c.session.int("corpid"), input).await.map(Value::Int)
 }
 
-pub(crate) struct SendMail {
-    pub to_chars: Vec<i64>,
-    pub to_list: Option<i64>,
-    pub to_corp: Option<i64>,
-    pub title: String,
-    pub body: String,
-    pub reply_to: i64,
-    pub forwarded_from: i64,
-}
-
-pub(crate) async fn send_mail(db: &Db, world: &World, me: i64, corpid: Option<i64>, input: SendMail) -> Result<i64, CallError> {
-    let SendMail { to_chars, to_list, to_corp, title, body, reply_to, forwarded_from } = input;
-    let title = title.chars().take(usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX)).collect::<String>();
-    if to_list.is_some() {
-        return Err(notify_error(messages::MAILING_LISTS_UNSUPPORTED));
-    }
-    if to_chars.is_empty() && to_corp.is_none() {
-        return Err(notify_error(messages::MAIL_RECIPIENT_REQUIRED));
-    }
-    if to_chars.len() > MAX_RECIPIENTS {
-        return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS));
-    }
-    if let Some(corp) = to_corp {
-        if corpid != Some(corp) {
-            return Err(notify_error(messages::MAIL_ONLY_TO_OWN_CORPORATION));
-        }
-    }
-    let sent = filetime_now() / FILETIME_MINUTE * FILETIME_MINUTE;
-    let to_text = to_chars.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-    // Everyone involved gets a status row; the sender's starts read.
-    let mut boxes: Vec<(i64, i32, i32)> = vec![];
-    for ch in &to_chars {
-        boxes.push((*ch, 0, LABEL_INBOX));
-    }
-    if let Some(corp) = to_corp {
-        for ch in corp_members(db, corp).await? {
-            match boxes.iter_mut().find(|b| b.0 == ch) {
-                Some(b) => b.2 |= LABEL_CORPORATION,
-                None => boxes.push((ch, 0, LABEL_CORPORATION)),
-            }
-        }
-    }
-    match boxes.iter_mut().find(|b| b.0 == me) {
-        Some(b) => b.2 |= LABEL_SENT,
-        None => boxes.push((me, STATUS_READ, LABEL_SENT)),
-    }
-    // Stable sorting preserves which status wins for duplicate recipients.
-    let mut sorted_boxes = boxes.clone();
-    sorted_boxes.sort_by_key(|b| b.0);
-    let mut originals = [(reply_to, STATUS_REPLIED), (forwarded_from, STATUS_FORWARDED)];
-    originals.sort_by_key(|(id, _)| *id);
-    let to_list_value = Value::list(to_chars.iter().map(|i| Value::Int(*i)));
-    let inputs = std::sync::Arc::new((to_text, title, body, boxes, sorted_boxes, to_list_value));
-    let id = db.transaction(
-        |tx, outbox: &mut Outbox| {
-            let inputs = std::sync::Arc::clone(&inputs);
-            Box::pin(async move {
-                let (to_text, title, body, boxes, sorted_boxes, to_list_value) = &*inputs;
-                let id = mail::insert_message(tx, me, to_text, to_corp, title, body, sent).await.map_err(db_err)?;
-                for (ch, status, labels) in sorted_boxes {
-                    mail::insert_status(tx, id, *ch, *status, *labels).await.map_err(db_err)?;
-                }
-                for (original, bit) in originals {
-                    if original > 0 {
-                        mail::mark_original(tx, original, me, bit).await.map_err(db_err)?;
-                    }
-                }
-                for (ch, _, _) in boxes.iter().filter(|b| b.0 != me) {
-                    outbox.notify_pilot(
-                        *ch,
-                        "OnMailSent",
-                        vec![
-                            Value::Int(id),
-                            Value::Int(me),
-                            Value::Int(sent),
-                            to_list_value.clone(),
-                            Value::None,
-                            to_corp.map(Value::Int).unwrap_or(Value::None),
-                            Value::unicode(title.as_str()),
-                            Value::Int(0),
-                        ],
-                    );
-                }
-                Ok(id)
-            })
-        },
-        |id, outbox| async move { dispatch_world(id, outbox, world) },
-    ).await?;
-    info!("mail: {me} sent message {id} to {} recipients", inputs.3.len() - 1);
-    Ok(id)
-}
 
 /// `GetBody(messageID, markRead)` -> the zlib-compressed UTF-8 body.
 async fn body(c: &Client, id: i64, mark_read: bool) -> CallResult {
@@ -202,7 +113,7 @@ async fn set_bits(db: &Db, me: i64, which: Selector, ids: &[i64], bits: i32, on:
     Ok(())
 }
 
-/// Messages a selector covers: listed ids, a label, a mailing list (none), or all.
+/// Messages a selector covers: listed ids, a label, a mailing list, or all.
 fn selector(method: &str) -> Selector {
     if method.ends_with("ByLabel") {
         Selector::Label
@@ -249,6 +160,13 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     let me = c.session.int("charid").unwrap_or(0);
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let db = &c.db;
+    if call.service == "mailMgr" && matches!(call.method, "MarkAsReadByList" | "MarkAsUnreadByList" | "MoveToTrashByList") {
+        if me <= 0 { return Some(Err(notify_error(messages::mail::SELECT_CHARACTER))); }
+        if call.args.len() != 1 || !matches!(call.args.first(), Some(Value::Int(id)) if *id > 0)
+            || !(matches!(call.kwargs, Value::None) || matches!(call.kwargs, Value::Dict(v) if v.is_empty())) {
+            return Some(Err(notify_error(messages::mail::INVALID_ARGUMENT)));
+        }
+    }
     Some(match (call.service, call.method) {
         ("mailMgr", "SyncMail") => sync(c, int(1).unwrap_or(0)).await,
         ("mailMgr", "GetMailHeaders") => {
@@ -261,15 +179,15 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("mailMgr", "SendMail") => send(c, call).await,
         ("mailMgr", "GetBody") => body(c, int(0).unwrap_or(0), call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1))).await,
         ("mailMgr", m @ ("MarkAsRead" | "MarkAsReadByLabel" | "MarkAsReadByList" | "MarkAllAsRead")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") || m.ends_with("ByList") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_READ, true).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MarkAsUnread" | "MarkAsUnreadByLabel" | "MarkAsUnreadByList" | "MarkAllAsUnread")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") || m.ends_with("ByList") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_READ, false).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MoveToTrash" | "MoveToTrashByLabel" | "MoveToTrashByList" | "MoveAllToTrash")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") || m.ends_with("ByList") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_TRASHED, true).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MoveFromTrash" | "MoveAllFromTrash")) => {

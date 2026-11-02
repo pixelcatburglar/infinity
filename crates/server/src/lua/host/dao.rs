@@ -102,7 +102,7 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
     let mail = lua.create_table()?;
     mail.set("send", lua.create_async_function(|_, (ctx, recipients, title, body, to_list, to_corp, reply_to, forwarded_from): (mlua::AnyUserData, Table, String, String, Option<i64>, Option<i64>, Option<i64>, Option<i64>)| async move {
         for id in [to_list, to_corp, reply_to, forwarded_from].into_iter().flatten() { positive(id)?; }
-        let input = crate::services::mail::mail_mgr::SendMail { to_chars: ids(recipients)?, to_list, to_corp, title, body, reply_to: reply_to.unwrap_or(0), forwarded_from: forwarded_from.unwrap_or(0) };
+        let input = crate::services::mail::delivery::SendMail { to_chars: ids(recipients)?, to_list, to_corp, title, body, reply_to: reply_to.unwrap_or(0), forwarded_from: forwarded_from.unwrap_or(0) };
         mutate(ctx, Mutation::Mail(input)).await
     })?)?;
     dao.set("mail", mail)?;

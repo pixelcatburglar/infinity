@@ -22,6 +22,7 @@ pub(crate) mod heat;
 pub(crate) mod industry;
 pub(crate) mod mining;
 pub(crate) mod missions;
+pub(crate) mod mail;
 pub(crate) mod map;
 pub(crate) mod repair;
 pub(crate) mod scheduler;
@@ -421,8 +422,6 @@ pub(crate) const NOT_YOUR_CORPORATION_HANGAR: &str = "这不是你军团的机�
 pub(crate) const CONTAINER_LOCKED_NEEDS_ANALYZER: &str = "这个容器被锁住了。用数据分析仪或遗迹分析仪破解它。";
 
 // Mail (services/mail.rs)
-/// Mailing lists unsupported.
-pub(crate) const MAILING_LISTS_UNSUPPORTED: &str = "暂不支持邮件列表。";
 /// At least one recipient required.
 pub(crate) const MAIL_RECIPIENT_REQUIRED: &str = "请至少选择一名收件人。";
 /// Too many recipients.
