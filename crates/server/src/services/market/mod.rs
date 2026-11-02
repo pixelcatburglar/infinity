@@ -25,7 +25,7 @@ use crate::dao::market::listings::{self, Area};
 use super::wallets::{balance, credit, debit, not_enough_money};
 use super::{crowset, db_err, keyval, notify_error, user_error, value_field, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR, SKILL_ACCOUNTING, SKILL_BROKER_RELATIONS};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Effect, Outbox};
@@ -58,10 +58,8 @@ const STATE_CANCELLED: i32 = 3;
 
 const SKILL_TRADE: i32 = 3443;
 const SKILL_RETAIL: i32 = 3444;
-const SKILL_BROKER_RELATIONS: i32 = 3446;
 const SKILL_WHOLESALE: i32 = 16596;
 const SKILL_MARGIN_TRADING: i32 = 16597;
-const SKILL_ACCOUNTING: i32 = 16622;
 const SKILL_TYCOON: i32 = 18580;
 
 enum MarketEffect {

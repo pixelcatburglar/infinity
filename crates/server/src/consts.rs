@@ -64,6 +64,10 @@ pub const DRONE_STATE_APPROACHING: i32 = 3;
 pub const DRONE_STATE_DEPARTING: i32 = 4;
 
 // SDE inventory type, group and category IDs.
+/// Client `inventorycommon.const.typeBrokerRelations`.
+pub const SKILL_BROKER_RELATIONS: i32 = 3446;
+/// Client `inventorycommon.const.typeAccounting`.
+pub const SKILL_ACCOUNTING: i32 = 16622;
 /// SDE invTypes: Character (Gallente), used for player owners.
 pub const TYPE_CHARACTER: i32 = 1373;
 /// SDE invTypes: Solar System.
