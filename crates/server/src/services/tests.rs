@@ -63,3 +63,20 @@ async fn item_locking_dispatch_returns_empty_collections() {
         assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), expected);
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn character_selection_fixed_dispatch_without_selected_character() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 0).await;
+    client.session.apply(vec![("charid", Value::None)]);
+    assert_eq!(client.session.int("charid"), None);
+    let kwargs = Value::Dict(vec![]);
+    for method in ["GetQAStarterSystemIDs", "GetCharacterInfo"] {
+        let call = Call { service: "charUnboundMgr", method, args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+        let reply = dispatch(&mut client, &call).await.unwrap();
+        assert_eq!(reply, Value::list([]));
+        assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), Value::list([]));
+    }
+}
