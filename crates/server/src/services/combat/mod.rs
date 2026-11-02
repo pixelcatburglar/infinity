@@ -493,8 +493,28 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "LinkWeapons" | "LinkAllWeapons" | "UnlinkModule" | "UnlinkAllModules" | "MergeModuleGroups" | "PeelAndLink" | "DestroyWeaponBank" | "GetWeaponBankInfoForShip" => {
             weapon_groups(c, call).await
         }
-        "Activate" => lifecycle::activate(c, call).await,
-        "Deactivate" => lifecycle::deactivate(c, call).await,
+        "Activate" | "Deactivate" => {
+            let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let effect_name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
+            let target = call.args.get(2).and_then(|v| v.as_int());
+            let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let identity = Identity::of_client(c);
+            let db = c.db.clone();
+            let world = c.world.clone();
+            let sde = c.sde.clone();
+            let space_system = c.session.int("solarsystemid");
+            let sender = c.notify_tx.clone();
+            let login_user = c.login.user_id;
+            let notify = |notification| match notification {
+                notification @ crate::db::outbox::Notification::DirectClient { .. } => notification.dispatch(&world, Some(&mut *c)),
+                notification => super::effects::online::dispatch_notification(notification, c),
+            };
+            if call.method == "Activate" {
+                lifecycle::activate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, target, repeat, notify).await
+            } else {
+                lifecycle::deactivate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, notify).await
+            }
+        }
         _ => return None,
     })
 }

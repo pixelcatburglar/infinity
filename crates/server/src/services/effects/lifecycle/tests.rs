@@ -7,6 +7,40 @@ mod forced_retire;
 mod banks_db;
 mod boundary;
 
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn identity_lifecycle_requires_explicit_space_ship_and_character() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let module = -9041;
+    let identities = [
+        (Identity { char_id: 1, ship_id: Some(1), corp_id: 1, station_id: None, system_id: Some(1) }, None),
+        (Identity { char_id: 1, ship_id: None, corp_id: 1, station_id: None, system_id: Some(1) }, Some(1)),
+        (Identity { char_id: 0, ship_id: Some(1), corp_id: 1, station_id: None, system_id: Some(1) }, Some(1)),
+    ];
+    for (identity, system) in identities {
+        let mut notifications = 0;
+        let result = activate(&identity, &db, &world, &sde, system, sender.clone(), 1, module, "", None, 0, |_| {
+            notifications += 1;
+            Ok(())
+        }).await;
+        assert!(matches!(result, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        let result = deactivate(&identity, &db, &world, &sde, system, sender.clone(), 1, module, "", |_| {
+            notifications += 1;
+            Ok(())
+        }).await;
+        assert!(matches!(result, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert_eq!(notifications, 0);
+        assert!(receiver.try_recv().is_err());
+        let st = state();
+        assert!(!st.active.contains_key(&module));
+        assert!(!st.activation_generation.contains_key(&module));
+    }
+}
+
 #[test]
 fn blocker_uses_target_modifier_source_not_scramble_identity() {
     let mut row = crate::sde::dogma::Modifier {

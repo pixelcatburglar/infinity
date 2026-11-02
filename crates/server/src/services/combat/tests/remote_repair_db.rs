@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     config::Config, conn::Conn, consts::{CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_HULL_REPAIRER, dogma::EFFECT_REMOTE_SHIELD_BOOSTER, FLAG_FITTING_FIRST},
     db::Error, handshake::Login,
-    services::effects::{lifecycle, registry::{self, EffectAttribute}},
+    services::effects::registry::{self, EffectAttribute},
     space::{WarpState, MODE_STOP},
 };
 
@@ -101,15 +101,15 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
         if effect_id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER {
-            let refused = lifecycle::activate(&mut client, &call).await;
+            let refused = crate::services::combat::dispatch(&mut client, &call).await.expect("combat method");
             assert!(matches!(refused, Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_CUSTOM_NOTIFY));
             assert!(crate::services::effects::unsupported::snapshot().contains(&(args[1].as_text().unwrap().into_owned(), module_type)));
             assert_eq!(state().condition[&f.victim].now, target_before);
             return;
         }
-        assert!(lifecycle::activate(&mut client, &call).await.is_err(), "unlocked target must be refused");
+        assert!(crate::services::combat::dispatch(&mut client, &call).await.expect("combat method").is_err(), "unlocked target must be refused");
         state().targets.entry(f.source).or_default().insert(f.victim);
-        assert!(lifecycle::activate(&mut client, &call).await.is_ok());
+        assert!(crate::services::combat::dispatch(&mut client, &call).await.expect("combat method").is_ok());
         if layer != 0 { assert_eq!(state().condition[&f.victim].now[layer], target_before[layer]); }
         let (event, payload) = source_rx.try_recv().unwrap();
         assert_eq!(event, "OnGodmaShipEffect");

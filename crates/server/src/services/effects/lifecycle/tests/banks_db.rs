@@ -2,9 +2,10 @@
 use super::*;
 use crate::services::effects::online::set_online;
 use crate::{
+    client::Client,
     consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS},
     dao::items::{charges, combat as item_combat, dogma},
-    services::combat,
+    services::{combat, Call},
     space::{Ball, WarpState, World, MODE_STOP},
 };
 
