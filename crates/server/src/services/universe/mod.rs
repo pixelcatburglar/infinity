@@ -121,7 +121,6 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
 mod map;
 mod corp_registry;
 mod corpmgr;
-mod scan_mgr;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if let Some(reply) = super::fixed::universe(call) { return Some(reply); }
@@ -129,7 +128,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "map" => map::dispatch(c, call).await,
         "corpRegistry" => corp_registry::dispatch(c, call).await,
         "corpmgr" => corpmgr::dispatch(c, call).await,
-        "scanMgr" => scan_mgr::dispatch(c, call).await,
         _ => None,
     }
 }

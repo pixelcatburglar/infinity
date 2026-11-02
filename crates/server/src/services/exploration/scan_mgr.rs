@@ -5,6 +5,7 @@ use super::*;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match (call.service, call.method) {
+        ("scanMgr", "GetSystemScanMgr") => Some(Ok(c.bind("scanMgr", Value::None))),
         ("scanMgr", "SignalTrackerRegister") => {
             let system = c.session.int("solarsystemid")?;
             if let Err(e) = crate::services::mining::ensure_fields(&c.db, &c.world, system).await {
