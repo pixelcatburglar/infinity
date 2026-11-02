@@ -4,14 +4,15 @@
 //! Failed statements are not retried. Startup schema application can be disabled.
 //! Account and market persistence is delegated to the DAO; login and startup policy remain here.
 //! Unknown accounts are registered only when enabled by the development policy.
+//! Startup reserves a server-owned simulated-pilot account; that identity cannot log in.
 
 pub mod executor;
 pub mod outbox;
 pub mod transaction;
 
 use crate::config::deployment::{DatabaseConfig, DevelopmentConfig};
-use crate::consts::{GM_ROLES, ROLE_PLAYER_LOGIN};
-use crate::dao::{accounts::authentication, market::startup};
+use crate::consts::{GM_ROLES, ROLE_PLAYER_LOGIN, ROLE_SERVICE};
+use crate::dao::{accounts::{authentication, simulated}, market::startup};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -114,6 +115,9 @@ impl Db {
         }
         drop(client);
         let db = Db { pool, online: Arc::new(AtomicI64::new(0)) };
+        if !simulated::ensure(&db).await.context("ensuring simulated-pilot account")? {
+            anyhow::bail!("reserved account {:?} is not a valid server-owned account", simulated::ACCOUNT_NAME);
+        }
         load_retail_prices(&db).await.context("loading retail prices")?;
         let seeded = startup::seeded(&db).await?;
         if !seeded {
@@ -147,7 +151,7 @@ impl Db {
         let row = authentication::find(self, user_name).await?;
         let (user_id, role, user_type) = match row {
             Some(r) => {
-                if r.password_hash != password_hash {
+                if r.role & ROLE_SERVICE != 0 || r.password_hash != password_hash {
                     return Ok(None);
                 }
                 (r.user_id, r.role, r.user_type)
@@ -175,3 +179,5 @@ async fn load_retail_prices(db: &Db) -> Result<()> {
     info!("{} retail market prices loaded", ids.len());
     Ok(())
 }
+
+#[cfg(test)] mod tests;

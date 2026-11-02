@@ -5,3 +5,4 @@
 pub(crate) mod authentication;
 pub(crate) mod balances;
 pub(crate) mod selection;
+pub(crate) mod simulated;

@@ -299,6 +299,8 @@ pub const ROLE_TRADER: i64 = 18_014_398_509_481_984;
 pub const ROLE_DELIVERIES_VIEW: i64 = ROLE_ACCOUNTANT | ROLE_JUNIOR_ACCOUNTANT | ROLE_TRADER;
 /// Roles allowed to take corporation deliveries (itemLocking.py).
 pub const ROLE_DELIVERIES_TAKE: i64 = ROLE_ACCOUNTANT | ROLE_TRADER;
+/// Client `carbon/common/script/sys/serviceConst.py:39`: ROLE_SERVICE.
+pub(crate) const ROLE_SERVICE: i64 = 1_152_921_504_606_846_976;
 /// Client carbon/common/script/sys/serviceConst.py: ROLE_PLAYER | ROLE_LOGIN.
 pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
 /// Client carbon/common/script/sys/serviceConst.py: ROLE_GML.
