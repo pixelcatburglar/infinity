@@ -28,6 +28,7 @@ pub(crate) mod loyalty;
 pub(crate) mod standings;
 pub(crate) mod trade;
 pub(crate) mod skills;
+pub(crate) mod store;
 pub(crate) mod wars;
 
 // Client fitting and online UserError catalogue keys.
