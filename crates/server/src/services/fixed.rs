@@ -167,7 +167,6 @@ pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
         ("shipKillCounter", "GetItemKillCountPlayer") => int(0),
         ("shipCosmeticsMgr", "GetEnabledCosmetics") => empty_dict(),
         ("keeper", "GetCurrentDungeonForCharacter") => Value::None,
-        ("dogmaIM", "GetTargets") | ("dogmaIM", "GetTargeters") => Value::list([]),
         ("scanMgr", "SignalTrackerRegister") => Value::None,
         ("monolithTaskTrackerMgr", "HasEverWarped") => Value::Bool(true),
         ("essMgr", "GetDataForClientSolarSystem") => Value::None,
