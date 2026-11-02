@@ -23,6 +23,7 @@ pub(crate) mod mining;
 pub(crate) mod map;
 pub(crate) mod repair;
 pub(crate) mod scheduler;
+pub(crate) mod settings_sharing;
 pub(crate) mod lua;
 pub(crate) mod loyalty;
 pub(crate) mod standings;

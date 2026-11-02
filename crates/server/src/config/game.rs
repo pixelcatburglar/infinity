@@ -62,6 +62,8 @@ pub struct GameConfig {
     pub bounty: super::bounty::BountyConfig,
     /// Map history retention and maintenance policy.
     pub map: super::map::MapConfig,
+    /// Resource policy for permanent shared settings.
+    pub shared_settings: super::shared_settings::SharedSettingsConfig,
     /// Accounts policy.
     pub accounts: economy::AccountsConfig,
     /// Characters policy.
@@ -114,6 +116,7 @@ impl GameConfig {
     pub fn validate(&self) -> Result<()> {
         self.bounty.validate()?;
         self.map.validate()?;
+        self.shared_settings.validate()?;
         self.accounts.validate()?;
         self.characters.validate()?;
         self.market.validate()?;

@@ -40,6 +40,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS accounts_user_name_idx ON game.accounts (lower
 -- User IDs in the live game are large; start well clear of NPC/static ID ranges.
 SELECT setval('game.accounts_user_id_seq', GREATEST((SELECT max(user_id) FROM game.accounts), 10000000), true);
 
+-- dao/shared_settings: permanent forwardable settings and overview links.
+CREATE SEQUENCE IF NOT EXISTS game.shared_setting_links_sq_id_seq
+    START 9950000000000 MAXVALUE 9999999999999 NO CYCLE;
+CREATE TABLE IF NOT EXISTS game.shared_setting_links (
+    sq_id bigint PRIMARY KEY DEFAULT nextval('game.shared_setting_links_sq_id_seq'),
+    kind text NOT NULL CHECK (kind IN ('shared', 'overview')),
+    setting_type_id integer,
+    hash_value text NOT NULL,
+    payload text NOT NULL,
+    creator_user_id bigint NOT NULL REFERENCES game.accounts(user_id),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((kind = 'shared' AND setting_type_id IN (2, 3) AND setting_type_id IS NOT NULL)
+        OR (kind = 'overview' AND setting_type_id IS NULL))
+);
+
 CREATE TABLE IF NOT EXISTS game.characters (
     character_id     bigserial PRIMARY KEY,
     user_id          bigint NOT NULL REFERENCES game.accounts,

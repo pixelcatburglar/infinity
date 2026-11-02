@@ -261,3 +261,7 @@ kill_right_suspect_secs = 900        # server kill-right activation policy
 [telemetry]
 # B batches occurrence counts; D also delivers detailed reports.
 client_error_log_mode = "B"
+
+[shared_settings]
+max_payload_bytes = 262144          # Maximum encoded UTF-8 bytes per permanent link.
+max_nesting_depth = 64              # Server resource policy; implementation ceiling is 64.

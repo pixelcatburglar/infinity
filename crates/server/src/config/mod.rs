@@ -8,6 +8,7 @@ pub mod game;
 pub mod map;
 pub mod scheduler;
 pub mod lua;
+pub mod shared_settings;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -33,6 +34,7 @@ pub struct Config {
     pub lua: lua::LuaConfig,
     pub bounty: bounty::BountyConfig,
     pub map: map::MapConfig,
+    pub shared_settings: shared_settings::SharedSettingsConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
@@ -76,6 +78,7 @@ impl PartialEq for Config {
             && self.lua == other.lua
             && self.bounty == other.bounty
             && self.map == other.map
+            && self.shared_settings == other.shared_settings
             && self.accounts == other.accounts
             && self.characters == other.characters
             && self.market == other.market
@@ -221,6 +224,7 @@ impl Config {
         GameConfig {
             bounty: self.bounty.clone(),
             map: self.map.clone(),
+            shared_settings: self.shared_settings.clone(),
             accounts: self.accounts.clone(),
             characters: self.characters.clone(),
             market: self.market.clone(),

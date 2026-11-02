@@ -48,6 +48,23 @@ fn client_error_mode_rejects_unknown_values() {
 }
 
 #[test]
+fn shared_settings_policy_defaults_validation_and_snapshot() {
+    let defaults = Config::default();
+    assert_eq!(defaults.shared_settings.max_payload_bytes, 262144);
+    assert_eq!(defaults.shared_settings.max_nesting_depth, 64);
+    let fixture = Fixture::new();
+    fixture.write("[shared_settings]\nmax_payload_bytes = 42\nmax_nesting_depth = 1");
+    let custom = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!(custom.game_config().shared_settings.max_payload_bytes, 42);
+    assert_eq!(custom.game_config().shared_settings.max_nesting_depth, 1);
+    assert!(custom != defaults);
+    assert!(load_error("[shared_settings]\nmax_payload_bytes = 0").contains("shared_settings.max_payload_bytes"));
+    for depth in [0, 65] {
+        assert!(load_error(&format!("[shared_settings]\nmax_nesting_depth = {depth}")).contains("shared_settings.max_nesting_depth"));
+    }
+}
+
+#[test]
 fn gm_spawn_policy_rejects_invalid_limits() {
     let mut config = Config::default();
     assert!(config.validate().is_ok());
