@@ -439,9 +439,9 @@ pub async fn send_state(c: &mut Client) -> Result<(), CallError> {
 }
 
 /// Steer or stop the ship, dropping a jump cloak.
-fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Vec<Value> + Send + 'static) -> CallResult {
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
-    c.world.post(system, move |s| {
+fn movement(identity: &Identity, world: &space::World, space_system: Option<i64>, f: impl FnOnce(&mut Ball, i64, &space::System) -> Vec<Value> + Send + 'static) -> CallResult {
+    let (Some(system), Some(ship)) = (space_system, identity.ship_id) else { return Ok(Value::None) };
+    world.post(system, move |s| {
         s.drop_jump_cloak(ship);
         s.command(ship, f);
     });

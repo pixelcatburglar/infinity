@@ -3,6 +3,32 @@
 //! Explicit stop and movement commands cancel an arrival jump cloak.
 use super::*;
 
+pub(crate) fn stop(identity: &Identity, world: &space::World, space_system: Option<i64>) -> CallResult {
+    movement(identity, world, space_system, |b, t, _| {
+        b.stop();
+        vec![event(t, "Stop", vec![Value::Int(b.id)])]
+    })
+}
+
+pub(crate) fn orbit(identity: &Identity, world: &space::World, space_system: Option<i64>, target: i64, range: f32) -> CallResult {
+    follow_or_orbit(identity, world, space_system, target, range, true)
+}
+
+pub(crate) fn follow_ball(identity: &Identity, world: &space::World, space_system: Option<i64>, target: i64, range: f32) -> CallResult {
+    follow_or_orbit(identity, world, space_system, target, range, false)
+}
+
+fn follow_or_orbit(identity: &Identity, world: &space::World, space_system: Option<i64>, target: i64, range: f32, orbit: bool) -> CallResult {
+    movement(identity, world, space_system, move |b, t, others| {
+        let Some(target_ball) = others.ball(target) else { return vec![] };
+        if !(if orbit { b.orbit(target_ball, range) } else { b.follow_ball(target_ball, range) }) { return vec![]; }
+        let name = if orbit { "Orbit" } else { "FollowBall" };
+        let mut ev = vec![event(t, name, vec![Value::Int(b.id), Value::Int(target), Value::Float(range as f64)])];
+        ensure_moving(b, t, &mut ev);
+        ev
+    })
+}
+
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let a = call.args;
     Some(match (call.service, call.method) {
@@ -10,7 +36,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
             if !dir.iter().all(|v| v.is_finite()) { return Some(Ok(Value::None)); }
-            movement(c, move |b, t, _| {
+            movement(&Identity::of_client(c), &c.world, c.session.int("solarsystemid"), move |b, t, _| {
                 if !b.goto_direction(dir) { return vec![]; }
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
@@ -19,7 +45,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         }
         ("beyonce", "CmdAlignTo") => {
             let target = call.kwargs.get("dstID").and_then(|v| v.as_int()).or_else(|| a.first().and_then(|v| v.as_int()));
-            movement(c, move |b, t, others| {
+            movement(&Identity::of_client(c), &c.world, c.session.int("solarsystemid"), move |b, t, others| {
                 let Some(tp) = target.and_then(|id| others.ball(id)).map(|o| o.pos) else { return vec![] };
                 let dir = [tp[0] - b.pos[0], tp[1] - b.pos[1], tp[2] - b.pos[2]];
                 if !b.goto_direction(dir) { return vec![]; }
@@ -28,16 +54,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 ev
             })
         }
-        ("beyonce", "CmdStop") => {
-            movement(c, |b, t, _| {
-                b.stop();
-                vec![event(t, "Stop", vec![Value::Int(b.id)])]
-            })
-        }
+        ("beyonce", "CmdStop") => stop(&Identity::of_client(c), &c.world, c.session.int("solarsystemid")),
         ("beyonce", "CmdSetSpeedFraction") => {
             let frac = f(a.first()) as f32;
             if !frac.is_finite() { return Some(Ok(Value::None)); }
-            movement(c, move |b, t, _| {
+            movement(&Identity::of_client(c), &c.world, c.session.int("solarsystemid"), move |b, t, _| {
                 b.set_speed_fraction(frac);
                 vec![event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(b.speed_fraction as f64)])]
             })
@@ -45,16 +66,14 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdFollowBall") | ("beyonce", "CmdOrbit") => {
             let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);
             let range = f(a.get(1)) as f32;
-            let orbit = call.method == "CmdOrbit";
             if !range.is_finite() { return Some(Ok(Value::None)); }
-            movement(c, move |b, t, others| {
-                let Some(target_ball) = others.ball(target) else { return vec![] };
-                if !(if orbit { b.orbit(target_ball, range) } else { b.follow_ball(target_ball, range) }) { return vec![]; }
-                let name = if orbit { "Orbit" } else { "FollowBall" };
-                let mut ev = vec![event(t, name, vec![Value::Int(b.id), Value::Int(target), Value::Float(range as f64)])];
-                ensure_moving(b, t, &mut ev);
-                ev
-            })
+            let identity = Identity::of_client(c);
+            let system = c.session.int("solarsystemid");
+            if call.method == "CmdOrbit" {
+                orbit(&identity, &c.world, system, target, range)
+            } else {
+                follow_ball(&identity, &c.world, system, target, range)
+            }
         }
         ("beyonce", "CmdWarpToStuff") if a.first().and_then(|v| v.as_text()).as_deref() == Some("scan") => {
             let target = a.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();

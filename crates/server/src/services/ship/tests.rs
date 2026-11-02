@@ -444,3 +444,63 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn movement_dispatch_and_headless_guards() {
+    use std::sync::Arc;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    let system = -1;
+    world.system(system).await.unwrap();
+    let mut vessel = ship();
+    vessel.speed_fraction = 1.0;
+    let mut target = ship();
+    target.id = 456;
+    target.mode = MODE_STOP;
+    target.pos = [1000.0, 0.0, 0.0];
+    target.vel = [0.0; 3];
+    world.with(system, move |s| { s.insert(vessel); s.insert(target); }).await.unwrap();
+    let identity = Identity { char_id: 789, ship_id: Some(123), corp_id: 12, station_id: None, system_id: Some(system) };
+    let missing_ship = Identity { ship_id: None, ..identity };
+    for result in [
+        beyonce::stop(&identity, &world, None),
+        beyonce::orbit(&identity, &world, None, 456, 100.0),
+        beyonce::follow_ball(&identity, &world, None, 456, 100.0),
+        beyonce::stop(&missing_ship, &world, Some(system)),
+        beyonce::orbit(&missing_ship, &world, Some(system), 456, 100.0),
+        beyonce::follow_ball(&missing_ship, &world, Some(system), 456, 100.0),
+    ] {
+        assert!(matches!(result, Ok(Value::None)));
+    }
+    assert!(world.after(system, 1100).await);
+    let ball = world.ball(system, 123).await.unwrap();
+    assert_eq!((ball.mode, ball.follow_id, ball.speed_fraction), (MODE_GOTO, 0, 1.0));
+
+    let cfg = Arc::new(crate::config::Config::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, address) = listener.accept().await.unwrap();
+    let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
+    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    client.session.apply(vec![("shipid", Value::Int(123)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
+    for (method, mode, range) in [
+        ("CmdStop", MODE_STOP, 0.0),
+        ("CmdOrbit", space::MODE_ORBIT, 100.0),
+        ("CmdFollowBall", space::MODE_FOLLOW, 200.0),
+    ] {
+        let args = [Value::Int(456), Value::Float(range)];
+        let call = Call { service: "beyonce", method, args: &args, kwargs: &Value::None, bound: false, bind_params: None };
+        assert!(matches!(crate::services::dispatch(&mut client, &call).await, Ok(Value::None)));
+        assert!(world.after(system, 1100).await);
+        let ball = world.ball(system, 123).await.unwrap();
+        assert_eq!(ball.mode, mode);
+        if mode != MODE_STOP {
+            assert_eq!((ball.follow_id, ball.follow_range), (456, range as f32));
+            assert_eq!(ball.speed_fraction, 1.0);
+        }
+    }
+}
