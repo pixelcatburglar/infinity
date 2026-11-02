@@ -190,11 +190,15 @@ pub(super) fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
 /// Stop everything a character was doing in space (docking, jumping, logging off).
 pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
+    reset_pilot(&c.world, char_id, c.session.int("solarsystemid").zip(c.session.int("shipid")));
+}
+
+pub(crate) fn reset_pilot(world: &crate::space::World, char_id: i64, space_ship: Option<(i64, i64)>) {
     super::effects::heat::clear_character(char_id);
-    clear_character_locks(&c.world, char_id);
+    clear_character_locks(world, char_id);
     state().reset_character(char_id);
-    if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
-        c.world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
+    if let Some((system, ship)) = space_ship {
+        world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
     }
 }
 

@@ -123,7 +123,24 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         }
         ("beyonce", "CmdDock") | ("beyonce", "CmdTurboDock") => {
             let station = a.first().and_then(|v| v.as_int()).unwrap_or(0);
-            dock(c, station).await
+            let identity = Identity::of_client(c);
+            let db = c.db.clone();
+            let world = c.world.clone();
+            let space_system = c.session.int("solarsystemid");
+            match dock(&identity, &db, &world, space_system, station, Some(c)).await {
+                Ok(change) => {
+                    info!(user = c.login.user_id, "ship {} docked at {station}", identity.ship_id.unwrap());
+                    c.change_session(change.updates);
+                    if let Some(event) = change.event {
+                        let mut outbox = Outbox::default();
+                        outbox.event(event);
+                        dispatch_client((), outbox, c).map(|_| Value::None)
+                    } else {
+                        Ok(Value::None)
+                    }
+                }
+                Err(error) => Err(error),
+            }
         }
         ("beyonce", m) => {
             warn!(user = c.login.user_id, "UNHANDLED {}::{m} args={} kwargs={}", call.service, short(&marshal::Value::Tuple(a.to_vec())), short(call.kwargs));

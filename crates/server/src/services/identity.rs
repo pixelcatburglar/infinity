@@ -3,12 +3,14 @@
 //! client and releases the old one in `ProcessSessionChange`. The character ID
 //! comes from the session, not the database; this snapshot carries neither transport
 //! state nor location, roles, or affiliations.
+//! A character ID of zero means no character.
 
 use crate::client::Client;
 use crate::session::Session;
 
 pub struct Identity {
     pub char_id: i64,
+    pub ship_id: Option<i64>,
 }
 
 impl Identity {
@@ -19,6 +21,7 @@ impl Identity {
     fn from_session(session: &Session) -> Self {
         Self {
             char_id: session.int("charid").unwrap_or(0),
+            ship_id: session.int("shipid"),
         }
     }
 }

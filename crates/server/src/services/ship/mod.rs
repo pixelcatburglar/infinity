@@ -29,6 +29,7 @@
 //! a crash between arrival and the telemetry transaction can leave an arrival unrecorded.
 
 use super::{db_err, Call, CallError, CallResult};
+use super::identity::Identity;
 use crate::client::{short, Client};
 use crate::consts::{FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
@@ -85,8 +86,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
 }
 
 /// Refuse docking and gate jumps while the pilot's weapons timer runs (crimewatch).
-fn check_weapons_timer(c: &Client, what: &str) -> Result<(), CallError> {
-    let char_id = c.session.int("charid").unwrap_or(0);
+fn check_weapons_timer(char_id: i64, what: &str) -> Result<(), CallError> {
     match super::crimewatch::weapons_timer(char_id) {
         Some(until) => {
             let secs = ((until - crate::client::filetime_now()) / 10_000_000).max(1);
@@ -100,13 +100,13 @@ fn check_weapons_timer(c: &Client, what: &str) -> Result<(), CallError> {
 }
 
 /// Quiesce condition mutations before removing the ball and capturing its final state.
-async fn remove_and_save(c: &Client, system: i64, ship: i64) -> Result<(), CallError> {
+async fn remove_and_save(db: &crate::db::Db, world: &space::World, system: i64, ship: i64) -> Result<(), CallError> {
     let ball = {
         let _lock = super::market::lock().await;
-        c.world.remove_ball(system, ship).await
+        world.remove_ball(system, ship).await
     }.ok_or_else(|| CallError::Internal(anyhow::anyhow!("ship {ship} is no longer in system {system}")))?;
-    if let Err(error) = super::combat::save_condition(&c.db, ship).await {
-        if let Err(restore) = c.world.add_ship(system, ball).await {
+    if let Err(error) = super::combat::save_condition(db, ship).await {
+        if let Err(restore) = world.add_ship(system, ball).await {
             tracing::warn!(ship, %restore, "failed to restore ship after condition save failure");
         }
         return Err(error);
@@ -114,12 +114,20 @@ async fn remove_and_save(c: &Client, system: i64, ship: i64) -> Result<(), CallE
     Ok(())
 }
 
-async fn dock(c: &mut Client, station: i64) -> CallResult {
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else {
+pub(crate) struct SessionChange {
+    pub updates: Vec<(&'static str, Value)>,
+    pub event: Option<GameEvent>,
+}
+
+pub(crate) async fn dock<O: observer::DockObserver>(
+    identity: &Identity, db: &crate::db::Db, world: &space::World, space_system: Option<i64>,
+    station: i64, mut observer: Option<&mut O>,
+) -> Result<SessionChange, CallError> {
+    let (Some(system), Some(ship)) = (space_system, identity.ship_id) else {
         return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
     };
-    check_weapons_timer(c, messages::WEAPONS_TIMER_DOCK)?;
-    let gap = c.world.with(system, move |s| {
+    check_weapons_timer(identity.char_id, messages::WEAPONS_TIMER_DOCK)?;
+    let gap = world.with(system, move |s| {
         let (b, station) = (s.ball(ship)?, s.ball(station)?);
         Some(space::dist(b.position_at(s.now_ms()), station.position_at(s.now_ms()))
             - b.radius as f64 - station.radius as f64)
@@ -127,28 +135,32 @@ async fn dock(c: &mut Client, station: i64) -> CallResult {
     if gap.is_none_or(|g| g > DOCKING_RANGE) {
         return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
     }
-    c.world.command(system, ship, |b, t, _| {
+    world.command(system, ship, |b, t, _| {
         b.stop();
         vec![event(t, "Stop", vec![Value::Int(b.id)])]
     });
-    c.world.uncloak(system, ship).await;
-    c.notify("OnDockingAccepted", vec![Value::Int(station)]);
-    if !c.wait_pumping(system, DOCK_DELAY_MS).await.map_err(CallError::Internal)? {
-        return Err(CallError::Internal(anyhow::anyhow!("system actor stopped during docking wait")));
+    world.uncloak(system, ship).await;
+    if let Some(observer) = observer.as_mut() {
+        observer.accepted(station);
+        if !observer.wait_pumping(system, DOCK_DELAY_MS).await? {
+            return Err(CallError::Internal(anyhow::anyhow!("system actor stopped during docking wait")));
+        }
     }
-    super::combat::reset(c);
-    remove_and_save(c, system, ship).await?;
-    c.world.unobserve(c.login.client_id);
-    item_dao::dock(&c.db, ship, station, FLAG_HANGAR).await.map_err(db_err)?;
-    character_dao::dock(&c.db, c.session.int("charid").unwrap_or(0), station, system).await.map_err(db_err)?;
-    info!(user = c.login.user_id, "ship {ship} docked at {station}");
-    c.change_session(vec![("solarsystemid", Value::None), ("stationid", Value::Int(station))]);
-    if let Some(char_id) = c.session.int("charid") {
-        let mut outbox = Outbox::default();
-        outbox.event(GameEvent::Docked { char_id, ship_id: ship, station_id: station, system_id: system });
-        dispatch_client((), outbox, c)?;
+    if identity.char_id != 0 {
+        super::combat::reset_pilot(world, identity.char_id, Some((system, ship)));
     }
-    Ok(Value::None)
+    remove_and_save(db, world, system, ship).await?;
+    if let Some(observer) = observer {
+        observer.unobserve();
+    }
+    item_dao::dock(db, ship, station, FLAG_HANGAR).await.map_err(db_err)?;
+    character_dao::dock(db, identity.char_id, station, system).await.map_err(db_err)?;
+    Ok(SessionChange {
+        updates: vec![("solarsystemid", Value::None), ("stationid", Value::Int(station))],
+        event: (identity.char_id != 0).then_some(GameEvent::Docked {
+            char_id: identity.char_id, ship_id: ship, station_id: station, system_id: system,
+        }),
+    })
 }
 
 /// Jump range: ship and gate surfaces within this distance (m).
@@ -186,7 +198,7 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
     let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
         return Err(CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] });
     };
-    check_weapons_timer(c, messages::WEAPONS_TIMER_JUMP)?;
+    check_weapons_timer(char_id, messages::WEAPONS_TIMER_JUMP)?;
     let dest = gate_destination(&c.sde, from_gate, to_gate, system)?
         .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?;
     let dest_system: i64 = dest.dest_solar_system_id;
@@ -251,7 +263,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     }
 
     super::combat::reset(c);
-    remove_and_save(c, system, ship).await?;
+    remove_and_save(&c.db, &c.world, system, ship).await?;
     c.world.unobserve(c.login.client_id);
     item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
@@ -298,7 +310,7 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     };
     c.world.system(dest_system).await.map_err(CallError::Internal)?;
     super::combat::reset(c);
-    remove_and_save(c, system, ship).await?;
+    remove_and_save(&c.db, &c.world, system, ship).await?;
     item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     let ball = ship_ball(c, ship, pos).await?;
     if dest_system == system {
@@ -539,6 +551,7 @@ fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
 }
 
 pub(crate) mod balls;
+pub(crate) mod observer;
 mod ship;
 mod undock_point;
 mod beyonce;

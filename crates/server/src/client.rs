@@ -51,6 +51,20 @@ pub struct Client {
     next_oid: i64,
 }
 
+impl crate::services::ship::observer::DockObserver for Client {
+    fn accepted(&mut self, station: i64) {
+        self.notify("OnDockingAccepted", vec![Value::Int(station)]);
+    }
+
+    async fn wait_pumping(&mut self, system: i64, delay_ms: u64) -> std::result::Result<bool, CallError> {
+        Client::wait_pumping(self, system, delay_ms).await.map_err(CallError::Internal)
+    }
+
+    fn unobserve(&mut self) {
+        self.world.unobserve(self.login.client_id);
+    }
+}
+
 /// Abbreviated repr for logs.
 pub fn short(v: &Value) -> String {
     let s = format!("{v:?}");
