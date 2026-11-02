@@ -100,6 +100,34 @@ fn decode(lua: &Lua, value: serde_json::Value, key: &str, depth: usize) -> Resul
     })
 }
 
+fn decode_stored(lua: &Lua, value: &str, key: &str, limit: usize) -> Result<Value> {
+    // PostgreSQL renders JSONB with spaces after separators; allow that
+    // representation before applying the cap to compact JSON.
+    if value.len() > limit.saturating_mul(2) { return Err(mlua::Error::runtime(format!("store value at {key} exceeds {limit} bytes"))); }
+    let value: serde_json::Value = serde_json::from_str(value).map_err(|error| mlua::Error::runtime(format!("invalid store value at {key}: {error}")))?;
+    charge_json(&value, &mut limit.clone(), key)?;
+    decode(lua, value, key, 0)
+}
+
+fn sequence_keys(table: Table) -> Result<Vec<String>> {
+    let len = table.raw_len();
+    let mut count = 0;
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (index, key) = pair?;
+        match (index, key) {
+            (Value::Integer(index), Value::String(key)) if index > 0 && (index as u64) <= len as u64 => {
+                key.to_str()?;
+                count += 1;
+            }
+            _ => return Err(mlua::Error::runtime("store keys must be a dense sequence of strings")),
+        }
+    }
+    if count != len {
+        return Err(mlua::Error::runtime("store keys must be a dense sequence of strings"));
+    }
+    table.sequence_values::<String>().collect()
+}
+
 pub(super) fn register(lua: &Lua, env: &Table, db: &Db, script: &str, limit: usize) -> Result<()> {
     let store = lua.create_table()?;
     let (db, name) = (db.clone(), script.to_owned());
@@ -108,16 +136,22 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, script: &str, limit: usi
         let (db, script) = (handle.clone(), script.clone());
         async move {
             match lua_store::get(&db, &script, &key).await.map_err(mlua::Error::external)? {
-                Some(value) => {
-                    // PostgreSQL renders JSONB with spaces after separators; allow that
-                    // representation before applying the cap to compact JSON.
-                    if value.len() > limit.saturating_mul(2) { return Err(mlua::Error::runtime(format!("store value at {key} exceeds {limit} bytes"))); }
-                    let value: serde_json::Value = serde_json::from_str(&value).map_err(|error| mlua::Error::runtime(format!("invalid store value at {key}: {error}")))?;
-                    charge_json(&value, &mut limit.clone(), &key)?;
-                    decode(&lua, value, &key, 0)
-                }
+                Some(value) => decode_stored(&lua, &value, &key, limit),
                 None => Ok(Value::Nil),
             }
+        }
+    })?)?;
+    let (handle, script) = (db.clone(), name.clone());
+    store.set("get_many", lua.create_async_function(move |lua, keys: Table| {
+        let (db, script) = (handle.clone(), script.clone());
+        async move {
+            let keys = sequence_keys(keys)?;
+            let rows = lua_store::get_many(&db, &script, &keys).await.map_err(mlua::Error::external)?;
+            let values = lua.create_table()?;
+            for row in rows {
+                values.set(row.key.as_str(), decode_stored(&lua, &row.value, &row.key, limit)?)?;
+            }
+            Ok(values)
         }
     })?)?;
     let (handle, script) = (db.clone(), name.clone());
