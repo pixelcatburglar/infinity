@@ -10,13 +10,17 @@
 //! Notifications (game.notifications) are what other systems post for a character
 //! (`notify`): a type, a sender and YAML data the client's formatter for that type reads.
 
-pub(crate) mod mail_mgr;
+pub(crate) mod delivery;
+mod mail_mgr;
 mod notification_mgr;
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::db::{executor::Executor, outbox::Outbox};
 use marshal::Value;
+
+/// Client appConst.mailStatusMask read bit.
+pub(super) const STATUS_READ: i32 = 1;
 
 /// Post a notification to a character (and show it at once if they're online). `data` is
 /// the YAML mapping the client's formatter for `type_id` reads; `group` is its
