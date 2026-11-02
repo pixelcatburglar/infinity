@@ -253,6 +253,8 @@ description_max_len = 10000         # existing calendar description limit
 [space]
 position_snapshot_secs = 30         # server position persistence interval; bounds crash loss
 mailbox_budget = 10000              # server space actor mailbox depth budget
+# Restart required. Shape data is unavailable; enabled collisions use one sphere per ball.
+collisions = false
 
 [bounty]
 kill_right_lifetime_days = 30       # server kill-right lifetime policy

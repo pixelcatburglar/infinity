@@ -9,6 +9,7 @@ fn default_orbital_normal_converts_negative_zero_to_positive_zero() {
 
 #[test]
 fn orbit_uses_target_position_before_integration() {
+    crate::tests::init_config();
     let mut system = System::new(1, Arc::<Pilots>::default(), 0);
     let mut target = ship(1, [1000.0, 0.0, 0.0], [0.0, 100.0, 0.0]);
     target.goto_direction([0.0, 1.0, 0.0]);
@@ -31,6 +32,7 @@ fn orbit_uses_target_position_before_integration() {
 
 #[test]
 fn coincident_zero_throttle_orbit_stays_finite() {
+    crate::tests::init_config();
     let mut system = System::new(1, Arc::<Pilots>::default(), 0);
     let target = ship(1, [0.0; 3], [0.0; 3]);
     let mut orbiter = ship(2, [0.0; 3], [0.0; 3]);

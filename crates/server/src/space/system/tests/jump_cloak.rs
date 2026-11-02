@@ -24,7 +24,7 @@ fn explicit_drop_batches_exact_wire_and_suppresses_duplicates() {
     assert_eq!(notifications.try_recv().unwrap(), ("OnJumpCloakCancelled".to_string(), vec![Value::Int(1)]));
     assert!(notifications.try_recv().is_err());
     s.tick(6_000);
-    let expected_add = add_balls_event(5, s.ball(1).unwrap());
+    let expected_add = add_balls_event(5, s.ball(1).unwrap(), true);
     assert_eq!(own.try_recv().unwrap(), vec![event(5, "UncloakBall", vec![Value::Int(1)]), uncloak_fx(5, 1)]);
     assert_eq!(observer.try_recv().unwrap(), vec![expected_add, uncloak_fx(5, 1)]);
     assert!(own.try_recv().is_err());
@@ -43,7 +43,7 @@ fn immediate_uncloak_sends_one_batch_per_observer() {
     let mut observer = watch(&mut s, 2, 2);
     s.apply_uncloak(1, 5);
     assert_eq!(own.try_recv().unwrap(), vec![event(5, "UncloakBall", vec![Value::Int(1)]), uncloak_fx(5, 1)]);
-    assert_eq!(observer.try_recv().unwrap(), vec![add_balls_event(5, s.ball(1).unwrap()), uncloak_fx(5, 1)]);
+    assert_eq!(observer.try_recv().unwrap(), vec![add_balls_event(5, s.ball(1).unwrap(), true), uncloak_fx(5, 1)]);
     assert!(own.try_recv().is_err());
     assert!(observer.try_recv().is_err());
 }

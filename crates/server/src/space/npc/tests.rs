@@ -544,7 +544,7 @@ async fn timer_defers_async_work_without_polling_inside_actor() {
 #[test]
 fn groups_clear_once_for_destroyed_removed_and_missing_members() {
     let (mut s, _, _) = setup(None);
-    assert!(!s.is_cold());
+    assert!(!s.is_cold(true));
     s.insert(ball(2, None, 0.0));
     let cleared = Arc::new(AtomicUsize::new(0));
     let count = cleared.clone();

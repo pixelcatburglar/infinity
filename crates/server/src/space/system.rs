@@ -292,16 +292,19 @@ impl System {
     pub fn request_entry(&self, char_id: i64) -> Result<(), i64> {
         self.registry.request_entry(self.id, char_id, self.population())
     }
-    pub(super) fn is_cold(&self) -> bool {
+    pub(super) fn is_cold(&self, collisions: bool) -> bool {
         self.actions.is_empty()
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
             && self.module_cloaks.is_empty() && self.brains.is_empty() && self.drones.is_empty() && self.observers.is_empty()
             && !crate::services::effects::heat::active(&self.heat) && !self.balls.values().any(|b|
             (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
-            && !collision::stationary_contact(&self.balls)
+            && !collision::stationary_contact(&self.balls, collisions)
     }
     pub fn tick(&mut self, ms: i64) {
+        self.tick_with_collisions(ms, collision::enabled());
+    }
+    pub(super) fn tick_with_collisions(&mut self, ms: i64, collisions: bool) {
         self.observers.retain(|_, (_, tx)| !tx.is_closed());
         self.ms = ms;
         self.expire_projections();
@@ -317,7 +320,7 @@ impl System {
             self.next_tick_ms = Some(next_tick_ms + due * MILLISECONDS_PER_SECOND);
             due
         };
-        if !self.is_cold() { self.pending = Some(HashMap::new()); }
+        if !self.is_cold(collisions) { self.pending = Some(HashMap::new()); }
         for step in 0..steps {
             let count = self.actions.len();
             for _ in 0..count {
@@ -325,7 +328,7 @@ impl System {
                 action(self, stamp);
             }
             if self.balls.values().any(|b| b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
-                || collision::stationary_contact(&self.balls) {
+                || collision::stationary_contact(&self.balls, collisions) {
                 self.target_states.clear();
                 self.target_states.extend(self.balls.iter().map(|(&id, b)| (id, TargetState {
                     pos: b.pos, vel: b.vel, radius: b.radius,
@@ -345,7 +348,7 @@ impl System {
                     self.target_states.get_mut(&id).unwrap().vel = b.vel;
                     if activated { self.stop_all_followers(id); self.drone_controller_lost(id); }
                 }
-                collision::freeze(&mut self.collision_scratch, &self.balls);
+                collision::freeze(&mut self.collision_scratch, &self.balls, collisions);
                 collision::apply(&self.collision_scratch, &mut self.balls);
                 self.exited_ids.clear();
                 for snapshot in self.collision_scratch.iter().filter(|snapshot| snapshot.free) {
@@ -353,12 +356,17 @@ impl System {
                     let b = self.balls.get_mut(id).unwrap();
                     let was_warping = b.is_warping();
                     b.evolve_position(logical_ms, snapshot.time_factor);
-                    if was_warping && b.mode == MODE_STOP && self.warp_exits.contains_key(id) {
+                    if was_warping && b.mode == MODE_STOP && (!collisions || self.warp_exits.contains_key(id)) {
                         self.exited_ids.push(*id);
                     }
                 }
                 for index in 0..self.exited_ids.len() {
                     let id = self.exited_ids[index];
+                    // Native WarpDistance restores massiveness during the completed step
+                    // (Ballpark.cpp:4330,4355); correct it at the next pre-tick.
+                    if let Some(update) = collision::reset_event(id, self.current_time + 1, collisions) {
+                        self.broadcast(id, vec![update]);
+                    }
                     if let Some(callback) = self.warp_exits.remove(&id) { callback(self); }
                 }
             }
@@ -370,7 +378,7 @@ impl System {
             self.snapshot_due = ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND));
             snapshot::schedule(self);
         }
-        if self.is_cold() {
+        if self.is_cold(collisions) {
             self.pending = None;
             return;
         }
@@ -425,7 +433,7 @@ impl System {
     pub fn add_ship(&mut self, mut ball: Ball) {
         ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
         if ball.cloak == 0 {
-            let update = add_balls_event(self.current_time, &ball);
+            let update = add_balls_event(self.current_time, &ball, collision::enabled());
             self.actions.push_back((self.current_time, Box::new(move |s, _| s.deliver(None, vec![update]))));
         }
         self.insert(ball);
@@ -626,33 +634,49 @@ impl System {
         true
     }
     fn apply_uncloak(&mut self, ship: i64, stamp: i64) {
+        self.apply_uncloak_with_collisions(ship, stamp, collision::enabled());
+    }
+    pub(super) fn apply_uncloak_with_collisions(&mut self, ship: i64, stamp: i64, collisions: bool) {
         self.pending_uncloak.remove(&ship);
         let Some(ball) = self.balls.get_mut(&ship) else { return };
         if ball.cloak == 0 { return; }
         ball.cloak = 0;
         ball.cloak_until = 0;
-        let add = add_balls_event(stamp, ball);
+        let add = add_balls_event(stamp, ball, collisions);
         let own = event(stamp, "UncloakBall", vec![Value::Int(ship)]);
         let fx = special_fx(stamp, ship, None, None, "effects.Uncloak", 1, 0, UNCLOAK_FX_DURATION_MS, None);
+        // Native UncloakBall restores massiveness (Ballpark.cpp:5257-5287).
+        let reset = collision::reset_event(ship, stamp, collisions);
         self.observers.retain(|&client, (ego, tx)| {
             if tx.is_closed() { return false; }
             let update = if *ego == ship { own.clone() } else { add.clone() };
+            let owner_reset = if *ego == ship { reset.as_ref() } else { None };
             if let Some(pending) = &mut self.pending {
-                pending.entry(client).or_default().extend([update, fx.clone()]);
+                let updates = pending.entry(client).or_default();
+                updates.push(update);
+                if let Some(reset) = owner_reset { updates.push(reset.clone()); }
+                updates.push(fx.clone());
                 true
-            } else { tx.send(vec![update, fx.clone()]).is_ok() }
+            } else {
+                let mut updates = Vec::with_capacity(2 + usize::from(owner_reset.is_some()));
+                updates.push(update);
+                if let Some(reset) = owner_reset { updates.push(reset.clone()); }
+                updates.push(fx.clone());
+                tx.send(updates).is_ok()
+            }
         });
     }
     pub fn observe(&mut self, client_id: i64, ego: i64, tx: DestinyTx) -> Value {
         let system_id = self.id;
         let tick = self.current_time;
+        let collisions = collision::enabled();
         self.observers.insert(client_id, (ego, tx));
         let mut state = vec![DESTINY_FULLSTATE];
         state.extend_from_slice(&(tick as i32).to_le_bytes());
         let mut slims = Vec::new();
         let mut damage = Vec::new();
         for b in self.balls.values().filter(|b| b.cloak == 0 || b.id == ego) {
-            b.write(&mut state);
+            b.write(&mut state, collisions);
             slims.push(b.slim_item());
             if b.free {
                 damage.push((Value::Int(b.id), b.damage_state()));

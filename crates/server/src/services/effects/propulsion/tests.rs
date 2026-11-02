@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
+    crate::tests::init_config();
     let mut system = System::new(0, Arc::default(), 12_345);
     let ball = Ball {
         id: 1, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,

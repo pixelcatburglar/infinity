@@ -11,6 +11,7 @@ async fn interval_deadlines_align_to_wall_boundaries() {
 
 #[tokio::test]
 async fn waits_follow_timer_execution_and_actor_lifetime() {
+    crate::tests::init_config();
     assert!(!after(None, 100).await);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = SystemHandle { tx, gate: Arc::new(tokio::sync::Mutex::new(())), written: Arc::new(std::sync::atomic::AtomicU64::new(0)) };

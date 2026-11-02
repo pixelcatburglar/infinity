@@ -57,7 +57,7 @@ mod goto;
 mod follow;
 mod orbit;
 mod missile;
-mod collision;
+pub(crate) mod collision;
 mod warp;
 pub use warp::{WarpOutcome, WarpState};
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
@@ -268,22 +268,22 @@ impl Ball {
             0.0, ms_to_seconds(elapsed as f64))
     }
 
-    fn flags(&self) -> u8 {
+    fn flags(&self, collisions: bool) -> u8 {
         (if self.free { FLAG_FREE } else { 0 })
             | (if self.global { FLAG_GLOBAL } else { 0 })
-            | (if self.massive { FLAG_MASSIVE } else { 0 })
+            | (if collision::massive(self, collisions) { FLAG_MASSIVE } else { 0 })
             | if self.interactive { FLAG_INTERACTIVE } else { 0 }
     }
 
     /// Ballpark::WriteBallToStream (no miniballs, no dynamical orientation).
-    fn write(&self, o: &mut Vec<u8>) {
+    fn write(&self, o: &mut Vec<u8>, collisions: bool) {
         o.extend_from_slice(&self.id.to_le_bytes());
         o.push(self.mode);
         o.extend_from_slice(&self.radius.to_le_bytes());
         for c in self.pos {
             o.extend_from_slice(&c.to_le_bytes());
         }
-        o.push(self.flags());
+        o.push(self.flags(collisions));
         if self.mode != MODE_RIGID {
             o.extend_from_slice(&self.mass.to_le_bytes());
             o.push(self.cloak); // isCloaked
@@ -435,10 +435,10 @@ struct JumpQueue {
 }
 
 /// AddBalls for one ball.
-fn add_balls_event(tick: i64, ball: &Ball) -> Value {
+fn add_balls_event(tick: i64, ball: &Ball, collisions: bool) -> Value {
     let mut state = vec![DESTINY_BALLS];
     state.extend_from_slice(&(tick as i32).to_le_bytes());
-    ball.write(&mut state);
+    ball.write(&mut state, collisions);
     let chunk = Value::tuple([Value::str(state), Value::list([ball.slim_item()]), Value::Dict(vec![])]);
     event(tick, "AddBalls", vec![chunk])
 }

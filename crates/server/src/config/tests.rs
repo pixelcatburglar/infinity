@@ -41,6 +41,23 @@ fn load_error(contents: &str) -> String {
         Err(error) => format!("{error:#}"),
     }
 }
+
+#[test]
+fn space_collision_policy_defaults_parsing_and_snapshot() {
+    let fixture = Fixture::new();
+    assert!(!Config::load_with(&fixture.path(), |_| None).unwrap().space.collisions);
+    fixture.write("");
+    assert!(!Config::load_with(&fixture.path(), |_| None).unwrap().space.collisions);
+    for value in [false, true] {
+        fixture.write(&format!("[space]\ncollisions = {value}"));
+        let config = Config::load_with(&fixture.path(), |_| None).unwrap();
+        assert_eq!(config.space.collisions, value);
+        assert_eq!(config.game_config().space.collisions, value);
+    }
+    for value in ["\"false\"", "0"] {
+        assert!(load_error(&format!("[space]\ncollisions = {value}")).contains("collisions"));
+    }
+}
 #[test]
 fn client_error_mode_rejects_unknown_values() {
     assert_eq!(Config::default().telemetry.client_error_log_mode, "B");

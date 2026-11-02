@@ -98,7 +98,7 @@ fn missile_and_warp_wire_bytes_match_explicit_interactivity() {
         (warp, "7b000000000000000300002040000000000000f03f0000000000000040000000000000084009000000000000244000ffffffffffffffff0c000000220000000000a0410000000000001040000000000000144000000000000018400000003f0000403fff0000000000001c400000000000002040000000000000224029090000000000000000344000000000000024400300000000000000"),
     ] {
         let mut bytes = Vec::new();
-        ball.write(&mut bytes);
+        ball.write(&mut bytes, true);
         let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, expected);
     }
@@ -114,10 +114,10 @@ fn wire_interactivity_is_independent_of_free() {
         ball.mode = if free { MODE_STOP } else { MODE_RIGID };
         ball.interactive = false;
         let mut noninteractive = Vec::new();
-        ball.write(&mut noninteractive);
+        ball.write(&mut noninteractive, true);
         ball.interactive = true;
         let mut interactive = Vec::new();
-        ball.write(&mut interactive);
+        ball.write(&mut interactive, true);
 
         let flag_offset = 8 + 1 + 4 + 3 * 8;
         let other_flags = FLAG_GLOBAL | FLAG_MASSIVE | if free { FLAG_FREE } else { 0 };
@@ -138,7 +138,7 @@ fn goto_direction_stores_absolute_point_and_serializes_it() {
     assert_eq!((ball.warp.length, ball.warp.min_range, ball.warp.factor), (20.0, 10.0, 3));
     assert_eq!(ball.goto, [1e16, 1.2e17, 3e16]);
     let mut bytes = Vec::new();
-    ball.write(&mut bytes);
+    ball.write(&mut bytes, true);
     let expected: Vec<u8> = ball.goto.iter().flat_map(|c| c.to_le_bytes()).collect();
     assert_eq!(&bytes[bytes.len() - expected.len()..], expected);
 

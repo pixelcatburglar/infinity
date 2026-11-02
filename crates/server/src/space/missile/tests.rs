@@ -43,6 +43,7 @@ fn prediction_uses_target_velocity_without_arrival_throttling() {
 
 #[test]
 fn sorted_behavior_observes_stopy_and_target_loss_drifts() {
+    crate::tests::init_config();
     let mut system = System::default();
     let target = ship(1, [100.0, 0.0, 0.0], [0.0, 20.0, 0.0]);
     let mut missile = ship(2, [0.0; 3], [1.0, 0.0, 0.0]);
@@ -69,12 +70,13 @@ fn sorted_behavior_observes_stopy_and_target_loss_drifts() {
 
 #[test]
 fn lone_missing_target_missile_keeps_system_active() {
+    crate::tests::init_config();
     let mut system = System::default();
     let mut missile = ship(2, [0.0; 3], [10.0, 0.0, 0.0]);
     missile.mode = MODE_MISSILE;
     missile.follow_id = 99;
     system.insert(missile);
-    assert!(!system.is_cold());
+    assert!(!system.is_cold(true));
     system.tick(1000);
     assert_eq!(system.ball(2).unwrap().mode, MODE_GOTO);
     assert!(system.ball(2).unwrap().pos[0] > 0.0);
