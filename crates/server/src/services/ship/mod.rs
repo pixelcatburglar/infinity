@@ -100,7 +100,9 @@ fn check_weapons_timer(char_id: i64, what: &str) -> Result<(), CallError> {
     }
 }
 
-/// Quiesce condition mutations before removing the ball and capturing its final state.
+/// Dock and teleport remove the specified ball or fail if absent. The economy
+/// lock is released before saving condition; a save failure restores the ball.
+/// Unlike logout, this does not save position or continue departure on failure.
 async fn remove_and_save(db: &crate::db::Db, world: &space::World, system: i64, ship: i64) -> Result<(), CallError> {
     let ball = {
         let _lock = super::market::lock().await;

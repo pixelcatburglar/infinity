@@ -1,8 +1,8 @@
-//! Pilot preparation and process-local pilot and chat presence.
+//! Pilot preparation, ordered departure, and process-local pilot and chat presence.
 //! `carbon/common/script/net/machoNet.py:3954-3957` binds the new charid to the
-//! client and releases the old one in `ProcessSessionChange`. Preparation uses
-//! character, item and skill data and the SDE to restore the selected pilot.
-//! Transport lifecycle and cross-process presence are not managed here.
+//! client and releases the old one in `ProcessSessionChange`. Preparation and
+//! departure use character, item and skill data and the SDE to restore or save
+//! pilots. Transport lifecycle and cross-process presence are not managed here.
 
 use std::sync::Arc;
 
@@ -70,6 +70,65 @@ pub(crate) fn online(identity: &Identity, world: &World, chat: &Hub, notify_tx: 
 pub(crate) fn offline(identity: &Identity, world: &World, chat: &Hub) {
     world.unregister_pilot(identity.char_id);
     chat.disconnect_character(identity.char_id);
+}
+
+/// Logout removes only the matching pilot ball, holding the economy lock through
+/// condition and position saves. Unlike dock removal, missing or replaced balls
+/// are skipped, save failures do not restore a ball, and cleanup continues.
+pub(crate) async fn leave(
+    identity: &Identity, db: &Db, world: &World, chat: &Hub, sde: &Arc<Sde>,
+    space_system: Option<i64>, unobserve: impl FnOnce() + Send,
+) -> anyhow::Result<()> {
+    let char_id = identity.char_id;
+    if char_id != 0 {
+        super::combat::reset_pilot(world, char_id, space_system.zip(identity.ship_id));
+    }
+    let mut failure = None;
+    if let Some(ship) = identity.ship_id {
+        let _lock = super::market::lock().await;
+        let ball = if let Some(system) = space_system.filter(|_| char_id != 0) {
+            world.with(system, move |s| {
+                if s.pilot_ball(char_id).is_some_and(|ball| ball.id == ship) {
+                    s.remove_ball(ship)
+                } else {
+                    None
+                }
+            }).await.flatten()
+        } else {
+            None
+        };
+        if space_system.is_none() || ball.is_some() {
+            if let Err(error) = super::combat::save_condition_in(db, ship).await {
+                let error = match error {
+                    CallError::Internal(error) => error,
+                    CallError::User { msg, .. } => anyhow::anyhow!(msg),
+                };
+                tracing::warn!(ship, %error, "saving condition on leave failed");
+                failure = Some(error);
+            }
+        }
+        if let Some(b) = ball {
+            if let Err(error) = crate::dao::items::positions::save(db, ship, &b.pos).await {
+                tracing::warn!(ship, %error, "saving position on leave failed");
+                if failure.is_none() { failure = Some(error.into()); }
+            }
+        }
+    }
+    unobserve();
+    if char_id != 0 {
+        super::drones::settings::logged_off(char_id);
+        offline(identity, world, chat);
+        super::online_status::presence_changed(db, world, char_id, false).await;
+        if let Err(error) = super::trade::on_leave(identity, db, world, sde).await {
+            let error = match error {
+                CallError::Internal(error) => error,
+                CallError::User { msg, .. } => anyhow::anyhow!(msg),
+            };
+            tracing::warn!(%error, "trade cleanup on leave failed");
+            if failure.is_none() { failure = Some(error); }
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

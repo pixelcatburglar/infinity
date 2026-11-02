@@ -41,9 +41,9 @@ pub(crate) async fn abort_for_char(ex: &(impl crate::db::executor::Executor + ?S
     settle::abort_for_char(ex, sde, outbox, char_id).await
 }
 
-pub(crate) async fn on_leave(c: &Client) -> Result<(), CallError> {
-    let Some(char_id) = c.session.int("charid") else { return Ok(()) };
-    settle::leave(&c.db, &c.world, c.sde.clone(), char_id).await
+pub(crate) async fn on_leave(identity: &crate::services::identity::Identity, db: &crate::db::Db, world: &World, sde: &std::sync::Arc<crate::sde::Sde>) -> Result<(), CallError> {
+    if identity.char_id == 0 { return Ok(()); }
+    settle::leave(db, world, sde.clone(), identity.char_id).await
 }
 
 /// The caller holds the economy lock through the subsequent departure.

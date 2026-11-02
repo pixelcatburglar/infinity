@@ -124,3 +124,89 @@ async fn prepare_restores_docked_and_space_pilots_without_a_connection() {
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn headless_leave_saves_owned_ship_before_unobserving_and_clears_presence() {
+    use crate::{config::deployment::DatabaseConfig, consts::{TYPE_CAPSULE, dogma::{ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE, ATTR_SHIELD_CHARGE}}, dao::{characters, items}, db::Db, sde::Sde, services::{combat, identity::Identity, ship}, session::ChatSession, space::World};
+    crate::tests::init_config();
+    let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let system_row = sde.map.systems().find(|s| s.constellation_id.is_some() && s.region_id.is_some()).unwrap();
+    let (system, constellation, region) = (system_row.solar_system_id, system_row.constellation_id.unwrap(), system_row.region_id.unwrap());
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id,constellation_id,region_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,NULL,$2,$3,$4) RETURNING character_id", &[&account, &system, &constellation, &region]).await.unwrap().get("character_id");
+    let ship_id = items::creation::positioned(&db, TYPE_CAPSULE, character, system, [1.0, 2.0, 3.0]).await.unwrap();
+    characters::selection::set_ship(&db, character, ship_id).await.unwrap();
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let cfg = crate::config::Config::default();
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
+    let test_db = db.clone();
+    let test_world = world.clone();
+    let result = tokio::spawn(async move {
+        let ids = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
+        items::dogma::save_condition(&test_db, ship_id, &ids, &[0.0, 1.0, 0.0], ATTR_SHIELD_CHARGE, 0).await.unwrap();
+        let row = items::space_ships::FreeShip { item_id: ship_id, type_id: TYPE_CAPSULE, owner_id: character, corporation_id: 1, alliance_id: 0, pos: [1.0e15, 2.0e15, 3.0e15] };
+        let ball = ship::balls::piloted(&test_db, sde.clone(), &row, character, 0.0).await.ok().unwrap().install();
+        assert!((combat::ship_condition(ship_id).unwrap().1 - 1.0).abs() < 1e-9);
+        test_world.add_ship(system, ball).await.unwrap();
+        items::dogma::save_condition(&test_db, ship_id, &ids, &[0.0, 0.0, 0.0], ATTR_SHIELD_CHARGE, 0).await.unwrap();
+        let identity = Identity { char_id: character, ship_id: Some(ship_id), corp_id: 1, station_id: None, system_id: Some(system) };
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        super::online(&identity, &test_world, &chat, notify_tx, None, ChatSession {
+            character_id: character, system_id: Some(system), corporation_id: Some(1),
+            alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+        });
+        let position = test_world.with(system, move |s| s.pilot_ball(character).unwrap().pos).await.unwrap();
+        assert_ne!(position, [1.0, 2.0, 3.0]);
+        let (boundary_tx, boundary_rx) = tokio::sync::oneshot::channel();
+        let callback_world = test_world.clone();
+        super::leave(&identity, &test_db, &test_world, &chat, &sde, Some(system), move || {
+            assert!(callback_world.is_online(character));
+            assert!(callback_world.chat_session(character).is_some());
+            callback_world.post(system, move |s| {
+                let _ = boundary_tx.send(s.pilot_ball(character).is_none() && s.ball(ship_id).is_none());
+            });
+        }).await.unwrap();
+        assert!(boundary_rx.await.unwrap());
+        assert!(!test_world.is_online(character));
+        assert!(test_world.chat_session(character).is_none());
+        let saved = test_db.query_one("SELECT x,y,z FROM game.items WHERE item_id=$1", &[&ship_id]).await.unwrap();
+        assert_eq!([saved.get::<_, f64>("x"), saved.get("y"), saved.get("z")], position);
+        let rows = items::dogma::overrides(&test_db, ship_id).await.unwrap();
+        for id in ids { assert!(rows.iter().any(|row| row.attribute_id == id)); }
+        assert!((rows.iter().find(|row| row.attribute_id == ATTR_ARMOR_DAMAGE).unwrap().value - 1.0).abs() < 1e-9);
+    }).await;
+    world.remove_ball(system, ship_id).await;
+    combat::invalidate_condition(ship_id);
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&ship_id]).await.unwrap();
+    db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship_id]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn absent_identity_leaves_zero_registry_untouched_and_calls_observer() {
+    use crate::{config::deployment::DatabaseConfig, db::Db, sde::Sde, services::identity::Identity, session::ChatSession, space::World};
+    crate::tests::init_config();
+    let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let cfg = crate::config::Config::default();
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+    world.register_pilot(0, notify_tx);
+    world.set_chat_session(0, Some(ChatSession { character_id: 0, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }));
+    let identity = Identity { char_id: 0, ship_id: None, corp_id: 0, station_id: None, system_id: None };
+    let mut called = 0;
+    super::leave(&identity, &db, &world, &chat, &sde, None, || called += 1).await.unwrap();
+    assert_eq!(called, 1);
+    assert!(world.is_online(0));
+    assert!(world.chat_session(0).is_some());
+    world.notify_pilot(0, "test", vec![]);
+    assert_eq!(notify_rx.try_recv().unwrap().0, "test");
+    world.unregister_pilot(0);
+}
