@@ -47,7 +47,7 @@ use super::market::{lock, round2, station};
 use crate::dao::items::transfers;
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_PLASTIC_WRAP};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
@@ -60,8 +60,6 @@ use std::future::Future;
 use std::sync::Arc;
 use tracing::info;
 
-
-const TYPE_PLASTIC_WRAP: i32 = 3468;
 
 // appConst.conType*
 const TYPE_ITEM_EXCHANGE: i32 = 1;

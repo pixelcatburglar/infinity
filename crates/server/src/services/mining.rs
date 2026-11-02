@@ -13,6 +13,7 @@
 //! (miningAmount m3, with critical successes and residue waste) from the rock to the
 //! mining hold, or the cargo hold of ships without one, and tells the client
 //! (OnOreMined -> notifications.oreMinedNotificationAdapter, OnItemChange).
+//! Hold occupancy follows client item-aware packaged and assembled volumes.
 //! Extraction range uses ship and rock positions sampled at the same system-actor time.
 //! Laser extraction revalidates the online fitted module under row locks. Per-cycle
 //! rounding is randomized as in `packages/mining/__init__.py`, with no fraction carry.
@@ -381,8 +382,8 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
     if units <= 0 { return Ok(DeliveryOutcome::NoYield); }
     let t = sde.types.get(pending.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", pending.type_id)))?;
     let volume = t.volume.unwrap_or(1.0).max(0.01);
-    let used: f64 = crate::dao::items::mining::rows(ex, ship, flag).await.map_err(db_err)?.iter()
-        .filter_map(|item| sde.types.get(item.type_id).map(|t| item.quantity as f64 * t.volume.unwrap_or(0.0))).sum();
+    let rows = crate::dao::items::loading::load_items(ex, crate::dao::items::loading::ItemQuery::LocationFlags(ship, &[flag])).await.map_err(db_err)?;
+    let used = rows.iter().try_fold(0.0, |sum, item| Ok::<_, CallError>(sum + crate::services::item_volume::item_volume(sde, item.type_id, item.singleton, i64::from(item.quantity), None)?))?;
     let room = ((capacity - used) / volume).floor().max(0.0) as i64;
     let stack = crate::dao::items::transfers::stack(ex, ship, flag, pending.type_id, owner).await.map_err(db_err)?;
     let stack_room = stack.as_ref().map_or(i64::from(i32::MAX), |r| i64::from(i32::MAX - r.quantity));

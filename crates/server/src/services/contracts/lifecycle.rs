@@ -4,6 +4,7 @@
 //! Expiry, courier duration, item counts and text lengths use the configured contracts policy.
 //! Status transitions are guarded; overdue couriers are completed or failed manually.
 //! Auction candidates are rechecked in their settlement transaction.
+//! Escrow volume uses client packaged-item rules and the selected logical quantities.
 
 use super::*;
 use crate::dao::contracts::lifecycle as contract_dao;
@@ -204,14 +205,16 @@ fn expiry_time(now: i64, minutes: i128) -> i64 {
 }
 
 async fn volume(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, id: i64) -> Result<f64, CallError> {
-    Ok(sum_volume(shared::items(db, &[id]).await.map_err(db_err)?.iter()
-        .filter(|item| item.in_crate)
-        .filter_map(|item| sde.types.get(item.type_id as i32).and_then(|t| t.volume).map(|volume| volume * item.quantity as f64))))
-}
-
-fn sum_volume(volumes: impl Iterator<Item = f64>) -> f64 {
-    // Match SQL COALESCE(SUM, 0) sign on an empty set.
-    volumes.fold(0.0, |total, v| total + v)
+    let entries: Vec<_> = shared::items(db, &[id]).await.map_err(db_err)?.into_iter().filter(|item| item.in_crate).collect();
+    let ids: Vec<_> = entries.iter().map(|item| item.item_id.ok_or_else(|| anyhow::anyhow!("contract escrow item missing"))).collect::<Result<_, _>>()?;
+    let roots = load_items(db, sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
+    let mut total = 0.0;
+    for (entry, item_id) in entries.iter().zip(ids) {
+        let root = roots.iter().find(|root| root.item_id == item_id)
+            .ok_or_else(|| anyhow::anyhow!("contract escrow item {item_id} or its SDE type is missing"))?;
+        total += crate::services::item_volume::item_volume(sde, root.type_id, root.singleton, i64::from(root.quantity), Some(entry.quantity))?;
+    }
+    Ok(total)
 }
 
 /// `AcceptContract(contractID, forCorp)` -> the contract.

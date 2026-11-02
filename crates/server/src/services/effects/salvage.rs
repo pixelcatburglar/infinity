@@ -2,6 +2,7 @@
 //! The client dogma salvaging effect uses fitted accessDifficultyBonus and the
 //! wreck's SDE accessDifficulty. Native wreck yield tables do not ship: rewards
 //! are a configured random selection of published Salvaged Materials types.
+//! Cargo occupancy follows `inventorycommon.util.GetItemVolume` for each item.
 //! Loose wreck contents are retained in a positioned cargo container.
 use super::{lifecycle::{Cycle, CycleOutcome, Module, subject_valid}, notify::fire_fx, registry::{Effect, EffectAttribute, EffectFlag}};
 use crate::consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, FLAG_CARGO, GROUP_CARGO_CONTAINER, GROUP_WRECK, IX_LOCATION_ID};
@@ -101,13 +102,14 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
             Box::pin(async move {
                 if !active(master, &generation, character, target) { return Ok(false); }
                 if !ship::lock_reload_ship(tx, source).await.map_err(db_err)? { return Ok(false); }
-                let cargo = load_items(tx, &sde, ItemQuery::LocationFlags(source, &[FLAG_CARGO])).await.map_err(db_err)?;
-                if cargo.len() != loading::load_items(tx, ItemQuery::LocationFlags(source, &[FLAG_CARGO])).await.map_err(db_err)?.len() {
-                    return Err(CallError::Internal(anyhow::anyhow!("cargo contains an item with missing SDE type")));
-                }
-                let volume = |id| sde.types.get(id).and_then(|t| t.volume).filter(|v| v.is_finite() && *v >= 0.0).ok_or_else(|| CallError::Internal(anyhow::anyhow!("item volume missing for type {id}")));
-                let used = cargo.iter().try_fold(0.0, |sum, item| Ok::<_, CallError>(sum + volume(item.type_id)? * f64::from(item.quantity)))?;
-                let added = yields.iter().try_fold(0.0, |sum, (id, quantity)| Ok::<_, CallError>(sum + volume(*id)? * f64::from(*quantity)))?;
+                let cargo = loading::load_items(tx, ItemQuery::LocationFlags(source, &[FLAG_CARGO])).await.map_err(db_err)?;
+                let volume = |id, singleton, quantity| {
+                    let value = crate::services::item_volume::item_volume(&sde, id, singleton, quantity, None)?;
+                    if !value.is_finite() || value < 0.0 { return Err(CallError::Internal(anyhow::anyhow!("invalid item volume for type {id}"))); }
+                    Ok(value)
+                };
+                let used = cargo.iter().try_fold(0.0, |sum, item| Ok::<_, CallError>(sum + volume(item.type_id, item.singleton, i64::from(item.quantity))?))?;
+                let added = yields.iter().try_fold(0.0, |sum, (id, quantity)| Ok::<_, CallError>(sum + volume(*id, false, i64::from(*quantity))?))?;
                 if !capacity.is_finite() || !used.is_finite() || !added.is_finite() || used + added > capacity { return Ok(false); }
                 if !salvage::claim(tx, target, system, ball.type_id).await.map_err(db_err)? { return Ok(false); }
                 let loot = load_items(tx, &sde, ItemQuery::Location(target)).await.map_err(db_err)?;

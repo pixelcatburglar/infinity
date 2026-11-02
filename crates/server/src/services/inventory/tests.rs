@@ -4,6 +4,7 @@ use crate::consts::FLAG_CORP_SAG1;
 use crate::consts::ROLE_HANGAR_CAN_TAKE_1;
 mod deliveries;
 mod reachability;
+mod volume;
 
 fn item(id: i64, quantity: i32) -> Item {
     Item { item_id: id, type_id: 1, owner_id: 1, location_id: 1, flag_id: 1, quantity, singleton: false, group_id: 1, category_id: 1, custom_info: None }
@@ -28,34 +29,6 @@ fn merge_plan_deletes_sources_and_rejects_destination_overflow() {
     assert!(matches!(plan_merges(&overflow, &[(1, 2, 2)]), Err(CallError::User { .. })));
 }
 
-#[test]
-fn capacity_uses_parent_and_matching_children_from_the_same_rows() {
-    let mut parent = item(10, 0);
-    parent.location_id = 10;
-    let mut child = item(11, 3);
-    child.location_id = 10;
-    child.type_id = 2;
-    let mut null_volume = item(12, -2);
-    null_volume.location_id = 10;
-    null_volume.type_id = 3;
-    let unrelated = item(13, 7);
-    let rows = [parent, child, null_volume, unrelated];
-    let data = |id| match id {
-        1 => (Some(20.0), Some(30.0), Some(2.0)),
-        2 => (None, None, Some(4.0)),
-        _ => (None, None, None),
-    };
-    assert_eq!(item_capacity(&rows, 10, data), (20.0, 14.0));
-    assert_eq!(item_capacity(&rows, 99, data), (0.0, 0.0));
-    let empty_children = item_capacity(&rows, 11, |_| (None, Some(9.0), None));
-    assert_eq!(empty_children, (9.0, 0.0));
-    assert_eq!(empty_children.1.to_bits(), 0.0_f64.to_bits());
-    let empty_default = item_capacity(&rows, 11, |_| (None, None, None));
-    assert_eq!(empty_default, (0.0, 0.0));
-    assert_eq!(empty_default.1.to_bits(), 0.0_f64.to_bits());
-    let empty_volume = item_capacity(&rows, 10, |_| (None, None, None));
-    assert_eq!(empty_volume.1.to_bits(), 0.0_f64.to_bits());
-}
 
 #[test]
 fn gm_fit_sources_must_belong_to_target_and_be_in_cargo_or_hangar() {
