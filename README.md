@@ -351,7 +351,7 @@ Tagged versions are published on the repository's GitHub releases page. Each rel
 - `infinity-<version>-x86_64-windows.zip`
 - `SHA256SUMS`
 
-Each package holds `infinity-server`, `sde-import`, `marshal-dump`, `blue-patch` and this README.
+Each package holds `infinity-server`, `sde-import`, `marshal-dump`, `blue-patch`, this README and the `docs` folder.
 
 To release, a maintainer pushes a tag `vMAJOR.MINOR.PATCH` that points at a commit on `main`, for example `git tag v0.1.0 && git push origin v0.1.0`. Tags with any other name do not start a release.
 
