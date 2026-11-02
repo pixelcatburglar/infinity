@@ -29,6 +29,58 @@ fn follow_or_orbit(identity: &Identity, world: &space::World, space_system: Opti
     })
 }
 
+/// `login_user` is the owning server account ID: the belt-arrival callback forwards it
+/// to `belt_rats` for its spawn info log and uses it in the callback failure warning.
+pub(crate) async fn warp_to_ball(
+    identity: &Identity, db: &crate::db::Db, world: &std::sync::Arc<space::World>, sde: &crate::sde::Sde,
+    space_system: Option<i64>, login_user: i64,
+    target: i64, by_pilot: bool, min_range: f64, mut order: Option<super::super::fleets::warp::Order>,
+) -> CallResult {
+    let me = identity.char_id;
+    if by_pilot && order.as_ref().is_some_and(|order| !super::super::fleets::warp::permits_target(order, target)) {
+        return Ok(Value::None);
+    }
+    let found = if let Some(sys) = space_system {
+        world.with(sys, move |s| {
+            let b = if by_pilot { s.pilot_ball(target) } else { s.ball(target) }?;
+            if !s.fleet_broadcast_visible(me, b.id)
+                || (by_pilot && (b.char_id != Some(target) || b.owner_id != target)) { return None; }
+            Some((b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
+        }).await.flatten()
+    } else {
+        None
+    };
+    let Some((id, pos, radius, warp_in)) = found else {
+        return Ok(Value::None);
+    };
+    if by_pilot {
+        if let Some(order) = order.as_mut() { super::super::fleets::warp::target(order, target, id); }
+    }
+    let on_exit: Option<Timer> = if !by_pilot {
+        space_system.map(|system| {
+            let db = db.clone();
+            let world = std::sync::Arc::downgrade(world);
+            let user = login_user;
+            Box::new(move |s: &mut space::System| {
+                s.defer(async move {
+                    let Some(world) = world.upgrade() else { return };
+                    if let Err(e) = crate::services::exploration::belt_rats(&db, &world, user, system, id, pos).await {
+                        warn!(user, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
+                    }
+                });
+            }) as Timer
+        })
+    } else { None };
+    // Suns, planets, moons and belts land at their warp-in point, not off the surface.
+    let destination = if !by_pilot && sde.map.celestial(id).is_some() {
+        Value::dict([("celestialID", Value::Int(id))])
+    } else { Value::Dict(vec![]) };
+    match warp_in {
+        Some(point) => warp_destination(identity, db, world, space_system, order, None, point, min_range, on_exit, destination).await,
+        None => warp_destination(identity, db, world, space_system, order, Some((pos, radius)), pos, min_range, on_exit, destination).await,
+    }
+}
+
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let a = call.args;
     Some(match (call.service, call.method) {
@@ -84,56 +136,15 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             crate::services::exploration::warp_to_scan(c, &target, min_range, order).await
         }
         ("beyonce", "CmdWarpToStuff") | ("beyonce", "CmdWarpToStuffAutopilot") => {
-            let mut order = if call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
+            let order = if call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
                 match super::super::fleets::warp::authorize(c).await { Ok(order) => Some(order), Err(err) => return Some(Err(err)) }
             } else { None };
             let target = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
             // 'char': a fleet member's ship.
             let by_pilot = a.first().and_then(|v| v.as_text()).as_deref() == Some("char");
-            let me = c.session.int("charid").unwrap_or(0);
-            if by_pilot && order.as_ref().is_some_and(|order| !super::super::fleets::warp::permits_target(order, target)) {
-                return Some(Ok(Value::None));
-            }
-            let found = if let Some(sys) = c.session.int("solarsystemid") {
-                c.world.with(sys, move |s| {
-                    let b = if by_pilot { s.pilot_ball(target) } else { s.ball(target) }?;
-                    if !s.fleet_broadcast_visible(me, b.id)
-                        || (by_pilot && (b.char_id != Some(target) || b.owner_id != target)) { return None; }
-                    Some((b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
-                }).await.flatten()
-            } else {
-                None
-            };
-            let Some((id, pos, radius, warp_in)) = found else {
-                return Some(Ok(Value::None));
-            };
-            if by_pilot {
-                if let Some(order) = order.as_mut() { super::super::fleets::warp::target(order, target, id); }
-            }
-            let on_exit: Option<Timer> = if !by_pilot {
-                c.session.int("solarsystemid").map(|system| {
-                    let db = c.db.clone();
-                    let world = std::sync::Arc::downgrade(&c.world);
-                    let user = c.login.user_id;
-                    Box::new(move |s: &mut space::System| {
-                        s.defer(async move {
-                            let Some(world) = world.upgrade() else { return };
-                            if let Err(e) = crate::services::exploration::belt_rats(&db, &world, user, system, id, pos).await {
-                                warn!(user, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
-                            }
-                        });
-                    }) as Timer
-                })
-            } else { None };
-            // Suns, planets, moons and belts land at their warp-in point, not off the surface.
-            let destination = if !by_pilot && c.sde.map.celestial(id).is_some() {
-                Value::dict([("celestialID", Value::Int(id))])
-            } else { Value::Dict(vec![]) };
-            match warp_in {
-                Some(point) => warp_destination(c, order, None, point, min_range, on_exit, destination).await,
-                None => warp_destination(c, order, Some((pos, radius)), pos, min_range, on_exit, destination).await,
-            }
+            warp_to_ball(&Identity::of_client(c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"),
+                c.login.user_id, target, by_pilot, min_range, order).await
         }
         ("beyonce", "CmdStargateJump") => {
             let from_gate = a.first().and_then(|v| v.as_int()).unwrap_or(0);

@@ -504,3 +504,79 @@ async fn movement_dispatch_and_headless_guards() {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn warp_dispatch_and_identity_guards() {
+    use std::sync::Arc;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let system = -1;
+    let target_id = -2;
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
+    let hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, character, system, [0.0; 3]).await.unwrap();
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    world.system(system).await.unwrap();
+    let d = db.clone();
+    let w = world.clone();
+    let result = tokio::spawn(async move {
+        let mut vessel = ship();
+        vessel.id = hull;
+        vessel.type_id = TYPE_CAPSULE;
+        vessel.owner_id = character;
+        vessel.char_id = Some(character);
+        vessel.mode = MODE_STOP;
+        vessel.pos = [0.0; 3];
+        vessel.old_pos = vessel.pos;
+        vessel.vel = [0.0; 3];
+        vessel.old_vel = vessel.vel;
+        vessel.segment_acceleration = None;
+        let mut target = vessel.clone();
+        target.id = target_id;
+        target.char_id = None;
+        target.pos = [1000.0, 0.0, 0.0];
+        target.old_pos = target.pos;
+        w.with(system, move |s| { s.insert(vessel); s.insert(target); }).await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        w.observe(system, character, hull, tx).await.unwrap();
+        let identity = Identity { char_id: character, ship_id: Some(hull), corp_id: 1, station_id: None, system_id: Some(system) };
+        let missing_ship = Identity { ship_id: None, ..identity };
+        for (pilot, space_system, point) in [
+            (&identity, None, [1000.0, 0.0, 0.0]),
+            (&missing_ship, Some(system), [1000.0, 0.0, 0.0]),
+            (&identity, Some(system), [f64::NAN, 0.0, 0.0]),
+        ] {
+            assert!(matches!(warp_to(pilot, &d, &w, space_system, None, point, 0.0, None).await, Ok(Value::None)));
+        }
+        assert!(w.after(system, 1100).await);
+        assert_eq!(w.ball(system, hull).await.unwrap().mode, MODE_STOP);
+        let cfg = Arc::new(crate::config::Config::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, address) = listener.accept().await.unwrap();
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
+        let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
+        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
+        client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
+        let args = [Value::str("item"), Value::Int(target_id)];
+        let call = Call { service: "beyonce", method: "CmdWarpToStuff", args: &args, kwargs: &Value::None, bound: false, bind_params: None };
+        assert!(matches!(crate::services::dispatch(&mut client, &call).await, Ok(Value::None)));
+        assert!(w.after(system, 1100).await);
+        let ball = w.ball(system, hull).await.unwrap();
+        assert_eq!(ball.mode, MODE_GOTO);
+        assert_eq!(ball.goto, [1000.0, 0.0, 0.0]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let callback: Timer = Box::new(move |_| { let _ = tx.send(()); });
+        assert!(matches!(warp_to(&identity, &d, &w, Some(system), None, [2000.0, 0.0, 0.0], 0.0, Some(callback)).await, Ok(Value::None)));
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx).await.unwrap().unwrap();
+        assert_eq!(w.ball(system, hull).await.unwrap().goto, [2000.0, 0.0, 0.0]);
+    }).await;
+    world.remove_ball(system, hull).await;
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    result.unwrap();
+}

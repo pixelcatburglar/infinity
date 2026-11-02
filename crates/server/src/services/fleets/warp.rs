@@ -78,21 +78,21 @@ fn commit_in<T>(st: &State, s: &mut space::System, order: &Order, pilot: i64, sh
     Some(f(s))
 }
 
-pub(in crate::services) async fn execute(c: &mut Client, order: Order, object: Option<(V3, f64)>, point: V3, min_range: f64, mut on_exit: Option<Timer>, destination: Value) -> CallResult {
+pub(in crate::services) async fn execute(db: &crate::db::Db, world: &space::World, space_system: Option<i64>, order: Order, object: Option<(V3, f64)>, point: V3, min_range: f64, mut on_exit: Option<Timer>, destination: Value) -> CallResult {
     if !super::super::ship::valid_warp_geometry(object, point, min_range) { return Ok(Value::None); }
-    let Some(system) = c.session.int("solarsystemid") else { return Ok(Value::None) };
+    let Some(system) = space_system else { return Ok(Value::None) };
     let ids: Vec<_> = order.members.iter().map(|(id, _)| *id).collect();
     let commander = order.commander;
     let ship = order.ship;
-    let Some(ships) = c.world.with(system, move |s| {
+    let Some(ships) = world.with(system, move |s| {
         if !live(s, commander, ship) { return Vec::new(); }
         ids.into_iter().filter_map(|id| s.pilot_ball(id).filter(|b| live(s, id, b.id)).map(|b| (id, b.id))).collect::<Vec<_>>()
     }).await else { return Ok(Value::None) };
     let order = std::sync::Arc::new(order);
     for (pilot, ship) in ships {
-        let (queued, callback) = super::super::ship::warp_pilot(&c.db, &c.world, system, pilot, ship, object, point, min_range, on_exit, Some(order.clone())).await?;
+        let (queued, callback) = super::super::ship::warp_pilot(db, world, system, pilot, ship, object, point, min_range, on_exit, Some(order.clone())).await?;
         on_exit = callback;
-        if queued { c.world.notify_pilot(pilot, "OnRemoteMessage", vec![Value::str("FleetWarp"), destination.clone()]); }
+        if queued { world.notify_pilot(pilot, "OnRemoteMessage", vec![Value::str("FleetWarp"), destination.clone()]); }
     }
     Ok(Value::None)
 }

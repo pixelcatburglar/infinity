@@ -457,19 +457,19 @@ pub(super) fn valid_warp_geometry(object: Option<(V3, f64)>, point: V3, min_rang
         && object.is_none_or(|(pos, radius)| pos.iter().all(|v| v.is_finite()) && radius.is_finite())
 }
 
-pub(super) async fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
+pub(crate) async fn warp_to(identity: &Identity, db: &crate::db::Db, world: &space::World, space_system: Option<i64>,
+    object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
     if !valid_warp_geometry(object, point, min_range) { return Ok(Value::None); }
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
-    let pilot = c.session.int("charid").unwrap_or(0);
-    warp_pilot(&c.db, &c.world, system, pilot, ship, object, point, min_range, on_exit, None).await?;
+    let (Some(system), Some(ship)) = (space_system, identity.ship_id) else { return Ok(Value::None) };
+    warp_pilot(db, world, system, identity.char_id, ship, object, point, min_range, on_exit, None).await?;
     Ok(Value::None)
 }
 
-pub(super) async fn warp_destination(c: &mut Client, order: Option<super::fleets::warp::Order>,
-    object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>, destination: Value) -> CallResult {
+pub(super) async fn warp_destination(identity: &Identity, db: &crate::db::Db, world: &space::World, space_system: Option<i64>,
+    order: Option<super::fleets::warp::Order>, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>, destination: Value) -> CallResult {
     match order {
-        Some(order) => super::fleets::warp::execute(c, order, object, point, min_range, on_exit, destination).await,
-        None => warp_to(c, object, point, min_range, on_exit).await,
+        Some(order) => super::fleets::warp::execute(db, world, space_system, order, object, point, min_range, on_exit, destination).await,
+        None => warp_to(identity, db, world, space_system, object, point, min_range, on_exit).await,
     }
 }
 
