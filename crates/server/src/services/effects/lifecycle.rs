@@ -17,23 +17,26 @@ use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::notify::{fire_fx, ship_effect};
 use super::propulsion::apply_propulsion;
 use super::behaviors::{Activation, on_activate, on_cycle_start, on_cycle_end, on_stop};
-use crate::services::combat::{ctx, state, ActiveModule, Ctx};
+use crate::services::combat::{state, ActiveModule, Ctx};
 use crate::services::combat::groups_health::{drain_capacitor, inject};
 use crate::services::combat::targeting_charges::{bank, charge_key, loaded};
 use crate::services::fit::{Fit, Key};
 use crate::services::items::load_items;
-use crate::services::{db_err, notify_error, user_error, Call, CallError, CallResult};
+use crate::services::{db_err, notify_error, user_error, CallError, CallResult};
+use crate::services::identity::Identity;
 use crate::dao::items::loading::{Item, ItemQuery};
-use crate::client::{filetime_now, Client};
+use crate::client::filetime_now;
 use crate::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_CAPACITOR_NEED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, FLAG_HANGAR};
 use crate::consts::{dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
 use crate::messages;
-use crate::space::{ms_to_seconds, seconds_to_ms, System, World, MODE_WARP};
+use crate::space::{ms_to_seconds, seconds_to_ms, NotifyTx, System, World, MODE_WARP};
 use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tracing::{debug, info, warn};
+use crate::db::Db;
 use crate::db::executor::Executor;
+use crate::db::outbox::Notification;
 use crate::sde::Sde;
 use super::online::OnlinePolicy;
 
@@ -443,44 +446,45 @@ pub(super) async fn subject_valid(cx: &Ctx, module: &Module, effect: &Effect) ->
     }
 }
 
-pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
-    let policy = OnlinePolicy::from_client(c)?;
-    Ok(subject_core(&c.db, &c.sde, &policy, ship, item_id, effect, require_online).await?.1)
+pub(super) async fn subject(db: &Db, sde: &Sde, policy: &OnlinePolicy, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
+    Ok(subject_core(db, sde, policy, ship, item_id, effect, require_online).await?.1)
 }
 
-/// Activate(itemID, effectName, targetID, repeat)
-pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
-    let mut item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let effect_name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
-    let target = call.args.get(2).and_then(|v| v.as_int());
-    let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-    let Some(cx) = ctx(c) else { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)) };
-    let module = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next()
+/// Activate an effect. `login_user` feeds the activation, online and hacking-start info logs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn activate(
+    identity: &Identity, db: &Db, world: &Arc<World>, sde: &Arc<Sde>, space_system: Option<i64>,
+    sender: NotifyTx, login_user: i64, mut item_id: i64, effect_name: &str, target: Option<i64>, repeat: i64,
+    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
+) -> CallResult {
+    let Some(cx) = Ctx::from_identity(identity, db, world, space_system, sender.clone()) else { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)) };
+    let module = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next()
         .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    let mut matches = cx.world.sde().dogma.effects_by_name(&effect_name);
-    let Some(row) = matches.next() else { return Err(unsupported::refusal(None, &effect_name, module.type_id)) };
+    let mut matches = cx.world.sde().dogma.effects_by_name(effect_name);
+    let Some(row) = matches.next() else { return Err(unsupported::refusal(None, effect_name, module.type_id)) };
     if matches.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {effect_name}"))); }
     drop(matches);
     let id = row.effect_id;
     // Fitting mutations and non-online activation share this lock through registration and FX queuing.
     // Online activation takes it inside set_online instead.
     let _lock = if id != EFFECT_ONLINE as i32 { Some(crate::services::market::lock().await) } else { None };
-    let mut module = subject(c, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
+    let policy = OnlinePolicy::from_identity(identity, sender.clone())?;
+    let mut module = subject(db, sde, &policy, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
     let Some(effect) = registry::resolve(cx.world.sde(), id) else {
-        return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
+        return Err(unsupported::refusal(Some(id), effect_name, module.type_id));
     };
     let kind = effect.kind;
     let target = if kind == EffectKind::BurstJammer { None } else { target };
     if id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER || !registry::activation_in_scope(module.category_id, module.group_id, kind) || !effect.manually_activatable() {
-        return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
+        return Err(unsupported::refusal(Some(id), effect_name, module.type_id));
     }
     // Bank selection is serialized with fitting mutations by the shared lock above.
     if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
-        let master = crate::services::combat::targeting_charges::master_for_member(&c.db, cx.ship_id, item_id).await?;
+        let master = crate::services::combat::targeting_charges::master_for_member(db, cx.ship_id, item_id).await?;
         if master != item_id {
-            module = subject(c, cx.ship_id, master, id, true).await?;
+            module = subject(db, sde, &policy, cx.ship_id, master, id, true).await?;
             if !registry::activation_in_scope(module.category_id, module.group_id, kind) {
-                return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
+                return Err(unsupported::refusal(Some(id), effect_name, module.type_id));
             }
             item_id = master;
         }
@@ -488,11 +492,11 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     match kind {
         EffectKind::Hacking => {
             super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::super::hacking::start(c, item_id, target).await;
+            return super::super::hacking::start(identity, db, world, sde, space_system, sender, login_user, item_id, target, notify).await;
         }
         EffectKind::Online => {
             super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::online::set_online(c, cx.ship_id, item_id, true).await;
+            return super::online::set_online(identity, db, sde, sender, login_user, cx.ship_id, item_id, true, notify).await;
         }
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
         EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
@@ -503,7 +507,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         EffectKind::MicroJumpDrive | EffectKind::Salvage | EffectKind::Tractor |
         EffectKind::CargoScan | EffectKind::ShipScan | EffectKind::SurveyScan |
         EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb | EffectKind::Compression => {}
-        EffectKind::ProbeLaunch => return Err(unsupported::refusal(Some(id), &effect_name, module.type_id)),
+        EffectKind::ProbeLaunch => return Err(unsupported::refusal(Some(id), effect_name, module.type_id)),
     }
     super::cloak::before_activate(&cx, item_id, kind).await?;
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
@@ -519,7 +523,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];
     if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
         for slave in bank(&cx.db, cx.ship_id, item_id).await?.into_iter().skip(1) {
-            let m = subject(c, cx.ship_id, slave, id, true).await?;
+            let m = subject(db, sde, &policy, cx.ship_id, slave, id, true).await?;
             modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
         }
     }
@@ -530,7 +534,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     active.sort_unstable();
     active.dedup();
     let activating: Vec<i64> = modules.iter().map(|module| module.id).collect();
-    super::fitting::validate_active(&cx.db, c.sde.clone(), &fit, cx.ship_id, &active, &activating).await?;
+    super::fitting::validate_active(&cx.db, sde.clone(), &fit, cx.ship_id, &active, &activating).await?;
     on_activate(&cx, &fit, &activation).await?;
     if matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Neutralizer | EffectKind::Nosferatu) {
         let t = target.unwrap_or(0);
@@ -562,7 +566,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     });
     let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };
     ship_effect(&cx, item_id, effect.id, target, other.clone(), true, filetime_now(), duration_ms, repeat);
-    info!(user = c.login.user_id, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());
+    info!(user = login_user, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());
     let world = cx.world.clone();
     let cycle = Cycle { cx, modules, effect, target, repeat, stop, owner, started: filetime_now(), charge_type: None, cycles: 0, duration_ms, nominal_start: 0, other, repair_amount: 0.0 };
     world.post(cycle.cx.system_id, move |s| {
@@ -573,24 +577,29 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
 }
 
 
-/// Deactivate(itemID, effectName): stop after the current cycle.
-pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
-    let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let Some(cx) = ctx(c) else { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)) };
-    let module = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    let name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
-    let mut rows = c.sde.dogma.effects_by_name(&name);
-    let Some(row) = rows.next() else { return Err(unsupported::refusal(None, &name, module.type_id)) };
+/// Stop after the current cycle. `login_user` is read only by the online/offline info log.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn deactivate(
+    identity: &Identity, db: &Db, world: &Arc<World>, sde: &Arc<Sde>, space_system: Option<i64>,
+    sender: NotifyTx, login_user: i64, item_id: i64, effect_name: &str,
+    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
+) -> CallResult {
+    let Some(cx) = Ctx::from_identity(identity, db, world, space_system, sender.clone()) else { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)) };
+    let module = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+    let name = effect_name;
+    let mut rows = sde.dogma.effects_by_name(name);
+    let Some(row) = rows.next() else { return Err(unsupported::refusal(None, name, module.type_id)) };
     if rows.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {name}"))); }
     let id = row.effect_id;
     drop(rows);
-    let module = subject(c, cx.ship_id, item_id, id, false).await?;
-    let Some(kind) = registry::kind(&c.sde, id) else { return Err(unsupported::refusal(Some(id), &name, module.type_id)) };
-    if !c.sde.types.effects(module.type_id).iter().any(|effect| effect.effect_id == id)
+    let policy = OnlinePolicy::from_identity(identity, sender.clone())?;
+    let module = subject(db, sde, &policy, cx.ship_id, item_id, id, false).await?;
+    let Some(kind) = registry::kind(sde, id) else { return Err(unsupported::refusal(Some(id), name, module.type_id)) };
+    if !sde.types.effects(module.type_id).iter().any(|effect| effect.effect_id == id)
         || !registry::activation_in_scope(module.category_id, module.group_id, kind) {
-        return Err(unsupported::refusal(Some(id), &name, module.type_id));
+        return Err(unsupported::refusal(Some(id), name, module.type_id));
     }
-    if kind == EffectKind::Online { return super::online::set_online(c, cx.ship_id, item_id, false).await; }
+    if kind == EffectKind::Online { return super::online::set_online(identity, db, sde, sender, login_user, cx.ship_id, item_id, false, notify).await; }
     if let Some(stop) = state().active.get(&item_id) {
         stop_generation(&stop.stop);
     }

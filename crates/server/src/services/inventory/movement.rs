@@ -8,6 +8,10 @@
 use super::*;
 use super::reachability::{Endpoint, Reachability};
 use crate::consts::{CORP_HANGAR_DIVISIONS, IX_FLAG, IX_SINGLETON, IX_OWNER_ID};
+use crate::services::identity::Identity;
+use crate::db::{Db, outbox::Notification};
+use crate::space::{NotifyTx, World};
+use std::sync::Arc;
 
 const FLAG_AUTOFIT: i32 = 0;
 
@@ -21,14 +25,14 @@ impl From<super::super::effects::online::OnlineChanged> for MoveEffect {
     fn from(change: super::super::effects::online::OnlineChanged) -> Self { Self::Online(change) }
 }
 
-pub(super) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, c: &Client, target: i64) -> Result<T, CallError> {
+pub(super) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, mut notify: impl FnMut(Notification) -> Result<(), CallError>) -> Result<T, CallError> {
     use crate::db::outbox::Effect;
     for entry in outbox.into_entries() {
         match entry {
             Effect::Operation(MoveEffect::Bank(stop)) => super::super::combat::banks::apply_stop(stop),
             Effect::Operation(MoveEffect::Online(change)) => super::super::effects::online::apply_online_changed(change),
             Effect::Operation(MoveEffect::ClearHeat(ship, modules)) => super::super::effects::heat::clear_modules(ship, &modules),
-            Effect::Notification(notification) => super::super::effects::online::dispatch_notification(gm::route_target(notification, target, c.session.int("charid")), c)?,
+            Effect::Notification(notification) => notify(notification)?,
             Effect::Event(event) => crate::lua::on_event(event),
         }
     }
@@ -80,31 +84,34 @@ async fn authorized_destination(ex: &(impl Executor + ?Sized), sde: &Sde, contai
 
 /// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
 /// Returns the ID of the item now at the destination.
-pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
+pub(crate) async fn move_item(
+    identity: &Identity, db: &Db, world: &World, sde: &Arc<Sde>, space_system: Option<i64>, sender: NotifyTx,
+    container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>,
+    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
+) -> Result<Option<i64>, CallError> {
     let _lock = super::super::market::lock().await;
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
-    let station = c.session.int("stationid");
-    let system = c.session.int("solarsystemid");
-    let corporation = c.session.int("corpid");
-    let source_proof = authorized_source(&c.db, &c.sde, &item, source, char_id, station, system).await?;
-    let destination = if source_proof.is_some() { authorized_destination(&c.db, &c.sde, container, flag, char_id, station, corporation).await? } else { None };
+    let char_id = identity.char_id;
+    let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
+    let station = identity.station_id;
+    let system = space_system;
+    let corporation = (identity.corp_id != 0).then_some(identity.corp_id);
+    let source_proof = authorized_source(db, sde, &item, source, char_id, station, system).await?;
+    let destination = if source_proof.is_some() { authorized_destination(db, sde, container, flag, char_id, station, corporation).await? } else { None };
     let Some((location, owner, destination_flag, corporate_destination)) = destination else {
         let destination = match container { Container::Hangar { station_id, .. } | Container::Deliveries { station_id, .. } => *station_id, Container::Item(id) => *id };
         warn!(char_id, item_id, destination, "inventory move authorization refused");
         return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
     };
-    if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
+    if Some(item_id) == identity.ship_id && matches!(container, Container::Item(_)) {
         return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
     }
     let source_endpoint = Endpoint { location: item.location_id, flag: item.flag_id };
     let destination_endpoint = Endpoint { location, flag: destination_flag };
-    let reachability = Reachability::capture(c, &[source_endpoint, destination_endpoint]).await?;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
-    let active_ship = c.session.int("shipid");
+    let reachability = Reachability::capture(identity, db, world, space_system, &[source_endpoint, destination_endpoint]).await?;
+    let sde = sde.clone();
+    let active_ship = identity.ship_id;
     let container = container.clone();
-    let policy = super::super::effects::online::OnlinePolicy::from_client(c)?;
+    let policy = super::super::effects::online::OnlinePolicy::from_identity(identity, sender)?;
     db.transaction(
         move |tx, outbox: &mut Outbox<MoveEffect>| {
             let item = item.clone();
@@ -191,7 +198,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 Ok(Some(moved_id))
             })
         },
-        |value, outbox| async move { dispatch_move(value, outbox, c, char_id) },
+        |value, outbox| async move { dispatch_move(value, outbox, notify) },
     ).await
 }
 

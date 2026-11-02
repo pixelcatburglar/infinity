@@ -443,7 +443,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             ensure_site(c, &m).await?;
-            super::ship::warp_destination(c, order, None, m.pos, range, None, Value::Dict(vec![])).await
+            super::ship::warp_destination(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, here, order, None, m.pos, range, None, Value::Dict(vec![])).await
         }
         "agenthomebase" => {
             let (station, _, system, pos) = agent_station(c, agent).await?;
@@ -451,7 +451,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(FALLBACK_STATION_RADIUS);
-            super::ship::warp_destination(c, order, Some((pos, radius)), pos, range, None, Value::dict([("celestialID", Value::Int(station))])).await
+            super::ship::warp_destination(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, here, order, Some((pos, radius)), pos, range, None, Value::dict([("celestialID", Value::Int(station))])).await
         }
         _ => Ok(Value::None),
     }

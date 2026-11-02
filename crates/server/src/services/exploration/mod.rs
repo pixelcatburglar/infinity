@@ -492,7 +492,7 @@ pub(super) async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64, o
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
-        return super::ship::warp_destination(c, order, Some((site.pos, 3000.0)), site.pos, min_range, None, Value::Dict(vec![])).await;
+        return super::ship::warp_destination(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, Some((site.pos, 3000.0)), site.pos, min_range, None, Value::Dict(vec![])).await;
     }
     let db = c.db.clone();
     let world = Arc::downgrade(&c.world);
@@ -506,7 +506,7 @@ pub(super) async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64, o
             }
         });
     });
-    super::ship::warp_destination(c, order, None, site.pos, min_range, Some(on_exit), Value::Dict(vec![])).await
+    super::ship::warp_destination(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, None, site.pos, min_range, Some(on_exit), Value::Dict(vec![])).await
 }
 
 

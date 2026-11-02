@@ -83,7 +83,7 @@ async fn fitting_online_priming_and_slash() {
             assert!(item_dogma::set_override(&test_db, id, attr, value).await.unwrap());
         }
         let destination = Container::Item(f.ship);
-        assert_eq!(inventory::movement::move_item(&mut client, &destination, f.modules[0], Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None).await.ok().flatten(), Some(f.modules[0]));
+        assert_eq!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, f.modules[0], Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().flatten(), Some(f.modules[0]));
         while events.try_recv().is_ok() {}
         let mut fit = Fit::load(&test_db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
         let offline_load = fit.value(Key::Ship, ATTR_CPU_LOAD);
@@ -92,7 +92,7 @@ async fn fitting_online_priming_and_slash() {
         assert!((fit.value(Key::Ship, ATTR_CPU_LOAD) - offline_load - need).abs() < 1e-6);
         fit.set_module_online(f.modules[0], false);
         assert!((fit.value(Key::Ship, ATTR_CPU_LOAD) - offline_load).abs() < 1e-6);
-        match services::effects::online::set_online(&mut client, f.ship, f.modules[0], true).await {
+        match services::effects::online::set_online(&services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, f.ship, f.modules[0], true, |notification| services::effects::online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await {
             Err(CallError::User { msg, dict }) => {
                 assert_eq!(msg, "NotEnoughCpu");
                 for (key, value) in [("moduleName", Value::tuple([Value::Int(4), Value::Int(i64::from(module_type))])), ("moduleType", Value::Int(i64::from(module_type))), ("require", Value::Float(need)), ("remaining", Value::Float(0.0)), ("total", Value::Float(0.0))] {
@@ -108,7 +108,7 @@ async fn fitting_online_priming_and_slash() {
         assert!(item_dogma::set_override(&test_db, f.modules[0], ATTR_POWER, 10.0).await.unwrap());
         let power_fit = Fit::load(&test_db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
         let power_need = power_fit.value(Key::Module(f.modules[0]), ATTR_POWER);
-        match services::effects::online::set_online(&mut client, f.ship, f.modules[0], true).await {
+        match services::effects::online::set_online(&services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, f.ship, f.modules[0], true, |notification| services::effects::online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await {
             Err(CallError::User { msg, dict }) => {
                 assert_eq!(msg, "NotEnoughPower");
                 for (key, value) in [("moduleName", Value::tuple([Value::Int(4), Value::Int(i64::from(module_type))])), ("moduleType", Value::Int(i64::from(module_type))), ("require", Value::Float(power_need)), ("remaining", Value::Float(0.0)), ("total", Value::Float(0.0))] {
@@ -120,14 +120,14 @@ async fn fitting_online_priming_and_slash() {
         assert!(item_dogma::online(&test_db, f.ship).await.unwrap().is_empty());
         assert!(events.try_recv().is_err());
         assert!(item_dogma::set_override(&test_db, f.ship, ATTR_POWER_OUTPUT, power_need).await.unwrap());
-        assert!(inventory::movement::move_item(&mut client, &destination, f.modules[1], Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None).await.is_err());
-        assert!(inventory::movement::move_item(&mut client, &destination, f.modules[1], Some(f.ship), Some(FLAG_MED_SLOT_FIRST), None).await.is_err());
+        assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, f.modules[1], Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
+        assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, f.modules[1], Some(f.ship), Some(FLAG_MED_SLOT_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
         let row = test_db.query_one("SELECT location_id, flag_id FROM game.items WHERE item_id=$1", &[&f.modules[1]]).await.unwrap();
         assert_eq!(row.get::<_, i64>("location_id"), f.ship);
         assert_eq!(row.get::<_, i32>("flag_id"), crate::consts::FLAG_CARGO);
         assert!(events.try_recv().is_err());
         assert!(item_dogma::set_override(&test_db, f.ship, ATTR_CPU_OUTPUT, need).await.unwrap());
-        services::effects::online::set_online(&mut client, f.ship, f.modules[0], true).await.ok().expect("exact CPU boundary");
+        services::effects::online::set_online(&services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, f.ship, f.modules[0], true, |notification| services::effects::online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("exact CPU boundary");
         while events.try_recv().is_ok() {}
         let legal_before = fixture::fingerprint(&test_db).await.unwrap();
         services::dogma::ship_state(&client, f.ship).await.ok().unwrap();
@@ -150,7 +150,7 @@ async fn fitting_online_priming_and_slash() {
         assert!(effect && attribute);
         assert!(item_dogma::set_override(&test_db, f.ship, ATTR_CPU_OUTPUT, 1000.0).await.unwrap());
         assert!(item_dogma::set_override(&test_db, f.ship, ATTR_POWER_OUTPUT, 1000.0).await.unwrap());
-        assert_eq!(inventory::movement::move_item(&mut client, &destination, f.modules[1], Some(f.ship), Some(FLAG_HI_SLOT_FIRST + 1), None).await.ok().flatten(), Some(f.modules[1]));
+        assert_eq!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, f.modules[1], Some(f.ship), Some(FLAG_HI_SLOT_FIRST + 1), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().flatten(), Some(f.modules[1]));
         for (id, attr, value) in [(f.modules[0], ATTR_CPU, 20.0), (f.modules[1], ATTR_CPU, 10.0), (f.modules[0], ATTR_POWER, 0.0), (f.modules[1], ATTR_POWER, 0.0), (f.ship, ATTR_CPU_OUTPUT, 15.0)] {
             assert!(item_dogma::set_override(&test_db, id, attr, value).await.unwrap());
         }
@@ -196,7 +196,7 @@ async fn fitting_online_priming_and_slash() {
         }
         for index in 0..2 {
             let id: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,false) RETURNING item_id", &[&rig_type,&f.owner,&f.ship,&crate::consts::FLAG_CARGO]).await.unwrap().get("item_id");
-            assert_eq!(inventory::movement::move_item(&mut client, &destination, id, Some(f.ship), Some(crate::consts::FLAG_RIG_FIRST + index), None).await.ok().flatten(), Some(id), "fitting rig slot {index}");
+            assert_eq!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, id, Some(f.ship), Some(crate::consts::FLAG_RIG_FIRST + index), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().flatten(), Some(id), "fitting rig slot {index}");
         }
         while events.try_recv().is_ok() {}
         scenarios::exercise(&mut client, &f, &sde, &mut events).await;

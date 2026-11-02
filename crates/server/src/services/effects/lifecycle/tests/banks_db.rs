@@ -2,9 +2,10 @@
 use super::*;
 use crate::services::effects::online::set_online;
 use crate::{
+    client::Client,
     consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS},
     dao::items::{charges, combat as item_combat, dogma},
-    services::combat,
+    services::{combat, Call},
     space::{Ball, WarpState, World, MODE_STOP},
 };
 
@@ -172,7 +173,7 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
                 }
             }
         }).await.expect("per-gun firing FX");
-        set_online(&mut client, ship, ids[1], false).await.ok().expect("offline slave");
+        set_online(&crate::services::identity::Identity::of_client(&client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, ids[1], false, |notification| super::super::super::online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("offline slave");
         assert!(charges::banks(&d, ship).await.unwrap().is_empty());
         assert!(stop.load(Ordering::Relaxed));
         tokio::time::timeout(std::time::Duration::from_secs(40), async {
@@ -182,7 +183,7 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         // A competing forced offline commits while activation is waiting for the shared lock.
         while notifications.try_recv().is_ok() {}
         while events.try_recv().is_ok() {}
-        let policy = super::super::super::online::OnlinePolicy::from_client(&client).ok().expect("derive online policy");
+        let policy = super::super::super::online::OnlinePolicy::from_identity(&crate::services::identity::Identity::of_client(&client), client.notify_tx.clone()).ok().expect("derive online policy");
         let lock = crate::services::market::lock().await;
         let activation_args = args(ids[0]);
         let (started, waiting) = tokio::sync::oneshot::channel();

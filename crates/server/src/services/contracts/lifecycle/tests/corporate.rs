@@ -213,7 +213,7 @@ async fn corporate_courier_member_moves_and_delivers_overdue_package() {
         let wrap = db.query_one("SELECT owner_id,location_id,flag_id FROM game.items WHERE item_id=$1", &[&package]).await.unwrap();
         assert_eq!((wrap.get::<_, i64>("owner_id"), wrap.get::<_, i64>("location_id"), wrap.get::<_, i32>("flag_id")), (buyer.id, start, f::DELIVERIES));
         let destination = crate::services::inventory::Container::Hangar { station_id: start, owner_id: buyer.actor.character };
-        assert!(matches!(crate::services::inventory::movement::move_item(&mut courier, &destination, package, Some(start), Some(FLAG_HANGAR), None).await, Ok(Some(id)) if id == package));
+        assert!(matches!(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&courier), &courier.db, &courier.world, &courier.sde, courier.session.int("solarsystemid"), courier.notify_tx.clone(), &destination, package, Some(start), Some(FLAG_HANGAR), None, |n| crate::services::effects::online::dispatch_notification(n, &courier.world, &courier.notify_tx, courier.session.int("charid"))).await, Ok(Some(id)) if id == package));
         db.execute("UPDATE game.characters SET corp_roles=0 WHERE character_id=$1", &[&buyer.actor.character]).await.unwrap();
         assert!(complete(&courier, id, STATUS_FAILED).await.is_err());
         db.execute("UPDATE game.items SET location_id=$2 WHERE item_id=$1", &[&package, &end]).await.unwrap();

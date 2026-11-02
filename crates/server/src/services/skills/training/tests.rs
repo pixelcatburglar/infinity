@@ -20,6 +20,19 @@ fn malformed_queue_maps_are_refused_without_becoming_aborts() {
     assert!(matches!(parse_queue(&Value::Dict(entries)), Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_QUEUE_TOO_MANY));
 }
 
+#[test]
+fn queue_wire_preserves_optional_filetimes() {
+    let rows = [
+        queue_dao::QueueEntry { position: 0, type_id: 42, to_level: 1, start_sp: 10, dest_sp: 20, start_time: None, end_time: None },
+        queue_dao::QueueEntry { position: 1, type_id: 43, to_level: 2, start_sp: 20, dest_sp: 30, start_time: Some(132_000_000_000_000_000), end_time: Some(132_000_000_600_000_000) },
+    ];
+    let expected = Value::List(vec![
+        keyval([("queuePosition", Value::Int(0)), ("trainingTypeID", Value::Int(42)), ("trainingToLevel", Value::Int(1)), ("trainingStartSP", Value::Int(10)), ("trainingDestinationSP", Value::Int(20)), ("trainingStartTime", Value::None), ("trainingEndTime", Value::None)]),
+        keyval([("queuePosition", Value::Int(1)), ("trainingTypeID", Value::Int(43)), ("trainingToLevel", Value::Int(2)), ("trainingStartSP", Value::Int(20)), ("trainingDestinationSP", Value::Int(30)), ("trainingStartTime", Value::Int(132_000_000_000_000_000)), ("trainingEndTime", Value::Int(132_000_000_600_000_000))]),
+    ]);
+    assert_eq!(super::super::skill_handler::queue_value(&rows), expected);
+}
+
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn queue_validation_checks_real_skills_and_capacity() {
@@ -74,19 +87,19 @@ async fn queue_replacement_and_abort_bank_progress_and_update_deadline() {
     fixture::seed_skill(&db, f.character).await.unwrap();
     let now = filetime_now();
     db.execute("UPDATE game.skill_queue SET start_time=$2, end_time=$3 WHERE character_id=$1", &[&f.character, &(now - crate::consts::FILETIME_MINUTE), &(now + crate::consts::FILETIME_MINUTE)]).await.unwrap();
-    let (mut c, _peer) = client(db.clone(), f.character).await;
+    let (c, _peer) = client(db.clone(), f.character).await;
     let type_id = c.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SKILL) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none()).expect("SDE must contain a skill without prerequisites").type_id;
     db.execute("UPDATE game.skills SET type_id=$2 WHERE character_id=$1", &[&f.character, &type_id]).await.unwrap();
     db.execute("UPDATE game.skill_queue SET type_id=$2 WHERE character_id=$1", &[&f.character, &type_id]).await.unwrap();
     let replacement = Value::Dict(vec![(Value::Int(0), Value::tuple([Value::Int(i64::from(type_id)), Value::Int(1)]))]);
-    save_queue(&mut c, f.character, &replacement, true, true).await.unwrap_or_else(|_| panic!("failed to replace skill queue"));
+    save_queue(&Identity::of_client(&c), &c.db, &c.sde, &replacement, true, true, |n| online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("failed to replace skill queue"));
     let skills = training_dao::current(&db, f.character).await.unwrap();
     assert!(skills[0].skill_points >= 50);
     let id = format!("{}:{}", super::super::completion::KIND, f.character);
     let row = db.query_one("SELECT due_at FROM game.jobs WHERE job_id=$1", &[&id]).await.unwrap();
     let queued = queue_dao::active(&db, f.character).await.unwrap().unwrap();
     assert_eq!(Some(row.get::<_, i64>("due_at")), queued.end_time);
-    save_queue(&mut c, f.character, &Value::Dict(vec![]), false, false).await.unwrap_or_else(|_| panic!("failed to abort skill queue"));
+    save_queue(&Identity::of_client(&c), &c.db, &c.sde, &Value::Dict(vec![]), false, false, |n| online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("failed to abort skill queue"));
     assert!(queue_dao::list(&db, f.character).await.unwrap().is_empty());
     assert!(db.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&id]).await.unwrap().is_none());
     assert!(training_dao::current(&db, f.character).await.unwrap()[0].skill_points >= 50);

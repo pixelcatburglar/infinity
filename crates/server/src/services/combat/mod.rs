@@ -30,6 +30,7 @@
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Explicit lock removal also removes the matching outgoing projected effects.
+//! The shared incoming-targeter query combines player locks and NPC hostiles as ball IDs.
 //! Ship condition is persisted in game.item_attributes, with shield recharge time on
 //! the shield override; capacitor and in-flight effects remain runtime-only.
 //! Space damage, repair and GM condition changes serialize with final condition saves;
@@ -54,6 +55,7 @@ use super::inventory::{notify_item_change, notify_item_removed};
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
 use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
+use super::identity::Identity;
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
 use crate::consts::{ACCOUNT_CASH, dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_QUANTITY, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_FALLOFF, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_EM_DAMAGE, dogma::ATTR_THERMAL_DAMAGE, dogma::ATTR_KINETIC_DAMAGE, dogma::ATTR_EXPLOSIVE_DAMAGE};
@@ -166,20 +168,25 @@ pub(super) struct Ctx {
 }
 
 impl Ctx {
+    pub(super) fn from_identity(identity: &Identity, db: &Db, world: &Arc<World>, space_system: Option<i64>, sender: NotifyTx) -> Option<Self> {
+        if identity.char_id == 0 { return None; }
+        Some(Self {
+            db: db.clone(),
+            world: world.clone(),
+            notify: sender,
+            char_id: identity.char_id,
+            ship_id: identity.ship_id?,
+            system_id: space_system?,
+        })
+    }
+
     pub(super) fn notify(&self, event: &str, args: Vec<Value>) {
         let _ = self.notify.send((event.to_string(), args));
     }
 }
 
 pub(super) fn ctx(c: &Client) -> Option<Ctx> {
-    Some(Ctx {
-        db: c.db.clone(),
-        world: c.world.clone(),
-        notify: c.notify_tx.clone(),
-        char_id: c.session.int("charid")?,
-        ship_id: c.session.int("shipid")?,
-        system_id: c.session.int("solarsystemid")?,
-    })
+    Ctx::from_identity(&Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), c.notify_tx.clone())
 }
 
 
@@ -190,11 +197,15 @@ pub(super) fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
 /// Stop everything a character was doing in space (docking, jumping, logging off).
 pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
+    reset_pilot(&c.world, char_id, c.session.int("solarsystemid").zip(c.session.int("shipid")));
+}
+
+pub(crate) fn reset_pilot(world: &crate::space::World, char_id: i64, space_ship: Option<(i64, i64)>) {
     super::effects::heat::clear_character(char_id);
-    clear_character_locks(&c.world, char_id);
+    clear_character_locks(world, char_id);
     state().reset_character(char_id);
-    if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
-        c.world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
+    if let Some((system, ship)) = space_ship {
+        world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
     }
 }
 
@@ -252,6 +263,18 @@ pub async fn banks(db: &(impl Executor + ?Sized), ship: i64) -> Result<Value, Ca
         }
     }
     Ok(Value::Dict(by_master.into_iter().map(|(m, s)| (Value::Int(m), Value::List(s))).collect()))
+}
+
+pub(super) async fn targeters(world: &World, system: i64, ship: i64) -> Vec<i64> {
+    let incoming = targeters_of(ship);
+    let candidates = world.with(system, move |s| {
+        let mut candidates = s.hostiles_targeting(ship);
+        candidates.extend(incoming.into_iter().filter_map(|pilot| s.pilot_ball(pilot).map(|ball| ball.id)));
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    }).await.unwrap_or_default();
+    candidates
 }
 
 pub fn ship_condition(ship: i64) -> Option<(f64, f64, f64)> {
@@ -483,8 +506,28 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "LinkWeapons" | "LinkAllWeapons" | "UnlinkModule" | "UnlinkAllModules" | "MergeModuleGroups" | "PeelAndLink" | "DestroyWeaponBank" | "GetWeaponBankInfoForShip" => {
             weapon_groups(c, call).await
         }
-        "Activate" => lifecycle::activate(c, call).await,
-        "Deactivate" => lifecycle::deactivate(c, call).await,
+        "Activate" | "Deactivate" => {
+            let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let effect_name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
+            let target = call.args.get(2).and_then(|v| v.as_int());
+            let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let identity = Identity::of_client(c);
+            let db = c.db.clone();
+            let world = c.world.clone();
+            let sde = c.sde.clone();
+            let space_system = c.session.int("solarsystemid");
+            let sender = c.notify_tx.clone();
+            let login_user = c.login.user_id;
+            let notify = |notification| match notification {
+                notification @ crate::db::outbox::Notification::DirectClient { .. } => notification.dispatch(&world, Some(&mut *c)),
+                notification => super::effects::online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid")),
+            };
+            if call.method == "Activate" {
+                lifecycle::activate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, target, repeat, notify).await
+            } else {
+                lifecycle::deactivate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, notify).await
+            }
+        }
         _ => return None,
     })
 }

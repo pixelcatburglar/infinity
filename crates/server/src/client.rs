@@ -12,7 +12,7 @@ use crate::db::outbox::{dispatch_client, Outbox};
 use crate::lua::events::GameEvent;
 use crate::handshake::Login;
 use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
-use crate::services::{self, Call, CallError};
+use crate::services::{self, identity::Identity, presence, Call, CallError};
 use crate::session::Session;
 use crate::config::Config;
 use anyhow::{anyhow, Result};
@@ -49,6 +49,20 @@ pub struct Client {
     /// Bound objects handed to this client: OID -> (service, bindParams).
     pub bound: std::collections::HashMap<String, (String, Value)>,
     next_oid: i64,
+}
+
+impl crate::services::ship::observer::DockObserver for Client {
+    fn accepted(&mut self, station: i64) {
+        self.notify("OnDockingAccepted", vec![Value::Int(station)]);
+    }
+
+    async fn wait_pumping(&mut self, system: i64, delay_ms: u64) -> std::result::Result<bool, CallError> {
+        Client::wait_pumping(self, system, delay_ms).await.map_err(CallError::Internal)
+    }
+
+    fn unobserve(&mut self) {
+        self.world.unobserve(self.login.client_id);
+    }
 }
 
 /// Abbreviated repr for logs.
@@ -102,6 +116,7 @@ impl Client {
 
     /// Change session attributes and queue a SessionChangeNotification for the client.
     pub fn change_session(&mut self, updates: Vec<(&str, Value)>) {
+        let old_identity = Identity::of_client(self);
         let old = crate::session::ChatSession::from_session(&self.session);
         let change = self.session.apply(updates);
         if change.is_empty() {
@@ -109,18 +124,14 @@ impl Client {
         }
         let new = crate::session::ChatSession::from_session(&self.session);
         if old != new {
+            let new_identity = Identity::of_client(self);
             if let Some(previous) = &old {
                 if new.as_ref().map(|s| s.character_id) != Some(previous.character_id) {
-                    self.world.unregister_pilot(previous.character_id);
-                    self.chat.disconnect_character(previous.character_id);
+                    presence::offline(&old_identity, &self.world, &self.chat);
                 }
             }
-            if let Some(current) = &new {
-                if old.as_ref().map(|s| s.character_id) != Some(current.character_id) {
-                    self.world.register_pilot(current.character_id, self.notify_tx.clone());
-                }
-                self.world.set_chat_session(current.character_id, Some(current.clone()));
-                self.chat.session_changed(current.character_id);
+            if let Some(current) = new {
+                presence::online(&new_identity, &self.world, &self.chat, self.notify_tx.clone(), old.as_ref(), current);
             }
         }
         info!(user = self.login.user_id, "session change {}", short(&marshal::Value::Dict(change.clone())));

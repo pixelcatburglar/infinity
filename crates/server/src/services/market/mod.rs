@@ -25,6 +25,7 @@ use crate::dao::market::trading;
 use crate::dao::market::orders::{self, Order, Station};
 use crate::dao::market::listings::{self, Area};
 use super::wallets::{balance, credit, debit, not_enough_money};
+use super::identity::Identity;
 use super::{crowset, db_err, keyval, notify_error, user_error, value_field, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR, SKILL_ACCOUNTING, SKILL_BROKER_RELATIONS};
@@ -32,6 +33,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Effect, Outbox};
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::{HashMap, HashSet};
@@ -455,16 +457,16 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
 
 /// One item of `PlaceMultiSellOrder`: sell to the bids now, and with a duration list the
 /// rest as a sell order. Returns whether anything sold or was listed.
-async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, price: f64, quantity: i64, duration: i64) -> Result<bool, CallError> {
-    let (db, world) = (&c.db, &*c.world);
-    let me = c.session.int("charid").unwrap_or(0);
+#[allow(clippy::too_many_arguments)]
+async fn place_sell(identity: &Identity, db: &Db, world: &World, sde: &Arc<Sde>, item_id: i64, station_id: i64, type_id: i64, price: f64, quantity: i64, duration: i64) -> Result<bool, CallError> {
+    let me = identity.char_id;
     let price = valid_price(price)?;
     let now = filetime_now();
     if quantity <= 0 || !valid_duration(duration, now) {
         return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
     }
     let _trading = lock().await;
-    let sde = Arc::clone(&c.sde);
+    let sde = Arc::clone(sde);
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
@@ -636,18 +638,18 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let float = |i: usize| call.args.get(i).and_then(|v| v.as_float()).unwrap_or(0.0);
     Some(match call.method {
-        "GetOrders" => orders(c, int(0).unwrap_or(0)).await,
+        "GetOrders" => orders(&c.db, c.session.int("regionid").unwrap_or(0), int(0).unwrap_or(0)).await,
         "GetStationAsks" => {
             let station = c.session.int("stationid").unwrap_or(0);
-            best_asks(c, Area::Station, station, false).await
+            best_asks(&c.db, Area::Station, station, false).await
         }
         "GetSystemAsks" => {
             let system = c.session.int("solarsystemid2").unwrap_or(0);
-            best_asks(c, Area::System, system, false).await
+            best_asks(&c.db, Area::System, system, false).await
         }
         "GetRegionBest" => {
             let region = c.session.int("regionid").unwrap_or(0);
-            best_asks(c, Area::Region, region, true).await
+            best_asks(&c.db, Area::Region, region, true).await
         }
         // PlaceBuyOrder(stationID, typeID, price, quantity, orderRange, minVolume, duration, useCorp, expectedBrokersFee)
         "PlaceBuyOrder" => {
@@ -684,7 +686,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             for item in &items {
                 let get = |k: &str| value_field(item, k).and_then(|v| v.as_int()).unwrap_or(0);
                 let price = value_field(item, "price").and_then(|v| v.as_float()).unwrap_or(0.0);
-                match place_sell(c, get("itemID"), get("stationID"), get("typeID"), price, get("quantity"), duration).await {
+                match place_sell(&Identity::of_client(c), &c.db, &c.world, &c.sde, get("itemID"), get("stationID"), get("typeID"), price, get("quantity"), duration).await {
                     Ok(made) => any |= made,
                     Err(e @ CallError::User { .. }) if items.len() == 1 => return Some(Err(e)),
                     Err(CallError::User { msg, .. }) => warn!(user = c.login.user_id, "market: selling {} failed: {msg}", get("itemID")),

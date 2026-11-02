@@ -134,7 +134,7 @@ async fn ancestry_rechecks_roots_and_rejects_cycles_and_missing_parents() {
     let alternate = crate::dao::items::transfers::insert(&db, ty, actor.character, station, FLAG_HANGAR, 1).await.unwrap();
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = ANY($1)", &[&&[root, nested, alternate][..]]).await.unwrap();
     let endpoint = Endpoint { location: nested, flag: FLAG_CARGO };
-    let reach = Reachability::capture(&client, &[endpoint]).await.unwrap();
+    let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[endpoint]).await.unwrap();
     assert!(reach.check(&db, &client.sde, endpoint).await.is_ok());
     for (column, value) in [("owner_id", actor.character + 1), ("flag_id", i64::from(FLAG_HANGAR)), ("location_id", alternate)] {
         let original: i64 = db.query_one(&format!("SELECT {column}::bigint AS value FROM game.items WHERE item_id = $1"), &[&nested]).await.unwrap().get("value");
@@ -149,7 +149,7 @@ async fn ancestry_rechecks_roots_and_rejects_cycles_and_missing_parents() {
     assert!(reach.check(&db, &client.sde, endpoint).await.is_err());
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&root]).await.unwrap();
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&nested, &alternate]).await.unwrap();
-    let recaptured = Reachability::capture(&client, &[endpoint]).await.unwrap();
+    let recaptured = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[endpoint]).await.unwrap();
     assert!(recaptured.check(&db, &client.sde, endpoint).await.is_ok());
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&nested, &root]).await.unwrap();
     for location in [remote, nested, -999_i64] {
@@ -202,10 +202,10 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = ANY($1)", &[&&[ship, other_ship, fleet_ship, no_bay_ship, can, nested, override_can, uncaptured_can, missing_ball][..]]).await.unwrap();
     client.session.apply(vec![("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system))]);
     let active_endpoint = Endpoint { location: ship, flag: FLAG_CARGO };
-    let absent_actor = Reachability::capture(&client, &[active_endpoint]).await.unwrap();
+    let absent_actor = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[active_endpoint]).await.unwrap();
     assert!(absent_actor.check(&db, &client.sde, active_endpoint).await.is_err());
     client.world.system(system).await.unwrap();
-    let absent_pilot = Reachability::capture(&client, &[active_endpoint]).await.unwrap();
+    let absent_pilot = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[active_endpoint]).await.unwrap();
     assert!(absent_pilot.check(&db, &client.sde, active_endpoint).await.is_err());
     let ball = |id, x| crate::space::Ball {
         id, type_id: 1, owner_id: actor.character, corp_id: 1, alliance_id: 0, char_id: (id == ship).then_some(actor.character),
@@ -218,7 +218,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     let mut unpiloted = ball(ship, 0.0);
     unpiloted.char_id = None;
     client.world.with(system, move |s| { s.insert(unpiloted); }).await.unwrap();
-    let absent_index = Reachability::capture(&client, &[active_endpoint]).await.unwrap();
+    let absent_index = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[active_endpoint]).await.unwrap();
     assert!(absent_index.check(&db, &client.sde, active_endpoint).await.is_err());
     let (pilot, root, inactive, fleet, no_bay) = (ball(ship, 0.0), ball(can, 2600.0), ball(other_ship, 2600.0), ball(fleet_ship, 2600.0), ball(no_bay_ship, 2600.0));
     client.world.with(system, move |s| { s.insert(pilot); s.insert(root); s.insert(inactive); s.insert(fleet); s.insert(no_bay); }).await.unwrap();
@@ -231,12 +231,12 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
         Endpoint { location: no_bay_ship, flag: 90 },
         Endpoint { location: no_bay_ship, flag: 155 },
     ];
-    let reach = Reachability::capture(&client, &endpoints).await.unwrap();
+    let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &endpoints).await.unwrap();
     for (endpoint, allowed) in endpoints.into_iter().zip([true, true, false, true, true, false, false]) {
         assert_eq!(reach.check(&db, &client.sde, endpoint).await.is_ok(), allowed);
     }
     db.execute("UPDATE game.items SET singleton = false WHERE item_id = $1", &[&can]).await.unwrap();
-    let packaged = Reachability::capture(&client, &[endpoints[1]]).await.unwrap();
+    let packaged = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[endpoints[1]]).await.unwrap();
     assert!(packaged.check(&db, &client.sde, endpoints[1]).await.is_err());
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&can]).await.unwrap();
     let wrong_type = client.sde.types.iter().find(|t| t.group_id.is_some_and(|g| [329, 330, 346].contains(&g))).expect("SDE must contain a formerly misclassified group").type_id;
@@ -245,7 +245,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     let wrong_ball = ball(wrong, 0.0);
     client.world.with(system, move |s| { s.insert(wrong_ball); }).await.unwrap();
     let wrong_endpoint = Endpoint { location: wrong, flag: FLAG_CARGO };
-    let wrong_reach = Reachability::capture(&client, &[wrong_endpoint]).await.unwrap();
+    let wrong_reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[wrong_endpoint]).await.unwrap();
     assert!(wrong_reach.check(&db, &client.sde, wrong_endpoint).await.is_err());
     let commodity = client.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let source = crate::dao::items::transfers::insert(&db, commodity, actor.character, nested, FLAG_CARGO, 10).await.unwrap();
@@ -260,7 +260,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     for (destination, id) in [(Container::Item(ship), source), (Container::Item(ship), bare_source), (Container::Item(nested), aboard), (Container::Item(ship), inactive_cargo)] {
         let before = move_fingerprint(&db).await;
         clear_notifications(&mut client, &mut notifications);
-        assert!(move_item(&mut client, &destination, id, None, None, None).await.is_err());
+        assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
         assert_eq!(move_fingerprint(&db).await, before);
         assert_no_notifications(&mut client, &mut notifications);
     }
@@ -303,7 +303,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     assert!(inventory(&mut client, &call).await.is_ok());
     assert!(has_item_change(&mut client, &mut notifications));
     for id in [maintenance_cargo, fleet_cargo] {
-        assert!(move_item(&mut client, &Container::Item(ship), id, None, None, None).await.is_ok());
+        assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(ship), id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
         assert!(has_item_change(&mut client, &mut notifications));
     }
     for id in [source, source2, maintenance_cargo, fleet_cargo] {
@@ -311,30 +311,30 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
         assert_eq!(moved.location_id, ship);
     }
     let absent = Endpoint { location: missing_ball, flag: FLAG_CARGO };
-    let no_ball = Reachability::capture(&client, &[absent]).await.unwrap();
+    let no_ball = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[absent]).await.unwrap();
     assert!(no_ball.check(&db, &client.sde, absent).await.is_err());
     let (custom, uncaptured) = (ball(override_can, override_distance + 100.0), ball(uncaptured_can, 0.0));
     client.world.with(system, move |s| { s.insert(custom); s.insert(uncaptured); }).await.unwrap();
     let custom_endpoint = Endpoint { location: override_can, flag: FLAG_CARGO };
-    let custom_reach = Reachability::capture(&client, &[custom_endpoint]).await.unwrap();
+    let custom_reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[custom_endpoint]).await.unwrap();
     assert!(custom_reach.check(&db, &client.sde, custom_endpoint).await.is_ok());
     let custom_far = ball(override_can, override_distance + 101.0);
     client.world.with(system, move |s| { s.insert(custom_far); }).await.unwrap();
-    let custom_reach = Reachability::capture(&client, &[custom_endpoint]).await.unwrap();
+    let custom_reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[custom_endpoint]).await.unwrap();
     assert!(custom_reach.check(&db, &client.sde, custom_endpoint).await.is_err());
     let nested_endpoint = Endpoint { location: nested, flag: FLAG_CARGO };
-    let captured = Reachability::capture(&client, &[nested_endpoint]).await.unwrap();
+    let captured = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[nested_endpoint]).await.unwrap();
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&nested, &uncaptured_can]).await.unwrap();
     assert!(captured.check(&db, &client.sde, nested_endpoint).await.is_err());
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&nested, &can]).await.unwrap();
     let (far_can, far_ship, far_fleet) = (ball(can, 2601.0), ball(other_ship, 2601.0), ball(fleet_ship, 2601.0));
     client.world.with(system, move |s| { s.insert(far_can); s.insert(far_ship); s.insert(far_fleet); }).await.unwrap();
-    let reach = Reachability::capture(&client, &endpoints).await.unwrap();
+    let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &endpoints).await.unwrap();
     for endpoint in [endpoints[1], endpoints[3], endpoints[4]] {
         assert!(reach.check(&db, &client.sde, endpoint).await.is_err());
     }
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&can, &(system - 1)]).await.unwrap();
-    let reach = Reachability::capture(&client, &endpoints).await.unwrap();
+    let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &endpoints).await.unwrap();
     assert!(reach.check(&db, &client.sde, endpoints[1]).await.is_err());
     fixture::cleanup(&db, actor).await.unwrap();
     assert_eq!(fixture::remaining(&db, actor).await.unwrap(), 0);
@@ -365,7 +365,7 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     let distant = crate::dao::items::transfers::insert(&db, ty, corp, distant_office, FLAG_CORP_SAG1, 1).await.unwrap();
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = ANY($1)", &[&&[office, distant_office, local, distant][..]]).await.unwrap();
     let endpoints = [Endpoint { location: local, flag: FLAG_CARGO }, Endpoint { location: distant, flag: FLAG_CARGO }];
-    let reach = Reachability::capture(&client, &endpoints).await.unwrap();
+    let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &endpoints).await.unwrap();
     assert!(reach.check(&db, &client.sde, endpoints[0]).await.is_ok());
     assert!(reach.check(&db, &client.sde, endpoints[1]).await.is_err());
     let commodity = client.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
@@ -376,7 +376,7 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     for (destination, id) in [(hangar.clone(), remote_stack), (Container::Item(distant_office), personal)] {
         let before = move_fingerprint(&db).await;
         clear_notifications(&mut client, &mut notifications);
-        assert!(move_item(&mut client, &destination, id, None, None, None).await.is_err());
+        assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
         assert_eq!(move_fingerprint(&db).await, before);
         assert_no_notifications(&mut client, &mut notifications);
     }
@@ -385,17 +385,17 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     db.execute("UPDATE game.characters SET corp_roles = 0 WHERE character_id = $1", &[&actor.character]).await.unwrap();
     let before = move_fingerprint(&db).await;
     clear_notifications(&mut client, &mut notifications);
-    assert!(move_item(&mut client, &hangar, local_stack, None, None, None).await.is_err());
+    assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, local_stack, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     assert_eq!(move_fingerprint(&db).await, before);
     assert_no_notifications(&mut client, &mut notifications);
     db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
     clear_notifications(&mut client, &mut notifications);
-    assert!(move_item(&mut client, &hangar, local_stack, None, None, None).await.is_ok());
+    assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, local_stack, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
     let moved = load_items(&db, &client.sde, ItemQuery::Id(local_stack)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id), (actor.character, station));
     assert!(has_item_change(&mut client, &mut notifications));
     clear_notifications(&mut client, &mut notifications);
-    assert!(move_item(&mut client, &Container::Item(office), personal, None, None, None).await.is_ok());
+    assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(office), personal, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
     let moved = load_items(&db, &client.sde, ItemQuery::Id(personal)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id), (corp, office));
     assert!(has_item_change(&mut client, &mut notifications));

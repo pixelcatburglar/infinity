@@ -5,6 +5,7 @@
 use super::*;
 use super::movement::{dispatch_move, move_core, MoveEffect};
 use crate::db::outbox::Notification;
+use crate::services::identity::Identity;
 
 pub(super) fn available(item: &Item, target: i64, type_id: i32, ship: i64, station: Option<i64>) -> bool {
     item.owner_id == target && item.type_id == type_id && item.quantity > 0
@@ -62,7 +63,7 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                 Ok(quantity as usize)
             })
         },
-        |value, outbox| async move { dispatch_move(value, outbox, c, target) },
+        |value, outbox| async move { dispatch_move(value, outbox, |n| super::super::effects::online::dispatch_notification(route_target(n, target, c.session.int("charid")), &c.world, &c.notify_tx, c.session.int("charid"))) },
     ).await
 }
 
@@ -78,7 +79,7 @@ pub(super) fn route_target(notification: Notification, target: i64, current: Opt
 pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64, mut ids: Vec<i64>, destination: i64, flag: i32) -> Result<usize, CallError> {
     use super::super::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
     let _lock = super::super::market::lock().await;
-    let policy = OnlinePolicy::from_client(c)?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     if policy.owner != owner { return Err(notify_error(messages::gm::GM_FIT_REFUSED)); }
     ids.sort_unstable();
     ids.dedup();

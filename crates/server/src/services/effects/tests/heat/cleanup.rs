@@ -39,11 +39,11 @@ async fn primed_unfit_clears_only_after_commit() {
         while rx.try_recv().is_ok() {}
         c.outbox.clear();
         let destination = Container::Item(f.ship);
-        assert!(inventory::movement::move_item(&mut c, &destination, f.module, Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None).await.is_err());
+        assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &destination, f.module, Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.is_err());
         assert!(heat::overloaded_modules().contains(&f.module));
         assert!(rx.try_recv().is_err());
         assert!(c.outbox.is_empty());
-        assert_eq!(inventory::movement::move_item(&mut c, &destination, f.module, Some(f.ship), Some(FLAG_CARGO), None).await.ok().unwrap(), Some(f.module));
+        assert_eq!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &destination, f.module, Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.ok().unwrap(), Some(f.module));
         assert!(!heat::overloaded_modules().contains(&f.module));
         assert!(heat::ship_state(&w, SYSTEM, f.ship).await.is_none_or(|r| r.iter().all(|r| r.incoming == 0.0)));
     }).await;

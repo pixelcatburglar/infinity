@@ -243,36 +243,36 @@ async fn move_item_authorizes_sources_and_destinations() {
     for (destination, id, source) in rejected {
         let before = move_fingerprint(&db).await;
         client.outbox.clear();
-        assert!(matches!(move_item(&mut client, &destination, id, source, None, None).await, Err(CallError::User { dict, .. }) if dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert!(matches!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, id, source, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await, Err(CallError::User { dict, .. }) if dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
         assert_eq!(move_fingerprint(&db).await, before);
         assert!(client.outbox.is_empty());
     }
     let before = move_fingerprint(&db).await;
     client.outbox.clear();
-    assert!(matches!(move_item(&mut client, &Container::Item(foreign_office), own, None, None, None).await, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))]));
+    assert!(matches!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(foreign_office), own, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))]));
     assert_eq!(move_fingerprint(&db).await, before);
     assert!(client.outbox.is_empty());
     db.execute("UPDATE game.characters SET corp_roles = 0 WHERE character_id = $1", &[&me]).await.unwrap();
     for id in [corp_item, personal_office_item] {
         let before = move_fingerprint(&db).await;
         client.outbox.clear();
-        assert!(matches!(move_item(&mut client, &hangar, id, None, None, None).await, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))]));
+        assert!(matches!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))]));
         assert_eq!(move_fingerprint(&db).await, before);
         assert!(client.outbox.is_empty());
     }
     db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&me, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
     for (destination, location, flag) in [(Container::Item(own_ship), own_ship, FLAG_CARGO), (Container::Item(own_container), own_container, FLAG_HANGAR), (hangar.clone(), station, FLAG_HANGAR)] {
-        assert!(move_item(&mut client, &destination, own, None, None, None).await.is_ok());
+        assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, own, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
         let moved = load_items(&db, &client.sde, ItemQuery::Id(own)).await.unwrap().pop().unwrap();
         assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, location, flag));
     }
-    assert!(move_item(&mut client, &hangar, corp_item, None, None, None).await.is_ok());
+    assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, corp_item, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
     let moved = load_items(&db, &client.sde, ItemQuery::Id(corp_item)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, station, FLAG_HANGAR));
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&own_ship]).await.unwrap();
     let before = move_fingerprint(&db).await;
     client.outbox.clear();
-    assert!(move_item(&mut client, &Container::Item(own_ship), own, None, Some(FLAG_FITTING_FIRST), None).await.is_err());
+    assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(own_ship), own, None, Some(FLAG_FITTING_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     assert_eq!(move_fingerprint(&db).await, before);
     assert!(client.outbox.is_empty());
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&own_ship, &system]).await.unwrap();
@@ -290,14 +290,14 @@ async fn move_item_authorizes_sources_and_destinations() {
     for id in [loot, foreign[0]] {
         let before = move_fingerprint(&db).await;
         client.outbox.clear();
-        assert!(matches!(move_item(&mut client, &Container::Item(own_ship), id, None, None, None).await, Err(CallError::User { dict, .. }) if dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert!(matches!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(own_ship), id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await, Err(CallError::User { dict, .. }) if dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
         assert_eq!(move_fingerprint(&db).await, before);
         assert!(client.outbox.is_empty());
     }
     let nearby = ball(wreck, 2600.0);
     world.with(system, move |s| { s.insert(nearby); }).await.unwrap();
     for id in [loot, can_loot] {
-        assert!(move_item(&mut client, &Container::Item(own_ship), id, None, None, None).await.is_ok());
+        assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(own_ship), id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
         let moved = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
         assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, own_ship, FLAG_CARGO));
     }
@@ -306,4 +306,44 @@ async fn move_item_authorizes_sources_and_destinations() {
     db.execute("DELETE FROM game.items WHERE owner_id = ANY($1) OR item_id = ANY($2)", &[&&chars[..], &&[office, foreign_office, corp_item][..]]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE user_id = $1", &[&account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated database with SDE"]
+async fn headless_personal_stack_move_notifies_sender() {
+    use std::sync::Arc;
+    use crate::services::identity::Identity;
+    use crate::services::tests::fixture;
+
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let actor = fixture::create(&db).await.unwrap();
+    let d = db.clone();
+    let result = tokio::spawn(async move {
+        let station = sde.map.stations().next().expect("SDE station").station_id;
+        let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
+        let stack_type = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+        let ship = crate::dao::items::transfers::insert(&d, ship_type, actor.character, station, FLAG_HANGAR, 1).await.unwrap();
+        d.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&ship]).await.unwrap();
+        let stack = crate::dao::items::transfers::insert(&d, stack_type, actor.character, ship, FLAG_CARGO, 10).await.unwrap();
+        let world = crate::space::World::new(d.clone(), sde.clone(), 1);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let identity = Identity { char_id: actor.character, corp_id: 1, ship_id: Some(ship), station_id: Some(station), system_id: None };
+        let destination = Container::Hangar { station_id: station, owner_id: actor.character };
+        let moved = move_item(&identity, &d, &world, &sde, None, sender.clone(), &destination, stack, Some(ship), Some(FLAG_HANGAR), Some(4),
+            |n| crate::services::effects::online::dispatch_notification(n, &world, &sender, Some(actor.character))).await.unwrap().unwrap();
+        assert_ne!(moved, stack);
+        let original = load_items(&d, &sde, ItemQuery::Id(stack)).await.unwrap().pop().unwrap();
+        let split = load_items(&d, &sde, ItemQuery::Id(moved)).await.unwrap().pop().unwrap();
+        assert_eq!((original.owner_id, original.location_id, original.flag_id, original.quantity), (actor.character, ship, FLAG_CARGO, 6));
+        assert_eq!((split.owner_id, split.location_id, split.flag_id, split.quantity), (actor.character, station, FLAG_HANGAR, 4));
+        let notices: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert_eq!(notices.iter().filter(|(event, _)| event == "OnItemChange").count(), 2);
+        assert!(notices.iter().any(|(event, args)| event == "OnItemChange" && args[0] == original.row()));
+        assert!(notices.iter().any(|(event, args)| event == "OnItemChange" && args[0] == split.row()));
+    }).await;
+    fixture::cleanup(&db, actor).await.unwrap();
+    assert_eq!(fixture::remaining(&db, actor).await.unwrap(), 0);
+    result.unwrap();
 }

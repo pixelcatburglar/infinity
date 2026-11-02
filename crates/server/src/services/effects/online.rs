@@ -10,6 +10,7 @@ use crate::db::{executor::Executor, outbox::{Effect as OutboxEffect, Outbox}};
 use crate::messages;
 use crate::sde::Sde;
 use crate::services::{db_err, notify_error, CallError, CallResult};
+use crate::services::identity::Identity;
 use crate::space::NotifyTx;
 use marshal::Value;
 use tracing::info;
@@ -30,12 +31,13 @@ pub(in crate::services) struct OnlineChanged {
 }
 
 impl OnlinePolicy {
-    pub(in crate::services) fn from_client(c: &Client) -> Result<Self, CallError> {
+    pub(in crate::services) fn from_identity(identity: &Identity, sender: NotifyTx) -> Result<Self, CallError> {
+        if identity.char_id == 0 { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
         Ok(Self {
-            owner: c.session.int("charid").ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?,
-            active_ship: c.session.int("shipid"),
-            station: c.session.int("stationid"),
-            notify: c.notify_tx.clone(),
+            owner: identity.char_id,
+            active_ship: identity.ship_id,
+            station: identity.station_id,
+            notify: sender,
         })
     }
 }
@@ -110,17 +112,18 @@ pub(in crate::services) fn apply_online_changed(change: OnlineChanged) {
     for stop in change.bank_stops { crate::services::combat::banks::apply_stop(stop); }
     if !change.clear_heat.is_empty() { super::heat::clear_modules(change.ship, &change.clear_heat); }
 }
-pub(in crate::services) fn dispatch_notification(notification: crate::db::outbox::Notification, c: &Client) -> Result<(), CallError> {
+/// Crate-visible so the Lua host move adapter can deliver its notifications.
+pub(crate) fn dispatch_notification(notification: crate::db::outbox::Notification, world: &crate::space::World, sender: &NotifyTx, current_character: Option<i64>) -> Result<(), CallError> {
     match notification {
-        crate::db::outbox::Notification::Pilot { char_id, event, args } if c.session.int("charid") == Some(char_id) => {
-            let _ = c.notify_tx.send((event, args));
+        crate::db::outbox::Notification::Pilot { char_id, event, args } if current_character == Some(char_id) => {
+            let _ = sender.send((event, args));
             Ok(())
         }
-        notification => notification.dispatch_sender(&c.world, &c.notify_tx),
+        notification => notification.dispatch_sender(world, sender),
     }
 }
 
-fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError>) -> Result<T, CallError> {
+pub(in crate::services) fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError>) -> Result<T, CallError> {
     for entry in outbox.into_entries() {
         match entry {
             OutboxEffect::Operation(change) => apply_online_changed(change),
@@ -132,7 +135,7 @@ fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl
 }
 
 pub(in crate::services) fn dispatch_changed<T>(value: T, outbox: Outbox<OnlineChanged>, c: &Client) -> Result<T, CallError> {
-    dispatch_entries(value, outbox, |notification| dispatch_notification(notification, c))
+    dispatch_entries(value, outbox, |notification| dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid")))
 }
 
 pub(in crate::services) fn dispatch_changed_world<T>(value: T, outbox: Outbox<OnlineChanged>, world: &crate::space::World) -> Result<T, CallError> {
@@ -189,25 +192,30 @@ pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
     Ok(())
 }
 
-pub(in crate::services) async fn reconcile_ship(c: &Client, owner: i64, ship: i64) -> Result<(), CallError> {
+pub(in crate::services) async fn reconcile_ship(
+    db: &crate::db::Db, sde: &Arc<Sde>, owner: i64, ship: i64,
+    notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError> + Send,
+) -> Result<(), CallError> {
     let _lock = crate::services::market::lock().await;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
+    let sde = sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
             Box::pin(async move { reconcile_core(tx, &sde, outbox, owner, ship).await })
         },
-        |value, outbox| async move { dispatch_changed(value, outbox, c) },
+        |value, outbox| async move { dispatch_entries(value, outbox, notify) },
     ).await
 }
 
-/// Change online state for an authorized fitted module, including docked hangar ships.
-pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: bool) -> CallResult {
+/// Change online state for an authorized fitted module; login_user comes from the owning account and is read only by the module-online/offline info log.
+pub(crate) async fn set_online(
+    identity: &Identity, db: &crate::db::Db, sde: &Arc<Sde>, sender: NotifyTx, login_user: i64,
+    ship: i64, item_id: i64, online: bool,
+    notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError> + Send,
+) -> CallResult {
     let _lock = crate::services::market::lock().await;
-    let policy = OnlinePolicy::from_client(c)?;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
+    let policy = OnlinePolicy::from_identity(identity, sender)?;
+    let sde = sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let policy = policy.clone();
@@ -215,8 +223,8 @@ pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: 
             Box::pin(async move { set_online_core(tx, &sde, &policy, outbox, ship, item_id, online).await })
         },
         |changed, outbox| async move {
-            dispatch_changed((), outbox, c)?;
-            if changed { info!(user = c.login.user_id, "module {item_id} {}", if online { "online" } else { "offline" }); }
+            dispatch_entries((), outbox, notify)?;
+            if changed { info!(user = login_user, "module {item_id} {}", if online { "online" } else { "offline" }); }
             Ok(Value::None)
         },
     ).await

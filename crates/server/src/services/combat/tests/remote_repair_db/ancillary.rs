@@ -81,7 +81,7 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         let args = [Value::Int(f.module), Value::str(name), Value::Int(f.victim), Value::Int(1)];
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
-        assert!(lifecycle::activate(&mut client, &call).await.is_ok());
+        assert!(crate::services::combat::dispatch(&mut client, &call).await.expect("combat method").is_ok());
         assert!(test_world.after(system, 1500).await);
         let remaining = crate::dao::items::charges::loaded(&test_db, f.ship, FLAG_FITTING_FIRST).await.unwrap();
         assert!(remaining.is_none(), "last charge consumed or magazine empty");

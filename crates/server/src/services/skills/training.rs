@@ -15,7 +15,9 @@ use super::formulas::sp_for_level;
 use crate::client::filetime_now;
 use crate::consts::{CATEGORY_SKILL, FILETIME_MINUTE, dogma::{CHAR_ATTRIBUTES, MAX_SKILL_LEVEL}};
 use crate::db::executor::Executor;
-use crate::db::outbox::Outbox;
+use crate::db::outbox::{Notification, Outbox};
+use crate::services::identity::Identity;
+use std::sync::Arc;
 use crate::services::effects::online::{self, OnlineChanged};
 use crate::dao::skills::{queue as queue_dao, training as training_dao};
 use marshal::Value;
@@ -219,28 +221,8 @@ pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, C
     ))
 }
 
-pub(super) async fn queue_list(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
-    queue_list_db(&c.db, char_id).await
-}
-
-pub(super) async fn queue_list_db(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Value, CallError> {
-    let rows = queue_dao::list(db, char_id).await.map_err(db_err)?;
-    let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
-    Ok(Value::List(
-        rows.iter()
-            .map(|r| {
-                keyval([
-                    ("queuePosition", Value::Int(r.position as i64)),
-                    ("trainingTypeID", Value::Int(r.type_id as i64)),
-                    ("trainingToLevel", Value::Int(r.to_level as i64)),
-                    ("trainingStartSP", Value::Int(r.start_sp)),
-                    ("trainingDestinationSP", Value::Int(r.dest_sp)),
-                    ("trainingStartTime", opt(r.start_time)),
-                    ("trainingEndTime", opt(r.end_time)),
-                ])
-            })
-            .collect(),
-    ))
+pub(super) async fn queue_list(identity: &Identity, db: &(impl Executor + ?Sized)) -> Result<Vec<queue_dao::QueueEntry>, CallError> {
+    queue_dao::list(db, identity.char_id).await.map_err(db_err)
 }
 
 pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut progress: super::completion::AdvanceResult, additional: &[i32]) -> Result<super::completion::AdvanceResult, CallError> {
@@ -269,17 +251,16 @@ pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Exec
     if !notify { progress.queue_changed = previous_queue_changed; }
     super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, additional).await?;
     if notify && !progress.queue_changed {
-        outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
+        outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![super::skill_handler::queue_value(&queue_dao::list(tx, char_id).await.map_err(db_err)?)]);
     }
     progress.queue_changed |= changed;
     Ok(progress)
 }
 /// `SaveNewQueue({idx: (typeID, toLevel)}, activate=bool)`: rebuild the queue with timings.
-pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, activate: bool, notify: bool) -> Result<(), CallError> {
+pub(super) async fn save_queue(identity: &Identity, db: &crate::db::Db, sde: &Arc<crate::sde::Sde>, queue: &Value, activate: bool, notify: bool, dispatch: impl FnMut(Notification) -> Result<(), CallError> + Send) -> Result<(), CallError> {
     let now = filetime_now();
     let entries = parse_queue(queue)?;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
+    let char_id = identity.char_id;
     let _market = crate::services::market::lock().await;
     db.transaction(
         |tx, outbox: &mut Outbox<OnlineChanged>| {
@@ -294,7 +275,7 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
                 info!("character {char_id} finished training skill {type_id} to level {level}");
             }
             crate::scheduler::wake();
-            online::dispatch_changed((), outbox, c)?;
+            online::dispatch_entries((), outbox, dispatch)?;
             Ok(())
         },
     ).await

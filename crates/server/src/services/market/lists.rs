@@ -24,9 +24,8 @@ fn order_header() -> DbRowDescriptor {
     ])
 }
 /// `GetOrders(typeID)` -> (asks, bids) in the session's region.
-pub(super) async fn orders(c: &Client, type_id: i64) -> CallResult {
-    let region = c.session.int("regionid").unwrap_or(0);
-    let rows = listings::orders(&c.db, today(), type_id as i32, region).await.map_err(db_err)?;
+pub(super) async fn orders(db: &Db, region: i64, type_id: i64) -> CallResult {
+    let rows = listings::orders(db, today(), type_id as i32, region).await.map_err(db_err)?;
     let header = order_header();
     let (mut asks, mut bids) = (vec![], vec![]);
     for r in &rows {
@@ -42,8 +41,8 @@ pub(super) async fn orders(c: &Client, type_id: i64) -> CallResult {
 }
 
 /// Cheapest ask per type within `column = id`: {typeID: best}.
-pub(super) async fn best_asks(c: &Client, area: Area, id: i64, as_rows: bool) -> CallResult {
-    let rows = listings::best_asks(&c.db, area, id).await.map_err(db_err)?;
+pub(super) async fn best_asks(db: &Db, area: Area, id: i64, as_rows: bool) -> CallResult {
+    let rows = listings::best_asks(db, area, id).await.map_err(db_err)?;
     // Station/system answers are tuples (marketutil.ConvertTuplesToBestByOrders); the
     // region answer is used as-is, by attribute.
     let header = DbRowDescriptor::new([("price", DbType::R8), ("volRemaining", DbType::I4), ("typeID", DbType::I4), ("stationID", DbType::I8)]);

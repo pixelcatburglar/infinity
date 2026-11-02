@@ -19,6 +19,7 @@ pub(crate) mod brain;
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use super::{combat, exploration, fit, skills};
+use super::identity::Identity;
 use crate::client::{filetime_now, short, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -168,7 +169,7 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
     use super::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
     use crate::db::outbox::Outbox;
     let _lock = super::market::lock().await;
-    let policy = OnlinePolicy::from_client(c)?;
+    let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
@@ -199,7 +200,7 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
 /// [itemID, isOnline, damage, charge, skillPoints, armorDamage, shieldCharge, isIncapacitated].
 pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
     let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    super::effects::online::reconcile_ship(c, owner, ship_id).await?;
+    super::effects::online::reconcile_ship(&c.db, &c.sde, owner, ship_id, |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await?;
     ship_state_core(c, ship_id).await
 }
 
@@ -243,7 +244,7 @@ pub(crate) async fn ship_state_core(c: &Client, ship_id: i64) -> Result<Value, C
 async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let Some(ship_id) = c.session.int("shipid") else { return Ok(vec![]) };
     let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    super::effects::online::reconcile_ship(c, owner, ship_id).await?;
+    super::effects::online::reconcile_ship(&c.db, &c.sde, owner, ship_id, |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await?;
     let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let mut out = Vec::new();
@@ -395,7 +396,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            super::effects::online::set_online(c, ship, module, online).await
+            super::effects::online::set_online(&Identity::of_client(c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, ship, module, online, |notification| super::effects::online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid"))).await
         }
         _ => {
             warn!(
