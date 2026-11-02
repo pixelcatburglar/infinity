@@ -68,6 +68,7 @@ Any other tag starts nothing.
 | Area | Where |
 |---|---|
 | Listeners and startup | `crates/server/src/main.rs` (`Config::from_env`, one task per connection) |
+| Server logs | `logging.rs` (stdout, plus time-rotated files when `logging.dir` is set; `main` keeps the writer guards until exit so the last lines are flushed) |
 | Login handshake | `handshake.rs` (GPS, Placebo crypto), `live_sessions.rs` (one live session per account) |
 | Packet loop, session changes, notifications | `client.rs`, `session.rs`, `macho.rs`, `conn.rs`, `framing.rs` |
 | Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |

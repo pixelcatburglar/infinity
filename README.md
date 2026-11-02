@@ -204,6 +204,8 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `cdn.bind` | `CDN_BIND` | `0.0.0.0:80` | Content CDN listener |
 | `server.macho_version`, `.boot_version`, `.boot_build`, `.boot_codename`, `.boot_region`, `.node_id` | `MACHO_VERSION`, `BOOT_VERSION`, `BOOT_BUILD`, `BOOT_CODENAME`, `BOOT_REGION`, `NODE_ID` | match build 3653293 | Values the client checks during the handshake |
 | `logging.filter` | `RUST_LOG` | `info,infinity_server=debug` | Log filter |
+| `logging.dir` | `LOG_DIR` | empty | Also write the server log to files in this directory (empty = stdout only); see Logs below |
+| `logging.rotation` / `.keep_files` | | `daily` / `14` | When a new log file starts (`minutely`, `hourly`, `daily` or `never`), and how many files are kept, the current one included; at least 1, and ignored with `never` |
 | `lua.enabled` | | `true` | Load the Lua scripts. With `false` no Lua VM is created and no call is claimed by a script. |
 | `lua.scripts_dir` | | `crates/server/lua` | Directory the scripts are loaded from, relative to the working directory |
 | `lua.memory_limit_mb`, `.call_budget_ms`, `.call_budget_instructions`, `.instruction_hook_interval` | | `64`, `50`, `5000000`, `1000` | Lua VM memory, and the time and instructions one call may use (counted every `instruction_hook_interval` instructions). A call over budget fails; a game change it already started still completes. |
@@ -226,6 +228,10 @@ Some keys switch behaviour on or off rather than set a number:
 | `salvage.salvage_material_stacks` / `.salvage_quantity_min` / `.salvage_quantity_max` | `1` / `1` / `3` | What a successful salvage gives, since wreck yield tables do not ship with the client: this many stacks of a random published salvaged material, each of between the minimum and maximum units. All must be positive, and the maximum at least the minimum. |
 | `mining.ledger_retention_days` / `.ledger_maintenance_secs` | `90` / `3600` | How many days of personal mining ledger history are kept (90 is the client's chart range), and how often older entries are deleted. Both must be positive. Deleted history does not come back if the retention is raised later. |
 | `map.history_retention_hours` / `.maintenance_secs` | `48` / `3600` | How many hours of star-map jump and kill history are kept, and how often older events are deleted. The retention must be at least 24, the longest window the client asks for, and the interval positive. Visits are never deleted. |
+
+### Logs
+
+The server always logs to stdout, which is what `docker compose logs` shows. With `logging.dir` set (for example `dir = "logs"`, or `LOG_DIR=logs`) it also writes the same lines, filtered the same way and without colour codes, to files in that directory, created at start; a directory it cannot create stops the start with an error. Files are named in UTC: `server.YYYY-MM-DD.log` daily, with `-HH` added hourly and `-HH-MM` added minutely, and `server.log` with `never`. Rotation is by time only: `keep_files` limits the number of files, not their size, and a `never` file grows without limit. A graceful stop writes out the last lines. In Docker, uncomment `LOG_DIR` and the logs volume in `docker-compose.yml` to keep the files on the host. Logs can contain player information: keep them private and out of commits (`logs/` is ignored by Git).
 
 ## Database
 
