@@ -257,8 +257,10 @@ pub const ROLE_DELIVERIES_VIEW: i64 = ROLE_ACCOUNTANT | ROLE_JUNIOR_ACCOUNTANT |
 pub const ROLE_DELIVERIES_TAKE: i64 = ROLE_ACCOUNTANT | ROLE_TRADER;
 /// Client carbon/common/script/sys/serviceConst.py: ROLE_PLAYER | ROLE_LOGIN.
 pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
+/// Client carbon/common/script/sys/serviceConst.py: ROLE_GML.
+pub const ROLE_GML: i64 = 18014398509481984;
 /// Client carbon serviceConst: ROLE_GML | ROLE_GMH | ROLE_LEGIONEER | ROLE_WORLDMOD.
-pub const GM_ROLES: i64 = 18014398509481984 | 9007199254740992 | 262144 | 4096;
+pub const GM_ROLES: i64 = ROLE_GML | 9007199254740992 | 262144 | 4096;
 
 // Client wallet and office constants; server market policy.
 /// Gateway PLEX vault protocol: one PLEX is 100 hundredths.

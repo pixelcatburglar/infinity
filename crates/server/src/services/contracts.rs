@@ -26,6 +26,7 @@
 //! Contract lifecycle mutations guard the previous persisted status and commit atomically;
 //! their notifications are delivered only after commit. Overdue couriers remain in progress
 //! until manually failed, and their acceptors may still complete them.
+//! GMs can advance outstanding contract deadlines; bid auctions settle through the normal lifecycle.
 //! Contract and item state comes from game tables; station ancestry comes from the loaded SDE.
 //! Skill-based outstanding caps follow the client; listing page sizes use contracts configuration.
 //! Auction settlement scans run as durable periodic jobs registered through the services
@@ -307,6 +308,20 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let for_corp = |i: usize| truthy(call.args.get(i));
     Some(match call.method {
+        // eve/client/script/ui/shared/neocom/contracts/contractentry.py:_ExpireContract
+        // sends one contractID and ignores the result (None).
+        "GM_ExpireContract" => {
+            if c.login.role & crate::consts::ROLE_GML == 0 {
+                Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION))
+            } else if c.session.int("charid").unwrap_or(0) <= 0 {
+                Err(notify_error(messages::gm::GM_ARGS_NO_CHARACTER))
+            } else if let [Value::Int(id)] = call.args {
+                if *id > 0 { lifecycle::gm_expire(c, *id).await }
+                else { Err(user_error(messages::MSG_CON_CONTRACT_NOT_FOUND, vec![])) }
+            } else {
+                Err(user_error(messages::MSG_CON_CONTRACT_NOT_FOUND, vec![]))
+            }
+        }
         "CreateContract" => match call.args.first() {
             Some(info) => create(c, info).await,
             None => Err(notify_error(messages::CONTRACT_CREATION_REQUEST_MISSING)),

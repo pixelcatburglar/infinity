@@ -4,6 +4,7 @@
 //! Expiry, courier duration, item counts and text lengths use the configured contracts policy.
 //! Status transitions are guarded; overdue couriers are completed or failed manually.
 //! Auction candidates are rechecked in their settlement transaction.
+//! GM expiry advances outstanding deadlines and settles bid auctions in the same transaction.
 //! Escrow volume uses client packaged-item rules and the selected logical quantities.
 
 use super::*;
@@ -550,6 +551,34 @@ async fn settle<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, o
     ownership::tell(db, outbox, k.issuer_owner().id, "OnContractCompleted", k.id).await?;
     ownership::tell(db, outbox, winner.id, "OnContractCompleted", k.id).await?;
     Ok(())
+}
+
+/// Advance an outstanding deadline, settling a bid auction without reacquiring the economy lock.
+pub(super) async fn gm_expire(c: &Client, id: i64) -> CallResult {
+    let _trading = lock().await;
+    let now = filetime_now();
+    let (db, sde, world) = (&c.db, &c.sde, &*c.world);
+    db.transaction(
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                let mut k = contract(db, id).await?;
+                if k.status != STATUS_OUTSTANDING {
+                    return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
+                }
+                if !contract_dao::expire_outstanding(db, id, k.expires, now, STATUS_OUTSTANDING).await.map_err(db_err)? {
+                    return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
+                }
+                if k.kind == TYPE_AUCTION {
+                    if let Some(bid) = shared::top_bid(db, id).await.map_err(db_err)? {
+                        settle(db, &sde, outbox, &mut k, ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, now).await?;
+                    }
+                }
+                Ok(Value::None)
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await
 }
 
 pub(super) async fn settle_expired(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World) -> Result<(), CallError> {

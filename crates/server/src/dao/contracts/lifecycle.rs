@@ -1,6 +1,7 @@
 //! Contract lifecycle persistence for contractProxy (eve/client/script/ui/shared/neocom/contracts).
 //! Uses game contracts, contract items, bids and items.
 //! Transaction management and contract policy remain in the service.
+//! Administrative expiry is guarded by the observed deadline and outstanding status.
 
 use crate::db::{Error, executor::Executor};
 use tokio_postgres::Row;
@@ -89,6 +90,10 @@ pub(crate) async fn clear_deposit(ex: &(impl Executor + ?Sized), id: i64) -> Res
 
 pub(crate) async fn insert_bid(ex: &(impl Executor + ?Sized), id: i64, bidder: i64, wallet_key: i32, amount: f64, now: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.contract_bids (contract_id, bidder_id, wallet_key, amount, date) VALUES ($1, $2, $3, $4, $5)", &[&id, &bidder, &wallet_key, &amount, &now]).await
+}
+
+pub(crate) async fn expire_outstanding(ex: &(impl Executor + ?Sized), id: i64, observed_expiry: i64, now: i64, outstanding_status: i32) -> Result<bool, Error> {
+    Ok(ex.execute("UPDATE game.contracts SET date_expired = LEAST(date_expired, $3) WHERE contract_id = $1 AND date_expired = $2 AND status = $4", &[&id, &observed_expiry, &now, &outstanding_status]).await? == 1)
 }
 
 pub(crate) async fn expired_auctions_with_bids(ex: &(impl Executor + ?Sized), kind: i32, status: i32, now: i64) -> Result<Vec<super::Contract>, Error> {
