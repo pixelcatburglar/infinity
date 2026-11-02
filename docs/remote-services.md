@@ -53,3 +53,12 @@ A disconnected member's fleet seat is kept for `fleets.reconnect_timeout_secs` (
 | mobileCollectMgr | MobileBindSucceed | fixed | `crates/server/src/services/fixed.rs` |
 
 The callback receives a fixed `None` reply only to complete the call; it does not verify or persist a binding. Phone binding, binding state and rewards remain unsupported.
+
+## Contracts
+
+| service | method | status | handler file |
+|---|---|---|---|
+| contractProxy | GM_ExpireContract | handled | `crates/server/src/services/contracts.rs` |
+
+Authorized GMs can advance outstanding deadlines. Auctions with bids settle normally;
+other contracts retain their escrow for issuer reclamation.
