@@ -253,3 +253,7 @@ mailbox_budget = 10000              # server space actor mailbox depth budget
 [bounty]
 kill_right_lifetime_days = 30       # server kill-right lifetime policy
 kill_right_suspect_secs = 900        # server kill-right activation policy
+
+[telemetry]
+# B batches occurrence counts; D also delivers detailed reports.
+client_error_log_mode = "B"

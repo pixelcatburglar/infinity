@@ -1,4 +1,4 @@
-//! Operator configuration and immutable game-policy snapshot.
+//! Operator configuration and immutable game-policy snapshot, including client telemetry.
 //! Deployment settings may be overridden by environment variables; game policy
 //! comes only from the TOML file and compiled defaults. No runtime reload is supported.
 
@@ -24,6 +24,7 @@ pub struct Config {
     pub database: deployment::DatabaseConfig,
     pub development: deployment::DevelopmentConfig,
     pub logging: deployment::LoggingConfig,
+    pub telemetry: deployment::TelemetryConfig,
     pub chat: deployment::ChatConfig,
     pub images: deployment::ImagesConfig,
     pub gateway: deployment::GatewayConfig,
@@ -65,6 +66,7 @@ impl PartialEq for Config {
             && self.database == other.database
             && self.development == other.development
             && self.logging == other.logging
+            && self.telemetry == other.telemetry
             && self.chat == other.chat
             && self.images == other.images
             && self.gateway == other.gateway
@@ -200,6 +202,7 @@ impl Config {
         self.database.validate()?;
         self.development.validate()?;
         self.logging.validate()?;
+        self.telemetry.validate()?;
         self.chat.validate()?;
         self.images.validate()?;
         self.gateway.validate()?;

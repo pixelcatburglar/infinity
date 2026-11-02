@@ -1,4 +1,4 @@
-//! Deployment settings and their defaults, including optional rotating server logs.
+//! Deployment settings and their defaults, including rotating logs and client telemetry mode.
 //! Connection credentials are never formatted in errors. These settings do not mirror
 //! client modules or use tables; logging does not support size-based rotation.
 
@@ -182,6 +182,25 @@ impl LoggingConfig {
             "logging.rotation must be minutely, hourly, daily or never: {:?}", self.rotation
         );
         anyhow::ensure!(self.keep_files >= 1, "logging.keep_files must be at least 1: {}", self.keep_files);
+        Ok(())
+    }
+}
+
+/// Default logging mode assigned to newly observed client errors.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    pub client_error_log_mode: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self { Self { client_error_log_mode: "B".into() } }
+}
+
+impl TelemetryConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(matches!(self.client_error_log_mode.as_str(), "B" | "D"),
+            "telemetry.client_error_log_mode must be B or D");
         Ok(())
     }
 }
