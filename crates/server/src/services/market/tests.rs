@@ -1,5 +1,7 @@
 use super::*;
 
+mod broker_standings;
+
 #[test]
 fn station_preserves_location_and_defaults_null_owner() {
     let mut row = crate::sde::map::Station {
@@ -18,6 +20,18 @@ fn broker_fee_applies_minimum_and_rounds() {
     crate::tests::init_config();
     assert_eq!(broker_fee(0.03, 10.0), 100.0);
     assert_eq!(broker_fee(0.03, 4_001.0), 120.03);
+}
+
+#[test]
+fn broker_standings_adjust_rate_without_clamping() {
+    crate::tests::init_config();
+    assert_eq!(broker_fee(adjusted_broker_rate(0.015, 3.0, 5.0), 1_000_000.0), 13_100.0);
+    assert_eq!(broker_fee(adjusted_broker_rate(0.015, 0.0, 0.0), 1_000_000.0), 15_000.0);
+    assert_eq!(broker_fee(adjusted_broker_rate(0.015, -3.0, -5.0), 1_000_000.0), 16_900.0);
+    let negative = adjusted_broker_rate(0.001, 3.0, 5.0);
+    assert!(negative < 0.0);
+    assert_eq!(broker_fee(negative, 1_000_000.0), 100.0);
+    assert_eq!(broker_fee(adjusted_broker_rate(0.015, 3.0, 5.0), 10_001.0), 131.01);
 }
 
 #[test]

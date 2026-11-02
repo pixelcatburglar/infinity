@@ -6,7 +6,9 @@
 //!
 //! A trade happens at the resting order's price and delivers to the buyer's hangar in the
 //! seller's station. The seller pays sales tax and an order that rests pays the broker's
-//! fee, both as marketutil computes them (skilllimits, brokerFee) at zero standings. A sell
+//! fee, as marketutil computes them (skilllimits, brokerFee), using raw NPC station owner
+//! corporation and faction standings from game.standings. Faction-war upgrades are
+//! unsupported (upgrade level zero); structure markets are unsupported. A sell
 //! order holds its items and a buy order its ISK in escrow until it fills, is cancelled or
 //! expires; closed orders move to game.market_order_history, and every fill is a row of
 //! game.market_transactions (wallet transactions and price history). Ranges in jumps use
@@ -51,6 +53,10 @@ const UNREACHABLE: i64 = 1_000_000;
 // marketutil.const, appConst.mktMinimumFee and MKT_TRANSACTION_TAX_DEFAULT
 const BROKER_RELATIONS_PER_LEVEL: f64 = 0.003;
 const ACCOUNTING_PER_LEVEL: f64 = 0.11;
+/// `marketutil/const.py:15`: faction standing contribution to broker rate.
+const MARKET_FACTION_STANDING_MULTIPLIER: f64 = 0.0003;
+/// `marketutil/const.py:16`: NPC corporation standing contribution to broker rate.
+const MARKET_NPC_CORP_STANDING_MULTIPLIER: f64 = 0.0002;
 
 // marketHistory orderState
 const STATE_CLOSED: i32 = 2; // filled or expired
@@ -192,6 +198,21 @@ async fn skills(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, C
         modification_discount: 0.5 + 0.06 * l(SKILL_MARGIN_TRADING),
     })
 }
+/// `marketutil/brokerFee.py:63-70`; faction-war upgrade level zero is identity.
+fn adjusted_broker_rate(commission: f64, faction: f64, corp: f64) -> f64 {
+    commission - faction * MARKET_FACTION_STANDING_MULTIPLIER - corp * MARKET_NPC_CORP_STANDING_MULTIPLIER
+}
+
+async fn station_broker_rate(ex: &(impl Executor + ?Sized), sde: &crate::sde::Sde, char_id: i64, owner: i64, commission: f64) -> Result<f64, CallError> {
+    let Some(corp) = sde.npc_corporations.get(owner) else { return Ok(commission) };
+    let corp_standing = super::standings::standing(ex, char_id, owner).await?;
+    let faction_standing = match corp.faction_id {
+        Some(faction) => super::standings::standing(ex, char_id, faction).await?,
+        None => 0.0,
+    };
+    Ok(adjusted_broker_rate(commission, faction_standing, corp_standing))
+}
+
 
 fn broker_fee(rate: f64, amount: f64) -> f64 {
     round2((rate * amount).max(crate::config::game().market.broker_fee_min_isk))
@@ -388,11 +409,15 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let sde = Arc::clone(&sde);
     Box::pin(async move {
     let skills = skills(db, me).await?;
-    if duration > 0 {
+    let broker_rate = if duration > 0 {
         check_order_slots(db, me, &skills).await?;
+        let rate = station_broker_rate(db, &sde, me, at.owner, skills.broker_fee).await?;
         let escrow = round2(price * quantity as f64);
-        require_balance(db, me, escrow + broker_fee(skills.broker_fee, escrow)).await?;
-    }
+        require_balance(db, me, escrow + broker_fee(rate, escrow)).await?;
+        rate
+    } else {
+        skills.broker_fee
+    };
     let (bought, _) = lift_asks(db, outbox, &sde, me, &at, range, type_id, price, quantity, true, now).await?;
     let mut order = Order {
         id: 0,
@@ -419,7 +444,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
         return Ok(order_keyval(&order));
     }
     order.escrow = round2(price * order.vol_remaining as f64);
-    debit(db, outbox, me, order.escrow + broker_fee(skills.broker_fee, order.escrow)).await?;
+    debit(db, outbox, me, order.escrow + broker_fee(broker_rate, order.escrow)).await?;
     insert_order(db, &mut order).await?;
     outbox.event(crate::lua::events::GameEvent::MarketOrderPlaced { char_id: me, order_id: order.id, type_id, quantity: order.vol_remaining, price, is_buy: true });
     outbox.operation(MarketEffect::Placed { buyer: true, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
@@ -481,7 +506,8 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
         return Ok(true);
     }
     check_order_slots(db, me, &skills).await?;
-    require_balance(db, me, broker_fee(skills.broker_fee, price * quantity as f64)).await?;
+    let broker_rate = station_broker_rate(db, &sde, me, at.owner, skills.broker_fee).await?;
+    require_balance(db, me, broker_fee(broker_rate, price * quantity as f64)).await?;
     // The items go into escrow first; what the bids don't take stays listed.
     take_items(db, outbox, item, quantity).await?;
     let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, now).await?;
@@ -503,7 +529,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     if order.vol_remaining == 0 {
         return Ok(true);
     }
-    debit(db, outbox, me, broker_fee(skills.broker_fee, price * order.vol_remaining as f64)).await?;
+    debit(db, outbox, me, broker_fee(broker_rate, price * order.vol_remaining as f64)).await?;
     insert_order(db, &mut order).await?;
     outbox.event(crate::lua::events::GameEvent::MarketOrderPlaced { char_id: me, order_id: order.id, type_id, quantity: order.vol_remaining, price, is_buy: false });
     outbox.operation(MarketEffect::Placed { buyer: false, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
@@ -526,10 +552,12 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     Box::pin(async move {
     let mut o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
     let skills = skills(db, me).await?;
+    let owner = station(&sde, o.at.id)?.owner;
+    let broker_rate = station_broker_rate(db, &sde, me, owner, skills.broker_fee).await?;
     let volume = o.vol_remaining as f64;
     let (old_amount, new_amount) = (o.price * volume, new_price * volume);
     let fee = round2(
-        (new_amount * skills.broker_fee * (1.0 - skills.modification_discount) + (new_amount - old_amount).max(0.0) * skills.broker_fee).max(crate::config::game().market.broker_fee_min_isk),
+        (new_amount * broker_rate * (1.0 - skills.modification_discount) + (new_amount - old_amount).max(0.0) * broker_rate).max(crate::config::game().market.broker_fee_min_isk),
     );
     let escrow = if o.bid { round2(new_amount) } else { 0.0 };
     let top_up = escrow - o.escrow;
