@@ -59,6 +59,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - wars declared by one side, which need a war headquarters structure; war allies and surrender; sovereignty, and alliance capital systems and prime time
   - wallet journals; votes on a new CEO, war, share issue, expulsion or item locks, and acting on a vote's result; dividends paid equally to members
   - reactions and industry at player structures; NPC stations offer no reaction facility in the client
+  - moon mining observers and the corporation tab of the mining ledger, which stays empty; the personal mining ledger works
   - fleet boosts, loading a saved fleet setup, removing unqualified members when arranging a wing by ship type, fleet warp to a bookmark, and cynosural beacon broadcasts
   - beacon counts and faction-warfare kills on the star map
   - in chat: password-protected channels, granting channel access to a whole corporation or alliance, taking over ownership of a system channel, and the local chat blackout in null-security space
