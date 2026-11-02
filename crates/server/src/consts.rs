@@ -66,6 +66,8 @@ pub const DRONE_STATE_APPROACHING: i32 = 3;
 pub const DRONE_STATE_DEPARTING: i32 = 4;
 
 // SDE inventory type, group and category IDs.
+/// SDE invTypes: Velator, the fallback rookie ship.
+pub const FALLBACK_ROOKIE_SHIP: i32 = 606;
 /// Client `inventorycommon.const.typeBrokerRelations`.
 pub const SKILL_BROKER_RELATIONS: i32 = 3446;
 /// Client `inventorycommon.const.typeAccounting`.

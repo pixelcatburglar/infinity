@@ -1,5 +1,5 @@
 use super::*;
-use crate::consts::{FLAG_FITTING_FIRST, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
+use crate::consts::{FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
 
 #[test]
 fn name_shape_checks_configured_boundaries_and_spacing() {
@@ -18,19 +18,13 @@ const SLOT_ATTRIBUTES: [(i32, i32); 3] = [(FLAG_FITTING_FIRST, 12), (FLAG_MED_SL
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn rookie_grants_are_persistent_and_atomic() {
-    use std::{collections::HashSet, sync::Arc};
-    use crate::{config::{Config, deployment::DatabaseConfig}, conn::Conn, db::Db, handshake::Login, sde::Sde, space::World};
+    use std::collections::HashSet;
+    use crate::{config::deployment::DatabaseConfig, db::Db, sde::Sde, services::character::provisioning::ensure_ship};
     crate::tests::init_config();
     let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
-    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let sde = Sde::load(&db).await.unwrap();
     let station = sde.map.stations().next().unwrap().station_id;
     let account: i64 = db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES (nextval('game.accounts_user_id_seq')::text, ''::bytea, 0) RETURNING user_id", &[]).await.unwrap().get("user_id");
-    let world = World::new(db.clone(), sde.clone(), 1);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-    let (stream, addr) = listener.accept().await.unwrap();
-    let login = Login { user_id: account, user_name: account.to_string(), role: 0, client_id: account, session_id: account, language_id: "EN".into() };
-    let c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde.clone(), crate::chat::Hub::new("localhost", db.clone(), world.clone()), world, login);
     let cases: &[(i32, i32, &[(i32, i32, i32)])] = &[
         (1, 601, &[(3638,27,1),(3651,28,1),(10039,19,1),(21857,20,1),(30839,11,1),(32465,87,1)]),
         (2, 588, &[(3636,27,1),(3651,28,1),(10039,19,1),(21857,20,1),(30839,11,1),(32465,87,1)]),
@@ -40,7 +34,7 @@ async fn rookie_grants_are_persistent_and_atomic() {
     ];
     for &(race, hull, expected) in cases {
         let owner: i64 = db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id, station_id, balance) VALUES ($1, nextval('game.characters_character_id_seq')::text, $2, 1, 1, 1, $3, 0) RETURNING character_id", &[&account, &race, &station]).await.unwrap().get("character_id");
-        let (first, second) = tokio::join!(ensure_ship(&c, owner, race, station), ensure_ship(&c, owner, race, station));
+        let (first, second) = tokio::join!(ensure_ship(&db, &sde, owner, race, station), ensure_ship(&db, &sde, owner, race, station));
         let ship = first.ok().unwrap();
         assert_eq!(second.ok().unwrap(), ship);
         assert_eq!(db.query_one("SELECT count(*) AS count FROM game.items WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3", &[&owner, &station, &FLAG_HANGAR]).await.unwrap().get::<_, i64>("count"), 1);
@@ -68,7 +62,7 @@ async fn rookie_grants_are_persistent_and_atomic() {
         }
         assert!(db.query("SELECT 1 FROM game.module_charges WHERE ship_id = $1", &[&ship]).await.unwrap().is_empty());
         db.execute("DELETE FROM game.items WHERE location_id = $1", &[&ship]).await.unwrap();
-        assert_eq!(ensure_ship(&c, owner, race, station).await.ok().unwrap(), ship);
+        assert_eq!(ensure_ship(&db, &sde, owner, race, station).await.ok().unwrap(), ship);
         assert!(db.query("SELECT 1 FROM game.items WHERE location_id = $1", &[&ship]).await.unwrap().is_empty());
         db.execute("UPDATE game.characters SET ship_id = NULL WHERE character_id = $1", &[&owner]).await.unwrap();
         db.execute("DELETE FROM game.items WHERE item_id = $1", &[&ship]).await.unwrap();
@@ -84,7 +78,6 @@ async fn rookie_grants_are_persistent_and_atomic() {
         assert_eq!(db.query_one("SELECT ship_id FROM game.characters WHERE character_id = $1", &[&owner]).await.unwrap().get::<_, Option<i64>>("ship_id"), None);
         db.execute("DELETE FROM game.characters WHERE character_id = $1", &[&owner]).await.unwrap();
     }
-    assert!(rookie_fit::for_ship(-1).is_none());
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
 }
 

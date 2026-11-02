@@ -9,12 +9,10 @@
 //! First selection serializes rookie ship grants on the character row and grants a
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
 
-mod rookie_fit;
-
 use crate::dao::{accounts, characters, items, skills};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ACCOUNT_CASH, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_HANGAR};
+use crate::consts::{ACCOUNT_CASH, FALLBACK_ROOKIE_SHIP, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::lua::events::GameEvent;
 use crate::messages;
@@ -36,8 +34,6 @@ const NAME_TOO_MANY_SPACES: i64 = -6;
 const NAME_CONSECUTIVE_SPACES: i64 = -7;
 /// Client chooseNameSection.py unavailable-name result.
 const NAME_UNAVAILABLE: i64 = -101;
-/// SDE invTypes: Velator, the fallback rookie ship.
-const FALLBACK_ROOKIE_SHIP: i32 = 606;
 /// SDE chrRaces: Caldari, used when the creation argument is missing.
 const FALLBACK_RACE_ID: i64 = 1;
 /// SDE chrBloodlines: Deteis, used when the creation argument is missing.
@@ -172,27 +168,6 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
     Ok(char_id)
 }
 
-/// Give the character a rookie ship in their station hangar if they have none.
-async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) -> Result<i64, CallError> {
-    let ship_type = c.sde.characters.race(race_id as i64).and_then(|race| race.ship_type_id).unwrap_or(FALLBACK_ROOKIE_SHIP);
-    let ship_id = c.db.transaction(
-        |tx, _: &mut Outbox| Box::pin(async move {
-            characters::selection::lock_character(tx, char_id).await?;
-            if let Some(ship_id) = characters::selection::ship_id(tx, char_id).await? {
-                return Ok::<i64, CallError>(ship_id);
-            }
-            let fit = rookie_fit::for_ship(ship_type)
-                .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no rookie fit for ship type {ship_type}")))?;
-            let ship_id = items::creation::rookie_ship(tx, fit.ship, char_id, station_id, FLAG_HANGAR).await?;
-            items::creation::fitted_items(tx, ship_id, char_id, fit.items).await?;
-            characters::selection::set_ship(tx, char_id, ship_id).await?;
-            Ok(ship_id)
-        }),
-        |value, _| async move { Ok(value) },
-    ).await?;
-    Ok(ship_id)
-}
-
 /// Select a character and restore its station or space session (eveSessions.GetSessionValuesFromRowset).
 async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError> {
     let r = characters::selection::selected(&c.db, char_id, c.login.user_id).await.map_err(db_err)?
@@ -204,7 +179,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     let space_ship = characters::selection::space_ship(&c.db, char_id).await.map_err(db_err)?;
     let ship = match (&space_ship, station) {
         (Some(s), None) => s.item_id,
-        (_, Some(st)) => ensure_ship(c, char_id, race, st).await?,
+        (_, Some(st)) => super::character::provisioning::ensure_ship(&c.db, &c.sde, char_id, race, st).await?,
         (None, None) => return Err(CallError::Internal(anyhow::anyhow!("character {char_id} is in space without a ship"))),
     };
     let has_skills = skills::selection::has_skills(&c.db, char_id).await.map_err(db_err)?;

@@ -2,8 +2,7 @@
 //! Character selection grants these persistent items; there is no client fit mirror,
 //! no charges and no retroactive refit of existing ships.
 
-use crate::consts::{FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
-use super::FALLBACK_ROOKIE_SHIP;
+use crate::consts::{FALLBACK_ROOKIE_SHIP, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
 
 /// SDE invTypes: Ibis.
 const IBIS: i32 = 601;
