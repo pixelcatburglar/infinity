@@ -24,6 +24,7 @@
 //! Operators configure basic mission rewards, site placement and NPC spawn distances.
 //! Epic arc rewards continue to come from mission data.
 mod agent_mgr;
+mod epic_arc_status;
 mod gm;
 mod mechanics;
 mod mission_tracker_mgr;
@@ -200,6 +201,7 @@ impl Mission {
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
         "agentMgr" => agent_mgr::dispatch(c, call).await,
+        "epicArcStatus" => epic_arc_status::dispatch(c, call).await,
         "missionTrackerMgr" => mission_tracker_mgr::dispatch(c, call).await,
         _ => None,
     }

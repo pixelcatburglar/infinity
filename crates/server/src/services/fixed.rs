@@ -225,6 +225,8 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
         ("charUnboundMgr", "GetQAStarterSystemIDs") => Ok(Value::list([])),
         // petitionWindow.py:CategoryScreen iterates characterID and characterName before selection.
         ("charUnboundMgr", "GetCharacterInfo") => Ok(Value::list([])),
+        // evemissions/client/qa_tools.py:_select_mission stops on an empty candidate list.
+        ("agentMgr", "GetPlausibleMissionIDs") => Ok(Value::list([])),
 
         // ledgerSvc.py:LedgerSvc.GetStructuresForCorpData reads solarSystemID, itemID and itemName.
         ("corpMiningLedger", "GetObserversWithMiningEvents") => Ok(Value::list([])),

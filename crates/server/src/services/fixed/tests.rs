@@ -37,3 +37,12 @@ fn mobile_binding_callback_does_not_match_other_calls() {
         assert!(root(&call).is_none());
     }
 }
+
+#[test]
+fn qa_mission_selection_matches_only_its_exact_call() {
+    let kwargs = Value::None;
+    for (service, method) in [("otherService", "GetPlausibleMissionIDs"), ("agentMgr", "OtherMethod")] {
+        let call = Call { service, method, args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+        assert!(root(&call).is_none());
+    }
+}
