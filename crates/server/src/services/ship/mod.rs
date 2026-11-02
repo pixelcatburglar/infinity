@@ -167,11 +167,11 @@ const JUMP_CLOAK_SECONDS: i64 = 60;
 const UE_LOCID: i64 = 3;
 
 /// Install an arriving ship with the actor-managed restoring cloak.
-pub(super) async fn arrive_cloaked(c: &mut Client, system: i64, mut ball: Ball) -> Result<i64, CallError> {
+pub(super) async fn arrive_cloaked(world: &crate::space::World, system: i64, mut ball: Ball) -> Result<i64, CallError> {
     let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND;
     ball.cloak = CLOAK_RESTORE;
     ball.cloak_until = cloak_until;
-    c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+    world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     Ok(cloak_until)
 }
 
@@ -256,7 +256,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
     let ball = ship_ball(c, ship, pos).await?;
-    let cloak_until = arrive_cloaked(c, dest_system, ball).await?;
+    let cloak_until = arrive_cloaked(&c.world, dest_system, ball).await?;
     // The client rebinds its remote ballpark for the new system, which sends SetState.
     c.change_session(vec![
         ("solarsystemid", Value::Int(dest_system)),

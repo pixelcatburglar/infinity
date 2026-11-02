@@ -9,7 +9,7 @@
 //! First selection serializes rookie ship grants on the character row and grants a
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
 
-use crate::dao::{accounts, characters, items, skills};
+use crate::dao::{accounts, characters};
 use super::character::creation::{self, NewPilot, NAME_VALID};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
@@ -113,40 +113,15 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     let station = r.station_id;
     let system = r.solar_system_id;
     let race = r.race_id;
-    // A character that logged off in space resumes in its ship at the stored position.
-    let space_ship = characters::selection::space_ship(&c.db, char_id).await.map_err(db_err)?;
-    let ship = match (&space_ship, station) {
-        (Some(s), None) => s.item_id,
-        (_, Some(st)) => super::character::provisioning::ensure_ship(&c.db, &c.sde, char_id, race, st).await?,
-        (None, None) => return Err(CallError::Internal(anyhow::anyhow!("character {char_id} is in space without a ship"))),
-    };
-    let has_skills = skills::selection::has_skills(&c.db, char_id).await.map_err(db_err)?;
-    if !has_skills {
-        super::skills::starting::grant_starting_skills(&c.db, &c.sde, char_id, race).await?;
-    }
-    characters::selection::logoff(&c.db, char_id).await.map_err(db_err)?;
-    super::effects::online::reconcile_ship(c, char_id, ship).await?;
-    if station.is_some() {
-        super::combat::load_docked_condition(&c.db, &c.world, char_id, ship).await?;
-    }
+    let super::presence::Prepared { ship_id: ship, cloak_until } = super::presence::prepare(
+        &c.db, &c.world, &c.sde, char_id, &r,
+        |n| super::effects::online::dispatch_notification(n, c),
+    ).await?;
     let int = Value::Int;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     let corp = r.corporation_id;
     let roles = r.roles;
     let alliance = r.alliance_id;
-    let cloak_until = if let Some(s) = space_ship.as_ref().filter(|_| station.is_none()) {
-        let type_id = items::inventory::type_id(&c.db, ship).await.map_err(db_err)?
-            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing SDE ship item")))?;
-        let vessel = items::space_ships::FreeShip {
-            item_id: ship, type_id, owner_id: char_id, corporation_id: corp,
-            alliance_id: alliance.unwrap_or(-1), pos: [s.x.unwrap(), s.y.unwrap(), s.z.unwrap()],
-        };
-        let security = super::crimewatch::security_status(&c.db, char_id).await?;
-        let ball = super::ship::balls::piloted(&c.db, c.sde.clone(), &vessel, char_id, security).await?.install();
-        Some(super::ship::arrive_cloaked(c, system, ball).await?)
-    } else {
-        None
-    };
     c.change_session(vec![
         ("charid", int(char_id)),
         ("corpid", int(corp)),

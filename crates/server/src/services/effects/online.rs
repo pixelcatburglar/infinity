@@ -189,16 +189,18 @@ pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
     Ok(())
 }
 
-pub(in crate::services) async fn reconcile_ship(c: &Client, owner: i64, ship: i64) -> Result<(), CallError> {
+pub(in crate::services) async fn reconcile_ship(
+    db: &crate::db::Db, sde: &Arc<Sde>, owner: i64, ship: i64,
+    notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError> + Send,
+) -> Result<(), CallError> {
     let _lock = crate::services::market::lock().await;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
+    let sde = sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
             Box::pin(async move { reconcile_core(tx, &sde, outbox, owner, ship).await })
         },
-        |value, outbox| async move { dispatch_changed(value, outbox, c) },
+        |value, outbox| async move { dispatch_entries(value, outbox, notify) },
     ).await
 }
 

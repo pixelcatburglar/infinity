@@ -161,7 +161,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     assert_eq!(dogma::online(&db, f.ship).await.unwrap().len(), 2);
     assert_eq!(crate::dao::items::charges::banks(&db, f.ship).await.unwrap().len(), 1);
     assert!(events.try_recv().is_err());
-    online::reconcile_ship(client, f.owner, f.ship).await.ok().expect("committed overload reconciliation");
+    online::reconcile_ship(&client.db, &client.sde, f.owner, f.ship, |n| online::dispatch_notification(n, client)).await.ok().expect("committed overload reconciliation");
     assert!(dogma::online(&db, f.ship).await.unwrap().is_empty());
     assert!(crate::dao::items::charges::banks(&db, f.ship).await.unwrap().is_empty());
     assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|(name, _)| name == "OnWeaponBanksChanged"));

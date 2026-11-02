@@ -1,4 +1,5 @@
 use super::*;
+use crate::dao::items;
 use crate::consts::{FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
 
 #[tokio::test]
