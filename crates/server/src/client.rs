@@ -310,7 +310,7 @@ impl Client {
         }
         self.world.unobserve(self.login.client_id);
         if let Some(char_id) = self.session.int("charid") {
-            services::fleet_logged_off(&self.world, char_id);
+            services::fleets::lifecycle::leave(&self.world, char_id);
             services::drones::settings::logged_off(char_id);
             self.world.unregister_pilot(char_id);
             self.chat.disconnect_character(char_id);

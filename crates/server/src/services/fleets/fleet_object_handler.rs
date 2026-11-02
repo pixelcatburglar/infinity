@@ -160,7 +160,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "LeaveFleet" => {
             let mut st = state();
             if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
-            remove_member_from(&mut st, &world, fleet_id, me);
+            lifecycle::remove_member_from(&mut st, &world, fleet_id, me);
             Ok(Value::None)
         }
         "KickMember" => {
@@ -170,7 +170,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             if !allowed {
                 return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_REMOVE_MEMBER)));
             }
-            remove_member_from(&mut st, &world, fleet_id, target);
+            lifecycle::remove_member_from(&mut st, &world, fleet_id, target);
             Ok(Value::None)
         }
         "DisbandFleet" => {
@@ -181,7 +181,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 _ => return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_DISBAND))),
             };
             for ch in members {
-                remove_member_from(&mut st, &world, fleet_id, ch);
+                lifecycle::remove_member_from(&mut st, &world, fleet_id, ch);
             }
             Ok(Value::None)
         }

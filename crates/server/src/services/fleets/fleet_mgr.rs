@@ -60,7 +60,7 @@ pub(super) fn update_watchlist(st: &mut State, me: i64, method: &str, args: &[Va
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.method {
         "ForceLeaveFleet" => {
-            logged_off(&c.world, c.session.int("charid").unwrap_or(0));
+            lifecycle::leave(&c.world, c.session.int("charid").unwrap_or(0));
             Some(Ok(Value::None))
         }
         "AddToWatchlist" | "RemoveFromWatchlist" | "RegisterForDamageUpdates" => {

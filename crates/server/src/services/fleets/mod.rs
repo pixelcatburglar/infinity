@@ -242,37 +242,6 @@ fn bound_fleet(call: &Call<'_>) -> i64 {
     call.bind_params.and_then(|p| p.as_int().or_else(|| p.items().and_then(|t| t.first()?.as_int()))).unwrap_or(0)
 }
 
-/// Remove a member (leaving, kicked or logged off); an empty fleet goes away and a
-/// leaderless one passes the lead on.
-fn remove_member_from(st: &mut State, world: &World, fleet_id: i64, char_id: i64) {
-    if !st.is_member(fleet_id, char_id) { return; }
-    st.clear_member_references(char_id);
-    st.of.remove(&char_id);
-    let Some(f) = st.fleets.get_mut(&fleet_id) else { return };
-    let Some(old) = f.members.remove(&char_id) else { return };
-    world.notify_pilot(char_id, "__session", session_pairs(None, None));
-    world.notify_pilot(char_id, "OnFleetLeave", vec![Value::Int(char_id)]);
-    broadcast(world, f, None, "OnFleetLeave", vec![Value::Int(char_id)]);
-    if f.members.is_empty() {
-        st.fleets.remove(&fleet_id);
-        info!("fleets: {fleet_id} disbanded");
-        return;
-    }
-    if old.role == ROLE_LEADER {
-        if let Some((&next, m)) = f.members.iter_mut().next() {
-            let before = m.clone();
-            m.role = ROLE_LEADER;
-            m.job |= JOB_CREATOR;
-            m.wing = NONE_ID;
-            m.squad = NONE_ID;
-            let after = m.clone();
-            world.notify_pilot(next, "__session", session_pairs(Some(fleet_id), Some(&after)));
-            broadcast(world, f, None, "OnFleetMemberChanged", changed(next, fleet_id, &before, &after, false));
-            fleet_proxy::leader_changed(world, f, next);
-        }
-    }
-}
-
 fn changed(char_id: i64, fleet_id: i64, before: &Member, after: &Member, only: bool) -> Vec<Value> {
     vec![
         Value::Int(char_id),
@@ -291,15 +260,6 @@ fn changed(char_id: i64, fleet_id: i64, before: &Member, after: &Member, only: b
     ]
 }
 
-/// A pilot logged off: they leave their fleet.
-pub fn logged_off(world: &World, char_id: i64) {
-    let mut st = state();
-    st.clear_departing(char_id);
-    if let Some(f) = st.of.get(&char_id).copied() {
-        remove_member_from(&mut st, world, f, char_id);
-    }
-}
-
 fn is_leader(f: &Fleet, char_id: i64) -> bool {
     f.members.get(&char_id).is_some_and(|m| m.role == ROLE_LEADER)
 }
@@ -310,6 +270,7 @@ pub(crate) mod damage;
 mod fleet_mgr;
 mod fleet_object_handler;
 mod fleet_proxy;
+pub(crate) mod lifecycle;
 pub(super) mod warp;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
