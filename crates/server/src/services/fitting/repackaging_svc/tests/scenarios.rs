@@ -24,6 +24,31 @@ async fn unchanged(c: &mut Client, db: &Db, f: Fixture, id: i64, events: &mut Ev
     assert!(events.try_recv().is_err());
 }
 
+pub(super) async fn sealed_wrap(c: &mut Client, db: &Db, f: Fixture, rig_type: i32, events: &mut Events) {
+    let ordinary = insert(db, f.owner, rig_type, f.station, FLAG_HANGAR, 1, true, false).await;
+    let wrap = insert(db, f.owner, crate::consts::TYPE_PLASTIC_WRAP, f.station, FLAG_HANGAR, -2, true, false).await;
+    let child = insert(db, f.owner, rig_type, wrap, FLAG_CARGO, 3, false, false).await;
+    assert!(ordinary < wrap);
+    let before = fingerprint(db).await;
+    for ids in [&[wrap][..], &[ordinary, wrap][..]] {
+        let result = many(c, f.station, ids, Some(Value::Bool(true))).await;
+        assert!(matches!(result, Err(CallError::User { msg, dict }) if msg == crate::messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert_eq!(fingerprint(db).await, before);
+        assert!(events.try_recv().is_err());
+        assert!(c.outbox.is_empty());
+        let row = db.query_one("SELECT quantity,singleton FROM game.items WHERE item_id=$1", &[&wrap]).await.unwrap();
+        assert_eq!(row.get::<_, i32>("quantity"), -2);
+        assert!(row.get::<_, bool>("singleton"));
+        let row = db.query_one("SELECT quantity,singleton FROM game.items WHERE item_id=$1", &[&ordinary]).await.unwrap();
+        assert_eq!(row.get::<_, i32>("quantity"), 1);
+        assert!(row.get::<_, bool>("singleton"));
+        let row = db.query_one("SELECT location_id,quantity,singleton FROM game.items WHERE item_id=$1", &[&child]).await.unwrap();
+        assert_eq!(row.get::<_, i64>("location_id"), wrap);
+        assert_eq!(row.get::<_, i32>("quantity"), 3);
+        assert!(!row.get::<_, bool>("singleton"));
+    }
+}
+
 async fn contents(c: &mut Client, db: &Db, f: Fixture, hull_type: i32, rig_type: i32, events: &mut Events) {
     let module_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE) && t.effects().iter().any(|e| e.effect_id == 12)).expect("online high-slot module").type_id;
     let charge_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_CHARGE)).expect("charge").type_id;

@@ -10,6 +10,7 @@
 //!   station; delivering the wrap to their hangar at the end station hands the goods to the
 //!   issuer there and pays out reward and collateral. A failed courier contract pays the
 //!   collateral to the issuer and leaves the goods with the acceptor, where the wrap is.
+//!   The singleton wrap's negative quantity encodes its contract volume in hundredths.
 //!
 //! Escrowed items stay in game.items, located at -contractID. An expired or rejected
 //! contract waits for its issuer to delete it and take the escrow back; expired auctions
@@ -47,7 +48,7 @@ use super::market::{lock, round2, station};
 use crate::dao::items::transfers;
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_PLASTIC_WRAP};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
@@ -61,12 +62,12 @@ use std::sync::Arc;
 use tracing::info;
 
 
-const TYPE_PLASTIC_WRAP: i32 = 3468;
-
 // appConst.conType*
 const TYPE_ITEM_EXCHANGE: i32 = 1;
 const TYPE_AUCTION: i32 = 2;
 const TYPE_COURIER: i32 = 3;
+/// `eve/common/script/util/contractscommon.py:36`, checked by `createContractWnd.py:1371-1372`.
+const MAX_COURIER_VOLUME: f64 = 1_200_000.0;
 // contractscommon.CONTYPE_*
 const CONTYPE_AUCTION_AND_ITEM_EXCHANGE: i64 = 10;
 const CONTYPE_ALL: i64 = 11;

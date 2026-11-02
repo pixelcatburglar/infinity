@@ -68,6 +68,8 @@ pub const DRONE_STATE_DEPARTING: i32 = 4;
 pub const SKILL_BROKER_RELATIONS: i32 = 3446;
 /// Client `inventorycommon.const.typeAccounting`.
 pub const SKILL_ACCOUNTING: i32 = 16622;
+/// Client `inventorycommon/const.py` typePlasticWrap.
+pub const TYPE_PLASTIC_WRAP: i32 = 3468;
 /// SDE invTypes: Character (Gallente), used for player owners.
 pub const TYPE_CHARACTER: i32 = 1373;
 /// SDE invTypes: Solar System.

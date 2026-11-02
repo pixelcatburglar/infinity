@@ -200,7 +200,7 @@ async fn routed_refusals_preserve_inventory_and_stale_helper_refuses() -> anyhow
         ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(source), Value::Int(ship)]).await.is_err(), "overflow admitted");
         ensure!(item(&f.db, &f.sde, overflow).await.map_err(|e| anyhow!("load: {e:?}"))?.context("overflow output missing")?.quantity == i32::MAX, "overflow output changed");
         let expected = item(&f.db, &f.sde, source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing")?;
-        transfers::add(&f.db, source, 1).await?;
+        ensure!(transfers::add(&f.db, source, 1).await?, "source stack missing");
         let context = Context { character: f.owner, ship, system: f.system };
         let mut outbox = Outbox::default();
         ensure!(compress_tx(&f.db, &f.sde, &mut outbox, &context, SourceGuard::from(&expected)).await.is_err(), "stale source admitted");

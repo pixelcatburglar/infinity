@@ -23,7 +23,7 @@ use crate::client::{filetime_now, short, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
 use crate::dao::items::{charges, dogma as dogma_dao};
-use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
+use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -36,15 +36,24 @@ const ONLINE_EFFECT_DURATION: i64 = -1;
 /// Server online-effect repeat wire choice for godma.py RefreshItemEffects' tuple.
 const ONLINE_EFFECT_REPEAT: i64 = -1;
 
-/// Inventory wire quantity: singleton originals are -1 and blueprint copies are -2.
-pub(super) fn wire_quantity(singleton: bool, quantity: i64) -> i64 {
-    if singleton { if quantity == BLUEPRINT_COPY_QUANTITY { BLUEPRINT_COPY_QUANTITY } else { SINGLETON_QUANTITY } } else { quantity }
+/// Inventory wire quantity preserves encoded plastic wrap volumes; other singleton
+/// originals are -1 and blueprint copies are -2.
+pub(super) fn wire_quantity(type_id: i32, singleton: bool, quantity: i64) -> i64 {
+    if !singleton {
+        quantity
+    } else if type_id == TYPE_PLASTIC_WRAP && quantity < 0 {
+        quantity
+    } else if quantity == BLUEPRINT_COPY_QUANTITY {
+        BLUEPRINT_COPY_QUANTITY
+    } else {
+        SINGLETON_QUANTITY
+    }
 }
 
 
 impl Item {
     pub fn row(&self) -> Value {
-        let quantity = wire_quantity(self.singleton, self.quantity as i64);
+        let quantity = wire_quantity(self.type_id, self.singleton, self.quantity as i64);
         item_descriptor().row(&[
             Value::Int(self.item_id),
             Value::Int(self.type_id as i64),

@@ -69,9 +69,9 @@ impl ItemId {
     fn from_row(row: &Row) -> Self { Self { item_id: row.get("item_id") } }
 }
 
-pub(crate) async fn insert_package(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, location: i64, flag: i32, custom_info: &str) -> Result<i64, Error> {
+pub(crate) async fn insert_package(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, location: i64, flag: i32, quantity: i32, custom_info: &str) -> Result<i64, Error> {
     let row = ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, custom_info)
-                             VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id", &[&type_id, &owner, &location, &flag, &custom_info]).await?;
+                             VALUES ($1, $2, $3, $4, $5, true, $6) RETURNING item_id", &[&type_id, &owner, &location, &flag, &quantity, &custom_info]).await?;
     Ok(ItemId::from_row(&row).item_id)
 }
 

@@ -1,5 +1,6 @@
 //! Physical drone recovery and contact-time mining delivery.
 //! Inventory transitions commit before space removal and client notifications.
+//! Drone bay occupancy uses the client item-aware volume for existing and returning items.
 use std::sync::Arc;
 use marshal::Value;
 use crate::client::Client;
@@ -46,14 +47,13 @@ async fn lock_sources(ex: &(impl Executor + ?Sized), sde: &Sde, system: i64, sou
 }
 
 async fn check_bay(ex: &(impl Executor + ?Sized), sde: &Sde, ship: i64, capacity: f64, sources: &[Source]) -> Result<(), CallError> {
-    let items = load_items(ex, sde, ItemQuery::LocationFlags(ship, &[FLAG_DRONE_BAY])).await.map_err(db_err)?;
-    let raw = crate::dao::items::loading::load_items(ex, ItemQuery::LocationFlags(ship, &[FLAG_DRONE_BAY])).await.map_err(db_err)?;
-    if items.len() != raw.len() { return Err(CallError::Internal(anyhow::anyhow!("bay item missing SDE type"))); }
+    let items = crate::dao::items::loading::load_items(ex, ItemQuery::LocationFlags(ship, &[FLAG_DRONE_BAY])).await.map_err(db_err)?;
     let mut used = 0.0;
-    for (type_id, quantity) in items.iter().map(|i| (i.type_id, i.quantity)).chain(sources.iter().map(|i| (i.type_id, 1))) {
-        let volume = sde.types.get(type_id).and_then(|t| t.volume).ok_or_else(|| CallError::Internal(anyhow::anyhow!("bay item missing volume")))?;
-        if !volume.is_finite() || volume < 0.0 || quantity <= 0 { return Err(notify_error(text::NOT_AVAILABLE)); }
-        used += volume * f64::from(quantity);
+    for (type_id, singleton, quantity) in items.iter().map(|i| (i.type_id, i.singleton, i64::from(i.quantity))).chain(sources.iter().map(|i| (i.type_id, true, 1))) {
+        if quantity <= 0 && !(singleton && type_id == crate::consts::TYPE_PLASTIC_WRAP) { return Err(notify_error(text::NOT_AVAILABLE)); }
+        let volume = crate::services::item_volume::item_volume(sde, type_id, singleton, quantity, None)?;
+        if !volume.is_finite() || volume < 0.0 { return Err(notify_error(text::NOT_AVAILABLE)); }
+        used += volume;
     }
     if !capacity.is_finite() || capacity < 0.0 || !used.is_finite() || used > capacity { return Err(notify_error(text::BAY_FULL)); }
     Ok(())

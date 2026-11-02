@@ -44,6 +44,7 @@ mod hacking;
 pub(crate) mod industry;
 mod insurance;
 pub(crate) mod inventory;
+mod item_volume;
 pub(crate) mod items;
 pub(crate) mod mail;
 pub(crate) mod market;

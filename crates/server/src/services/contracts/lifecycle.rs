@@ -4,6 +4,7 @@
 //! Expiry, courier duration, item counts and text lengths use the configured contracts policy.
 //! Status transitions are guarded; overdue couriers are completed or failed manually.
 //! Auction candidates are rechecked in their settlement transaction.
+//! Escrow volume uses client packaged-item rules and the selected logical quantities.
 
 use super::*;
 use crate::dao::contracts::lifecycle as contract_dao;
@@ -183,6 +184,15 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
             contract_dao::insert_requested_item(db, id, *type_id, *qty).await.map_err(db_err)?;
         }
         let volume = volume(db, &sde, id).await?;
+        if kind == TYPE_COURIER {
+            if volume > MAX_COURIER_VOLUME {
+                return Err(user_error(messages::MSG_CON_EXCEEDS_MAX_VOLUME, vec![
+                    ("max".into(), Value::Float(MAX_COURIER_VOLUME)),
+                    ("vol".into(), Value::Float(volume)),
+                ]));
+            }
+            crate::services::item_volume::encode_wrap_quantity(volume)?;
+        }
         contract_dao::update_volume(db, id, volume).await.map_err(db_err)?;
         ownership::tell(db, outbox, assignee, "OnContractAssigned", id).await?;
         created.push(Value::Int(id));
@@ -204,14 +214,16 @@ fn expiry_time(now: i64, minutes: i128) -> i64 {
 }
 
 async fn volume(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, id: i64) -> Result<f64, CallError> {
-    Ok(sum_volume(shared::items(db, &[id]).await.map_err(db_err)?.iter()
-        .filter(|item| item.in_crate)
-        .filter_map(|item| sde.types.get(item.type_id as i32).and_then(|t| t.volume).map(|volume| volume * item.quantity as f64))))
-}
-
-fn sum_volume(volumes: impl Iterator<Item = f64>) -> f64 {
-    // Match SQL COALESCE(SUM, 0) sign on an empty set.
-    volumes.fold(0.0, |total, v| total + v)
+    let entries: Vec<_> = shared::items(db, &[id]).await.map_err(db_err)?.into_iter().filter(|item| item.in_crate).collect();
+    let ids: Vec<_> = entries.iter().map(|item| item.item_id.ok_or_else(|| anyhow::anyhow!("contract escrow item missing"))).collect::<Result<_, _>>()?;
+    let roots = load_items(db, sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
+    let mut total = 0.0;
+    for (entry, item_id) in entries.iter().zip(ids) {
+        let root = roots.iter().find(|root| root.item_id == item_id)
+            .ok_or_else(|| anyhow::anyhow!("contract escrow item {item_id} or its SDE type is missing"))?;
+        total += crate::services::item_volume::item_volume(sde, root.type_id, root.singleton, i64::from(root.quantity), Some(entry.quantity))?;
+    }
+    Ok(total)
 }
 
 /// `AcceptContract(contractID, forCorp)` -> the contract.
@@ -316,7 +328,8 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                 TYPE_COURIER => {
                     ownership::debit(db, outbox, owner, k.collateral).await?;
                     let dest = custody::receiving(owner.id, k.start);
-                    let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, owner.id, dest.location, dest.flag, &messages::contract_package_name(id)).await.map_err(db_err)?;
+                    let quantity = crate::services::item_volume::encode_wrap_quantity(k.volume)?;
+                    let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, owner.id, dest.location, dest.flag, quantity, &messages::contract_package_name(id)).await.map_err(db_err)?;
                     let item = load_items(db, &sde, ItemQuery::Id(wrap)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
                     if for_corp {
                         super::super::inventory::notify_corp_item_change(db, outbox, &item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;

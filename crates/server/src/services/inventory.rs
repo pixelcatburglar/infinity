@@ -4,18 +4,19 @@
 //! Item quantities are stored in `game.items`; static item data comes from the loaded SDE.
 //! Merge plans are guarded against stale snapshots. Staged trade items and their
 //! descendants cannot be moved, split, merged, trashed, renamed or accessed here.
-//! Item capacity and contents are read from one game-item statement snapshot.
+//! Item capacity and contents share one game-item snapshot; child volumes follow
+//! `inventorycommon.util.GetItemVolume`, including packaged and assembled items.
 //! Corporation deliveries are station-owned custody, viewable by authorized
 //! members and received only through server business operations, never drops.
 //! Player transfers and merges check physical reachability of their inventories.
 
-use crate::dao::items::loading::{Item, ItemQuery};
+use crate::dao::items::loading::{self, GameItem, Item, ItemQuery};
 use super::items::load_items;
 use crate::dao::items::inventory as inventory_dao;
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{dogma::ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_CHARACTER};
+use crate::consts::{dogma::ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
 use crate::consts::{CORP_HANGAR_DIVISIONS, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
@@ -184,26 +185,26 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
     Ok(item.unwrap_or(Value::None))
 }
 
-fn item_capacity(items: &[Item], id: i64, data: impl Fn(i32) -> (Option<f64>, Option<f64>, Option<f64>)) -> (f64, f64) {
-    let Some(parent) = items.iter().find(|item| item.item_id == id) else { return (0.0, 0.0) };
-    let (attribute, physical, _) = data(parent.type_id);
-    // The former SQL COALESCE(sum(...), 0) returned positive zero for an empty sum.
-    let used = items.iter().filter(|item| item.location_id == parent.item_id).filter_map(|item| {
-        data(item.type_id).2.map(|volume| volume * f64::from(item.quantity.max(1)))
-    }).fold(0.0_f64, |total, value| total + value);
-    (attribute.or(physical).unwrap_or(0.0), used)
+fn item_capacity(items: &[GameItem], id: i64, sde: &Sde) -> Result<(f64, f64), CallError> {
+    let Some(parent) = items.iter().find(|item| item.item_id == id) else { return Ok((0.0, 0.0)) };
+    let used = items.iter().filter(|item| item.location_id == parent.item_id).try_fold(0.0_f64, |total, item| {
+        Ok::<_, CallError>(total + super::item_volume::item_volume(sde, item.type_id, item.singleton, i64::from(item.quantity), None)?)
+    })?;
+    let data = sde.types.get(parent.type_id).ok_or_else(|| anyhow::anyhow!("missing SDE type {}", parent.type_id))?;
+    let capacity = if parent.type_id == TYPE_PLASTIC_WRAP { used } else { data.attribute(ATTR_CAPACITY).or(data.capacity).unwrap_or(0.0) };
+    Ok((capacity, used))
+}
+
+async fn item_capacity_reply(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64) -> Result<Value, CallError> {
+    let items = loading::load_items(ex, ItemQuery::IdOrLocation(id)).await.map_err(db_err)?;
+    let (cap, used) = item_capacity(&items, id, sde)?;
+    Ok(keyval([("capacity", Value::Float(cap)), ("used", Value::Float(used))]))
 }
 
 async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError> {
     let (cap, used) = match container {
         Container::Hangar { .. } | Container::Deliveries { .. } => (1e12, 0.0),
-        Container::Item(id) => {
-            let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocation(*id)).await.map_err(db_err)?;
-            item_capacity(&items, *id, |type_id| {
-                let data = c.sde.types.get(type_id).unwrap();
-                (data.attribute(ATTR_CAPACITY), data.capacity, data.volume)
-            })
-        }
+        Container::Item(id) => return item_capacity_reply(&c.db, &c.sde, *id).await,
     };
     Ok(keyval([("capacity", Value::Float(cap)), ("used", Value::Float(used))]))
 }

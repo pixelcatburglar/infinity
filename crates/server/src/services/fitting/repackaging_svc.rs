@@ -2,13 +2,14 @@
 //! `eve/client/script/ui/services/menuSvcExtras/invItemFunctions.py`.
 //! Uses game items, charges, reload reservations, banks, insurance and dogma overrides,
 //! plus SDE stations and types. Confirmed ordinary ship rigs are destroyed; other
-//! direct contents return to the owning station hangar atomically. Structure access
-//! and repackaging the contents of non-ship containers are unsupported.
+//! direct contents return to the owning station hangar atomically.
+//! Structure access, sealed plastic wrap repackaging, and repackaging the contents
+//! of non-ship containers are unsupported.
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::client::Client;
 use crate::consts::dogma::EFFECT_ONLINE;
-use crate::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR, FLAG_RIG_FIRST, FLAG_RIG_LAST, GROUP_STRATEGIC_CRUISER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON};
+use crate::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR, FLAG_RIG_FIRST, FLAG_RIG_LAST, GROUP_STRATEGIC_CRUISER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, TYPE_PLASTIC_WRAP};
 use crate::dao::items::{charges, combat as combat_dao, dogma, fitting as fitting_dao, inventory as inventory_dao, loading::{Item, ItemQuery}, pending_reloads, ship};
 use crate::db::outbox::Outbox;
 use crate::messages;
@@ -60,6 +61,7 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                         || item.flag_id != FLAG_HANGAR || sde.map.station(station).is_none() {
                         return Err(refuse());
                     }
+                    if item.singleton && item.type_id == TYPE_PLASTIC_WRAP { return Err(refuse()); }
                     if item.singleton { roots.push(item); }
                 }
                 let mut locked_children = BTreeMap::new();

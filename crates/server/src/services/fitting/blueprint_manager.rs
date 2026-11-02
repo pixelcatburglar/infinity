@@ -27,7 +27,7 @@ async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Val
             let solar_system = station.and_then(|s| s.solar_system_id).or(r.location_parent_id).or(r.character_system_id);
             let singleton = r.singleton;
             let stored = r.quantity as i64;
-            let quantity = wire_quantity(singleton, stored);
+            let quantity = wire_quantity(r.type_id, singleton, stored);
             keyval([
                 ("itemID", Value::Int(r.item_id)),
                 ("typeID", Value::Int(r.type_id as i64)),

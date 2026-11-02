@@ -146,6 +146,34 @@ async fn rig_confirmation_preserves_then_destroys() {
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
+async fn sealed_wrap_repackaging_refused_without_changes() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let station = sde.map.stations().next().expect("SDE station").station_id;
+    let hull_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.group_id.map(i64::from) != Some(GROUP_STRATEGIC_CRUISER)).expect("ordinary hull").type_id;
+    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_RIG_SLOT)).expect("rig type").type_id;
+    let before = fingerprint(&db).await;
+    let f = create(&db, station, hull_type, rig_type).await;
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, address) = listener.accept().await.unwrap();
+        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost", test_db.clone(), world.clone()), world, crate::handshake::Login { user_id: f.account, user_name: "repackage-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
+        c.session.apply(vec![("charid", Value::Int(f.owner))]);
+        let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
+        c.notify_tx = notify;
+        scenarios::sealed_wrap(&mut c, &test_db, f, rig_type, &mut events).await;
+    }).await;
+    cleanup(&db, f).await;
+    assert_eq!(fingerprint(&db).await, before);
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
 async fn late_hull_update_failure_rolls_back_rig_and_notices() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();

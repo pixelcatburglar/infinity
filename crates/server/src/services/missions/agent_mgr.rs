@@ -1,5 +1,7 @@
 //! Agent manager service and dialogue.
 //! Successful acceptance queues an event after the existing state and cargo writes.
+//! Courier and trade cargo objectives use packaged item volume from the loaded SDE,
+//! matching `agentinteraction/objectivesteps.py`; unsupported mission kinds have no cargo objective.
 use super::*;
 // ---------------------------------------------------------------- client shapes
 
@@ -50,7 +52,7 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
     let cargo_value = |has: bool, (type_id, qty): (i32, i32), volume: f64| {
         Value::dict([("hasCargo", Value::Bool(has)), ("quantity", Value::Int(qty as i64)), ("typeID", Value::Int(type_id as i64)), ("volume", Value::Float(volume))])
     };
-    let volume = |c: &Client, type_id: i32| c.sde.types.get(type_id).and_then(|t| t.volume).unwrap_or(0.0);
+    let volume = |c: &Client, (type_id, qty): (i32, i32)| crate::services::item_volume::item_volume(&c.sde, type_id, false, i64::from(qty), None);
     match (m.kind, m.cargo) {
         (Kind::Talk, _) => objectives.push(Value::tuple([Value::str("agent"), Value::tuple([Value::Int(hand_in), agent_location(c, hand_in).await?])])),
         (Kind::Courier, Some(cargo)) => {
@@ -61,14 +63,14 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
                 agent_location(c, m.agent_id).await?,
                 Value::Int(hand_in),
                 agent_location(c, hand_in).await?,
-                cargo_value(has, cargo, volume(c, cargo.0) * cargo.1 as f64),
+                cargo_value(has, cargo, volume(c, cargo)?),
             ]);
             objectives.push(Value::tuple([Value::str("transport"), data]));
         }
         (Kind::Trade, Some(cargo)) => {
             let station = agent(hand_in).map(|a| a.station_id).unwrap_or(0);
             let has = has_goods(c, station, cargo).await?;
-            let data = Value::tuple([Value::Int(hand_in), agent_location(c, hand_in).await?, cargo_value(has, cargo, volume(c, cargo.0) * cargo.1 as f64)]);
+            let data = Value::tuple([Value::Int(hand_in), agent_location(c, hand_in).await?, cargo_value(has, cargo, volume(c, cargo)?)]);
             objectives.push(Value::tuple([Value::str("fetch"), data]));
         }
         _ => {}
