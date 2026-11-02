@@ -10,13 +10,28 @@ use super::{host, registry::{Claims, Command, Handler, Registry, Tick}, value};
 
 /// The space actor loop cadence is 100 ms (space/actor.rs).
 const MIN_TICK_INTERVAL_MS: u64 = 100;
+#[derive(Debug)]
+struct BudgetExceeded;
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Lua execution budget exceeded")
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
+pub(super) fn budget_exceeded() -> mlua::Error {
+    mlua::Error::external(BudgetExceeded)
+}
+
 
 fn install_budget(thread: &Thread, maximum: u64, interval: u64, deadline: Instant) -> mlua::Result<()> {
     let count = AtomicU64::new(0);
     thread.set_hook(HookTriggers::new().every_nth_instruction(interval as u32), move |_, _| {
         let instructions = count.fetch_add(interval, Ordering::Relaxed).saturating_add(interval);
         if instructions >= maximum || Instant::now() >= deadline {
-            return Err(mlua::Error::runtime("Lua execution budget exceeded"));
+            return Err(budget_exceeded());
         }
         Ok(VmState::Continue)
     })
@@ -63,6 +78,36 @@ fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
         if name == "string" { copy.set("dump", mlua::Value::Nil)?; }
         env.set(name, copy)?;
     }
+    let is_budget = lua.create_function(|_, value: mlua::Value| {
+        Ok(matches!(value, mlua::Value::Error(error) if error.downcast_ref::<BudgetExceeded>().is_some()))
+    })?;
+    let factory: Function = lua.load(r#"
+        return function(pcall, xpcall, pack, unpack, raise, is_budget, kind)
+            local function finish(...)
+                local results = pack(...)
+                if not results[1] and is_budget(results[2]) then raise(results[2], 0) end
+                return unpack(results, 1, results.n)
+            end
+            return function(f, ...) return finish(pcall(f, ...)) end,
+                function(f, handler, ...)
+                    if kind(handler) ~= "function" then return xpcall(f, handler, ...) end
+                    return finish(xpcall(f, function(err)
+                        if is_budget(err) then return err end
+                        local ok, result = pcall(handler, err)
+                        if ok or is_budget(result) then return result end
+                        raise(result, 0)
+                    end, ...))
+                end
+        end
+    "#).eval()?;
+    let table: Table = globals.get("table")?;
+    let (pcall, xpcall): (Function, Function) = factory.call((
+        globals.get::<Function>("pcall")?, globals.get::<Function>("xpcall")?,
+        table.get::<Function>("pack")?, table.get::<Function>("unpack")?,
+        globals.get::<Function>("error")?, is_budget, globals.get::<Function>("type")?,
+    ))?;
+    env.set("pcall", pcall)?;
+    env.set("xpcall", xpcall)?;
     let os: Table = globals.get("os")?;
     let safe_os = lua.create_table()?;
     for name in ["time", "clock", "date", "difftime"] { safe_os.set(name, os.get::<mlua::Value>(name)?)?; }

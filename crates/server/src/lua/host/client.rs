@@ -210,7 +210,7 @@ pub async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::vm::Inv
     loop {
         tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(deadline) => return Err(CallError::Internal(anyhow::anyhow!("Lua execution budget exceeded"))),
+            _ = tokio::time::sleep_until(deadline) => return Err(CallError::Internal(super::super::vm::budget_exceeded().into())),
             result = &mut call => return result.map_err(call_error),
             request = rx.recv() => match request {
                 Some(Request::Get(key, tx)) => { let _ = tx.send(c.session.get(&key).clone()); }
@@ -224,7 +224,7 @@ pub async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::vm::Inv
                 Some(Request::Mutation(operation, tx)) => {
                     let result = apply_mutation(c, operation).await;
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(CallError::Internal(anyhow::anyhow!("Lua execution budget exceeded")));
+                        return Err(CallError::Internal(super::super::vm::budget_exceeded().into()));
                     }
                     let _ = tx.send(result);
                 }

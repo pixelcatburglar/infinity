@@ -5,7 +5,7 @@ fn sandbox_hides_native_and_budget_escape_paths() -> mlua::Result<()> {
     let lua = Lua::new();
     let root = std::env::current_dir().unwrap().canonicalize().unwrap();
     let env = environment(&lua, &root)?;
-    let safe: bool = lua.load("return io == nil and debug == nil and package == nil and load == nil and loadfile == nil and dofile == nil and coroutine == nil and pcall == nil and getmetatable == nil and string.dump == nil and os.execute == nil and type(os.time) == 'function'").set_environment(env.clone()).eval()?;
+    let safe: bool = lua.load("return io == nil and debug == nil and package == nil and load == nil and loadfile == nil and dofile == nil and coroutine == nil and type(pcall) == 'function' and type(xpcall) == 'function' and getmetatable == nil and string.dump == nil and os.execute == nil and type(os.time) == 'function'").set_environment(env.clone()).eval()?;
     assert!(safe);
     assert!(lua.load("return require('../outside')").set_environment(env.clone()).eval::<mlua::Value>().is_err());
     assert!(lua.load("collectgarbage('stop')").set_environment(env).exec().is_err());
@@ -55,7 +55,141 @@ fn required_module_runs_under_callers_instruction_budget() -> mlua::Result<()> {
     let function = lua.load("return require('loop')").set_environment(env).into_function()?;
     let result = budgeted_thread(&lua, function, &config, Instant::now() + Duration::from_secs(60))?.resume::<mlua::Value>(());
     std::fs::remove_dir_all(dir).unwrap();
-    assert!(result.is_err());
+    assert!(result.unwrap_err().downcast_ref::<BudgetExceeded>().is_some());
+    Ok(())
+}
+
+#[test]
+fn protected_calls_preserve_results_and_ordinary_errors() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    lua.load(r#"
+        local ok, err = pcall(function() error('ordinary') end)
+        assert(not ok and string.find(err, 'ordinary', 1, true))
+        local values = table.pack(pcall(function() return 1, nil, 3, nil end))
+        assert(values.n == 5 and values[1] and values[2] == 1 and values[3] == nil and values[4] == 3 and values[5] == nil)
+        local called = false
+        local success, result = xpcall(function() error('bad') end, function(e) called = true; return 'handled:' .. e end)
+        assert(not success and called and string.find(result, 'handled:', 1, true))
+        local failed, handler_error = xpcall(function() error('bad') end, function() error('handler failed') end)
+        assert(not failed and handler_error == 'error in error handling')
+        local ran = false
+        local valid = pcall(function() xpcall(function() ran = true end, nil) end)
+        assert(not valid and not ran)
+        local same, message = pcall(function() error('Lua execution budget exceeded', 0) end)
+        assert(not same and message == 'Lua execution budget exceeded')
+        local p, x = pcall, xpcall
+        table.pack = nil; table.unpack = nil; error = nil; pcall = nil; xpcall = nil
+        local ok2, a, b, c = p(function() return 1, nil, 3 end)
+        assert(ok2 and a == 1 and b == nil and c == 3)
+        assert(x(function() return 7 end, function(e) return e end))
+    "#).set_environment(env).exec()
+}
+
+#[test]
+fn protected_calls_cannot_catch_typed_budget_errors() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..LuaConfig::default() };
+    for source in [
+        "pcall(function() while true do end end)",
+        "xpcall(function() pcall(function() while true do end end) end, function(e) intercepted = true; return 'replaced' end)",
+        "pcall(function() xpcall(function() error('ordinary') end, function() while true do end end) end)",
+    ] {
+        let function = lua.load(source).set_environment(env.clone()).into_function()?;
+        let error = budgeted_thread(&lua, function, &config, Instant::now() + Duration::from_secs(60))?.resume::<()>(()).unwrap_err();
+        assert!(error.downcast_ref::<BudgetExceeded>().is_some());
+        assert!(!env.get::<Option<bool>>("intercepted")?.unwrap_or(false));
+    }
+    Ok(())
+}
+
+#[test]
+fn protected_handler_budget_at_each_instruction_boundary() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    for maximum in 1..=128 {
+        let config = LuaConfig { call_budget_instructions: maximum, instruction_hook_interval: 1, ..LuaConfig::default() };
+        let function = lua.load("pcall(function() xpcall(function() error('ordinary') end, function() while true do end end) end)").set_environment(env.clone()).into_function()?;
+        let error = budgeted_thread(&lua, function, &config, Instant::now() + Duration::from_secs(60))?.resume::<()>(()).unwrap_err();
+        assert!(error.downcast_ref::<BudgetExceeded>().is_some(), "instruction budget {maximum}: {error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn caught_memory_exhaustion_keeps_allocator_limit() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let limit = lua.used_memory() + 256 * 1024;
+    lua.set_memory_limit(limit)?;
+    let (first, second, used): (bool, bool, f64) = lua.load(r#"
+        local first = pcall(function() return string.rep('x', 1024 * 1024) end)
+        local second = pcall(function() return string.rep('y', 1024 * 1024) end)
+        return first, second, collectgarbage('count')
+    "#).set_environment(env).eval()?;
+    assert!(!first && !second);
+    assert!(used * 1024.0 <= limit as f64);
+    Ok(())
+}
+
+#[test]
+fn required_module_uses_safe_protected_calls() -> mlua::Result<()> {
+    let dir = std::env::temp_dir().join(format!("lua-protected-module-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("module.lua"), "return pcall(function() return 42 end) and type(xpcall) == 'function'").unwrap();
+    let lua = Lua::new();
+    let env = environment(&lua, &dir.canonicalize().unwrap())?;
+    let result = lua.load("return require('module')").set_environment(env).eval::<bool>();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(result?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn protected_calls_yield_and_retain_invocation_budget() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    env.set("wait", lua.create_async_function(|_, ()| async {
+        tokio::task::yield_now().await;
+        Ok(42)
+    })?)?;
+    let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..LuaConfig::default() };
+    for source in [
+        "local ok, n = pcall(wait); assert(ok and n == 42); return n",
+        "local ok, n = xpcall(wait, function(e) return e end); assert(ok and n == 42); return n",
+    ] {
+        let handler = lua.load(source).set_environment(env.clone()).into_function()?;
+        let invocation = budgeted_invocation(&lua, handler, &config, Instant::now() + Duration::from_secs(60))?;
+        let _guard = super::super::HookGuard(invocation.hook_thread);
+        assert_eq!(invocation.function.call_async::<i64>(()).await?, 42);
+    }
+    let handler = lua.load("pcall(function() wait(); while true do end end)").set_environment(env).into_function()?;
+    let invocation = budgeted_invocation(&lua, handler, &config, Instant::now() + Duration::from_secs(60))?;
+    let _guard = super::super::HookGuard(invocation.hook_thread);
+    let error = invocation.function.call_async::<()>(()).await.unwrap_err();
+    assert!(error.downcast_ref::<BudgetExceeded>().is_some());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn protected_async_call_obeys_no_context_deadline() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    env.set("wait", lua.create_async_function(|_, ()| async {
+        std::future::pending::<mlua::Result<()>>().await
+    })?)?;
+    let function = lua.load("return function() pcall(wait); resumed = true end").set_environment(env.clone()).eval()?;
+    let handler = Handler { script: "test".into(), function };
+    let registry = Registry { lua, claims: Claims::default(), overrides: Mutex::new(Default::default()) };
+    let config = LuaConfig { call_budget_ms: 100, ..LuaConfig::default() };
+    let call = super::super::invoke_no_context(&registry, &config, &handler, Ok(mlua::Value::Nil));
+    tokio::pin!(call);
+    tokio::select! { biased; _ = &mut call => panic!("completed before deadline"), _ = tokio::task::yield_now() => {} }
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let error = call.await.unwrap_err();
+    assert!(error.downcast_ref::<BudgetExceeded>().is_some());
+    assert!(env.get::<Option<bool>>("resumed")?.is_none());
     Ok(())
 }
 

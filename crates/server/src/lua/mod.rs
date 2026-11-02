@@ -174,7 +174,7 @@ async fn invoke_no_context(registry: &Registry, config: &crate::config::lua::Lua
         let _guard = HookGuard(invocation.hook_thread);
         tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(timeout) => Err(mlua::Error::runtime("Lua execution budget exceeded")),
+            _ = tokio::time::sleep_until(timeout) => Err(vm::budget_exceeded()),
             result = &mut call => result,
         }
     };
