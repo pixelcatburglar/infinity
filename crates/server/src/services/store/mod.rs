@@ -19,8 +19,6 @@
 //! Clients cannot display oversized balances exactly.
 //! Daily gift, turnover and checkout policies come from the game configuration.
 
-use crate::dao::items::loading::ItemQuery;
-use super::items::load_items;
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
 use crate::consts::FLAG_HANGAR;

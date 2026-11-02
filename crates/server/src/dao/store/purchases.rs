@@ -8,8 +8,6 @@ use crate::db::{executor::Executor, Error};
 
 pub(crate) struct Token { pub token_id: i64, pub type_id: i32, pub quantity: i32, pub label: String, pub description: String, pub created: i64 }
 impl Token { fn from_row(r: &tokio_postgres::Row) -> Self { Self { token_id:r.get("token_id"), type_id:r.get("type_id"), quantity:r.get("quantity"), label:r.get("label"), description:r.get("description"), created:r.get("created") } } }
-pub(crate) struct TokenItem { pub type_id: i32, pub quantity: i32 }
-impl TokenItem { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id:r.get("type_id"), quantity:r.get("quantity") } } }
 pub(crate) struct Stations { pub home_station_id: Option<i64>, pub station_id: Option<i64> }
 impl Stations { fn from_row(r: &tokio_postgres::Row) -> Self { Self { home_station_id:r.get("home_station_id"), station_id:r.get("station_id") } } }
 struct User { user_id:i64 }
@@ -19,7 +17,7 @@ impl Points { fn from_row(r:&tokio_postgres::Row)->Self { Self { free_skill_poin
 pub(crate) async fn grant(ex:&impl Executor, user:i64, type_id:i32, quantity:i32, label:&str, created:i64)->Result<u64,Error> { ex.execute("INSERT INTO game.redeem_tokens (user_id, type_id, quantity, label, created) VALUES ($1, $2, $3, $4, $5)",&[&user,&type_id,&quantity,&label,&created]).await }
 pub(crate) async fn tokens(ex:&impl Executor,user:i64)->Result<Vec<Token>,Error> { Ok(ex.query("SELECT token_id, type_id, quantity, label, description, created FROM game.redeem_tokens WHERE user_id = $1 ORDER BY token_id",&[&user]).await?.iter().map(Token::from_row).collect()) }
 pub(crate) async fn stations(ex:&impl Executor,char_id:i64,user:i64)->Result<Option<Stations>,Error> { Ok(ex.query_opt("SELECT home_station_id, station_id FROM game.characters WHERE character_id = $1 AND user_id = $2",&[&char_id,&user]).await?.map(|r| Stations::from_row(&r))) }
-pub(crate) async fn claim(ex:&impl Executor,user:i64,ids:&[i64])->Result<Vec<TokenItem>,Error> { Ok(ex.query("DELETE FROM game.redeem_tokens WHERE user_id = $1 AND token_id = ANY($2) RETURNING type_id, quantity",&[&user,&ids]).await?.iter().map(TokenItem::from_row).collect()) }
+pub(crate) async fn lock_tokens(ex:&impl Executor,user:i64,ids:&[i64])->Result<Vec<Token>,Error> { Ok(ex.query("SELECT token_id, type_id, quantity, label, description, created FROM game.redeem_tokens WHERE user_id = $1 AND token_id = ANY($2) ORDER BY token_id FOR UPDATE",&[&user,&ids]).await?.iter().map(Token::from_row).collect()) }
 pub(crate) async fn trash(ex:&impl Executor,user:i64,ids:&[i64])->Result<u64,Error> { ex.execute("DELETE FROM game.redeem_tokens WHERE user_id = $1 AND token_id = ANY($2)",&[&user,&ids]).await }
 pub(crate) async fn add_points(ex:&impl Executor,char_id:i64,points:i64)->Result<i64,Error> { Ok(Points::from_row(&ex.query_one("UPDATE game.characters SET free_skill_points = free_skill_points + $2 WHERE character_id = $1 RETURNING free_skill_points",&[&char_id,&points]).await?).free_skill_points) }
 pub(crate) async fn recipient(ex:&impl Executor,char_id:i64)->Result<Option<i64>,Error> { Ok(ex.query_opt("SELECT user_id FROM game.characters WHERE character_id = $1",&[&char_id]).await?.map(|r|User::from_row(&r).user_id)) }

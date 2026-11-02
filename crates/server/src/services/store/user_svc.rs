@@ -1,5 +1,7 @@
 //! userSvc redeem queue for eve/client/script/ui/services/redeemsvc.py.
-//! Uses game redeem tokens, characters and items; unsupported token types follow existing delivery policy.
+//! Uses game redeem tokens, characters, items and SDE types and stations. Invalid
+//! tokens remain queued; database write failures roll back the entire claim.
+//! Licenses and ISK rewards are not supported.
 use super::*;
 /// Skill points granted per redeemed type (redeem/data.py `get_redeem_data`).
 const SKILL_POINT_TYPES: &[(i32, i64)] = &[
@@ -36,12 +38,13 @@ async fn redeem_tokens(c: &Client) -> CallResult {
     Ok(Value::tuple([Value::list(tokens), Value::list([])]))
 }
 
-/// `tokenID`s of the `[{'tokenID', 'massTokenID', 'typeID'}]` the client sends.
+/// Token keys from redeemsvc include pairs as well as dictionary and KeyVal forms.
 fn token_ids(v: Option<&Value>) -> Vec<i64> {
     v.and_then(|v| v.items())
         .unwrap_or_default()
         .iter()
         .filter_map(|t| match t {
+            Value::Tuple(items) | Value::List(items) => items.first(),
             Value::Instance(_, state) => state.get("tokenID"),
             other => other.get("tokenID"),
         })
@@ -49,55 +52,100 @@ fn token_ids(v: Option<&Value>) -> Vec<i64> {
         .collect()
 }
 
-/// ClaimRedeemTokens(tokens, charID, useHomeStation=False) -> {'errors', 'itemsCreated', 'stationID',
-/// 'isk_balance', 'activated_licenses', 'isk_rewarded'}
+/// ClaimRedeemTokens(tokens, charID, useHomeStation=False).
 async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ids = token_ids(call.args.first());
     let char_id = call.args.get(1).and_then(|v| v.as_int()).or_else(|| c.session.int("charid")).unwrap_or(0);
     let home = call.kwargs.get("useHomeStation").or_else(|| call.args.get(2)).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-    let row = crate::dao::store::purchases::stations(&c.db, char_id, c.login.user_id).await.map_err(db_err)?
+    let user = c.login.user_id;
+    let selected = c.session.int("charid") == Some(char_id);
+    let current_station = c.session.int("stationid");
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    let ids: std::sync::Arc<[i64]> = ids.into();
+    db.transaction(
+        |tx, outbox| {
+            let ids = ids.clone();
+            let sde = sde.clone();
+            Box::pin(async move { claim_in_transaction(tx, outbox, &sde, user, char_id, &ids, home, selected, current_station).await })
+        },
+        |value, outbox| async move { crate::db::outbox::dispatch_client(value, outbox, c) },
+    ).await
+}
+
+async fn claim_in_transaction(
+    tx: &tokio_postgres::Transaction<'_>,
+    outbox: &mut crate::db::outbox::Outbox,
+    sde: &crate::sde::Sde,
+    user: i64,
+    char_id: i64,
+    ids: &[i64],
+    home: bool,
+    selected: bool,
+    current_station: Option<i64>,
+) -> CallResult {
+    use crate::dao::store::purchases;
+    let row = purchases::stations(tx, char_id, user).await.map_err(db_err)?
         .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
-    let docked = if c.session.int("charid") == Some(char_id) { c.session.int("stationid") } else { row.station_id };
-    let station: Option<i64> = if home { row.home_station_id } else { docked.or(row.home_station_id) };
-    let tokens = crate::dao::store::purchases::claim(&c.db, c.login.user_id, &ids).await.map_err(db_err)?;
-    let mut created = vec![];
+    let docked = if selected { current_station } else { row.station_id };
+    let station = if home { row.home_station_id } else { docked.or(row.home_station_id) };
+    let tokens = purchases::lock_tokens(tx, user, ids).await.map_err(db_err)?;
+    let mut valid = Vec::new();
+    let mut errors = Vec::new();
+    for token in &tokens {
+        let is_sp = SKILL_POINT_TYPES.iter().any(|(id, _)| *id == token.type_id);
+        if sde.types.get(token.type_id).is_none()
+            || (!is_sp && station.and_then(|id| sde.map.station(id)).is_none())
+        {
+            errors.push(redeem_error(token.token_id));
+        } else {
+            valid.push(token);
+        }
+    }
+    let mut successful = Vec::new();
+    let mut created = Vec::new();
     let mut skill_points = 0i64;
-    for t in &tokens {
-        let (type_id, quantity) = (t.type_id, t.quantity);
-        if let Some((_, sp)) = SKILL_POINT_TYPES.iter().find(|(id, _)| *id == type_id) {
-            skill_points += sp * quantity as i64;
+    for token in valid {
+        if let Some((_, sp)) = SKILL_POINT_TYPES.iter().find(|(id, _)| *id == token.type_id) {
+            skill_points += sp * i64::from(token.quantity);
+            successful.push(token.token_id);
             continue;
         }
-        let Some(station) = station else { continue };
-        let item_id = crate::dao::items::transfers::insert(&c.db, type_id, char_id, station, FLAG_HANGAR, quantity).await.map_err(db_err)?;
-        created.push((item_id, type_id, quantity));
+        let destination = station.expect("validated item destination");
+        let item_id = crate::dao::items::transfers::insert(tx, token.type_id, char_id, destination, FLAG_HANGAR, token.quantity).await.map_err(db_err)?;
+        successful.push(token.token_id);
+        created.push(Value::dict([
+            ("itemID", Value::Int(item_id)),
+            ("typeID", Value::Int(i64::from(token.type_id))),
+            ("quantity", Value::Int(i64::from(token.quantity))),
+            ("stationID", Value::Int(destination)),
+        ]));
+        if selected && current_station == station {
+            crate::services::inventory::notify_item_change(tx, sde, outbox, item_id, vec![(crate::consts::IX_LOCATION_ID, Value::Int(0))]).await?;
+        }
+    }
+    if purchases::trash(tx, user, &successful).await.map_err(db_err)? != successful.len() as u64 {
+        return Err(db_err(anyhow::anyhow!("redeem token deletion mismatch")));
     }
     if skill_points > 0 {
-        let free = crate::dao::store::purchases::add_points(&c.db, char_id, skill_points).await.map_err(db_err)?;
-        if c.session.int("charid") == Some(char_id) {
-            c.notify("OnFreeSkillPointsChanged", vec![Value::Int(free)]);
+        let free = purchases::add_points(tx, char_id, skill_points).await.map_err(db_err)?;
+        if selected {
+            outbox.notify_client("OnFreeSkillPointsChanged", vec![Value::Int(free)]);
         }
     }
-    if station.is_some() && station == c.session.int("stationid") && c.session.int("charid") == Some(char_id) {
-        for (item_id, ..) in &created {
-            if let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(*item_id)).await.map_err(db_err)?.into_iter().next() {
-                c.notify("OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(3), Value::Int(0))]), Value::None]);
-            }
-        }
-    }
-    info!(user = c.login.user_id, "redeemed {} tokens onto {char_id}: {} items, {skill_points} SP", tokens.len(), created.len());
-    let items = created.iter().map(|(item, t, q)| {
-        Value::dict([("itemID", Value::Int(*item)), ("typeID", Value::Int(*t as i64)), ("quantity", Value::Int(*q as i64))])
-    });
     Ok(Value::dict([
-        ("errors", Value::list([])),
-        ("itemsCreated", Value::list(items)),
+        ("errors", Value::list(errors)),
+        ("itemsCreated", Value::list(created)),
         ("stationID", station.map(Value::Int).unwrap_or(Value::None)),
         ("isk_balance", Value::None),
-        // RedeemItemsContainer._OnRedeem indexes these when no items were created (SP tokens).
         ("activated_licenses", Value::list([])),
         ("isk_rewarded", Value::Int(0)),
     ]))
+}
+
+fn redeem_error(token_id: i64) -> Value {
+    let error = crate::client::user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::store::REDEEM_FAILED))]);
+    Value::tuple([Value::Int(token_id), error])
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -115,3 +163,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         _ => return None,
     })
 }
+
+#[cfg(test)] mod tests;
