@@ -17,3 +17,14 @@ This document lists client remote-service calls the server answers specially, gr
 | charUnboundMgr | GetCharacterInfo | fixed | `crates/server/src/services/fixed.rs` |
 
 The QA starter-system override list is empty; normal starter-system allocation is unchanged. The legacy petition window offers no character choices before character selection. Petition categories, submission, and external support are not guaranteed.
+
+## Station
+
+| service | method | status | handler file |
+|---|---|---|---|
+| stationSvc | GetStationsForOwner | handled | `crates/server/src/services/station/station_svc.rs` |
+| stationSvc | GetStation | handled | `crates/server/src/services/station/station_svc.rs` |
+| stationSvc | GetSolarSystem | handled | `crates/server/src/services/station/station_svc.rs` |
+| stationSvc | GetSystemsForAlliance | out-of-scope | — |
+
+NPC station and solar-system data comes from static data; alliance sovereignty is not supported.
