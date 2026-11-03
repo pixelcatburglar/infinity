@@ -540,7 +540,8 @@ async fn warp_dispatch_and_identity_guards() {
         target.old_pos = target.pos;
         w.with(system, move |s| { s.insert(vessel); s.insert(target); }).await.unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        w.observe(system, character, hull, tx).await.unwrap();
+        let connection = 1_000_000_000_001;
+        w.observe(system, connection, hull, tx).await.unwrap();
         let identity = Identity { char_id: character, ship_id: Some(hull), corp_id: 1, station_id: None, system_id: Some(system) };
         let missing_ship = Identity { ship_id: None, ..identity };
         for (pilot, space_system, point) in [
@@ -557,7 +558,7 @@ async fn warp_dispatch_and_identity_guards() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
-        let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
+        let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: connection, session_id: character, language_id: "EN".into() };
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
         let args = [Value::str("item"), Value::Int(target_id)];
