@@ -3,6 +3,7 @@
 //! container types retain the existing generic binding; direct-trade PLEX is refused.
 
 use super::{CONTAINER_CORP_MARKET, CONTAINER_HANGAR, INVENTORY};
+use super::crystals;
 use super::access::may_view_corp_hangar;
 use super::notifications::{notify_corp_item_change, notify_item_change};
 use super::stacks::{mutation_corporate, split_stack, trash_items};
@@ -54,6 +55,8 @@ pub(super) async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             }
         }
         "GetItemDescriptor" => super::super::item_descriptor().to_value(),
+        // inventorysvc.py:CrystalDamageTracker.PrimeCrystals reads a batch dict.
+        "GetDamageForCrystals" => return Some(crystals::get_damage(c, call).await),
         "IsMyItemAtDockableLocation" => Value::Bool(true),
         // SplitStack(locationID, itemID, qty, ownerID): a new stack beside the old one.
         "SplitStack" => {

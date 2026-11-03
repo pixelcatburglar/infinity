@@ -15,6 +15,8 @@
 //! Player structures are unsupported, so the character structure directory is empty.
 //! Single-track login campaigns are closed; seasonal login campaigns remain separate.
 //! `loginrewards/client/loginCampaignService.py` receives no campaign or claim.
+//! Inventory configuration and item-price writes/reads are explicitly refused;
+//! crystal damage is handled by the inventory feature module.
 
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
@@ -225,6 +227,12 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
 
         // menuFunctions.py:DecryptItem cannot open media without a supported source; refuse without consuming the item.
         ("encodedItems", "DecodeItem") => Err(notify_error(crate::messages::encoded_items::DECODE_UNAVAILABLE)),
+        // invControllers.py:BaseInvContainer.__AddItem reads this root mask.
+        ("invInventory", "ALSCConfigGet") => Ok(Value::Int(0)),
+        // ConfigureALSC/menuFunctions.py writes config; persistence is unsupported.
+        ("invInventory", "ALSCConfigSet") => Err(notify_error(crate::messages::inventory::ALSC_CONFIG_UNSUPPORTED)),
+        // invCache.py:AcceptPossibleRemovalTax requires a real price, never a fake zero.
+        ("invInventory", "GetPriceForItems") => Err(notify_error(crate::messages::inventory::ITEM_PRICES_UNSUPPORTED)),
 
         // ccSvc.py:_QAPickStarterSystem sorts the IDs and uses normal allocation when empty.
         ("charUnboundMgr", "GetQAStarterSystemIDs") => Ok(Value::list([])),

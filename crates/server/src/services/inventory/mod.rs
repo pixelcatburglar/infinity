@@ -1,9 +1,10 @@
 //! Inventory broker and bound inventory routing for `eve/client/script/environment/invCache.py`
 //! and `invCacheContainer`. Items and custody come from `game.items` and corporate
 //! records, with type and volume data from the SDE and space reachability from the
-//! system actor. Stale writes and staged trade items are guarded; deliveries obey
-//! corporate roles. Loot rights, suspect flags, foreign shared-bay permissions and
-//! POS tower control are not implemented.
+//! system actor. Crystal damage reads use dogma overrides; ALSC configuration,
+//! item-price reads and asset safety are not modelled. Stale writes and staged
+//! trade items are guarded; deliveries obey corporate roles. Loot rights, suspect
+//! flags, foreign shared-bay permissions and POS tower control are not implemented.
 
 use crate::client::Client;
 use crate::consts::{FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST};
@@ -17,6 +18,7 @@ pub(crate) mod access;
 pub(in crate::services) mod notifications;
 pub(crate) mod stacks;
 mod inv_broker;
+mod crystals;
 mod inv_inventory;
 
 /// const.containerHangar: "my hangar in the current station".

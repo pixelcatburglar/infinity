@@ -4,6 +4,7 @@
 //! the client's slash service. This module reads no database and does not
 //! implement localisation, data-derived names, or protocol identifiers.
 
+pub(crate) mod inventory;
 pub(crate) mod encoded_items;
 pub(crate) mod access_groups;
 pub(crate) mod bookmarks;
