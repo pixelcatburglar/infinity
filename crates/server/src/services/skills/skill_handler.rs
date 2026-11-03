@@ -64,6 +64,10 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
         }
         (SKILL_HANDLER, "ApplyFreeSkillPoints") => super::free_points::apply(c, me, call.args).await,
+        (SKILL_HANDLER, "GetFreeSkillPointsAppliedToQueue") => super::free_points::preview_queue(c, me).await,
+        (SKILL_HANDLER, "GetFreeSkillPointsAppliedToSkills") => super::free_points::preview_skills(c, me, call.args.first().unwrap_or(&Value::List(vec![]))).await,
+        (SKILL_HANDLER, "ApplyFreeSkillPointsToQueue") => super::free_points::apply_queue(c, me).await.map(|_| Value::None),
+        (SKILL_HANDLER, "ApplyFreeSkillPointsToSkills") => super::free_points::apply_skills(c, me, call.args.first().unwrap_or(&Value::List(vec![]))).await.map(|_| Value::None),
         (SKILL_HANDLER, "CharStartTrainingSkill") => super::books::start_training(c, me, call.args).await,
         (SKILL_HANDLER, "PurchaseSkills") => super::purchase::purchase(c, me, call.args, call.kwargs).await,
         (SKILL_HANDLER, "GetSkillPoints") => match crate::dao::skills::training::total(&c.db, me).await

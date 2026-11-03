@@ -621,6 +621,8 @@ pub(crate) const MSG_CORP_BULLETIN_NOT_FOUND: &str = "CorpBulletinNotFound";
 pub(crate) const MSG_CORP_TOO_MANY_BULLETINS: &str = "CorpTooManyBulletins";
 /// Client message `CustomNotify`.
 pub(crate) const MSG_CUSTOM_NOTIFY: &str = "CustomNotify";
+/// Client message `CannotApplyFreePointsDoNotHaveSkill`.
+pub(crate) const MSG_CANNOT_APPLY_FREE_POINTS_DO_NOT_HAVE_SKILL: &str = "CannotApplyFreePointsDoNotHaveSkill";
 /// Client message `InjectorSkillPointLimitReached`.
 pub(crate) const MSG_INJECTOR_SKILL_POINT_LIMIT_REACHED: &str = "InjectorSkillPointLimitReached";
 /// Client kill-right refusal keys.
