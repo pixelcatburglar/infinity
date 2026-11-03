@@ -11,6 +11,7 @@
 pub(crate) mod characters;
 pub(crate) mod compression;
 pub(crate) mod corporations;
+pub(crate) mod crates;
 pub(crate) mod dogma;
 pub(crate) mod dungeons;
 pub(crate) mod dynamic_items;
@@ -33,6 +34,7 @@ const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
 
 pub(crate) struct Sde {
     pub(crate) types: types::Types,
+    pub(crate) crates: crates::Crates,
     pub(crate) compression: compression::Compression,
     pub(crate) dogma: dogma::Dogma,
     pub(crate) dynamic_items: dynamic_items::DynamicItems,
@@ -68,12 +70,12 @@ impl Sde {
             graphic_locations::GraphicLocations::load(db),
             async { crate::dao::sde::dynamic_items::load(db).await.map_err(anyhow::Error::from) },
         )?;
-        let (compression, typelists) = tokio::try_join!(compression::Compression::load(db, &types), typelists::TypeLists::load(db, &types))?;
+        let (compression, typelists, crates) = tokio::try_join!(compression::Compression::load(db, &types), typelists::TypeLists::load(db, &types), crates::Crates::load(db, &types))?;
         let dynamic_items = dynamic_items::DynamicItems::from_rows(dynamic_rows, &types, &dogma);
         types.index_modifiers(&dogma);
         dungeons.index_map(&map);
         tracing::info!(types = types.len(), dogma_attributes = dogma.attribute_count(), dogma_effects = dogma.effect_count(), systems = map.systems().count(), stations = map.stations().count(), celestials = map.all_celestials().count(), factions = factions.len(), npc_corporations = npc_corporations.len(), localization = localization.len(), elapsed_ms = started.elapsed().as_millis(), "SDE loaded");
-        Ok(Self { types, compression, dogma, dynamic_items, map, graphic_locations, factions, npc_corporations, localization, wrecks, industry, store, missions, dungeons, characters, typelists })
+        Ok(Self { types, crates, compression, dogma, dynamic_items, map, graphic_locations, factions, npc_corporations, localization, wrecks, industry, store, missions, dungeons, characters, typelists })
     }
     /// Mirrors the client's non-tradable and soulbound type-list checks.
     pub(crate) fn is_tradable(&self, type_id: i32) -> bool {

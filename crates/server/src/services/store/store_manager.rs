@@ -40,7 +40,6 @@ fn service_price(average: Option<f64>, plex_isk: f64, list_price: i64) -> i64 {
     average.filter(|p| crate::dao::store::catalogue::positive_price(*p)).map(|p| ((p / plex_isk).round() as i64).max(1)).unwrap_or(list_price)
 }
 
-
 async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
     let plex_isk = prices.get(&TYPE_PLEX).copied().unwrap_or(crate::config::game().store.plex_price_isk_fallback);
@@ -120,7 +119,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     }
 
     // Crates that traded on Serenity, with their splash art.
-    for r in sde.store.crates() {
+    for r in sde.crates.iter().filter(|entry| entry.sale_supported()) {
         let Some(t) = sde.types.get(r.type_id).filter(|t| t.published == Some(true)) else { continue };
         let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
         let type_id = t.type_id;

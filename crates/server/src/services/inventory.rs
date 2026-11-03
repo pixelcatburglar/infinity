@@ -28,7 +28,7 @@ use tracing::warn;
 
 pub(super) mod gm;
 pub(crate) mod movement;
-mod reachability;
+pub(in crate::services) mod reachability;
 use reachability::{Endpoint, Reachability};
 
 /// const.containerHangar: "my hangar in the current station".

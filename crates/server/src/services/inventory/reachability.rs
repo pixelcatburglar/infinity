@@ -26,10 +26,10 @@ const ATTR_SHIP_MAINTENANCE_BAY_CAPACITY: i32 = 908;
 const ATTR_FLEET_HANGAR_CAPACITY: i32 = 912;
 
 #[derive(Clone, Copy)]
-pub(super) struct Endpoint { pub location: i64, pub flag: i32 }
+pub(in crate::services) struct Endpoint { pub location: i64, pub flag: i32 }
 
 #[derive(Clone)]
-pub(super) struct Reachability {
+pub(in crate::services) struct Reachability {
     character: Option<i64>, station: Option<i64>, ship: Option<i64>,
     system: Option<i64>, corporation: Option<i64>, capture: Arc<Capture>,
 }
@@ -45,7 +45,7 @@ fn in_range(gap: Option<f64>, operational_distance: Option<f64>) -> bool {
 }
 
 impl Reachability {
-    pub(super) async fn capture(identity: &Identity, db: &Db, world: &World, space_system: Option<i64>, endpoints: &[Endpoint]) -> Result<Self, CallError> {
+    pub(in crate::services) async fn capture(identity: &Identity, db: &Db, world: &World, space_system: Option<i64>, endpoints: &[Endpoint]) -> Result<Self, CallError> {
         let character = (identity.char_id != 0).then_some(identity.char_id);
         let station = identity.station_id;
         let ship = identity.ship_id;
@@ -81,7 +81,7 @@ impl Reachability {
         Ok(Self { character, station, ship, system, corporation, capture: Arc::new(Capture { gaps, ancestry }) })
     }
 
-    pub(super) async fn check(&self, ex: &(impl Executor + ?Sized), sde: &Sde, endpoint: Endpoint) -> Result<(), CallError> {
+    pub(in crate::services) async fn check(&self, ex: &(impl Executor + ?Sized), sde: &Sde, endpoint: Endpoint) -> Result<(), CallError> {
         let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
         let rows = crate::dao::items::deliveries::ancestry(ex, endpoint.location).await.map_err(db_err)?;
         if self.capture.ancestry.get(&endpoint.location) != Some(&rows) { return Err(refuse()); }

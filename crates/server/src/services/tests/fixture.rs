@@ -59,8 +59,42 @@ pub(in crate::services) async fn cleanup(db: &Db, fixture: Fixture) -> Result<()
         tx.execute("DELETE FROM game.skill_queue WHERE character_id = $1", &[&fixture.character]).await?;
         tx.execute("DELETE FROM game.skills WHERE character_id = $1", &[&fixture.character]).await?;
         tx.execute("DELETE FROM game.items WHERE owner_id = $1", &[&fixture.character]).await?;
+        tx.execute("DELETE FROM game.store_purchases WHERE user_id = $1", &[&fixture.account]).await?;
         tx.execute("DELETE FROM game.characters WHERE character_id = $1", &[&fixture.character]).await?;
         tx.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&fixture.account]).await?;
         Ok(())
     }), |(), ()| async move { Ok(()) }).await
+}
+
+pub(in crate::services) async fn create_corporation(db: &Db, ceo: i64, station: i64) -> Result<i64, Error> {
+    let name = format!("fixture-corporation-{ceo}");
+    let ticker = format!("F{ceo}");
+    crate::dao::corporations::registry::create(db, &crate::dao::corporations::registry::NewCorporation {
+        name: &name, ticker: &ticker, description: "", url: "", tax: 0.0, ceo,
+        station, recruiting: false, friendly: false, shapes: [None; 7], now: 0,
+    }).await
+}
+
+pub(in crate::services) async fn assign_corporation(db: &Db, character: i64, corporation: i64, roles: i64) -> Result<(), Error> {
+    db.execute("UPDATE game.characters SET corporation_id = $2, corp_roles = $3 WHERE character_id = $1", &[&character, &corporation, &roles]).await?;
+    Ok(())
+}
+
+pub(in crate::services) async fn create_office(db: &Db, office: i64, corporation: i64, station: i64) -> Result<(), Error> {
+    crate::dao::offices::insert(db, office, corporation, station, i64::MAX).await?;
+    Ok(())
+}
+
+pub(in crate::services) async fn cleanup_corporation(db: &Db, corporation: i64, members: &[i64], office: i64) -> Result<(), Error> {
+    db.transaction(|tx, _: &mut ()| {
+        let members = members.to_vec();
+        Box::pin(async move {
+            tx.execute("DELETE FROM game.items WHERE owner_id = $1", &[&corporation]).await?;
+            tx.execute("DELETE FROM game.offices WHERE office_id = $1", &[&office]).await?;
+            tx.execute("DELETE FROM game.employment_history WHERE char_id = ANY($1)", &[&members]).await?;
+            tx.execute("UPDATE game.characters SET corporation_id = 1, corp_roles = 0 WHERE character_id = ANY($1)", &[&members]).await?;
+            tx.execute("DELETE FROM game.corporations WHERE corporation_id = $1", &[&corporation]).await?;
+            Ok(())
+        })
+    }, |(), ()| async move { Ok(()) }).await
 }
