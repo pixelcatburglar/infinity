@@ -22,6 +22,51 @@ fn signed_filetime_seconds_conversions() {
 }
 
 #[test]
+fn filetime_to_unix_nanoseconds_preserves_ticks_and_checks_overflow() {
+    assert_eq!(unix_ns_from_filetime(FILETIME_UNIX_EPOCH), Some(0));
+    assert_eq!(unix_ns_from_filetime(FILETIME_UNIX_EPOCH + 1), Some(100));
+    assert_eq!(unix_ns_from_filetime(FILETIME_UNIX_EPOCH - 1), Some(-100));
+    assert_eq!(unix_ns_from_filetime(crate::consts::FAR_FUTURE), Some(4_132_224_000_000_000_000));
+    assert_eq!(unix_ns_from_filetime(i64::MIN), None);
+    assert_eq!(unix_ns_from_filetime(i64::MAX), None);
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn cancelled_run_detaches_account_sender_even_with_clones() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    let cfg = Arc::new(Config::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, address) = listener.accept().await.unwrap();
+    let account = -81103;
+    let login = Login { user_id: account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
+    let client = Client::new(Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    let mut registration = crate::live_sessions::register(account, true).unwrap();
+    registration.wait_for_predecessor().await;
+    let retained_sender;
+    {
+        let run = client.run(&mut registration);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("client exited unexpectedly: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        retained_sender = crate::live_sessions::sender(account).unwrap();
+    }
+    assert!(crate::live_sessions::sender(account).is_none());
+    assert!(retained_sender.is_closed());
+    let mut outbox = Outbox::default();
+    outbox.notify_sender(retained_sender, "event", vec![]);
+    assert!(crate::db::outbox::dispatch_world((), outbox, &world).is_ok());
+    assert!(crate::live_sessions::sender(account).is_none());
+}
+
+#[test]
 fn filetime_timestamp_milliseconds_round_up() {
     assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH), 0);
     assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH + FILETIME_TICKS_PER_MS), 1);

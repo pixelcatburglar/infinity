@@ -1,6 +1,7 @@
 //! Skill trading boundaries and database settlement regressions.
 use super::*;
 mod reconciliation;
+mod alpha_injections;
 
 async fn fingerprint(db: &crate::db::Db, character: i64) -> String {
     let job = format!("skills.complete:{character}");

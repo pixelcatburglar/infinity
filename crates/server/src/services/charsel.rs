@@ -206,6 +206,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             info!(user = c.login.user_id, "character {char_id} deleted");
             Ok(Value::None)
         }
+        // The client consumes a historical lapsed-Omega flag; current authority
+        // tracks eligibility, not whether a downgrade occurred previously.
         "GetCharOmegaDowngradeStatus" => Ok(Value::Bool(false)),
         "SelectCharacterID" => {
             let char_id = call.args.first().and_then(|v| v.as_int()).or_else(|| call.kwargs.get("charID").and_then(|v| v.as_int()));

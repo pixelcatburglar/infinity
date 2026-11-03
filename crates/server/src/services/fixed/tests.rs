@@ -61,14 +61,9 @@ fn qa_mission_selection_matches_only_its_exact_call() {
 }
 
 #[test]
-fn alpha_and_encoded_item_answers_match_only_exact_calls() {
+fn encoded_item_answer_matches_only_exact_call() {
     let kwargs = Value::None;
-    for (service, method) in [
-        ("otherService", "GetNextAvailableInjection"),
-        ("alphaInjectorMgr", "OtherMethod"),
-        ("otherService", "DecodeItem"),
-        ("encodedItems", "OtherMethod"),
-    ] {
+    for (service, method) in [("otherService", "DecodeItem"), ("encodedItems", "OtherMethod")] {
         let call = Call { service, method, args: &[], kwargs: &kwargs, bound: false, bind_params: None };
         assert!(root(&call).is_none());
     }

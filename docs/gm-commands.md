@@ -18,6 +18,7 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/addisk <amount>` | Add ISK to your character's wallet |
 | `/setplex <count>` | Set your account's PLEX vault balance |
 | `/addplex <count>` | Add PLEX to your account's vault |
+| `/clonegrade <userID> alpha\|omega [seconds [grace_seconds]]` | Set an account's clone grade. Omega without a duration has no end date; with one, the account turns Alpha when the duration and then the grace period (0 by default) have passed. Alpha takes no duration. The account's client is told at once, and every change is audited. |
 | `/heal` | Repair the ship in space |
 | `/dogma <ship\|itemID\|flag:N> <attribute> [value\|reset]` | Show, set or clear a per-item base value of a dogma attribute (by ID or exact name). Skills and modules still apply on top. Targets are single items only: the active ship, a module fitted at flag `N`, or any singleton item by ID. Runtime state (shield, armor and hull damage, online, charge, quantity, skills) is refused; use `/heal` or the module controls. |
 | `/dogma <target> list` | List the overrides of an item; for `ship`, of the ship and every fitted module |

@@ -81,16 +81,11 @@ async fn item_locking_dispatch_returns_empty_collections() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
-async fn item_fixed_dispatch_roundtrips_alpha_and_decode_responses() {
+async fn item_fixed_dispatch_roundtrips_encoded_decode_responses() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let (mut client, _peer) = client(db, 1).await;
     let kwargs = Value::Dict(vec![]);
-
-    let alpha = Call { service: "alphaInjectorMgr", method: "GetNextAvailableInjection", args: &[], kwargs: &kwargs, bound: false, bind_params: None };
-    let alpha_reply = dispatch(&mut client, &alpha).await.unwrap();
-    assert_eq!(alpha_reply, Value::Int(0));
-    assert_eq!(marshal::loads(&marshal::dumps(&alpha_reply)).unwrap(), Value::Int(0));
 
     let item_id = [Value::Int(1)];
     let decode = Call { service: "encodedItems", method: "DecodeItem", args: &item_id, kwargs: &kwargs, bound: false, bind_params: None };

@@ -130,3 +130,65 @@ fn concurrent_disabled_takeovers_have_one_winner() {
     assert_eq!(threads.into_iter().map(|thread| thread.join().unwrap()).filter(|won| *won).count(), 1);
     assert!(!contains(account));
 }
+
+#[tokio::test]
+async fn sender_lifetime_and_disconnected_receiver() {
+    let account = -81101;
+    let registration = register(account, true).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let guard = registration.attach_sender(tx.clone()).unwrap();
+    let attached = sender(account).unwrap();
+    attached.send(("event".into(), vec![])).unwrap();
+    assert_eq!(rx.recv().await.unwrap().0, "event");
+    assert!(registration.attach_sender(tx.clone()).is_none());
+    drop(guard);
+    assert!(sender(account).is_none());
+    drop(rx);
+    assert!(attached.send(("event".into(), vec![])).is_err());
+    drop(registration);
+    assert!(sender(account).is_none());
+}
+
+#[tokio::test]
+async fn sender_takeover_is_generation_safe() {
+    let account = -81102;
+    let first = register(account, true).unwrap();
+    let (old_tx, mut old_rx) = tokio::sync::mpsc::unbounded_channel();
+    let old_guard = first.attach_sender(old_tx.clone()).unwrap();
+    let mut second = register(account, true).unwrap();
+    let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert!(second.attach_sender(new_tx.clone()).is_none());
+    assert!(first.attach_sender(old_tx).is_none());
+    sender(account).unwrap().send(("old".into(), vec![])).unwrap();
+    assert_eq!(old_rx.recv().await.unwrap().0, "old");
+    still_waiting(&mut second).await;
+    drop(first);
+    assert!(sender(account).is_none());
+    second.wait_for_predecessor().await;
+    let new_guard = second.attach_sender(new_tx).unwrap();
+    drop(old_guard);
+    sender(account).unwrap().send(("new".into(), vec![])).unwrap();
+    assert_eq!(new_rx.recv().await.unwrap().0, "new");
+    drop(second);
+    assert!(sender(account).is_none());
+    drop(new_guard);
+    assert!(sender(account).is_none());
+}
+
+#[tokio::test]
+async fn sender_takeover_after_old_guard_detaches() {
+    let account = -81104;
+    let first = register(account, true).unwrap();
+    let (old_tx, _old_rx) = tokio::sync::mpsc::unbounded_channel();
+    let old_guard = first.attach_sender(old_tx).unwrap();
+    let mut second = register(account, true).unwrap();
+    let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(old_guard);
+    assert!(sender(account).is_none());
+    assert!(second.attach_sender(new_tx.clone()).is_none());
+    drop(first);
+    second.wait_for_predecessor().await;
+    let _new_guard = second.attach_sender(new_tx).unwrap();
+    sender(account).unwrap().send(("new".into(), vec![])).unwrap();
+    assert_eq!(new_rx.recv().await.unwrap().0, "new");
+}

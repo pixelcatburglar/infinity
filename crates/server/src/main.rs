@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
     info!(restored, "restored active kill rights");
     services::skills::completion::seed(&db).await.map_err(startup_call_error)?;
     services::industry::completion::seed(&db).await.map_err(startup_call_error)?;
+    services::subscriptions::deadlines::recover(&db).await.map_err(startup_call_error)?;
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
     let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
     scheduler::seed(&db).await?;

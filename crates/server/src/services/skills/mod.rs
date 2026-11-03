@@ -5,6 +5,7 @@
 //! Station clone custody preserves implants per body; boosters remain on the current body.
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;
+pub(crate) mod alpha_injections;
 pub(crate) mod attributes;
 pub(crate) mod brain_items;
 pub(crate) mod body_change;
