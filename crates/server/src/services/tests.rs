@@ -47,6 +47,21 @@ fn surface_offset_includes_radius() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn login_campaign_fixed_dispatch_roundtrips_none() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 1).await;
+    let kwargs = Value::Dict(vec![]);
+    for method in ["get_client_campaign_state", "claim_reward"] {
+        let call = Call { service: "loginCampaignManager", method, args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+        let reply = dispatch(&mut client, &call).await.unwrap();
+        assert_eq!(reply, Value::None);
+        assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), Value::None);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn item_locking_dispatch_returns_empty_collections() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
