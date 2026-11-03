@@ -153,8 +153,19 @@ ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_slot integer;
 ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_activated_at bigint;
 ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_expires_at bigint;
 ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_effect_ids integer[];
+-- Replace the legacy index only when installing custody, not on later startups.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'game' AND table_name = 'items' AND column_name = 'jump_clone_id') THEN
+        ALTER TABLE game.items ADD COLUMN jump_clone_id bigint;
+        DROP INDEX IF EXISTS game.items_brain_slot_idx;
+    END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS items_brain_slot_idx ON game.items (owner_id, flag_id, brain_slot)
-    WHERE location_id = owner_id AND brain_slot IS NOT NULL;
+    WHERE location_id = owner_id AND brain_slot IS NOT NULL AND jump_clone_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS items_clone_brain_slot_idx ON game.items (jump_clone_id, brain_slot)
+    WHERE jump_clone_id IS NOT NULL;
 -- dao/items/dogma: per-item dogma base overrides.
 CREATE TABLE IF NOT EXISTS game.item_attributes (
     item_id bigint NOT NULL REFERENCES game.items(item_id) ON DELETE CASCADE,
@@ -855,14 +866,26 @@ CREATE TABLE IF NOT EXISTS game.jump_clones (
     name        text NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jump_clones_owner_idx ON game.jump_clones (owner_id);
--- services/clones.rs: retain the oldest clone per station; duplicate names are discarded.
--- Implants are not modelled, so there is no implant data to transfer.
-DELETE FROM game.jump_clones AS duplicate
-USING game.jump_clones AS retained
-WHERE duplicate.owner_id = retained.owner_id
-  AND duplicate.location_id = retained.location_id
-  AND duplicate.clone_id > retained.clone_id;
-CREATE UNIQUE INDEX IF NOT EXISTS jump_clones_owner_location_idx ON game.jump_clones (owner_id, location_id);
+-- Duplicate legacy clones fail the unique constraint rather than deleting player property.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.jump_clones'::regclass AND conname = 'jump_clones_owner_location_key') THEN
+        DROP INDEX IF EXISTS game.jump_clones_owner_location_idx;
+        ALTER TABLE game.jump_clones ADD CONSTRAINT jump_clones_owner_location_key UNIQUE (owner_id, location_id) DEFERRABLE INITIALLY IMMEDIATE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.jump_clones'::regclass AND conname = 'jump_clones_clone_owner_key') THEN
+        ALTER TABLE game.jump_clones ADD CONSTRAINT jump_clones_clone_owner_key UNIQUE (clone_id, owner_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.items'::regclass AND conname = 'items_jump_clone_owner_fkey') THEN
+        ALTER TABLE game.items ADD CONSTRAINT items_jump_clone_owner_fkey FOREIGN KEY (jump_clone_id, owner_id)
+            REFERENCES game.jump_clones (clone_id, owner_id) ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.items'::regclass AND conname = 'items_jump_clone_shape_check') THEN
+        -- inventorycommon.const.flagImplant
+        ALTER TABLE game.items ADD CONSTRAINT items_jump_clone_shape_check CHECK
+            (jump_clone_id IS NULL OR (location_id = owner_id AND flag_id = 89 AND quantity = 1 AND singleton AND brain_slot IS NOT NULL));
+    END IF;
+END $$;
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS last_clone_jump bigint;
 
 -- Personal bookmark folders, subfolders and bookmarks (services/bookmarks.rs).

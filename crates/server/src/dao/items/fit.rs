@@ -16,7 +16,7 @@ pub(crate) struct Drone { pub item_id: i64, pub type_id: i32 }
 impl Drone { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id") } } }
 
 pub(crate) async fn brain_items(ex: &(impl Executor + ?Sized), char_id: i64, at: i64) -> Result<Vec<BrainItem>, Error> {
-    Ok(ex.query("SELECT item_id, type_id, flag_id, brain_slot, brain_activated_at, brain_expires_at, brain_effect_ids FROM game.items WHERE owner_id = $1 AND location_id = $1 AND flag_id IN ($2, $3) AND (flag_id <> $2 OR ((brain_activated_at IS NULL OR brain_activated_at <= $4) AND (brain_expires_at IS NULL OR brain_expires_at > $4))) ORDER BY item_id",
+    Ok(ex.query("SELECT item_id, type_id, flag_id, brain_slot, brain_activated_at, brain_expires_at, brain_effect_ids FROM game.items WHERE owner_id = $1 AND location_id = $1 AND flag_id IN ($2, $3) AND jump_clone_id IS NULL AND (flag_id <> $2 OR ((brain_activated_at IS NULL OR brain_activated_at <= $4) AND (brain_expires_at IS NULL OR brain_expires_at > $4))) ORDER BY item_id",
         &[&char_id, &FLAG_BOOSTER, &FLAG_IMPLANT, &at]).await?.iter().map(BrainItem::from_row).collect())
 }
 pub(crate) async fn drones(ex: &(impl Executor + ?Sized), char_id: i64, ship: i64) -> Result<Vec<Drone>, Error> {

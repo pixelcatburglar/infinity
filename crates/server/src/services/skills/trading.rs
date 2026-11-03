@@ -2,8 +2,8 @@
 //! Item sources are the current personal hangar or the active owned ship's cargo.
 //! The caller owns serialization, transaction and post-commit dispatch.
 //! Timeline mutations reconcile owned online hulls in the settlement transaction.
-//! Planetary colonies, clone implant custody and clone-grade restrictions are not
-//! modelled; all characters follow the existing Omega policy.
+//! Planetary colonies and clone-grade restrictions are not modelled; all characters
+//! follow the existing Omega policy. Dormant clone implants protect prerequisites.
 use super::{db_err, CallError};
 use crate::{consts::{dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
 use marshal::Value;
@@ -248,6 +248,7 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             let mut dependents: Vec<i32> = skills.iter().filter(|s| s.skill_points - selected.get(&s.type_id).copied().unwrap_or(0) > 0).map(|s| s.type_id).collect();
             dependents.extend(queued.iter().map(|q| q.type_id));
             dependents.extend(crate::dao::items::fit::brain_items(tx, char_id, now).await.map_err(db_err)?.into_iter().map(|item| item.type_id));
+            dependents.extend(crate::dao::items::clones::implant_types(tx, char_id).await.map_err(db_err)?);
             if let Some(ship) = ship {
                 let ships = load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?;
                 if let Some(item) = ships.into_iter().find(|item| item.owner_id == char_id) {

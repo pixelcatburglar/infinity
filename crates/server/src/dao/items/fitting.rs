@@ -38,7 +38,7 @@ pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), item: &Item) -> Res
     ex.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND singleton = $7 AND singleton AND flag_id = $8", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton, &FLAG_HANGAR]).await
 }
 pub(crate) async fn destroy_upgrade(ex: &(impl Executor + ?Sized), item: &Item) -> Result<bool, Error> {
-    Ok(ex.execute("DELETE FROM game.items i WHERE i.item_id = $1 AND i.owner_id = $2 AND i.location_id = $3 AND i.flag_id = $4 AND i.type_id = $5 AND i.quantity = $6 AND i.singleton = $7 AND NOT EXISTS (SELECT 1 FROM game.items child WHERE child.location_id = i.item_id)", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton]).await? != 0)
+    Ok(ex.execute("DELETE FROM game.items i WHERE i.item_id = $1 AND i.owner_id = $2 AND i.location_id = $3 AND i.flag_id = $4 AND i.type_id = $5 AND i.quantity = $6 AND i.singleton = $7 AND i.jump_clone_id IS NULL AND NOT EXISTS (SELECT 1 FROM game.items child WHERE child.location_id = i.item_id)", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton]).await? != 0)
 }
 const COLS: &str = "fitting_id, owner_id, name, description, ship_type_id, fit_types, fit_flags, fit_qty";
 pub(crate) async fn fittings(ex: &(impl Executor + ?Sized), owner: i64) -> Result<Vec<Fitting>, Error> {

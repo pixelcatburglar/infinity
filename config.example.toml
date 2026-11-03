@@ -239,8 +239,7 @@ page_size = 100                     # existing contract search default page size
 page_size_max = 1000                # existing contract search maximum page size
 
 [clones]
-jump_cooldown_hours = 24            # existing base jump-clone cooldown
-synchronizing_hours_per_level = 1   # existing Infomorph Synchronizing cooldown reduction per level
+service_fee_isk = 900000.0         # ISK charged for station clone installation and each jump
 
 [mail]
 title_max_len = 150                 # server mail title policy

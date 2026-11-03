@@ -39,5 +39,5 @@ impl Ancestor {
 }
 
 pub(crate) async fn ancestry(ex: &(impl Executor + ?Sized), id: i64) -> Result<Vec<Ancestor>, Error> {
-    Ok(ex.query("WITH RECURSIVE ancestors AS (SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE item_id = $1 UNION SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.singleton FROM game.items i JOIN ancestors a ON i.item_id = a.location_id) SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM ancestors ORDER BY item_id", &[&id]).await?.iter().map(Ancestor::from_row).collect())
+    Ok(ex.query("WITH RECURSIVE ancestors AS (SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE item_id = $1 AND jump_clone_id IS NULL UNION SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.singleton FROM game.items i JOIN ancestors a ON i.item_id = a.location_id WHERE i.jump_clone_id IS NULL) SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM ancestors ORDER BY item_id", &[&id]).await?.iter().map(Ancestor::from_row).collect())
 }

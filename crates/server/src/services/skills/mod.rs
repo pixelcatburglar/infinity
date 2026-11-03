@@ -2,11 +2,12 @@
 //! Submodules use game.skills, game.skill_queue, game.characters, game.items,
 //! game.item_attributes and game.jobs with startup SDE data. Training and timed
 //! augmentations are durable; legacy boosters without timing have no known expiry.
-//! Clone custody is not modelled.
+//! Station clone custody preserves implants per body; boosters remain on the current body.
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;
 pub(crate) mod attributes;
 pub(crate) mod brain_items;
+pub(crate) mod body_change;
 mod brain_reads;
 pub(crate) mod formulas;
 pub(crate) mod requirements;

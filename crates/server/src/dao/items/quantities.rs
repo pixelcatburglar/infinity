@@ -26,11 +26,11 @@ pub(crate) async fn apply(db: &(impl Executor + ?Sized), changes: &BTreeMap<i64,
     for (&id, change) in changes {
         let affected = match change.quantity {
             Some(quantity) => db.execute(
-                "UPDATE game.items SET quantity = $7 WHERE item_id = $1 AND quantity = $2 AND owner_id = $3 AND location_id = $4 AND flag_id = $5 AND singleton = $6",
+                "UPDATE game.items SET quantity = $7 WHERE item_id = $1 AND quantity = $2 AND owner_id = $3 AND location_id = $4 AND flag_id = $5 AND singleton = $6 AND jump_clone_id IS NULL",
                 &[&id, &change.expected_quantity, &change.owner_id, &change.location_id, &change.flag_id, &change.singleton, &quantity],
             ).await,
             None => db.execute(
-                "DELETE FROM game.items WHERE item_id = $1 AND quantity = $2 AND owner_id = $3 AND location_id = $4 AND flag_id = $5 AND singleton = $6",
+                "DELETE FROM game.items WHERE item_id = $1 AND quantity = $2 AND owner_id = $3 AND location_id = $4 AND flag_id = $5 AND singleton = $6 AND jump_clone_id IS NULL",
                 &[&id, &change.expected_quantity, &change.owner_id, &change.location_id, &change.flag_id, &change.singleton],
             ).await,
         }?;

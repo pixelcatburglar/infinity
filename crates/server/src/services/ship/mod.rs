@@ -31,7 +31,7 @@
 use super::{db_err, Call, CallError, CallResult};
 use super::identity::Identity;
 use crate::client::{short, Client};
-use crate::consts::{FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::consts::{FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE, UE_LOCID};
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::lua::events::GameEvent;
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
@@ -177,7 +177,6 @@ const LOCAL_CHAT_INVITE_DELAY_MS: u64 = 2000;
 const WORMHOLE_EFFECT_STOP_DELAY_MS: u64 = 3000;
 /// Arrival cloak duration in seconds (`appConst.invulnerabilityRestoring`).
 const JUMP_CLOAK_SECONDS: i64 = 60;
-const UE_LOCID: i64 = 3;
 
 /// Install an arriving ship with the actor-managed restoring cloak.
 pub(super) async fn arrive_cloaked(world: &crate::space::World, system: i64, mut ball: Ball) -> Result<i64, CallError> {

@@ -18,6 +18,12 @@ pub const ATTR_BOOSTER_MAX_CHAR_AGE_HOURS: i32 = 1647;
 pub const ATTR_BOOSTER_LAST_INJECTION_DATETIME: i32 = 2422;
 /// Client dogma/const.py attributeNonDiminishingSkillInjectorUses.
 pub const ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES: i32 = 2806;
+/// Client dogma/const.py attributeMaxJumpClones.
+pub const ATTR_MAX_JUMP_CLONES: i32 = 979;
+/// Client dogma/const.py attributeCloneJumpCoolDown.
+pub const ATTR_CLONE_JUMP_COOLDOWN: i32 = 1921;
+/// Client dogma/const.py attributeFollowsJumpClones.
+pub const ATTR_FOLLOWS_JUMP_CLONES: i32 = 1916;
 // SDE dogma attribute and effect IDs.
 /// SDE dgmAttributeTypes: maxActiveDrones.
 pub const ATTR_MAX_ACTIVE_DRONES: i32 = 352;

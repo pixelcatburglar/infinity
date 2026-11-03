@@ -134,3 +134,22 @@ The bound skill handler returns the bought type IDs in request order and sends t
 | structureDirectory | GetMyCharacterStructures | fixed | `crates/server/src/services/fixed.rs` |
 
 The character's player-structure directory is empty because player structures are not supported. The market's multi-buy window lists only NPC stations.
+
+## Jump clones
+
+| service | method | status | handler file |
+|---|---|---|---|
+| jumpCloneSvc | GetCloneState | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | GetStationCloneState | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | GetPriceForClone | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | ValidateInstallJumpClone | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | InstallCloneInStation | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | CloneJump | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | DestroyInstalledClone | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | SetJumpCloneName | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | ResetLastCloneJumpTime | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | GetShipCloneState | fixed | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | GetNumClonesInPilotsStructure | fixed | `crates/server/src/services/clones/jump_clone_svc.rs` |
+| jumpCloneSvc | InstallCloneInStructure | fixed | `crates/server/src/services/clones/jump_clone_svc.rs` |
+
+Station clones keep their own implants. Ship clone bays and player structures are not implemented yet: the ship clone state is empty, the structure clone count is zero, and installing a clone in a structure is refused with a message.

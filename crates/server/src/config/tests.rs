@@ -43,6 +43,23 @@ fn load_error(contents: &str) -> String {
 }
 
 #[test]
+fn clone_service_fee_policy_and_legacy_keys() {
+    assert_eq!(Config::default().clones.service_fee_isk, 900_000.0);
+    let fixture = Fixture::new();
+    fixture.write("[clones]\nservice_fee_isk = 0.0");
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().game_config().clones.service_fee_isk, 0.0);
+    assert!(load_error("[clones]\nservice_fee_isk = -1.0").contains("clones.service_fee_isk"));
+    for key in ["jump_cooldown_hours", "synchronizing_hours_per_level"] {
+        assert!(load_error(&format!("[clones]\n{key} = 1")).contains(key));
+    }
+    let mut config = Config::default();
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        config.clones.service_fee_isk = value;
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn space_collision_policy_defaults_parsing_and_snapshot() {
     let fixture = Fixture::new();
     assert!(!Config::load_with(&fixture.path(), |_| None).unwrap().space.collisions);
