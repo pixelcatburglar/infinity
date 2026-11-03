@@ -58,10 +58,23 @@ pub(crate) async fn available_credits(tx: &(impl Executor + ?Sized), sde: &Sde, 
     credits(tx, sde, char_id, at).await?.iter().try_fold(0_i64, |sum, credit| sum.checked_add(credit.uses).ok_or_else(refusal))
 }
 
-/// Server policy: each unit uses the rate at its starting total, rounding down;
-/// one charge exempts one full or small injector, never a mini.
-fn injector_yield(sde: &Sde, type_id: i32, quantity: i64, mut total: i64, mut charges: i64) -> Result<(i64, i64), CallError> {
-    if quantity <= 0 || quantity > MAX_STACK || total < 0 { return Err(refusal()); }
+/// Apply one homogeneous batch while tracking credited points and remaining units.
+///
+/// The injector algorithm, including diminishing rates and charge exemptions, is
+/// implemented by `injector_yield` below.
+fn add_yield(credited: &mut i64, total: &mut i64, remaining: &mut i64, count: i64, points: i64) -> Result<(), CallError> {
+    let amount = count.checked_mul(points).ok_or_else(refusal)?;
+    *credited = credited.checked_add(amount).ok_or_else(refusal)?;
+    *total = total.checked_add(amount).ok_or_else(refusal)?;
+    *remaining -= count;
+    Ok(())
+}
+
+/// Calculate injector points using the client `appConst.py` thresholds and
+/// diminishing rates. Preview calls leave stack size and mini-injector limits
+/// unenforced; checked settlement calls enforce both limits.
+fn injector_yield(sde: &Sde, type_id: i32, quantity: i64, mut total: i64, charges: i64, enforce_limits: bool) -> Result<(i64, i64), CallError> {
+    if quantity <= 0 || total < 0 { return Err(refusal()); }
     if type_id == super::alpha_injections::TYPE_ID {
         if quantity != 1 { return Err(refusal()); }
         let points = sde.types.attribute(type_id, CONTAINED_POINTS).ok_or_else(refusal)?;
@@ -83,20 +96,46 @@ fn injector_yield(sde: &Sde, type_id: i32, quantity: i64, mut total: i64, mut ch
         }
         _ => return Err(refusal()),
     };
+    let points_per_diminished_unit = |rate: i64| (base / RATE_DENOMINATOR) * rate + (base % RATE_DENOMINATOR) * rate / RATE_DENOMINATOR;
+    let mut remaining = quantity;
     let mut credited = 0_i64;
     let mut used = 0_i64;
-    for _ in 0..quantity {
-        if mini_limit.is_some_and(|limit| total >= limit) { return Err(refusal()); }
-        let points = if type_id == MINI_INJECTOR || total < FREE_ZONE { base } else if charges > 0 {
-            charges -= 1; used += 1; base
-        } else {
-            let rate = if total < LOW_BOUNDARY { LOW_RATE } else if total < MEDIUM_BOUNDARY { MEDIUM_RATE } else { HIGH_RATE };
-            (base / RATE_DENOMINATOR) * rate + (base % RATE_DENOMINATOR) * rate / RATE_DENOMINATOR
-        };
-        credited = credited.checked_add(points).ok_or_else(refusal)?;
-        total = total.checked_add(points).ok_or_else(refusal)?;
+    if let Some(limit) = mini_limit {
+        if enforce_limits && (total >= limit || quantity > (limit - total - 1) / base + 1) {
+            return Err(CallError::User {
+                msg: messages::MSG_INJECTOR_SKILL_POINT_LIMIT_REACHED.into(),
+                dict: vec![("typeID".into(), Value::Int(i64::from(type_id))), ("limit".into(), Value::Int(limit))],
+            });
+        }
+        let count = remaining;
+        add_yield(&mut credited, &mut total, &mut remaining, count, base)?;
+        return Ok((credited, 0));
+    }
+    if total < FREE_ZONE {
+        let count = remaining.min((FREE_ZONE - total - 1) / base + 1);
+        add_yield(&mut credited, &mut total, &mut remaining, count, base)?;
+    }
+    let exempt = remaining.min(charges);
+    used += exempt;
+    add_yield(&mut credited, &mut total, &mut remaining, exempt, base)?;
+    for (boundary, rate) in [(LOW_BOUNDARY, LOW_RATE), (MEDIUM_BOUNDARY, MEDIUM_RATE)] {
+        if remaining == 0 { break; }
+        if total < boundary {
+            let points = points_per_diminished_unit(rate);
+            let count = if points == 0 { remaining } else { remaining.min((boundary - total - 1) / points + 1) };
+            add_yield(&mut credited, &mut total, &mut remaining, count, points)?;
+        }
+    }
+    if remaining > 0 {
+        let count = remaining;
+        add_yield(&mut credited, &mut total, &mut remaining, count, points_per_diminished_unit(HIGH_RATE))?;
     }
     Ok((credited, used))
+}
+
+fn checked_injector_yield(sde: &Sde, type_id: i32, quantity: i64, total: i64, charges: i64) -> Result<(i64, i64), CallError> {
+    if quantity > MAX_STACK { return Err(refusal()); }
+    injector_yield(sde, type_id, quantity, total, charges, true)
 }
 
 pub(super) fn refusal() -> CallError { notify_error(messages::skills::INVALID_ECONOMY_REQUEST) }
@@ -138,7 +177,7 @@ pub(super) async fn quote(c: &crate::client::Client, char_id: i64, args: &[Value
     let _lock = crate::services::market::lock().await;
     let sde = c.sde.clone();
     if type_id == super::alpha_injections::TYPE_ID {
-        return Ok(Value::Int(injector_yield(&sde, type_id, quantity, 0, 0)?.0));
+        return Ok(Value::Int(injector_yield(&sde, type_id, quantity, 0, 0, false)?.0));
     }
     c.db.transaction(|tx, _: &mut Outbox| {
         let sde = sde.clone();
@@ -148,7 +187,7 @@ pub(super) async fn quote(c: &crate::client::Client, char_id: i64, args: &[Value
             let free = crate::dao::characters::attributes::free_points(tx, char_id).await.map_err(db_err)?;
             let total = plan.trained_points()?.checked_add(free).ok_or_else(refusal)?;
             let count = available_credits(tx, &sde, char_id, now).await?;
-            Ok(Value::Int(injector_yield(&sde, type_id, quantity, total, count)?.0))
+            Ok(Value::Int(injector_yield(&sde, type_id, quantity, total, count, false)?.0))
         })
     }, |value, _: Outbox| async move { Ok(value) }).await
 }
@@ -313,7 +352,7 @@ async fn inject_tx(tx: &impl Executor, outbox: &mut Outbox<OnlineChanged>, sde: 
             let total = plan.trained_points()?.checked_add(balance).ok_or_else(refusal)?;
             let mut credits = if alpha { Vec::new() } else { credits(tx, sde, char_id, now).await? };
             let count = credits.iter().try_fold(0_i64, |sum, c| sum.checked_add(c.uses).ok_or_else(refusal))?;
-            let (amount, mut used) = injector_yield(&sde, item.type_id, quantity, total, count)?;
+            let (amount, mut used) = checked_injector_yield(&sde, item.type_id, quantity, total, count)?;
             if check { return Ok(Value::None); }
             if let Some(deadline) = deadline { super::alpha_injections::claim_tx(tx, char_id, now, deadline).await?; }
             let progress = super::completion::apply_plan_tx(tx, outbox, sde, &plan).await?;
