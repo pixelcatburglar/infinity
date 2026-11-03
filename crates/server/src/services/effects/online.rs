@@ -182,6 +182,17 @@ pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
         if !mutate_online(ex, outbox, &hull, &module, false, true, None).await? { return Err(refuse()); }
     }
     let mut remaining = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.len();
+    let modules = crate::dao::items::fit::modules(ex, ship).await.map_err(db_err)?;
+    let captured_at = filetime_now();
+    let skills = crate::services::skills::effective::snapshot_at(ex, sde, owner, captured_at).await?;
+    for module in modules.into_iter().filter(|module| module.online) {
+        let missing_prerequisite = crate::services::skills::requirements::requirements(sde, module.type_id)
+            .any(|(skill, level)| skills.level(skill) < level);
+        if !missing_prerequisite { continue; }
+        let module = load_items(ex, sde, ItemQuery::Id(module.item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
+        if module.owner_id != owner || module.location_id != ship || !module.singleton || !crate::services::inventory::is_fitting_flag(module.flag_id) { return Err(refuse()); }
+        if !mutate_online(ex, outbox, &hull, &module, false, true, None).await? { return Err(refuse()); }
+    }
     while let Some(item) = super::fitting::overload_candidate(ex, sde.clone(), owner, ship).await? {
         if remaining == 0 { return Err(refuse()); }
         let module = load_items(ex, sde, ItemQuery::Id(item)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;

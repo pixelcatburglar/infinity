@@ -163,7 +163,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             )
         }),
         // [characterID] of the members who could take over as CEO (Corporation Management).
-        "GetNumberOfPotentialCEOs" => potential_ceos(db, corp, me).await.map(|ids| Value::list(ids.into_iter().map(Value::Int))),
+        "GetNumberOfPotentialCEOs" => potential_ceos(db, &c.sde, corp, me).await.map(|ids| Value::list(ids.into_iter().map(Value::Int))),
         "UpdateMember" => update_member(db, world, me, call.args).await.map(|_| Value::None),
         // UpdateMembers(Rowset of UpdateMember argument lines)
         "UpdateMembers" => {
@@ -315,7 +315,8 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
         return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
     if !gm {
-        let skill = crate::services::skills::effective::snapshot(db, me).await?.level(SKILL_CORPORATION_MANAGEMENT);
+        let now = filetime_now();
+        let skill = crate::services::skills::effective::snapshot_at(db, &sde, me, now).await?.level(SKILL_CORPORATION_MANAGEMENT);
         if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
             return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
         }

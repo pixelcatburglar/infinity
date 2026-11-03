@@ -4,10 +4,9 @@
 //! Completed training and GM grants share one skills-changed notification per batch.
 //! Skill reductions reconcile the owner's online fitted ships after the batch.
 use super::{completion::{self, AdvanceResult}, db_err, CallError};
-use super::{formulas::sp_for_level, starting::starting_levels, training::skill_type, view::skill_info};
+use super::{formulas::sp_for_level, starting::starting_levels, training::skill_type};
 use crate::{client::{Client, filetime_now}, consts::CATEGORY_SKILL, dao::skills::{queue, training}, db::{executor::Executor, outbox::Outbox}, sde::Sde};
 use crate::services::effects::online::{self, OnlineChanged};
-use marshal::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 
@@ -79,16 +78,13 @@ pub(in crate::services) async fn remove<E: From<OnlineChanged> + Send>(tx: &(imp
     clean_queue(tx, char_id, &types, now, &mut progress).await?;
     let sorted: Vec<_> = types.into_iter().collect();
     let removed = training::remove(tx, char_id, &sorted).await.map_err(db_err)?;
-    let mut infos = Vec::new();
+    let mut changed = Vec::new();
     for s in removed {
         crate::dao::skills::history::append(tx, char_id, s.type_id, super::history::REMOVED, s.skill_points, now).await.map_err(db_err)?;
-        infos.push((Value::Int(s.type_id as i64), skill_info(sde, s.type_id, -1, -1, now)));
-    }
-    if !infos.is_empty() {
-        outbox.notify_pilot(char_id, "OnServerSkillsRemoved", vec![Value::Dict(infos), Value::Int(now)]);
+        changed.push(s.type_id);
     }
     progress.brain_changed = true;
-    completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await
+    completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &changed).await
 }
 
 async fn grant_starters<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<Sde>, char_id: i64, now: i64) -> Result<(), CallError> {

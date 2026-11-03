@@ -9,7 +9,7 @@ use std::{collections::{BTreeSet, HashMap}, sync::Arc};
 async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, ids: &[i64], now: i64, start: Option<i64>) -> Result<Value, CallError> {
     let progress = learning::begin_tx(tx, outbox, sde, char_id, now).await?;
     let known: HashMap<_, _> = skill_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| (s.type_id, s.level)).collect();
-    let snapshot = effective::snapshot(tx, char_id).await?;
+    let snapshot = effective::snapshot_at(tx, sde, char_id, now).await?;
     let mut types = BTreeSet::new();
     let mut items = Vec::new();
     for &id in ids {

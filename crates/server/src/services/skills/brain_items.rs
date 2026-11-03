@@ -45,7 +45,7 @@ pub(super) async fn activate_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outb
     for existing in brain::list(tx, char_id).await.map_err(db_err)? {
         if existing.flag_id == flag && (existing.slot == Some(slot) || existing.slot.is_none() && sde.types.attribute(existing.type_id, slot_attr) == Some(slot as f64)) { return Err(refusal()); }
     }
-    let snapshot = effective::snapshot(tx, char_id).await?;
+    let snapshot = effective::snapshot_at(tx, sde, char_id, now).await?;
     if requirements(sde, item.type_id).any(|(id, level)| snapshot.level(id) < level) { return Err(refusal()); }
     if booster {
         if let Some(age) = data.attribute(ATTR_BOOSTER_MAX_CHAR_AGE_HOURS) {

@@ -188,8 +188,8 @@ struct Skills {
     modification_discount: f64,
 }
 
-async fn skills(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, CallError> {
-    let levels = super::skills::effective::snapshot(ex, char_id).await?;
+async fn skills(ex: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<Skills, CallError> {
+    let levels = super::skills::effective::snapshot_at(ex, sde, char_id, at).await?;
     let l = |skill: i32| levels.level(skill) as f64;
     Ok(Skills {
         order_cap: (5.0 + 4.0 * l(SKILL_TRADE) + 8.0 * l(SKILL_RETAIL) + 16.0 * l(SKILL_WHOLESALE) + 32.0 * l(SKILL_TYCOON)) as i64,
@@ -379,7 +379,7 @@ async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffe
             let tax = match seller_taxes.get(&seller) {
                 Some(&tax) => tax,
                 None => {
-                    let tax = skills(db, seller).await?.sales_tax;
+                    let tax = skills(db, sde, seller, now).await?.sales_tax;
                     seller_taxes.insert(seller, tax);
                     tax
                 }
@@ -416,7 +416,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
-    let skills = skills(db, me).await?;
+    let skills = skills(db, &sde, me, now).await?;
     let broker_rate = if duration > 0 {
         check_order_slots(db, me, &skills).await?;
         let rate = station_broker_rate(db, &sde, me, at.owner, skills.broker_fee).await?;
@@ -488,7 +488,7 @@ pub(crate) async fn place_sell(identity: &Identity, db: &Db, world: &World, sde:
     }
     let (type_id, quantity) = (item.type_id, quantity.min(item.quantity as i64) as i32);
     let at = station(&sde, station_id)?;
-    let skills = skills(db, me).await?;
+    let skills = skills(db, &sde, me, now).await?;
     if duration == 0 {
         let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, skills.sales_tax, now).await?;
         if sold == 0 {
@@ -559,7 +559,7 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
     let mut o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
-    let skills = skills(db, me).await?;
+    let skills = skills(db, &sde, me, now).await?;
     let owner = station(&sde, o.at.id)?.owner;
     let broker_rate = station_broker_rate(db, &sde, me, owner, skills.broker_fee).await?;
     let volume = o.vol_remaining as f64;

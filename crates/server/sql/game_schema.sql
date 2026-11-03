@@ -274,6 +274,18 @@ CREATE TABLE IF NOT EXISTS game.skills (
     skill_points bigint NOT NULL,
     PRIMARY KEY (character_id, type_id)
 );
+-- Expert-system installation lifecycles (dao/skills/expert_systems).
+CREATE TABLE IF NOT EXISTS game.character_expert_systems (
+    character_id bigint NOT NULL REFERENCES game.characters ON DELETE CASCADE,
+    type_id integer NOT NULL,
+    installed_at bigint NOT NULL,
+    expires_at bigint NOT NULL,
+    PRIMARY KEY (character_id, type_id),
+    CHECK (character_id > 0 AND type_id > 0 AND installed_at > 0 AND expires_at > installed_at)
+);
+CREATE INDEX IF NOT EXISTS character_expert_systems_expiry_idx
+    ON game.character_expert_systems (expires_at, character_id);
+
 
 -- Skill history and authoritative character remaps (dao/skills/history, dao/characters/attributes).
 CREATE TABLE IF NOT EXISTS game.skill_history (

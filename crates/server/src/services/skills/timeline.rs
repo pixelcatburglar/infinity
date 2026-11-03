@@ -1,14 +1,14 @@
-//! Read-only chronological skill and booster projection for characterskills/util.py.
-//! Uses game.skills, game.skill_queue and installed brain metadata; completions
-//! precede booster expiries at equal times. Historical Fit snapshots cannot
-//! reconstruct brain items already removed from the database.
+//! Read-only chronological skill, booster, and expert-system projection for characterskills/util.py.
+//! The plan captures initial installations so historical fits retain grants through expiry.
+//! Completions precede booster and expert expiries at equal timestamps.
+//! Historical Fit snapshots cannot reconstruct brain items already removed from the database.
 use std::{collections::HashMap, sync::Arc};
-use crate::{consts::FLAG_BOOSTER, dao::{items::brain::BrainItem, skills::{queue::QueueEntry, training::Skill}}, db::executor::Executor, sde::Sde, services::{db_err, fit::{Fit, Key}, CallError}};
+use crate::{consts::FLAG_BOOSTER, dao::{items::brain::BrainItem, skills::{expert_systems::ExpertSystem, queue::QueueEntry, training::Skill}}, db::executor::Executor, sde::Sde, services::{db_err, fit::{Fit, Key}, CallError}};
 use super::training;
 use crate::consts::dogma::CHAR_ATTRIBUTES;
 
 pub(super) struct Completion { pub type_id: i32, pub level: i32, pub points: i64, pub end_time: i64 }
-pub(super) enum Event { Completion(Completion), Expiry { at: i64, items: Vec<BrainItem> } }
+pub(super) enum Event { Completion(Completion), Expiry { at: i64, items: Vec<BrainItem> }, ExpertExpiry { installations: Vec<ExpertSystem> } }
 
 /// Final persisted state excludes partial progress at the cutoff unless an
 /// earlier attribute change required banking it. `trained_points` includes it.
@@ -18,6 +18,7 @@ pub(super) struct AdvancePlan {
     pub initial_skills: Vec<Skill>,
     pub initial_queue: Vec<QueueEntry>,
     pub initial_brain: Vec<BrainItem>,
+    pub initial_installations: Vec<ExpertSystem>,
     pub skills: Vec<Skill>,
     pub queue: Vec<QueueEntry>,
     pub events: Vec<Event>,
@@ -25,6 +26,7 @@ pub(super) struct AdvancePlan {
     pub brain_changed: bool,
     pub boosters_changed: bool,
 }
+
 
 impl AdvancePlan {
     pub(super) fn trained_points(&self) -> Result<i64, CallError> {
@@ -49,12 +51,16 @@ pub(super) async fn plan_tx(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, char_
     initial_skills.sort_unstable_by_key(|skill| skill.type_id);
     let initial_queue = crate::dao::skills::queue::list(ex, char_id).await.map_err(db_err)?;
     let initial_brain = crate::dao::items::brain::list(ex, char_id).await.map_err(db_err)?;
-    let mut plan = AdvancePlan { char_id, skills: initial_skills.clone(), queue: initial_queue.clone(), initial_skills, initial_queue, initial_brain, through, events: Vec::new(), queue_changed: false, brain_changed: false, boosters_changed: false };
+    let initial_installations = crate::dao::skills::expert_systems::all(ex, char_id).await.map_err(db_err)?;
+    let mut plan = AdvancePlan { char_id, skills: initial_skills.clone(), queue: initial_queue.clone(), initial_skills, initial_queue, initial_brain, initial_installations, through, events: Vec::new(), queue_changed: false, brain_changed: false, boosters_changed: false };
     let mut expired = Vec::new();
+    let mut expert_expired = Vec::new();
     loop {
         let completion = plan.queue.first().and_then(|row| row.end_time).filter(|&at| at <= through);
         let expiry = plan.initial_brain.iter().filter(|row| row.flag_id == FLAG_BOOSTER && !expired.contains(&row.item_id)).filter_map(|row| row.expires_at).filter(|&at| at <= through).min();
-        if let Some(at) = completion.filter(|at| expiry.is_none_or(|expiry| *at <= expiry)) {
+        let expert_expiry = plan.initial_installations.iter().filter(|row| row.installed_at <= row.expires_at && row.expires_at <= through && !expert_expired.contains(&row.type_id)).map(|row| row.expires_at).min();
+        let next_expiry = expiry.into_iter().chain(expert_expiry).min();
+        if let Some(at) = completion.filter(|at| next_expiry.is_none_or(|expiry| *at <= expiry)) {
             let row = plan.queue.remove(0);
             for (position, entry) in plan.queue.iter_mut().enumerate() { entry.position = position as i32; }
             let skill = if let Some(index) = plan.skills.iter().position(|s| s.type_id == row.type_id) { &mut plan.skills[index] } else {
@@ -69,17 +75,25 @@ pub(super) async fn plan_tx(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, char_
             plan.queue_changed = true;
             continue;
         }
-        let Some(at) = expiry else { break };
-        let before_at = at.checked_sub(1).ok_or_else(|| CallError::Internal(anyhow::anyhow!("booster expiry time underflow")))?;
-        let before = Fit::load_character_with_skills_at(ex, Arc::clone(sde), char_id, before_at, &plan.skills).await?;
-        let after = Fit::load_character_with_skills_at(ex, Arc::clone(sde), char_id, at, &plan.skills).await?;
+        let Some(at) = next_expiry else { break };
+        let before_at = at.checked_sub(1).ok_or_else(|| CallError::Internal(anyhow::anyhow!("skill expiry time underflow")))?;
+        let before = Fit::load_character_with_skills_at(ex, Arc::clone(sde), char_id, before_at, &plan.skills, &plan.initial_installations).await?;
+        let after = Fit::load_character_with_skills_at(ex, Arc::clone(sde), char_id, at, &plan.skills, &plan.initial_installations).await?;
         let old: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, before.value(Key::Char, id as i32))).collect();
         let new: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, after.value(Key::Char, id as i32))).collect();
         let items: Vec<_> = plan.initial_brain.iter().filter(|row| row.flag_id == FLAG_BOOSTER && row.expires_at == Some(at)).cloned().collect();
         expired.extend(items.iter().map(|row| row.item_id));
-        plan.events.push(Event::Expiry { at, items });
-        plan.brain_changed = true;
-        plan.boosters_changed = true;
+        if !items.is_empty() {
+            plan.events.push(Event::Expiry { at, items });
+            plan.brain_changed = true;
+            plan.boosters_changed = true;
+        }
+        let installations: Vec<_> = plan.initial_installations.iter().filter(|row| row.expires_at == at && !expert_expired.contains(&row.type_id)).cloned().collect();
+        expert_expired.extend(installations.iter().map(|row| row.type_id));
+        if !installations.is_empty() {
+            plan.events.push(Event::ExpertExpiry { installations });
+            plan.brain_changed = true;
+        }
         if old != new {
             if let Some(row) = plan.queue.first_mut() {
                 if let (Some(start), Some(end)) = (row.start_time, row.end_time) {

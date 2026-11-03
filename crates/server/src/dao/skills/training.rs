@@ -16,6 +16,10 @@ pub(crate) async fn starting_skill(ex: &(impl Executor + ?Sized), char_id: i64, 
 pub(crate) async fn current(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Vec<Skill>, Error> {
     Ok(ex.query("SELECT type_id, level, skill_points FROM game.skills WHERE character_id = $1", &[&char_id]).await?.iter().map(Skill::from_row).collect())
 }
+pub(crate) async fn current_many(ex: &(impl Executor + ?Sized), char_ids: &[i64]) -> Result<Vec<(i64, Skill)>, Error> {
+    Ok(ex.query("SELECT character_id, type_id, level, skill_points FROM game.skills WHERE character_id = ANY($1) ORDER BY character_id, type_id", &[&char_ids]).await?
+        .iter().map(|r| (r.get("character_id"), Skill::from_row(r))).collect())
+}
 pub(crate) async fn total(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, Error> {
     Ok(Total::from_row(&ex.query_one("SELECT COALESCE(sum(skill_points), 0)::bigint AS points FROM game.skills WHERE character_id = $1", &[&char_id]).await?).points)
 }

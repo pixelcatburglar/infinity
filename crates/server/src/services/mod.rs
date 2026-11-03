@@ -37,6 +37,7 @@ pub(crate) mod drones;
 mod dynamic_items;
 pub(crate) mod effects;
 mod exploration;
+mod expert_systems;
 mod event_log;
 pub(crate) mod fit;
 mod fixed;
@@ -427,6 +428,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = fitting::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = expert_systems::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = skills::dispatch(c, call).await {

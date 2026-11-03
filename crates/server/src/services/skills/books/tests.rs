@@ -163,7 +163,7 @@ async fn overdue_completion_is_merged_with_book_injection_and_start() {
         let Value::Dict(infos) = &batches[0][0] else { panic!("skills dictionary") };
         assert_eq!(infos.len(), 2);
         for (id, level, sp) in [(trained, 1, points), (book, 0, 0)] {
-            assert!(infos.iter().any(|(key, value)| *key == Value::Int(i64::from(id)) && *value == super::super::view::skill_info(&sde, id, level, sp, now)));
+            assert!(infos.iter().any(|(key, value)| *key == Value::Int(i64::from(id)) && *value == super::super::view::incremental_skill_info(&sde, id, Some(level), Some(sp), None, now)));
         }
         assert_eq!(effects.iter().filter(|e| matches!(e, Effect::Notification(Notification::Pilot { char_id, event, .. }) if *char_id == f.character && event == crate::client::BRAIN_REFRESH)).count(), 1);
         assert_eq!(effects.iter().filter(|e| matches!(e, Effect::Notification(Notification::Pilot { char_id, event, .. }) if *char_id == f.character && event == "OnServerBoostersChanged")).count(), 1);

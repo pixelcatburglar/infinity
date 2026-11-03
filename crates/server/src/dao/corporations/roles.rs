@@ -40,22 +40,6 @@ impl CharacterId {
         Self { character_id: r.get("character_id") }
     }
 }
-pub(crate) struct CeoCandidate {
-    pub character_id: i64,
-    pub skill: Option<crate::dao::skills::training::Skill>,
-}
-impl CeoCandidate {
-    fn from_row(r: &tokio_postgres::Row) -> Self {
-        Self {
-            character_id: r.get("character_id"),
-            skill: r.get::<_, Option<i32>>("skill_type_id").map(|type_id| crate::dao::skills::training::Skill {
-                type_id,
-                level: r.get("skill_level"),
-                skill_points: r.get("skill_points"),
-            }),
-        }
-    }
-}
 
 pub(crate) struct Info {
     pub corporation_id: i64,
@@ -142,12 +126,11 @@ pub(crate) async fn delete_title(ex: &(impl Executor + ?Sized), corp: i64, title
     ex.execute("UPDATE game.characters SET corp_title_mask = corp_title_mask & ~$2 WHERE corporation_id = $1", &[&corp, &title]).await?;
     Ok(())
 }
-pub(crate) async fn potential_ceos(ex: &(impl Executor + ?Sized), corp: i64, ceo: i64, skill_type: i32) -> Result<Vec<CeoCandidate>, db::Error> {
-    Ok(ex.query("SELECT ch.character_id, s.type_id AS skill_type_id, s.level AS skill_level, s.skill_points
+pub(crate) async fn potential_ceos(ex: &(impl Executor + ?Sized), corp: i64, ceo: i64) -> Result<Vec<i64>, db::Error> {
+    Ok(ex.query("SELECT ch.character_id
              FROM game.characters ch
-             LEFT JOIN game.skills s ON s.character_id = ch.character_id AND s.type_id = $3
              WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted
-             ORDER BY ch.character_id", &[&corp, &ceo, &skill_type]).await?.iter().map(CeoCandidate::from_row).collect())
+             ORDER BY ch.character_id", &[&corp, &ceo]).await?.iter().map(|r| r.get("character_id")).collect())
 }
 pub(crate) async fn transfer_ceo(ex: &(impl Executor + ?Sized), corp: i64, next: i64, mut writes: [(i64, i64); 2]) -> Result<(), db::Error> {
     ex.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &next]).await?;

@@ -104,10 +104,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
 async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
+    let at = crate::client::filetime_now();
     match call.method {
         // GetQuotes(itemIDs, activeShipID) -> (stationTax, {typeID|None: stationEfficiency}, {itemID: quote})
         "GetQuotes" => {
-            let skills = crate::services::skills::effective::snapshot(&c.db, char_id).await?;
+            let skills = crate::services::skills::effective::snapshot_at(&c.db, &c.sde, char_id, at).await?;
             let mut quotes = vec![];
             for item in reprocessable(c, &value_id_list(call.args.first())).await? {
                 if let Some(q) = quote(c, &c.sde, &skills, &item).await? {
@@ -119,7 +120,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetStationEfficiencyForTypeID" => Ok(Value::Float(crate::config::game().mining.station_reprocessing_efficiency)),
         "GetCharRefiningYieldPercentageForType" => {
             let type_id = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-            let skills = crate::services::skills::effective::snapshot(&c.db, char_id).await?;
+            let skills = crate::services::skills::effective::snapshot_at(&c.db, &c.sde, char_id, at).await?;
             Ok(Value::Float(skill_multiplier(&skills, &c.sde, type_id)))
         }
         // Reprocess(itemIDs, fromLocationID, ownerID, outputLocationID, outputFlagID)
@@ -129,7 +130,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
             let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
             let items = reprocessable(c, &value_id_list(call.args.first())).await?;
-            let skills = crate::services::skills::effective::snapshot(&c.db, char_id).await?;
+            let skills = crate::services::skills::effective::snapshot_at(&c.db, &c.sde, char_id, at).await?;
             let mut sources = Vec::new();
             let mut output = BTreeMap::<i32, i64>::new();
             let mut tax = 0.0;

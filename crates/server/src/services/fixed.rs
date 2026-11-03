@@ -152,8 +152,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("corporationSvc", "GetCorpInfo") => Value::list([]),
         ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),
         ("monolithTaskTrackerMgr", "UpdateClientAchievmentsAndCounters") => Value::None,
-        // typeID -> expert system state; none installed.
-        ("expertSystemMgr", "GetMyExpertSystems") => Value::Dict(vec![]),
         // The adaptation tree answers through notifications; there are no trees to send.
         ("shipAdaptionMgr", "fetch_tree_data") | ("shipAdaptionMgr", "fetch_missions") => Value::None,
         _ => return None,

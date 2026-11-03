@@ -301,7 +301,7 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                 if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
                     return Err(notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED));
                 }
-                let skills = crate::services::skills::effective::snapshot(tx, me).await?;
+                let skills = crate::services::skills::effective::snapshot_at(tx, &sde, me, now).await?;
                 if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.level(*s) < *l) {
                     return Err(notify_error(&messages::required_skill_message(skill, level)));
                 }

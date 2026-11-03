@@ -108,7 +108,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     let (groups, requested, title, description) = &*input;
     if for_corp { ownership::authorize_corporate_action(db, me, corp, wallet_key).await?; }
     let source = custody::issuer_source(db, me, corp, for_corp, start_id, source_flag).await?;
-    let skills = super::super::skills::effective::snapshot(db, me).await?;
+    let skills = super::super::skills::effective::snapshot_at(db, &sde, me, now).await?;
     let counts = shared::outstanding_counts(db, me, corp, STATUS_OUTSTANDING).await.map_err(db_err)?;
     let internal = assignee != 0 && (assignee == corp || crate::dao::characters::members::active_ids(db, corp).await.map_err(db_err)?.contains(&assignee));
     let open = match (for_corp, internal) {

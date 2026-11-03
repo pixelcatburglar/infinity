@@ -182,7 +182,7 @@ async fn purchase_settlement_and_rollback() {
     let expected_balance = characters::balance(&db, f.character).await.unwrap();
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnAccountChange" && *args == vec![Value::str("cash"), Value::Int(f.character), Value::Float(expected_balance)])));
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == crate::client::BRAIN_REFRESH && args.is_empty())));
-    let expected_infos = Value::Dict(skills.iter().map(|skill| (Value::Int(i64::from(skill.type_id)), super::super::view::skill_info(&sde, skill.type_id, 0, 0, now))).collect());
+    let expected_infos = Value::Dict(skills.iter().map(|skill| (Value::Int(i64::from(skill.type_id)), super::super::view::incremental_skill_info(&sde, skill.type_id, Some(0), Some(0), None, now))).collect());
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnServerSkillsChanged" && *args == vec![expected_infos.clone(), Value::None, Value::Int(now)])));
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Event(GameEvent::WalletChanged { owner_id, account_key, balance, delta }) if *owner_id == f.character && *account_key == ACCOUNT_CASH && *balance == expected_balance && *delta == -total)));
     let before = fixture::skill_fingerprint(&db, f.character).await.unwrap();

@@ -162,13 +162,30 @@ pub(super) async fn delete_title(db: &Db, world: &World, me: i64, corp: i64, tit
 }
 
 /// Members other than the CEO with Corporation Management, who could take over.
-pub(super) async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i64>, CallError> {
-    let candidates = role_dao::potential_ceos(db, corp, ceo, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?;
+pub(super) async fn potential_ceos(db: &Db, sde: &Sde, corp: i64, ceo: i64) -> Result<Vec<i64>, CallError> {
+    let candidates = role_dao::potential_ceos(db, corp, ceo).await.map_err(db_err)?;
+    if candidates.is_empty() { return Ok(Vec::new()); }
+    let now = filetime_now();
+    let trained = crate::dao::skills::training::current_many(db, &candidates).await.map_err(db_err)?;
+    let installations = crate::dao::skills::expert_systems::active_many(db, &candidates, now).await.map_err(db_err)?;
+    let mut trained_by_character = std::collections::HashMap::<i64, Vec<_>>::new();
+    for (character_id, skill) in trained {
+        trained_by_character.entry(character_id).or_default().push(skill);
+    }
+    let mut installations_by_character = std::collections::HashMap::<i64, Vec<_>>::new();
+    for installation in installations {
+        installations_by_character.entry(installation.character_id).or_default().push(installation);
+    }
     let minimum = crate::config::game().corporations.min_management_skill_level;
-    Ok(candidates.into_iter()
-        .filter(|candidate| i64::from(crate::services::skills::effective::from_trained(candidate.skill.as_slice()).level(SKILL_CORPORATION_MANAGEMENT)) >= minimum)
-        .map(|candidate| candidate.character_id)
-        .collect())
+    Ok(candidates.into_iter().filter(|&character_id| {
+        let snapshot = crate::services::skills::effective::project(
+            trained_by_character.get(&character_id).map_or(&[], Vec::as_slice),
+            installations_by_character.get(&character_id).map_or(&[], Vec::as_slice),
+            sde,
+            now,
+        );
+        i64::from(snapshot.level(SKILL_CORPORATION_MANAGEMENT)) >= minimum
+    }).collect())
 }
 
 /// `ResignFromCEO(newCeoID=None)`. Without a successor it returns the members who could be
@@ -181,7 +198,7 @@ pub(super) async fn resign_ceo(db: &Db, sde: &Arc<Sde>, world: &World, me: i64, 
     }
     match successor {
         Some(next) => {
-            if !potential_ceos(db, corp, me).await?.contains(&next) {
+            if !potential_ceos(db, sde, corp, me).await?.contains(&next) {
                 return Err(notify_error(messages::MEMBER_CANNOT_BECOME_CEO));
             }
             db.transaction(
@@ -205,7 +222,7 @@ pub(super) async fn resign_ceo(db: &Db, sde: &Arc<Sde>, world: &World, me: i64, 
                 leave(db, sde, world, me).await?;
                 return Ok(Value::None);
             }
-            let candidates = potential_ceos(db, corp, me).await?;
+            let candidates = potential_ceos(db, sde, corp, me).await?;
             if !candidates.is_empty() {
                 return Ok(Value::list(candidates.into_iter().map(Value::Int)));
             }

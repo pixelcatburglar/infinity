@@ -1,10 +1,8 @@
-//! Skill snapshots for gameplay consumers preserve persisted training rows and
-//! separate non-trained level contributions. Reads `game.skills` through the
-//! training DAO; mirrors CharacterSkillEntry effective-level accessors.
-//! Only trained rows are currently loaded.
-use crate::dao::skills::training::Skill;
+//! Effective skill snapshots combine persisted training with active expert grants.
+use crate::dao::skills::{expert_systems::ExpertSystem as Installation, training::Skill};
 use crate::db::executor::Executor;
 use crate::services::{db_err, CallError};
+use crate::sde::Sde;
 use std::collections::BTreeMap;
 
 /// A persisted skill and its optional non-trained level contribution.
@@ -40,27 +38,64 @@ impl SkillSnapshot {
     }
 }
 
-/// Read persisted training rows for one character.
-pub(crate) async fn snapshot(
+/// Read and project the rows active at one captured FILETIME.
+pub(crate) async fn snapshot_at(
     ex: &(impl Executor + ?Sized),
-    char_id: i64,
+    sde: &Sde,
+    character: i64,
+    at: i64,
 ) -> Result<SkillSnapshot, CallError> {
-    let skills = crate::dao::skills::training::current(ex, char_id)
-        .await
-        .map_err(db_err)?;
-    Ok(from_owned(skills.into_iter()))
+    let (trained, installations) = tokio::try_join!(
+        crate::dao::skills::training::current(ex, character),
+        crate::dao::skills::expert_systems::active(ex, character, at),
+    )
+    .map_err(db_err)?;
+    Ok(project_core(&trained, &installations, |type_id| {
+        sde.expert_systems.get(type_id).map(|definition| definition.skills.as_slice())
+    }, at))
 }
 
-/// Build a snapshot from an already captured set of persisted training rows.
-pub(crate) fn from_trained(skills: &[Skill]) -> SkillSnapshot {
-    from_owned(skills.iter().cloned())
-}
-
-fn from_owned(skills: impl Iterator<Item = Skill>) -> SkillSnapshot {
-    let entries = skills.map(|skill| {
-        (skill.type_id, SkillEntry { trained: Some(skill), virtual_level: None })
-    }).collect();
+/// Project persisted rows using a caller-provided expert-system definition lookup.
+fn project_core<'a, Lookup>(
+    trained: &[Skill],
+    installations: &[Installation],
+    lookup: Lookup,
+    at: i64,
+) -> SkillSnapshot
+where
+    Lookup: Fn(i32) -> Option<&'a [(i32, i32)]>,
+{
+    let mut entries: BTreeMap<i32, SkillEntry> = trained
+        .iter()
+        .cloned()
+        .map(|skill| (skill.type_id, SkillEntry { trained: Some(skill), virtual_level: None }))
+        .collect();
+    for installation in installations {
+        if installation.installed_at > at || at >= installation.expires_at {
+            continue;
+        }
+        let Some(skills) = lookup(installation.type_id) else { continue };
+        for &(type_id, level) in skills {
+            let entry = entries.entry(type_id).or_insert_with(|| SkillEntry {
+                trained: None,
+                virtual_level: None,
+            });
+            entry.virtual_level = Some(entry.virtual_level.unwrap_or(0).max(level));
+        }
+    }
     SkillSnapshot { entries }
+}
+
+/// Project persisted rows and grants without querying or cloning static data.
+pub(crate) fn project(
+    trained: &[Skill],
+    installations: &[Installation],
+    sde: &Sde,
+    at: i64,
+) -> SkillSnapshot {
+    project_core(&trained, &installations, |type_id| {
+        sde.expert_systems.get(type_id).map(|definition| definition.skills.as_slice())
+    }, at)
 }
 
 #[cfg(test)]

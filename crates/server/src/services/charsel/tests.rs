@@ -216,8 +216,12 @@ async fn space_selection_restores_cloak_before_session_and_without_map_telemetry
             assert_eq!(c.session.int("constellationid"), Some(constellation));
             assert_eq!(c.session.int("regionid"), Some(region));
             let session = c.outbox.iter().position(|p| p.command == macho::cmd::SESSIONCHANGENOTIFICATION).unwrap();
+            let expert = c.outbox.iter().position(|p| matches!(&p.destination, Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnExpertSystemsUpdated"))).unwrap();
             let timer = c.outbox.iter().position(|p| matches!(&p.destination, Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnJumpCloakUpdated"))).unwrap();
-            assert!(session < timer);
+            assert!(session < expert && expert < timer);
+            let envelope = c.outbox[expert].body[0].items().unwrap();
+            let payload = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();
+            assert_eq!(payload, Value::tuple([Value::Int(1), Value::tuple([Value::Dict(vec![]), Value::Bool(false), Value::None])]));
             let envelope = c.outbox[timer].body[0].items().unwrap();
             let payload = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();
             assert_eq!(payload, Value::tuple([Value::Int(1), Value::tuple([Value::Int(ship), Value::Int(ball.cloak_until), Value::Int(60 * FILETIME_SECOND)])]));
