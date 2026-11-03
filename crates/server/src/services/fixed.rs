@@ -71,7 +71,7 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("map", "GetDeadspaceComplexMap") | ("map", "GetDeadspaceAgentsMap") => Value::None,
         ("map", "GetBeaconCount") => Value::Dict(vec![]),
         ("map", "GetIndustryJobsOverLast") => rowset(&history_header, vec![]),
-        ("map", "GetInsurgencySystem") => Value::None,
+        ("map", "GetInsurgencySystem") => Value::list([]),
         ("map", "GetAllRoamingWeatherSystems") => Value::Dict(vec![]),
         ("map", "GetTriglavianMinorVictorySystems") | ("map", "GetEdencomMinorVictorySystems") | ("map", "GetEdencomFortressSystems") => {
             Value::list([])

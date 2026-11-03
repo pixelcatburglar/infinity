@@ -62,6 +62,36 @@ async fn login_campaign_fixed_dispatch_roundtrips_none() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn map_insurgency_fixed_dispatch_roundtrips_empty_list() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 1).await;
+    let kwargs = Value::Dict(vec![]);
+    let call = Call {
+        service: "map",
+        method: "GetInsurgencySystem",
+        args: &[],
+        kwargs: &kwargs,
+        bound: false,
+        bind_params: None,
+    };
+    let reply = dispatch(&mut client, &call).await.unwrap();
+    assert_eq!(reply, Value::list([]));
+    assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), Value::list([]));
+
+    let unknown = Call {
+        service: "map",
+        method: "UnknownCompatibilityMethod",
+        args: &[],
+        kwargs: &kwargs,
+        bound: false,
+        bind_params: None,
+    };
+    assert_eq!(dispatch(&mut client, &unknown).await.unwrap(), Value::None);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn item_locking_dispatch_returns_empty_collections() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();

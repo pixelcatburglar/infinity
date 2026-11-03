@@ -30,6 +30,19 @@ The QA starter-system override list is empty; normal starter-system allocation i
 
 NPC station and solar-system data comes from static data; alliance sovereignty is not supported.
 
+## Map compatibility
+
+| service | method | status | handler file |
+|---|---|---|---|
+| map | GetInsurgencySystem | fixed | `crates/server/src/services/fixed.rs` |
+| map | GetAllRoamingWeatherSystems | fixed | `crates/server/src/services/fixed.rs` |
+| map | GetTriglavianMinorVictorySystems | fixed | `crates/server/src/services/fixed.rs` |
+| map | GetEdencomMinorVictorySystems | fixed | `crates/server/src/services/fixed.rs` |
+| map | GetEdencomFortressSystems | fixed | `crates/server/src/services/fixed.rs` |
+| insurgencySolarsystem | GetAllVisibleCampaigns | fixed | `crates/server/src/services/fixed.rs` |
+
+These replies are empty because insurgency, roaming weather, minor-victory and fortress systems, and campaign snapshots are not modelled. Each has the shape its client reader expects: a list for the insurgency membership check, a dictionary for roaming weather, and lists for the others.
+
 ## Mining ledger
 
 | service | method | status | handler file |
