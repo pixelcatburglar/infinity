@@ -1,5 +1,6 @@
 //! Simulated pilot operations for scripts, backed by shared character services.
 //! Character data comes from the service account and SDE; online state is process-local.
+//! Enumeration includes online and offline pilots, allowing recovery after a create caller times out.
 //! The client accepts absent portrait data in eve/client/script/ui/services/ccSvc.py;
 //! simulated pilots do not receive generated portraits or customized dolls.
 
@@ -118,6 +119,23 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> mlua::R
             row.set("system_id", identity.system_id)?;
             row.set("online", online)?;
             Ok(row)
+        }
+    })?)?;
+    let r = resources.clone();
+    api.set("list", lua.create_async_function(move |lua, ()| {
+        let r = r.clone();
+        async move {
+            let characters = crate::dao::characters::selection::characters(
+                &r.db, r.pilots.account, crate::consts::FILETIME_SECOND, crate::consts::FILETIME_UNIX_EPOCH,
+            ).await.map_err(services::db_err).map_err(lua_error)?;
+            let list = lua.create_table()?;
+            for (index, character) in characters.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", character.character_id)?;
+                row.set("name", character.name)?;
+                list.set(index + 1, row)?;
+            }
+            Ok(list)
         }
     })?)?;
     space::register(lua, &api, resources)?;

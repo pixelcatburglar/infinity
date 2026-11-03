@@ -65,11 +65,33 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
     }
     let id: i64 = lua.load("return pilots.create{name=pilot_name,race_id=race,bloodline_id=bloodline,school_id=school,station_id=station,gender_id=0,balance=0}").eval_async().await.unwrap();
     globals.set("id", id).unwrap();
+    let check_list: mlua::Function = lua.load(r#"
+        return function(expected)
+            local found, previous = false, nil
+            for _, pilot in ipairs(pilots.list()) do
+                assert(type(pilot.id) == "number" and type(pilot.name) == "string")
+                assert(previous == nil or previous < pilot.id)
+                previous = pilot.id
+                local fields = 0
+                for key in pairs(pilot) do
+                    assert(key == "id" or key == "name")
+                    fields = fields + 1
+                end
+                assert(fields == 2)
+                if pilot.id == id then
+                    assert(pilot.name == pilot_name)
+                    found = true
+                end
+            end
+            assert(found == expected)
+        end
+    "#).eval().unwrap();
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let before: Table = lua.load("return pilots.identity(id)").eval_async().await?;
         assert_eq!(before.get::<i64>("station_id")?, station);
         assert_eq!(before.get::<Option<i64>>("ship_id")?, None);
         assert!(!before.get::<bool>("online")?);
+        check_list.call_async::<()>(true).await?;
         r.db.execute("UPDATE game.characters SET station_id=NULL WHERE character_id=$1", &[&id]).await?;
         assert!(lua.load("return pilots.online(id)").eval_async::<bool>().await.is_err());
         assert!(!r.world.is_online(id));
@@ -81,6 +103,7 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         let active: Table = lua.load("return pilots.identity(id)").eval_async().await?;
         let ship = active.get::<i64>("ship_id")?;
         assert!(active.get::<bool>("online")?);
+        check_list.call_async::<()>(true).await?;
         assert!(r.world.is_online(id));
         assert!(r.world.chat_session(id).is_some());
         let fitted: i64 = r.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id <> $3", &[&id, &ship, &crate::consts::FLAG_CARGO]).await?.get("n");
@@ -110,20 +133,24 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         let after: Table = lua.load("return pilots.identity(id)").eval_async().await?;
         assert_eq!(after.get::<i64>("ship_id")?, ship);
         assert!(!after.get::<bool>("online")?);
+        check_list.call_async::<()>(true).await?;
         for source in ["return pilots.identity(0)", "return pilots.online(-1)", "return pilots.offline(0)", "return pilots.identity(9223372036854775807)"] {
             assert!(lua.load(source).eval_async::<Value>().await.is_err());
         }
         r.db.execute("UPDATE game.characters SET deleted=true WHERE character_id=$1", &[&id]).await?;
+        check_list.call_async::<()>(false).await?;
         for source in ["return pilots.identity(id)", "return pilots.online(id)", "return pilots.offline(id)"] {
             assert!(lua.load(source).eval_async::<Value>().await.is_err());
         }
         r.db.execute("UPDATE game.characters SET deleted=false WHERE character_id=$1", &[&id]).await?;
         let foreign: i64 = r.db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('pilot-foreign-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"test"[..]]).await?.get("user_id");
         r.db.execute("UPDATE game.characters SET user_id=$2 WHERE character_id=$1", &[&id, &foreign]).await?;
+        check_list.call_async::<()>(false).await?;
         for source in ["return pilots.identity(id)", "return pilots.online(id)", "return pilots.offline(id)"] {
             assert!(lua.load(source).eval_async::<Value>().await.is_err());
         }
         r.db.execute("UPDATE game.characters SET user_id=$2 WHERE character_id=$1", &[&id, &r.pilots.account]).await?;
+        check_list.call_async::<()>(true).await?;
         r.db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&foreign]).await?;
         Ok(())
     }.await;
