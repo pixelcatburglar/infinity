@@ -126,3 +126,11 @@ Epic-arc availability follows the selected character's active missions and unloc
 | skillHandler | PurchaseSkills | handled | `crates/server/src/services/skills/purchase.rs` |
 
 The bound skill handler returns the bought type IDs in request order and sends the same committed skill updates as skillbook injection. Skills in the client's hidden skill groups cannot be bought.
+
+## Player structure directory
+
+| service | method | status | handler file |
+|---|---|---|---|
+| structureDirectory | GetMyCharacterStructures | fixed | `crates/server/src/services/fixed.rs` |
+
+The character's player-structure directory is empty because player structures are not supported. The market's multi-buy window lists only NPC stations.
