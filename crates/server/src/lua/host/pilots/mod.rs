@@ -4,6 +4,7 @@
 //! simulated pilots do not receive generated portraits or customized dolls.
 
 mod lifecycle;
+mod space;
 #[cfg(test)]
 mod tests;
 
@@ -116,5 +117,6 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> mlua::R
             Ok(row)
         }
     })?)?;
+    space::register(lua, &api, resources)?;
     env.set("pilots", api)
 }

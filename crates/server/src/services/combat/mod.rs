@@ -265,7 +265,7 @@ pub async fn banks(db: &(impl Executor + ?Sized), ship: i64) -> Result<Value, Ca
     Ok(Value::Dict(by_master.into_iter().map(|(m, s)| (Value::Int(m), Value::List(s))).collect()))
 }
 
-pub(super) async fn targeters(world: &World, system: i64, ship: i64) -> Vec<i64> {
+pub(crate) async fn targeters(world: &World, system: i64, ship: i64) -> Vec<i64> {
     let incoming = targeters_of(ship);
     let candidates = world.with(system, move |s| {
         let mut candidates = s.hostiles_targeting(ship);

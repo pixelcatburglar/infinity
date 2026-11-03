@@ -554,9 +554,9 @@ fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
 
 pub(crate) mod balls;
 pub(crate) mod observer;
-mod ship;
+pub(crate) mod ship;
 mod undock_point;
-mod beyonce;
+pub(crate) mod beyonce;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {

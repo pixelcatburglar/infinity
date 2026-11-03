@@ -1,5 +1,6 @@
 //! Lua-facing simulated pilot lifecycle and cancellation coverage.
 mod fixture;
+mod space;
 use super::*;
 
 #[tokio::test]

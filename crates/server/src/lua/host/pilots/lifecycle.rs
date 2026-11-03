@@ -7,8 +7,8 @@ use super::Resources;
 use crate::services::identity::Identity;
 
 pub(super) struct OnlinePilot {
-    _session: ChatSession,
-    _notify: NotifyTx,
+    pub(super) session: ChatSession,
+    pub(super) notify: NotifyTx,
     drain: tokio::task::JoinHandle<()>,
 }
 
@@ -17,23 +17,24 @@ async fn selected(r: &Resources, id: i64) -> Result<SelectedCharacter, CallError
         .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })
 }
 
-async fn snapshot(r: &Resources, id: i64, row: &SelectedCharacter) -> Result<Identity, CallError> {
+pub(super) async fn snapshot(r: &Resources, id: i64, row: &SelectedCharacter) -> Result<Identity, CallError> {
     Ok(Identity { char_id: id, corp_id: row.corporation_id, ship_id: selection::ship_id(&r.db, id).await.map_err(services::db_err)?, station_id: row.station_id, system_id: Some(row.solar_system_id) })
 }
 
-pub(super) async fn identity(r: &Resources, id: i64) -> Result<(Identity, bool), CallError> {
+pub(super) async fn locked(r: &Resources, id: i64) -> Result<(tokio::sync::OwnedMutexGuard<Option<OnlinePilot>>, SelectedCharacter), CallError> {
     selected(r, id).await?;
-    let state = r.pilots.state(id);
-    let _state = state.lock().await;
+    let state = r.pilots.state(id).lock_owned().await;
     let row = selected(r, id).await?;
+    Ok((state, row))
+}
+
+pub(super) async fn identity(r: &Resources, id: i64) -> Result<(Identity, bool), CallError> {
+    let (_state, row) = locked(r, id).await?;
     Ok((snapshot(r, id, &row).await?, r.world.is_online(id)))
 }
 
 pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
-    selected(&r, id).await?;
-    let state = r.pilots.state(id);
-    let mut state = state.lock().await;
-    let row = selected(&r, id).await?;
+    let (mut state, row) = locked(&r, id).await?;
     if state.is_some() { return Ok(false); }
     let (notify, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -53,17 +54,14 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
         drain.abort();
         return Err(error);
     }
-    *state = Some(OnlinePilot { _session: session, _notify: notify, drain });
+    *state = Some(OnlinePilot { session, notify, drain });
     services::online_status::presence_changed(&r.db, &r.world, id, true).await;
     crate::lua::on_event(GameEvent::CharacterSelected { user_id: r.pilots.account, char_id: id });
     Ok(true)
 }
 
 pub(super) async fn offline(r: Resources, id: i64) -> Result<(), CallError> {
-    selected(&r, id).await?;
-    let state = r.pilots.state(id);
-    let mut state = state.lock().await;
-    let row = selected(&r, id).await?;
+    let (mut state, row) = locked(&r, id).await?;
     if state.is_none() { return Ok(()); }
     let identity = snapshot(&r, id, &row).await?;
     let result = services::presence::leave(&identity, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), || {}).await;

@@ -11,7 +11,7 @@ impl From<&Member> for Position {
     fn from(m: &Member) -> Self { Self { wing: m.wing, squad: m.squad, role: m.role } }
 }
 #[derive(Clone)]
-pub(in crate::services) struct Order { fleet: i64, commander: i64, ship: i64, position: Position, members: Vec<(i64, Position)>, target: Option<(i64, i64)> }
+pub(crate) struct Order { fleet: i64, commander: i64, ship: i64, position: Position, members: Vec<(i64, Position)>, target: Option<(i64, i64)> }
 
 fn in_scope(commander: Position, member: Position) -> bool {
     match commander.role {
