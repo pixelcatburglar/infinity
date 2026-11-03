@@ -26,7 +26,8 @@ impl Default for LuaConfig {
             scripts_dir: "crates/server/lua".into(),
             mod_dirs: Vec::new(),
             memory_limit_mb: 64,
-            call_budget_ms: 50,
+            // Allow the slowest simulated pilot operation, bringing a pilot online, with headroom.
+            call_budget_ms: 1000,
             call_budget_instructions: 5_000_000,
             instruction_hook_interval: 1000,
             store_value_limit_bytes: 65536,
