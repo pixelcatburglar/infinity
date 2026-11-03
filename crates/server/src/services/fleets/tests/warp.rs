@@ -119,7 +119,13 @@ fn character_target_is_current_visible_fleet_pilot_at_commit() {
     s.insert(ball(104, 4));
     s.insert(ball(105, 5));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(3, 103, tx);
+    s.observe(1_000_000_000_001, 103, tx);
+    assert!(s.fleet_broadcast_visible(3, 103));
+    let mut self_cloaked = ball(103, 3);
+    self_cloaked.cloak = 1;
+    s.insert(self_cloaked);
+    assert!(s.fleet_broadcast_visible(3, 103));
+    s.insert(ball(103, 3));
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_some());
     st.of.remove(&5);
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_none());
@@ -132,6 +138,14 @@ fn character_target_is_current_visible_fleet_pilot_at_commit() {
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_none());
     s.insert(ball(106, 5));
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_none());
+    s.unobserve(1_000_000_000_001);
+    let (stale, _stale_rx) = tokio::sync::mpsc::unbounded_channel();
+    s.observe(1_000_000_000_001, 104, stale);
+    assert!(!s.fleet_broadcast_visible(3, 104));
+    let (closed, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+    s.observe(1_000_000_000_001, 103, closed);
+    drop(closed_rx);
+    assert!(!s.fleet_broadcast_visible(3, 104));
 }
 
 #[test]

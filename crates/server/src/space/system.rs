@@ -195,12 +195,14 @@ impl System {
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
         self.pilots.get(&char_id).and_then(|id| self.ball(*id))
     }
+    fn pilot_observer(&self, character: i64) -> Option<&(i64, DestinyTx)> {
+        let ego = self.pilot_ball(character)?.id;
+        self.observers.values().find(|(observer_ego, tx)| *observer_ego == ego && !tx.is_closed())
+    }
     /// Current ballpark visibility for a pilot with a live matching observer.
     pub(crate) fn fleet_broadcast_visible(&self, character: i64, ball: i64) -> bool {
-        let Some(ego) = self.pilot_ball(character).map(|pilot| pilot.id) else { return false };
-        let Some((observer_ego, tx)) = self.observers.get(&character) else { return false };
-        *observer_ego == ego && !tx.is_closed()
-            && self.ball(ball).is_some_and(|target| target.cloak == 0 || target.id == ego)
+        let Some((ego, _)) = self.pilot_observer(character) else { return false };
+        self.ball(ball).is_some_and(|target| target.cloak == 0 || target.id == *ego)
     }
     /// Snapshot a pilot's real actor-owned damage state and visibility.
     pub(crate) fn fleet_damage_snapshot(&self, character: i64) -> Option<(i64, u8, Value)> {
@@ -210,9 +212,8 @@ impl System {
 
     /// Targeted ballpark function, only while the destination observer owns its ego.
     pub(crate) fn fleet_damage_update(&self, watcher: i64, source_system: i64, ship: i64, cloak: u8, damage: Value) {
-        let Some(ego) = self.pilot_ball(watcher).map(|ball| ball.id) else { return };
-        let Some((observer_ego, tx)) = self.observers.get(&watcher) else { return };
-        if *observer_ego != ego || tx.is_closed() || (self.id == source_system && (cloak == 0 || ship == ego)) { return; }
+        let Some((ego, _)) = self.pilot_observer(watcher) else { return };
+        if self.id == source_system && (cloak == 0 || ship == *ego) { return; }
         // michelle.py:875-879,1594-1599: a ballpark function, not a service event.
         let update = event(self.current_time, "OnFleetDamageStateChange", vec![Value::Int(ship), damage]);
         self.registry.notify_pilot(watcher, "DoDestinyUpdate", vec![Value::list([update]), Value::Bool(false)]);

@@ -92,14 +92,28 @@ fn damage_ballpark_update_requires_live_observer_and_uses_destination_stamp() {
     let health = Value::tuple([Value::Int(1), Value::Int(2)]);
     system.fleet_damage_update(1, 10, 200, 0, health.clone());
     assert!(notifications.try_recv().is_err());
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(1, 100, tx);
+    let connection = 1_000_000_000_001;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    system.observe(connection, 999, tx);
+    system.fleet_damage_update(1, 10, 200, 0, health.clone());
+    assert!(notifications.try_recv().is_err());
+    system.unobserve(connection);
+    drop(rx);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    system.observe(connection, 100, tx);
     system.fleet_damage_update(1, 20, 200, 0, health.clone());
     assert!(notifications.try_recv().is_err());
     system.fleet_damage_update(1, 10, 200, 0, health.clone());
     assert_eq!(notifications.try_recv().unwrap(), ("DoDestinyUpdate".to_string(),
         vec![Value::list([event(42, "OnFleetDamageStateChange", vec![Value::Int(200), health])]), Value::Bool(false)]));
-    system.unobserve(1);
+    system.fleet_damage_update(1, 20, 100, 1, Value::None);
+    assert!(notifications.try_recv().is_err());
+    system.fleet_damage_update(1, 20, 200, 1, Value::None);
+    assert!(notifications.try_recv().is_ok());
+    drop(rx);
+    system.fleet_damage_update(1, 10, 200, 0, Value::None);
+    assert!(notifications.try_recv().is_err());
+    system.unobserve(connection);
     system.fleet_damage_update(1, 10, 200, 0, Value::None);
     assert!(notifications.try_recv().is_err());
 }
