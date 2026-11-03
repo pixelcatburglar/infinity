@@ -128,6 +128,17 @@ Epic-arc availability follows the selected character's active missions and unloc
 
 The bound skill handler returns the bought type IDs in request order and sends the same committed skill updates as skillbook injection. Skills in the client's hidden skill groups cannot be bought.
 
+## Clone grade
+
+| service | method | status | handler file |
+|---|---|---|---|
+| subscriptionMgr | GetCloneGrade | handled | `crates/server/src/services/subscriptions/subscription_mgr.rs` |
+| subscriptionMgr | GetSubscriptionTime | handled | `crates/server/src/services/subscriptions/subscription_mgr.rs` |
+| loginRewardFacilities | get_my_clone_grade | handled | `crates/server/src/services/store/login_reward_facilities.rs` |
+| alphaInjectorMgr | GetNextAvailableInjection | handled | `crates/server/src/services/subscriptions/alpha_injector_mgr.rs` |
+
+The client asks for the grade with and without the grace period through the same call, so both answers include the grace period. The subscription time is the Omega end date in Unix nanoseconds: zero for Alpha, and 31 December 2100 for Omega with no end date. The Alpha injector query returns when the selected character can next use a daily Alpha injector, as a FILETIME, or zero if it never has.
+
 ## Player structure directory
 
 | service | method | status | handler file |
@@ -181,12 +192,11 @@ The three preview calls return the crate's contents as `(typeID, quantity, None)
 
 | service | method | status | handler file |
 |---|---|---|---|
-| alphaInjectorMgr | GetNextAvailableInjection | fixed | `crates/server/src/services/fixed.rs` |
 | encodedItems | DecodeItem | fixed | `crates/server/src/services/fixed.rs` |
 | itemLocking | GetItemsByLocation | fixed | `crates/server/src/services/fixed.rs` |
 | itemLocking | GetLockedItemLocations | fixed | `crates/server/src/services/fixed.rs` |
 
-The Alpha injection availability query returns zero for no recorded cooldown; it does not grant injection permission. Encoded-item decoding is deferred and currently returns an explicit refusal without consuming or changing the item. Corporation lockdown management and voting are deferred; locked-item queries retain an empty mapping and a mutable empty set of locations.
+Encoded-item decoding is deferred and currently returns an explicit refusal without consuming or changing the item. Corporation lockdown management and voting are deferred; locked-item queries retain an empty mapping and a mutable empty set of locations.
 
 ## Single-track login campaigns
 

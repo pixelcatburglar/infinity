@@ -12,7 +12,8 @@
   - beacon counts and faction-warfare kills on the star map
   - in chat: password-protected channels, granting channel access to a whole corporation or alliance, taking over ownership of a system channel, and the local chat blackout in null-security space
   - access groups owned by a corporation, and access lists for structures
-  - clone-grade restrictions and planetary colony extraction rules: every character is treated as Omega
+  - Alpha clone limits on skills, training speed, ships and modules, and planetary colony extraction rules: an Alpha account plays as an Omega one, except for seasonal login rewards and the daily Alpha skill injector
+  - buying Omega time: only a GM can grant it, with `/clonegrade`
   - jump clones in ships and in player structures, and the body lost when a capsule is destroyed or a pilot self-destructs. The client does not include the server's clone-bay check: the server allows installation at NPC stations with a cloning service or a jump clone facility, and always applies the facility's standing restrictions, comparing raw standings rounded to two decimals as the client does. The Zarzakh facility refuses everyone, because faction-warfare enrolment is not modelled. Resetting the jump timer needs the GM or QA role.
   - phone-number binding and its rewards, an external NetEase account service: the binding-success callback is answered but no binding is recorded
   - single-track login campaigns: none is open, and a claim reports that no reward was claimed; seasonal login rewards are unaffected
@@ -42,6 +43,8 @@
 - Fleet bubble broadcasts and fleet warp treat a whole solar system as one grid, because the server keeps one ballpark per system.
 - Shared item-filter and fleet-broadcast links are permanent and public: anyone signed in who has the whole link can open it, and a link cannot be made private, revoked or set to expire. Overview profile links are not supported.
 - A pilot who changes corporation or alliance gains or loses access to shared bookmark folders at once, but a shared folder the client already shows stays in its list until the pilot logs in again.
+- The daily Alpha skill injector can be used once per character in any 24 hours, counted from each use; this is the server's own rule.
+- The client reads the Omega end date in two units: its clone-grade service expects Unix nanoseconds and the character selection screen expects Windows FILETIME. The server sends Unix nanoseconds, so the Omega time left on character selection is wrong. An Omega grade with no end date is sent as 31 December 2100.
 - Mailing lists are free: a request to charge for mail to a list is refused. A list's owner cannot hand it over. List names are compared after PostgreSQL folds their case, which can differ from the client for a few Unicode letters.
 - Search words are checked against the client's moderation rules. Where a rule ignores case, the server also treats the Kelvin sign (U+212A) and the long s (U+017F) as the letters k and s, which the client does not, so a search containing them can be refused where the client would allow it.
 - Some runtime state lives only in memory and is lost when the server restarts:
