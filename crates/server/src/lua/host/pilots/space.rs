@@ -6,7 +6,7 @@ use mlua::{Lua, Table, Value};
 use crate::{messages, services::{self, CallError, identity::Identity, ship}, space::V3};
 use super::{lifecycle::{self, OnlinePilot}, lua_error, mutate, positive, Resources};
 
-async fn actual_system(r: &Resources, identity: &Identity) -> Option<i64> {
+pub(super) async fn actual_system(r: &Resources, identity: &Identity) -> Option<i64> {
     if identity.station_id.is_some() || !r.world.is_online(identity.char_id) { return None; }
     let (system, ship) = (identity.system_id?, identity.ship_id?);
     let id = identity.char_id;

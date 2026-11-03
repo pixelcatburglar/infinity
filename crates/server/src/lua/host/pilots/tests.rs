@@ -1,4 +1,5 @@
 //! Lua-facing simulated pilot lifecycle and cancellation coverage.
+mod effects;
 mod fixture;
 mod space;
 use super::*;

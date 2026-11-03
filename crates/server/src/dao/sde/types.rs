@@ -100,17 +100,19 @@ pub(crate) async fn attributes(ex: &(impl Executor + ?Sized)) -> Result<Vec<Attr
 pub(crate) struct EffectRow {
     pub(crate) type_id: i32,
     pub(crate) effect_id: i32,
+    pub(crate) is_default: bool,
 }
 impl EffectRow {
     fn from_row(row: &Row) -> Self {
         Self {
             type_id: row.get("type_id"),
             effect_id: row.get("effect_id"),
+            is_default: row.get("is_default"),
         }
     }
 }
 pub(crate) async fn effects(ex: &(impl Executor + ?Sized)) -> Result<Vec<EffectRow>, db::Error> {
-    Ok(ex.query("SELECT type_id, effect_id FROM sde.type_effects ORDER BY type_id, effect_id", &[]).await?.iter().map(EffectRow::from_row).collect())
+    Ok(ex.query("SELECT type_id, effect_id, is_default FROM sde.type_effects ORDER BY type_id, effect_id", &[]).await?.iter().map(EffectRow::from_row).collect())
 }
 pub(crate) struct MaterialRow {
     pub(crate) type_id: i32,

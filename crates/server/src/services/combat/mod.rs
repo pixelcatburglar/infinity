@@ -158,7 +158,7 @@ pub(super) fn state() -> MutexGuard<'static, State> {
 
 /// What a cycle task needs once the call that started it has returned.
 #[derive(Clone)]
-pub(super) struct Ctx {
+pub(crate) struct Ctx {
     pub(super) db: Db,
     pub(super) world: Arc<World>,
     pub(super) notify: NotifyTx,
@@ -168,7 +168,7 @@ pub(super) struct Ctx {
 }
 
 impl Ctx {
-    pub(super) fn from_identity(identity: &Identity, db: &Db, world: &Arc<World>, space_system: Option<i64>, sender: NotifyTx) -> Option<Self> {
+    pub(crate) fn from_identity(identity: &Identity, db: &Db, world: &Arc<World>, space_system: Option<i64>, sender: NotifyTx) -> Option<Self> {
         if identity.char_id == 0 { return None; }
         Some(Self {
             db: db.clone(),
@@ -484,17 +484,23 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "RemoveTarget" => {
             let t = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            drop_targets(c, &[t]);
+            let identity = Identity::of_client(c);
+            let world = c.world.clone();
+            let system = c.session.int("solarsystemid");
+            drop_targets(&identity, &world, system, &[t], |event, args| c.notify(event, args));
             Ok(Value::None)
         }
         "RemoveTargets" => {
-            drop_targets(c, &value_id_list(call.args.first()));
+            let identity = Identity::of_client(c);
+            let world = c.world.clone();
+            let system = c.session.int("solarsystemid");
+            drop_targets(&identity, &world, system, &value_id_list(call.args.first()), |event, args| c.notify(event, args));
             Ok(Value::None)
         }
         "ClearTargets" => {
             if let Some(ch) = c.session.int("charid") {
                 let targets = clear_character_locks(&c.world, ch);
-                remove_target_projections(c, targets);
+                remove_target_projections(&Identity::of_client(c), &c.world, c.session.int("solarsystemid"), targets);
             }
             c.notify("OnTarget", vec![Value::str("clear")]);
             Ok(Value::None)

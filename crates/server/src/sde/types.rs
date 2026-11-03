@@ -24,6 +24,7 @@ pub(crate) struct TypeData {
 }
 pub(crate) struct TypeEffect {
     pub(crate) effect_id: i32,
+    pub(crate) is_default: bool,
 }
 pub(crate) struct TypeMaterial { pub(crate) material_type_id: i32, pub(crate) quantity: Option<i64> }
 pub(crate) struct Group {
@@ -57,7 +58,7 @@ impl Types {
         let (types, groups, categories, attrs, effects, materials) = tokio::try_join!(dao::types(db), dao::groups(db), dao::categories(db), dao::attributes(db), dao::effects(db), dao::materials(db))?;
         let mut children: HashMap<i32, Children> = HashMap::new();
         for r in attrs { children.entry(r.type_id).or_default().attributes.push((r.attribute_id, r.value)); }
-        for r in effects { children.entry(r.type_id).or_default().effects.push(TypeEffect { effect_id: r.effect_id }); }
+        for r in effects { children.entry(r.type_id).or_default().effects.push(TypeEffect { effect_id: r.effect_id, is_default: r.is_default }); }
         for r in materials { children.entry(r.type_id).or_default().materials.push(TypeMaterial { material_type_id: r.material_type_id, quantity: r.quantity }); }
         let mut result = Self { types: Vec::with_capacity(types.len()), by_id: HashMap::with_capacity(types.len()), groups: groups.into_iter().map(|r| (r.group_id, Group { category_id: r.category_id, name: r.name, lower_name: r.lower_name })).collect(), categories: categories.into_iter().map(|r| (r.category_id, Category { name: r.name })).collect(), group_types: HashMap::new(), orphans: HashMap::new(), modified_attributes: HashSet::new() };
         for r in types {

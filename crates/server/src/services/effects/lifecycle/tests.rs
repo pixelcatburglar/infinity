@@ -222,7 +222,7 @@ fn subject_requires_owned_fitted_module_on_permitted_ship() {
     use crate::sde::types::TypeEffect;
     let mut hull = Item { item_id: 3, type_id: 1, owner_id: 2, location_id: 4, flag_id: FLAG_HANGAR, quantity: 1, singleton: true, group_id: 0, category_id: i64::from(CATEGORY_SHIP), custom_info: None };
     let mut module = Item { item_id: 5, type_id: 1, owner_id: 2, location_id: 3, flag_id: FLAG_FITTING_FIRST, quantity: 1, singleton: true, group_id: 0, category_id: i64::from(CATEGORY_MODULE), custom_info: None };
-    let effects = [TypeEffect { effect_id: EFFECT_ONLINE as i32 }];
+    let effects = [TypeEffect { effect_id: EFFECT_ONLINE as i32, is_default: false }];
     let valid = |h: &Item, m: &Item, active, station, entries: &[TypeEffect], require_online, online| valid_subject(h, m, 2, 3, active, station, entries, EFFECT_ONLINE as i32, require_online, online);
     assert!(valid(&hull, &module, Some(3), None, &effects, true, true));
     assert!(valid(&hull, &module, Some(9), Some(4), &effects, false, false));
@@ -272,6 +272,6 @@ fn online_dispatch_stops_current_cycle_after_commit() {
 
 #[test]
 fn passive_effect_list_is_not_online_capable() {
-    let passive = [crate::sde::types::TypeEffect { effect_id: 1 }];
+    let passive = [crate::sde::types::TypeEffect { effect_id: 1, is_default: false }];
     assert!(!has_effect(&passive, EFFECT_ONLINE as i32));
 }
