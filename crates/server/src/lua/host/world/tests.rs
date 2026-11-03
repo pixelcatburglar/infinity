@@ -125,3 +125,99 @@ async fn scheduled_removal_refuses_persistent_ships_at_schedule_and_execution_bu
     assert!(world.ball(1, later).await.is_some());
     assert!(world.ball(1, drone).await.is_none());
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with initialized SDE"]
+async fn world_observations_filter_sampled_balls_and_read_static_celestials_without_loading() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let first = sde.types.iter().find(|t| t.group_id.is_some_and(|id| id > 0) && t.category_id.is_some_and(|id| id > 0)).expect("SDE type with group and category");
+    let second = sde.types.iter().find(|t| t.group_id.is_some_and(|id| id > 0 && Some(id) != first.group_id)
+        && t.category_id.is_some_and(|id| id > 0 && Some(id) != first.category_id)).expect("SDE type in another group and category");
+    let (first_type, first_group, first_category) = (first.type_id, first.group_id.unwrap(), first.category_id.unwrap());
+    let (second_type, second_group, second_category) = (second.type_id, second.group_id.unwrap(), second.category_id.unwrap());
+    let static_system = sde.map.all_celestials().find(|c| c.group_id == Some(i64::from(GROUP_ASTEROID_BELT)) && c.solar_system_id.is_some_and(|id| id > 0))
+        .expect("SDE asteroid belt").solar_system_id.unwrap();
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
+    let pilots = crate::lua::host::pilots::Pilots::new(&db, hub).await.unwrap();
+    let resources = Resources { db, sde: sde.clone(), world: world.clone(), pilots, store_value_limit_bytes: 1024 };
+    let lua = Lua::new();
+    register(&lua, &lua.globals(), &resources).unwrap();
+    lua.globals().set("static_system", static_system).unwrap();
+    assert!(world.with(static_system, |_| ()).await.is_none());
+    for (name, belts) in [("celestials", false), ("asteroid_belts", true)] {
+        let rows: Table = lua.load(format!("return world.{name}(static_system)")).eval().unwrap();
+        let expected: Vec<_> = sde.map.celestials(static_system).filter(|c| !belts || c.group_id == Some(i64::from(GROUP_ASTEROID_BELT))).collect();
+        assert_eq!(rows.raw_len(), expected.len());
+        for (index, celestial) in expected.iter().enumerate() {
+            let row: Table = rows.raw_get(index + 1).unwrap();
+            assert_eq!(row.raw_get::<i64>("id").unwrap(), celestial.item_id);
+            assert_eq!(row.raw_get::<Option<i64>>("type_id").unwrap(), celestial.type_id);
+            assert_eq!(row.raw_get::<Option<i64>>("group_id").unwrap(), celestial.group_id);
+            let position: Table = row.raw_get("position").unwrap();
+            for (i, value) in [celestial.x, celestial.y, celestial.z].into_iter().enumerate() {
+                assert_eq!(position.raw_get::<Option<f64>>(i + 1).unwrap(), value);
+            }
+        }
+        assert!(lua.load(format!("return world.{name}(0)")).eval::<Table>().is_err());
+        assert_eq!(lua.load(format!("return world.{name}({})", i64::MAX)).eval::<Table>().unwrap().raw_len(), 0);
+    }
+    assert!(world.with(static_system, |_| ()).await.is_none());
+    assert_eq!(lua.load("return world.balls(1, nil)").eval_async::<Table>().await.unwrap().raw_len(), 0);
+    assert!(world.with(1, |_| ()).await.is_none());
+    world.system(1).await.unwrap();
+    let (first_id, second_id) = (i64::MAX - 1, i64::MAX);
+    world.with(1, move |s| {
+        let mut first = ball(first_id, first_type);
+        first.pos = [100.0, 200.0, 300.0];
+        first.old_pos = first.pos;
+        let mut second = ball(second_id, second_type);
+        second.pos = [400.0, 500.0, 600.0];
+        second.old_pos = second.pos;
+        s.add_ship(first);
+        s.add_ship(second);
+        s.set_ball_position(first_id, [110.0, 210.0, 310.0], |_, _| true);
+    }).await.unwrap();
+    assert!(world.after(1, 1200).await);
+    for (name, value) in [("first_id", first_id), ("second_id", second_id), ("first_group", i64::from(first_group)),
+        ("second_group", i64::from(second_group)), ("first_category", i64::from(first_category)), ("second_category", i64::from(second_category))] {
+        lua.globals().set(name, value).unwrap();
+    }
+    lua.load(r#"
+        local all = world.balls(1, nil)
+        local seen = {}
+        for _, row in ipairs(all) do
+            if row.id == first_id or row.id == second_id then
+                local single = world.ball(1, row.id)
+                for _, key in ipairs({"id", "type_id", "owner_id", "radius"}) do assert(row[key] == single[key]) end
+                for _, key in ipairs({"position", "velocity"}) do
+                    assert(#row[key] == 3)
+                    for i = 1, 3 do assert(row[key][i] == single[key][i]) end
+                end
+                if row.id == first_id then
+                    assert(row.position[1] == 110 and row.position[2] == 210 and row.position[3] == 310)
+                end
+                seen[row.id] = true
+            end
+        end
+        assert(seen[first_id] and seen[second_id])
+        local function contains(rows, id)
+            for _, row in ipairs(rows) do if row.id == id then return true end end
+            return false
+        end
+        local category = world.balls(1, {category_id=first_category})
+        assert(contains(category, first_id) and not contains(category, second_id))
+        local group = world.balls(1, {group_id=second_group})
+        assert(contains(group, second_id) and not contains(group, first_id))
+        local both = world.balls(1, {category_id=first_category, group_id=first_group})
+        assert(contains(both, first_id) and not contains(both, second_id))
+        assert(#world.balls(1, {category_id=first_category, group_id=second_group}) == 0)
+        assert(#world.balls(1, {category_id=second_category, group_id=first_group}) == 0)
+    "#).exec_async().await.unwrap();
+    for expression in ["world.balls(0)", "world.balls(1, {category_id=0})", "world.balls(1, {group_id=-1})",
+        "world.balls(1, {category_id=2147483648})", "world.balls(1, {group_id=2147483648})", "world.balls(1, {extra=1})"] {
+        assert!(lua.load(format!("return {expression}")).eval_async::<Table>().await.is_err(), "{expression}");
+    }
+}

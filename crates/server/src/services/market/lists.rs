@@ -25,7 +25,7 @@ fn order_header() -> DbRowDescriptor {
 }
 /// `GetOrders(typeID)` -> (asks, bids) in the session's region.
 pub(super) async fn orders(db: &Db, region: i64, type_id: i64) -> CallResult {
-    let rows = listings::orders(db, today(), type_id as i32, region).await.map_err(db_err)?;
+    let rows = listings::orders(db, today(), type_id as i32, Area::Region, region, None).await.map_err(db_err)?;
     let header = order_header();
     let (mut asks, mut bids) = (vec![], vec![]);
     for r in &rows {

@@ -14,7 +14,7 @@ async fn broker_standings_placement_and_repricing() {
     let f = fixture::create(&db).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
-        let (c, _peer) = client(test_db.clone(), f.character).await;
+        let (mut c, _peer) = client(test_db.clone(), f.character).await;
         let row = c.sde.map.stations().find(|s| s.solar_system_id.is_some() && s.constellation_id.is_some() && s.region_id.is_some() && s.owner_id.and_then(|id| c.sde.npc_corporations.get(id)).and_then(|corp| corp.faction_id).is_some()).expect("NPC station with faction");
         let station_id = row.station_id;
         let owner = row.owner_id.unwrap();
@@ -29,6 +29,7 @@ async fn broker_standings_placement_and_repricing() {
         let sell_type = types.next().expect("unlisted SDE type").type_id;
         let buy_type = types.next().expect("second unlisted SDE type").type_id;
         let other_type = types.next().expect("third unlisted SDE type").type_id;
+        drop(types);
         test_db.execute("INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, 5, 0)", &[&f.character, &SKILL_BROKER_RELATIONS]).await.unwrap();
         crate::dao::characters::standings::set(&test_db, f.character, owner, 5.0).await.unwrap();
         crate::dao::characters::standings::set(&test_db, f.character, faction, 3.0).await.unwrap();
@@ -55,6 +56,58 @@ async fn broker_standings_placement_and_repricing() {
         assert_eq!(balance(&test_db, f.character).await.unwrap(), 0.0);
         let buy = orders::my_orders(&test_db, f.character, filetime_now()).await.unwrap().into_iter().find(|o| o.bid).unwrap();
         assert_eq!((buy.vol_remaining, buy.escrow), (1, 1_000_000.0));
+        // Exercise the same regional GetOrders route and its complete wire rows.
+        let current_sell = orders::my_orders(&test_db, f.character, filetime_now()).await.unwrap().into_iter().find(|o| o.id == sell.id).unwrap();
+        for order in [&current_sell, &buy] {
+            c.session.apply(vec![("regionid", Value::Int(order.at.region))]);
+            let kwargs = Value::Dict(vec![]);
+            let call = crate::services::Call { service: "marketProxy", method: "GetOrders", args: &[Value::Int(i64::from(order.type_id))], kwargs: &kwargs, bound: false, bind_params: None };
+            let wire = crate::services::dispatch(&mut c, &call).await.unwrap();
+            let sides = wire.items().unwrap();
+            assert_eq!(sides.len(), 2);
+            for (index, side) in sides.iter().enumerate() {
+                let Value::Reduce { data, list, dict } = side else { panic!("expected CRowset") };
+                assert!(list.is_empty() && dict.is_empty());
+                let parts = data.items().unwrap();
+                assert_eq!(parts[0], Value::global("carbon.common.script.sys.crowset.CRowset"));
+                let args = parts[1].items().unwrap();
+                let descriptor = DbRowDescriptor::from_value(&args[0]).unwrap();
+                assert_eq!(descriptor.columns, vec![
+                    ("price".into(), DbType::R8), ("volRemaining".into(), DbType::I4),
+                    ("typeID".into(), DbType::I4), ("range".into(), DbType::I2),
+                    ("orderID".into(), DbType::I8), ("volEntered".into(), DbType::I4),
+                    ("minVolume".into(), DbType::I4), ("bid".into(), DbType::Bool),
+                    ("issueDate".into(), DbType::FileTime), ("duration".into(), DbType::I2),
+                    ("stationID".into(), DbType::I8), ("regionID".into(), DbType::I4),
+                    ("solarSystemID".into(), DbType::I4), ("constellationID".into(), DbType::I4),
+                    ("jumps".into(), DbType::I2),
+                ]);
+                let rows = args[1].items().unwrap();
+                if (index == 1) == order.bid {
+                    assert_eq!(rows.len(), 1);
+                    for (name, expected) in [
+                        ("price", Value::Float(order.price)), ("volRemaining", Value::Int(order.vol_remaining.into())),
+                        ("typeID", Value::Int(order.type_id.into())), ("range", Value::Int(order.range)),
+                        ("orderID", Value::Int(order.id)), ("volEntered", Value::Int(order.vol_entered.into())),
+                        ("minVolume", Value::Int(order.min_volume.into())), ("bid", Value::Bool(order.bid)),
+                        ("issueDate", Value::Int(order.issued)), ("duration", Value::Int(order.duration)),
+                        ("stationID", Value::Int(order.at.id)), ("regionID", Value::Int(order.at.region)),
+                        ("solarSystemID", Value::Int(order.at.system)), ("constellationID", Value::Int(order.at.constellation)),
+                        ("jumps", Value::Int(0)),
+                    ] {
+                        assert_eq!(descriptor.get(&rows[0], name), Some(expected), "{name}");
+                    }
+                } else {
+                    assert!(rows.is_empty());
+                }
+            }
+            c.session.apply(vec![("regionid", Value::Int(order.at.region + 1))]);
+            let wrong_region = crate::services::dispatch(&mut c, &call).await.unwrap();
+            for side in wrong_region.items().unwrap() {
+                let Value::Reduce { data, .. } = side else { panic!("expected CRowset") };
+                assert!(data.items().unwrap()[1].items().unwrap()[1].items().unwrap().is_empty());
+            }
+        }
         assert!(test_db.query("SELECT 1 FROM game.standings WHERE char_id=$1 AND from_id=ANY($2)", &[&f.character, &vec![other_owner, other_faction]]).await.unwrap().is_empty());
         test_db.execute("UPDATE game.characters SET balance=2000000 WHERE character_id=$1", &[&f.character]).await.unwrap();
         place_buy(&c, other_station, other_type as i64, 1_000_000.0, 1, RANGE_STATION, 1, 1).await.unwrap();

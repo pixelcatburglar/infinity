@@ -1,6 +1,6 @@
-//! Script access to existing game data and service operations. Reads use DAOs;
-//! writes are sent through the invocation's client pump and service policies.
-//! No arbitrary SQL or independent game mutation path is exposed.
+//! Script access to existing game data and service operations. Observers read
+//! items and station-local market orders without a context; writes use the
+//! invocation's client pump and service policies. No arbitrary SQL is exposed.
 
 use mlua::{Lua, Result, Table};
 use crate::{dao::{characters::{crimewatch, routing, selection, social, standings}, items::loading::ItemQuery, skills::levels}, db::Db, sde::Sde};
@@ -81,6 +81,17 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
             }
         })?)?;
     }
+    let handle = db.clone();
+    let sde = sde.clone();
+    items.set("in_hangar", lua.create_async_function(move |lua, (character, station): (i64, i64)| {
+        let handle = handle.clone();
+        let sde = sde.clone();
+        async move {
+            let query = ItemQuery::OwnerLocationFlag(positive(character)?, positive(station)?, crate::consts::FLAG_HANGAR);
+            let rows = crate::services::items::load_items(&handle, &sde, query).await.map_err(mlua::Error::external)?;
+            item_rows(&lua, rows)
+        }
+    })?)?;
     items.set("create", lua.create_async_function(|_, (ctx, owner, location, flag, type_id, quantity): (mlua::AnyUserData, i64, i64, i32, i32, i32)| async move {
         positive(owner)?; positive(location)?; positive(i64::from(type_id))?; positive(i64::from(quantity))?;
         mutate(ctx, Mutation::Create { owner, location, flag, type_id, quantity }).await?;
@@ -99,6 +110,30 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
         Ok(())
     })?)?;
     dao.set("items", items)?;
+    let market = lua.create_table()?;
+    for (name, bid) in [("bids", true), ("asks", false)] {
+        let handle = db.clone();
+        market.set(name, lua.create_async_function(move |lua, (station, type_id): (i64, i64)| {
+            let handle = handle.clone();
+            async move {
+                let station = positive(station)?;
+                let type_id = i32::try_from(positive(type_id)?).map_err(|_| mlua::Error::runtime("type identifier exceeds limit"))?;
+                let orders = crate::dao::market::listings::orders(&handle, crate::client::filetime_now(), type_id, crate::dao::market::listings::Area::Station, station, Some(bid)).await.map_err(mlua::Error::external)?;
+                let rows = lua.create_table()?;
+                for (index, order) in orders.into_iter().enumerate() {
+                    let row = lua.create_table()?;
+                    row.set("order_id", order.order_id)?;
+                    row.set("price", order.price)?;
+                    row.set("volume_remaining", order.vol_remaining)?;
+                    row.set("min_volume", order.min_volume)?;
+                    row.set("range", order.range)?;
+                    rows.set(index + 1, row)?;
+                }
+                Ok(rows)
+            }
+        })?)?;
+    }
+    dao.set("market", market)?;
     let mail = lua.create_table()?;
     mail.set("send", lua.create_async_function(|_, (ctx, recipients, title, body, to_list, to_corp, reply_to, forwarded_from): (mlua::AnyUserData, Table, String, String, Option<i64>, Option<i64>, Option<i64>, Option<i64>)| async move {
         for id in [to_list, to_corp, reply_to, forwarded_from].into_iter().flatten() { positive(id)?; }

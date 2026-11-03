@@ -9,14 +9,20 @@ pub(crate) struct BookOrder { pub price: f64, pub vol_remaining: i64, pub type_i
 impl BookOrder { fn from_row(r: &Row) -> Self { Self { price:r.get("price"), vol_remaining:r.get("vol_remaining"), type_id:r.get("type_id"), range:r.get("range"), order_id:r.get("order_id"), vol_entered:r.get("vol_entered"), min_volume:r.get("min_volume"), bid:r.get("bid"), issued:r.get("issued"), duration:r.get("duration"), station_id:r.get("station_id"), region_id:r.get("region_id"), solar_system_id:r.get("solar_system_id"), constellation_id:r.get("constellation_id") } } }
 const ORDER_COLUMNS: &str = "price, vol_remaining::bigint, type_id::bigint, range::bigint, order_id, vol_entered::bigint,
     min_volume::bigint, bid, COALESCE(issued, $1) AS issued, duration::bigint, station_id, region_id, solar_system_id, constellation_id";
-pub(crate) async fn orders(ex: &(impl Executor + ?Sized), today: i64, type_id: i32, region: i64) -> Result<Vec<BookOrder>, db::Error> {
-    Ok(ex.query(&format!("SELECT {ORDER_COLUMNS} FROM game.market_orders WHERE type_id = $2 AND region_id = $3 AND vol_remaining > 0 ORDER BY price"), &[&today, &type_id, &region]).await?.iter().map(BookOrder::from_row).collect())
+pub(crate) async fn orders(ex: &(impl Executor + ?Sized), today: i64, type_id: i32, area: Area, id: i64, side: Option<bool>) -> Result<Vec<BookOrder>, db::Error> {
+    let column = area.column();
+    Ok(ex.query(&format!("SELECT {ORDER_COLUMNS} FROM game.market_orders WHERE type_id = $2 AND {column} = $3 AND vol_remaining > 0 AND ($4::boolean IS NULL OR bid = $4) ORDER BY price"), &[&today, &type_id, &id, &side]).await?.iter().map(BookOrder::from_row).collect())
 }
 pub(crate) enum Area { Station, System, Region }
+impl Area {
+    fn column(&self) -> &'static str {
+        match self { Self::Station => "station_id", Self::System => "solar_system_id", Self::Region => "region_id" }
+    }
+}
 pub(crate) struct BestAsk { pub type_id: i64, pub price: f64, pub vol_remaining: i64, pub station_id: i64 }
 impl BestAsk { fn from_row(r: &Row) -> Self { Self { type_id:r.get("type_id"), price:r.get("price"), vol_remaining:r.get("vol_remaining"), station_id:r.get("station_id") } } }
 pub(crate) async fn best_asks(ex: &(impl Executor + ?Sized), area: Area, id: i64) -> Result<Vec<BestAsk>, db::Error> {
-    let column = match area { Area::Station => "station_id", Area::System => "solar_system_id", Area::Region => "region_id" };
+    let column = area.column();
     Ok(ex.query(&format!("SELECT DISTINCT ON (type_id) type_id::bigint, price, vol_remaining::bigint, station_id
                  FROM game.market_orders WHERE {column} = $1 AND NOT bid AND vol_remaining > 0 ORDER BY type_id, price"), &[&id]).await?.iter().map(BestAsk::from_row).collect())
 }
