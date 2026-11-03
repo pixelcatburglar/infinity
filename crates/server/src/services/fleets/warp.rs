@@ -73,7 +73,7 @@ fn commit_in<T>(st: &State, s: &mut space::System, order: &Order, pilot: i64, sh
     if let Some((target, ball)) = order.target {
         if !st.is_member(order.fleet, target)
             || !s.pilot_ball(target).is_some_and(|b| b.id == ball && b.char_id == Some(target) && b.owner_id == target)
-            || !s.fleet_broadcast_visible(order.commander, ball) { return None; }
+            || !s.visible_to(order.commander, ball) { return None; }
     }
     Some(f(s))
 }

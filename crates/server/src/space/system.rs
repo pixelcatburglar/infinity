@@ -195,14 +195,18 @@ impl System {
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
         self.pilots.get(&char_id).and_then(|id| self.ball(*id))
     }
+    /// Actor-owned visibility, independent of client ballpark delivery.
+    pub(crate) fn visible_to(&self, character: i64, ball: i64) -> bool {
+        let Some(ego) = self.pilot_ball(character) else { return false };
+        self.ball(ball).is_some_and(|target| target.cloak == 0 || target.id == ego.id)
+    }
     fn pilot_observer(&self, character: i64) -> Option<&(i64, DestinyTx)> {
         let ego = self.pilot_ball(character)?.id;
         self.observers.values().find(|(observer_ego, tx)| *observer_ego == ego && !tx.is_closed())
     }
     /// Current ballpark visibility for a pilot with a live matching observer.
     pub(crate) fn fleet_broadcast_visible(&self, character: i64, ball: i64) -> bool {
-        let Some((ego, _)) = self.pilot_observer(character) else { return false };
-        self.ball(ball).is_some_and(|target| target.cloak == 0 || target.id == *ego)
+        self.pilot_observer(character).is_some() && self.visible_to(character, ball)
     }
     /// Snapshot a pilot's real actor-owned damage state and visibility.
     pub(crate) fn fleet_damage_snapshot(&self, character: i64) -> Option<(i64, u8, Value)> {

@@ -185,11 +185,14 @@ async fn spatial_operations_authorize_and_use_actor() {
         lua.load("pilots.online(id); pilots.undock(id)").exec_async().await?;
         r.world.with(system, move |s| s.set_ball_position(ship, [station_pos[0] + 1_000_000.0, station_pos[1], station_pos[2]], |_, _| true)).await.unwrap();
         assert!(r.world.after(system, 1100).await);
-        let before = r.world.ball(system, ship).await.unwrap();
+        let destination = r.world.with(system, move |s| {
+            s.warp_in(station).unwrap_or_else(|| s.ball(station).unwrap().position_at(s.now_ms()))
+        }).await.unwrap();
         lua.load("pilots.warp_to_ball(id,station)").exec_async().await?;
         assert!(r.world.after(system, 1100).await);
         let after = r.world.ball(system, ship).await.unwrap();
-        assert_eq!((after.mode, after.goto, after.follow_id), (before.mode, before.goto, before.follow_id));
+        assert_eq!(after.mode, crate::space::MODE_WARP);
+        assert_eq!(after.goto, destination);
         Ok(())
         }.await;
         result.unwrap();
