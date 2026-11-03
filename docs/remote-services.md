@@ -26,6 +26,7 @@ The QA starter-system override list is empty; normal starter-system allocation i
 | stationSvc | GetStation | handled | `crates/server/src/services/station/station_svc.rs` |
 | stationSvc | GetSolarSystem | handled | `crates/server/src/services/station/station_svc.rs` |
 | stationSvc | GetSystemsForAlliance | out-of-scope | — |
+| station | GetGuests | handled | `crates/server/src/services/character/station.rs` |
 
 NPC station and solar-system data comes from static data; alliance sovereignty is not supported.
 

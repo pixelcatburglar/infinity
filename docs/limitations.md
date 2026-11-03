@@ -47,7 +47,8 @@
   - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space except ships (NPCs, wrecks, scheduled effects);
   - drone orders and control, the drone settings the client sends before each launch, and ore a mining drone is carrying back;
-  - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
+  - a ship's velocity, warp and cloak, so a restarted ship starts at rest;
+  - simulated pilot presence; scripts restore online simulated pilots after a restart. Simulated pilots have no client connection and no custom portrait, so the client shows its missing-portrait fallback.
 - A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
 - A ship's position in space is saved when its pilot leaves the game, and every 30 seconds while it moves. A crash therefore loses at most the last 30 seconds of movement.
 - A ship's shield charge and its armor and hull damage are saved when it docks, jumps through a gate or wormhole, or is swapped, when its pilot logs off, and with the periodic and shutdown position saves, including ships that are not moving. Damage to an unpiloted ship in space is saved as it happens. Armor and hull damage survive a restart, and shields recharge from the time they were saved. A crash can lose condition changes made since the last periodic save.
