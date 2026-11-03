@@ -27,16 +27,21 @@ async fn injector_rates_crossings_credits_and_limits() {
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let calc = |ty, qty, total, credits| injector_yield(&c.sde, ty, qty, total, credits).unwrap_or_else(|_| panic!("unexpected refusal"));
+    let calc = |ty, qty, total, credits| injector_yield(&c.sde, ty, qty, total, credits, false).unwrap_or_else(|_| panic!("unexpected refusal"));
     assert_eq!(calc(FULL_INJECTOR, 2, FREE_ZONE - 1, 1), (1_000_000, 1));
     assert_eq!(calc(FULL_INJECTOR, 2, LOW_BOUNDARY - 1, 0), (700_000, 0));
     assert_eq!(calc(FULL_INJECTOR, 2, MEDIUM_BOUNDARY - 1, 0), (450_000, 0));
-    assert_eq!(calc(SMALL_INJECTOR, 1, MEDIUM_BOUNDARY, 0), (30_000, 0));
-    assert!(injector_yield(&c.sde, FULL_INJECTOR, MAX_STACK + 1, 0, 0).is_err());
-    assert!(injector_yield(&c.sde, FULL_INJECTOR, 0, 0, 0).is_err());
+    assert!(injector_yield(&c.sde, FULL_INJECTOR, MAX_STACK + 1, 0, 0, false).unwrap().0 > 0);
+    assert!(matches!(checked_injector_yield(&c.sde, FULL_INJECTOR, MAX_STACK + 1, 0, 0), Err(CallError::User { msg, .. }) if msg == messages::MSG_CUSTOM_NOTIFY));
+    assert!(injector_yield(&c.sde, FULL_INJECTOR, 0, 0, 0, false).is_err());
     if let (Some(points), Some(limit)) = (c.sde.types.attribute(MINI_INJECTOR, CONTAINED_POINTS), c.sde.types.attribute(MINI_INJECTOR, MAX_CHARACTER_POINTS)) {
         assert_eq!(calc(MINI_INJECTOR, 1, 0, 1), (points as i64, 0));
-        assert!(injector_yield(&c.sde, MINI_INJECTOR, 1, limit as i64, 0).is_err());
+        assert_eq!(calc(MINI_INJECTOR, 1, limit as i64, 0), (points as i64, 0));
+        for (quantity, total) in [(1, limit as i64), (2, limit as i64 - 1)] {
+            assert!(matches!(checked_injector_yield(&c.sde, MINI_INJECTOR, quantity, total, 0),
+                Err(CallError::User { msg, dict }) if msg == messages::MSG_INJECTOR_SKILL_POINT_LIMIT_REACHED
+                    && dict == vec![("typeID".into(), Value::Int(i64::from(MINI_INJECTOR))), ("limit".into(), Value::Int(limit as i64))]));
+        }
     }
     fixture::cleanup(&db, f).await.unwrap();
 }
@@ -148,8 +153,11 @@ async fn conversion_and_injection_conserve_items_and_refuse_wrong_sources() {
     db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&f.character, &station]).await.unwrap();
     let item = transfers::insert(&db, FULL_INJECTOR, f.character, station, FLAG_HANGAR, 2).await.unwrap();
     let args = vec![Value::Int(item), Value::Int(1)];
+    let large = transfers::insert(&db, FULL_INJECTOR, f.character, station, FLAG_HANGAR, (MAX_STACK + 1) as i32).await.unwrap();
     assert!(inject(&mut c, f.character, &[Value::Int(item), Value::Int(3)], false).await.is_err());
-    assert!(convert(&mut c, f.character, &[Value::Int(item), Value::Int(0)], true).await.is_err());
+    assert!(inject(&mut c, f.character, &[Value::Int(large), Value::Int(MAX_STACK + 1)], true).await.is_err());
+    assert!(inject(&mut c, f.character, &[Value::Int(large), Value::Int(MAX_STACK + 1)], false).await.is_err());
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&large]).await.unwrap();
     convert(&mut c, f.character, &args, true).await.unwrap_or_else(|_| panic!("split failed"));
     let mut events = Vec::new();
     while let Ok((event, _)) = receiver.try_recv() { events.push(event); }

@@ -75,6 +75,23 @@ fn filetime_timestamp_milliseconds_round_up() {
     assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH - FILETIME_TICKS_PER_MS + 1), 0);
 }
 
+#[test]
+fn call_kwargs_strip_only_macho_version() {
+    let mut kwargs = Value::Dict(vec![
+        (Value::str("machoVersion"), Value::Int(496)),
+        (Value::str("keep"), Value::Int(7)),
+        (Value::Int(1), Value::str("non-text key")),
+    ]);
+    strip_macho_version(&mut kwargs);
+    assert_eq!(
+        kwargs,
+        Value::Dict(vec![
+            (Value::str("keep"), Value::Int(7)),
+            (Value::Int(1), Value::str("non-text key")),
+        ])
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn wait_flushes_queued_notifications_and_forwards_later_destiny() {

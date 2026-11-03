@@ -89,7 +89,13 @@ pub async fn log_off(c: &mut Client) -> CallResult {
         "charid", "corpid", "corprole", "rolesAtAll", "rolesAtBase", "rolesAtHQ", "rolesAtOther", "corpAccountKey", "allianceid", "warfactionid",
         "genderID", "bloodlineID", "raceID", "hqID", "stationid", "solarsystemid", "solarsystemid2", "constellationid", "regionid", "shipid",
     ];
-    c.change_session(cleared.into_iter().map(|k| (k, Value::None)).collect());
+    c.change_session(cleared.into_iter().map(|k| {
+        let value = match k {
+            "corprole" | "rolesAtAll" | "rolesAtBase" | "rolesAtHQ" | "rolesAtOther" => Value::Int(0),
+            _ => Value::None,
+        };
+        (k, value)
+    }).collect());
     let mut outbox = Outbox::default();
     outbox.event(GameEvent::CharacterLoggedOff { user_id: c.login.user_id, char_id });
     dispatch_client((), outbox, c)?;
