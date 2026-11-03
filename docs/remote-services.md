@@ -154,6 +154,28 @@ The character's player-structure directory is empty because player structures ar
 
 Station clones keep their own implants. Ship clone bays and player structures are not implemented yet: the ship clone state is empty, the structure clone count is zero, and installing a clone in a structure is refused with a message.
 
+## Crates
+
+| service | method | status | handler file |
+|---|---|---|---|
+| crateService | PeekInsideCrate | handled | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | PeekInsideFixedCrate | handled | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | CustomGetLootFromFixedCrate | handled | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | GetCrate | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | GetCrateLocation | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | OpenCrate | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | CustomOpenCrate | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | ClaimLootFromCrateStack | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | ClaimLoot | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | ClaimSkillBundle | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | ClaimFitting | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| skillHandler | GetSkillBundleInfo | fixed | `crates/server/src/services/skills/skill_handler.rs` |
+| ship | GetShipFittingInfo | fixed | `crates/server/src/services/station/ship.rs` |
+| storeManager | can_purchase_offer | handled | `crates/server/src/services/store/store_manager.rs` |
+| storeManager | is_offer_purchasable | handled | `crates/server/src/services/store/store_manager.rs` |
+
+The three preview calls return the crate's contents as `(typeID, quantity, None)` entries and change nothing; a preview of a crate item needs the same ownership, corporation hangar role and reachability as moving it. `GetCrate` returns an empty list. Opening, claiming, the crate location and the skill-bundle and fitting details are refused with a message. The store checks answer no for an unknown offer, a daily gift already claimed today, or a crate.
+
 ## Item compatibility
 
 | service | method | status | handler file |
