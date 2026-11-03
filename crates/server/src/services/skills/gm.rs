@@ -4,7 +4,7 @@
 //! Completed training and GM grants share one skills-changed notification per batch.
 //! Skill reductions reconcile the owner's online fitted ships after the batch.
 use super::{completion::{self, AdvanceResult}, db_err, CallError};
-use super::{formulas::sp_for_level, starting::starting_levels, training::{skill_info, skill_type}};
+use super::{formulas::sp_for_level, starting::starting_levels, training::skill_type, view::skill_info};
 use crate::{client::{Client, filetime_now}, consts::CATEGORY_SKILL, dao::skills::{queue, training}, db::{executor::Executor, outbox::Outbox}, sde::Sde};
 use crate::services::effects::online::{self, OnlineChanged};
 use marshal::Value;
@@ -82,7 +82,7 @@ pub(in crate::services) async fn remove<E: From<OnlineChanged> + Send>(tx: &(imp
     let mut infos = Vec::new();
     for s in removed {
         crate::dao::skills::history::append(tx, char_id, s.type_id, super::history::REMOVED, s.skill_points, now).await.map_err(db_err)?;
-        infos.push((Value::Int(s.type_id as i64), skill_info(sde, s.type_id, 0, -1, now)));
+        infos.push((Value::Int(s.type_id as i64), skill_info(sde, s.type_id, -1, -1, now)));
     }
     if !infos.is_empty() {
         outbox.notify_pilot(char_id, "OnServerSkillsRemoved", vec![Value::Dict(infos), Value::Int(now)]);

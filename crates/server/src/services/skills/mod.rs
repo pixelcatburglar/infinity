@@ -17,6 +17,7 @@ mod non_diminishing_injection_mgr;
 mod skill_mgr2;
 mod skill_handler;
 pub(crate) mod training;
+mod view;
 mod timeline;
 pub(crate) mod completion;
 pub(crate) mod gm;

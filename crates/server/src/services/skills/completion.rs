@@ -3,7 +3,7 @@
 //! Persists game.skills, game.skill_queue, game.items, skill history and game.jobs;
 //! one job per character uses the shared planner and reconciles fitted resources.
 //! Legacy boosters without expiry have no scheduled deadline.
-use super::{db_err, timeline, training::skill_info, CallError};
+use super::{db_err, timeline, view::skill_info, CallError};
 use crate::{client::{filetime_now, BRAIN_REFRESH}, consts::{IX_LOCATION_ID, LOCATION_JUNKYARD}, dao::{items::{brain, loading::{Item, ItemQuery}}, skills::{queue, training}}, db::{executor::Executor, outbox::Outbox, Db}, scheduler::{self, Job}, sde::Sde, services::effects::online::{self, OnlineChanged}, space::World};
 use marshal::Value;
 use std::{collections::{BTreeMap, BTreeSet}, future::Future, pin::Pin, sync::Arc};
