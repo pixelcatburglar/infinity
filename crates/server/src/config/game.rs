@@ -10,6 +10,8 @@ pub mod economy;
 pub mod world;
 #[path = "social.rs"]
 pub mod social;
+#[path = "expert_systems.rs"]
+pub mod expert_systems;
 #[path = "gm.rs"]
 pub mod gm;
 
@@ -108,6 +110,8 @@ pub struct GameConfig {
     pub calendar: social::CalendarConfig,
     /// Space policy.
     pub space: social::SpaceConfig,
+    /// Expert-system client feature advertisement policy.
+    pub expert_systems: expert_systems::ExpertSystemsConfig,
     /// GM spawn policy.
     pub gm: gm::GmConfig,
 }

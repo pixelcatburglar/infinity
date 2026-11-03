@@ -57,6 +57,7 @@ pub struct Config {
     pub mail: game::social::MailConfig,
     pub calendar: game::social::CalendarConfig,
     pub space: game::social::SpaceConfig,
+    pub expert_systems: game::expert_systems::ExpertSystemsConfig,
     pub gm: game::gm::GmConfig,
     #[serde(skip)]
     source: String,
@@ -101,6 +102,7 @@ impl PartialEq for Config {
             && self.mail == other.mail
             && self.calendar == other.calendar
             && self.space == other.space
+            && self.expert_systems == other.expert_systems
             && self.gm == other.gm
     }
 }
@@ -247,6 +249,7 @@ impl Config {
             mail: self.mail.clone(),
             calendar: self.calendar.clone(),
             space: self.space.clone(),
+            expert_systems: self.expert_systems.clone(),
             gm: self.gm.clone(),
         }
     }
@@ -258,6 +261,7 @@ impl Config {
         marshal::Value::dict([
             ("imageserverurl", marshal::Value::str(format!("http://{}:{}/", self.server.public_host, self.images.port))),
             ("banned_words_enabled", marshal::Value::str(if self.chat.banned_words { "1" } else { "0" })),
+            ("expert_system_feature_enabled", marshal::Value::str(if self.expert_systems.enabled { "1" } else { "0" })),
         ])
     }
 }
