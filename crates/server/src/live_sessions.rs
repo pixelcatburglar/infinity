@@ -11,6 +11,9 @@
 //! completion remains ordered behind its predecessor, even if its waiting future
 //! or its owning task is cancelled. Dropping an active registration before its
 //! cleanup has actually finished would incorrectly allow a replacement to proceed.
+//! An active registration may expose its notification sender only for the
+//! duration of its client transport; this process-local lookup is not a durable
+//! delivery mechanism and does not reach other server processes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -27,6 +30,7 @@ struct Pending {
     _completion: watch::Sender<()>,
     completion: watch::Receiver<()>,
     dropped: bool,
+    sender: Option<crate::space::NotifyTx>,
 }
 
 #[derive(Default)]
@@ -47,6 +51,20 @@ pub struct Registration {
     id: u64,
     predecessor: Option<watch::Receiver<()>>,
     cancelled: watch::Receiver<bool>,
+}
+
+/// Removes only the sender attached to this registration's generation.
+pub(crate) struct SenderGuard {
+    account_id: i64,
+    id: u64,
+}
+
+/// Return the active account transport's sender, if one is attached.
+pub(crate) fn sender(account_id: i64) -> Option<crate::space::NotifyTx> {
+    let state = state().lock().expect("live session registry poisoned");
+    let pending = state.accounts.get(&account_id)?.registrations.front()?;
+    if pending.dropped { return None; }
+    pending.sender.clone()
 }
 
 /// Atomically install a registration, or refuse an existing account without takeover.
@@ -72,11 +90,25 @@ pub fn register(account_id: i64, takeover: bool) -> Option<Registration> {
         _completion: completion_tx,
         completion: completion_rx,
         dropped: false,
+        sender: None,
     });
     Some(Registration { account_id, id, predecessor, cancelled: cancelled_rx })
 }
 
 impl Registration {
+    /// Attach a transport only after this uncancelled generation becomes active.
+    pub(crate) fn attach_sender(&self, sender: crate::space::NotifyTx) -> Option<SenderGuard> {
+        let mut state = state().lock().expect("live session registry poisoned");
+        let pending = state.accounts.get_mut(&self.account_id)?.registrations.front_mut()?;
+        if self.predecessor.is_some() || pending.id != self.id || pending.dropped
+            || *pending.cancelled.borrow() || pending.sender.is_some()
+        {
+            return None;
+        }
+        pending.sender = Some(sender);
+        Some(SenderGuard { account_id: self.account_id, id: self.id })
+    }
+
     /// Wait until the previous registration and its predecessors have completed.
     /// This future is cancellation-safe and may be awaited again if interrupted.
     /// Always wait before acting on cancellation or starting session work.
@@ -115,6 +147,17 @@ impl Drop for Registration {
         }
         if entry.registrations.is_empty() {
             state.accounts.remove(&self.account_id);
+        }
+    }
+}
+
+impl Drop for SenderGuard {
+    fn drop(&mut self) {
+        let mut state = state().lock().expect("live session registry poisoned");
+        if let Some(pending) = state.accounts.get_mut(&self.account_id)
+            .and_then(|entry| entry.registrations.iter_mut().find(|item| item.id == self.id))
+        {
+            pending.sender = None;
         }
     }
 }

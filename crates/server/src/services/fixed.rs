@@ -20,7 +20,6 @@
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
 use marshal::Value;
-use crate::consts::FAR_FUTURE;
 /// Client paperdoll.State.no_recustomization.
 const PAPERDOLL_NO_RECUSTOMIZATION: i64 = 0;
 
@@ -248,9 +247,6 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
         // mobilecollect/client/mobilecollect_svc.py:MobilecollectService.OnUnisdkBindMobileSucceed
         // ignores the reply and closes the open window.
         ("mobileCollectMgr", "MobileBindSucceed") => Ok(Value::None),
-
-        ("subscriptionMgr", "GetCloneGrade") => Ok(Value::Int(1)), // CLONE_STATE_OMEGA
-        ("subscriptionMgr", "GetSubscriptionTime") => Ok(Value::Int(FAR_FUTURE)),
 
         // NetEase account/payment gateway; endpoints are never contacted here.
         ("kiringMgr", "GetKiringConfiguration") => Ok(Value::dict([

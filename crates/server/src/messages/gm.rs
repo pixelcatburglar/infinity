@@ -38,6 +38,12 @@ pub(crate) const GM_HELP_ADD_PLEX: &str = "/addplex <count> — add PLEX to your
 pub(crate) const GM_HELP_HEAL: &str = "/heal — repair your ship in space";
 /// Help command help.
 pub(crate) const GM_HELP_HELP: &str = "/help — this list";
+/// Clone grade command help.
+pub(crate) const GM_HELP_CLONE_GRADE: &str = "/clonegrade <user_id> alpha|omega [duration_seconds [grace_seconds]] — 设置账号克隆等级；省略时长则 Omega 无限期，宽限期默认为 0；时长必须为正数，宽限期不能为负数；Alpha 不接受时长参数。";
+/// Clone grade change result.
+pub(crate) fn clone_grade_changed(user: i64, grade: &str) -> String {
+    format!("已将账号 {user} 的克隆等级设置为 {grade}。")
+}
 /// Teleport command usage error.
 pub(crate) const GM_TELEPORT_USAGE: &str = "usage: /tr me <itemID|characterID|solarSystemID>";
 /// Create command usage error.

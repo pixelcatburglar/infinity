@@ -39,6 +39,37 @@ CREATE TABLE IF NOT EXISTS game.accounts (
 CREATE UNIQUE INDEX IF NOT EXISTS accounts_user_name_idx ON game.accounts (lower(user_name));
 -- User IDs in the live game are large; start well clear of NPC/static ID ranges.
 SELECT setval('game.accounts_user_id_seq', GREATEST((SELECT max(user_id) FROM game.accounts), 10000000), true);
+-- dao/accounts/subscriptions: one durable clone-grade authority per account.
+CREATE TABLE IF NOT EXISTS game.account_clone_grades (
+    user_id bigint PRIMARY KEY REFERENCES game.accounts(user_id) ON DELETE CASCADE,
+    grade smallint NOT NULL CHECK (grade IN (0, 1)),
+    omega_until bigint,
+    grace_until bigint,
+    revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    CHECK (
+        (grade = 0 AND omega_until IS NULL AND grace_until IS NULL)
+        OR (grade = 1 AND omega_until IS NULL AND grace_until IS NULL)
+        OR (grade = 1 AND omega_until IS NOT NULL AND grace_until IS NOT NULL
+            AND omega_until > 0 AND grace_until > 0 AND grace_until >= omega_until)
+    )
+);
+CREATE TABLE IF NOT EXISTS game.account_clone_grade_audit (
+    audit_id bigserial PRIMARY KEY,
+    user_id bigint NOT NULL REFERENCES game.accounts(user_id) ON DELETE CASCADE,
+    actor_user_id bigint REFERENCES game.accounts(user_id),
+    before_grade smallint NOT NULL,
+    after_grade smallint NOT NULL,
+    before_omega_until bigint,
+    after_omega_until bigint,
+    before_grace_until bigint,
+    after_grace_until bigint,
+    reason text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+-- Existing accounts retain the historical unlimited-Omega policy; this never overwrites rows.
+INSERT INTO game.account_clone_grades (user_id, grade)
+SELECT user_id, 1 FROM game.accounts
+ON CONFLICT (user_id) DO NOTHING;
 
 -- dao/shared_settings: permanent forwardable settings and overview links.
 CREATE SEQUENCE IF NOT EXISTS game.shared_setting_links_sq_id_seq

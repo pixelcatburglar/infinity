@@ -36,6 +36,7 @@ pub(crate) mod standings;
 pub(crate) mod trade;
 pub(crate) mod skills;
 pub(crate) mod store;
+pub(crate) mod subscriptions;
 pub(crate) mod wars;
 
 // Client moderation UserError catalogue keys.

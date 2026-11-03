@@ -42,6 +42,7 @@ mod social;
 mod info;
 mod wormholes;
 mod hitchance;
+mod subscriptions;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -68,6 +69,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("addisk", messages::gm::GM_HELP_ADD_ISK),
     ("setplex", messages::gm::GM_HELP_SET_PLEX),
     ("addplex", messages::gm::GM_HELP_ADD_PLEX),
+    ("clonegrade", messages::gm::GM_HELP_CLONE_GRADE),
     ("heal", messages::gm::GM_HELP_HEAL),
     ("dogma", messages::gm::GM_HELP_DOGMA),
     ("jobs", messages::scheduler::HELP),
@@ -336,6 +338,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "sites" => super::exploration::gm_sites(c).await,
         "create" | "createitem" => create(c, args).await,
         "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, args, &command).await,
+        "clonegrade" => subscriptions::run(c, args).await,
         "heal" => heal(c).await,
         "dogma" => dogma::command(c, args).await,
         "jobs" => jobs::command(&c.db, args).await,

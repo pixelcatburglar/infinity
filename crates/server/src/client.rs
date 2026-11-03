@@ -188,6 +188,7 @@ impl Client {
     }
 
     pub async fn run(mut self, registration: &mut crate::live_sessions::Registration) -> Result<()> {
+        let _sender_guard = registration.attach_sender(self.notify_tx.clone());
         let result: Result<()> = async {
             if registration.is_cancelled() {
                 return Ok(());
@@ -431,6 +432,11 @@ pub fn ms_from_filetime_ticks(ticks: i64) -> i64 {
 /// Convert a FILETIME timestamp to Unix seconds, truncating toward zero.
 pub fn unix_seconds_from_filetime(ticks: i64) -> i64 {
     ((i128::from(ticks) - i128::from(FILETIME_UNIX_EPOCH)) / i128::from(FILETIME_SECOND)) as i64
+}
+
+/// Convert a FILETIME timestamp to checked Unix nanoseconds without losing ticks.
+pub(crate) fn unix_ns_from_filetime(ticks: i64) -> Option<i64> {
+    i64::try_from((i128::from(ticks) - i128::from(FILETIME_UNIX_EPOCH)) * i128::from(FILETIME_TICK_NS)).ok()
 }
 
 /// Convert a signed whole-second duration to FILETIME ticks.

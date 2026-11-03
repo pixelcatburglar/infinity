@@ -6,7 +6,9 @@ pub(in crate::services) struct Fixture { pub account: i64, pub character: i64 }
 
 pub(in crate::services) async fn create(db: &Db) -> Result<Fixture, Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
-        let account = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('atomicity-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
+        let seq: i64 = tx.query_one("SELECT nextval('game.accounts_user_id_seq') AS id", &[]).await?.get("id");
+        let registered = crate::dao::accounts::authentication::register(tx, &format!("atomicity-{seq}"), b"fixture", 0, 0).await?;
+        let account = registered.user_id;
         let character = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'atomicity-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await?.get("character_id");
         Ok(Fixture { account, character })
     }), |fixture, ()| async move { Ok(fixture) }).await
@@ -58,6 +60,8 @@ pub(in crate::services) async fn remaining(db: &Db, f: Fixture) -> Result<i64, E
 
 pub(in crate::services) async fn cleanup(db: &Db, fixture: Fixture) -> Result<(), Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        tx.execute("DELETE FROM game.account_clone_grade_audit WHERE user_id = $1 OR actor_user_id = $1", &[&fixture.account]).await?;
+        tx.execute("DELETE FROM game.jobs WHERE job_id = $1", &[&format!("subscription.clone_grade.expire:{}", fixture.account)]).await?;
         tx.execute("DELETE FROM game.agent_missions WHERE character_id = $1", &[&fixture.character]).await?;
         tx.execute("DELETE FROM game.epic_arc_missions WHERE character_id = $1", &[&fixture.character]).await?;
         tx.execute("DELETE FROM game.skill_queue WHERE character_id = $1", &[&fixture.character]).await?;

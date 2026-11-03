@@ -66,6 +66,7 @@ pub(crate) mod standings;
 mod slash;
 mod sql_pattern;
 mod station;
+pub(crate) mod subscriptions;
 mod store;
 pub(crate) mod trade;
 mod universe;
@@ -92,6 +93,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(chat::expiry::KIND, chat::expiry::handle),
         crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
         crate::scheduler::register(corps::vote_close::KIND, corps::vote_close::handle),
+        crate::scheduler::register(subscriptions::deadlines::KIND, subscriptions::deadlines::handle),
     ]
 }
 
@@ -385,6 +387,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 if let Some(r) = fixed::social_early(call) { return r; }
             }
             if let Some(r) = clones::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = subscriptions::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = insurance::dispatch(c, call).await {
