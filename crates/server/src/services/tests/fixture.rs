@@ -47,6 +47,10 @@ pub(in crate::services) async fn clear_cargo_stack(db: &Db, character: i64) -> R
     Ok(())
 }
 
+pub(in crate::services) async fn store_purchase_count(db: &Db, account: i64, offer: i32) -> Result<i64, Error> {
+    Ok(db.query_one("SELECT count(*) AS count FROM game.store_purchases WHERE user_id = $1 AND offer_id = $2", &[&account, &offer]).await?.get("count"))
+}
+
 
 pub(in crate::services) async fn remaining(db: &Db, f: Fixture) -> Result<i64, Error> {
     Ok(db.query_one("SELECT (SELECT count(*) FROM game.accounts WHERE user_id = $1) + (SELECT count(*) FROM game.characters WHERE character_id = $2) + (SELECT count(*) FROM game.items WHERE owner_id = $2) + (SELECT count(*) FROM game.skills WHERE character_id = $2) + (SELECT count(*) FROM game.skill_queue WHERE character_id = $2) + (SELECT count(*) FROM game.agent_missions WHERE character_id = $2) + (SELECT count(*) FROM game.epic_arc_missions WHERE character_id = $2) AS remaining", &[&f.account, &f.character]).await?.get("remaining"))
