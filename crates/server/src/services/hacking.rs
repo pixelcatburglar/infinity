@@ -475,7 +475,8 @@ pub async fn start(
     if gap > range {
         return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
-    let level = crate::dao::skills::levels::level(db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
+    let skills = crate::services::skills::effective::snapshot(db, char_id).await?;
+    let level = skills.level(needed) as f64;
     let coherence = (attr(ATTR_VIRUS_COHERENCE, 40.0) + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
     let strength = attr(ATTR_VIRUS_STRENGTH, 20.0).round() as i64;
     let slots = attr(ATTR_VIRUS_SLOTS, 3.0).round().clamp(1.0, 6.0) as usize;

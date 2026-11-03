@@ -1,6 +1,7 @@
 //! Corporation role, title and leadership mechanics for corpRegistry.
 //! Mirrors eve/client/script/ui/services/corporation, using game corporations,
-//! characters, skills and titles, and startup SDE schools and NPC corporations; shares remain unsupported.
+//! characters, skills and titles, and startup SDE schools and NPC corporations. CEO eligibility
+//! uses effective management skill; shares remain unsupported.
 
 use super::*;
 use crate::dao::corporations::roles as role_dao;
@@ -162,7 +163,12 @@ pub(super) async fn delete_title(db: &Db, world: &World, me: i64, corp: i64, tit
 
 /// Members other than the CEO with Corporation Management, who could take over.
 pub(super) async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i64>, CallError> {
-    role_dao::potential_ceos(db, corp, ceo, SKILL_CORPORATION_MANAGEMENT, crate::config::game().corporations.min_management_skill_level as i32).await.map_err(db_err)
+    let candidates = role_dao::potential_ceos(db, corp, ceo, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?;
+    let minimum = crate::config::game().corporations.min_management_skill_level;
+    Ok(candidates.into_iter()
+        .filter(|candidate| i64::from(crate::services::skills::effective::from_trained(candidate.skill.as_slice()).level(SKILL_CORPORATION_MANAGEMENT)) >= minimum)
+        .map(|candidate| candidate.character_id)
+        .collect())
 }
 
 /// `ResignFromCEO(newCeoID=None)`. Without a successor it returns the members who could be

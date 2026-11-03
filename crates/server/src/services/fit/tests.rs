@@ -99,6 +99,20 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
     assert_eq!(node.base(None, None, super::ATTR_SKILL_LEVEL), 3.0);
 }
 
+#[test]
+fn supplied_skill_level_comes_from_points_not_stored_level() {
+    let skill = crate::dao::skills::training::Skill { type_id: 42, level: 5, skill_points: 8000 };
+    let snapshot = crate::services::skills::effective::from_trained(&[skill]);
+    let entry = snapshot.get(42).expect("supplied skill snapshot entry");
+    let rank = 1.0;
+    let level = crate::services::skills::formulas::level_from_points(
+        entry.trained.as_ref().expect("trained skill").skill_points,
+        rank,
+    );
+    assert_eq!(entry.trained.as_ref().unwrap().level, 5);
+    assert_eq!(level, 3);
+}
+
 fn fixture_node(location: super::Location) -> super::Node {
     super::Node { type_id: 1, data_position: None, location, online: true,
         active: false, overloaded: false, projected_effect: None, receiver: None,

@@ -2,7 +2,8 @@
 //! `eve/client/script/ui/services/corporation`.
 //! Uses the shared corporation mechanics in `services::corps` and its DAOs,
 //! including `game.corporations`, `game.characters`, `game.corp_applications` and startup SDE corporations.
-//! Share ownership and dividends use the corporation ledger; alliance calls have separate handlers.
+//! Founding uses effective management skill. Share ownership and dividends use the corporation
+//! ledger; alliance calls have separate handlers.
 
 use super::*;
 use crate::dao::corporations::dispatch as dispatch_dao;
@@ -314,7 +315,7 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
         return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
     if !gm {
-        let skill = crate::dao::skills::levels::level(db, me, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?.unwrap_or(0);
+        let skill = crate::services::skills::effective::snapshot(db, me).await?.level(SKILL_CORPORATION_MANAGEMENT);
         if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
             return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
         }

@@ -7,6 +7,7 @@ use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;
 pub(crate) mod alpha_injections;
 pub(crate) mod attributes;
+pub(crate) mod effective;
 pub(crate) mod brain_items;
 pub(crate) mod body_change;
 mod brain_reads;

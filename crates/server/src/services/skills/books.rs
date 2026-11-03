@@ -1,6 +1,7 @@
 //! Atomic book injection and start-training for skillsvc.py and dogmaIM.
-//! Uses startup SDE prerequisites and game items, skills, history and queue.
-use super::{db_err, learning, requirements::requirements, trading::{consume, refusal, source}, training, CallError};
+//! Uses startup SDE prerequisites, effective skill snapshots and game items, skills,
+//! history and queue. Already-injected checks and training requirements use real skills.
+use super::{db_err, effective, learning, requirements::requirements, trading::{consume, refusal, source}, training, CallError};
 use crate::{client::{filetime_now, Client}, consts::CATEGORY_SKILL, dao::skills::training as skill_dao, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{effects::online::{self, OnlineChanged}, user_error}};
 use marshal::Value;
 use std::{collections::{BTreeSet, HashMap}, sync::Arc};
@@ -8,6 +9,7 @@ use std::{collections::{BTreeSet, HashMap}, sync::Arc};
 async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, ids: &[i64], now: i64, start: Option<i64>) -> Result<Value, CallError> {
     let progress = learning::begin_tx(tx, outbox, sde, char_id, now).await?;
     let known: HashMap<_, _> = skill_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| (s.type_id, s.level)).collect();
+    let snapshot = effective::snapshot(tx, char_id).await?;
     let mut types = BTreeSet::new();
     let mut items = Vec::new();
     for &id in ids {
@@ -17,7 +19,7 @@ async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChan
         if data.category_id != Some(CATEGORY_SKILL) || data.published != Some(true) {
             return Err(user_error(messages::MSG_ITEM_NOT_A_SKILL, vec![("skillName".into(), Value::Int(i64::from(item.type_id)))]));
         }
-        if known.contains_key(&item.type_id) || !types.insert(item.type_id) || requirements(sde, item.type_id).any(|(id, level)| known.get(&id).copied().unwrap_or(0) < level) { return Err(refusal()); }
+        if known.contains_key(&item.type_id) || !types.insert(item.type_id) || requirements(sde, item.type_id).any(|(id, level)| snapshot.level(id) < level) { return Err(refusal()); }
         items.push(item);
     }
     for item in items {

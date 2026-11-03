@@ -67,13 +67,15 @@ async fn corporate_lists_counts_search_and_wire() {
         assert_eq!(number(&page, "numBiddingOnCorp"), 1);
         assert_eq!(number(&page, "numInProgressCorp"), 1);
         assert_eq!(number(&page, "numRequiresAttentionCorp"), 1);
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, false).await), 1);
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, true).await), 10);
+        let skills = success(crate::services::skills::effective::snapshot(&db, actor.character).await);
+        assert_eq!(super::super::super::max_outstanding(&skills, false), 1);
+        assert_eq!(super::super::super::max_outstanding(&skills, true), 10);
         for skill in [SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING, SKILL_CORPORATION_CONTRACTING] {
             db.execute("INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, 5, 0)", &[&actor.character, &skill]).await.unwrap();
         }
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, false).await), 41);
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, true).await), 60);
+        let skills = success(crate::services::skills::effective::snapshot(&db, actor.character).await);
+        assert_eq!(super::super::super::max_outstanding(&skills, false), 41);
+        assert_eq!(super::super::super::max_outstanding(&skills, true), 60);
         let kwargs = Value::Dict(vec![]);
         for (owner, included, excluded) in [(corp, corporate, personal), (actor.character, personal, corporate), (corp + 1, 0, corporate)] {
             let args = [Value::Int(owner), Value::Int(i64::from(STATUS_OUTSTANDING)), Value::Int(CONTYPE_ALL), Value::Bool(false)];

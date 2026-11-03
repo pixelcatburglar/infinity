@@ -88,9 +88,9 @@ pub(super) async fn broadcast_sites(world: &World, system: i64, added: &[Site], 
 
 /// A pilot's probe strength (baseSensorStrength with the Astrometrics skills) and scan
 /// time (ms, Astrometric Acquisition).
-pub(super) async fn probe_skills(db: &Db, char_id: i64) -> Result<(f64, f64), CallError> {
-    let rows = crate::dao::skills::levels::levels_of(db, char_id, &[SKILL_ASTROMETRICS, SKILL_RANGEFINDING, SKILL_ACQUISITION]).await.map_err(db_err)?;
-    let level = |skill: i32| rows.iter().find(|r| r.type_id == skill).map(|r| r.level as f64).unwrap_or(0.0);
+pub(super) async fn probe_skills(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<(f64, f64), CallError> {
+    let skills = crate::services::skills::effective::snapshot(ex, char_id).await?;
+    let level = |skill: i32| skills.level(skill) as f64;
     let strength = (1.0 + 0.05 * level(SKILL_ASTROMETRICS)) * (1.0 + 0.05 * level(SKILL_RANGEFINDING));
     let scan_ms = 10_000.0 * (1.0 - 0.1 * level(SKILL_ACQUISITION));
     Ok((strength, scan_ms))
