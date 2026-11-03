@@ -20,6 +20,7 @@ pub(crate) mod dynamic_items;
 pub(crate) mod exploration;
 pub(crate) mod fitting;
 pub(crate) mod fleets;
+pub(crate) mod gateway;
 pub(crate) mod gm;
 pub(crate) mod expert_systems;
 pub(crate) mod heat;

@@ -1,0 +1,7 @@
+//! Gateway response text for requestBroker.py response consumers.
+//! These server-authored messages use no database or client data and do not
+//! expose internal diagnostics or provide localisation.
+pub(crate) const INVALID_REQUEST: &str = "请求无效";
+pub(crate) const UNAUTHORIZED: &str = "未登录或未选择角色";
+pub(crate) const NOT_IMPLEMENTED: &str = "功能尚未实现";
+pub(crate) const INTERNAL_ERROR: &str = "服务器内部错误";

@@ -1,11 +1,12 @@
 //! Personal plans for `requestsMessenger.py:create` and `requestsMessenger.py:get_all`.
-//! Uses the skills plan DAO and descriptors, not World; unsupported methods on
-//! the legacy broad route fall through to existing default handling.
-use anyhow::{Context, Result};
+//! Uses the skills plan DAO and descriptors, not World; guarded missing-row
+//! refusals and transaction-based activation are not implemented here.
+use anyhow::Result;
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage, Value as PV};
 use crate::dao::skills::plans;
 use super::super::{Gateway, Caller, resources::db, message::{UUID_LEN, new_uuid, msg_field, str_field, identifier, child, set, response_for}};
+use super::super::error::{GatewayError, FailureCode};
 
 /// `skill_plan.uuid` of a request.
 fn plan_id(req: &DynamicMessage) -> Option<Vec<u8>> {
@@ -51,58 +52,57 @@ fn plan_identifier(desc: &MessageDescriptor, field: &str, id: Vec<u8>) -> Result
 }
 
 
-pub(in crate::gateway) async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> Result<Option<DynamicMessage>> {
-    let me = caller.character_id.context("no character")?;
-    let db = db(gw)?;
-    let mut rsp = response_for(name)?;
+pub(in crate::gateway) async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> std::result::Result<DynamicMessage, GatewayError> {
+    let invalid = || GatewayError::refusal(FailureCode::BadRequest, crate::messages::gateway::INVALID_REQUEST);
+    let me = caller.character_id.ok_or_else(|| GatewayError::refusal(FailureCode::Unauthorized, crate::messages::gateway::UNAUTHORIZED))?;
+    let db = db(gw).map_err(GatewayError::Internal)?;
+    let mut rsp = response_for(name).map_err(GatewayError::Internal)?;
     let desc = rsp.descriptor();
     let method = name.rsplit('.').next().unwrap_or_default();
     let id = plan_id(req);
     match method {
         "CreateRequest" => {
-            let plan = msg_field(req, "skill_plan").context("no skill_plan")?;
+            let plan = msg_field(req, "skill_plan").ok_or_else(invalid)?;
             let (skills, levels) = requirements(&plan, "skill_requirements");
             let new = new_uuid();
             plans::create(db, &new, me, &str_field(&plan, "name"), &str_field(&plan, "description"), &skills, &levels).await?;
-            set(&mut rsp, "skill_plan", PV::Message(plan_identifier(&desc, "skill_plan", new)?))?;
+            let value = plan_identifier(&desc, "skill_plan", new).map_err(GatewayError::Internal)?;
+            set(&mut rsp, "skill_plan", PV::Message(value)).map_err(GatewayError::Internal)?;
         }
         "GetAllRequest" => {
             let rows = plans::all(db, me).await?;
-            let ids = rows.into_iter().map(|id| plan_identifier(&desc, "skill_plans", id).map(PV::Message)).collect::<Result<Vec<_>>>()?;
-            set(&mut rsp, "skill_plans", PV::List(ids))?;
+            let ids = rows.into_iter().map(|id| plan_identifier(&desc, "skill_plans", id).map(PV::Message)).collect::<Result<Vec<_>>>().map_err(GatewayError::Internal)?;
+            set(&mut rsp, "skill_plans", PV::List(ids)).map_err(GatewayError::Internal)?;
         }
-        // Shared plans are looked up by id regardless of owner.
         "GetRequest" | "GetSharedRequest" => {
             let owner = if method == "GetRequest" { Some(me) } else { None };
-            let row = plans::get(db, &id.context("no skill_plan")?, owner).await?;
+            let row = plans::get(db, &id.ok_or_else(invalid)?, owner).await?;
             if let Some(row) = row {
-                set(&mut rsp, "skill_plan", PV::Message(plan_attributes(&desc, "skill_plan", &row)?))?;
+                let value = plan_attributes(&desc, "skill_plan", &row).map_err(GatewayError::Internal)?;
+                set(&mut rsp, "skill_plan", PV::Message(value)).map_err(GatewayError::Internal)?;
             }
         }
         "GetActiveRequest" => {
             let row = plans::active(db, me).await?;
-            // No active plan: the all-zero uuid.
             let plan = row.as_ref().map(|r| r.plan_id.clone()).unwrap_or_else(|| vec![0u8; UUID_LEN]);
-            set(&mut rsp, "skill_plan", PV::Message(plan_identifier(&desc, "skill_plan", plan)?))?;
+            let value = plan_identifier(&desc, "skill_plan", plan).map_err(GatewayError::Internal)?;
+            set(&mut rsp, "skill_plan", PV::Message(value)).map_err(GatewayError::Internal)?;
             if let Some(row) = row {
-                set(&mut rsp, "skill_plan_info", PV::Message(plan_attributes(&desc, "skill_plan_info", &row)?))?;
+                let value = plan_attributes(&desc, "skill_plan_info", &row).map_err(GatewayError::Internal)?;
+                set(&mut rsp, "skill_plan_info", PV::Message(value)).map_err(GatewayError::Internal)?;
             }
         }
-        "SetActiveRequest" => {
-            plans::set_active(db, me, &id.unwrap_or_default()).await?;
-        }
-        "DeleteRequest" => {
-            plans::delete(db, me, &id.context("no skill_plan")?).await?;
-        }
+        "SetActiveRequest" => { plans::set_active(db, me, &id.unwrap_or_default()).await?; }
+        "DeleteRequest" => { plans::delete(db, me, &id.ok_or_else(invalid)?).await?; }
         "SetNameRequest" | "SetDescriptionRequest" => {
             let (field, column) = if method == "SetNameRequest" { (plans::Field::Name, "name") } else { (plans::Field::Description, "description") };
-            plans::set_field(db, me, &id.context("no skill_plan")?, field, &str_field(req, column)).await?;
+            plans::set_field(db, me, &id.ok_or_else(invalid)?, field, &str_field(req, column)).await?;
         }
         "SetSkillRequirementsRequest" => {
             let (skills, levels) = requirements(req, "requirements");
-            plans::set_requirements(db, me, &id.context("no skill_plan")?, &skills, &levels).await?;
+            plans::set_requirements(db, me, &id.ok_or_else(invalid)?, &skills, &levels).await?;
         }
-        _ => return Ok(None),
+        _ => unreachable!("router only claims known plan methods"),
     }
-    Ok(Some(rsp))
+    Ok(rsp)
 }

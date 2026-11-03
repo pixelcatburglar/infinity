@@ -11,15 +11,17 @@
 //! Payloads are `google.protobuf.Any`; they are decoded with the client's own
 //! descriptors (extracted by tools/extract_protos.py) through prost-reflect.
 //! Responses use embedded protobuf descriptors, server CDN content and DAO data;
-//! these handlers do not read World. Unclaimed requests retain default responses,
-//! Events are drained, notice delivery is not repaired, and career content is
-//! not complete.
+//! these handlers do not read World. Unclaimed requests retain default responses;
+//! valid Events are decoded and dropped, notice delivery is not repaired, and
+//! career content is not complete.
 
 mod achievements;
 mod career_goals;
 mod character_titles;
 mod characters;
 mod content;
+mod error;
+mod events;
 mod fallback;
 mod handlers;
 mod insurgency;
@@ -34,14 +36,13 @@ mod transport;
 
 use crate::db::Db;
 use anyhow::Result;
-use prost_reflect::DynamicMessage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
-use message::{pool, pack, UUID_LEN};
-use protocol::{Notice, TargetGroup, now_timestamp};
+use message::pool;
+use protocol::Notice;
 use transport::connection;
 
 /// Who sent a request.
@@ -61,8 +62,6 @@ pub struct Gateway {
     pub cdn_url: String,
     /// application instance uuid -> notice stream
     notice_streams: Mutex<HashMap<Vec<u8>, NoticeTx>>,
-    /// application instance uuid -> (user, character) last seen on its requests
-    identities: Mutex<HashMap<Vec<u8>, (Option<i64>, Option<i64>)>>,
 }
 
 impl Gateway {
@@ -70,29 +69,11 @@ impl Gateway {
         Arc::new(Gateway { db: Some(db), cdn_url, ..Default::default() })
     }
 
-    /// Push a notice to every client playing `character_id`.
-    #[allow(dead_code)]
-    pub fn notify_character(&self, character_id: i64, payload: &DynamicMessage) {
-        let ids = self.identities.lock().unwrap();
-        let streams = self.notice_streams.lock().unwrap();
-        for (app, (_, ch)) in ids.iter() {
-            if *ch == Some(character_id) {
-                if let Some(tx) = streams.get(app) {
-                    let _ = tx.send(Notice {
-                        dispatched: Some(now_timestamp()),
-                        uuid: crate::handshake::rand_i64().to_le_bytes().repeat(UUID_LEN / std::mem::size_of::<i64>()),
-                        internal_origin: "infinity".into(),
-                        tenant: String::new(),
-                        payload: Some(pack(payload)),
-                        target_group: Some(TargetGroup { character: Some(character_id as u32), ..Default::default() }),
-                    });
-                }
-            }
-        }
-    }
 }
 
 pub async fn serve(bind: String, gw: Arc<Gateway>) -> Result<()> {
+    handlers::validate()?;
+    anyhow::ensure!(message::message("eve_public.Event").is_some(), "missing event descriptor eve_public.Event");
     let listener = TcpListener::bind(&bind).await?;
     info!("public gateway (gRPC) listening on {bind}; {} message types loaded", pool().all_messages().count());
     loop {

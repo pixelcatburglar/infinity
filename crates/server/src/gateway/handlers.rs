@@ -1,22 +1,71 @@
-//! Route requests from `requestBroker.py:_send_request` to gateway handlers.
-//! Handlers use descriptors, CDN content and DAO data, not World; unclaimed
-//! requests fall through to the existing no-content or default response.
-use anyhow::Result;
+//! Request routing for requestBroker.py and its feature messengers.
+//! Uses descriptors, CDN data and DAO-backed handlers; unknown requests retain
+//! the existing fallback behavior and do not claim future feature methods.
 use prost_reflect::DynamicMessage;
-use super::{Gateway, Caller, achievements, character_titles, space_content, career_goals, insurgency, characters, plex, skill_plans};
+use super::{Gateway, Caller, achievements, character_titles, space_content, career_goals, insurgency, characters, plex, skill_plans, error::GatewayError, message::{message, response_name}};
 
-pub(super) async fn handle(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> Result<Option<DynamicMessage>> {
-    match name {
-        "eve_public.achievement.definition.api.cdn.GetLatestRequest" => achievements::definition::handle(gw, name).map(Some),
-        "eve_public.cosmetic.character.title.definition.api.GetLatestRequest" => character_titles::definition::handle(gw, name).map(Some),
-        "eve_public.space.api.cdn.GetUpdateRequest" => space_content::handle(gw, name).map(Some),
-        "eve_public.career.goal.api.GetDefinitionsRequest" => career_goals::career_goal_definitions().map(Some),
-        "eve_public.career.goal.api.GetAllRequest" => career_goals::career_goal_states().map(Some),
-        "eve_public.pirate.corruption.api.GetStageThresholdsRequest" => insurgency::corruption::handle(name).map(Some),
-        "eve_public.pirate.suppression.api.GetStageThresholdsRequest" => insurgency::suppression::handle(name).map(Some),
-        "eve_public.character.GetNamesByUserRequest" => characters::names_by_user(gw, caller).await.map(Some),
-        "eve_public.plex.vault.api.BalanceRequest" => plex::plex_balance(gw, caller).await.map(Some),
-        n if n.starts_with("eve_public.character.skill.plan.") && !n.contains(".milestone.") => skill_plans::personal::skill_plan(gw, caller, n, req).await,
-        _ => Ok(None),
-    }
+#[derive(Clone, Copy)]
+enum Route {
+    AchievementDefinition,
+    CharacterTitleDefinition,
+    SpaceContent,
+    CareerGoalDefinitions,
+    CareerGoalStates,
+    Corruption,
+    Suppression,
+    CharacterNamesByUser,
+    PlexBalance,
+    PersonalSkillPlan,
 }
+
+const CLAIMS: &[(&str, Route)] = &[
+    ("eve_public.achievement.definition.api.cdn.GetLatestRequest", Route::AchievementDefinition),
+    ("eve_public.cosmetic.character.title.definition.api.GetLatestRequest", Route::CharacterTitleDefinition),
+    ("eve_public.space.api.cdn.GetUpdateRequest", Route::SpaceContent),
+    ("eve_public.career.goal.api.GetDefinitionsRequest", Route::CareerGoalDefinitions),
+    ("eve_public.career.goal.api.GetAllRequest", Route::CareerGoalStates),
+    ("eve_public.pirate.corruption.api.GetStageThresholdsRequest", Route::Corruption),
+    ("eve_public.pirate.suppression.api.GetStageThresholdsRequest", Route::Suppression),
+    ("eve_public.character.GetNamesByUserRequest", Route::CharacterNamesByUser),
+    ("eve_public.plex.vault.api.BalanceRequest", Route::PlexBalance),
+    ("eve_public.character.skill.plan.CreateRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.GetAllRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.GetRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.GetSharedRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.GetActiveRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.SetActiveRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.DeleteRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.SetNameRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.SetDescriptionRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.SetSkillRequirementsRequest", Route::PersonalSkillPlan),
+];
+
+pub(super) fn validate() -> anyhow::Result<()> {
+    for &(name, _) in CLAIMS {
+        anyhow::ensure!(message(name).is_some(), "missing request descriptor {name}");
+        let response = response_name(name).expect("claimed request name");
+        anyhow::ensure!(message(&response).is_some(), "missing response descriptor {response}");
+    }
+    Ok(())
+}
+
+pub(super) enum Dispatch { Unclaimed, Claimed(Result<DynamicMessage, GatewayError>) }
+
+pub(super) async fn handle(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> Dispatch {
+    let Some((_, route)) = CLAIMS.iter().find(|(claim, _)| *claim == name) else { return Dispatch::Unclaimed };
+    let result = match route {
+        Route::AchievementDefinition => achievements::definition::handle(gw, name).map_err(GatewayError::Internal),
+        Route::CharacterTitleDefinition => character_titles::definition::handle(gw, name).map_err(GatewayError::Internal),
+        Route::SpaceContent => space_content::handle(gw, name).map_err(GatewayError::Internal),
+        Route::CareerGoalDefinitions => career_goals::career_goal_definitions().map_err(GatewayError::Internal),
+        Route::CareerGoalStates => career_goals::career_goal_states().map_err(GatewayError::Internal),
+        Route::Corruption => insurgency::corruption::handle(name).map_err(GatewayError::Internal),
+        Route::Suppression => insurgency::suppression::handle(name).map_err(GatewayError::Internal),
+        Route::CharacterNamesByUser => characters::names_by_user(gw, caller).await,
+        Route::PlexBalance => plex::plex_balance(gw, caller).await,
+        Route::PersonalSkillPlan => skill_plans::personal::skill_plan(gw, caller, name, req).await,
+    };
+    Dispatch::Claimed(result)
+}
+
+#[cfg(test)] mod tests;
