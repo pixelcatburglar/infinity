@@ -1,4 +1,6 @@
 //! Lua-facing simulated pilot lifecycle and cancellation coverage.
+mod economy;
+mod skills;
 mod effects;
 mod fixture;
 mod space;

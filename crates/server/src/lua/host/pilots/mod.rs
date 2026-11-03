@@ -3,6 +3,8 @@
 //! The client accepts absent portrait data in eve/client/script/ui/services/ccSvc.py;
 //! simulated pilots do not receive generated portraits or customized dolls.
 
+mod economy;
+mod skills;
 mod effects;
 mod lifecycle;
 mod space;
@@ -120,5 +122,7 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> mlua::R
     })?)?;
     space::register(lua, &api, resources)?;
     effects::register(lua, &api, resources)?;
+    economy::register(lua, &api, resources)?;
+    skills::register(lua, &api, resources)?;
     env.set("pilots", api)
 }
