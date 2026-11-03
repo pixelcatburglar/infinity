@@ -10,6 +10,7 @@
 //! their queries return empty lists.
 //! External phone binding, binding state and rewards are unsupported; the
 //! binding-success callback does not establish binding state.
+//! Player structures are unsupported, so the character structure directory is empty.
 
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
@@ -75,6 +76,9 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("stationSvc", "GetAllianceSystems") => Value::list([]),
         // (jumpBridgeGates, hasAccessTo, hasNoAccessTo)
         ("structureDirectory", "GetStructureMapData") => Value::list([]),
+        // GetMarketDockableLocationsInRegion iterates the dict and reads each entry's
+        // services; player structures are unsupported.
+        ("structureDirectory", "GetMyCharacterStructures") => Value::Dict(vec![]),
         // SKIN licences the character has activated: none yet.
         ("shipCosmeticsMgr", "GetLicencedSkins") | ("shipCosmeticsMgr", "GetLicencedSkinsForShipType") => Value::list([]),
         ("structureDirectory", "GetJumpBridgesWithMyAccess") => Value::tuple([Value::list([]), Value::list([]), Value::list([])]),
