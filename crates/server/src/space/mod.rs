@@ -483,6 +483,12 @@ impl Pilots {
         self.notify.lock().unwrap().get(&char_id).filter(|(tx, _)| !tx.is_closed()).and_then(|(_, session)| session.clone()).filter(|s| s.character_id == char_id)
     }
 
+    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::ChatSession> {
+        self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, session))| {
+            session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id && s.station_id == Some(station_id)).cloned()
+        }).collect()
+    }
+
     pub fn unregister_pilot(&self, char_id: i64) {
         self.notify.lock().unwrap().remove(&char_id);
         for q in self.queues.lock().unwrap().values_mut() {
@@ -587,6 +593,7 @@ impl World {
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
     pub(crate) fn set_chat_session(&self, char_id: i64, session: Option<crate::session::ChatSession>) { self.pilots.set_chat_session(char_id, session); }
     pub(crate) fn chat_session(&self, char_id: i64) -> Option<crate::session::ChatSession> { self.pilots.chat_session(char_id) }
+    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::ChatSession> { self.pilots.station_guests(station_id) }
     pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
     pub fn is_online(&self, char_id: i64) -> bool { self.pilots.is_online(char_id) }
     pub fn online_pilots(&self) -> Vec<i64> { self.pilots.online_pilots() }

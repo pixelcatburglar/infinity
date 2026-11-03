@@ -31,7 +31,7 @@ pub(in crate::services) async fn form_fleet(f: &mut Fixture, other: i64, ship: i
     let online = f.world.is_online(other);
     let original_target = f.world.chat_session(other);
     let target_session = original_target.clone().unwrap_or(crate::session::ChatSession {
-        character_id: other, system_id: system, corporation_id: Some(corporation),
+        character_id: other, station_id: None, system_id: system, corporation_id: Some(corporation),
         alliance_id: (other_ball.alliance_id > 0).then_some(other_ball.alliance_id),
         faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     });

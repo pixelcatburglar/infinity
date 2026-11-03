@@ -5,7 +5,7 @@ use crate::services::value_field;
 use crate::session::ChatSession;
 
 fn session(id: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>) -> ChatSession {
-    ChatSession { character_id: id, system_id: Some(10), corporation_id: Some(corp), alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }
+    ChatSession { character_id: id, station_id: None, system_id: Some(10), corporation_id: Some(corp), alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }
 }
 fn contact(id: i64, standing: f32) -> Contact {
     Contact { contact_id: id, relationship: standing, in_watchlist: false, label_mask: 0 }
