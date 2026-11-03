@@ -13,10 +13,12 @@ pub(crate) mod rules;
 pub(crate) mod management;
 pub(crate) mod deadlines;
 mod subscription_mgr;
+mod alpha_injector_mgr;
 
 pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
         "subscriptionMgr" => subscription_mgr::dispatch(c, call).await,
+        "alphaInjectorMgr" => alpha_injector_mgr::dispatch(c, call).await,
         _ => None,
     }
 }

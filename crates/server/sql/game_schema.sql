@@ -110,6 +110,13 @@ CREATE TABLE IF NOT EXISTS game.characters (
     deleted          boolean NOT NULL DEFAULT false
 );
 
+-- dao/skills/alpha_injections: persistent daily Alpha injector cooldowns.
+CREATE TABLE IF NOT EXISTS game.character_alpha_injections (
+    character_id bigint PRIMARY KEY REFERENCES game.characters ON DELETE CASCADE,
+    next_available bigint NOT NULL CHECK (next_available > 0),
+    available_notified boolean NOT NULL DEFAULT false
+);
+
 -- services/slash.rs / dao/wallets: exact 36-digit character ISK storage.
 DO $$
 BEGIN

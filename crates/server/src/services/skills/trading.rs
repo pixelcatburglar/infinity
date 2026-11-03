@@ -2,8 +2,9 @@
 //! Item sources are the current personal hangar or the active owned ship's cargo.
 //! The caller owns serialization, transaction and post-commit dispatch.
 //! Timeline mutations reconcile owned online hulls in the settlement transaction.
-//! Planetary colonies and clone-grade restrictions are not modelled; all characters
-//! follow the existing Omega policy. Dormant clone implants protect prerequisites.
+//! Daily Alpha injectors enforce clone grade and cooldown; full Alpha gameplay
+//! restrictions and planetary colonies are not modelled here. Dormant clone
+//! implants protect prerequisites.
 use super::{db_err, CallError};
 use crate::{consts::{dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
 use marshal::Value;
@@ -61,6 +62,12 @@ pub(crate) async fn available_credits(tx: &(impl Executor + ?Sized), sde: &Sde, 
 /// one charge exempts one full or small injector, never a mini.
 fn injector_yield(sde: &Sde, type_id: i32, quantity: i64, mut total: i64, mut charges: i64) -> Result<(i64, i64), CallError> {
     if quantity <= 0 || quantity > MAX_STACK || total < 0 { return Err(refusal()); }
+    if type_id == super::alpha_injections::TYPE_ID {
+        if quantity != 1 { return Err(refusal()); }
+        let points = sde.types.attribute(type_id, CONTAINED_POINTS).ok_or_else(refusal)?;
+        if !points.is_finite() || points <= 0.0 || points.fract() != 0.0 || points >= i64::MAX as f64 { return Err(refusal()); }
+        return Ok((points as i64, 0));
+    }
     let (base, mini_limit) = match type_id {
         FULL_INJECTOR | SMALL_INJECTOR => {
             let fallback = if type_id == FULL_INJECTOR { BUCKET } else { BUCKET / SMALL_DIVISOR };
@@ -130,6 +137,9 @@ pub(super) async fn quote(c: &crate::client::Client, char_id: i64, args: &[Value
     let now = crate::client::filetime_now();
     let _lock = crate::services::market::lock().await;
     let sde = c.sde.clone();
+    if type_id == super::alpha_injections::TYPE_ID {
+        return Ok(Value::Int(injector_yield(&sde, type_id, quantity, 0, 0)?.0));
+    }
     c.db.transaction(|tx, _: &mut Outbox| {
         let sde = sde.clone();
         Box::pin(async move {
@@ -282,17 +292,30 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             Ok(Value::None)
 }
 
-async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, check: bool) -> Result<Value, CallError> {
+async fn inject_tx(tx: &impl Executor, outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, check: bool) -> Result<Value, CallError> {
+            let initial_type = crate::dao::items::inventory::type_id(tx, id).await.map_err(db_err)?.ok_or_else(refusal)?;
+            let alpha = initial_type == super::alpha_injections::TYPE_ID;
+            let authority = if alpha {
+                if char_id <= 0 { return Err(refusal()); }
+                let user_id = crate::dao::store::purchases::recipient(tx, char_id).await.map_err(db_err)?.ok_or_else(refusal)?;
+                Some(crate::dao::accounts::subscriptions::lock(tx, user_id).await.map_err(db_err)?)
+            } else { None };
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-            let item = source(tx, &sde, char_id, ship, id, false).await?;
-            if qty <= 0 || qty > item.quantity { return Err(refusal()); }
+            let now = if alpha { crate::client::filetime_now() } else { now };
+            let item = source(tx, sde, char_id, ship, id, false).await?;
+            if item.type_id != initial_type || qty <= 0 || qty > item.quantity { return Err(refusal()); }
+            let deadline = if let Some(authority) = &authority {
+                let grade = crate::services::subscriptions::rules::effective_grade(authority, now);
+                Some(super::alpha_injections::check_tx(tx, char_id, grade, now).await?)
+            } else { None };
             let plan = super::timeline::plan_tx(tx, sde, char_id, now).await?;
             let balance = crate::dao::characters::attributes::free_points(tx, char_id).await.map_err(db_err)?;
             let total = plan.trained_points()?.checked_add(balance).ok_or_else(refusal)?;
-            let mut credits = credits(tx, sde, char_id, now).await?;
+            let mut credits = if alpha { Vec::new() } else { credits(tx, sde, char_id, now).await? };
             let count = credits.iter().try_fold(0_i64, |sum, c| sum.checked_add(c.uses).ok_or_else(refusal))?;
             let (amount, mut used) = injector_yield(&sde, item.type_id, quantity, total, count)?;
             if check { return Ok(Value::None); }
+            if let Some(deadline) = deadline { super::alpha_injections::claim_tx(tx, char_id, now, deadline).await?; }
             let progress = super::completion::apply_plan_tx(tx, outbox, sde, &plan).await?;
             let accrued = super::training::in_training_sp(tx, char_id, now).await?;
             crate::dao::skills::training::write_skills(tx, char_id, &super::training::plan_skills(&[], accrued)).await.map_err(db_err)?;

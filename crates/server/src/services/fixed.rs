@@ -2,9 +2,8 @@
 //! Mirrors client remote-service calls; no database or state is accessed.
 //! Stateful and argument-dependent services are handled by their feature modules;
 //! personal contact label management and corporation item lockdown votes are unsupported.
-//! Alpha injector availability uses the client sentinel value; encoded-item decoding
-//! is refused until media decoding is modelled. Item-locking queries retain their
-//! empty-dictionary and mutable-set compatibility replies.
+//! Encoded-item decoding is refused until media decoding is modelled. Item-locking
+//! queries retain their empty-dictionary and mutable-set compatibility replies.
 //! `eve/client/script/ui/services/ccSvc.py` uses an empty QA starter-system list
 //! to retain ordinary allocation; QA overrides are unavailable.
 //! `eve/client/script/ui/shared/neocom/petitionWindow.py` receives no character
@@ -226,8 +225,6 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
         ("machoNet", "GetServiceInfo") => Ok(Value::Dict(vec![])),
         ("air_npe", "is_air_npe_enabled") => Ok(Value::Bool(false)),
 
-        // skillsvc.py:GetDurationUntilNextAlphaInjection subtracts the wall clock from this FILETIME sentinel.
-        ("alphaInjectorMgr", "GetNextAvailableInjection") => Ok(Value::Int(0)),
         // menuFunctions.py:DecryptItem cannot open media without a supported source; refuse without consuming the item.
         ("encodedItems", "DecodeItem") => Err(notify_error(crate::messages::encoded_items::DECODE_UNAVAILABLE)),
 

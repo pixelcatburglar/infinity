@@ -56,6 +56,9 @@ pub(crate) const MSG_MODULE_NOT_POWERED: &str = "ModuleNotPowered";
 pub(crate) const MSG_NO_SUITABLE_SLOTS_FOR_THIS_SUBSYSTEM: &str = "NoSuitableSlotsForThisSubSystem";
 pub(crate) const MSG_CANNOT_FIT_SUBSYSTEM_NOT_SHIP: &str = "CannotFitSubSystemNotShip";
 
+// Client skill injector UserError catalogue key.
+pub(crate) const MSG_ALREADY_INJECTED_TODAY: &str = "AlreadyInjectedToday";
+
 /// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.
 pub(crate) const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";
 /// Generic connection refusal mapped by `carbon/common/script/net/ExceptionMappingGPCS.py:16`.
