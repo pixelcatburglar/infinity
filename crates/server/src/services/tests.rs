@@ -66,6 +66,29 @@ async fn item_locking_dispatch_returns_empty_collections() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn item_fixed_dispatch_roundtrips_alpha_and_decode_responses() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut client, _peer) = client(db, 1).await;
+    let kwargs = Value::Dict(vec![]);
+
+    let alpha = Call { service: "alphaInjectorMgr", method: "GetNextAvailableInjection", args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+    let alpha_reply = dispatch(&mut client, &alpha).await.unwrap();
+    assert_eq!(alpha_reply, Value::Int(0));
+    assert_eq!(marshal::loads(&marshal::dumps(&alpha_reply)).unwrap(), Value::Int(0));
+
+    let item_id = [Value::Int(1)];
+    let decode = Call { service: "encodedItems", method: "DecodeItem", args: &item_id, kwargs: &kwargs, bound: false, bind_params: None };
+    let decode_error = dispatch(&mut client, &decode).await.unwrap_err();
+    let CallError::User { msg, dict } = decode_error else { panic!("expected CustomNotify refusal") };
+    assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
+    assert_eq!(dict, vec![("notify".into(), Value::unicode(crate::messages::encoded_items::DECODE_UNAVAILABLE))]);
+    let wire_error = crate::client::user_error(&msg, dict);
+    assert_eq!(marshal::loads(&marshal::dumps(&wire_error)).unwrap(), wire_error);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn character_selection_fixed_dispatch_without_selected_character() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
