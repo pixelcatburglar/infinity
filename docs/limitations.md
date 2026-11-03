@@ -43,6 +43,7 @@
 - Shared item-filter and fleet-broadcast links are permanent and public: anyone signed in who has the whole link can open it, and a link cannot be made private, revoked or set to expire. Overview profile links are not supported.
 - A pilot who changes corporation or alliance gains or loses access to shared bookmark folders at once, but a shared folder the client already shows stays in its list until the pilot logs in again.
 - Mailing lists are free: a request to charge for mail to a list is refused. A list's owner cannot hand it over. List names are compared after PostgreSQL folds their case, which can differ from the client for a few Unicode letters.
+- Search words are checked against the client's moderation rules. Where a rule ignores case, the server also treats the Kelvin sign (U+212A) and the long s (U+017F) as the letters k and s, which the client does not, so a search containing them can be refused where the client would allow it.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space except ships (NPCs, wrecks, scheduled effects);

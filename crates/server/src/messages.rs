@@ -38,6 +38,10 @@ pub(crate) mod skills;
 pub(crate) mod store;
 pub(crate) mod wars;
 
+// Client moderation UserError catalogue keys.
+pub(crate) const MSG_BANNED_WORDS_DOWN: &str = "BannedWordsDown";
+pub(crate) const MSG_LOCATION_NAME_INVALID_BANNED_WORD: &str = "LocationNameInvalidBannedWord";
+
 // Client fitting and online UserError catalogue keys.
 pub(crate) const MSG_FITTING_HAS_SKILL_PREREQUISITES: &str = "FittingHasSkillPrerequisites";
 pub(crate) const MSG_ONLINE_HAS_SKILL_PREREQUISITES: &str = "OnlineHasSkillPrerequisites";
