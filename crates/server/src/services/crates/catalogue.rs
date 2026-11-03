@@ -9,7 +9,7 @@ use crate::dao::{items::loading::ItemQuery, skills::training};
 use crate::messages::crates as messages;
 use crate::services::{db_err, notify_error, CallError, CallResult};
 use crate::services::identity::Identity;
-use crate::services::inventory::{corporate_custody, may_view_corp_hangar};
+use crate::services::inventory::access::{corporate_custody, may_view_corp_hangar};
 use crate::services::inventory::reachability::{Endpoint, Reachability};
 use crate::services::items::load_items;
 use marshal::Value;

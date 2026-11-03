@@ -62,7 +62,7 @@ async fn courier_volume_limit_and_wrap_persistence() {
         assert_eq!(crate::services::item_descriptor().get(&wrap.row(), "quantity"), Some(Value::Int(-120000000)));
         assert_eq!(crate::services::item_volume::stack_size(wrap.singleton, i64::from(wrap.quantity)), 1);
         assert_eq!(crate::services::item_volume::item_volume(&sde, wrap.type_id, wrap.singleton, i64::from(wrap.quantity), None).unwrap(), MAX_COURIER_VOLUME);
-        let destination = crate::services::inventory::Container::Hangar { station_id: start, owner_id: buyer.actor.character };
+        let destination = crate::services::inventory::access::Container::Hangar { station_id: start, owner_id: buyer.actor.character };
         assert!(matches!(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&courier), &courier.db, &courier.world, &courier.sde, courier.session.int("solarsystemid"), courier.notify_tx.clone(), &destination, package, Some(start), Some(FLAG_HANGAR), None, |n| crate::services::effects::online::dispatch_notification(n, &courier.world, &courier.notify_tx, courier.session.int("charid"))).await, Ok(Some(moved)) if moved == package));
         let moved = load_items(&db, &sde, ItemQuery::Id(package)).await.unwrap().pop().unwrap();
         assert_eq!(moved.quantity, -120000000);

@@ -4,8 +4,11 @@
 //! permissions and POS tower-control inventories are not implemented.
 //! Relocations of shared containers are serialized by the economy lock; system-driven deletion or ownership changes are caught by the item's guarded write.
 
-use super::*;
-use crate::consts::{CARGO_CONTAINER_GROUPS, GROUP_WRECK};
+use crate::consts::{CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, GROUP_WRECK};
+use crate::db::executor::Executor;
+use crate::messages;
+use crate::sde::Sde;
+use crate::services::{db_err, notify_error, CallError};
 use crate::db::Db;
 use crate::services::identity::Identity;
 use crate::space::World;

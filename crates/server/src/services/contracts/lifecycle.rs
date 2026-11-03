@@ -163,10 +163,10 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
             if let Some(item) = loaded.remove(item_id) {
                 let quantity = if item.singleton { 1 } else { i32::try_from(*qty).map_err(|_| notify_error(messages::CONTRACT_ITEM_QUANTITY_INSUFFICIENT))? };
                 let root = if !item.singleton && quantity < item.quantity {
-                    let root = super::super::inventory::split_stack(db, &item, quantity, source.owner, source.location, source.flag, false).await?;
+                    let root = super::super::inventory::stacks::split_stack(db, &item, quantity, source.owner, source.location, source.flag, false).await?;
                     let remaining = Item { quantity: item.quantity - quantity, ..item.clone() };
                     if for_corp {
-                        super::super::inventory::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
+                        super::super::inventory::notifications::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
                     } else {
                         outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(i64::from(item.quantity)))]), Value::None]);
                     }
@@ -293,10 +293,10 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     let mut roots = Vec::new();
                     for (item, quantity) in takes {
                         let item_id = if !item.singleton && quantity < item.quantity {
-                            let id = super::super::inventory::split_stack(db, &item, quantity, source.owner, source.location, source.flag, false).await?;
+                            let id = super::super::inventory::stacks::split_stack(db, &item, quantity, source.owner, source.location, source.flag, false).await?;
                             let remaining = Item { quantity: item.quantity - quantity, ..item.clone() };
                             if for_corp {
-                                super::super::inventory::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
+                                super::super::inventory::notifications::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
                             } else {
                                 outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(i64::from(item.quantity)))]), Value::None]);
                             }
@@ -333,7 +333,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, owner.id, dest.location, dest.flag, quantity, &messages::contract_package_name(id)).await.map_err(db_err)?;
                     let item = load_items(db, &sde, ItemQuery::Id(wrap)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
                     if for_corp {
-                        super::super::inventory::notify_corp_item_change(db, outbox, &item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
+                        super::super::inventory::notifications::notify_corp_item_change(db, outbox, &item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
                     } else {
                         if transfers::docked(db, me).await.map_err(db_err)? == Some(k.start) {
                             outbox.notify_pilot(me, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(LOCATION_JUNKYARD))]), Value::None]);

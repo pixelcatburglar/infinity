@@ -21,7 +21,7 @@ pub(super) struct Custody { pub owner: i64, pub location: i64, pub flag: i32 }
 pub(super) async fn issuer_source(ex: &(impl Executor + ?Sized), actor: i64, corp: i64, for_corp: bool, station: i64, requested_flag: i32) -> Result<Custody, CallError> {
     if !for_corp { return Ok(Custody { owner: actor, location: station, flag: FLAG_HANGAR }); }
     let flag = if requested_flag == FLAG_HANGAR { FLAG_CORP_SAG1 } else { requested_flag };
-    if !corps::is_player_corp(corp) || !inventory::may_take_corp_hangar(ex, actor, corp, flag).await? {
+    if !corps::is_player_corp(corp) || !inventory::access::may_take_corp_hangar(ex, actor, corp, flag).await? {
         return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE));
     }
     let location = if flag == FLAG_CORP_DELIVERIES { station } else {
@@ -48,7 +48,7 @@ pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde,
     for item in &old {
         if corps::is_player_corp(item.owner_id) && item.location_id >= 0 {
             let gone = Item { location_id: LOCATION_JUNKYARD, ..item.clone() };
-            inventory::notify_corp_item_change(ex, outbox, &gone, vec![(IX_LOCATION_ID, Value::Int(item.location_id))]).await?;
+            inventory::notifications::notify_corp_item_change(ex, outbox, &gone, vec![(IX_LOCATION_ID, Value::Int(item.location_id))]).await?;
         }
         if !item_inventory::move_item(ex, item, destination.location, destination.flag, destination.owner, item.singleton).await.map_err(db_err)? {
             return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
@@ -64,7 +64,7 @@ pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde,
             outbox.notify_pilot(previous.owner_id, "OnItemChange", vec![item.row(), Value::Dict(change.iter().map(|(k, v)| (Value::Int(*k), v.clone())).collect()), Value::None]);
         }
         if corps::is_player_corp(destination.owner) {
-            inventory::notify_corp_item_change(ex, outbox, &item, change).await?;
+            inventory::notifications::notify_corp_item_change(ex, outbox, &item, change).await?;
         } else if docked {
             outbox.notify_pilot(destination.owner, "OnItemChange", vec![item.row(), Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect()), Value::None]);
         }
@@ -76,7 +76,7 @@ pub(super) async fn remove_package<X: Send>(ex: &(impl Executor + ?Sized), outbo
     let gone = Item { location_id: LOCATION_JUNKYARD, ..item.clone() };
     let change = vec![(IX_LOCATION_ID, Value::Int(item.location_id))];
     if corps::is_player_corp(item.owner_id) {
-        inventory::notify_corp_item_change(ex, outbox, &gone, change).await?;
+        inventory::notifications::notify_corp_item_change(ex, outbox, &gone, change).await?;
     } else {
         outbox.notify_pilot(item.owner_id, "OnItemChange", vec![gone.row(), Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect()), Value::None]);
     }

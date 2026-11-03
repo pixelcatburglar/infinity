@@ -126,10 +126,10 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                             }
                             if root.group_id != GROUP_STRATEGIC_CRUISER && (FLAG_RIG_FIRST..=FLAG_RIG_LAST).contains(&item.flag_id) {
                                 if !fitting_dao::destroy_upgrade(tx, &item).await.map_err(db_err)? { return Err(refuse()); }
-                                inventory::notify_item_removed(outbox, item);
+                                inventory::notifications::notify_item_removed(outbox, item);
                             } else {
                                 if !inventory_dao::move_item(tx, &item, root.location_id, FLAG_HANGAR, char_id, item.singleton).await.map_err(db_err)? { return Err(refuse()); }
-                                inventory::notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(i64::from(item.flag_id)))]).await?;
+                                inventory::notifications::notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(i64::from(item.flag_id)))]).await?;
                                 outbox.event(crate::lua::events::GameEvent::ItemsMoved { char_id, item_id: item.item_id, from_location_id: id, to_location_id: root.location_id, quantity: item.quantity });
                             }
                         }
@@ -146,7 +146,7 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                     }
                     if fitting_dao::repackage(tx, root).await.map_err(db_err)? == 0 { return Err(refuse()); }
                     dogma::clear_overrides(tx, root.item_id).await.map_err(db_err)?;
-                    inventory::notify_item_change(tx, &sde, outbox, root.item_id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
+                    inventory::notifications::notify_item_change(tx, &sde, outbox, root.item_id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
                 }
                 Ok(ships)
             })

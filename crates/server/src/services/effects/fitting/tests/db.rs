@@ -8,7 +8,7 @@ use crate::{
     consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_OUTPUT, dogma::ATTR_REQUIRED_SKILLS, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST, GM_ROLES},
     dao::items::dogma as item_dogma,
     sde::Sde,
-    services::{self, Call, CallError, fit::{Fit, Key}, inventory::{self, Container}},
+    services::{self, Call, CallError, fit::{Fit, Key}, inventory::{self, access::Container}},
     space::World,
 };
 use marshal::Value;

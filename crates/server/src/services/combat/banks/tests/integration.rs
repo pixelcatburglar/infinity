@@ -1,5 +1,5 @@
 use super::*;
-use crate::services::{effects::online, inventory::{self, Container}};
+use crate::services::{effects::online, inventory::{self, access::Container}};
 use crate::db::outbox::Outbox;
 use tokio::sync::mpsc::UnboundedReceiver;
 

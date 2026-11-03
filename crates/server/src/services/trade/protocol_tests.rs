@@ -219,34 +219,34 @@ async fn two_clients_settle_through_service_routes() {
     let foreign = transfers::insert(&db, normal, b, station, crate::consts::FLAG_HANGAR, 1).await.unwrap();
     let foreign_args = [Value::Int(foreign), Value::Int(station)];
     let foreign_add = Call { service: "invInventory", method: "Add", args: &foreign_args, kwargs: &empty, bound: true, bind_params: Some(&bind) };
-    assert!(crate::services::inventory::inventory(&mut ca, &foreign_add).await.is_err());
+    assert!(crate::services::inventory::dispatch(&mut ca, &foreign_add).await.expect("inventory route").is_err());
     let foreign_row = db.query_one("SELECT owner_id, location_id FROM game.items WHERE item_id = $1", &[&foreign]).await.unwrap();
     assert_eq!(foreign_row.get::<_, i64>("owner_id"), b);
     assert_eq!(foreign_row.get::<_, i64>("location_id"), station);
     let plex_args = [Value::Int(1), Value::Int(1), Value::str("VaultToDirectTrade")];
     let plex = Call { service: "invbroker", method: "WithdrawPlexFromVault", args: &plex_args, kwargs: &empty, bound: false, bind_params: None };
-    refusal!(crate::services::inventory::broker(&mut ca, &plex).await.expect("PLEX route"), crate::messages::trade::TRADE_PLEX_UNSUPPORTED);
+    refusal!(crate::services::inventory::dispatch(&mut ca, &plex).await.expect("PLEX route"), crate::messages::trade::TRADE_PLEX_UNSUPPORTED);
     for id in [root, child] {
         let args = [Value::Int(id), Value::Int(trade.id)];
         let icall = Call { service: "invInventory", method: "Add", args: &args, kwargs: &empty, bound: true, bind_params: Some(&bind) };
-        assert!(crate::services::inventory::inventory(&mut ca, &icall).await.is_err());
+        assert!(crate::services::inventory::dispatch(&mut ca, &icall).await.expect("inventory route").is_err());
         let args = [Value::list([Value::Int(id)])];
         let bcall = Call { service: "invbroker", method: "TrashItems", args: &args, kwargs: &empty, bound: true, bind_params: None };
-        assert!(crate::services::inventory::broker(&mut ca, &bcall).await.unwrap().is_err());
+        assert!(crate::services::inventory::dispatch(&mut ca, &bcall).await.unwrap().is_err());
         let args = [Value::Int(id)];
         let bcall = Call { service: "invbroker", method: "GetInventoryFromId", args: &args, kwargs: &empty, bound: true, bind_params: None };
-        assert!(crate::services::inventory::broker(&mut ca, &bcall).await.unwrap().is_err());
+        assert!(crate::services::inventory::dispatch(&mut ca, &bcall).await.unwrap().is_err());
     }
     for id in [root, child] {
         let args = [Value::Int(root), Value::Int(id), Value::Int(1), Value::Int(a)];
         let split = Call { service: "invbroker", method: "SplitStack", args: &args, kwargs: &empty, bound: true, bind_params: None };
-        assert!(crate::services::inventory::broker(&mut ca, &split).await.unwrap().is_err());
+        assert!(crate::services::inventory::dispatch(&mut ca, &split).await.unwrap().is_err());
         let args = [Value::list([Value::tuple([Value::Int(id), Value::Int(stack), Value::Int(1)])])];
         let merge = Call { service: "invInventory", method: "MultiMerge", args: &args, kwargs: &empty, bound: true, bind_params: Some(&bind) };
-        assert!(crate::services::inventory::inventory(&mut ca, &merge).await.is_err());
+        assert!(crate::services::inventory::dispatch(&mut ca, &merge).await.expect("inventory route").is_err());
         let item_bind = Value::tuple([Value::Int(id)]);
         let stack_all = Call { service: "invInventory", method: "StackAll", args: &[], kwargs: &empty, bound: true, bind_params: Some(&item_bind) };
-        assert!(crate::services::inventory::inventory(&mut ca, &stack_all).await.is_err());
+        assert!(crate::services::inventory::dispatch(&mut ca, &stack_all).await.expect("inventory route").is_err());
     }
     assert!(call(&mut ca, "OfferMoney", &[Value::Float(10.0)], Some(trade.id), &empty).await.is_ok());
     assert_timeout(&db, trade.id).await;

@@ -64,7 +64,7 @@ async fn reservation_lineage_batch_and_closed_trade() {
     assert_eq!(crate::dao::trades::reserved(&tx, &[nested, free]).await.unwrap(), vec![nested]);
     assert_eq!(crate::dao::trades::reserved(&tx, &[trade.id, root]).await.unwrap(), vec![trade.id, root]);
     let nested_item = crate::dao::items::loading::Item { item_id: nested, type_id: 1, owner_id: 2, location_id: root, flag_id: 4, quantity: 2, singleton: false, group_id: 1, category_id: 1, custom_info: None };
-    assert!(crate::services::inventory::split_stack(&tx, &nested_item, 1, 2, root, 4, false).await.is_err());
+    assert!(crate::services::inventory::stacks::split_stack(&tx, &nested_item, 1, 2, root, 4, false).await.is_err());
     tx.execute("UPDATE game.trades SET state = 'cancelled' WHERE trade_id = $1", &[&trade.id]).await.unwrap();
     assert!(crate::dao::trades::reserved(&tx, &[nested]).await.unwrap().is_empty());
     tx.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&root, &nested]).await.unwrap();

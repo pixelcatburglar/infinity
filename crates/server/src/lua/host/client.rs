@@ -29,7 +29,7 @@ enum Request {
 pub(super) enum Mutation {
     Wallet { character: i64, amount: f64, credit: bool },
     Create { owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32 },
-    Move { container: crate::services::inventory::Container, item: i64, flag: Option<i32>, quantity: Option<i64> },
+    Move { container: crate::services::inventory::access::Container, item: i64, flag: Option<i32>, quantity: Option<i64> },
     Delete { item: i64 },
     Mail(crate::services::mail::delivery::SendMail),
     Standing { character: i64, from: i64, value: f64 },
@@ -140,7 +140,7 @@ async fn apply_mutation(c: &mut Client, operation: Mutation) -> Result<Option<i6
     use crate::{db::outbox::{dispatch_client, dispatch_world, Outbox}, services::{inventory, items, market, standings, wallets}};
     match operation {
         Mutation::Move { container, item, flag, quantity } => inventory::movement::move_item(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &container, item, None, flag, quantity, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await,
-        Mutation::Delete { item } => { inventory::trash_items(c, &[item]).await?; Ok(None) }
+        Mutation::Delete { item } => { inventory::stacks::trash_items(c, &[item]).await?; Ok(None) }
         Mutation::Mail(input) => {
             let id = crate::services::mail::delivery::send_mail(&c.db, &c.world, c.session.int("charid").unwrap_or(0), c.session.int("corpid"), input).await?;
             Ok(Some(id))

@@ -126,8 +126,8 @@ async fn take_offer(c: &mut Client, corp: i64, offer_id: i64, count: i64, corpor
             if !quantities::apply(tx, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
             for item in items {
                 if let Some(change) = changes.get(&item.item_id) {
-                    if change.quantity.is_none() { super::super::inventory::notify_item_removed(outbox, item); }
-                    else { super::super::inventory::notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?; }
+                    if change.quantity.is_none() { super::super::inventory::notifications::notify_item_removed(outbox, item); }
+                    else { super::super::inventory::notifications::notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?; }
                 }
             }
             if let Some(key) = key { super::super::wallets::corp_debit(tx, outbox, owner, key, cost.isk as f64).await?; }

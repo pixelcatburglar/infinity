@@ -309,12 +309,12 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                     assert!(industry_dao::has_active_blueprint_job(&db, &[container, blueprint, f.office]).await.unwrap());
                     client.outbox.clear();
                     let state = fingerprint(&db, f).await;
-                    let destination = crate::services::inventory::Container::Item(container);
+                    let destination = crate::services::inventory::access::Container::Item(container);
                     assert_active(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, blueprint, Some(f.station), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await);
                     assert_eq!(fingerprint(&db, f).await, state);
                     assert!(client.outbox.is_empty());
 
-                    assert_active(crate::services::inventory::trash_items(&mut client, &[blueprint]).await);
+                    assert_active(crate::services::inventory::stacks::trash_items(&mut client, &[blueprint]).await);
                     assert_eq!(fingerprint(&db, f).await, state);
                     assert!(client.outbox.is_empty());
 
@@ -354,9 +354,9 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                 assert_eq!(projections.iter().find(|row| row.item_id == blueprint).unwrap().job_id, Some(id));
                 let state = fingerprint(&db, f).await;
                 client.outbox.clear();
-                let destination = crate::services::inventory::Container::Item(f.office);
+                let destination = crate::services::inventory::access::Container::Item(f.office);
                 assert!(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, blueprint, Some(f.office), Some(output.flag_id), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
-                assert!(crate::services::inventory::trash_items(&mut client, &[blueprint]).await.is_err());
+                assert!(crate::services::inventory::stacks::trash_items(&mut client, &[blueprint]).await.is_err());
                 let args = [Value::list([keyval([
                     ("stationID", Value::Int(f.station)), ("typeID", Value::Int(i64::from(f.bp))),
                     ("itemID", Value::Int(blueprint)), ("price", Value::Float(1.0)), ("quantity", Value::Int(1)),
@@ -431,7 +431,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             if owner == f.actor && wallet == f.actor {
                 assert!(!industry_dao::has_active_blueprint_job(&db, &[blueprint, f.office]).await.unwrap());
                 let container = db.query_one("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id = ANY($3) ORDER BY item_id DESC LIMIT 1", &[&f.actor, &f.station, &sde.types.iter().filter(|t| t.group_id.is_some_and(|g| CARGO_CONTAINER_GROUPS.contains(&g)) && sde.is_tradable(t.type_id)).map(|t| t.type_id).collect::<Vec<_>>()]).await.unwrap().get("item_id");
-                let destination = crate::services::inventory::Container::Item(container);
+                let destination = crate::services::inventory::access::Container::Item(container);
                 assert_eq!(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, blueprint, Some(f.station), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().unwrap(), Some(blueprint));
             }
             let output_after = quantities(&db, owner, output.item_id, output.flag_id, product).await;

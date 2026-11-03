@@ -16,7 +16,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             }
             let corp = arg_int(0).unwrap_or(0);
             let me = c.session.int("charid").unwrap_or(0);
-            match crate::services::inventory::may_view_corp_hangar(&c.db, me, corp, crate::consts::FLAG_CORP_DELIVERIES).await {
+            match crate::services::inventory::access::may_view_corp_hangar(&c.db, me, corp, crate::consts::FLAG_CORP_DELIVERIES).await {
                 Ok(true) => {}
                 Ok(false) => return Some(Ok(Value::list([]))),
                 Err(error) => return Some(Err(error)),

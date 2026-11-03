@@ -9,7 +9,7 @@ use crate::consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, FLAG_CARGO, GRO
 use crate::dao::items::{creation, inventory, loading::{self, ItemQuery}, salvage, ship};
 use crate::db::outbox::{Effect as OutboxEffect, Outbox};
 use crate::messages;
-use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, db_err, fit::{Fit, Key, PERCENT_SCALE}, inventory::notify_item_change, items::{deposit, load_items}, market, rand01, user_error, CallError};
+use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, db_err, fit::{Fit, Key, PERCENT_SCALE}, inventory::notifications::notify_item_change, items::{deposit, load_items}, market, rand01, user_error, CallError};
 use crate::space::{dist, Ball, System, MODE_RIGID, MODE_WARP};
 use marshal::Value;
 use std::sync::Arc;

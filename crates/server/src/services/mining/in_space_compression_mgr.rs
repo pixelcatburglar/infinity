@@ -83,9 +83,9 @@ async fn compress_tx(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outb
         None => transfers::insert(ex, output_type, context.character, context.ship, source.flag_id, source.quantity).await.map_err(db_err)?,
     };
     let result = Value::tuple([Value::Int(source.item_id), Value::Int(i64::from(source.type_id)), Value::Int(i64::from(source.quantity)), Value::Int(output_id), Value::Int(i64::from(output_type)), Value::Int(i64::from(source.quantity))]);
-    inventory::notify_item_removed(outbox, source);
+    inventory::notifications::notify_item_removed(outbox, source);
     let change = match output { Some(output) => (IX_STACK_SIZE, Value::Int(i64::from(output.quantity))), None => (IX_LOCATION_ID, Value::Int(0)) };
-    inventory::notify_item_change(ex, sde, outbox, output_id, vec![change]).await?;
+    inventory::notifications::notify_item_change(ex, sde, outbox, output_id, vec![change]).await?;
     Ok(result)
 }
 

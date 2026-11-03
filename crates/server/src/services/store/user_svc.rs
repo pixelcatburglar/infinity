@@ -121,7 +121,7 @@ async fn claim_in_transaction(
             ("stationID", Value::Int(destination)),
         ]));
         if selected && current_station == station {
-            crate::services::inventory::notify_item_change(tx, sde, outbox, item_id, vec![(crate::consts::IX_LOCATION_ID, Value::Int(0))]).await?;
+            crate::services::inventory::notifications::notify_item_change(tx, sde, outbox, item_id, vec![(crate::consts::IX_LOCATION_ID, Value::Int(0))]).await?;
         }
     }
     if purchases::trash(tx, user, &successful).await.map_err(db_err)? != successful.len() as u64 {

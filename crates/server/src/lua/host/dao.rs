@@ -103,7 +103,7 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
             positive(q)?;
             i32::try_from(q).map_err(|_| mlua::Error::runtime("quantity exceeds inventory limit"))?;
         }
-        mutate(ctx, Mutation::Move { container: crate::services::inventory::Container::Item(container), item, flag, quantity }).await
+        mutate(ctx, Mutation::Move { container: crate::services::inventory::access::Container::Item(container), item, flag, quantity }).await
     })?)?;
     items.set("delete", lua.create_async_function(|_, (ctx, item): (mlua::AnyUserData, i64)| async move {
         mutate(ctx, Mutation::Delete { item: positive(item)? }).await?;
