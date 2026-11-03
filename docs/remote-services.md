@@ -153,3 +153,14 @@ The character's player-structure directory is empty because player structures ar
 | jumpCloneSvc | InstallCloneInStructure | fixed | `crates/server/src/services/clones/jump_clone_svc.rs` |
 
 Station clones keep their own implants. Ship clone bays and player structures are not implemented yet: the ship clone state is empty, the structure clone count is zero, and installing a clone in a structure is refused with a message.
+
+## Item compatibility
+
+| service | method | status | handler file |
+|---|---|---|---|
+| alphaInjectorMgr | GetNextAvailableInjection | fixed | `crates/server/src/services/fixed.rs` |
+| encodedItems | DecodeItem | fixed | `crates/server/src/services/fixed.rs` |
+| itemLocking | GetItemsByLocation | fixed | `crates/server/src/services/fixed.rs` |
+| itemLocking | GetLockedItemLocations | fixed | `crates/server/src/services/fixed.rs` |
+
+The Alpha injection availability query returns zero for no recorded cooldown; it does not grant injection permission. Encoded-item decoding is deferred and currently returns an explicit refusal without consuming or changing the item. Corporation lockdown management and voting are deferred; locked-item queries retain an empty mapping and a mutable empty set of locations.
