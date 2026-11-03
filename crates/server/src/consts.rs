@@ -6,6 +6,8 @@
 //! not belong here. Shared gateway protocol units are included. This module
 //! provides no data lookup or runtime state.
 pub mod dogma;
+/// `eveexceptions/const.py`: UE_LOCID location substitution tag.
+pub const UE_LOCID: i64 = 3;
 /// `carbon/common/script/sys/serviceConst.py`: ROLE_QA.
 pub const ROLE_QA: i64 = 4_503_599_627_370_496;
 /// Client inventorycommon.const.categoryImplant.
