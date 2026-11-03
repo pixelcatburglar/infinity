@@ -1,14 +1,10 @@
-//! Jump clones (jumpCloneSvc, bound per station; eve/client/script/ui/services/clonejumpsvc.py).
+//! jumpCloneSvc station-bound calls and clone transitions.
 //!
-//! A character can keep one jump clone per station (game.jump_clones), as many as
-//! Infomorph Psychology and Advanced Infomorph Psychology levels allow. Clone jumping from a
-//! station to one of them leaves the current body behind as a clone there and wakes the
-//! pilot in a fresh capsule at the destination. The jump cooldown and its reduction per
-//! Infomorph Synchronizing level are configured by the operator. Implants aren't modelled,
-//! so clones carry none and cost nothing. Ship-borne clone vat bays aren't supported.
-//! Clone destinations are resolved from the startup SDE after checking game ownership.
+//! Mirrors eve/client/script/ui/services/clonejumpsvc.py, using game clone and
+//! item data, skill levels, and the startup SDE. Implants and ship-borne clone
+//! vat bays are not modelled.
 
-use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
+use super::super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE, SKILL_INFOMORPH_PSYCHOLOGY, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY};
 use crate::dao::{characters::clones as clone_dao, items::{clones as item_dao, creation}, skills::levels as skill_dao};
@@ -17,14 +13,12 @@ use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
 
+use super::policy::jump_cooldown;
+
 const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
 /// Existing server policy: maximum jump clone name characters.
 const MAX_CLONE_NAME_LENGTH: usize = 100;
 
-fn jump_cooldown(base_hours: i64, reduction_per_level: i64, level: i64) -> i128 {
-    let hours = (i128::from(base_hours) - i128::from(level.max(0)) * i128::from(reduction_per_level)).max(0);
-    hours * i128::from(FILETIME_HOUR)
-}
 
 enum JumpEffect {
     Trade(Outbox<crate::services::trade::TradeEffect>),
@@ -51,7 +45,7 @@ async fn clone_rows(c: &Client, me: i64) -> Result<Value, CallError> {
 /// `GetCloneState` -> KeyVal(clones, implants, timeLastJump).
 async fn clone_state(c: &Client, me: i64) -> CallResult {
     let last = clone_dao::last_jump(&c.db, me).await.map_err(db_err)?;
-    Ok(super::keyval([
+    Ok(super::super::keyval([
         ("clones", clone_rows(c, me).await?),
         ("implants", crowset(&DbRowDescriptor::new([("jumpCloneID", DbType::I4), ("typeID", DbType::I4)]), vec![])),
         ("timeLastJump", last.map(Value::Int).unwrap_or(Value::None)),
@@ -144,7 +138,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     ).await
 }
 
-pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
+pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if call.service != "jumpCloneSvc" {
         return None;
     }
@@ -178,6 +172,3 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
-
-#[cfg(test)]
-mod tests;
