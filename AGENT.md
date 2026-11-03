@@ -15,7 +15,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
   - anything under `/tools/`
   - client caches, settings, and logs (`/logs/`)
 
-  The only captured data in the tree is `crates/server/retail/`, which is wired in through `crates/server/src/retail.rs`, and the protobuf descriptor set `crates/server/proto/eve_protos.desc`, which the public gateway compiles in.
+  The only captured data in the tree is `crates/server/retail/`, which is wired in through `crates/server/src/retail.rs`, and the protobuf descriptor set `crates/server/proto/eve_protos.desc`, which the public gateway compiles in. `crates/server/content/` is not captured data: it holds the server's own content for what the client never shipped, such as crate contents, embedded at compile time and validated by the static-data loader that uses it.
 - **Release builds only.** Use `--release` for every build, test and run. Do not add debug profiles or rely on debug builds. Builds are warning-free; CI denies warnings.
 - **The client is the specification.** Argument shapes, return shapes and behaviour come from the client's own Python (`eve/client/script/...`, `eve/common/script/...`, `carbon/common/script/...`) and from carbonengine sources. When the live server's data or logic never shipped with the client (dungeon layouts, LP offers, the store catalogue, the hacking board generator), build the closest faithful substitute and document it in the module docs.
 - **Keep diffs minimal and on-topic.** No drive-by refactors, renames or reformatting of code you are not changing. Cleanups that the rules below require (removing a duplicate helper, naming a constant, migrating to the one mechanism) go into a commit of their own, never mixed into a feature commit.
@@ -81,6 +81,7 @@ Any other tag starts nothing.
 | Chat | `chat.rs` and `chat/` (XMPP transport, connected occupants and stanzas); `services/chat/` (`XmppChatMgr`, room admission and moderation authority, moderation expiry); `dao/chat_channels.rs` |
 | Image server and content CDN | `images.rs`, `cdn.rs` |
 | Captured retail data | `retail.rs` and `crates/server/retail/` |
+| Server-authored content | `crates/server/content/` (embedded with `include_str!`, validated when the `sde/` dataset that uses it loads; `crates.jsonl` is read by `sde/crates.rs`) |
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
 | Static data (SDE) | `sde/mod.rs` (`Sde`: loaded once at startup, read-only, shared as `Arc<Sde>`; one module per dataset such as `types`, `dogma`, `map`, `industry`, `missions`), `dao/sde/` (the only static-data SQL, run once by the loader) |
 | Game data access (all `game.*` SQL) | `dao/`: one module per kind of data (`accounts`, `characters`, `items`, `wallets`, `skills`, `market`, `contracts`, ...); a feature's statements on shared data live in `dao/<data>/<feature>.rs` |

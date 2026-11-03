@@ -3,7 +3,8 @@
 //! `game.redeem_tokens`; live catalogue data is unavailable. Account PLEX is exact
 //! up to 36 digits in storage, with the client-facing i64 projection clamped by the
 //! DAO. Balance notifications include `userid`; clients cannot display oversized
-//! balances exactly.
+//! balances exactly. Crates are listed, sold and reported purchasable only when
+//! their shared catalogue definition supports sale; opening is not implemented.
 use super::*;
 const PLX: &str = "PLX";
 const TYPE_PLEX: i32 = 44992;
@@ -39,7 +40,6 @@ struct Catalogue {
 fn service_price(average: Option<f64>, plex_isk: f64, list_price: i64) -> i64 {
     average.filter(|p| crate::dao::store::catalogue::positive_price(*p)).map(|p| ((p / plex_isk).round() as i64).max(1)).unwrap_or(list_price)
 }
-
 
 async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
@@ -120,7 +120,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     }
 
     // Crates that traded on Serenity, with their splash art.
-    for r in sde.store.crates() {
+    for r in sde.crates.iter().filter(|entry| entry.sale_supported()) {
         let Some(t) = sde.types.get(r.type_id).filter(|t| t.published == Some(true)) else { continue };
         let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
         let type_id = t.type_id;
@@ -187,6 +187,7 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
     let gift_to = call.kwargs.get("to_character_id").and_then(|v| v.as_int());
     let cat = catalogue(c).await?;
     let Some(offer) = cat.offers.iter().find(|o| o.id == offer_id && !o.daily) else { return Ok(Value::Bool(false)) };
+    if c.sde.crates.get(offer.type_id).is_some_and(|entry| !entry.sale_supported()) { return Ok(Value::Bool(false)); }
     let cost = offer.price * qty;
     let recipient = match gift_to {
         Some(ch) => match crate::dao::store::purchases::recipient(&c.db, ch).await.map_err(db_err)? {
@@ -244,7 +245,25 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("storeManager", "get_offer_groups") => Ok(Value::list([])),
         ("storeManager", "buy_offer") => buy_offer(c, call).await,
         ("storeManager", "free_to_get") => free_to_get(c, call).await,
-        ("storeManager", "can_purchase_offer") | ("storeManager", "is_offer_purchasable") => Ok(Value::Bool(true)),
+        ("storeManager", "can_purchase_offer") | ("storeManager", "is_offer_purchasable") => async {
+            let id = call.args.first().or_else(|| call.kwargs.get("offer_id"));
+            let offer_id = id.and_then(|v| v.as_int().or_else(|| {
+                v.as_text().and_then(|s| s.strip_prefix("VEVC-").and_then(|s| s.parse::<i64>().ok()))
+            }));
+            let cat = catalogue(c).await?;
+            let offer = cat.offers.iter().find(|o| Some(o.id) == offer_id);
+            let can_purchase = if let Some(offer) = offer {
+                !c.sde.crates.get(offer.type_id).is_some_and(|entry| !entry.sale_supported())
+                    && (!offer.daily || !claimed_daily_gift(c).await?)
+            } else {
+                false
+            };
+            Ok(if call.method == "can_purchase_offer" {
+                Value::dict([("canPurchase", Value::Bool(can_purchase))])
+            } else {
+                Value::Bool(can_purchase)
+            })
+        }.await,
         ("storeManager", "set_offer_purchased") => Ok(Value::None),
 
         _ => return None,

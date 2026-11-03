@@ -30,6 +30,7 @@ mod contracts;
 pub(crate) mod corps;
 mod corpwallet;
 pub(crate) mod crimewatch;
+mod crates;
 pub(crate) mod dogma;
 pub(crate) mod drones;
 mod dynamic_items;
@@ -351,6 +352,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         ("dogmaIM", _) => dogma::dispatch(c, call).await,
 
         _ => {
+            if let Some(r) = crates::dispatch(c, call).await { return r; }
             if let Some(r) = alert::dispatch(c, call).await { return r; }
             if let Some(r) = event_log::dispatch(c, call).await { return r; }
             if let Some(r) = settings_sharing::dispatch(c, call).await { return r; }

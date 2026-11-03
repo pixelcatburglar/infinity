@@ -5,6 +5,7 @@
 //! `eve/client/script/remote/michelle.py:491-532` and
 //! `eve/client/script/parklife/autopilot.py:260-261,329-332`.
 //! Other SDE tables remain with their existing consumers until migrated.
+pub(crate) mod crates;
 pub(crate) mod characters;
 pub(crate) mod compression;
 pub(crate) mod corporations;

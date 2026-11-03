@@ -31,9 +31,11 @@
   - moving items through another pilot's fleet hangar or ship maintenance bay, and control towers
   - boarding a ship in space that someone else owns, and taking over its contents
   - wrecks, insurance payouts and killmails for an unpiloted ship destroyed in space; the ship and its contents are deleted
+  - opening crates and claiming their loot, skill bundles or fittings: the client gets a message and the crate is left unchanged. The store does not sell crates. A crate whose contents are a skill bundle or a fitted ship cannot be previewed, and a crate whose contents are not known shows an empty preview.
 - An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
 - Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100). Drones with no targeting range or scan resolution in the static data lock at once within control range.
 - The personal mining ledger starts with mining done after this version is installed.
+- Crate contents that the static data does not list come from the server's own content, inferred from each crate's description; they are not the live server's reward tables.
 - A corporation at war that joins an alliance keeps its war, but the war no longer applies to its pilots, who now fight as the alliance, as the client also shows. The corporation's own CEO or directors can still retract it.
 - Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
 - In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.

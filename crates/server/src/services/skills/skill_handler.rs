@@ -6,6 +6,7 @@
 //! location (`skillsvc.py:763-767`); learned skills have no item identity here.
 //! Direct skill purchases use imported availability and prices without prerequisites.
 //! Injector diminishing and rounding are server policy, not a native algorithm.
+//! Special crate skill bundle metadata is unavailable and is refused.
 use super::*;
 use super::attributes::character_attributes;
 use super::training::{skills_dict, queue_list, save_queue};
@@ -38,6 +39,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetSkills") | (SKILL_HANDLER, "GetAllSkills") => skills_dict(c, me).await,
         // [(typeID, pointChange)] since the last login
         (SKILL_HANDLER, "GetSkillChangesForISIS") => Ok(Value::list([])),
+        (SKILL_HANDLER, "GetSkillBundleInfo") => Err(crate::services::notify_error(crate::messages::crates::METADATA_UNAVAILABLE)),
         (SKILL_HANDLER, "CheckAndSendNotifications") => Ok(Value::None),
         (SKILL_HANDLER, "GetSkillQueueAndFreePoints") => {
             let free: i64 = match crate::dao::characters::attributes::free_points(&c.db, me).await {
