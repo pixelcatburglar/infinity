@@ -164,3 +164,12 @@ Station clones keep their own implants. Ship clone bays and player structures ar
 | itemLocking | GetLockedItemLocations | fixed | `crates/server/src/services/fixed.rs` |
 
 The Alpha injection availability query returns zero for no recorded cooldown; it does not grant injection permission. Encoded-item decoding is deferred and currently returns an explicit refusal without consuming or changing the item. Corporation lockdown management and voting are deferred; locked-item queries retain an empty mapping and a mutable empty set of locations.
+
+## Single-track login campaigns
+
+| service | method | status | handler file |
+|---|---|---|---|
+| loginCampaignManager | get_client_campaign_state | fixed | `crates/server/src/services/fixed.rs` |
+| loginCampaignManager | claim_reward | fixed | `crates/server/src/services/fixed.rs` |
+
+Single-track login campaigns are not open. Both the campaign-state query and claim request return None, meaning no campaign and no reward claimed. Seasonal login campaigns use their separate implementation and are unchanged.

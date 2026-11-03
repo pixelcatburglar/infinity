@@ -15,6 +15,7 @@
   - clone-grade restrictions and planetary colony extraction rules: every character is treated as Omega
   - jump clones in ships and in player structures, and the body lost when a capsule is destroyed or a pilot self-destructs. The client does not include the server's clone-bay check: the server allows installation at NPC stations with a cloning service or a jump clone facility, and always applies the facility's standing restrictions, comparing raw standings rounded to two decimals as the client does. The Zarzakh facility refuses everyone, because faction-warfare enrolment is not modelled. Resetting the jump timer needs the GM or QA role.
   - phone-number binding and its rewards, an external NetEase account service: the binding-success callback is answered but no binding is recorded
+  - single-track login campaigns: none is open, and a claim reports that no reward was claimed; seasonal login rewards are unaffected
   - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls

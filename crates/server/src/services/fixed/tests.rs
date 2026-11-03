@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn login_campaign_fixed_answers_do_not_match_other_calls() {
+    let kwargs = Value::Dict(vec![]);
+    for (service, method) in [
+        ("otherService", "claim_reward"),
+        ("loginCampaignManager", "UnknownMethod"),
+        ("seasonalLoginCampaignManager", "claim_reward"),
+    ] {
+        let call = Call { service, method, args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+        assert!(root(&call).is_none());
+    }
+}
+
+#[test]
 fn character_selection_fixed_answers_do_not_match_other_calls() {
     let kwargs = Value::Dict(vec![]);
     for (service, method) in [

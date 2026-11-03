@@ -14,6 +14,8 @@
 //! External phone binding, binding state and rewards are unsupported; the
 //! binding-success callback does not establish binding state.
 //! Player structures are unsupported, so the character structure directory is empty.
+//! Single-track login campaigns are closed; seasonal login campaigns remain separate.
+//! `loginrewards/client/loginCampaignService.py` receives no campaign or claim.
 
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
@@ -275,6 +277,8 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
 
         // Login reward campaigns: none running.
         ("loginCampaignManager", "get_client_campaign_state") => Ok(Value::None),
+        // loginCampaignService.py:claim_reward returns early on None; no reward was claimed.
+        ("loginCampaignManager", "claim_reward") => Ok(Value::None),
 
         _ => return None,
     })
