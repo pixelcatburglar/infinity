@@ -1114,6 +1114,19 @@ CREATE TABLE IF NOT EXISTS game.login_reward_claims (
     PRIMARY KEY (user_id, campaign_id, day)
 );
 
+-- Seasonal Omega retrogrants: one audited grant per historical claim.
+CREATE TABLE IF NOT EXISTS game.login_reward_retro_grants (
+    user_id     bigint NOT NULL,
+    campaign_id integer NOT NULL,
+    day         date NOT NULL,
+    type_id     integer NOT NULL,
+    quantity    integer NOT NULL CHECK (quantity > 0),
+    granted_at  bigint NOT NULL, -- FILETIME
+    PRIMARY KEY (user_id, campaign_id, day),
+    FOREIGN KEY (user_id, campaign_id, day)
+        REFERENCES game.login_reward_claims (user_id, campaign_id, day)
+);
+
 -- Agent missions: one per character and agent (services/missions.rs). The site is a
 -- deadspace point in system_id; its NPCs are spawned on first approach.
 CREATE TABLE IF NOT EXISTS game.agent_missions (
