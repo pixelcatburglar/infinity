@@ -374,11 +374,14 @@ pub(crate) fn forget_gm_spawn(world: &World, id: i64) {
 }
 
 
-pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id: i64) {
+pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id: i64) -> bool {
     forget_ship(ship);
     if let Some(b) = world.destroy_ball(system, ship).await {
         forget_target(world, ship);
         world.notify_pilot(char_id, "__ship_destroyed", vec![Value::Int(ship), Value::Float(b.pos[0]), Value::Float(b.pos[1]), Value::Float(b.pos[2])]);
+        true
+    } else {
+        false
     }
 }
 

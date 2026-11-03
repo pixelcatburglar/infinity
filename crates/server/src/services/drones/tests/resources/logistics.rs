@@ -64,7 +64,7 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
         let signature = f.sde.types.attribute(target_ball.type_id, ATTR_SIGNATURE_RADIUS).unwrap_or(f64::from(target_ball.radius));
         let lock_ms = crate::space::lock_time_ms(scan, signature);
         ensure!(scan > 0.0 && lock_ms <= 1000, "unexpected fitted lock time: scan={scan}, signature={signature}, delay={lock_ms}ms");
-        groups_health::damage(&f.db, &f.world, f.system, target, [2500.0, 0.0, 0.0, 0.0], None).await.map_err(error)?;
+        groups_health::damage(&f.db, &f.world, f.system, target, [2500.0, 0.0, 0.0, 0.0], None, None).await.map_err(error)?;
         ensure!(f.world.after(f.system, 100).await, "system stopped after damage");
         let initial = health(&f, target).await?;
         ensure!(initial[0].abs() < 1e-6 && initial[1].abs() < 1e-6 && (initial[2] - 0.5).abs() < 1e-6, "damage did not reach all layers: {initial:?}");

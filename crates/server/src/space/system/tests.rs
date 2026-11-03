@@ -3,6 +3,7 @@ mod jamming;
 mod jump_cloak;
 mod drone;
 mod visibility;
+pub(crate) mod events;
 #[path = "../effects/tests.rs"]
 mod effect_actions;
 

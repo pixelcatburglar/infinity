@@ -231,15 +231,15 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
                 &[&(EventSource::NpcOccurrence as i16), &marker, &system]).await.unwrap()
         };
         add_npc(world.clone(), npc).await;
-        damage(&db, &world, system, npc, [1e30; 4], None).await.ok().unwrap();
+        damage(&db, &world, system, npc, [1e30; 4], None, None).await.ok().unwrap();
         assert!(world.ball(system, npc).await.is_none());
         assert_eq!(events().await.len(), 1);
-        assert_eq!(damage(&db, &world, system, npc, [1e30, 0.0, 0.0, 0.0], None).await.ok().unwrap(), 0.0);
+        assert_eq!(damage(&db, &world, system, npc, [1e30, 0.0, 0.0, 0.0], None, None).await.ok().unwrap(), 0.0);
         assert_eq!(events().await.len(), 1);
 
         let balance = crate::dao::wallets::characters::balance(&db, owner).await.unwrap();
         add_npc(second.clone(), npc).await;
-        damage(&db, &second, system, npc, [1e30; 4], Some(owner)).await.ok().unwrap();
+        damage(&db, &second, system, npc, [1e30; 4], Some(owner), None).await.ok().unwrap();
         assert!(second.ball(system, npc).await.is_none());
         assert!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap() > balance);
         assert!(db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2 AND item_id<>$3",
@@ -257,7 +257,7 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         b.owner_id = owner;
         world.add_ship(system, b).await.unwrap();
         assert!(!world.with(system, move |s| s.is_npc(other)).await.unwrap());
-        damage(&db, &world, system, other, [1e30; 4], None).await.ok().unwrap();
+        damage(&db, &world, system, other, [1e30; 4], None, None).await.ok().unwrap();
         assert!(world.ball(system, other).await.is_none());
         assert_eq!(events().await.len(), 2);
 
@@ -268,7 +268,7 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         let mut b = ball(drone, drone_type, None);
         b.owner_id = owner;
         world.with(system, move |s| s.restore_drone(b, spec, Arc::new(|_| Box::pin(async {})))).await.unwrap();
-        damage(&db, &world, system, drone, [1e30, 1e30, 1e30, 1e30], None).await.ok().unwrap();
+        damage(&db, &world, system, drone, [1e30, 1e30, 1e30, 1e30], None, None).await.ok().unwrap();
         assert!(world.ball(system, drone).await.is_none());
         assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_none());
         assert_eq!(events().await.len(), 2);

@@ -38,6 +38,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::Notification;
 use crate::sde::Sde;
+use crate::lua::events::{GameEvent, ModuleCycleOutcome};
 use super::online::OnlinePolicy;
 
 
@@ -143,6 +144,36 @@ pub(super) fn cycle_valid(s: &System, cycle: &Cycle) -> bool {
         && state().active.get(&cycle.modules[0].id).is_some_and(|v| Arc::ptr_eq(&v.stop, &cycle.stop))
 }
 
+fn cycle_source_current(s: &System, cycle: &Cycle) -> bool {
+    !cycle.stop.load(Ordering::Relaxed)
+        && s.ball(cycle.cx.ship_id).is_some_and(|ball| ball.char_id == Some(cycle.cx.char_id))
+        && state().active.get(&cycle.modules[0].id).is_some_and(|active| Arc::ptr_eq(&active.stop, &cycle.stop))
+}
+
+fn cycle_target_lost(s: &System, cycle: &Cycle) -> bool {
+    cycle_source_current(s, cycle) && cycle.target.is_some_and(|target| !s.contains(target))
+}
+
+pub(super) async fn target_loss(cycle: &Cycle) -> CycleOutcome {
+    let (ship, character, master, target, generation) = (cycle.cx.ship_id, cycle.cx.char_id, cycle.modules[0].id, cycle.target, cycle.stop.clone());
+    let absent = cycle.cx.world.with(cycle.cx.system_id, move |s| {
+        !generation.load(Ordering::Relaxed)
+            && s.ball(ship).is_some_and(|ball| ball.char_id == Some(character))
+            && state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &generation))
+            && target.is_some_and(|target| !s.contains(target))
+    }).await.unwrap_or(false);
+    if absent { CycleOutcome::Ended { reason: "target lost", outcome: ModuleCycleOutcome::TargetLost } }
+    else { CycleOutcome::Stop("target lost") }
+}
+
+fn publish_cycle(cycle: &Cycle, outcome: ModuleCycleOutcome) {
+    for module in &cycle.modules {
+        crate::lua::on_event(GameEvent::ModuleCycleEnded {
+            char_id: cycle.cx.char_id, module_item_id: module.id, effect_id: cycle.effect.id, outcome,
+        });
+    }
+}
+
 pub(super) fn cycle_deadline(start: i64, duration_ms: f64) -> i64 {
     start.saturating_add(seconds_to_ms(ms_to_seconds(duration_ms)) as i64)
 }
@@ -224,6 +255,7 @@ pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) 
         return;
     }
     if !cycle_valid(s, &cycle) {
+        if cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
         cycle_stop(s, cycle);
         return;
     }
@@ -233,7 +265,11 @@ pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) 
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) enum CycleOutcome { Continue, Stop(&'static str) }
+pub(super) enum CycleOutcome {
+    Continue,
+    Stop(&'static str),
+    Ended { reason: &'static str, outcome: ModuleCycleOutcome },
+}
 
 fn cycle_discharge(kind: EffectKind, charged: bool, need: f64) -> f64 {
     if matches!(kind, EffectKind::FueledLocalRepair { layer: 0, .. }) && charged { 0.0 } else { need }
@@ -267,6 +303,8 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     if cycle.effect.kind == EffectKind::Propulsion {
         apply_propulsion(&cx, master, cycle.stop.clone(), true).await;
     }
+    let mut public = None;
+    let mut check_target = false;
     let result = async {
         let fit = match Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await {
             Ok(fit) => fit,
@@ -295,18 +333,25 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
         cycle.duration_ms = cycle.effect.attribute(EffectAttribute::Duration).map(|a| fit.value(Key::Module(master), a)).unwrap_or(cycle.duration_ms).max(MIN_MODULE_DURATION_MS);
         if matches!(cycle.effect.kind, EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu)
             && capacitor::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() {
+            check_target = true;
             return Err("target lost");
         }
-        if matches!(cycle.effect.kind, EffectKind::Ecm | EffectKind::BurstJammer) && ecm::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Err("target lost"); }
+        if matches!(cycle.effect.kind, EffectKind::Ecm | EffectKind::BurstJammer) && ecm::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { check_target = true; return Err("target lost"); }
         let discharge = cycle.effect.attribute(EffectAttribute::Discharge).unwrap_or(ATTR_CAPACITOR_NEED);
         let need = cycle_discharge(resource_kind, charged, cycle.modules.iter().map(|m| fit.value(Key::Module(m.id), discharge)).sum());
         if !drain_capacitor(&cx, &fit, need) {
             cx.notify("OnEffectMessage", vec![Value::str("NotEnoughCharge"), Value::Dict(vec![])]);
+            public = Some(ModuleCycleOutcome::OutOfCapacitor);
             return Err("out of capacitor");
         }
         match on_cycle_start(&cx, &fit, &mut cycle, charged).await {
             Ok(CycleOutcome::Continue) => {}
-            Ok(CycleOutcome::Stop(reason)) => {
+            Ok(result) => {
+                let reason = match result {
+                    CycleOutcome::Stop(reason) => reason,
+                    CycleOutcome::Ended { reason, outcome } => { public = Some(outcome); reason }
+                    CycleOutcome::Continue => unreachable!(),
+                };
                 if (charge_sensitive(resource_kind) && matches!(reason, "out of charges" | "source lost or in warp")
                     || matches!(cycle.effect.kind, EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu) && reason == "target lost") && need > 0.0 {
                     if let Err(error) = refund_refused_charge(&cx, need).await {
@@ -336,13 +381,23 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
         }
         Err(reason) => {
             debug!("module {master} stopped: {reason}");
-            cx.world.post(cx.system_id, move |s| cycle_stop(s, cycle));
+            cx.world.post(cx.system_id, move |s| {
+                if cycle_source_current(s, &cycle) {
+                    if let Some(outcome) = public { publish_cycle(&cycle, outcome); }
+                    else if check_target && cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
+                }
+                cycle_stop(s, cycle);
+            });
         }
     }
 }
 
 pub(super) fn cycle_end(s: &mut System, cycle: Cycle, fit: Fit, end: i64) {
-    if !cycle_valid(s, &cycle) { cycle_stop(s, cycle); return; }
+    if !cycle_valid(s, &cycle) {
+        if cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
+        cycle_stop(s, cycle);
+        return;
+    }
     let final_cycle = cycle_is_final(cycle.stop.load(Ordering::Relaxed), cycle.effect.has(EffectFlag::DisallowAutoRepeat), cycle.repeat, cycle.cycles);
     let Some(receiver) = super::heat::finish_cycle(s, &cycle, end, final_cycle) else { cycle_stop(s, cycle); return };
     s.defer(async move { cycle_end_work(cycle, fit, end, final_cycle, receiver).await; });
@@ -356,9 +411,11 @@ async fn cycle_end_work(mut cycle: Cycle, fit: Fit, end: i64, final_cycle: bool,
         Ok(Some(sources)) => Some(sources),
         Ok(None) | Err(_) => None,
     };
+    let mut public = None;
     let (sources, finished) = if let Some(sources) = captured {
         let mut finished = match on_cycle_end(&cx, &fit, &mut cycle).await {
-            Ok(CycleOutcome::Continue) => final_cycle,
+            Ok(CycleOutcome::Continue) => { public = Some(ModuleCycleOutcome::Completed); final_cycle }
+            Ok(CycleOutcome::Ended { outcome, .. }) => { public = Some(outcome); true }
             Ok(CycleOutcome::Stop(_)) => true,
             Err(e) => { warn!("module {} cycle end failed: {}", cycle.modules[0].id, match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); true }
         };
@@ -371,11 +428,12 @@ async fn cycle_end_work(mut cycle: Cycle, fit: Fit, end: i64, final_cycle: bool,
         (false, true)
     };
     cx.world.post(cx.system_id, move |s| {
-        if boundary_continues(sources, finished, &cycle.stop) {
-            super::heat::complete_cycle(s, &cycle, false);
+        let continuing = boundary_continues(sources, finished, &cycle.stop);
+        super::heat::complete_cycle(s, &cycle, !continuing);
+        if let Some(outcome) = public { publish_cycle(&cycle, outcome); }
+        if continuing {
             cycle_start(s, cycle, end);
         } else {
-            super::heat::complete_cycle(s, &cycle, true);
             cycle_stop(s, cycle);
         }
     });

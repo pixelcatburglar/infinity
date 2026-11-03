@@ -47,15 +47,23 @@ pub(super) fn start(cx: &Ctx, cycle: &Cycle) -> CycleOutcome {
     CycleOutcome::Continue
 }
 
-fn extraction_outcome(more: bool) -> CycleOutcome {
-    if more { CycleOutcome::Continue } else { CycleOutcome::Stop("mining finished") }
+fn extraction_outcome(extraction: crate::services::mining::Extraction) -> CycleOutcome {
+    let reason = if extraction.error.is_some() { "mining failed" } else { "mining finished" };
+    if extraction.repeat { CycleOutcome::Continue }
+    else if let Some(outcome) = extraction.outcome { CycleOutcome::Ended { reason, outcome } }
+    else { CycleOutcome::Stop(reason) }
 }
 
 pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> CycleOutcome {
     let Some(rock) = cycle.target else { return CycleOutcome::Continue };
     let master = cycle.modules[0].id;
     match crate::services::mining::extract(&cx.db, &cx.world, &cx.notify, cx.char_id, cx.ship_id, cx.system_id, fit, master, cycle.modules[0].type_id, cycle.modules[0].flag, rock).await {
-        Ok(more) => extraction_outcome(more),
+        Ok(extraction) => {
+            if let Some(e) = &extraction.error {
+                warn!("mining {master}: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg.clone() });
+            }
+            extraction_outcome(extraction)
+        }
         Err(e) => {
             warn!("mining {master}: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
             CycleOutcome::Stop("mining failed")

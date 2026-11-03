@@ -97,7 +97,7 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
         let full = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(full, 1.0);
         let raw = (0..layer).map(|i| hp[i] / resonance[i]).sum::<f64>() + hp[layer] * 0.5 / resonance[layer];
-        for id in [ally, rival, outsider] { damage(&db, &world, system, id, [raw, 0.0, 0.0, 0.0], None).await.ok().unwrap(); }
+        for id in [ally, rival, outsider] { damage(&db, &world, system, id, [raw, 0.0, 0.0, 0.0], None, None).await.ok().unwrap(); }
         let before = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert!(before < 1.0);
         assert!(world.after(system, CYCLE_WAIT_MS).await);

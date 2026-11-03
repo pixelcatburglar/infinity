@@ -59,7 +59,7 @@ pub(super) async fn validate(cx: &Ctx, _fit: &Fit, module: &Module, _effect: &Ef
 }
 
 pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
-    let Some(primary) = cycle.target.filter(|t| targets_of(cx.char_id).contains(t)) else { return Ok(CycleOutcome::Stop("target lost")); };
+    let Some(primary) = cycle.target.filter(|t| targets_of(cx.char_id).contains(t)) else { return Ok(super::lifecycle::target_loss(cycle).await); };
     let master = cycle.modules[0].id;
     let generation = cycle.stop.clone();
     let mut fired = false;

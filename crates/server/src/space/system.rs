@@ -361,8 +361,15 @@ impl System {
                     let b = self.balls.get_mut(id).unwrap();
                     let was_warping = b.is_warping();
                     b.evolve_position(logical_ms, snapshot.time_factor);
-                    if was_warping && b.mode == MODE_STOP && (!collisions || self.warp_exits.contains_key(id)) {
-                        self.exited_ids.push(*id);
+                    if was_warping && b.mode == MODE_STOP {
+                        if let Some(char_id) = b.char_id {
+                            crate::lua::on_event(crate::lua::events::GameEvent::WarpArrived {
+                                char_id, system_id: self.id,
+                            });
+                        }
+                        if !collisions || self.warp_exits.contains_key(id) {
+                            self.exited_ids.push(*id);
+                        }
                     }
                 }
                 for index in 0..self.exited_ids.len() {
@@ -759,4 +766,4 @@ impl System {
         })));
     }
 }
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;

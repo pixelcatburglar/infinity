@@ -78,7 +78,7 @@ async fn salvage_preserves_loot_refuses_full_cargo_and_claims_once() {
         let mut second = cycle(&cx, f.module, module, target, effect, generation);
         let (a, b) = tokio::join!(salvage::end(&cx, &fit, &mut first), salvage::end(&cx, &fit, &mut second));
         let outcomes = [a.ok().unwrap(), b.ok().unwrap()];
-        assert_eq!(outcomes.iter().filter(|o| matches!(o, CycleOutcome::Stop("salvage complete"))).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| matches!(o, CycleOutcome::Ended { reason: "salvage complete", outcome: crate::lua::events::ModuleCycleOutcome::Completed })).count(), 1);
         assert!(loading::load_items(&test_db, ItemQuery::Id(target)).await.unwrap().is_empty());
         assert!(test_world.ball(SYSTEM, target).await.is_none());
         let cargo = loading::load_items(&test_db, ItemQuery::LocationFlags(f.ship, &[FLAG_CARGO])).await.unwrap();

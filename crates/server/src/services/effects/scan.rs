@@ -10,6 +10,7 @@ use crate::services::{combat::{Ctx, state, targeting_charges::targets_of, groups
 use crate::dao::items::loading::ItemQuery;
 use crate::space::{dist, System, MODE_WARP};
 use std::sync::Arc;
+use crate::lua::events::ModuleCycleOutcome;
 
 
 fn in_range(s: &System, source: i64, target: i64, range: f64, sde: &crate::sde::Sde) -> bool {
@@ -40,7 +41,7 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
 
 pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? { return Ok(CycleOutcome::Stop("subject lost")); }
-    if validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(CycleOutcome::Stop("target lost")); }
+    if validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(super::lifecycle::target_loss(cycle).await); }
     if cycle.cycles == 0 {
         if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) {
             let (modules, ship, target, duration, repeat, offensive) = (cycle.modules.clone(), cx.ship_id, cycle.target, cycle.duration_ms, cycle.repeat, cycle.effect.has(EffectFlag::Offensive));
@@ -51,23 +52,24 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
 }
 
 pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
-    if cycle.effect.kind == EffectKind::SurveyScan { return Ok(CycleOutcome::Stop("scan complete")); }
+    if cycle.effect.kind == EffectKind::SurveyScan { return Ok(CycleOutcome::Ended { reason: "scan complete", outcome: ModuleCycleOutcome::Completed }); }
     let Some(target) = cycle.target else { return Ok(CycleOutcome::Stop("target lost")); };
     if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? { return Ok(CycleOutcome::Stop("subject lost")); }
-    if load_items(&cx.db, cx.world.sde(), ItemQuery::Id(target)).await.map_err(db_err)?.into_iter().next().is_none_or(|item| item.category_id != i64::from(CATEGORY_SHIP)) { return Ok(CycleOutcome::Stop("target lost")); }
+    if load_items(&cx.db, cx.world.sde(), ItemQuery::Id(target)).await.map_err(db_err)?.into_iter().next().is_none_or(|item| item.category_id != i64::from(CATEGORY_SHIP)) { return Ok(super::lifecycle::target_loss(cycle).await); }
     let items = load_items(&cx.db, cx.world.sde(), ItemQuery::Location(target)).await.map_err(db_err)?;
     let cargo = cycle.effect.kind == EffectKind::CargoScan;
     let rows: Vec<(i32, i64)> = items.into_iter().filter(|item| visible_flag(cargo, item.flag_id)).map(|item| (item.type_id, i64::from(item.quantity))).collect();
     let cap = if cargo { None } else { capacitor_snapshot(&cx.db, &cx.world, cx.system_id, target).await? };
-    if !cargo && cap.is_none() { return Ok(CycleOutcome::Stop("target lost")); }
+    if !cargo && cap.is_none() { return Ok(super::lifecycle::target_loss(cycle).await); }
     let (source, character, master, generation, range, sde, notify) = (cx.ship_id, cx.char_id, cycle.modules[0].id, cycle.stop.clone(), scan_range(fit, &cycle.modules[0], &cycle.effect), cx.world.sde().clone(), cx.clone());
-    cx.world.with(cx.system_id, move |s| {
+    let applied = cx.world.with(cx.system_id, move |s| {
         let active = state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &generation));
-        if !active || !targets_of(character).contains(&target) || !in_range(s, source, target, range, &sde) { return; }
+        if !active || !targets_of(character).contains(&target) || !in_range(s, source, target, range, &sde) { return false; }
         if let Some(cap) = cap { ship_scan_completed(&notify, target, cap.level, cap.capacity, rows); }
         else { cargo_scan_complete(&notify, target, rows); }
-    }).await;
-    Ok(CycleOutcome::Stop("scan complete"))
+        true
+    }).await.unwrap_or(false);
+    Ok(if applied { CycleOutcome::Ended { reason: "scan complete", outcome: ModuleCycleOutcome::Completed } } else { CycleOutcome::Stop("scan complete") })
 }
 
 pub(super) fn stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {

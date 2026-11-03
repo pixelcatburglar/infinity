@@ -6,6 +6,7 @@ mod refund_db;
 mod forced_retire;
 mod banks_db;
 mod boundary;
+mod event_guards;
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]

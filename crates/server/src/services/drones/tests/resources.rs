@@ -40,7 +40,7 @@ async fn laser_generated_rock_full_hold_and_one_unit_boundary() -> Result<()> {
         f.world.register_pilot(f.owner, tx.clone());
         let quantity = |row: &tokio_postgres::Row| row.get::<_, i64>("quantity");
         let initial = quantity(&f.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2", &[&rock, &f.system]).await?);
-        ensure!(mining::extract(&f.db, &f.world, &tx, f.owner, f.ship, f.system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await.map_err(|e| anyhow!("extract: {e:?}"))?, "initial extraction did not repeat");
+        ensure!(mining::extract(&f.db, &f.world, &tx, f.owner, f.ship, f.system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await.map_err(|e| anyhow!("extract: {e:?}"))?.repeat, "initial extraction did not repeat");
         let remaining = quantity(&f.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2", &[&rock, &f.system]).await?);
         let stack = f.db.query_one("SELECT item_id,quantity FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 AND type_id=$4", &[&f.owner, &f.ship, &FLAG_CARGO, &ball.type_id]).await?;
         let item: i64 = stack.get("item_id");
@@ -48,14 +48,14 @@ async fn laser_generated_rock_full_hold_and_one_unit_boundary() -> Result<()> {
         let mut mined = 0;
         while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { mined += 1; } }
         ensure!(mined == 1, "expected one post-commit OnOreMined");
-        ensure!(!mining::extract(&f.db, &f.world, &tx, f.owner, f.ship, f.system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await.map_err(|e| anyhow!("boundary extraction: {e:?}"))?, "one-unit boundary must stop");
+        ensure!(!mining::extract(&f.db, &f.world, &tx, f.owner, f.ship, f.system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await.map_err(|e| anyhow!("boundary extraction: {e:?}"))?.repeat, "one-unit boundary must stop");
         let after = quantity(&f.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2", &[&rock, &f.system]).await?);
         ensure!(remaining - after == 1, "one-unit boundary decremented wrong amount: rock type={} volume={volume:?} capacity={capacity:?} yield={yield_values:?} remaining={remaining} after={after}", ball.type_id);
         ensure!(f.db.query_one("SELECT quantity FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&item, &f.owner]).await?.get::<_, i32>("quantity") == 3, "one-unit boundary deposited wrong amount");
         let mut mined = 0; let mut full = false;
         while let Ok((event, args)) = rx.try_recv() { if event == "OnOreMined" { mined += 1; } if event == "OnRemoteMessage" && format!("{args:?}").contains(crate::messages::CARGO_HOLD_FULL) { full = true; } }
         ensure!(mined == 1 && full, "boundary notices missing");
-        ensure!(!mining::extract(&f.db, &f.world, &tx, f.owner, f.ship, f.system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await.map_err(|e| anyhow!("full extraction: {e:?}"))?, "full hold must stop");
+        ensure!(!mining::extract(&f.db, &f.world, &tx, f.owner, f.ship, f.system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await.map_err(|e| anyhow!("full extraction: {e:?}"))?.repeat, "full hold must stop");
         ensure!(quantity(&f.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2", &[&rock, &f.system]).await?) == after, "full hold consumed rock");
         ensure!(f.db.query_one("SELECT quantity FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&item, &f.owner]).await?.get::<_, i32>("quantity") == 3, "full hold changed stack");
         let mut full = false; let mut mined = 0;

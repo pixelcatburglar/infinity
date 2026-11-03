@@ -8,6 +8,7 @@ use crate::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_WARP_SCRAMBLE_ST
 use crate::messages;
 use crate::services::{combat::{self, Ctx}, fit::{Fit, Key}, notify_error, CallError};
 use crate::space::{add, scale, MODE_WARP};
+use crate::lua::events::ModuleCycleOutcome;
 
 /// dogma/const.py: attributeMjdJumpRange, metres.
 const ATTR_MJD_JUMP_RANGE: i32 = 2066;
@@ -59,6 +60,7 @@ pub(super) async fn end(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<Cycle
     let Some(revision) = fit.projection_revision() else { return Ok(CycleOutcome::Stop("fit unavailable")); };
     let Some(range) = range.filter(|_| !blocked(&fit, module)) else { return Ok(CycleOutcome::Stop("micro jump blocked")); };
     let generation = cycle.stop.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     cx.world.with(cx.system_id, move |s| {
         let current = combat::state().active.get(&module).is_some_and(|a| Arc::ptr_eq(&a.stop, &generation));
         if !current || generation.load(Ordering::Relaxed) || s.projection_revision(ship) != revision { return; }
@@ -67,11 +69,15 @@ pub(super) async fn end(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<Cycle
         let Some(heading) = s.heading(ship) else { return };
         let destination = add(ball.pos, scale(heading, range));
         s.set_ball_position(ship, destination, move |ball, s| {
-            !generation.load(Ordering::Relaxed) && ball.mode != MODE_WARP
-                && s.persistent_generation(ship) == Some(membership)
+            let applied = !generation.load(Ordering::Relaxed) && ball.mode != MODE_WARP
+                && s.persistent_generation(ship) == Some(membership);
+            let _ = tx.send(applied);
+            applied
         });
     }).await;
-    Ok(CycleOutcome::Stop("micro jump completed"))
+    Ok(if rx.await.unwrap_or(false) {
+        CycleOutcome::Ended { reason: "micro jump completed", outcome: ModuleCycleOutcome::Completed }
+    } else { CycleOutcome::Stop("micro jump completed") })
 }
 
 #[cfg(test)]

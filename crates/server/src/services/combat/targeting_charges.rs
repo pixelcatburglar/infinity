@@ -129,6 +129,11 @@ async fn add_target_impl(cx: &Ctx, target: i64, silent: bool, owner: Option<(i64
             result
         };
         if added {
+            if let Some(char_id) = pilot {
+                crate::lua::on_event(crate::lua::events::GameEvent::Targeted {
+                    char_id, by_ball_id: ship_id, system_id: cx.system_id,
+                });
+            }
             notify_lock(target, ship_id, silent, |args| cx.notify("OnTarget", args), |args| {
                 if let Some(pilot) = pilot {
                     s.notify_pilot(pilot, "OnTarget", args);
