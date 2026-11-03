@@ -196,3 +196,11 @@ The Alpha injection availability query returns zero for no recorded cooldown; it
 | loginCampaignManager | claim_reward | fixed | `crates/server/src/services/fixed.rs` |
 
 Single-track login campaigns are not open. Both the campaign-state query and claim request return None, meaning no campaign and no reward claimed. Seasonal login campaigns use their separate implementation and are unchanged.
+
+## Search-word moderation
+
+| service | method | status | handler file |
+|---|---|---|---|
+| bannedwords | check_search_words_allowed | handled | `crates/server/src/services/bannedwords.rs` |
+
+Search-word checks use the captured retail moderation rules. Missing rules and unsupported or failing regular expressions refuse the request rather than bypassing moderation. Resource Wars channel creation has no handler: its instance gate is closed and the channel lifecycle is not modeled.

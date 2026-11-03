@@ -16,6 +16,7 @@ mod access_groups;
 mod agency;
 mod alert;
 mod alliances;
+mod bannedwords;
 mod bills;
 mod bookmarks;
 pub(crate) mod bounty;
@@ -352,6 +353,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         ("dogmaIM", _) => dogma::dispatch(c, call).await,
 
         _ => {
+            if let Some(r) = bannedwords::dispatch(call) { return r; }
             if let Some(r) = crates::dispatch(c, call).await { return r; }
             if let Some(r) = alert::dispatch(c, call).await { return r; }
             if let Some(r) = event_log::dispatch(c, call).await { return r; }
