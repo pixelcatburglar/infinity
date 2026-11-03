@@ -17,7 +17,9 @@ async fn reload_preserves_old_generation_on_failure_and_in_flight_call() {
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let world = World::new(db.clone(), sde.clone(), 1);
-    let resources = Resources { db, sde, world, store_value_limit_bytes: 65536 };
+    let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
+    let pilots = crate::lua::host::pilots::Pilots::new(&db, hub).await.unwrap();
+    let resources = Resources { db, sde, world, pilots, store_value_limit_bytes: 65536 };
     let dir = std::env::temp_dir().join(format!("lua-reload-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir(&dir).unwrap();
     let script = dir.join("test.lua");

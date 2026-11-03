@@ -20,7 +20,7 @@ mod bills;
 mod bookmarks;
 pub(crate) mod bounty;
 mod calendar;
-mod character;
+pub(crate) mod character;
 pub(crate) mod chat;
 mod clones;
 pub(crate) mod combat;

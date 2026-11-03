@@ -1,8 +1,9 @@
 //! XMPP transport for `xmppchatclient/xmppchatsvc.py` and `xmppchannelsettings.py`.
 //! Token-authenticated SASL, binding, presence, MUC discovery and messages use
 //! plain TCP (the launcher disables TLS). Durable room metadata and ACLs are
-//! supplied by chat services and their DAO; connections and occupants are runtime
-//! state. Password rooms, corporation/alliance ACLs and proxy ownership are unsupported.
+//! supplied by chat services and their DAO; real and virtual occupants are runtime
+//! state. Virtual occupants join system rooms only, not durable custom rooms.
+//! Password rooms, corporation/alliance ACLs and proxy ownership are unsupported.
 
 use crate::consts::TYPE_CHARACTER;
 use anyhow::Result;
@@ -82,9 +83,27 @@ type Tx = mpsc::UnboundedSender<String>;
 #[derive(Clone)]
 struct Occupant {
     full_jid: String,
-    tx: Tx,
+    tx: Option<Tx>,
     affiliation: String,
     role: String,
+}
+
+impl Occupant {
+    fn send(&self, stanza: String) {
+        if let Some(tx) = &self.tx { let _ = tx.send(stanza); }
+    }
+
+    fn matches_socket(&self, jid: &str, tx: &Tx) -> bool {
+        self.full_jid == jid && self.tx.as_ref().is_some_and(|current| current.same_channel(tx))
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.full_jid == other.full_jid && match (&self.tx, &other.tx) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_channel(b),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]

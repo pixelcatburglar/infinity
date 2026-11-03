@@ -29,7 +29,7 @@ async fn lua_mail_rpc_validates_and_delivers() {
         let mut config = crate::config::Config::default();
         config.lua.enabled = true;
         config.lua.scripts_dir = test_dir.to_string_lossy().into_owned();
-        crate::lua::start(&config, &test_db, &client.sde, &client.world).await.unwrap();
+        crate::lua::start(&config, &test_db, &client.sde, &client.world, &client.chat).await.unwrap();
         let id = rpc(&mut client, "mailFixture", "Send", &[]).await.unwrap().as_int().unwrap();
         let headers = crate::dao::mail::headers(&test_db, recipient.character, &vec![id]).await.unwrap();
         assert_eq!(headers.len(), 1);

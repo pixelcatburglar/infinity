@@ -242,7 +242,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let portrait = marshal::dumps(call.args.get(6).unwrap_or(&Value::None));
             let created = creation::create(&c.db, &c.sde, c.login.user_id, NewPilot {
                 name, race: race_id, bloodline: bloodline_id, gender: gender_id,
-                ancestry: ancestry_id, school: school_id, appearance, portrait,
+                ancestry: ancestry_id, school: school_id, station: None, appearance, portrait,
                 balance: crate::config::game().characters.starting_isk,
             }).await?;
             let char_id = created.char_id;

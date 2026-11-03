@@ -26,7 +26,9 @@ async fn world_host_routes_notifications_and_refuses_missing_system() {
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let world = World::new(db.clone(), sde.clone(), 1);
-    let resources = Resources { db, sde: sde.clone(), world: world.clone(), store_value_limit_bytes: 1024 };
+    let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
+    let pilots = crate::lua::host::pilots::Pilots::new(&db, hub).await.unwrap();
+    let resources = Resources { db, sde: sde.clone(), world: world.clone(), pilots, store_value_limit_bytes: 1024 };
     let lua = Lua::new();
     crate::lua::value::register(&lua, &lua.globals()).unwrap();
     register(&lua, &lua.globals(), &resources).unwrap();
@@ -98,7 +100,9 @@ async fn scheduled_removal_refuses_persistent_ships_at_schedule_and_execution_bu
     let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).expect("SDE ship").type_id;
     let drone_type = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_DRONE)).expect("SDE drone").type_id;
     let world = World::new(db.clone(), sde.clone(), 1);
-    let resources = Resources { db, sde, world: world.clone(), store_value_limit_bytes: 1024 };
+    let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
+    let pilots = crate::lua::host::pilots::Pilots::new(&db, hub).await.unwrap();
+    let resources = Resources { db, sde, world: world.clone(), pilots, store_value_limit_bytes: 1024 };
     let lua = Lua::new();
     register(&lua, &lua.globals(), &resources).unwrap();
     world.system(1).await.unwrap();

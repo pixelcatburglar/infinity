@@ -89,7 +89,8 @@ async fn real_database_events_and_intercepts() {
         config.lua.scripts_dir = task_dir.to_string_lossy().into_owned();
         config.lua.call_budget_ms = 15_000;
         config.lua.call_budget_instructions = 50_000_000;
-        start(&config, &test_db, &sde, &world).await.unwrap();
+        let hub = crate::chat::Hub::new(&config.chat.domain, test_db.clone(), world.clone());
+        start(&config, &test_db, &sde, &world, &hub).await.unwrap();
         let char_id = fixture.char_id;
         let result: Result<(), CallError> = test_db.transaction(
             |tx, outbox: &mut Outbox| Box::pin(async move {
@@ -139,8 +140,7 @@ async fn real_database_events_and_intercepts() {
         let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "acceptance".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), chat, world.clone(), login);
+        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), hub, world.clone(), login);
         client.change_session(vec![("charid", marshal::Value::Int(char_id))]);
         let mut type_id = None;
         for candidate in sde.types.iter().filter(|t| t.type_id > 0) {

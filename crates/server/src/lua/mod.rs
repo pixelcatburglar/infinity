@@ -22,9 +22,10 @@ static EVENTS: OnceLock<tokio::sync::mpsc::UnboundedSender<events::GameEvent>> =
 
 pub fn enabled() -> bool { ENABLED.load(Ordering::Acquire) }
 
-pub async fn start(config: &Config, db: &Db, sde: &Arc<Sde>, world: &Arc<World>) -> anyhow::Result<()> {
+pub async fn start(config: &Config, db: &Db, sde: &Arc<Sde>, world: &Arc<World>, hub: &Arc<crate::chat::Hub>) -> anyhow::Result<()> {
     if !config.lua.enabled { return Ok(()); }
-    let resources = host::Resources { db: db.clone(), sde: sde.clone(), world: world.clone(), store_value_limit_bytes: config.lua.store_value_limit_bytes };
+    let pilots = host::pilots::Pilots::new(db, hub.clone()).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let resources = host::Resources { db: db.clone(), sde: sde.clone(), world: world.clone(), pilots, store_value_limit_bytes: config.lua.store_value_limit_bytes };
     let host = reload::Host::new(config.lua.clone(), resources).await?;
     HOST.set(host).map_err(|_| anyhow::anyhow!("Lua host already initialized"))?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

@@ -37,14 +37,14 @@ async fn creation_rolls_back_skill_failure_and_commits_before_ship_provisioning(
         db.execute(&format!("CREATE TRIGGER test_creation_skill_failure BEFORE INSERT ON game.skills FOR EACH ROW EXECUTE FUNCTION game.test_creation_skill_failure('{failed_name}')"), &[]).await?;
         let pilot = NewPilot {
             name: failed_name.clone(), race: race.race_id, bloodline: 1, ancestry: None, gender: 1,
-            school: Some(school.school_id), balance: 0.0, appearance: Vec::new(), portrait: Vec::new(),
+            school: Some(school.school_id), station: None, balance: 0.0, appearance: Vec::new(), portrait: Vec::new(),
         };
         let failure = create(&db, &sde, account, pilot).await;
         anyhow::ensure!(matches!(&failure, Err(CallError::Internal(error)) if error.chain().any(|cause| cause.downcast_ref::<tokio_postgres::Error>().and_then(|e| e.as_db_error()).is_some_and(|e| e.message() == "creation fixture skill failure"))), "expected fixture skill insertion failure");
         anyhow::ensure!(!characters::creation::name_taken(&db, &failed_name).await?, "character survived failed skill grant");
         let pilot = NewPilot {
             name: success_name, race: race.race_id, bloodline: 1, ancestry: None, gender: 1,
-            school: Some(school.school_id), balance: 0.0, appearance: Vec::new(), portrait: Vec::new(),
+            school: Some(school.school_id), station: None, balance: 0.0, appearance: Vec::new(), portrait: Vec::new(),
         };
         let created = create(&db, &sde, account, pilot).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let actual = crate::dao::skills::training::current(&db, created.char_id).await?;

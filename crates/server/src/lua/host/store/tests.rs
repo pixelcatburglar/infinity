@@ -48,7 +48,9 @@ async fn registered_stores_are_bound_to_their_own_script() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = std::sync::Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
-    let resources = super::super::Resources { db: db.clone(), sde, world, store_value_limit_bytes: 65536 };
+    let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
+    let pilots = super::super::pilots::Pilots::new(&db, hub).await.unwrap();
+    let resources = super::super::Resources { db: db.clone(), sde, world, pilots, store_value_limit_bytes: 65536 };
     let lua = Lua::new();
     let a = lua.create_table().unwrap();
     let b = lua.create_table().unwrap();
