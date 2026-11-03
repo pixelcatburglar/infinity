@@ -1,174 +1,177 @@
-//! jumpCloneSvc station-bound calls and clone transitions.
-//!
-//! Mirrors eve/client/script/ui/services/clonejumpsvc.py, using game clone and
-//! item data, skill levels, and the startup SDE. Implants and ship-borne clone
-//! vat bays are not modelled.
+//! Station-bound jumpCloneSvc RPC adapter, mirroring clonejumpsvc.py.
+//! Reads game.jump_clones and item custody through the clone DAOs; body mutation
+//! lives in the lifecycle and transition modules. Ship clone bays are unsupported.
 
-use super::super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
-use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE, SKILL_INFOMORPH_PSYCHOLOGY, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY};
-use crate::dao::{characters::clones as clone_dao, items::{clones as item_dao, creation}, skills::levels as skill_dao};
-use crate::db::outbox::{Effect, Outbox};
-use crate::messages;
+use super::{lifecycle, policy, transition, CloneEffect, MAX_CLONE_NAME_LENGTH};
+use super::super::{crowset, db_err, notify_error, Call, CallError, CallResult};
+use crate::{client::{filetime_now, Client}, consts::{GM_ROLES, ROLE_QA, TYPE_CAPSULE},
+    dao::{characters::clones as clone_dao, items::clones as item_dao},
+    db::outbox::{Effect, Outbox}, messages, services::{effects::online, identity::Identity, market, trade}};
 use marshal::{DbRowDescriptor, DbType, Value};
-use tracing::info;
 
-use super::policy::jump_cooldown;
-
-const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
-/// Existing server policy: maximum jump clone name characters.
-const MAX_CLONE_NAME_LENGTH: usize = 100;
-
-
-enum JumpEffect {
-    Trade(Outbox<crate::services::trade::TradeEffect>),
-    Session { station: i64, system: i64, constellation: i64, region: i64, capsule: i64 },
+fn positive_id(value: &Value) -> Option<i64> {
+    match value { Value::Int(id) if *id > 0 => Some(*id), _ => None }
 }
 
-/// The character's clones as `(jumpCloneID, ownerID, locationID, typeID, cloneName)` rows.
-async fn clone_rows(c: &Client, me: i64) -> Result<Value, CallError> {
+fn jump_arguments(args: &[Value]) -> Option<(i64, i64, f64, bool)> {
+    let [destination, clone, quote, Value::Bool(confirmed)] = args else { return None };
+    let quote = match quote { Value::Int(v) => *v as f64, Value::Float(v) => *v, _ => return None };
+    if !quote.is_finite() || quote < 0.0 { return None; }
+    Some((positive_id(destination)?, positive_id(clone)?, quote, *confirmed))
+}
+
+fn clone_name_arguments(args: &[Value]) -> Option<(i64, &str)> {
+    let [id, Value::Unicode(name)] = args else { return None };
+    if name.chars().count() > MAX_CLONE_NAME_LENGTH || name.contains('\0') { return None; }
+    Some((positive_id(id)?, name))
+}
+
+fn invalid() -> CallError { notify_error(messages::clones::INVALID_ARGUMENTS) }
+
+fn clone_rows(rows: &[clone_dao::CloneRow]) -> Value {
     let header = DbRowDescriptor::new([
-        ("jumpCloneID", DbType::I4),
-        ("ownerID", DbType::I4),
-        ("locationID", DbType::I8),
-        ("typeID", DbType::I4),
-        ("cloneName", DbType::WStr),
+        ("jumpCloneID", DbType::I8), ("ownerID", DbType::I4),
+        ("locationID", DbType::I8), ("typeID", DbType::I4), ("cloneName", DbType::WStr),
     ]);
-    let rows = clone_dao::clones(&c.db, me).await.map_err(db_err)?;
-    let lines = rows
-        .iter()
-        .map(|r| header.row(&[Value::Int(r.clone_id), Value::Int(me), Value::Int(r.location_id), Value::Int(TYPE_CAPSULE as i64), Value::unicode(&r.name)]))
-        .collect();
-    Ok(crowset(&header, lines))
+    let lines = rows.iter().map(|r| header.row(&[
+        Value::Int(r.clone_id), Value::Int(r.owner_id), Value::Int(r.location_id),
+        Value::Int(TYPE_CAPSULE as i64), Value::unicode(&r.name),
+    ])).collect();
+    crowset(&header, lines)
 }
 
-/// `GetCloneState` -> KeyVal(clones, implants, timeLastJump).
-async fn clone_state(c: &Client, me: i64) -> CallResult {
-    let last = clone_dao::last_jump(&c.db, me).await.map_err(db_err)?;
-    Ok(super::super::keyval([
-        ("clones", clone_rows(c, me).await?),
-        ("implants", crowset(&DbRowDescriptor::new([("jumpCloneID", DbType::I4), ("typeID", DbType::I4)]), vec![])),
-        ("timeLastJump", last.map(Value::Int).unwrap_or(Value::None)),
-    ]))
+async fn clone_state(c: &Client, me: i64, station_only: bool) -> CallResult {
+    c.db.transaction(
+        |tx, _: &mut Outbox| Box::pin(async move {
+            let character = clone_dao::lock_character(tx, me).await.map_err(db_err)?
+                .ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
+            let mut rows = clone_dao::clones(tx, me).await.map_err(db_err)?;
+            if station_only {
+                rows.retain(|r| Some(r.location_id) == character.station_id);
+                return Ok(clone_rows(&rows));
+            }
+            let header = DbRowDescriptor::new([("jumpCloneID", DbType::I8), ("typeID", DbType::I4)]);
+            let mut implants = Vec::new();
+            for row in &rows {
+                for item in item_dao::list(tx, me, row.clone_id).await.map_err(db_err)? {
+                    implants.push(header.row(&[Value::Int(row.clone_id), Value::Int(i64::from(item.type_id))]));
+                }
+            }
+            Ok(super::super::keyval([
+                ("clones", clone_rows(&rows)),
+                ("implants", crowset(&header, implants)),
+                ("timeLastJump", character.last_clone_jump.map(Value::Int).unwrap_or(Value::None)),
+            ]))
+        }),
+        |value, _: Outbox| async move { Ok(value) },
+    ).await
 }
 
-async fn install(c: &Client, me: i64) -> CallResult {
-    let Some(station) = c.session.int("stationid") else {
-        return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_JUMP_CLONE_INSTALL));
-    };
-    let max = skill_dao::level(&c.db, me, SKILL_INFOMORPH_PSYCHOLOGY).await.map_err(db_err)?.unwrap_or(0) as i64
-        + skill_dao::level(&c.db, me, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY).await.map_err(db_err)?.unwrap_or(0) as i64;
-    let rows = clone_dao::locations(&c.db, me).await.map_err(db_err)?;
-    if rows.contains(&station) {
-        return Err(notify_error(messages::JUMP_CLONE_ALREADY_AT_STATION));
+fn dispatch_effects(c: &mut Client, outbox: Outbox<CloneEffect>) -> Result<(), CallError> {
+    let world = c.world.clone();
+    for entry in outbox.into_entries() {
+        match entry {
+            Effect::Notification(notification) => online::dispatch_notification(notification, &world, &c.notify_tx, c.session.int("charid"))?,
+            Effect::Operation(CloneEffect::Online(change)) => online::apply_online_changed(change),
+            Effect::Operation(CloneEffect::Trade(effects)) => trade::dispatch((), effects, &world)?,
+            Effect::Event(event) => crate::lua::on_event(event),
+        }
     }
-    if rows.len() as i64 >= max {
-        return Err(notify_error(&messages::jump_clone_limit(max)));
-    }
-    let inserted = clone_dao::install(&c.db, me, station).await.map_err(db_err)?;
-    if inserted == 0 {
-        return Err(notify_error(messages::JUMP_CLONE_ALREADY_AT_STATION));
-    }
-    info!("clones: {me} installed a jump clone at {station}");
-    c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
-    Ok(Value::None)
+    Ok(())
 }
 
-/// `CloneJump(destLocationID, cloneID, cost, confirmed)`.
-async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
-    let Some(station) = c.session.int("stationid") else {
-        return Err(CallError::User { msg: messages::MSG_NOT_AT_STATION.into(), dict: vec![] });
-    };
+#[derive(Clone)]
+enum Mutation {
+    Install,
+    Destroy(i64),
+    Rename(i64, String),
+    Reset,
+    Jump(i64, i64, f64, bool),
+}
+
+async fn mutate(c: &mut Client, mutation: Mutation) -> CallResult {
+    let id = Identity::of_client(c);
+    if id.char_id <= 0 { return Err(invalid()); }
     let now = filetime_now();
-    let ship = c.session.int("shipid");
-    let _lock = crate::services::market::lock().await;
+    let _guard = market::lock().await;
+    let char_id = id.char_id;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
-        |tx, outbox: &mut Outbox<JumpEffect>| {
+        |tx, outbox: &mut Outbox<CloneEffect>| {
             let sde = sde.clone();
+            let id = Identity { char_id: id.char_id, ship_id: id.ship_id, corp_id: id.corp_id, station_id: id.station_id, system_id: id.system_id };
+            let mutation = mutation.clone();
             Box::pin(async move {
-            let last = clone_dao::last_jump(tx, me).await.map_err(db_err)?;
-            let level = skill_dao::level(tx, me, SKILL_INFOMORPH_SYNCHRONIZING).await.map_err(db_err)?.unwrap_or(0) as i64;
-            let policy = &crate::config::game().clones;
-            let cooldown = jump_cooldown(policy.jump_cooldown_hours, policy.synchronizing_hours_per_level, level);
-            if let Some(ready) = last.map(|l| i128::from(l) + cooldown).filter(|r| *r > i128::from(now)) {
-                let hours = (ready - i128::from(now)) as f64 / FILETIME_HOUR as f64;
-                return Err(notify_error(&messages::jump_clone_cooldown(hours)));
-            }
-            let target = clone_dao::target(tx, clone_id, me, dest).await.map_err(db_err)?
-                .and_then(|id| sde.map.station(id)).ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
-            let required = |v: Option<i64>| v.ok_or_else(|| CallError::Internal(anyhow::anyhow!("jump clone station required field is null")));
-            let (to, system, constellation, region) = (target.station_id, required(target.solar_system_id)?, required(target.constellation_id)?, required(target.region_id)?);
-            if to == station {
-                return Err(notify_error(messages::ALREADY_AT_JUMP_CLONE_DESTINATION));
-            }
-            let mut trade_outbox = Outbox::default();
-            crate::services::trade::abort_for_char(tx, &sde, &mut trade_outbox, me).await?;
-            outbox.operation(JumpEffect::Trade(trade_outbox));
-            clone_dao::delete(tx, clone_id).await.map_err(db_err)?;
-            clone_dao::install(tx, me, station).await.map_err(db_err)?;
-            if let Some(ship) = ship {
-                item_dao::delete_capsule(tx, ship, TYPE_CAPSULE).await.map_err(db_err)?;
-            }
-            let capsule = creation::rookie_ship(tx, TYPE_CAPSULE, me, to, FLAG_HANGAR).await.map_err(db_err)?;
-            clone_dao::jump(tx, me, capsule, to, system, constellation, region, now).await.map_err(db_err)?;
-            outbox.operation(JumpEffect::Session { station: to, system, constellation, region, capsule });
-            outbox.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
-            Ok(to)
+                match mutation {
+                    Mutation::Install => { lifecycle::install_tx(tx, outbox, &sde, &id, now).await?; Ok(None) }
+                    Mutation::Destroy(clone) => { lifecycle::destroy_tx(tx, outbox, &id, clone).await?; Ok(None) }
+                    Mutation::Rename(clone, name) => { lifecycle::rename_tx(tx, outbox, &id, clone, &name).await?; Ok(None) }
+                    Mutation::Reset => { lifecycle::reset_tx(tx, outbox, &id).await?; Ok(None) }
+                    Mutation::Jump(dest, clone, quote, confirmed) => transition::jump_tx(tx, outbox, &sde, &id, dest, clone, quote, confirmed, now).await.map(Some),
+                }
             })
         },
-        |to, outbox| async move {
-            let world = c.world.clone();
-            for effect in outbox.into_entries() {
-                match effect {
-                    Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
-                    Effect::Operation(JumpEffect::Trade(trade_outbox)) => crate::services::trade::dispatch((), trade_outbox, &world)?,
-                    Effect::Event(event) => crate::lua::on_event(event),
-                    Effect::Operation(JumpEffect::Session { station, system, constellation, region, capsule }) => c.change_session(vec![
-                        ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system)),
-                        ("constellationid", Value::Int(constellation)), ("regionid", Value::Int(region)),
-                        ("shipid", Value::Int(capsule)),
-                    ]),
-                }
+        |transition, outbox| async move {
+            if let Some(t) = transition {
+                c.change_session(vec![
+                    ("stationid", Value::Int(t.station)), ("solarsystemid2", Value::Int(t.system)),
+                    ("constellationid", Value::Int(t.constellation)), ("regionid", Value::Int(t.region)),
+                    ("shipid", Value::Int(t.capsule)),
+                ]);
+                c.world.notify_pilot(char_id, "OnJumpCloneTransitionCompleted", vec![]);
             }
-            info!("clones: {me} clone jumped from {station} to {to}");
+            let result = dispatch_effects(c, outbox);
+            crate::scheduler::wake();
+            result?;
             Ok(Value::None)
         },
     ).await
 }
 
-pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    if call.service != "jumpCloneSvc" {
-        return None;
-    }
-    let me = c.session.int("charid").unwrap_or(0);
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-    Some(match call.method {
-        "GetCloneState" => clone_state(c, me).await,
-        "GetShipCloneState" | "GetStationCloneState" => {
-            let header = DbRowDescriptor::new([("jumpCloneID", DbType::I4), ("ownerID", DbType::I4), ("locationID", DbType::I8), ("typeID", DbType::I4), ("cloneName", DbType::WStr)]);
-            Ok(crowset(&header, vec![]))
-        }
-        "GetNumClonesInPilotsStructure" => Ok(Value::Int(0)),
-        "ValidateInstallJumpClone" => Ok(Value::list([])),
-        "GetPriceForClone" => Ok(Value::Float(0.0)),
-        "InstallCloneInStation" => install(c, me).await,
-        "InstallCloneInStructure" => Err(notify_error(messages::CLONE_STRUCTURE_INSTALL_UNSUPPORTED)),
-        "DestroyInstalledClone" => match clone_dao::destroy(&c.db, int(0), me).await {
-            Ok(_) => {
-                c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
-                Ok(Value::None)
-            }
-            Err(e) => Err(db_err(e)),
+async fn validate(c: &Client) -> CallResult {
+    let id = Identity::of_client(c);
+    if id.char_id <= 0 { return Err(invalid()); }
+    let now = filetime_now();
+    let sde = c.sde.clone();
+    c.db.transaction(
+        |tx, _: &mut Outbox| {
+            let sde = sde.clone();
+            let id = Identity { char_id: id.char_id, ship_id: id.ship_id, corp_id: id.corp_id, station_id: id.station_id, system_id: id.system_id };
+            Box::pin(async move { policy::validate_install_tx(tx, &sde, &id, now).await.map(Value::list) })
         },
-        // SetJumpCloneName(cloneID, name)
-        "SetJumpCloneName" => {
-            let name = value_text(call.args.get(1), MAX_CLONE_NAME_LENGTH);
-            clone_dao::rename(&c.db, int(0), me, &name).await.map(|_| Value::None).map_err(db_err)
-        }
-        "CloneJump" => jump(c, me, int(0), int(1)).await,
-        "ResetLastCloneJumpTime" => Ok(Value::None),
+        |value, _: Outbox| async move { Ok(value) },
+    ).await
+}
+fn ship_clone_state(args: &[Value]) -> CallResult {
+    if !args.is_empty() { return Err(invalid()); }
+    Ok(clone_rows(&[]))
+}
+
+
+pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
+    if call.service != "jumpCloneSvc" { return None; }
+    let me = c.session.int("charid").unwrap_or(0);
+    let no_args = || if call.args.is_empty() { Ok(()) } else { Err(invalid()) };
+    Some(match call.method {
+        "GetCloneState" => match no_args() { Ok(()) if me > 0 => clone_state(c, me, false).await, _ => Err(invalid()) },
+        "GetStationCloneState" => match no_args() { Ok(()) if me > 0 => clone_state(c, me, true).await, _ => Err(invalid()) },
+        "GetShipCloneState" => ship_clone_state(call.args),
+        "GetNumClonesInPilotsStructure" => Ok(Value::Int(0)),
+        "ValidateInstallJumpClone" => match no_args() { Ok(()) => validate(c).await, Err(e) => Err(e) },
+        "GetPriceForClone" => match no_args() { Ok(()) => Ok(Value::Float(crate::config::game().clones.service_fee_isk)), Err(e) => Err(e) },
+        "InstallCloneInStation" => match no_args() { Ok(()) => mutate(c, Mutation::Install).await, Err(e) => Err(e) },
+        "InstallCloneInStructure" => Err(notify_error(messages::CLONE_STRUCTURE_INSTALL_UNSUPPORTED)),
+        "DestroyInstalledClone" => match call.args { [value] => match positive_id(value) { Some(id) => mutate(c, Mutation::Destroy(id)).await, None => Err(invalid()) }, _ => Err(invalid()) },
+        "SetJumpCloneName" => match clone_name_arguments(call.args) { Some((id, name)) => mutate(c, Mutation::Rename(id, name.to_owned())).await, None => Err(invalid()) },
+        "CloneJump" => match jump_arguments(call.args) { Some((dest, clone, quote, confirmed)) => mutate(c, Mutation::Jump(dest, clone, quote, confirmed)).await, None => Err(invalid()) },
+        "ResetLastCloneJumpTime" => match no_args() {
+            Err(e) => Err(e),
+            Ok(()) if c.login.role & (GM_ROLES | ROLE_QA) == 0 => Err(notify_error(messages::clones::RESET_ROLE_REQUIRED)),
+            Ok(()) => mutate(c, Mutation::Reset).await,
+        },
         _ => return None,
     })
 }
+
+#[cfg(test)] mod tests;

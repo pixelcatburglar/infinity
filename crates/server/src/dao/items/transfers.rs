@@ -28,9 +28,9 @@ pub(crate) async fn hand_over(ex: &(impl Executor + ?Sized), transfers: &[Transf
     let owners: Vec<_> = transfers.iter().map(|item| item.owner).collect();
     let locations: Vec<_> = transfers.iter().map(|item| item.location).collect();
     let flags: Vec<_> = transfers.iter().map(|item| item.flag).collect();
-    let tree = "WITH RECURSIVE roots(root, owner, location, flag) AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int4[])), tree(root, id, owner, location, flag) AS (SELECT root, root, owner, location, flag FROM roots UNION SELECT t.root, i.item_id, t.owner, t.location, t.flag FROM tree t JOIN game.items i ON i.location_id = t.id)";
-    ex.query(&format!("{tree} SELECT i.item_id FROM game.items i JOIN tree t ON t.id = i.item_id ORDER BY i.item_id FOR UPDATE OF i"), &[&ids, &owners, &locations, &flags]).await?;
-    ex.execute(&format!("{tree} UPDATE game.items i SET owner_id = t.owner, location_id = CASE WHEN t.id = t.root THEN t.location ELSE i.location_id END, flag_id = CASE WHEN t.id = t.root THEN t.flag ELSE i.flag_id END FROM tree t WHERE i.item_id = t.id"), &[&ids, &owners, &locations, &flags]).await?;
+    let tree = "WITH RECURSIVE roots(root, owner, location, flag) AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int4[])), tree(root, id, owner, location, flag) AS (SELECT r.root, r.root, r.owner, r.location, r.flag FROM roots r JOIN game.items i ON i.item_id = r.root AND i.jump_clone_id IS NULL UNION SELECT t.root, i.item_id, t.owner, t.location, t.flag FROM tree t JOIN game.items i ON i.location_id = t.id AND i.jump_clone_id IS NULL)";
+    ex.query(&format!("{tree} SELECT i.item_id FROM game.items i JOIN tree t ON t.id = i.item_id WHERE i.jump_clone_id IS NULL ORDER BY i.item_id FOR UPDATE OF i"), &[&ids, &owners, &locations, &flags]).await?;
+    ex.execute(&format!("{tree} UPDATE game.items i SET owner_id = t.owner, location_id = CASE WHEN t.id = t.root THEN t.location ELSE i.location_id END, flag_id = CASE WHEN t.id = t.root THEN t.flag ELSE i.flag_id END FROM tree t WHERE i.item_id = t.id AND i.jump_clone_id IS NULL"), &[&ids, &owners, &locations, &flags]).await?;
     Ok(())
 }
 

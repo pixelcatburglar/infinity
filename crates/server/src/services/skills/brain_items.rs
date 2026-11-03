@@ -7,7 +7,7 @@
 //! The static data has no skill modifier to duration, so Biology does not lengthen boosters here.
 //! Only passiveFit effects are applied. Native comparisons and RNG are unavailable:
 //! eligibility cutoffs are inclusive and chance effects use independent Bernoulli draws.
-//! Legacy untimed boosters have no known expiry; clone custody is not modelled.
+//! Legacy untimed boosters have no known expiry; dormant implants belong to their clone.
 //! Static datetime follows dogma/attributes/datetime.py:6-12 (days since Unix epoch).
 use super::{attributes::character_attributes_at, completion, db_err, requirements::requirements, trading::{available_credits, refusal, source}, training, CallError, CallResult};
 use crate::{client::{filetime_from_dogma_days, filetime_now, filetime_ticks_from_hours, filetime_ticks_from_ms, ms_from_filetime_ticks, Client}, consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTER_LAST_INJECTION_DATETIME, dogma::ATTR_BOOSTER_MAX_CHAR_AGE_HOURS, dogma::ATTR_BOOSTERNESS, dogma::ATTR_IMPLANTNESS, dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, CATEGORY_IMPLANT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_BOOSTER, FLAG_IMPLANT, GROUP_BOOSTER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE}, dao::{characters::social, items::{brain, dogma, inventory, loading::ItemQuery}, skills::training as skill_dao}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{effects::online::{self, OnlineChanged}, fit::{Fit, Key}, inventory::{notify_item_change, notify_item_removed, split_stack}, items::load_items}};

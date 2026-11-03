@@ -8,6 +8,7 @@ pub(crate) mod access_groups;
 pub(crate) mod bookmarks;
 pub(crate) mod bounty;
 pub(crate) mod chat;
+pub(crate) mod clones;
 pub(crate) mod combat;
 pub(crate) mod contacts;
 pub(crate) mod corporations;
@@ -170,20 +171,12 @@ pub(crate) const RANDOM_LAST_ARVEL: &str = "Arvel";
 pub(crate) const RANDOM_LAST_CASTOR: &str = "Castor";
 
 // Clones (services/clones.rs)
-/// Jump-clone installation requires docking.
-pub(crate) const STATION_DOCK_REQUIRED_FOR_JUMP_CLONE_INSTALL: &str = "你必须停靠在空间站内才能安装远距克隆。";
 /// Duplicate jump clone at station.
 pub(crate) const JUMP_CLONE_ALREADY_AT_STATION: &str = "你在这个空间站已经有一个远距克隆。";
 /// Jump clone destination missing.
 pub(crate) const JUMP_CLONE_NOT_FOUND: &str = "该远距克隆已不在原处。";
-/// Jump destination is current station.
-pub(crate) const ALREADY_AT_JUMP_CLONE_DESTINATION: &str = "你已经在该空间站中。";
 /// Structure clone installation unavailable.
 pub(crate) const CLONE_STRUCTURE_INSTALL_UNSUPPORTED: &str = "暂不支持建筑。";
-/// Maximum installed jump clones.
-pub(crate) fn jump_clone_limit(max: i64) -> String { format!("你的意识形态心理学技能允许 {max} 个远距克隆。") }
-/// Remaining jump clone cooldown.
-pub(crate) fn jump_clone_cooldown(hours: f64) -> String { format!("你需要再等 {hours:.1} 小时才能再次进行远距克隆跳跃。") }
 
 // Combat (services/combat.rs)
 /// Charge quantity unavailable.

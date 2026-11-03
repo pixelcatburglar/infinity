@@ -1,7 +1,7 @@
-//! Startup projections of the typed SDE map and station tables, with no direct client mirror.
-//! Client consumers include `eve/client/script/remote/michelle.py:491-532` and
-//! `eve/client/script/parklife/autopilot.py:260-261,329-332`.
-//! Unused map fields and complete raw JSON objects are not loaded.
+//! Startup projections of SDE map, station, and native station restriction tables.
+//! Client consumers include `eve/client/script/remote/michelle.py:491-532`,
+//! `eve/client/script/parklife/autopilot.py:260-261,329-332`, and
+//! `evestations/standingsrestriction.py`. Unused map fields are not loaded.
 
 use crate::db::{self, executor::Executor};
 use crate::sde::map::{SolarSystem, Region, Constellation, Stargate, Station, Celestial};
@@ -92,6 +92,21 @@ impl Jump {
             to_solar_system_id: row.get("to_solar_system_id"),
         }
     }
+}
+/// Raw owner-keyed service thresholds from `sde_native.stationstandingsrestrictions`.
+pub(crate) struct StationStandingRestriction {
+    pub owner: Option<String>,
+    pub services: Option<String>,
+}
+
+impl StationStandingRestriction {
+    fn from_row(row: &Row) -> Self {
+        Self { owner: row.get("owner"), services: row.get("services") }
+    }
+}
+
+pub(crate) async fn station_standing_restrictions(ex: &(impl Executor + ?Sized)) -> Result<Vec<StationStandingRestriction>, db::Error> {
+    Ok(ex.query("SELECT key AS owner, (data->'services')::text AS services FROM sde_native.stationstandingsrestrictions ORDER BY row_no", &[]).await?.iter().map(StationStandingRestriction::from_row).collect())
 }
 
 pub(crate) async fn systems(ex: &(impl Executor + ?Sized)) -> Result<Vec<SolarSystem>, db::Error> {

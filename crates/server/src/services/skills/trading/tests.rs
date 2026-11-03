@@ -259,6 +259,39 @@ async fn extraction_refuses_equipped_item_prerequisite() {
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn extraction_refuses_spare_clone_implant_prerequisite() {
+    use crate::services::tests::{client, fixture};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let (mut c, _peer) = client(db.clone(), f.character).await;
+    let (implant, slot, required, threshold) = c.sde.types.iter().filter(|t| t.category_id == Some(crate::consts::CATEGORY_IMPLANT) && t.group_id != Some(crate::consts::GROUP_BOOSTER)).find_map(|ty| {
+        let slot = ty.attribute(crate::consts::dogma::ATTR_IMPLANTNESS).filter(|v| *v > 0.0 && v.fract() == 0.0)? as i32;
+        super::super::requirements::requirements(&c.sde, ty.type_id).find_map(|(required, level)| {
+            let target = c.sde.types.get(required)?;
+            let threshold = super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, required).rank, i64::from(level));
+            (target.published == Some(true) && threshold >= BUCKET).then_some((ty.type_id, slot, required, threshold))
+        })
+    }).expect("implant prerequisite with enough points");
+    let filler = c.sde.types.iter().find(|t| t.type_id != required && t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none()).unwrap().type_id;
+    let station = 60000001_i64;
+    db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&f.character, &station]).await.unwrap();
+    db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,5,$3),($1,$4,5,$5)", &[&f.character, &required, &threshold, &filler, &EXTRACTION_MINIMUM]).await.unwrap();
+    let clone = crate::dao::characters::clones::create(&db, f.character, station).await.unwrap();
+    let dormant = transfers::insert(&db, implant, f.character, f.character, crate::consts::FLAG_IMPLANT, 1).await.unwrap();
+    db.execute("UPDATE game.items SET singleton=true, brain_slot=$2, jump_clone_id=$3 WHERE item_id=$1", &[&dormant, &slot, &clone.clone_id]).await.unwrap();
+    let extractor = transfers::insert(&db, EXTRACTOR, f.character, station, FLAG_HANGAR, 1).await.unwrap();
+    let args = [Value::Dict(vec![(Value::Int(i64::from(required)), Value::Int(BUCKET))]), Value::Int(extractor), Value::Int(1)];
+    assert!(extract(&mut c, f.character, &args).await.is_err());
+    assert_eq!(db.query_one("SELECT skill_points FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&f.character, &required]).await.unwrap().get::<_, i64>("skill_points"), threshold);
+    assert_eq!(db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&extractor]).await.unwrap().get::<_, i32>("quantity"), 1);
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&dormant]).await.unwrap();
+    crate::dao::characters::clones::destroy(&db, clone.clone_id, f.character).await.unwrap();
+    fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn extraction_refuses_clone_floor_and_overtraining_atomically() {
     use crate::services::tests::{client, fixture};
     crate::tests::init_config();
@@ -276,7 +309,7 @@ async fn extraction_refuses_clone_floor_and_overtraining_atomically() {
     let clone_points = super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, clone_skill).rank, 1);
     db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3),($1,$4,5,$5),($1,$6,5,$7)", &[&f.character, &clone_skill, &clone_points, &filler, &BUCKET, &reserve, &FREE_ZONE]).await.unwrap();
     let item = transfers::insert(&db, EXTRACTOR, f.character, station, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::characters::clones::install(&db, f.character, station).await.unwrap();
+    crate::dao::characters::clones::create(&db, f.character, station).await.unwrap();
     let args = [Value::Dict(vec![(Value::Int(i64::from(clone_skill)), Value::Int(1)), (Value::Int(i64::from(filler)), Value::Int(BUCKET - 1))]), Value::Int(item), Value::Int(1)];
     let before = fingerprint(&db, f.character).await;
     assert!(extract(&mut c, f.character, &args).await.is_err());
@@ -284,8 +317,9 @@ async fn extraction_refuses_clone_floor_and_overtraining_atomically() {
     assert!(receiver.try_recv().is_err());
     for (tier, count) in [(crate::consts::SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY, 6_i64), (crate::consts::SKILL_ELITE_INFOMORPH_PSYCHOLOGY, 11_i64)] {
         if c.sde.types.get(tier).is_none() { continue; }
-        for index in 1..count {
-            crate::dao::characters::clones::install(&db, f.character, station + index).await.unwrap();
+        let existing_count = crate::dao::characters::clones::clones(&db, f.character).await.unwrap().len() as i64;
+        for index in existing_count..count {
+            crate::dao::characters::clones::create(&db, f.character, station + index).await.unwrap();
         }
         let points = super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, tier).rank, 1);
         db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&f.character, &tier, &points]).await.unwrap();

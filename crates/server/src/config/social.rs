@@ -156,26 +156,21 @@ impl ContractsConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClonesConfig {
-    /// Server base jump-clone cooldown in services/clones.rs.
-    pub jump_cooldown_hours: i64,
-    /// One hour less cooldown per Infomorph Synchronizing level in services/clones.rs.
-    pub synchronizing_hours_per_level: i64,
+    /// Server policy: ISK charged for installing or jumping to a station clone.
+    pub service_fee_isk: f64,
 }
 
 impl Default for ClonesConfig {
     fn default() -> Self {
         Self {
-            jump_cooldown_hours: 24,
-            synchronizing_hours_per_level: 1,
+            service_fee_isk: 900_000.0,
         }
     }
 }
 
 impl ClonesConfig {
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.jump_cooldown_hours > 0, "clones.jump_cooldown_hours={} is outside its valid domain", self.jump_cooldown_hours);
-        anyhow::ensure!(self.synchronizing_hours_per_level > 0, "clones.synchronizing_hours_per_level={} is outside its valid domain", self.synchronizing_hours_per_level);
-        super::duration("clones.jump_cooldown_hours", self.jump_cooldown_hours, crate::consts::FILETIME_HOUR, true)?;
+        anyhow::ensure!(self.service_fee_isk.is_finite() && self.service_fee_isk >= 0.0, "clones.service_fee_isk={} is outside its valid domain", self.service_fee_isk);
         Ok(())
     }
 }

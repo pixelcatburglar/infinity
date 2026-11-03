@@ -1,5 +1,6 @@
 //! Inventory item row loading from `game.items`.
 //! Quantity-ordered queries use quantity and item ID; other queries use item ID.
+//! Dormant clone implants are excluded from all ordinary item queries.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Transactions, refusals, notifications and World are caller concerns.
 
@@ -77,7 +78,7 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), query: ItemQuery<'
         _ => "i.item_id",
     };
     let sql = format!("SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
-                        i.custom_info FROM game.items i WHERE {filter} ORDER BY {order}");
+                        i.custom_info FROM game.items i WHERE ({filter}) AND i.jump_clone_id IS NULL ORDER BY {order}");
     let rows = match &query {
         Id(a) | Location(a) | IdOrLocation(a) | Owner(a) | OwnerExceptSelf(a) => ex.query(&sql, &[a]).await?,
         Ids(a) => ex.query(&sql, &[a]).await?,

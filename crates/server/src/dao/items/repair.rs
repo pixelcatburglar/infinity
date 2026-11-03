@@ -18,6 +18,6 @@ impl Item {
 }
 /// Lock requested items, their containers, and directly fitted children in item ID order.
 pub(crate) async fn lock_items(ex: &(impl Executor + ?Sized), ids: &[i64], owner: i64) -> Result<Vec<Item>, Error> {
-    let rows = ex.query("SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE owner_id = $2 AND (item_id = ANY($1) OR location_id = ANY($1) OR item_id IN (SELECT location_id FROM game.items WHERE item_id = ANY($1) AND owner_id = $2)) ORDER BY item_id FOR UPDATE", &[&ids, &owner]).await?;
+    let rows = ex.query("SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE owner_id = $2 AND jump_clone_id IS NULL AND (item_id = ANY($1) OR location_id = ANY($1) OR item_id IN (SELECT location_id FROM game.items WHERE item_id = ANY($1) AND owner_id = $2 AND jump_clone_id IS NULL)) ORDER BY item_id FOR UPDATE", &[&ids, &owner]).await?;
     Ok(rows.iter().map(Item::from_row).collect())
 }
