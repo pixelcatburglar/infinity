@@ -59,6 +59,7 @@ Some keys switch behaviour on or off rather than set a number:
 | `shared_settings.max_payload_bytes` / `.max_nesting_depth` | `262144` / `64` | The largest shared item-filter or fleet-broadcast link the server stores, in bytes of encoded text, and how deeply its data may nest. Both must be positive, and the depth at most 64. |
 | `space.collisions` | `false` | Ball collisions, on the server and in the client. The server has no collision shapes, so with `true` every ship and celestial collides as one sphere. Missiles are not affected. Takes effect at the next start. |
 | `clones.service_fee_isk` | `900000` | ISK charged for installing a jump clone at an NPC station and for each clone jump, same-station swaps included, paid to the station. Must not be negative. The settings `clones.jump_cooldown_hours` and `clones.synchronizing_hours_per_level` no longer exist: the cooldown comes from the character's attributes, and a file that still sets either stops the start. |
+| `expert_systems.enabled` | `false` | Tells the client that expert systems are available, so it shows them. The expert system calls, the GM command and expiry work either way. |
 
 ## Logs
 
