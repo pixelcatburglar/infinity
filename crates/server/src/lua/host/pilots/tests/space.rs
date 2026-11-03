@@ -6,9 +6,13 @@ use super::*;
 async fn spatial_operations_authorize_and_use_actor() {
     let r = fixture::resources().await;
     let (race, bloodline, school, station) = fixture::creation_inputs(&r).await;
+    let fields = fixture::FieldSnapshot::capture(&r, station).await;
+    let fixture_system = r.sde.map.station(station).unwrap().solar_system_id.unwrap();
+    assert!(r.sde.map.celestials(fixture_system).any(|celestial| celestial.group_id == Some(i64::from(crate::consts::GROUP_ASTEROID_BELT))), "fixture system must contain SDE asteroid belts");
     let lua = Lua::new();
     register(&lua, &lua.globals(), &r).unwrap();
     let globals = lua.globals();
+    crate::lua::host::world::register(&lua, &globals, &r).unwrap();
     globals.set("race", race).unwrap();
     globals.set("bloodline", bloodline).unwrap();
     globals.set("school", school).unwrap();
@@ -59,6 +63,14 @@ async fn spatial_operations_authorize_and_use_actor() {
         let ship: i64 = identity.get("ship_id")?;
         *test_ship.lock().unwrap() = Some(ship);
         let system: i64 = identity.get("system_id")?;
+        assert_eq!(system, fixture_system);
+        globals.set("system", system)?;
+        let rock_ids: Table = lua.load("local rocks = world.balls(system, {category_id=25}); assert(#rocks > 0, 'undock must expose asteroid balls'); local ids = {}; for i, rock in ipairs(rocks) do ids[i] = rock.id end; return ids").eval_async().await?;
+        let rock_ids: Vec<i64> = rock_ids.sequence_values::<i64>().collect::<mlua::Result<Vec<_>>>()?;
+        for rock in rock_ids {
+            let row = r.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2", &[&rock, &system]).await?;
+            assert!(row.get::<_, i64>("quantity") > 0);
+        }
         assert_eq!(r.world.chat_session(id).unwrap().station_id, None);
         assert_eq!(r.world.with(system, move |s| s.pilot_ball(id).map(|b| b.id)).await.flatten(), Some(ship));
         let location = r.db.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&id]).await?;
@@ -207,5 +219,6 @@ async fn spatial_operations_authorize_and_use_actor() {
     fixture::cleanup(&r.db, peer).await;
     let _ = lifecycle::offline(r.clone(), id).await;
     fixture::cleanup(&r.db, id).await;
+    fields.restore(&r).await;
     result.unwrap();
 }

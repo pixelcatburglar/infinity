@@ -12,6 +12,7 @@ async fn mining_default_effect_and_target_lifecycle() {
     use crate::{consts::dogma::{ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}, dao::items::loading::ItemQuery, services::{combat, fit::{Fit, Key}, mining}};
     let r = fixture::resources().await;
     let (race, bloodline, school, station) = fixture::creation_inputs(&r).await;
+    let fields = fixture::FieldSnapshot::capture(&r, station).await;
     let lua = Lua::new();
     register(&lua, &lua.globals(), &r).unwrap();
     let globals = lua.globals();
@@ -178,5 +179,6 @@ async fn mining_default_effect_and_target_lifecycle() {
     r.db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&foreign]).await.unwrap();
     r.db.execute("DELETE FROM game.character_mining_ledger WHERE character_id=$1", &[&id]).await.unwrap();
     fixture::cleanup(&r.db, id).await;
+    fields.restore(&r).await;
     result.unwrap();
 }

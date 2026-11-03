@@ -15,6 +15,7 @@ const SOLD: i32 = 3;
 async fn registered_inventory_and_sale_use_real_services() {
     let r = fixture::resources().await;
     let (race, bloodline, school, _) = fixture::creation_inputs(&r).await;
+    let fields = fixture::FieldSnapshot::capture(&r, STATION).await;
     let lua = Lua::new();
     register(&lua, &lua.globals(), &r).unwrap();
     let globals = lua.globals();
@@ -144,6 +145,7 @@ async fn registered_inventory_and_sale_use_real_services() {
     fixture::cleanup(&r.db, id).await;
     let foreign = *foreign_id.lock().unwrap();
     if let Some(foreign) = foreign { r.db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&foreign]).await.unwrap(); }
+    fields.restore(&r).await;
     result.unwrap();
 }
 

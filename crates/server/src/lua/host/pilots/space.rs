@@ -1,6 +1,6 @@
 //! Spatial operations for simulated pilots through the normal ship and combat services.
 //! State comes from character and ship DAOs and the system actor; capacitor is runtime-only.
-//! Docked pilots have no in-space capacitor snapshot.
+//! Space-entry environment initialization reuses the normal entry rule; docked pilots have no in-space capacitor snapshot.
 
 use mlua::{Lua, Table, Value};
 use crate::{messages, services::{self, CallError, identity::Identity, ship}, space::V3};
@@ -58,6 +58,7 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
                 let result = ship::ship::undock(&identity, &r.db, &r.world, &r.sde, system, pilot.session.alliance_id).await?;
                 apply(&r, &identity, pilot, result.change)?;
                 drop(result.economy);
+                lifecycle::entered_space(&r, &pilot.session).await?;
                 Ok(())
             }).await.map_err(lua_error)
         }
