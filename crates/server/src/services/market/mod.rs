@@ -458,7 +458,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
 /// One item of `PlaceMultiSellOrder`: sell to the bids now, and with a duration list the
 /// rest as a sell order. Returns whether anything sold or was listed.
 #[allow(clippy::too_many_arguments)]
-async fn place_sell(identity: &Identity, db: &Db, world: &World, sde: &Arc<Sde>, item_id: i64, station_id: i64, type_id: i64, price: f64, quantity: i64, duration: i64) -> Result<bool, CallError> {
+pub(crate) async fn place_sell(identity: &Identity, db: &Db, world: &World, sde: &Arc<Sde>, item_id: i64, station_id: i64, type_id: i64, price: f64, quantity: i64, duration: i64) -> Result<bool, CallError> {
     let me = identity.char_id;
     let price = valid_price(price)?;
     let now = filetime_now();

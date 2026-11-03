@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
     let hub = chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     services::trade::recover(&db, &world, sde.clone()).await.map_err(startup_call_error)?;
-    lua::start(&cfg, &db, &sde, &world).await?;
+    lua::start(&cfg, &db, &sde, &world, &hub).await?;
     let restored = services::bounty::restore_activations(&db, &world).await.map_err(startup_call_error)?;
     info!(restored, "restored active kill rights");
     services::skills::completion::seed(&db).await.map_err(startup_call_error)?;

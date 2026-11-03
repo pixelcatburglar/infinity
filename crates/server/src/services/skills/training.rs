@@ -221,7 +221,7 @@ pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, C
     ))
 }
 
-pub(super) async fn queue_list(identity: &Identity, db: &(impl Executor + ?Sized)) -> Result<Vec<queue_dao::QueueEntry>, CallError> {
+pub(crate) async fn queue_list(identity: &Identity, db: &(impl Executor + ?Sized)) -> Result<Vec<queue_dao::QueueEntry>, CallError> {
     queue_dao::list(db, identity.char_id).await.map_err(db_err)
 }
 
@@ -257,7 +257,7 @@ pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Exec
     Ok(progress)
 }
 /// `SaveNewQueue({idx: (typeID, toLevel)}, activate=bool)`: rebuild the queue with timings.
-pub(super) async fn save_queue(identity: &Identity, db: &crate::db::Db, sde: &Arc<crate::sde::Sde>, queue: &Value, activate: bool, notify: bool, dispatch: impl FnMut(Notification) -> Result<(), CallError> + Send) -> Result<(), CallError> {
+pub(crate) async fn save_queue(identity: &Identity, db: &crate::db::Db, sde: &Arc<crate::sde::Sde>, queue: &Value, activate: bool, notify: bool, dispatch: impl FnMut(Notification) -> Result<(), CallError> + Send) -> Result<(), CallError> {
     let now = filetime_now();
     let entries = parse_queue(queue)?;
     let char_id = identity.char_id;

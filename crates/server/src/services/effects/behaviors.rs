@@ -27,7 +27,7 @@ fn repair_ranges(fit: &Fit, cycle: &Cycle) -> (f64, f64) {
 async fn remote_repair(cx: &Ctx, fit: &Fit, cycle: &Cycle, layer: usize) -> Result<CycleOutcome, CallError> {
     let (optimal, falloff) = repair_ranges(fit, cycle);
     let Ok((target, pilot, multiplier)) = repair::target(cx, cycle.target, optimal, falloff).await else {
-        return Ok(CycleOutcome::Stop("target lost"));
+        return Ok(super::lifecycle::target_loss(cycle).await);
     };
     let master = cycle.modules[0].id;
     if !state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &cycle.stop)) {
@@ -61,7 +61,7 @@ pub(super) async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charg
     let outcome = match cycle.effect.kind {
         Turret | Missile => {
             let target = cycle.target.unwrap_or(0);
-            if !targets_of(cx.char_id).contains(&target) { return Ok(CycleOutcome::Stop("target lost")); }
+            if !targets_of(cx.char_id).contains(&target) { return Ok(super::lifecycle::target_loss(cycle).await); }
             let mut fired = false;
             for module in &cycle.modules {
                 let charge = match consume_charge(cx, module, None).await { Ok(Some(t)) => t, _ => continue };
@@ -105,7 +105,7 @@ pub(super) async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charg
         RemoteRepair { layer } => {
             let (optimal, falloff) = repair_ranges(fit, cycle);
             if repair::target(cx, cycle.target, optimal, falloff).await.is_err() {
-                return Ok(CycleOutcome::Stop("target lost"));
+                return Ok(super::lifecycle::target_loss(cycle).await);
             }
             let module = &cycle.modules[0];
             cycle.repair_amount = if let FueledLocalRepair { amount_attr, charge_bonus_attr, .. } = charge_kind(cycle.effect.id, cycle.effect.kind) {
@@ -125,7 +125,7 @@ pub(super) async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charg
         Mining => Ok(mining::start(cx, cycle)),
         Projected { .. } => {
             let target = cycle.target.unwrap_or(0);
-            if !targets_of(cx.char_id).contains(&target) { return Ok(CycleOutcome::Stop("target lost")); }
+            if !targets_of(cx.char_id).contains(&target) { return Ok(super::lifecycle::target_loss(cycle).await); }
             for module in &cycle.modules {
                 let charge = fit.source_type(Key::Charge(module.id));
                 projected::apply(cx, fit, module.id, module.type_id, &cycle.effect, target, cycle.duration_ms, charge).await?;

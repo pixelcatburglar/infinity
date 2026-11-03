@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChatSession {
     pub character_id: i64,
+    pub station_id: Option<i64>,
     pub system_id: Option<i64>,
     pub corporation_id: Option<i64>,
     pub alliance_id: Option<i64>,
@@ -19,6 +20,7 @@ impl ChatSession {
     pub fn from_session(session: &Session) -> Option<Self> {
         Some(Self {
             character_id: session.int("charid").filter(|id| *id > 0)?,
+            station_id: session.int("stationid").filter(|id| *id > 0),
             system_id: session.int("solarsystemid2").filter(|id| *id > 0),
             corporation_id: session.int("corpid").filter(|id| *id > 0),
             alliance_id: session.int("allianceid").filter(|id| *id > 0),

@@ -11,7 +11,7 @@ impl From<&Member> for Position {
     fn from(m: &Member) -> Self { Self { wing: m.wing, squad: m.squad, role: m.role } }
 }
 #[derive(Clone)]
-pub(in crate::services) struct Order { fleet: i64, commander: i64, ship: i64, position: Position, members: Vec<(i64, Position)>, target: Option<(i64, i64)> }
+pub(crate) struct Order { fleet: i64, commander: i64, ship: i64, position: Position, members: Vec<(i64, Position)>, target: Option<(i64, i64)> }
 
 fn in_scope(commander: Position, member: Position) -> bool {
     match commander.role {
@@ -73,7 +73,7 @@ fn commit_in<T>(st: &State, s: &mut space::System, order: &Order, pilot: i64, sh
     if let Some((target, ball)) = order.target {
         if !st.is_member(order.fleet, target)
             || !s.pilot_ball(target).is_some_and(|b| b.id == ball && b.char_id == Some(target) && b.owner_id == target)
-            || !s.fleet_broadcast_visible(order.commander, ball) { return None; }
+            || !s.visible_to(order.commander, ball) { return None; }
     }
     Some(f(s))
 }

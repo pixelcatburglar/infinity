@@ -286,59 +286,16 @@ impl Client {
     /// The character leaves the game (disconnect, or logging off to character selection):
     /// out of its ballpark, and its ship out of space with its position remembered.
     pub async fn leave_world(&mut self) -> Result<()> {
-        if let Some(char_id) = self.session.int("charid") {
+        if let Some(char_id) = self.session.int("charid").filter(|id| *id != 0) {
             services::fleets::lifecycle::disconnect(&self.world, char_id, self.session.sid);
             self.change_session(vec![("fleetid", Value::None), ("wingid", Value::None), ("squadid", Value::None), ("fleetrole", Value::None)]);
         }
-        services::combat::reset(self);
-        let mut failure = None;
-        if let Some(ship) = self.session.int("shipid") {
-            let _lock = services::market::lock().await;
-            let system = self.session.int("solarsystemid");
-            let ball = if let (Some(system), Some(character)) = (system, self.session.int("charid")) {
-                self.world.with(system, move |s| {
-                    if s.pilot_ball(character).is_some_and(|ball| ball.id == ship) {
-                        s.remove_ball(ship)
-                    } else {
-                        None
-                    }
-                }).await.flatten()
-            } else {
-                None
-            };
-            if system.is_none() || ball.is_some() {
-                if let Err(error) = services::combat::save_condition_in(&self.db, ship).await {
-                    let error = match error {
-                        services::CallError::Internal(error) => error,
-                        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-                    };
-                    warn!(ship, %error, "saving condition on leave failed");
-                    failure = Some(error);
-                }
-            }
-            if let Some(b) = ball {
-                if let Err(error) = crate::dao::items::positions::save(&self.db, ship, &b.pos).await {
-                    warn!(ship, %error, "saving position on leave failed");
-                    if failure.is_none() { failure = Some(error.into()); }
-                }
-            }
-        }
-        self.world.unobserve(self.login.client_id);
-        if let Some(char_id) = self.session.int("charid") {
-            services::drones::settings::logged_off(char_id);
-            self.world.unregister_pilot(char_id);
-            self.chat.disconnect_character(char_id);
-            services::online_status::presence_changed(&self.db, &self.world, char_id, false).await;
-        }
-        if let Err(error) = services::trade::on_leave(self).await {
-            let error = match error {
-                services::CallError::Internal(error) => error,
-                services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-            };
-            warn!(%error, "trade cleanup on leave failed");
-            if failure.is_none() { failure = Some(error); }
-        }
-        failure.map_or(Ok(()), Err)
+        let identity = Identity::of_client(self);
+        let system = self.session.int("solarsystemid");
+        let world = &self.world;
+        let client_id = self.login.client_id;
+        presence::leave(&identity, &self.db, world, &self.chat, &self.sde, system,
+            move || world.unobserve(client_id)).await
     }
 
     async fn handle(&mut self, p: Packet) -> Result<()> {

@@ -441,17 +441,38 @@ fn full_notice(flag: i32) -> &'static str {
     if flag == FLAG_MINING_HOLD { messages::MINING_HOLD_FULL } else { messages::CARGO_HOLD_FULL }
 }
 
+pub(crate) struct Extraction {
+    pub repeat: bool,
+    pub outcome: Option<crate::lua::events::ModuleCycleOutcome>,
+    pub error: Option<CallError>,
+}
+
+enum ExtractionDelivery {
+    InvalidSource,
+    Delivery(DeliveryOutcome),
+}
+
 /// The end of a mining cycle of `module` on rock `target`: move the yield to the hold.
 #[allow(clippy::too_many_arguments)]
-pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, module_type: i32, module_flag: i32, target: i64) -> Result<bool, CallError> {
-    let Some(type_id) = rock_type(target, system) else { return Ok(false) };
-    let Some(gap) = world.with(system, move |s| {
-        let (me, it) = (s.ball(ship)?, s.ball(target)?);
-        Some(dist(s.sample_position(ship)?, s.sample_position(target)?) - me.radius as f64 - it.radius as f64)
-    }).await.flatten() else { return Ok(false) };
+pub(crate) async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, module_type: i32, module_flag: i32, target: i64) -> Result<Extraction, CallError> {
+    use crate::lua::events::ModuleCycleOutcome;
+    let facts = world.with(system, move |s| {
+        let me = s.ball(ship)?;
+        let position = s.sample_position(ship)?;
+        Some((me.char_id == Some(char_id), match s.ball(target) {
+            None => Some(None),
+            Some(it) => s.sample_position(target).map(|target_position| Some(
+                dist(position, target_position) - me.radius as f64 - it.radius as f64
+            )),
+        }))
+    }).await.flatten();
+    let Some((source_valid, Some(gap))) = facts else { return Ok(Extraction { repeat: false, outcome: None, error: None }) };
+    let target_lost = source_valid.then_some(ModuleCycleOutcome::TargetLost);
+    let Some(gap) = gap else { return Ok(Extraction { repeat: false, outcome: target_lost, error: None }) };
+    let Some(type_id) = rock_type(target, system) else { return Ok(Extraction { repeat: false, outcome: target_lost, error: None }) };
     if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
         tell(notify, messages::TARGET_OUTSIDE_MINING_RANGE);
-        return Ok(false);
+        return Ok(Extraction { repeat: false, outcome: None, error: None });
     }
     let volume = world.sde().types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {type_id}")))?.volume.unwrap_or(1.0).max(0.01);
     let values = yield_values(fit, Key::Module(module));
@@ -460,7 +481,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     let world = world.clone();
     let notify = notify.clone();
     tokio::spawn(async move {
-        let result: Result<bool, CallError> = async {
+        let result: Result<Extraction, CallError> = async {
             let _lock = super::market::lock().await;
             let pending = yield_intent(values, target, type_id, volume);
             let sde = world.sde().clone();
@@ -469,14 +490,14 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
                     let pending = pending.clone();
                     let sde = sde.clone();
                     Box::pin(async move {
-                        if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Ok(DeliveryOutcome::Missing); }
+                        if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Ok(ExtractionDelivery::InvalidSource); }
                         let hull = super::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next();
                         if !hull.is_some_and(|h| h.owner_id == char_id && h.location_id == system && h.singleton && h.category_id == i64::from(crate::consts::CATEGORY_SHIP))
                             || !super::inventory::is_fitting_flag(module_flag)
                             || !crate::dao::items::mining::lock_module(tx, char_id, ship, module, module_type, module_flag).await.map_err(db_err)? {
-                            return Ok(DeliveryOutcome::Missing);
+                            return Ok(ExtractionDelivery::InvalidSource);
                         }
-                        deliver(tx, outbox, &sde, char_id, ship, system, module, &pending, destination).await
+                        deliver(tx, outbox, &sde, char_id, ship, system, module, &pending, destination).await.map(ExtractionDelivery::Delivery)
                     })
                 },
                 |value, outbox| {
@@ -486,21 +507,27 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
                     }
                 },
             ).await?;
-            match result {
-                DeliveryOutcome::Missing => Ok(false),
-                DeliveryOutcome::Depleted { rock } => { reconcile_depleted(&db, &world, rock).await?; Ok(false) }
-                DeliveryOutcome::NoYield => Ok(true),
-                DeliveryOutcome::Full { flag } => {
-                    tell(&notify, full_notice(flag));
-                    Ok(false)
+            let (repeat, outcome, error) = match result {
+                ExtractionDelivery::InvalidSource => (false, None, None),
+                ExtractionDelivery::Delivery(DeliveryOutcome::Missing) => (false, target_lost, None),
+                ExtractionDelivery::Delivery(DeliveryOutcome::Depleted { rock }) => {
+                    let error = reconcile_depleted(&db, &world, rock).await.err();
+                    (false, target_lost, error)
                 }
-                DeliveryOutcome::Delivered(result) => {
+                ExtractionDelivery::Delivery(DeliveryOutcome::NoYield) => (true, Some(ModuleCycleOutcome::Completed), None),
+                ExtractionDelivery::Delivery(DeliveryOutcome::Full { flag }) => {
+                    tell(&notify, full_notice(flag));
+                    (false, Some(ModuleCycleOutcome::CargoFull), None)
+                }
+                ExtractionDelivery::Delivery(DeliveryOutcome::Delivered(result)) => {
                     let repeat = result.repeat();
                     if result.full { tell(&notify, full_notice(destination.0)); }
-                    delivered(&db, &world, system, char_id, result).await?;
-                    Ok(repeat)
+                    let error = delivered(&db, &world, system, char_id, result).await.err();
+                    (repeat && error.is_none(), Some(ModuleCycleOutcome::Completed), error)
                 }
-            }
+            };
+            if let Some(error) = &error { warn!(module, ?error, "mining extraction failed"); }
+            Ok(Extraction { repeat, outcome, error })
         }.await;
         if let Err(error) = &result { warn!(module, ?error, "mining extraction failed"); }
         result

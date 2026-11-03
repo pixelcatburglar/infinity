@@ -45,7 +45,7 @@ async fn apply_damage_guarded(
             crate::services::crimewatch::aggress(db, world, system, attacker, ship_type, weapon, pilot, target).await?;
         }
         if !guard_valid(world, system, &guard).await { break; }
-        let dealt = damage(db, world, system, target, raw, attacker).await?;
+        let dealt = damage(db, world, system, target, raw, attacker, Some(ship)).await?;
         super::weapons::report_hit(world, ship, target, attacker, pilot, weapon, dealt, super::weapons::hit_quality(1.0));
     }
     Ok(())

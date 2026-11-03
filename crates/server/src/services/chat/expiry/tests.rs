@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{services::{CallError, chat::authority::RoomConfig, tests::fixture}, session::ChatSession};
 
 fn session(id: i64) -> ChatSession {
-    ChatSession { character_id: id, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
+    ChatSession { character_id: id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
 }
 
 async fn job(db: &Db, room: &str, target: i64, kind: Restriction) -> Option<Job> {

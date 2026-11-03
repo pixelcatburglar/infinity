@@ -301,7 +301,7 @@ mod fleet_mgr;
 mod fleet_object_handler;
 mod fleet_proxy;
 pub(crate) mod lifecycle;
-pub(super) mod warp;
+pub(crate) mod warp;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {

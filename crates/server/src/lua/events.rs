@@ -4,6 +4,26 @@
 
 use mlua::{Lua, Table};
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ModuleCycleOutcome {
+    Completed,
+    TargetLost,
+    OutOfCapacitor,
+    CargoFull,
+}
+
+impl mlua::IntoLua for ModuleCycleOutcome {
+    fn into_lua(self, lua: &Lua) -> mlua::Result<mlua::Value> {
+        let value = match self {
+            Self::Completed => "completed",
+            Self::TargetLost => "target_lost",
+            Self::OutOfCapacitor => "out_of_capacitor",
+            Self::CargoFull => "cargo_full",
+        };
+        Ok(mlua::Value::String(lua.create_string(value)?))
+    }
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum GameEvent {
@@ -22,6 +42,10 @@ pub enum GameEvent {
     MissionAccepted { char_id: i64, agent_id: i64, mission_id: i32 },
     MissionCompleted { char_id: i64, agent_id: i64, mission_id: i32 },
     BallparkBound { char_id: i64, system_id: i64 },
+    Targeted { char_id: i64, by_ball_id: i64, system_id: i64 },
+    Damaged { char_id: i64, ship_id: i64, attacker_ball_id: i64, system_id: i64 },
+    ModuleCycleEnded { char_id: i64, module_item_id: i64, effect_id: i64, outcome: ModuleCycleOutcome },
+    WarpArrived { char_id: i64, system_id: i64 },
 }
 
 macro_rules! events {
@@ -55,6 +79,10 @@ events! {
     MarketOrderFilled { order_id, buyer_id, seller_id, type_id, quantity, price },
     MissionAccepted { char_id, agent_id, mission_id }, MissionCompleted { char_id, agent_id, mission_id },
     BallparkBound { char_id, system_id },
+    Targeted { char_id, by_ball_id, system_id },
+    Damaged { char_id, ship_id, attacker_ball_id, system_id },
+    ModuleCycleEnded { char_id, module_item_id, effect_id, outcome },
+    WarpArrived { char_id, system_id },
 }
 
 #[cfg(test)]

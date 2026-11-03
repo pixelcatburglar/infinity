@@ -238,24 +238,17 @@ async fn presence(c: &mut Conn, el: &Element) -> Result<()> {
     if nick != s.character_id.to_string() { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
     if el.attr("type") == Some("unavailable") {
         let mut rooms = c.hub.rooms.lock().unwrap();
-        if let Some(occ) = rooms.entries.get_mut(room) { if occ.get(nick).is_some_and(|o| o.full_jid == full && o.tx.same_channel(&c.tx)) { occ.remove(nick); let p = format!("<presence from='{}' type='unavailable'><x xmlns='{USER}'><item affiliation='none' role='none'/></x></presence>", esc(to)); let _ = c.tx.send(p.clone()); for o in occ.values() { let _ = o.tx.send(p.clone()); } } }
+        if let Some(occ) = rooms.entries.get_mut(room) { if occ.get(nick).is_some_and(|o| o.matches_socket(&full, &c.tx)) { occ.remove(nick); let p = format!("<presence from='{}' type='unavailable'><x xmlns='{USER}'><item affiliation='none' role='none'/></x></presence>", esc(to)); let _ = c.tx.send(p.clone()); for o in occ.values() { o.send(p.clone()); } } }
         return Ok(());
     }
     if el.attr("type").is_some() { error(c, el, "feature-not-implemented", ""); return Ok(()) }
     if el.child("x").and_then(|x| x.child("password")).is_some_and(|p| !p.text.is_empty()) { error(c, el, "feature-not-implemented", text::UNSUPPORTED_PASSWORD); return Ok(()) }
-    let epoch = c.hub.rooms.lock().unwrap().epoch;
-    let admission = authority::admit(&c.hub.db, c.hub.world.sde(), &s, name).await;
-    let admission = match admission { Ok(Some(admission)) => admission, Ok(None) => { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }, Err(e) => { domain_error(c, el, e); return Ok(()) } };
-    let mut rooms = c.hub.rooms.lock().unwrap();
-    if rooms.epoch != epoch || c.hub.world.chat_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
-    let occ = rooms.entries.entry(room.to_owned()).or_default();
-    if occ.get(nick).is_some_and(|o| o.full_jid != full || !o.tx.same_channel(&c.tx)) { error(c, el, "conflict", ""); return Ok(()) }
-    for (n, o) in occ.iter() { let _ = c.tx.send(format!("<presence from='{}' to='{}'><x xmlns='{USER}'><item affiliation='{}' role='{}' jid='{}'/></x>{}</presence>", esc(&format!("{room}/{n}")), esc(&full), esc(&o.affiliation), esc(&o.role), esc(&o.full_jid), c.hub.profile(n))); }
-    let p = format!("<presence from='{}'><x xmlns='{USER}'><item affiliation='{}' role='{}' jid='{}'/></x>{}</presence>", esc(to), esc(&admission.affiliation), esc(&admission.role), esc(&full), c.hub.profile(nick));
-    for o in occ.values() { let _ = o.tx.send(p.clone()); }
-    occ.insert(nick.to_owned(), Occupant { full_jid: full.clone(), tx: c.tx.clone(), affiliation: admission.affiliation.clone(), role: admission.role.clone() });
-    let _ = c.tx.send(format!("<presence id='{}' from='{}' to='{}'><x xmlns='{USER}'><item affiliation='{}' role='{}' jid='{}'/><status code='{MUC_SELF_PRESENCE}'/></x>{}</presence>", esc(el.attr("id").unwrap_or("")), esc(to), esc(&full), esc(&admission.affiliation), esc(&admission.role), esc(&full), c.hub.profile(nick)));
-    let _ = c.tx.send(format!("<message from='{}' to='{}' type='groupchat'><subject>{}</subject></message>", esc(room), esc(&full), esc(&admission.motd)));
+    match c.hub.join_room(&s, name, &full, Some((&c.tx, el.attr("id").unwrap_or("")))).await {
+        Ok(_) => (),
+        Err(rooms::JoinError::Forbidden) => error(c, el, "forbidden", text::FORBIDDEN),
+        Err(rooms::JoinError::Conflict) => error(c, el, "conflict", ""),
+        Err(rooms::JoinError::Domain(e)) => domain_error(c, el, e),
+    }
     Ok(())
 }
 
@@ -279,7 +272,7 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
             }
             return Ok(());
         }
-        let occupied = { let rooms = c.hub.rooms.lock().unwrap(); rooms.epoch == epoch && c.hub.world.chat_session(s.character_id).as_ref() == Some(&s) && rooms.entries.get(room).and_then(|o| o.get(&s.character_id.to_string())).is_some_and(|o| o.full_jid == full && o.tx.same_channel(&c.tx)) };
+        let occupied = { let rooms = c.hub.rooms.lock().unwrap(); rooms.epoch == epoch && c.hub.world.chat_session(s.character_id).as_ref() == Some(&s) && rooms.entries.get(room).and_then(|o| o.get(&s.character_id.to_string())).is_some_and(|o| o.matches_socket(&full, &c.tx)) };
         if !occupied { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
         if let Some(x) = el.child("x").filter(|x| x.attr("xmlns") == Some(USER)) {
             if let Some(invite) = x.child("invite") {
@@ -294,7 +287,7 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
             if admitted.role == "visitor" || admitted.role == "none" { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
             let rooms = c.hub.rooms.lock().unwrap();
             if rooms.epoch != epoch || c.hub.world.chat_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
-            if let Some(occ) = rooms.entries.get(room) { if occ.get(&s.character_id.to_string()).is_some_and(|o| o.full_jid == full && o.tx.same_channel(&c.tx)) { let from = format!("{room}/{}", s.character_id); for o in occ.values() { let _ = o.tx.send(el.to_xml_with(&[("from", &from), ("to", &o.full_jid)])); } } }
+            if let Some(occ) = rooms.entries.get(room) { if occ.get(&s.character_id.to_string()).is_some_and(|o| o.matches_socket(&full, &c.tx)) { let from = format!("{room}/{}", s.character_id); for o in occ.values() { o.send(el.to_xml_with(&[("from", &from), ("to", &o.full_jid)])); } } }
         } else { error(c, el, "feature-not-implemented", ""); }
         return Ok(());
     }

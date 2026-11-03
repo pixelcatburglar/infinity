@@ -35,7 +35,7 @@ impl MiningFixture {
         Fit::load_in_space(&self.f.db, &self.f.world, self.f.system, self.f.owner, self.f.ship).await.map_err(|e| anyhow::anyhow!("fit: {e:?}"))
     }
 
-    async fn extract(&self, fit: &Fit, notify: &crate::space::NotifyTx) -> anyhow::Result<bool> {
+    async fn extract(&self, fit: &Fit, notify: &crate::space::NotifyTx) -> anyhow::Result<Extraction> {
         extract(&self.f.db, &self.f.world, notify, self.f.owner, self.f.ship, self.f.system, fit, self.module, self.module_type, FLAG_HI_SLOT_FIRST, self.rock).await.map_err(|e| anyhow::anyhow!("extract: {e:?}"))
     }
 
@@ -61,6 +61,11 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
     let result: anyhow::Result<()> = async {
         let fit = m.fit().await?;
         let (notify, mut direct) = tokio::sync::mpsc::unbounded_channel();
+        let missing_target = -1;
+        let target = extract(&m.f.db, &m.f.world, &notify, m.f.owner, m.f.ship, m.f.system, &fit, m.module, m.module_type, FLAG_HI_SLOT_FIRST, missing_target).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(!target.repeat && target.outcome == Some(crate::lua::events::ModuleCycleOutcome::TargetLost));
+        let source = extract(&m.f.db, &m.f.world, &notify, m.f.owner, -1, m.f.system, &fit, m.module, m.module_type, FLAG_HI_SLOT_FIRST, missing_target).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(!source.repeat && source.outcome.is_none());
         let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
         m.f.world.register_pilot(m.f.owner, pilot);
         let before = m.snapshot().await?;
@@ -76,20 +81,24 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
             m.f.db.execute(sql, &[&m.module]).await?;
             let rejected = m.extract(&fit, &notify).await;
             m.f.db.execute("UPDATE game.items SET online=true,location_id=$2,flag_id=$3,owner_id=$4,singleton=true WHERE item_id=$1", &[&m.module, &m.f.ship, &FLAG_HI_SLOT_FIRST, &m.f.owner]).await?;
-            anyhow::ensure!(!rejected?, "stale module accepted: {sql}");
+            let rejected = rejected?;
+            anyhow::ensure!(!rejected.repeat && rejected.outcome.is_none(), "stale module accepted: {sql}");
             anyhow::ensure!(m.snapshot().await? == before, "stale module changed resources: {sql}");
             anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "stale module emitted notification: {sql}");
         }
         m.f.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&m.module, &other_type]).await?;
         let type_result = m.extract(&fit, &notify).await;
         m.f.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&m.module, &m.module_type]).await?;
-        anyhow::ensure!(!type_result? && m.snapshot().await? == before, "changed type accepted");
+        let type_result = type_result?;
+        anyhow::ensure!(!type_result.repeat && type_result.outcome.is_none() && m.snapshot().await? == before, "changed type accepted");
         m.f.db.execute("UPDATE game.items SET singleton=false WHERE item_id=$1", &[&m.f.ship]).await?;
         let hull_result = m.extract(&fit, &notify).await;
         m.f.db.execute("UPDATE game.items SET singleton=true WHERE item_id=$1", &[&m.f.ship]).await?;
-        anyhow::ensure!(!hull_result? && m.snapshot().await? == before, "invalid hull accepted");
+        let hull_result = hull_result?;
+        anyhow::ensure!(!hull_result.repeat && hull_result.outcome.is_none() && m.snapshot().await? == before, "invalid hull accepted");
         m.f.db.execute("DELETE FROM game.items WHERE item_id=$1", &[&m.module]).await?;
-        anyhow::ensure!(!m.extract(&fit, &notify).await? && m.snapshot().await? == before, "missing module accepted");
+        let missing = m.extract(&fit, &notify).await?;
+        anyhow::ensure!(!missing.repeat && missing.outcome.is_none() && m.snapshot().await? == before, "missing module accepted");
         anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "refusal emitted notification");
         Ok(())
     }.await;
@@ -227,7 +236,7 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
         match tokio::time::timeout(WAIT, &mut handle).await {
             Ok(joined) => joined.map_err(|e| anyhow::anyhow!("extraction task: {e}"))
                 .and_then(|r| r.map_err(|e| anyhow::anyhow!("extract: {e:?}")))
-                .and_then(|repeat| if repeat { Err(anyhow::anyhow!("stale extraction repeated")) } else { Ok(()) }),
+                .and_then(|result| if result.repeat || result.outcome.is_some() { Err(anyhow::anyhow!("stale extraction repeated or classified")) } else { Ok(()) }),
             Err(_) => {
                 handle.abort();
                 let _ = handle.await;

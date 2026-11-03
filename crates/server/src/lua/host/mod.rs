@@ -5,6 +5,7 @@
 pub mod client;
 mod dao;
 mod log;
+pub(crate) mod pilots;
 mod sde;
 mod store;
 mod time;
@@ -19,6 +20,7 @@ pub struct Resources {
     pub db: Db,
     pub sde: Arc<Sde>,
     pub world: Arc<World>,
+    pub(crate) pilots: Arc<pilots::Pilots>,
     pub store_value_limit_bytes: usize,
 }
 
@@ -55,6 +57,7 @@ pub fn register(lua: &Lua, env: &Table, script: &str, config: &toml::Table, reso
     sde::register(lua, env, &resources.sde)?;
     log::register(lua, env, script)?;
     time::register(lua, env, &resources.world)?;
+    pilots::register(lua, env, resources)?;
     store::register(lua, env, &resources.db, script, resources.store_value_limit_bytes)
 }
 

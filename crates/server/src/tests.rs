@@ -2,6 +2,8 @@
 
 use std::sync::Once;
 
+mod lua_events;
+
 pub(crate) fn init_config() -> &'static crate::config::game::GameConfig {
     static INIT: Once = Once::new();
     INIT.call_once(|| {

@@ -7,6 +7,7 @@
 //! NPC repairs use the damage cache in the system actor and are not persisted; missing
 //! cache entries represent undamaged NPCs. Persistent unpiloted ships use the fitted
 //! ship condition cache and commit damage and repairs before publishing health.
+//! Positive pilot damage with a supplied source ball emits after actor health update or actual removal.
 use super::*;
 use crate::consts::CATEGORY_MODULE;
 
@@ -408,7 +409,7 @@ async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball:
 
 /// Damage a player's ship; at zero structure it explodes and its pilot is told to eject
 /// (`__ship_destroyed`, handled by the pilot's connection).
-pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
+pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, raw: [f64; 4], attacker: Option<i64>, attacker_ball_id: Option<i64>) -> Result<f64, CallError> {
     let _lock = super::super::market::lock().await;
     if world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
         return Ok(0.0);
@@ -441,11 +442,21 @@ pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64
     world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
     if cond.now[2] <= 0.0 {
         info!("ship {ship} of {char_id} destroyed");
-        destroy_player_ship(world, system, ship, char_id).await;
+        let removed = destroy_player_ship(world, system, ship, char_id).await;
+        if let Some(attacker_ball_id) = attacker_ball_id.filter(|_| removed && dealt > 0.0) {
+            crate::lua::on_event(crate::lua::events::GameEvent::Damaged { char_id, ship_id: ship, attacker_ball_id, system_id: system });
+        }
     } else {
         let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
         state().condition.insert(ship, cond);
-        world.set_health(system, ship, health);
+        world.post(system, move |s| {
+            s.set_health(ship, health);
+            if s.ball(ship).is_some_and(|ball| ball.char_id == Some(char_id)) {
+                if let Some(attacker_ball_id) = attacker_ball_id.filter(|_| dealt > 0.0) {
+                    crate::lua::on_event(crate::lua::events::GameEvent::Damaged { char_id, ship_id: ship, attacker_ball_id, system_id: system });
+                }
+            }
+        });
     }
     Ok(dealt)
 }
@@ -456,10 +467,10 @@ pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64
 
 /// Damage whatever `target` is: a player's ship or an NPC. `attacker` is the pilot
 /// responsible, if any (NPCs remember them; kills pay them).
-pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>) -> Result<f64, CallError> {
+pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>, attacker_ball_id: Option<i64>) -> Result<f64, CallError> {
     let Some(char_id) = world.with(system, move |s| s.ball(target).map(|ball| ball.char_id)).await.flatten() else { return Ok(0.0) };
     match char_id {
-        Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker).await,
+        Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker, attacker_ball_id).await,
         None => match super::unpiloted::damage(db, world, system, target, raw).await? {
             Some(dealt) => Ok(dealt),
             None => damage_npc(db, world, system, target, raw, attacker).await,

@@ -1,6 +1,7 @@
 //! The beyonce remote ballpark service uses the space actor and SDE gate data.
 //! Belt rats spawn after actual warp exit; pending callbacks do not survive cancellation or restart.
 //! Explicit stop and movement commands cancel an arrival jump cloak.
+//! Warp target visibility comes from the space actor, independently of client observers.
 use super::*;
 
 pub(crate) fn stop(identity: &Identity, world: &space::World, space_system: Option<i64>) -> CallResult {
@@ -43,7 +44,7 @@ pub(crate) async fn warp_to_ball(
     let found = if let Some(sys) = space_system {
         world.with(sys, move |s| {
             let b = if by_pilot { s.pilot_ball(target) } else { s.ball(target) }?;
-            if !s.fleet_broadcast_visible(me, b.id)
+            if !s.visible_to(me, b.id)
                 || (by_pilot && (b.char_id != Some(target) || b.owner_id != target)) { return None; }
             Some((b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
         }).await.flatten()

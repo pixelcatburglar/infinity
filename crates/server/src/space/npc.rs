@@ -333,6 +333,11 @@ impl System {
         if valid {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
             brain.announced = true;
+            if let Some(char_id) = self.ball(ship).and_then(|ball| ball.char_id) {
+                crate::lua::on_event(crate::lua::events::GameEvent::Targeted {
+                    char_id, by_ball_id: id, system_id: self.id,
+                });
+            }
             self.npc_effect(&brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap(), generation: brain.target_generation });
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         } else if current {

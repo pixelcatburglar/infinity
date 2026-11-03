@@ -27,6 +27,28 @@ fn presence_tracks_live_replaced_and_removed_channels() {
 }
 
 #[test]
+fn station_guests_only_include_live_matching_sessions() {
+    let pilots = Pilots::default();
+    let session = |id, station| crate::session::ChatSession {
+        character_id: id, station_id: station, system_id: None, corporation_id: None,
+        alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+    };
+    let mut receivers = Vec::new();
+    for (key, value) in [(1, Some(session(1, Some(10)))), (2, Some(session(2, Some(20)))),
+        (3, None), (4, Some(session(5, Some(10)))), (5, Some(session(5, Some(10))))] {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        pilots.register_pilot(key, tx);
+        pilots.set_chat_session(key, value);
+        receivers.push(rx);
+    }
+    drop(receivers.pop());
+    assert_eq!(pilots.station_guests(10), vec![session(1, Some(10))]);
+    assert_eq!(pilots.station_guests(20), vec![session(2, Some(20))]);
+    pilots.unregister_pilot(1);
+    assert!(pilots.station_guests(10).is_empty());
+}
+
+#[test]
 fn integrate_zero_time_preserves_state_before_division() {
     let position = [1.0, -2.0, 3.0];
     let velocity = [4.0, 5.0, -6.0];

@@ -70,7 +70,7 @@ async fn scanner(effect_id: i32) {
             let cap = groups_health::capacitor_snapshot(&test_db, &test_world, 1, foreign.ship).await.ok().flatten().unwrap();
             assert!(groups_health::tests::drain_exact(&test_db, &test_world, 1, foreign.ship, cap.capacity / 2.0).await.ok().unwrap() > 0.0);
         }
-        assert_eq!(scan::end(&cx, &fit, &mut cycle).await.ok().unwrap(), CycleOutcome::Stop("scan complete"));
+        assert_eq!(scan::end(&cx, &fit, &mut cycle).await.ok().unwrap(), CycleOutcome::Ended { reason: "scan complete", outcome: crate::lua::events::ModuleCycleOutcome::Completed });
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         match effect_id {
             EFFECT_CARGO_SCAN => {
@@ -87,6 +87,14 @@ async fn scanner(effect_id: i32) {
                 assert_eq!(args[3], Value::list([Value::tuple([Value::Int(i64::from(module)), Value::Int(1)])]));
             }
             _ => assert!(events.is_empty(), "survey completion must not push a result"),
+        }
+        if target.is_some() {
+            while rx.try_recv().is_ok() {}
+            combat::state().active.get_mut(&f.module).unwrap().stop = Arc::new(AtomicBool::new(false));
+            assert!(!cycle.stop.load(Ordering::Relaxed));
+            assert_eq!(scan::end(&cx, &fit, &mut cycle).await.ok().unwrap(), CycleOutcome::Stop("scan complete"));
+            assert!(rx.try_recv().is_err(), "stale scan must not notify");
+            combat::state().active.get_mut(&f.module).unwrap().stop = cycle.stop.clone();
         }
         let stop_cx = cx.clone();
         test_world.with(1, move |s| scan::stop(s, &stop_cx, &cycle)).await.unwrap();

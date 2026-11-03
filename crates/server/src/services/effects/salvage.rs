@@ -13,6 +13,7 @@ use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, db_er
 use crate::space::{dist, Ball, System, MODE_RIGID, MODE_WARP};
 use marshal::Value;
 use std::sync::Arc;
+use crate::lua::events::ModuleCycleOutcome;
 
 /// SDE dgmAttributeTypes: accessDifficulty, highIsGood=true, unit 121 (realPercent).
 /// The additive sign and percent scaling are server policy.
@@ -54,7 +55,8 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
 }
 
 pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
-    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? || validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(CycleOutcome::Stop("target lost")); }
+    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? { return Ok(CycleOutcome::Stop("target lost")); }
+    if validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(super::lifecycle::target_loss(cycle).await); }
     if cycle.cycles == 0 {
         if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) {
             let (modules, ship, target, duration, repeat, offensive) = (cycle.modules.clone(), cx.ship_id, cycle.target, cycle.duration_ms, cycle.repeat, cycle.effect.has(EffectFlag::Offensive));
@@ -66,14 +68,15 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
 
 pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let Some(target) = cycle.target else { return Ok(CycleOutcome::Stop("target lost")); };
-    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? || validate(cx, fit, &cycle.modules[0], &cycle.effect, Some(target)).await.is_err() { return Ok(CycleOutcome::Stop("target lost")); }
+    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? { return Ok(CycleOutcome::Stop("target lost")); }
+    if validate(cx, fit, &cycle.modules[0], &cycle.effect, Some(target)).await.is_err() { return Ok(super::lifecycle::target_loss(cycle).await); }
     let (source, character, master, generation, range) = (cx.ship_id, cx.char_id, cycle.modules[0].id, cycle.stop.clone(), range(fit, &cycle.modules[0], &cycle.effect));
     let generation_check = generation.clone();
     let ball = cx.world.with(cx.system_id, move |s| {
         if !active(master, &generation_check, character, target) { return None; }
         target_ball(s, source, target, range)
     }).await.flatten();
-    let Some(ball) = ball else { return Ok(CycleOutcome::Stop("target lost")); };
+    let Some(ball) = ball else { return Ok(super::lifecycle::target_loss(cycle).await); };
     let sde = cx.world.sde().clone();
     let Some(difficulty) = sde.types.attribute(ball.type_id, ATTR_ACCESS_DIFFICULTY) else { return Ok(CycleOutcome::Stop("wreck difficulty missing")); };
     if rand01() >= chance(fit.value(Key::Module(master), ATTR_ACCESS_DIFFICULTY_BONUS), difficulty) { return Ok(CycleOutcome::Continue); }
@@ -152,7 +155,7 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
             Ok(value)
         },
     ).await?;
-    Ok(if outcome { CycleOutcome::Stop("salvage complete") } else { CycleOutcome::Stop("salvage unavailable") })
+    Ok(if outcome { CycleOutcome::Ended { reason: "salvage complete", outcome: ModuleCycleOutcome::Completed } } else { CycleOutcome::Stop("salvage unavailable") })
 }
 
 pub(super) fn stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {

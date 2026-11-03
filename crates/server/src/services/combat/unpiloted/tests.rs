@@ -74,14 +74,14 @@ async fn persistent_damage_repair_guard_and_death() {
         assert_eq!(groups_health::damage_npc(&d, &w, system, ship, [1e30, 0.0, 0.0, 0.0], None).await.unwrap(), 0.0);
         assert!(w.ball(system, ship).await.is_some());
         assert!(!state().hp.contains_key(&ship));
-        assert_eq!(groups_health::damage(&d, &w, system, ship, [0.0; 4], None).await.unwrap(), 0.0);
+        assert_eq!(groups_health::damage(&d, &w, system, ship, [0.0; 4], None, None).await.unwrap(), 0.0);
         assert!(w.ball(system, ship).await.unwrap().char_id.is_some());
         w.with(system, move |s| {
             let mut ball = s.take(ship).unwrap();
             ball.char_id = None;
             s.add_persistent_ship(ball);
         }).await.unwrap();
-        assert!(groups_health::damage(&d, &w, system, ship, [1.0, 0.0, 0.0, 0.0], None).await.unwrap() > 0.0);
+        assert!(groups_health::damage(&d, &w, system, ship, [1.0, 0.0, 0.0, 0.0], None, None).await.unwrap() > 0.0);
         let before_guard = fingerprint(&d, ship).await;
         let health_guard = w.ball(system, ship).await.unwrap().health;
         repair(&d, &w, system, ship, 0, 1.0, |_| false).await.unwrap();

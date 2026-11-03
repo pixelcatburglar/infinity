@@ -1,12 +1,13 @@
-//! Script access to sampled world state and fixed Rust actor operations.
+//! Script access to sampled world state, loaded SDE celestials and fixed Rust actor operations.
 //! Notifications use the pilot registry and space mutations use the system actor.
-//! Missing systems are never loaded by these operations; Lua never runs in an actor.
-//! Scheduled removal refuses persistent ship hulls, which require durable lifecycle handling.
+//! Observations never load missing systems; Lua never runs in an actor.
+//! Static observations use the loaded SDE, not runtime SQL. Scheduled removal refuses
+//! persistent ship hulls, which require durable lifecycle handling.
 //! Other balls, including persistent drones, remain eligible for scheduled removal.
 
 use std::sync::Arc;
 use mlua::{Lua, Result, Table, Value};
-use crate::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP}, lua::value::sequence, sde::Sde, space::{System, World}};
+use crate::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP, GROUP_ASTEROID_BELT}, lua::value::sequence, sde::Sde, space::{Ball, System, World}};
 use super::Resources;
 
 fn positive(id: i64) -> Result<i64> {
@@ -23,6 +24,36 @@ fn keys(table: &Table, allowed: &[&str]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ball_row(lua: &Lua, ball: Ball) -> Result<Table> {
+    let row = lua.create_table()?;
+    row.set("id", ball.id)?;
+    row.set("type_id", ball.type_id)?;
+    row.set("owner_id", ball.owner_id)?;
+    row.set("position", lua.create_sequence_from(ball.pos)?)?;
+    row.set("velocity", lua.create_sequence_from(ball.vel)?)?;
+    row.set("radius", ball.radius)?;
+    Ok(row)
+}
+
+fn celestial_rows(lua: &Lua, sde: &Sde, system: i64, belts: bool) -> Result<Table> {
+    positive(system)?;
+    let rows = lua.create_table()?;
+    for (index, celestial) in sde.map.celestials(system).filter(|celestial|
+        !belts || celestial.group_id == Some(i64::from(GROUP_ASTEROID_BELT))).enumerate() {
+        let row = lua.create_table()?;
+        row.set("id", celestial.item_id)?;
+        row.set("type_id", celestial.type_id)?;
+        row.set("group_id", celestial.group_id)?;
+        let position = lua.create_table()?;
+        position.raw_set(1, celestial.x)?;
+        position.raw_set(2, celestial.y)?;
+        position.raw_set(3, celestial.z)?;
+        row.set("position", position)?;
+        rows.raw_set(index + 1, row)?;
+    }
+    Ok(rows)
 }
 
 enum Operation {
@@ -96,18 +127,44 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> Result<
         async move {
             positive(system)?;
             positive(id)?;
-            handle.with(system, move |s| s.sampled_ball(id)).await.flatten().map(|ball| {
-                let row = lua.create_table()?;
-                row.set("id", ball.id)?;
-                row.set("type_id", ball.type_id)?;
-                row.set("owner_id", ball.owner_id)?;
-                row.set("position", lua.create_sequence_from(ball.pos)?)?;
-                row.set("velocity", lua.create_sequence_from(ball.vel)?)?;
-                row.set("radius", ball.radius)?;
-                Ok(row)
-            }).transpose()
+            handle.with(system, move |s| s.sampled_ball(id)).await.flatten()
+                .map(|ball| ball_row(&lua, ball)).transpose()
         }
     })?)?;
+    let handle = Arc::clone(&resources.world);
+    let sde = Arc::clone(&resources.sde);
+    table.set("balls", lua.create_async_function(move |lua, (system, filters): (i64, Option<Table>)| {
+        let handle = Arc::clone(&handle);
+        let sde = Arc::clone(&sde);
+        async move {
+            positive(system)?;
+            let (category, group) = if let Some(filters) = filters {
+                keys(&filters, &["category_id", "group_id"])?;
+                let category: Option<i32> = filters.raw_get("category_id")?;
+                let group: Option<i32> = filters.raw_get("group_id")?;
+                if let Some(id) = category { positive(i64::from(id))?; }
+                if let Some(id) = group { positive(i64::from(id))?; }
+                (category, group)
+            } else { (None, None) };
+            let balls = handle.with(system, move |s| {
+                s.balls().filter(|ball| {
+                    if category.is_none() && group.is_none() { return true; }
+                    sde.types.get(ball.type_id).is_some_and(|ty|
+                        category.is_none_or(|id| ty.category_id == Some(id))
+                            && group.is_none_or(|id| ty.group_id == Some(id)))
+                }).filter_map(|ball| s.sampled_ball(ball.id)).collect::<Vec<_>>()
+            }).await.unwrap_or_default();
+            let rows = lua.create_table()?;
+            for (index, ball) in balls.into_iter().enumerate() {
+                rows.raw_set(index + 1, ball_row(&lua, ball)?)?;
+            }
+            Ok(rows)
+        }
+    })?)?;
+    let sde = Arc::clone(&resources.sde);
+    table.set("celestials", lua.create_function(move |lua, system: i64| celestial_rows(lua, &sde, system, false))?)?;
+    let sde = Arc::clone(&resources.sde);
+    table.set("asteroid_belts", lua.create_function(move |lua, system: i64| celestial_rows(lua, &sde, system, true))?)?;
     let handle: Arc<World> = Arc::clone(&resources.world);
     let db = resources.db.clone();
     let sde = Arc::clone(&resources.sde);

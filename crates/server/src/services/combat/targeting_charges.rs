@@ -54,7 +54,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     add_target_ctx(&cx, target, false).await
 }
 
-pub(in crate::services) async fn add_target_ctx(cx: &Ctx, target: i64, silent: bool) -> CallResult {
+pub(crate) async fn add_target_ctx(cx: &Ctx, target: i64, silent: bool) -> CallResult {
     add_target_impl(cx, target, silent, None).await
 }
 
@@ -129,6 +129,11 @@ async fn add_target_impl(cx: &Ctx, target: i64, silent: bool, owner: Option<(i64
             result
         };
         if added {
+            if let Some(char_id) = pilot {
+                crate::lua::on_event(crate::lua::events::GameEvent::Targeted {
+                    char_id, by_ball_id: ship_id, system_id: cx.system_id,
+                });
+            }
             notify_lock(target, ship_id, silent, |args| cx.notify("OnTarget", args), |args| {
                 if let Some(pilot) = pilot {
                     s.notify_pilot(pilot, "OnTarget", args);
@@ -157,8 +162,9 @@ fn notify_lock(target: i64, ship: i64, silent: bool, owner: impl FnOnce(Vec<Valu
     if !silent { other(vec![Value::str("otheradd"), Value::Int(ship)]); }
 }
 
-pub(super) fn drop_targets(c: &mut Client, targets: &[i64]) {
-    let Some(char_id) = c.session.int("charid") else { return };
+pub(crate) fn drop_targets(identity: &Identity, world: &World, space_system: Option<i64>, targets: &[i64], mut notify: impl FnMut(&str, Vec<Value>)) {
+    let char_id = identity.char_id;
+    if char_id == 0 { return; }
     let (removed, notices) = {
         let mut st = state();
         for target in targets { st.locking.remove(&(char_id, *target)); }
@@ -166,18 +172,18 @@ pub(super) fn drop_targets(c: &mut Client, targets: &[i64]) {
         let notices = take_announced(&mut st, |ch, target| ch == char_id && targets.contains(&target));
         (removed, notices)
     };
-    notify_lost(&c.world, notices);
-    remove_target_projections(c, removed);
+    notify_lost(world, notices);
+    remove_target_projections(identity, world, space_system, removed);
     for t in targets {
-        c.notify("OnTarget", vec![Value::str("lost"), Value::Int(*t), Value::None]);
+        notify("OnTarget", vec![Value::str("lost"), Value::Int(*t), Value::None]);
     }
 }
 
 /// Remove outgoing effects for locks removed by an explicit targeting operation.
-pub(super) fn remove_target_projections(c: &Client, targets: Vec<i64>) {
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return };
+pub(super) fn remove_target_projections(identity: &Identity, world: &World, space_system: Option<i64>, targets: Vec<i64>) {
+    let (Some(system), Some(ship)) = (space_system, identity.ship_id) else { return };
     if targets.is_empty() { return; }
-    c.world.post(system, move |s| remove_target_projections_in_system(s, ship, &targets));
+    world.post(system, move |s| remove_target_projections_in_system(s, ship, &targets));
 }
 
 fn remove_target_projections_in_system(s: &mut crate::space::System, ship: i64, targets: &[i64]) {

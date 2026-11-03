@@ -162,7 +162,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         if !range.is_finite() || range <= 0.0 { return Vec::new(); }
         s.balls().filter(|b| b.id != source_id && eligible(&sde, b) && (dist(a.pos, b.position_at(s.now_ms())) - f64::from(a.radius) - f64::from(b.radius)).max(0.0) <= range).filter_map(|b| s.sampled_ball(b.id)).map(|b| { let revision = s.projection_revision(b.id); (b, revision) }).collect()
     }).await.unwrap_or_default();
-    if !burst && candidates.is_empty() { return Ok(CycleOutcome::Stop("target lost")); }
+    if !burst && candidates.is_empty() { return Ok(super::lifecycle::target_loss(cycle).await); }
     for (victim, _) in candidates {
         let admitted = apply_one(&cx.db, &cx.world, cx.system_id, &src, &victim, Some((cx.char_id, cycle.stop.clone())), None).await?;
         if src.offensive {

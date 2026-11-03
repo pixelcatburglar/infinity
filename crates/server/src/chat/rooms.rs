@@ -1,9 +1,73 @@
 //! Runtime MUC occupant lifecycle for `xmppchatsvc.py` and room settings clients.
 //! Authority and durable ACLs live in chat services/DAO; cached occupant roles are
-//! refreshed after commits. Password rooms, corporate ACLs and proxy ownership
-//! are not supported by the domain.
+//! refreshed after commits. Virtual occupants have no transport and join only
+//! authority-derived system rooms; durable custom virtual rooms are unsupported.
+//! Password rooms, corporate ACLs and proxy ownership are unsupported.
 use super::*;
 use crate::services::{chat::authority, CallError};
+
+/// Server-designated XMPP resource for protocol metadata, not an authenticated socket.
+const VIRTUAL_RESOURCE: &str = "virtual";
+
+pub(super) enum JoinError { Forbidden, Conflict, Domain(CallError) }
+
+impl Hub {
+    pub(super) async fn join_room(&self, session: &crate::session::ChatSession, name: &str, full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
+        let epoch = self.rooms.lock().unwrap().epoch;
+        let admission = authority::admit(&self.db, self.world.sde(), session, name).await.map_err(JoinError::Domain)?.ok_or(JoinError::Forbidden)?;
+        self.commit_admissions(session, epoch, &[(name.to_owned(), admission)], full, real)
+    }
+
+    pub(super) fn commit_admissions(&self, session: &crate::session::ChatSession, epoch: u64, admissions: &[(String, authority::Admission)], full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
+        let nick = session.character_id.to_string();
+        let mut rooms = self.rooms.lock().unwrap();
+        if rooms.epoch != epoch || self.world.chat_session(session.character_id).as_ref() != Some(session) { return Err(JoinError::Forbidden); }
+        for (name, _) in admissions {
+            let room = format!("{name}@{}", self.conference());
+            if let Some(old) = rooms.entries.get(&room).and_then(|occupants| occupants.get(&nick)) {
+                match real {
+                    Some((tx, _)) if old.matches_socket(full, tx) => (),
+                    None if old.tx.is_none() && old.full_jid == full => (),
+                    _ => return Err(JoinError::Conflict),
+                }
+            }
+        }
+        for (name, admission) in admissions {
+            let room = format!("{name}@{}", self.conference());
+            let occupants = rooms.entries.entry(room.clone()).or_default();
+            if real.is_none() && occupants.get(&nick).is_some_and(|old| old.tx.is_none() && old.full_jid == full) { continue; }
+            if let Some((tx, _)) = real {
+                for (n, o) in occupants.iter() {
+                    let _ = tx.send(format!("<presence from='{}' to='{}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{}' role='{}' jid='{}'/></x>{}</presence>", esc(&format!("{room}/{n}")), esc(full), esc(&o.affiliation), esc(&o.role), esc(&o.full_jid), self.profile(n)));
+                }
+            }
+            let p = format!("<presence from='{}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{}' role='{}' jid='{}'/></x>{}</presence>", esc(&format!("{room}/{nick}")), esc(&admission.affiliation), esc(&admission.role), esc(full), self.profile(&nick));
+            for o in occupants.values() { o.send(p.clone()); }
+            occupants.insert(nick.clone(), Occupant { full_jid: full.to_owned(), tx: real.map(|(tx, _)| tx.clone()), affiliation: admission.affiliation.clone(), role: admission.role.clone() });
+            if let Some((tx, id)) = real {
+                let _ = tx.send(format!("<presence id='{}' from='{}' to='{}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{}' role='{}' jid='{}'/><status code='{MUC_SELF_PRESENCE}'/></x>{}</presence>", esc(id), esc(&format!("{room}/{nick}")), esc(full), esc(&admission.affiliation), esc(&admission.role), esc(full), self.profile(&nick)));
+                let _ = tx.send(format!("<message from='{}' to='{}' type='groupchat'><subject>{}</subject></message>", esc(&room), esc(full), esc(&admission.motd)));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn join_virtual(&self, character_id: i64) -> Result<(), CallError> {
+        let denied = || crate::services::notify_error(crate::messages::chat::FORBIDDEN);
+        let session = self.world.chat_session(character_id).filter(|s| s.character_id == character_id).ok_or_else(denied)?;
+        let epoch = self.rooms.lock().unwrap().epoch;
+        let full = format!("{character_id}@{}/{VIRTUAL_RESOURCE}", self.host);
+        let mut admissions = Vec::new();
+        for name in authority::system_channels(self.world.sde(), &session) {
+            let admission = authority::admit(&self.db, self.world.sde(), &session, &name).await?.ok_or_else(denied)?;
+            admissions.push((name, admission));
+        }
+        self.commit_admissions(&session, epoch, &admissions, &full, None)
+            .map_err(|error| match error { JoinError::Domain(error) => error, JoinError::Forbidden | JoinError::Conflict => denied() })?;
+        Ok(())
+    }
+}
+
 
 fn unavailable(room: &str, nick: &str, destroy: bool) -> String {
     format!("<presence from='{}' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='none' role='none'/>{}</x></presence>", esc(&format!("{room}/{nick}")), if destroy { "<destroy/>" } else { "" })
@@ -18,8 +82,8 @@ impl Hub {
             for nick in gone {
                 if let Some(removed) = occupants.remove(&nick) {
                     let stanza = unavailable(room, &nick, destroy);
-                    let _ = removed.tx.send(stanza.clone());
-                    for occupant in occupants.values() { let _ = occupant.tx.send(stanza.clone()); }
+                    removed.send(stanza.clone());
+                    for occupant in occupants.values() { occupant.send(stanza.clone()); }
                 }
             }
         }
@@ -27,7 +91,7 @@ impl Hub {
     }
 
     pub(super) fn leave_all(&self, full_jid: &str, tx: &Tx) {
-        self.remove_matching(|_, _, o| o.full_jid == full_jid && o.tx.same_channel(tx), false);
+        self.remove_matching(|_, _, o| o.matches_socket(full_jid, tx), false);
     }
 
     pub(crate) fn disconnect_character(&self, id: i64) {
@@ -57,7 +121,7 @@ impl Hub {
         let room = format!("{channel}@{}", self.conference());
         let rooms = self.rooms.lock().unwrap();
         if let Some(occupants) = rooms.entries.get(&room) {
-            for o in occupants.values() { let _ = o.tx.send(format!("<message from='{}' to='{}' type='groupchat'><subject>{}</subject></message>", esc(&room), esc(&o.full_jid), esc(subject))); }
+            for o in occupants.values() { o.send(format!("<message from='{}' to='{}' type='groupchat'><subject>{}</subject></message>", esc(&room), esc(&o.full_jid), esc(subject))); }
         }
     }
 
@@ -83,19 +147,19 @@ impl Hub {
             let mut rooms = self.rooms.lock().unwrap();
             if rooms.epoch != epoch || self.world.chat_session(id) != session { continue; }
             let Some(occupants) = rooms.entries.get_mut(&room) else { break };
-            if !occupants.get(&nick).is_some_and(|o| o.full_jid == old.full_jid && o.tx.same_channel(&old.tx)) { break; }
+            if !occupants.get(&nick).is_some_and(|o| o.same_identity(&old)) { break; }
             if let Some(admission) = admission {
                 let o = occupants.get_mut(&nick).unwrap();
                 if o.role != admission.role || o.affiliation != admission.affiliation {
                     o.role = admission.role; o.affiliation = admission.affiliation;
                     let p = format!("<presence from='{}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{}' role='{}' jid='{}'/></x></presence>", esc(&format!("{room}/{nick}")), esc(&o.affiliation), esc(&o.role), esc(&o.full_jid));
-                    for target in occupants.values() { let _ = target.tx.send(p.clone()); }
+                    for target in occupants.values() { target.send(p.clone()); }
                 }
             } else {
                 let removed = occupants.remove(&nick).unwrap();
                 let p = unavailable(&room, &nick, false);
-                let _ = removed.tx.send(p.clone());
-                for target in occupants.values() { let _ = target.tx.send(p.clone()); }
+                removed.send(p.clone());
+                for target in occupants.values() { target.send(p.clone()); }
             }
             break;
           }

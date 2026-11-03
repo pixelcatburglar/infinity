@@ -42,7 +42,8 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
 }
 
 pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
-    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? || validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(CycleOutcome::Stop("target lost")); }
+    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? { return Ok(CycleOutcome::Stop("target lost")); }
+    if validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(super::lifecycle::target_loss(cycle).await); }
     let velocity = fit.value(Key::Module(cycle.modules[0].id), ATTR_MAX_TRACTOR_VELOCITY) as f32;
     if !velocity.is_finite() || velocity <= 0.0 { return Ok(CycleOutcome::Stop("invalid tractor velocity")); }
     let (target, master, generation, source, character, range) = (cycle.target.unwrap(), cycle.modules[0].id, cycle.stop.clone(), cx.ship_id, cx.char_id, range(fit, &cycle.modules[0], &cycle.effect));

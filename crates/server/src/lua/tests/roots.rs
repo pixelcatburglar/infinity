@@ -22,13 +22,13 @@ async fn list_shows_script_roots() {
         let mut config = Config::default();
         config.lua.scripts_dir = primary.to_string_lossy().into_owned();
         config.lua.mod_dirs = vec![extra.to_string_lossy().into_owned()];
-        start(&config, &db, &sde, &world).await.unwrap();
+        let chat = crate::chat::Hub::new(&config.chat.domain, db.clone(), world.clone());
+        start(&config, &db, &sde, &world, &chat).await.unwrap();
         let cfg = Arc::new(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: 1, user_name: "roots".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world, login);
         let list = command(&mut client, "lua", &["list".into()]).await.unwrap().unwrap();
         assert!(list.contains(&format!("script: primary root={}", primary.canonicalize().unwrap().display())));

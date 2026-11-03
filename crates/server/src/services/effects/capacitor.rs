@@ -68,7 +68,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
     }
     let (distance, target_drone) = match target_distance(cx, cycle.target).await {
         Ok(distance) => distance,
-        Err(CallError::User { .. }) => return Ok(CycleOutcome::Stop("target lost")),
+        Err(CallError::User { .. }) => return Ok(super::lifecycle::target_loss(cycle).await),
         Err(error) => return Err(error),
     };
     let target = cycle.target.expect("validated target");
@@ -89,7 +89,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         }
         EffectKind::Nosferatu => {
             let Some(source) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, cx.ship_id).await? else { return Ok(CycleOutcome::Stop("source lost")); };
-            let Some(victim) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, target).await? else { return Ok(CycleOutcome::Stop("target lost")); };
+            let Some(victim) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, target).await? else { return Ok(super::lifecycle::target_loss(cycle).await); };
             if nos_allowed(source.level, source.capacity, victim.level, victim.capacity, fit.value(key, ATTR_NOS_OVERRIDE) > 0.0) {
                 let amount = fit.value(key, ATTR_POWER_TRANSFER_AMOUNT).max(0.0) * scale;
                 if let Some((drained, owner)) = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await? {
