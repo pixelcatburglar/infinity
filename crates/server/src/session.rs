@@ -4,7 +4,7 @@ use marshal::Value;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ChatSession {
+pub(crate) struct OnlineSession {
     pub character_id: i64,
     pub station_id: Option<i64>,
     pub system_id: Option<i64>,
@@ -16,7 +16,7 @@ pub(crate) struct ChatSession {
     pub corporation_role: i64,
 }
 
-impl ChatSession {
+impl OnlineSession {
     pub fn from_session(session: &Session) -> Option<Self> {
         Some(Self {
             character_id: session.int("charid").filter(|id| *id > 0)?,

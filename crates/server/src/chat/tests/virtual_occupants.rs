@@ -1,6 +1,6 @@
 //! Virtual system-room occupants share the real XMPP presence stream.
 use super::{fixture, socket::{open, presence, read_until, Tasks}};
-use crate::{chat::Hub, db::Db, sde::Sde, services::chat::authority, session::ChatSession, space::World};
+use crate::{chat::Hub, db::Db, sde::Sde, services::chat::authority, session::OnlineSession, space::World};
 use marshal::Value;
 use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::mpsc};
@@ -16,7 +16,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap());
         let mut categories = std::collections::HashMap::new();
-        let mut session = ChatSession { character_id: virtual_char.id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+        let mut session = OnlineSession { character_id: virtual_char.id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
         for system in sde.map.systems() {
             session.system_id = Some(system.solar_system_id);
             if let Some(channel) = authority::system_channels(&sde, &session).first() {
@@ -34,7 +34,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
         let (notify, mut notifications) = mpsc::unbounded_channel();
         world.register_pilot(virtual_char.id, notify);
         session.system_id = Some(system);
-        world.set_chat_session(virtual_char.id, Some(session.clone()));
+        world.set_online_session(virtual_char.id, Some(session.clone()));
         hub.set_profile(virtual_char.id, "Virtual Pilot", 1, 1, None, None, 0);
         let channel = authority::system_channels(&sde, &session).into_iter().next().unwrap();
         let room = format!("{channel}@conference.chat.test");
@@ -73,7 +73,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
         assert!(hub.rooms.lock().unwrap().entries[&room][&virtual_char.id.to_string()].tx.is_none());
         let mut with_corp = session.clone();
         with_corp.corporation_id = Some(virtual_char.id);
-        world.set_chat_session(virtual_char.id, Some(with_corp.clone()));
+        world.set_online_session(virtual_char.id, Some(with_corp.clone()));
         let corp = format!("corp_{}", virtual_char.id);
         let corp_room = format!("{corp}@conference.chat.test");
         assert!(presence(&mut same, &corp_room, virtual_char.id, "corp-real").await.contains("code='110'"));
@@ -92,7 +92,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
             assert!(rooms.entries[&corp_room][&virtual_char.id.to_string()].tx.is_some());
             assert!(rooms.entries[&room][&virtual_char.id.to_string()].tx.is_none());
         }
-        world.set_chat_session(virtual_char.id, Some(session.clone()));
+        world.set_online_session(virtual_char.id, Some(session.clone()));
         let forged = presence(&mut socket, &room, virtual_char.id, "forged").await;
         assert!(forged.contains("type='error'"));
         socket.write_all(format!("<presence id='forged-leave' to='{room}/{}' type='unavailable'/>", virtual_char.id).as_bytes()).await.unwrap();
@@ -114,12 +114,12 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
         let (notify, receiver) = mpsc::unbounded_channel();
         world.register_pilot(virtual_char.id, notify);
         let _receiver = receiver;
-        world.set_chat_session(virtual_char.id, Some(session.clone()));
+        world.set_online_session(virtual_char.id, Some(session.clone()));
         hub.join_virtual(virtual_char.id).await.unwrap();
         let joined = read_until(&mut socket, "</presence>").await;
         assert!(joined.contains(&format!("{room}/{}", virtual_char.id)) && joined.contains("Virtual Pilot"));
         session.system_id = Some(other);
-        world.set_chat_session(virtual_char.id, Some(session.clone()));
+        world.set_online_session(virtual_char.id, Some(session.clone()));
         hub.session_changed(virtual_char.id);
         assert!(read_until(&mut socket, "</presence>").await.contains("type='unavailable'"));
         hub.join_virtual(virtual_char.id).await.unwrap();
@@ -134,7 +134,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
         for prefix in ["local", "nolocal", "wormhole", "triglavian"] {
             if let Some(&id) = categories.get(prefix) {
                 session.system_id = Some(id);
-                world.set_chat_session(virtual_char.id, Some(session.clone()));
+                world.set_online_session(virtual_char.id, Some(session.clone()));
                 hub.session_changed(virtual_char.id);
                 hub.join_virtual(virtual_char.id).await.unwrap();
                 let channel = authority::system_channels(&sde, &session).into_iter().next().unwrap();

@@ -500,7 +500,7 @@ pub(super) async fn invite(c: &mut Client, fleet_id: i64, target: i64, wing: Opt
     let name = crate::dao::characters::routing::character_name(&c.db, me).await.ok().flatten().unwrap_or_default();
     {
         let mut st = state();
-        if !valid_invite_target(me, target, c.world.is_online(target), c.world.chat_session(target).is_some()) {
+        if !valid_invite_target(me, target, c.world.is_online(target), c.world.online_session(target).is_some()) {
             return Err(notify_error(messages::fleets::INVALID_REQUEST));
         }
         if !st.is_member(fleet_id, me) { return Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)); }

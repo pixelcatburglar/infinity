@@ -2,10 +2,10 @@ use super::*;
 use super::super::fleet_proxy::{capacity, display, eligible, normalize, still_current};
 use crate::dao::characters::contacts::Contact;
 use crate::services::value_field;
-use crate::session::ChatSession;
+use crate::session::OnlineSession;
 
-fn session(id: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>) -> ChatSession {
-    ChatSession { character_id: id, station_id: None, system_id: Some(10), corporation_id: Some(corp), alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }
+fn session(id: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>) -> OnlineSession {
+    OnlineSession { character_id: id, station_id: None, system_id: Some(10), corporation_id: Some(corp), alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }
 }
 fn contact(id: i64, standing: f32) -> Contact {
     Contact { contact_id: id, relationship: standing, in_watchlist: false, label_mask: 0 }
@@ -92,7 +92,7 @@ async fn leader_transfer_withdraws_or_refreshes_advert() {
     let world = World::new(db, sde, 1);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(2, tx);
-    world.set_chat_session(2, Some(session(2, 12, Some(20), Some(30))));
+    world.set_online_session(2, Some(session(2, 12, Some(20), Some(30))));
     let mut f = Fleet::new(1, vec![]);
     f.options.registered = true;
     f.join_requests.insert(3, Value::None);
@@ -133,8 +133,8 @@ async fn application_becomes_normal_invitation_without_membership() {
     let (leader_tx, mut leader_rx) = tokio::sync::mpsc::unbounded_channel();
     let (applicant_tx, mut applicant_rx) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(leader, leader_tx); world.register_pilot(applicant, applicant_tx);
-    world.set_chat_session(leader, Some(session(leader, account, None, None)));
-    world.set_chat_session(applicant, Some(session(applicant, account, None, None)));
+    world.set_online_session(leader, Some(session(leader, account, None, None)));
+    world.set_online_session(applicant, Some(session(applicant, account, None, None)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();

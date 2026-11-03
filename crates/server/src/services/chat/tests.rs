@@ -1,10 +1,10 @@
 //! Durable chat authorization and manager RPC behavior.
 use super::authority::{self, RoomConfig};
-use crate::{dao::chat_channels as dao, db::Db, services::{Call, CallError}, session::ChatSession};
+use crate::{dao::chat_channels as dao, db::Db, services::{Call, CallError}, session::OnlineSession};
 use marshal::Value;
 
-fn session(id: i64) -> ChatSession {
-    ChatSession { character_id: id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
+fn session(id: i64) -> OnlineSession {
+    OnlineSession { character_id: id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
 }
 
 async fn rpc(c: &mut crate::client::Client, method: &str, args: &[Value]) -> Result<Value, CallError> {

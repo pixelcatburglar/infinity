@@ -117,12 +117,12 @@ impl Client {
     /// Change session attributes and queue a SessionChangeNotification for the client.
     pub fn change_session(&mut self, updates: Vec<(&str, Value)>) {
         let old_identity = Identity::of_client(self);
-        let old = crate::session::ChatSession::from_session(&self.session);
+        let old = crate::session::OnlineSession::from_session(&self.session);
         let change = self.session.apply(updates);
         if change.is_empty() {
             return;
         }
-        let new = crate::session::ChatSession::from_session(&self.session);
+        let new = crate::session::OnlineSession::from_session(&self.session);
         if old != new {
             let new_identity = Identity::of_client(self);
             if let Some(previous) = &old {

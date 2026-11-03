@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::dao::characters::{contacts, crimewatch, routing};
-use crate::session::ChatSession;
+use crate::session::OnlineSession;
 use crate::services::{db_err, value_field};
 use std::collections::{HashSet, VecDeque};
 
@@ -29,7 +29,7 @@ fn number(v: Option<&Value>) -> Option<Option<f64>> {
     match v { None | Some(Value::None) => Some(None), Some(v) => v.as_float().filter(|n| n.is_finite()).map(Some) }
 }
 fn opt_id(v: Option<i64>) -> Value { v.map(Value::Int).unwrap_or(Value::None) }
-fn leader_value(s: &ChatSession) -> Value {
+fn leader_value(s: &OnlineSession) -> Value {
     keyval([("charID", Value::Int(s.character_id)), ("corpID", opt_id(s.corporation_id)), ("allianceID", opt_id(s.alliance_id)), ("warFactionID", opt_id(s.faction_id))])
 }
 fn set(v: &mut Value, name: &str, value: Value) {
@@ -76,15 +76,15 @@ pub(super) fn capacity(f: &Fleet, ad: &Value) -> bool {
     let limit = field(ad, "advertJoinLimit").and_then(Value::as_int).map(|n| n as usize).unwrap_or(MAX_MEMBERS);
     f.members.len() < f.max_members.min(limit)
 }
-fn matches_group(scope: i64, leader: &ChatSession, applicant: &ChatSession) -> bool {
+fn matches_group(scope: i64, leader: &OnlineSession, applicant: &OnlineSession) -> bool {
     (scope & CORP != 0 && leader.corporation_id.is_some() && leader.corporation_id == applicant.corporation_id)
         || (scope & ALLIANCE != 0 && leader.alliance_id.is_some() && leader.alliance_id == applicant.alliance_id)
         || (scope & MILITIA != 0 && leader.faction_id.is_some() && leader.faction_id == applicant.faction_id)
 }
-fn identifiers(s: &ChatSession) -> impl Iterator<Item = i64> {
+fn identifiers(s: &OnlineSession) -> impl Iterator<Item = i64> {
     [Some(s.character_id), s.corporation_id, s.alliance_id, s.faction_id].into_iter().flatten()
 }
-pub(super) fn eligible(ad: &Value, leader: &ChatSession, applicant: &ChatSession, contacts: &[contacts::Contact], blocks: &[i64], reverse_blocks: &[i64], security: Option<f64>) -> Option<f64> {
+pub(super) fn eligible(ad: &Value, leader: &OnlineSession, applicant: &OnlineSession, contacts: &[contacts::Contact], blocks: &[i64], reverse_blocks: &[i64], security: Option<f64>) -> Option<f64> {
     if identifiers(applicant).any(|id| blocks.contains(&id)) || reverse_blocks.contains(&leader.character_id) { return None; }
     let scope = field(ad, "inviteScope").and_then(Value::as_int).unwrap_or(0);
     let group = matches_group(scope, leader, applicant);
@@ -107,7 +107,7 @@ fn distance(map: &crate::sde::map::Map, from: Option<i64>, to: Option<i64>) -> O
     }
     None
 }
-pub(super) fn display(mut ad: Value, fleet_id: i64, count: usize, leader: &ChatSession, standing: Option<f64>, jumps: Option<i64>, contacts: &[contacts::Contact], blocks: &[i64]) -> Value {
+pub(super) fn display(mut ad: Value, fleet_id: i64, count: usize, leader: &OnlineSession, standing: Option<f64>, jumps: Option<i64>, contacts: &[contacts::Contact], blocks: &[i64]) -> Value {
     set(&mut ad, "fleetID", Value::Int(fleet_id)); set(&mut ad, "leader", leader_value(leader));
     set(&mut ad, "solarSystemID", opt_id(leader.system_id)); set(&mut ad, "numMembers", Value::Int(count as i64));
     set(&mut ad, "standing", standing.map(Value::Float).unwrap_or(Value::None)); set(&mut ad, "numJumps", opt_id(jumps));
@@ -137,7 +137,7 @@ pub(super) fn leader_changed(world: &World, fleet: &mut Fleet, new_leader: i64) 
         fleet.advert = None; fleet.options.registered = false; fleet.join_requests.clear();
         broadcast(world, fleet, None, "OnFleetOptionsChanged", vec![old, options_value(&fleet.options)]);
     } else {
-        let session = world.chat_session(new_leader);
+        let session = world.online_session(new_leader);
         set(ad, "leader", session.as_ref().map(leader_value).unwrap_or(Value::None));
         set(ad, "solarSystemID", session.and_then(|s| s.system_id).map(Value::Int).unwrap_or(Value::None));
     }
@@ -159,7 +159,7 @@ pub(super) fn still_current(f: &Fleet, leader: i64, count: usize, ad: &Value) ->
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if call.service != "fleetProxy" { return None; }
     let me = c.session.int("charid").unwrap_or(0);
-    let applicant = match ChatSession::from_session(&c.session) { Some(s) => s, None => return Some(Err(invalid())) };
+    let applicant = match OnlineSession::from_session(&c.session) { Some(s) => s, None => return Some(Err(invalid())) };
     let own = || { let st = state(); st.of.get(&me).copied().filter(|id| st.is_member(*id, me)) };
     Some(match call.method {
         "GetAvailableFleetAds" => {
@@ -167,10 +167,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let mut ads = Vec::new();
             for id in ids {
                 let Some((leader, count, ad)) = snapshot(id) else { continue };
-                let Some(session) = c.world.chat_session(leader) else { continue };
+                let Some(session) = c.world.online_session(leader) else { continue };
                 let (contacts, blocks, reverse, security) = match facts(c, leader, me).await { Ok(v) => v, Err(e) => return Some(Err(e)) };
                 let Some(standing) = eligible(&ad, &session, &applicant, &contacts, &blocks, &reverse, security) else { continue };
-                if c.world.chat_session(leader).as_ref() != Some(&session) || !state().fleets.get(&id).is_some_and(|f| still_current(f, leader, count, &ad)) { continue; }
+                if c.world.online_session(leader).as_ref() != Some(&session) || !state().fleets.get(&id).is_some_and(|f| still_current(f, leader, count, &ad)) { continue; }
                 let jumps = distance(&c.world.sde().map, applicant.system_id, session.system_id);
                 ads.push((Value::Int(id), display(ad, id, count, &session, Some(standing), jumps, &contacts, &blocks)));
             }
@@ -179,9 +179,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "GetMyFleetFinderAdvert" => {
             let Some(id) = own() else { return Some(Ok(Value::None)) };
             let Some((leader, count, ad)) = snapshot(id) else { return Some(Ok(Value::None)) };
-            let Some(session) = c.world.chat_session(leader) else { return Some(Ok(Value::None)) };
+            let Some(session) = c.world.online_session(leader) else { return Some(Ok(Value::None)) };
             let (contacts, blocks, _, _) = match facts(c, leader, me).await { Ok(v) => v, Err(e) => return Some(Err(e)) };
-            if c.world.chat_session(leader).as_ref() != Some(&session) || !state().fleets.get(&id).is_some_and(|f| current_leader(f) == Some(leader) && f.members.len() == count && f.advert.as_ref() == Some(&ad)) { return Some(Err(unavailable())); }
+            if c.world.online_session(leader).as_ref() != Some(&session) || !state().fleets.get(&id).is_some_and(|f| current_leader(f) == Some(leader) && f.members.len() == count && f.advert.as_ref() == Some(&ad)) { return Some(Err(unavailable())); }
             Ok(display(ad, id, count, &session, None, distance(&c.world.sde().map, applicant.system_id, session.system_id), &contacts, &blocks))
         }
         "AddFleetFinderAdvert" | "UpdateAdvertInfo" | "UpdateAdvertAllowedEntities" | "UpdateFleetAdvertWithNewLeader" => {
@@ -212,11 +212,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 // and membership are the sole authority for the returned advert.
                 ad
             };
-            let Some(session) = c.world.chat_session(me) else { return Some(Err(unavailable())) };
+            let Some(session) = c.world.online_session(me) else { return Some(Err(unavailable())) };
             let (contacts, blocks, _, _) = match facts(c, me, me).await { Ok(v) => v, Err(e) => return Some(Err(e)) };
             {
                 let mut st = state();
-                if !st.is_member(id, me) || c.world.chat_session(me).as_ref() != Some(&session) { return Some(Err(unavailable())); }
+                if !st.is_member(id, me) || c.world.online_session(me).as_ref() != Some(&session) { return Some(Err(unavailable())); }
                 let f = st.fleets.get_mut(&id).unwrap();
                 if !is_leader(f, me) || f.members.len() != count || f.advert != previous { return Some(Err(unavailable())); }
                 let old = options_value(&f.options);
@@ -238,14 +238,14 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let Some(id) = call.args.first().and_then(Value::as_int) else { return Some(Err(invalid())) };
             let Some(auto) = boolean(call.args.get(1), false) else { return Some(Err(invalid())) };
             let Some((leader, count, ad)) = snapshot(id) else { return Some(Err(unavailable())) };
-            let Some(session) = c.world.chat_session(leader) else { return Some(Err(unavailable())) };
+            let Some(session) = c.world.online_session(leader) else { return Some(Err(unavailable())) };
             let (contacts, blocks, reverse, security) = match facts(c, leader, me).await { Ok(v) => v, Err(e) => return Some(Err(e)) };
             if eligible(&ad, &session, &applicant, &contacts, &blocks, &reverse, security).is_none() { return Some(Err(unavailable())); }
             let name = match routing::character_name(&c.db, leader).await { Ok(v) => v.unwrap_or_default(), Err(e) => return Some(Err(db_err(e))) };
             let approval = boolean(field(&ad, "joinNeedsApproval"), false).unwrap_or(false) || !auto;
             {
                 let mut st = state();
-                if st.of.get(&me).is_some_and(|&old| old == id || st.is_member(old, me)) || c.world.chat_session(leader).as_ref() != Some(&session) || ChatSession::from_session(&c.session).as_ref() != Some(&applicant) { return Some(Err(unavailable())); }
+                if st.of.get(&me).is_some_and(|&old| old == id || st.is_member(old, me)) || c.world.online_session(leader).as_ref() != Some(&session) || OnlineSession::from_session(&c.session).as_ref() != Some(&applicant) { return Some(Err(unavailable())); }
                 let Some(f) = st.fleets.get_mut(&id) else { return Some(Err(unavailable())) };
                 if !still_current(f, leader, count, &ad) { return Some(Err(unavailable())); }
                 if approval {

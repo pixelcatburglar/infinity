@@ -4,11 +4,11 @@
 //! Occupants and messages remain runtime transport state. Passwords, expiring
 //! restrictions, corporation/alliance ACL grants and proxy-room ownership are unsupported.
 use super::{authority, super::{Call, CallResult, notify_error}};
-use crate::{client::Client, messages::chat as text, session::ChatSession};
+use crate::{client::Client, messages::chat as text, session::OnlineSession};
 use marshal::Value;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let session = ChatSession::from_session(&c.session);
+    let session = OnlineSession::from_session(&c.session);
     let arg_text = |n: usize| call.args.get(n).and_then(Value::as_text).unwrap_or_default().into_owned();
     let arg_id = |n: usize| call.args.get(n).and_then(Value::as_int).unwrap_or(0);
     let result = match call.method {

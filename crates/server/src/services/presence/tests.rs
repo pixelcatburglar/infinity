@@ -26,13 +26,13 @@ async fn session_changes_keep_channel_and_complete_chat_metadata() {
         ("warfactionid", Value::Int(5)), ("fleetid", Value::Int(6)),
         ("role", Value::Int(7)), ("corprole", Value::Int(8)),
     ]);
-    let snapshot = world.chat_session(1).unwrap();
+    let snapshot = world.online_session(1).unwrap();
     assert_eq!((snapshot.system_id, snapshot.corporation_id, snapshot.alliance_id), (Some(3), Some(2), Some(4)));
     assert_eq!((snapshot.faction_id, snapshot.fleet_id, snapshot.role, snapshot.corporation_role), (Some(5), Some(6), 7, 8));
     let (replacement_tx, mut replacement_rx) = tokio::sync::mpsc::unbounded_channel();
     client.notify_tx = replacement_tx;
     client.change_session(vec![("solarsystemid2", Value::Int(9))]);
-    let updated = world.chat_session(1).unwrap();
+    let updated = world.online_session(1).unwrap();
     assert_eq!(updated.system_id, Some(9));
     assert_eq!((updated.alliance_id, updated.faction_id, updated.fleet_id, updated.role, updated.corporation_role), (Some(4), Some(5), Some(6), 7, 8));
     world.notify_pilot(1, "test", vec![]);
@@ -40,25 +40,25 @@ async fn session_changes_keep_channel_and_complete_chat_metadata() {
     assert!(replacement_rx.try_recv().is_err());
     client.change_session(vec![("charid", Value::Int(10))]);
     assert!(!world.is_online(1));
-    assert!(world.chat_session(1).is_none());
-    assert_eq!(world.chat_session(10).unwrap().character_id, 10);
+    assert!(world.online_session(1).is_none());
+    assert_eq!(world.online_session(10).unwrap().character_id, 10);
     world.notify_pilot(10, "replacement", vec![]);
     assert_eq!(replacement_rx.try_recv().unwrap().0, "replacement");
     client.change_session(vec![("charid", Value::None)]);
     assert!(!world.is_online(10));
-    assert!(world.chat_session(10).is_none());
+    assert!(world.online_session(10).is_none());
 }
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn station_presence_sends_one_record_to_correct_peers() {
-    use crate::{services::identity::Identity, session::ChatSession};
+    use crate::{services::identity::Identity, session::OnlineSession};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let (client, _peer) = crate::services::tests::client(db, 1).await;
     let world = &client.world;
     let chat = &client.chat;
-    let session = |id, station| ChatSession {
+    let session = |id, station| OnlineSession {
         character_id: id, station_id: station, system_id: None, corporation_id: Some(7),
         alliance_id: None, faction_id: Some(8), fleet_id: None, role: 0, corporation_role: 0,
     };
@@ -68,7 +68,7 @@ async fn station_presence_sends_one_record_to_correct_peers() {
     let (other_tx, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
     for (id, station, tx) in [(2, 10, a_tx), (3, 20, b_tx), (4, 30, other_tx)] {
         world.register_pilot(id, tx);
-        world.set_chat_session(id, Some(session(id, Some(station))));
+        world.set_online_session(id, Some(session(id, Some(station))));
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let docked = session(1, Some(10));
@@ -176,7 +176,7 @@ async fn prepare_restores_docked_and_space_pilots_without_a_connection() {
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn headless_leave_saves_owned_ship_before_unobserving_and_clears_presence() {
-    use crate::{config::deployment::DatabaseConfig, consts::{TYPE_CAPSULE, dogma::{ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE, ATTR_SHIELD_CHARGE}}, dao::{characters, items}, db::Db, sde::Sde, services::{combat, identity::Identity, ship}, session::ChatSession, space::World};
+    use crate::{config::deployment::DatabaseConfig, consts::{TYPE_CAPSULE, dogma::{ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE, ATTR_SHIELD_CHARGE}}, dao::{characters, items}, db::Db, sde::Sde, services::{combat, identity::Identity, ship}, session::OnlineSession, space::World};
     crate::tests::init_config();
     let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
@@ -201,7 +201,7 @@ async fn headless_leave_saves_owned_ship_before_unobserving_and_clears_presence(
         items::dogma::save_condition(&test_db, ship_id, &ids, &[0.0, 0.0, 0.0], ATTR_SHIELD_CHARGE, 0).await.unwrap();
         let identity = Identity { char_id: character, ship_id: Some(ship_id), corp_id: 1, station_id: None, system_id: Some(system) };
         let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
-        super::online(&identity, &test_world, &chat, notify_tx, None, ChatSession {
+        super::online(&identity, &test_world, &chat, notify_tx, None, OnlineSession {
             character_id: character, station_id: None, system_id: Some(system), corporation_id: Some(1),
             alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
         });
@@ -211,14 +211,14 @@ async fn headless_leave_saves_owned_ship_before_unobserving_and_clears_presence(
         let callback_world = test_world.clone();
         super::leave(&identity, &test_db, &test_world, &chat, &sde, Some(system), move || {
             assert!(callback_world.is_online(character));
-            assert!(callback_world.chat_session(character).is_some());
+            assert!(callback_world.online_session(character).is_some());
             callback_world.post(system, move |s| {
                 let _ = boundary_tx.send(s.pilot_ball(character).is_none() && s.ball(ship_id).is_none());
             });
         }).await.unwrap();
         assert!(boundary_rx.await.unwrap());
         assert!(!test_world.is_online(character));
-        assert!(test_world.chat_session(character).is_none());
+        assert!(test_world.online_session(character).is_none());
         let saved = test_db.query_one("SELECT x,y,z FROM game.items WHERE item_id=$1", &[&ship_id]).await.unwrap();
         assert_eq!([saved.get::<_, f64>("x"), saved.get("y"), saved.get("z")], position);
         let rows = items::dogma::overrides(&test_db, ship_id).await.unwrap();
@@ -238,7 +238,7 @@ async fn headless_leave_saves_owned_ship_before_unobserving_and_clears_presence(
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn absent_identity_leaves_zero_registry_untouched_and_calls_observer() {
-    use crate::{config::deployment::DatabaseConfig, db::Db, sde::Sde, services::identity::Identity, session::ChatSession, space::World};
+    use crate::{config::deployment::DatabaseConfig, db::Db, sde::Sde, services::identity::Identity, session::OnlineSession, space::World};
     crate::tests::init_config();
     let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
@@ -247,13 +247,13 @@ async fn absent_identity_leaves_zero_registry_untouched_and_calls_observer() {
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(0, notify_tx);
-    world.set_chat_session(0, Some(ChatSession { character_id: 0, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }));
+    world.set_online_session(0, Some(OnlineSession { character_id: 0, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }));
     let identity = Identity { char_id: 0, ship_id: None, corp_id: 0, station_id: None, system_id: None };
     let mut called = 0;
     super::leave(&identity, &db, &world, &chat, &sde, None, || called += 1).await.unwrap();
     assert_eq!(called, 1);
     assert!(world.is_online(0));
-    assert!(world.chat_session(0).is_some());
+    assert!(world.online_session(0).is_some());
     world.notify_pilot(0, "test", vec![]);
     assert_eq!(notify_rx.try_recv().unwrap().0, "test");
     world.unregister_pilot(0);

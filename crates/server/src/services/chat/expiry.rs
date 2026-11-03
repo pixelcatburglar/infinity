@@ -4,7 +4,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 use marshal::Value;
 use serde::{Deserialize, Serialize};
-use crate::{chat::Hub, client::{filetime_now, filetime_ticks_from_seconds}, consts::FILETIME_SECOND, dao::chat_channels::{self as dao, Restriction}, db::{self, Db, executor::Executor, outbox::{self, Outbox}}, messages::chat as text, scheduler::{self, Job}, session::ChatSession, space::World};
+use crate::{chat::Hub, client::{filetime_now, filetime_ticks_from_seconds}, consts::FILETIME_SECOND, dao::chat_channels::{self as dao, Restriction}, db::{self, Db, executor::Executor, outbox::{self, Outbox}}, messages::chat as text, scheduler::{self, Job}, session::OnlineSession, space::World};
 use super::{authority, PERMISSIONS_REFRESH};
 use super::super::{CallError, notify_error};
 
@@ -29,7 +29,7 @@ async fn authorize(ex: &(impl Executor + ?Sized), actor: i64, name: &str) -> Res
     authority::require_manager(ex, name, actor).await
 }
 
-pub(crate) async fn set(db: &Db, hub: &Hub, session: &ChatSession, name: &str, target: i64, kind: Restriction, duration_secs: i64) -> Result<(), CallError> {
+pub(crate) async fn set(db: &Db, hub: &Hub, session: &OnlineSession, name: &str, target: i64, kind: Restriction, duration_secs: i64) -> Result<(), CallError> {
     if target <= 0 || duration_secs <= 0 || duration_secs > i64::MAX / FILETIME_SECOND { return Err(notify_error(text::INVALID)); }
     let now = filetime_now();
     let deadline = now.checked_add(filetime_ticks_from_seconds(duration_secs)).ok_or_else(|| notify_error(text::INVALID))?;
@@ -47,7 +47,7 @@ pub(crate) async fn set(db: &Db, hub: &Hub, session: &ChatSession, name: &str, t
     }) }, |value, outbox| async move { scheduler::wake(); authority::dispatch(value, outbox, hub).await }).await
 }
 
-pub(crate) async fn remove(db: &Db, hub: &Hub, session: &ChatSession, name: &str, target: i64, kind: Restriction) -> Result<(), CallError> {
+pub(crate) async fn remove(db: &Db, hub: &Hub, session: &OnlineSession, name: &str, target: i64, kind: Restriction) -> Result<(), CallError> {
     if target <= 0 { return Err(notify_error(text::INVALID)); }
     let name: Arc<str> = Arc::from(name);
     let actor = session.character_id;
@@ -59,7 +59,7 @@ pub(crate) async fn remove(db: &Db, hub: &Hub, session: &ChatSession, name: &str
     }) }, |value, outbox| authority::dispatch(value, outbox, hub)).await
 }
 
-pub(crate) async fn list(db: &Db, session: &ChatSession, name: &str, kind: Restriction) -> Result<Vec<i64>, CallError> {
+pub(crate) async fn list(db: &Db, session: &OnlineSession, name: &str, kind: Restriction) -> Result<Vec<i64>, CallError> {
     let name: Arc<str> = Arc::from(name);
     let actor = session.character_id;
     db.transaction(|tx, _: &mut Outbox| { let name = Arc::clone(&name); Box::pin(async move {

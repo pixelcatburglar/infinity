@@ -3,12 +3,12 @@
 //! chat and notification state is process-local and does not survive server restart.
 //! Simulated space entry initializes the normal asteroid environment.
 
-use crate::{dao::characters::selection::{self, SelectedCharacter}, lua::events::GameEvent, messages, services::{self, CallError}, session::ChatSession, space::NotifyTx};
+use crate::{dao::characters::selection::{self, SelectedCharacter}, lua::events::GameEvent, messages, services::{self, CallError}, session::OnlineSession, space::NotifyTx};
 use super::Resources;
 use crate::services::identity::Identity;
 
 pub(super) struct OnlinePilot {
-    pub(super) session: ChatSession,
+    pub(super) session: OnlineSession,
     pub(super) notify: NotifyTx,
     drain: tokio::task::JoinHandle<()>,
 }
@@ -23,7 +23,7 @@ pub(super) async fn snapshot(r: &Resources, id: i64, row: &SelectedCharacter) ->
 }
 /// Mirrors `eve/client/script/parklife/sensorSuiteService.py` `OnEnterSpace`,
 /// which calls `scanMgr.SignalTrackerRegister` after `solarsystemid` is available.
-pub(super) async fn entered_space(r: &Resources, session: &ChatSession) -> Result<(), CallError> {
+pub(super) async fn entered_space(r: &Resources, session: &OnlineSession) -> Result<(), CallError> {
     if let (None, Some(system)) = (session.station_id, session.system_id) {
         services::mining::ensure_fields(&r.db, &r.world, system).await?;
     }
@@ -53,7 +53,7 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
         Err(error) => { drain.abort(); return Err(error); }
     };
     let identity = Identity { char_id: id, corp_id: row.corporation_id, ship_id: Some(prepared.ship_id), station_id: row.station_id, system_id: Some(row.solar_system_id) };
-    let session = ChatSession { character_id: id, station_id: row.station_id.filter(|id| *id > 0), system_id: Some(row.solar_system_id), corporation_id: Some(row.corporation_id), alliance_id: row.alliance_id.filter(|id| *id > 0), faction_id: None, fleet_id: None, role: 0, corporation_role: row.roles };
+    let session = OnlineSession { character_id: id, station_id: row.station_id.filter(|id| *id > 0), system_id: Some(row.solar_system_id), corporation_id: Some(row.corporation_id), alliance_id: row.alliance_id.filter(|id| *id > 0), faction_id: None, fleet_id: None, role: 0, corporation_role: row.roles };
     r.pilots.hub.set_profile(id, &row.name, i64::from(row.gender_id), row.corporation_id, row.alliance_id, None, 0);
     services::presence::online(&identity, &r.world, &r.pilots.hub, notify.clone(), None, session.clone());
     let admission = async {

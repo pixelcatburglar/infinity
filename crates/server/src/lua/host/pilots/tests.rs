@@ -95,7 +95,7 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         r.db.execute("UPDATE game.characters SET station_id=NULL WHERE character_id=$1", &[&id]).await?;
         assert!(lua.load("return pilots.online(id)").eval_async::<bool>().await.is_err());
         assert!(!r.world.is_online(id));
-        assert!(r.world.chat_session(id).is_none());
+        assert!(r.world.online_session(id).is_none());
         assert!(r.pilots.state(id).lock().await.is_none());
         r.db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&id, &station]).await?;
         assert!(lua.load("return pilots.online(id)").eval_async::<bool>().await?);
@@ -105,7 +105,7 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         assert!(active.get::<bool>("online")?);
         check_list.call_async::<()>(true).await?;
         assert!(r.world.is_online(id));
-        assert!(r.world.chat_session(id).is_some());
+        assert!(r.world.online_session(id).is_some());
         let fitted: i64 = r.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id <> $3", &[&id, &ship, &crate::consts::FLAG_CARGO]).await?.get("n");
         assert!(fitted > 0, "rookie ship must have its normal initial fit");
         for _ in 0..100 { r.world.notify_pilot(id, "OnTest", vec![]); }
@@ -129,7 +129,7 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         std::fs::remove_dir_all(dir)?;
         lua.load("pilots.offline(id); pilots.offline(id)").exec_async().await?;
         assert!(!r.world.is_online(id));
-        assert!(r.world.chat_session(id).is_none());
+        assert!(r.world.online_session(id).is_none());
         let after: Table = lua.load("return pilots.identity(id)").eval_async().await?;
         assert_eq!(after.get::<i64>("ship_id")?, ship);
         assert!(!after.get::<bool>("online")?);

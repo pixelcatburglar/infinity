@@ -14,12 +14,12 @@ use crate::dao::{characters, items, skills};
 use crate::dao::characters::selection::SelectedCharacter;
 use crate::db::{Db, outbox::Notification};
 use crate::sde::Sde;
-use crate::session::ChatSession;
+use crate::session::OnlineSession;
 use crate::space::{NotifyTx, World};
 use super::identity::Identity;
 use super::{db_err, CallError};
 
-pub(crate) fn guest_record(session: &ChatSession) -> marshal::Value {
+pub(crate) fn guest_record(session: &OnlineSession) -> marshal::Value {
     marshal::Value::tuple([
         marshal::Value::Int(session.character_id),
         session.corporation_id.map(marshal::Value::Int).unwrap_or(marshal::Value::None),
@@ -28,7 +28,7 @@ pub(crate) fn guest_record(session: &ChatSession) -> marshal::Value {
     ])
 }
 
-fn station_notice(world: &World, station: i64, session: &ChatSession, event: &str) {
+fn station_notice(world: &World, station: i64, session: &OnlineSession, event: &str) {
     for guest in world.station_guests(station) {
         if guest.character_id != session.character_id {
             world.notify_pilot(guest.character_id, event, vec![guest_record(session)]);
@@ -80,13 +80,13 @@ pub(crate) async fn prepare(
     Ok(Prepared { ship_id: ship, cloak_until })
 }
 
-pub(crate) fn online(identity: &Identity, world: &World, chat: &Hub, notify_tx: NotifyTx, previous: Option<&ChatSession>, current: ChatSession) {
+pub(crate) fn online(identity: &Identity, world: &World, chat: &Hub, notify_tx: NotifyTx, previous: Option<&OnlineSession>, current: OnlineSession) {
     let previous = previous.filter(|s| s.character_id == current.character_id);
     let old_station = previous.and_then(|s| s.station_id);
     if previous.map(|s| s.character_id) != Some(identity.char_id) {
         world.register_pilot(identity.char_id, notify_tx);
     }
-    world.set_chat_session(identity.char_id, Some(current.clone()));
+    world.set_online_session(identity.char_id, Some(current.clone()));
     chat.session_changed(identity.char_id);
     if old_station != current.station_id {
         if let (Some(station), Some(old)) = (old_station, previous) {
@@ -99,7 +99,7 @@ pub(crate) fn online(identity: &Identity, world: &World, chat: &Hub, notify_tx: 
 }
 
 pub(crate) fn offline(identity: &Identity, world: &World, chat: &Hub) {
-    let previous = world.chat_session(identity.char_id);
+    let previous = world.online_session(identity.char_id);
     world.unregister_pilot(identity.char_id);
     chat.disconnect_character(identity.char_id);
     if let Some(old) = previous {

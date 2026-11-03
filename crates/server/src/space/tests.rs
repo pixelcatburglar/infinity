@@ -29,7 +29,7 @@ fn presence_tracks_live_replaced_and_removed_channels() {
 #[test]
 fn station_guests_only_include_live_matching_sessions() {
     let pilots = Pilots::default();
-    let session = |id, station| crate::session::ChatSession {
+    let session = |id, station| crate::session::OnlineSession {
         character_id: id, station_id: station, system_id: None, corporation_id: None,
         alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     };
@@ -38,7 +38,7 @@ fn station_guests_only_include_live_matching_sessions() {
         (3, None), (4, Some(session(5, Some(10)))), (5, Some(session(5, Some(10))))] {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         pilots.register_pilot(key, tx);
-        pilots.set_chat_session(key, value);
+        pilots.set_online_session(key, value);
         receivers.push(rx);
     }
     drop(receivers.pop());

@@ -6,7 +6,7 @@
 //! and use the durable scheduler. Passwords, corporation/alliance ACL grants,
 //! proxy-room ownership and client-preference nullsec blackout are unsupported.
 use std::sync::Arc;
-use crate::{chat::Hub, client::filetime_now, consts::{ROLE_DIRECTOR, WORMHOLE_SYSTEM_START}, dao::{alliances, chat_channels as dao, characters::lookup}, db::{self, Db, executor::Executor, outbox::{Effect, Outbox}}, messages::chat as text, sde::Sde, session::ChatSession};
+use crate::{chat::Hub, client::filetime_now, consts::{ROLE_DIRECTOR, WORMHOLE_SYSTEM_START}, dao::{alliances, chat_channels as dao, characters::lookup}, db::{self, Db, executor::Executor, outbox::{Effect, Outbox}}, messages::chat as text, sde::Sde, session::OnlineSession};
 use super::super::{CallError, notify_error, has_role_or_is_ceo};
 
 /// `inventorycommon/const.py:48-59`: suppressed solar-system ranges.
@@ -56,7 +56,7 @@ fn local_prefix(sde: &Sde, id: i64) -> Option<&'static str> {
     Some(if SUPPRESSED_SYSTEM_RANGES.iter().any(|(start, end)| (*start..=*end).contains(&id)) { "nolocal" } else if id == ZARZAKH_SYSTEM_ID || (WORMHOLE_SYSTEM_START..=WORMHOLE_SYSTEM_END).contains(&id) { "wormhole" } else if system.faction_id == Some(TRIGLAVIAN_FACTION_ID) { "triglavian" } else { "local" })
 }
 
-fn matches_system_channel(sde: &Sde, session: &ChatSession, channel: &str) -> bool {
+fn matches_system_channel(sde: &Sde, session: &OnlineSession, channel: &str) -> bool {
     let Some((prefix, number)) = channel.split_once('_') else { return false; };
     if number.is_empty() || number.starts_with('0') || !number.bytes().all(|b| b.is_ascii_digit()) { return false; }
     let Ok(id) = number.parse::<i64>() else { return false; };
@@ -71,7 +71,7 @@ fn matches_system_channel(sde: &Sde, session: &ChatSession, channel: &str) -> bo
 }
 
 /// Mirrors chatutil/channelnames.py:22-35; nullsec blackout has no server state.
-pub(crate) fn system_channels(sde: &Sde, session: &ChatSession) -> Vec<String> {
+pub(crate) fn system_channels(sde: &Sde, session: &OnlineSession) -> Vec<String> {
     let mut result = Vec::new();
     if let Some(id) = session.system_id {
         if let Some(prefix) = local_prefix(sde, id) { result.push(format!("{prefix}_{id}")); }
@@ -114,7 +114,7 @@ fn voice(c: &dao::Channel, m: Option<&dao::Member>, aff: &str, now: i64) -> &'st
     match effective_voice(m, now) { dao::Voice::Muted => "visitor", dao::Voice::Voiced => "participant", _ if c.moderated && !c.members_by_default && aff == "none" => "visitor", _ => "participant" }
 }
 
-pub(crate) async fn admit(db: &Db, sde: &Sde, session: &ChatSession, channel: &str) -> Result<Option<Admission>, CallError> {
+pub(crate) async fn admit(db: &Db, sde: &Sde, session: &OnlineSession, channel: &str) -> Result<Option<Admission>, CallError> {
     let id = session.character_id;
     if id <= 0 { return Ok(None); }
     if matches_system_channel(sde, session, channel) || channel == DEFAULT_HELP || channel == ROOKIE || HELP_ROOMS.iter().any(|(_, room)| *room == channel) {
@@ -159,7 +159,7 @@ pub(super) async fn dispatch<T>(value: T, outbox: Outbox<ChatEffect>, hub: &Hub)
     Ok(value)
 }
 
-pub(crate) async fn destroy(db: &Db, hub: &Hub, session: &ChatSession, channel: &str) -> Result<(), CallError> {
+pub(crate) async fn destroy(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str) -> Result<(), CallError> {
     let id = session.character_id;
     let channel: Arc<str> = Arc::from(channel);
     db.transaction(|tx, outbox: &mut Outbox<ChatEffect>| { let channel = Arc::clone(&channel); Box::pin(async move {
@@ -178,7 +178,7 @@ pub(crate) async fn destroy(db: &Db, hub: &Hub, session: &ChatSession, channel: 
         outbox.operation(ChatEffect::EvictRoom(c.name)); Ok(())
     }) }, |v, o| dispatch(v, o, hub)).await
 }
-pub(crate) async fn room_config(db: &Db, session: &ChatSession, channel: &str) -> Result<RoomConfig, CallError> {
+pub(crate) async fn room_config(db: &Db, session: &OnlineSession, channel: &str) -> Result<RoomConfig, CallError> {
     let id = session.character_id;
     let channel: Arc<str> = Arc::from(channel);
     db.transaction(|tx, _: &mut Outbox| { let channel = Arc::clone(&channel); Box::pin(async move {
@@ -188,7 +188,7 @@ pub(crate) async fn room_config(db: &Db, session: &ChatSession, channel: &str) -
         Ok(RoomConfig { display_name: c.display_name, public: c.public, moderated: c.moderated, members_by_default: c.members_by_default })
     }) }, |value, _| async move { Ok(value) }).await
 }
-pub(crate) async fn configure(db: &Db, hub: &Hub, session: &ChatSession, channel: &str, config: RoomConfig) -> Result<(), CallError> {
+pub(crate) async fn configure(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str, config: RoomConfig) -> Result<(), CallError> {
     let id = session.character_id;
     let channel: Arc<str> = Arc::from(channel);
     let config = Arc::new(config);
@@ -206,7 +206,7 @@ pub(crate) async fn configure(db: &Db, hub: &Hub, session: &ChatSession, channel
         })
     }, |v, o| dispatch(v, o, hub)).await
 }
-pub(crate) async fn affiliations(db: &Db, session: &ChatSession, channel: &str) -> Result<Vec<Affiliation>, CallError> {
+pub(crate) async fn affiliations(db: &Db, session: &OnlineSession, channel: &str) -> Result<Vec<Affiliation>, CallError> {
     let c = dao::get(db, channel).await?.filter(valid_room).ok_or_else(invalid)?;
     let me = session.character_id;
     let member = dao::member(db, channel, me).await?;
@@ -216,7 +216,7 @@ pub(crate) async fn affiliations(db: &Db, session: &ChatSession, channel: &str) 
     result.extend(dao::members(db, channel).await?.into_iter().map(|m| Affiliation { character_id: m.character_id, affiliation: affiliation(&c, Some(&m), m.character_id, now).into() }));
     Ok(result)
 }
-pub(crate) async fn set_affiliation(db: &Db, hub: &Hub, session: &ChatSession, channel: &str, target: i64, affiliation: &str) -> Result<(), CallError> {
+pub(crate) async fn set_affiliation(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str, target: i64, affiliation: &str) -> Result<(), CallError> {
     let affiliation = match affiliation {
         "owner" => "owner", "admin" => "admin", "member" => "member", "outcast" => "outcast", "none" => "none",
         _ => return Err(invalid()),
@@ -243,7 +243,7 @@ pub(crate) async fn set_affiliation(db: &Db, hub: &Hub, session: &ChatSession, c
         outbox.operation(ChatEffect::Refresh(c.name)); Ok(())
     }) }, |v, o| dispatch(v, o, hub)).await
 }
-pub(crate) async fn set_role(db: &Db, hub: &Hub, session: &ChatSession, channel: &str, target: i64, role: &str) -> Result<(), CallError> {
+pub(crate) async fn set_role(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str, target: i64, role: &str) -> Result<(), CallError> {
     if !["participant", "visitor"].contains(&role) { return Err(forbidden()); }
     let muted = role == "visitor";
     let id = session.character_id;
@@ -259,7 +259,7 @@ pub(crate) async fn set_role(db: &Db, hub: &Hub, session: &ChatSession, channel:
         outbox.operation(ChatEffect::Refresh(c.name)); Ok(())
     }) }, |v, o| dispatch(v, o, hub)).await
 }
-pub(crate) async fn invite(db: &Db, hub: &Hub, session: &ChatSession, channel: &str, target: i64) -> Result<(), CallError> {
+pub(crate) async fn invite(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str, target: i64) -> Result<(), CallError> {
     let id = session.character_id;
     let channel: Arc<str> = Arc::from(channel);
     db.transaction(|tx, outbox: &mut Outbox<ChatEffect>| { let channel = Arc::clone(&channel); Box::pin(async move {
@@ -279,7 +279,7 @@ pub(crate) async fn invite(db: &Db, hub: &Hub, session: &ChatSession, channel: &
         outbox.operation(ChatEffect::Invite(target, c.name)); Ok(())
     }) }, |v, o| dispatch(v, o, hub)).await
 }
-pub(crate) async fn set_subject(db: &Db, hub: &Hub, session: &ChatSession, channel: &str, motd: &str) -> Result<(), CallError> {
+pub(crate) async fn set_subject(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str, motd: &str) -> Result<(), CallError> {
     if motd.contains('\0') || motd.chars().count() > MOTD_LIMIT { return Err(invalid()); }
     let id = session.character_id;
     let channel: Arc<str> = Arc::from(channel);
@@ -293,7 +293,7 @@ pub(crate) async fn set_subject(db: &Db, hub: &Hub, session: &ChatSession, chann
         outbox.operation(ChatEffect::Subject(c.name, motd.to_owned())); Ok(())
     }) }, |v, o| dispatch(v, o, hub)).await
 }
-pub(crate) async fn disco_list(db: &Db, session: &ChatSession) -> Result<Vec<DiscoRoom>, CallError> {
+pub(crate) async fn disco_list(db: &Db, session: &OnlineSession) -> Result<Vec<DiscoRoom>, CallError> {
     if session.character_id <= 0 { return Err(forbidden()); }
     let mut rooms = Vec::new();
     let now = filetime_now();
@@ -306,7 +306,7 @@ pub(crate) async fn disco_list(db: &Db, session: &ChatSession) -> Result<Vec<Dis
     }
     Ok(rooms)
 }
-pub(crate) async fn disco_info(db: &Db, sde: &Sde, session: &ChatSession, channel: &str) -> Result<Option<DiscoRoom>, CallError> {
+pub(crate) async fn disco_info(db: &Db, sde: &Sde, session: &OnlineSession, channel: &str) -> Result<Option<DiscoRoom>, CallError> {
     let Some(a) = admit(db, sde, session, channel).await? else { return Ok(None); };
     let display_name = dao::get(db, channel).await?.map_or_else(|| channel.to_owned(), |c| c.display_name);
     Ok(Some(DiscoRoom { name: channel.into(), display_name, affiliation: a.affiliation }))
@@ -321,7 +321,7 @@ pub(super) async fn create_private(db: &Db, id: i64, target: i64) -> Result<Stri
     if id == target { return Err(invalid()); }
     db.transaction(|tx, _: &mut Outbox| Box::pin(async move { active(tx, id).await?; active(tx, target).await?; let c = dao::create_private(tx, id, target).await?; if !valid_room(&c) { return Err(invalid()); } Ok(c.name) }), |v, _| async move { Ok(v) }).await
 }
-pub(super) async fn system_motd(db: &Db, hub: &Hub, session: &ChatSession, channel: &str, motd: &str) -> Result<(), CallError> {
+pub(super) async fn system_motd(db: &Db, hub: &Hub, session: &OnlineSession, channel: &str, motd: &str) -> Result<(), CallError> {
     if motd.contains('\0') || motd.chars().count() > MOTD_LIMIT || session.character_id <= 0 { return Err(invalid()); }
     let corp = session.corporation_id.filter(|id| *id > 0).ok_or_else(forbidden)?;
     let allowed_corp = channel == format!("corp_{corp}");

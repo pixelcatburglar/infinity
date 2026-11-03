@@ -16,7 +16,7 @@ pub(crate) async fn route(world: Arc<World>, damaged: i64, source_system: i64, s
         }).collect::<Vec<_>>()
     };
     for watcher in watchers {
-        let Some(system) = world.chat_session(watcher).and_then(|session| session.system_id) else { continue };
+        let Some(system) = world.online_session(watcher).and_then(|session| session.system_id) else { continue };
         let damage = health.clone();
         world.post(system, move |actor| actor.fleet_damage_update(watcher, source_system, ship, cloak, damage));
     }
@@ -25,7 +25,7 @@ pub(crate) async fn route(world: Arc<World>, damaged: i64, source_system: i64, s
 /// Registration obtains the current damage from each target's actual actor.
 pub(super) async fn initial(world: Arc<World>, watcher: i64, targets: Vec<i64>) {
     for target in targets {
-        let Some(system) = world.chat_session(target).and_then(|session| session.system_id) else { continue };
+        let Some(system) = world.online_session(target).and_then(|session| session.system_id) else { continue };
         let Some(Some((ship, cloak, health))) = world.with(system, move |actor| actor.fleet_damage_snapshot(target)).await else { continue };
         route(world.clone(), target, system, ship, cloak, health, Some(watcher)).await;
     }
