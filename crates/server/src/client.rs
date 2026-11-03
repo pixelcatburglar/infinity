@@ -346,7 +346,8 @@ impl Client {
         };
         let method = method.and_then(|m| m.as_text()).map(|m| m.into_owned()).unwrap_or_default();
         let args = tup.get(2).and_then(|a| a.items()).map(|a| a.to_vec()).unwrap_or_default();
-        let kwargs = tup.get(3).cloned().unwrap_or(Value::Dict(vec![]));
+        let mut kwargs = tup.get(3).cloned().unwrap_or(Value::Dict(vec![]));
+        strip_macho_version(&mut kwargs);
 
         // Bound-object calls are addressed by OID; map back to (service, bindParams).
         let (service, bind_params) = if is_object_call {
@@ -396,6 +397,13 @@ impl Client {
             }
         };
         self.send(&rsp).await
+    }
+}
+
+/// Remove the transport-only protocol kwarg before service dispatch.
+fn strip_macho_version(kwargs: &mut Value) {
+    if let Value::Dict(entries) = kwargs {
+        entries.retain(|(key, _)| key.as_text().as_deref() != Some("machoVersion"));
     }
 }
 
