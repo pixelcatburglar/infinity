@@ -17,7 +17,18 @@ async fn queue_roundtrip_offline_online_and_rollback() {
     let test_r = r.clone();
     let result = tokio::spawn(async move {
         let r = test_r;
-        let skills = crate::dao::skills::training::current(&r.db, id).await.unwrap();
+        let mut skills = crate::dao::skills::training::current(&r.db, id).await.unwrap();
+        skills.sort_unstable_by_key(|s| s.type_id);
+        let rows: Table = lua.load("return pilots.skills(id)").eval_async().await.unwrap();
+        assert_eq!(rows.raw_len(), skills.len());
+        for (index, skill) in skills.iter().enumerate() {
+            let row: Table = rows.raw_get(index + 1).unwrap();
+            assert!(matches!(row.raw_get::<Value>("type_id").unwrap(), Value::Integer(value) if value == i64::from(skill.type_id)));
+            assert!(matches!(row.raw_get::<Value>("level").unwrap(), Value::Integer(value) if value == i64::from(skill.level)));
+            assert!(matches!(row.raw_get::<Value>("skill_points").unwrap(), Value::Integer(value) if value == i64::from(skill.skill_points)));
+        }
+        assert!(lua.load("return pilots.skills(0)").eval_async::<Value>().await.is_err());
+        assert!(lua.load("return pilots.skills(9223372036854775807)").eval_async::<Value>().await.is_err());
         let skill = skills.iter().find(|s| s.level < 5 && s.skill_points > 0).expect("trainable starting skill");
         globals.set("skill", skill.type_id).unwrap(); globals.set("level", skill.level + 1).unwrap();
         lua.load("pilots.save_skill_queue(id, {{type_id=skill,level=level}})").exec_async().await.unwrap();
@@ -43,6 +54,16 @@ async fn queue_roundtrip_offline_online_and_rollback() {
         }
         assert!(lua.load("return pilots.skill_queue(0)").eval_async::<Value>().await.is_err());
         lua.load("pilots.online(id)").exec_async().await.unwrap();
+        let mut online_skills = crate::dao::skills::training::current(&r.db, id).await.unwrap();
+        online_skills.sort_unstable_by_key(|s| s.type_id);
+        let rows: Table = lua.load("return pilots.skills(id)").eval_async().await.unwrap();
+        assert_eq!(rows.raw_len(), online_skills.len());
+        for (index, skill) in online_skills.iter().enumerate() {
+            let row: Table = rows.raw_get(index + 1).unwrap();
+            assert!(matches!(row.raw_get::<Value>("type_id").unwrap(), Value::Integer(value) if value == i64::from(skill.type_id)));
+            assert!(matches!(row.raw_get::<Value>("level").unwrap(), Value::Integer(value) if value == i64::from(skill.level)));
+            assert!(matches!(row.raw_get::<Value>("skill_points").unwrap(), Value::Integer(value) if value == i64::from(skill.skill_points)));
+        }
         lua.load("local q=pilots.skill_queue(id); assert(#q == 1 and q[1].type_id == skill and q[1].level == level)").exec_async().await.unwrap();
         lua.load("pilots.save_skill_queue(id, {})").exec_async().await.unwrap();
         assert!(crate::dao::skills::queue::list(&r.db, id).await.unwrap().is_empty());

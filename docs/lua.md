@@ -353,6 +353,10 @@ character_id, queue)` works online or offline. `queue` is a dense one-based
 sequence of records containing only integer `type_id` and `level`; an empty
 sequence clears the queue and cancels its completion job.
 
+`pilots.skills(character_id)` works online or offline and returns records ordered
+by `type_id` as `{type_id, level, skill_points}`. These are the persisted skill
+levels and points used by skill-queue validation.
+
 ### Reads and timeouts
 
 `pilots.condition(character_id)` returns `{shield, armor_damage, hull_damage,

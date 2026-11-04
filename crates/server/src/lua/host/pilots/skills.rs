@@ -2,6 +2,7 @@
 //! Mirrors skillHandler queue operations over game.skill_queue and SDE skills.
 //! Training rules and scheduling remain owned by the training service.
 use mlua::{Lua, Table, Value};
+use crate::dao::skills::training as training_dao;
 use crate::services::skills::training;
 use super::{lifecycle, lua_error, mutate, positive, Resources};
 
@@ -37,6 +38,26 @@ fn queue_value(table: Table) -> mlua::Result<marshal::Value> {
 }
 
 pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::Result<()> {
+    let r = resources.clone();
+    api.set("skills", lua.create_async_function(move |lua, id: i64| {
+        let r = r.clone(); async move {
+            positive(id)?;
+            let mut entries = mutate(async move {
+                let (_state, _row) = lifecycle::locked(&r, id).await?;
+                training_dao::current(&r.db, id).await.map_err(crate::services::db_err)
+            }).await.map_err(lua_error)?;
+            entries.sort_unstable_by_key(|entry| entry.type_id);
+            let result = lua.create_table()?;
+            for (index, entry) in entries.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("type_id", entry.type_id)?;
+                row.set("level", entry.level)?;
+                row.set("skill_points", entry.skill_points)?;
+                result.raw_set(index + 1, row)?;
+            }
+            Ok(result)
+        }
+    })?)?;
     let r = resources.clone();
     api.set("skill_queue", lua.create_async_function(move |lua, id: i64| {
         let r = r.clone(); async move {
