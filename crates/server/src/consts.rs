@@ -130,6 +130,8 @@ pub const GROUP_LANCER_DREADNOUGHT: i32 = 4594;
 pub const GROUP_COMMAND_CARRIER: i32 = 5120;
 /// SDE invGroups: Planet.
 pub const GROUP_PLANET: i32 = 7;
+/// SDE invGroups: Moon.
+pub const GROUP_MOON: i32 = 8;
 /// SDE invGroups: Asteroid Belt.
 pub const GROUP_ASTEROID_BELT: i32 = 9;
 /// SDE invGroups: Wreck.

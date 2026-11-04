@@ -10,6 +10,7 @@ pub(super) fn remove_member_from(st: &mut State, world: &World, fleet_id: i64, c
     st.clear_member_references(char_id);
     st.of.remove(&char_id);
     let Some(f) = st.fleets.get_mut(&fleet_id) else { return };
+    space_state::leave(world, f, char_id);
     let Some(old) = f.members.remove(&char_id) else { return };
     if old.reconnect.is_none() {
         world.notify_pilot(char_id, "__session", session_pairs(None, None));

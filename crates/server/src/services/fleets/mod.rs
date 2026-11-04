@@ -1,7 +1,7 @@
 //! Fleets (fleetObjectHandler, bound per fleet; eve/client/script/parklife/fleetSvc.py).
 //!
-//! Fleets, reservations, preferences and advertisements live only in process memory and
-//! do not survive restart. Disconnected members retain their seats for the configured
+//! Fleets, reservations, preferences, advertisements and target tags live only in
+//! process memory and do not survive restart. Disconnected members retain their seats for the configured
 //! reconnect window; explicit departure and expiry remove them. Creating one (`CreateFleet`
 //! then `Init`) makes the creator its leader. Boosts and foreign hangars are unsupported.
 
@@ -130,11 +130,12 @@ struct Fleet {
     max_members: usize,
     join_requests: HashMap<i64, Value>,
     advert: Option<Value>,
+    target_tags: HashMap<(i64, i64), String>,
 }
 
 impl Fleet {
     fn new(creator: i64, wings: Vec<Wing>) -> Self {
-        Self { creator, creator_session: None, initialized: false, options: FleetOptions::default(), members: HashMap::new(), wings, motd: String::new(), invites: HashMap::new(), max_members: MAX_MEMBERS, join_requests: HashMap::new(), advert: None }
+        Self { creator, creator_session: None, initialized: false, options: FleetOptions::default(), members: HashMap::new(), wings, motd: String::new(), invites: HashMap::new(), max_members: MAX_MEMBERS, join_requests: HashMap::new(), advert: None, target_tags: HashMap::new() }
     }
 
     fn rename_structure(&mut self, id: i64, name: &str, wing: bool) -> bool {
@@ -301,6 +302,7 @@ mod fleet_mgr;
 mod fleet_object_handler;
 mod fleet_proxy;
 pub(crate) mod lifecycle;
+pub(crate) mod space_state;
 pub(crate) mod warp;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

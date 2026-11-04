@@ -12,6 +12,7 @@
 //! decisions run on 100 ms housekeeping ticks; snapshots follow motion.
 //! Explicit pilot actions cancel jump cloak once; expiry uses the raw uncloak queue.
 //! Uncloak batches restore the ball and clear its client shader for every observer.
+//! Fleet target tags are cleared on target removal or cloaking and synchronized on observation.
 //! After more than five due steps, catchup clamps to one logical step and the
 //! next deadline is the next whole wall second, an intentional departure from
 //! native cadence. The clamped interpolation anchor is actual execution time;
@@ -257,6 +258,9 @@ impl System {
         self.warp_exits.remove(&id);
         if self.balls.contains_key(&id) {
             crate::services::combat::jamming::clear(self, id);
+        }
+        if let Some(ball) = self.balls.get(&id) {
+            crate::services::fleets::space_state::ball_removed(self, self.id, id, ball.char_id);
         }
         let ball = self.balls.remove(&id)?;
         crate::services::effects::heat::remove_ship(self, id);
@@ -591,6 +595,7 @@ impl System {
                 }
                 return;
             }
+            crate::services::fleets::space_state::ball_removed(s, s.id, ship, None);
             s.deliver(None, vec![event(stamp, "CloakBall", vec![Value::Int(ship)])]);
             if let Some(ball) = s.balls.get_mut(&ship) {
                 ball.cloak = 1;
