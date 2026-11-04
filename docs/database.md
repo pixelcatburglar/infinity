@@ -6,6 +6,8 @@ The database has four schemas:
 - `sde_native` and `sde_compat` hold the raw static data bundles, one `jsonb` table per file.
 - `game` holds everything players create: accounts, characters, items, the market, mail and so on.
 
+`game.crate_rewards` records one receipt per reward item ID, with the opening character, crate type, destination location and flag, opening FILETIME and nullable first-confirmation FILETIME. Receipts are written in the same transaction as the reward items. They have no foreign key to items and survive a reward item's deletion or merge.
+
 Lifecycle:
 
 - **First start.** `scripts/db-init.sh` loads `db/<schema>/<table>.sql.gz` into an empty volume. Tables whose foreign keys aren't satisfied yet are retried until everything is loaded.
