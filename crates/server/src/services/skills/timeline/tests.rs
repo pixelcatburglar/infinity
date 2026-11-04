@@ -22,7 +22,7 @@ async fn fingerprint(db: &crate::db::Db, char_id: i64) -> String {
 fn projected_points_include_only_clamped_active_progress() {
     let skill = Skill { type_id: 1, level: 1, skill_points: 100 };
     let row = QueueEntry { position: 0, type_id: 1, to_level: 2, start_sp: 100, dest_sp: 200, start_time: Some(10), end_time: Some(20) };
-    let mut plan = AdvancePlan { char_id: 1, through: 15, initial_skills: vec![skill.clone()], initial_queue: vec![row.clone()], initial_brain: vec![], skills: vec![skill], queue: vec![row], events: vec![], queue_changed: false, brain_changed: false, boosters_changed: false };
+    let mut plan = AdvancePlan { char_id: 1, through: 15, initial_skills: vec![skill.clone()], initial_queue: vec![row.clone()], initial_brain: vec![], initial_installations: vec![], skills: vec![skill], queue: vec![row], events: vec![], queue_changed: false, brain_changed: false, boosters_changed: false };
     assert_eq!(plan.trained_points().unwrap_or_else(|_| panic!("projecting points")), 150);
     assert_eq!(plan.skills[0].skill_points, 100);
     plan.through = 30;
@@ -48,7 +48,8 @@ async fn planning_preserves_database_and_uses_same_fit() {
     let (c, _peer) = client(db.clone(), f.character).await;
     let skills = crate::dao::skills::training::current(&db, f.character).await.unwrap();
     let persisted = Fit::load_character_at(&db, c.sde.clone(), f.character, 100).await.unwrap_or_else(|_| panic!("loading persisted fit"));
-    let projected = Fit::load_character_with_skills_at(&db, c.sde.clone(), f.character, 100, &skills).await.unwrap_or_else(|_| panic!("loading projected fit"));
+    let installations = crate::dao::skills::expert_systems::all(&db, f.character).await.unwrap();
+    let projected = Fit::load_character_with_skills_at(&db, c.sde.clone(), f.character, 100, &skills, &installations).await.unwrap_or_else(|_| panic!("loading projected fit"));
     for attr in CHAR_ATTRIBUTES {
         assert_eq!(persisted.value(Key::Char, attr as i32), projected.value(Key::Char, attr as i32));
     }
@@ -212,8 +213,8 @@ async fn supplied_skill_points_change_an_applicable_modifier() {
             for modifier in effect.modifiers() {
                 let low = [Skill { type_id: data.type_id, level: 1, skill_points: super::super::formulas::sp_for_level(rank, 1) }];
                 let high = [Skill { type_id: data.type_id, level: 5, skill_points: super::super::formulas::sp_for_level(rank, 5) }];
-                let a = Fit::load_character_with_skills_at(&db, c.sde.clone(), f.character, 100, &low).await.unwrap_or_else(|_| panic!("loading lower skill"));
-                let b = Fit::load_character_with_skills_at(&db, c.sde.clone(), f.character, 100, &high).await.unwrap_or_else(|_| panic!("loading higher skill"));
+                let a = Fit::load_character_with_skills_at(&db, c.sde.clone(), f.character, 100, &low, &[]).await.unwrap_or_else(|_| panic!("loading lower skill"));
+                let b = Fit::load_character_with_skills_at(&db, c.sde.clone(), f.character, 100, &high, &[]).await.unwrap_or_else(|_| panic!("loading higher skill"));
                 if a.value(Key::Char, modifier.modified) != b.value(Key::Char, modifier.modified) {
                     found = true;
                     break 'skills;
@@ -223,4 +224,23 @@ async fn supplied_skill_points_change_an_applicable_modifier() {
     }
     fixture::cleanup(&db, f).await.unwrap();
     assert!(found, "test SDE has no applicable level-sensitive character modifier");
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn training_precedes_expert_expiry_at_equal_time() {
+    use crate::services::tests::{client, fixture};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let (c, _peer) = client(db.clone(), f.character).await;
+    let skill = c.sde.types.iter().find(|ty| ty.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).unwrap().type_id;
+    crate::dao::skills::training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
+    crate::dao::skills::queue::insert(&db, f.character, &QueueEntry { position: 0, type_id: skill, to_level: 5, start_sp: 0, dest_sp: 100, start_time: Some(10), end_time: Some(20) }).await.unwrap();
+    crate::dao::skills::expert_systems::insert(&db, f.character, 1, 10, 20).await.unwrap();
+    let projected = plan(&db, &c.sde, f.character, 20).await;
+    assert!(matches!(projected.events.as_slice(), [Event::Completion(_), Event::ExpertExpiry { .. }]));
+    assert_eq!(projected.initial_installations.len(), 1);
+    db.execute("DELETE FROM game.character_expert_systems WHERE character_id=$1", &[&f.character]).await.unwrap();
+    fixture::cleanup(&db, f).await.unwrap();
 }

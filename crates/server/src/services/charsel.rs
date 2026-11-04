@@ -9,7 +9,7 @@
 //! First selection serializes rookie ship grants on the character row and grants a
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
 
-use crate::dao::{accounts, characters};
+use crate::dao::{accounts, characters, skills};
 use super::character::creation::{self, NewPilot, NAME_VALID};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
@@ -149,6 +149,10 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         ("regionid", int(r.region_id)),
         ("shipid", int(ship)),
     ]);
+    let now = crate::client::filetime_now();
+    let active = skills::expert_systems::active(&c.db, char_id, now).await.map_err(db_err)?;
+    let active = super::skills::expert_systems::map(&active);
+    c.notify("OnExpertSystemsUpdated", vec![active, Value::Bool(false), Value::None]);
     if let Some(cloak_until) = cloak_until {
         super::ship::notify_jump_cloak(c, ship, cloak_until);
     }

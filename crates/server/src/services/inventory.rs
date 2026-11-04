@@ -30,6 +30,7 @@ pub(super) mod gm;
 pub(crate) mod movement;
 pub(in crate::services) mod reachability;
 use reachability::{Endpoint, Reachability};
+pub(crate) mod expert_systems;
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;

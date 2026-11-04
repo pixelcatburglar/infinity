@@ -394,9 +394,10 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     let attrs = &c.world.sde().types;
     let base = attrs.attribute(type_id, ATTR_BASE_SENSOR_STRENGTH).unwrap_or(40.0);
     let lifetime_ms = attrs.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
-    let (skill, _) = probe_skills(&c.db, char_id).await?;
+    let now = filetime_now();
+    let (skill, _) = probe_skills(&c.db, &c.sde, char_id, now).await?;
     let pos = c.world.with(system, move |s| s.sample_position(ship)).await.flatten().unwrap_or([0.0; 3]);
-    let expiry = filetime_now() + (lifetime_ms * 10_000.0) as i64;
+    let expiry = now + (lifetime_ms * 10_000.0) as i64;
     enum Launch { Probes }
     let user_id = c.login.user_id;
     let db = c.db.clone();

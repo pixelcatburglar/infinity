@@ -9,7 +9,8 @@
 //! Special crate skill bundle metadata is unavailable and is refused.
 use super::*;
 use super::attributes::character_attributes;
-use super::training::{skills_dict, queue_list, save_queue};
+use super::training::{queue_list, save_queue};
+use super::view::skills_dict;
 use crate::client::short;
 use marshal::Value;
 use tracing::warn;

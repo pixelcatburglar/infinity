@@ -8,14 +8,13 @@ use crate::services::inventory;
 /// The pilot's yield multiplier for reprocessing `type_id`: ores and ice train
 /// Reprocessing (+3%), Reprocessing Efficiency (+2%) and their processing skill (+2%) per
 /// level; everything else Scrapmetal Processing (+2%).
-async fn skill_multiplier(c: &Client, char_id: i64, type_id: i32) -> Result<f64, CallError> {
-    let own_skill = c.sde.types.attribute(type_id, ATTR_PROCESSING_SKILL);
-    let skills = crate::dao::skills::levels::levels(&c.db, char_id).await.map_err(db_err)?;
-    let level = |skill: i32| skills.iter().find(|r| r.type_id == skill).map(|r| r.level as f64).unwrap_or(0.0);
-    Ok(match own_skill {
+fn skill_multiplier(skills: &crate::services::skills::effective::SkillSnapshot, sde: &crate::sde::Sde, type_id: i32) -> f64 {
+    let own_skill = sde.types.attribute(type_id, ATTR_PROCESSING_SKILL);
+    let level = |skill: i32| skills.level(skill) as f64;
+    match own_skill {
         Some(s) => (1.0 + 0.03 * level(SKILL_REPROCESSING)) * (1.0 + 0.02 * level(SKILL_REPROCESSING_EFFICIENCY)) * (1.0 + 0.02 * level(s as i32)),
         None => 1.0 + 0.02 * level(SKILL_SCRAPMETAL),
-    })
+    }
 }
 
 struct Quote {
@@ -39,20 +38,25 @@ pub(super) fn output_stack_quantity(current: Option<i32>, amount: i64) -> Result
     current.unwrap_or(0).checked_add(amount).ok_or_else(output_overflow)
 }
 
-async fn quote(c: &Client, char_id: i64, item: &crate::dao::items::loading::Item) -> Result<Option<Quote>, CallError> {
-    let portion = c.sde.types.get(item.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", item.type_id)))?.portion_size.unwrap_or(1).max(1);
+async fn quote(
+    c: &Client,
+    sde: &crate::sde::Sde,
+    skills: &crate::services::skills::effective::SkillSnapshot,
+    item: &crate::dao::items::loading::Item,
+) -> Result<Option<Quote>, CallError> {
+    let portion = sde.types.get(item.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", item.type_id)))?.portion_size.unwrap_or(1).max(1);
     let quantity = if item.singleton { 1 } else { item.quantity };
     let batches = quantity / portion;
     if batches == 0 {
         return Ok(None);
     }
-    let materials = c.sde.types.materials(item.type_id);
+    let materials = sde.types.materials(item.type_id);
     if materials.is_empty() {
         return Ok(None);
     }
     let ids: Vec<_> = materials.iter().map(|m| m.material_type_id).collect();
     let prices: HashMap<_, _> = crate::dao::items::mining::prices(&c.db, &ids).await.map_err(db_err)?.into_iter().map(|p| (p.type_id, p.average)).collect();
-    let efficiency = (crate::config::game().mining.station_reprocessing_efficiency * skill_multiplier(c, char_id, item.type_id).await?).min(1.0);
+    let efficiency = (crate::config::game().mining.station_reprocessing_efficiency * skill_multiplier(skills, sde, item.type_id)).min(1.0);
     let mut result = Vec::new();
     for r in materials {
         let total = r.quantity.unwrap_or(0).checked_mul(batches as i64).ok_or_else(output_overflow)?;
@@ -100,12 +104,14 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
 async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
+    let at = crate::client::filetime_now();
     match call.method {
         // GetQuotes(itemIDs, activeShipID) -> (stationTax, {typeID|None: stationEfficiency}, {itemID: quote})
         "GetQuotes" => {
+            let skills = crate::services::skills::effective::snapshot_at(&c.db, &c.sde, char_id, at).await?;
             let mut quotes = vec![];
             for item in reprocessable(c, &value_id_list(call.args.first())).await? {
-                if let Some(q) = quote(c, char_id, &item).await? {
+                if let Some(q) = quote(c, &c.sde, &skills, &item).await? {
                     quotes.push((Value::Int(item.item_id), quote_value(item.item_id, &q)));
                 }
             }
@@ -114,7 +120,8 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetStationEfficiencyForTypeID" => Ok(Value::Float(crate::config::game().mining.station_reprocessing_efficiency)),
         "GetCharRefiningYieldPercentageForType" => {
             let type_id = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-            Ok(Value::Float(skill_multiplier(c, char_id, type_id).await?))
+            let skills = crate::services::skills::effective::snapshot_at(&c.db, &c.sde, char_id, at).await?;
+            Ok(Value::Float(skill_multiplier(&skills, &c.sde, type_id)))
         }
         // Reprocess(itemIDs, fromLocationID, ownerID, outputLocationID, outputFlagID)
         //   -> (reprocessed itemIDs, {typeID: quantity})
@@ -123,11 +130,12 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
             let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
             let items = reprocessable(c, &value_id_list(call.args.first())).await?;
+            let skills = crate::services::skills::effective::snapshot_at(&c.db, &c.sde, char_id, at).await?;
             let mut sources = Vec::new();
             let mut output = BTreeMap::<i32, i64>::new();
             let mut tax = 0.0;
             for item in items {
-                let Some(q) = quote(c, char_id, &item).await? else { continue };
+                let Some(q) = quote(c, &c.sde, &skills, &item).await? else { continue };
                 for (type_id, received, _, isk) in &q.materials {
                     let total = output.entry(*type_id).or_default();
                     *total = add_output(*total, *received)?;

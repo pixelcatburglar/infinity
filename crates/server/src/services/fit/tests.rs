@@ -99,6 +99,16 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
     assert_eq!(node.base(None, None, super::ATTR_SKILL_LEVEL), 3.0);
 }
 
+#[test]
+fn supplied_skill_level_comes_from_points_not_stored_level() {
+    let skill = crate::dao::skills::training::Skill { type_id: 42, level: 5, skill_points: 8000 };
+    let rank = 1.0;
+    let level = crate::services::skills::formulas::level_from_points(skill.skill_points, rank);
+    assert_eq!(skill.level, 5);
+    assert_eq!(level, 3);
+}
+
+
 fn fixture_node(location: super::Location) -> super::Node {
     super::Node { type_id: 1, data_position: None, location, online: true,
         active: false, overloaded: false, projected_effect: None, receiver: None,
@@ -518,4 +528,31 @@ async fn selected_booster_effect_changes_fit_and_wire_brain() {
     }
     fixture::cleanup(&db, f).await.unwrap();
     assert!(exercised, "no effective chance modifier was found in the test SDE");
+}
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn expert_fit_projects_virtual_level_and_dogma_sp_without_mutating_training() {
+    use std::sync::Arc;
+    use crate::consts::dogma::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS};
+    use crate::services::tests::fixture;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let definition = sde.expert_systems.iter().find(|definition| definition.skills.first().is_some()).expect("expert definition with skills");
+    let (skill_type, virtual_level) = definition.skills[0];
+    let expert_type = definition.type_id;
+    let rank = sde.types.get(skill_type).and_then(|skill| skill.fit_attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT)).expect("skill rank in SDE");
+    let trained_points = crate::services::skills::formulas::sp_for_level(rank, 1);
+    db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&f.character, &skill_type, &trained_points]).await.unwrap();
+    db.execute("INSERT INTO game.character_expert_systems (character_id,type_id,installed_at,expires_at) VALUES ($1,$2,100,300)", &[&f.character, &expert_type]).await.unwrap();
+    let before = super::Fit::load_character_at(&db, sde.clone(), f.character, 99).await.unwrap();
+    let after = super::Fit::load_character_at(&db, sde.clone(), f.character, 200).await.unwrap();
+    assert_eq!(before.value(super::Key::Skill(skill_type), ATTR_SKILL_LEVEL), 1.0);
+    assert_eq!(after.value(super::Key::Skill(skill_type), ATTR_SKILL_LEVEL), f64::from(virtual_level));
+    assert_eq!(before.value(super::Key::Skill(skill_type), ATTR_SKILL_POINTS), trained_points as f64);
+    assert_eq!(after.value(super::Key::Skill(skill_type), ATTR_SKILL_POINTS), crate::services::skills::formulas::sp_for_level(rank, i64::from(virtual_level)).max(trained_points) as f64);
+    let stored: i64 = db.query_one("SELECT skill_points FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&f.character, &skill_type]).await.unwrap().get("skill_points");
+    assert_eq!(stored, trained_points);
+    fixture::cleanup(&db, f).await.unwrap();
 }

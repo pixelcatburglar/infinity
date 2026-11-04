@@ -44,8 +44,9 @@ pub(crate) struct Prepared {
 pub(crate) async fn prepare(
     db: &Db, world: &World, sde: &Arc<Sde>, char_id: i64,
     selected: &SelectedCharacter,
-    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
+    mut notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
 ) -> Result<Prepared, CallError> {
+    super::skills::expert_systems::advance_expired(db, sde, char_id, crate::client::filetime_now(), &mut notify).await?;
     let station = selected.station_id;
     let race = selected.race_id;
     let space_ship = characters::selection::space_ship(db, char_id).await.map_err(db_err)?;

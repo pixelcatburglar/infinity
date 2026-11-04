@@ -1,6 +1,7 @@
 //! Implant and booster activation mirrors menuSvcExtras/invItemFunctions.py and
 //! implantsBoostersPanel.py, using game.items, game.item_attributes, game.skills,
 //! game.skill_queue and game.jobs through the shared skill timeline and Fit.
+//! Activation prerequisites use the effective skill snapshot at the operation time.
 //! Brain mutations reconcile owned online ships in the same transaction; resulting
 //! fitting changes and notifications are dispatched only after commit.
 //! Booster duration is attribute 330 evaluated by Fit with static-data modifiers.
@@ -9,10 +10,10 @@
 //! eligibility cutoffs are inclusive and chance effects use independent Bernoulli draws.
 //! Legacy untimed boosters have no known expiry; dormant implants belong to their clone.
 //! Static datetime follows dogma/attributes/datetime.py:6-12 (days since Unix epoch).
-use super::{attributes::character_attributes_at, completion, db_err, requirements::requirements, trading::{available_credits, refusal, source}, training, CallError, CallResult};
-use crate::{client::{filetime_from_dogma_days, filetime_now, filetime_ticks_from_hours, filetime_ticks_from_ms, ms_from_filetime_ticks, Client}, consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTER_LAST_INJECTION_DATETIME, dogma::ATTR_BOOSTER_MAX_CHAR_AGE_HOURS, dogma::ATTR_BOOSTERNESS, dogma::ATTR_IMPLANTNESS, dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, CATEGORY_IMPLANT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_BOOSTER, FLAG_IMPLANT, GROUP_BOOSTER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE}, dao::{characters::social, items::{brain, dogma, inventory, loading::ItemQuery}, skills::training as skill_dao}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{effects::online::{self, OnlineChanged}, fit::{Fit, Key}, inventory::{notify_item_change, notify_item_removed, split_stack}, items::load_items}};
+use super::{attributes::character_attributes_at, completion, db_err, effective, requirements::requirements, trading::{available_credits, refusal, source}, training, CallError, CallResult};
+use crate::{client::{filetime_from_dogma_days, filetime_now, filetime_ticks_from_hours, filetime_ticks_from_ms, ms_from_filetime_ticks, Client}, consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTER_LAST_INJECTION_DATETIME, dogma::ATTR_BOOSTER_MAX_CHAR_AGE_HOURS, dogma::ATTR_BOOSTERNESS, dogma::ATTR_IMPLANTNESS, dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, CATEGORY_IMPLANT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_BOOSTER, FLAG_IMPLANT, GROUP_BOOSTER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE}, dao::{characters::social, items::{brain, dogma, inventory, loading::ItemQuery}}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{effects::online::{self, OnlineChanged}, fit::{Fit, Key}, inventory::{notify_item_change, notify_item_removed, split_stack}, items::load_items}};
 use marshal::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 fn candidates(sde: &Sde, type_id: i32) -> Vec<(i32, i32)> {
     let mut effects: Vec<_> = sde.types.effects(type_id).iter().filter_map(|e| {
@@ -44,8 +45,8 @@ pub(super) async fn activate_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outb
     for existing in brain::list(tx, char_id).await.map_err(db_err)? {
         if existing.flag_id == flag && (existing.slot == Some(slot) || existing.slot.is_none() && sde.types.attribute(existing.type_id, slot_attr) == Some(slot as f64)) { return Err(refusal()); }
     }
-    let known: HashMap<_, _> = skill_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| (s.type_id, s.level)).collect();
-    if requirements(sde, item.type_id).any(|(id, level)| known.get(&id).copied().unwrap_or(0) < level) { return Err(refusal()); }
+    let snapshot = effective::snapshot_at(tx, sde, char_id, now).await?;
+    if requirements(sde, item.type_id).any(|(id, level)| snapshot.level(id) < level) { return Err(refusal()); }
     if booster {
         if let Some(age) = data.attribute(ATTR_BOOSTER_MAX_CHAR_AGE_HOURS) {
             let duration = filetime_ticks_from_hours(age).filter(|_| age >= 0.0).ok_or_else(refusal)?;

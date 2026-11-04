@@ -110,7 +110,7 @@ async fn plan(
     db: &(impl Executor + ?Sized),
     sde: &Sde,
     fit: &Fit,
-    skills: &HashMap<i32, i32>,
+    skills: &crate::services::skills::effective::SkillSnapshot,
     bp: &Blueprint,
     act: &Activity,
     activity_id: i32,
@@ -121,7 +121,7 @@ async fn plan(
     facility: &Facility,
 ) -> Result<Plan, CallError> {
     let policy = &crate::config::game().industry;
-    let level = |s: i32| skills.get(&s).copied().unwrap_or(0) as f64;
+    let level = |s: i32| skills.level(s) as f64;
     // Materials: ME applies to manufacturing; copying multiplies by the licensed runs.
     let material_runs = if activity_id == COPYING { runs as f64 * licensed_runs as f64 } else { runs as f64 };
     let me_factor = if activity_id == MANUFACTURING { 1.0 - bp.me as f64 / 100.0 } else { 1.0 };
@@ -301,13 +301,13 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                 if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
                     return Err(notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED));
                 }
-                let skills: HashMap<i32, i32> = crate::dao::skills::levels::levels(tx, me).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.level)).collect();
-                if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.get(s).copied().unwrap_or(0) < *l) {
+                let skills = crate::services::skills::effective::snapshot_at(tx, &sde, me, now).await?;
+                if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.level(*s) < *l) {
                     return Err(notify_error(&messages::required_skill_message(skill, level)));
                 }
                 // Remote jobs need Supply Chain Management / Scientific Networking.
                 let reach_skill = if activity_id == MANUFACTURING { SKILL_SUPPLY_CHAIN_MANAGEMENT } else { SKILL_SCIENTIFIC_NETWORKING };
-                let reach = DISTANCE_PER_LEVEL[skills.get(&reach_skill).copied().unwrap_or(0).clamp(0, 5) as usize];
+                let reach = DISTANCE_PER_LEVEL[skills.level(reach_skill).clamp(0, 5) as usize];
                 if jumps(&sde.map, here, fac.system, reach).is_none() {
                     return Err(notify_error(messages::FACILITY_OUTSIDE_REMOTE_INDUSTRY_RANGE));
                 }

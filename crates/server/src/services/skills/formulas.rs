@@ -9,7 +9,7 @@ const SKILL_LEVEL_BASE: f64 = 2.0;
 const SKILL_LEVEL_EXPONENT: f64 = 2.5;
 use crate::consts::dogma::MAX_SKILL_LEVEL;
 
-pub(super) fn sp_for_level(rank: f64, level: i64) -> i64 {
+pub(in crate::services) fn sp_for_level(rank: f64, level: i64) -> i64 {
     if level <= 0 {
         return 0;
     }

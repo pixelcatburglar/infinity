@@ -1,4 +1,5 @@
 use super::*;
+use marshal::Value;
 use crate::client::BRAIN_REFRESH;
 
 fn entry(position: i32, type_id: i32, start: Option<i64>, end: Option<i64>) -> queue::QueueEntry {

@@ -1,6 +1,6 @@
 //! Corporation roles, titles and CEO persistence for corpRegistry.
 //! Mirrors eve/client/script/ui/services/corporation; uses game characters,
-//! corporations, skills and corp_titles. Policy and notifications are unsupported.
+//! corporations and corp_titles. Policy and notifications are unsupported.
 
 use crate::db::{self, executor::Executor};
 
@@ -40,6 +40,7 @@ impl CharacterId {
         Self { character_id: r.get("character_id") }
     }
 }
+
 pub(crate) struct Info {
     pub corporation_id: i64,
     pub alliance_id: Option<i64>,
@@ -125,9 +126,11 @@ pub(crate) async fn delete_title(ex: &(impl Executor + ?Sized), corp: i64, title
     ex.execute("UPDATE game.characters SET corp_title_mask = corp_title_mask & ~$2 WHERE corporation_id = $1", &[&corp, &title]).await?;
     Ok(())
 }
-pub(crate) async fn potential_ceos(ex: &(impl Executor + ?Sized), corp: i64, ceo: i64, skill: i32, level: i32) -> Result<Vec<i64>, db::Error> {
-    Ok(ex.query("SELECT ch.character_id FROM game.characters ch JOIN game.skills s ON s.character_id = ch.character_id AND s.type_id = $3 AND s.level >= $4
-             WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted ORDER BY ch.character_id", &[&corp, &ceo, &skill, &level]).await?.iter().map(|r| CharacterId::from_row(r).character_id).collect())
+pub(crate) async fn potential_ceos(ex: &(impl Executor + ?Sized), corp: i64, ceo: i64) -> Result<Vec<i64>, db::Error> {
+    Ok(ex.query("SELECT ch.character_id
+             FROM game.characters ch
+             WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted
+             ORDER BY ch.character_id", &[&corp, &ceo]).await?.iter().map(|r| r.get("character_id")).collect())
 }
 pub(crate) async fn transfer_ceo(ex: &(impl Executor + ?Sized), corp: i64, next: i64, mut writes: [(i64, i64); 2]) -> Result<(), db::Error> {
     ex.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &next]).await?;

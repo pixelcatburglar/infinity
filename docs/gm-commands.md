@@ -28,6 +28,7 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/allskills [character]` | Give every published skill (default: yourself) |
 | `/removeskill <character> <skill\|all>` | Remove skills from a character |
 | `/givestarterskills <character>` | Add the race's starting skills the character is missing |
+| `/expertsystem add\|remove <typeID>` | Install or extend an expert system on your character without an item, or remove one. The player limits apply: three at a time, and extension only once 30 days or less remain. |
 | `/ship <type> [character]` | Create and assemble a ship in the station hangar (default: yourself) |
 | `/spawn <type>` | Create an assembled ship and return its item ID: in the station hangar while docked, or in space, unoccupied, `gm.spawn_distance_m` from your ship. Your active ship does not change; board the new one to fly it. |
 | `/fit <character> <type\|itemID> [count]` | Fit modules by the same rules as the fitting window; they are not brought online |

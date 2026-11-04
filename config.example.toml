@@ -79,6 +79,8 @@ store_value_limit_bytes = 65536     # Maximum encoded value size in the script s
 # [lua.scripts.motd]                # Arbitrary per-script TOML settings.
 
 # Game parameters have no environment overrides.
+[expert_systems]
+enabled = false                      # advertise expert-system feature support to clients
 [map]
 history_retention_hours = 48        # server event history retention; minimum 24 hours
 maintenance_secs = 3600             # server event history cleanup interval

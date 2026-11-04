@@ -207,3 +207,57 @@ async fn fitting_online_priming_and_slash() {
     assert_eq!(after.unwrap(), before);
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
+async fn reconciliation_offlines_only_modules_with_missing_prerequisites() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let requirements = |ty| services::skills::requirements::requirements(&sde, ty);
+    let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
+        && t.attribute(14).is_some_and(|v| v >= 2.0)).expect("published ship with two high slots").type_id;
+    let is_online_module = |t: &crate::sde::types::TypeData| {
+        t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
+            && t.effects().iter().any(|e| e.effect_id == 12)
+            && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)
+    };
+    let dependent = sde.types.iter().find(|t| is_online_module(t) && requirements(t.type_id).next().is_some())
+        .expect("high-slot online module with prerequisites").type_id;
+    let mut needed: Vec<_> = requirements(dependent).collect();
+    let lost_skill = needed[0].0;
+    let independent = sde.types.iter().find(|t| is_online_module(t) && requirements(t.type_id).all(|(skill, _)| skill != lost_skill))
+        .expect("high-slot online module not requiring the lost skill").type_id;
+    needed.extend(requirements(independent));
+    let f = fixture::create(&db, ship_type, dependent).await.unwrap();
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let test_db = db.clone();
+    let test_sde = sde.clone();
+    let result = tokio::spawn(async move {
+        for (skill, level) in needed {
+            test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0) ON CONFLICT (character_id,type_id) DO UPDATE SET level=GREATEST(game.skills.level,EXCLUDED.level)", &[&f.owner, &skill, &level]).await.unwrap();
+        }
+        for (index, id) in f.modules.into_iter().enumerate() {
+            let ty = if index == 0 { dependent } else { independent };
+            let flag = FLAG_HI_SLOT_FIRST + index as i32;
+            assert_eq!(test_db.execute("UPDATE game.items SET type_id=$2,flag_id=$3,online=true WHERE item_id=$1", &[&id, &ty, &flag]).await.unwrap(), 1);
+            for attr in [ATTR_CPU, ATTR_POWER] {
+                assert!(item_dogma::set_override(&test_db, id, attr, 0.0).await.unwrap());
+            }
+        }
+        for attr in [ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT] {
+            assert!(item_dogma::set_override(&test_db, f.ship, attr, 1_000_000.0).await.unwrap());
+        }
+        let reconcile = || services::effects::online::reconcile_ship(&test_db, &test_sde, f.owner, f.ship, |_| Ok(()));
+        reconcile().await.ok().expect("reconcile with prerequisites");
+        let online = item_dogma::online(&test_db, f.ship).await.unwrap();
+        assert_eq!(online.len(), 2, "both modules must remain online with prerequisites");
+        assert_eq!(test_db.execute("DELETE FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&f.owner, &lost_skill]).await.unwrap(), 1);
+        reconcile().await.ok().expect("reconcile after skill loss");
+        let online = item_dogma::online(&test_db, f.ship).await.unwrap();
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0].item_id, f.modules[1], "only the module with the missing prerequisite should go offline");
+    }).await;
+    fixture::cleanup(&db, &world, f).await.unwrap();
+    result.unwrap();
+}

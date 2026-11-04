@@ -6,8 +6,8 @@
 //!
 //! A trade happens at the resting order's price and delivers to the buyer's hangar in the
 //! seller's station. The seller pays sales tax and an order that rests pays the broker's
-//! fee, as marketutil computes them (skilllimits, brokerFee), using raw NPC station owner
-//! corporation and faction standings from game.standings. Faction-war upgrades are
+//! fee, as marketutil computes them (skilllimits, brokerFee), using effective skills and
+//! raw NPC station owner corporation and faction standings from game.standings. Faction-war upgrades are
 //! unsupported (upgrade level zero); structure markets are unsupported. A sell
 //! order holds its items and a buy order its ISK in escrow until it fills, is cancelled or
 //! expires; closed orders move to game.market_order_history, and every fill is a row of
@@ -188,11 +188,9 @@ struct Skills {
     modification_discount: f64,
 }
 
-async fn skills(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, CallError> {
-    let wanted = vec![SKILL_TRADE, SKILL_RETAIL, SKILL_BROKER_RELATIONS, SKILL_WHOLESALE, SKILL_MARGIN_TRADING, SKILL_ACCOUNTING, SKILL_TYCOON];
-    let rows = crate::dao::skills::levels::levels_of(db, char_id, &wanted).await.map_err(db_err)?;
-    let levels: HashMap<i32, i32> = rows.iter().map(|r| (r.type_id, r.level)).collect();
-    let l = |skill: i32| levels.get(&skill).copied().unwrap_or(0) as f64;
+async fn skills(ex: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<Skills, CallError> {
+    let levels = super::skills::effective::snapshot_at(ex, sde, char_id, at).await?;
+    let l = |skill: i32| levels.level(skill) as f64;
     Ok(Skills {
         order_cap: (5.0 + 4.0 * l(SKILL_TRADE) + 8.0 * l(SKILL_RETAIL) + 16.0 * l(SKILL_WHOLESALE) + 32.0 * l(SKILL_TYCOON)) as i64,
         sales_tax: crate::config::game().market.sales_tax * (1.0 - ACCOUNTING_PER_LEVEL * l(SKILL_ACCOUNTING)),
@@ -320,9 +318,8 @@ async fn consume<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>,
 
 /// Sell up to `quantity` x `type_id` at `at` to the best bids paying at least `floor`.
 /// Returns how many sold.
-async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &crate::sde::Sde, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
+async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &crate::sde::Sde, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, tax: f64, now: i64) -> Result<i32, CallError> {
     let rows = orders::bids(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, floor).await.map_err(db_err)?;
-    let tax = skills(db, seller).await?.sales_tax;
     let mut left = quantity;
     for mut bid in rows {
         if left == 0 {
@@ -355,9 +352,11 @@ async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffec
 /// than `cap`, paying from the wallet unless an order's escrow covers it.
 /// Returns (bought, spent).
 #[allow(clippy::too_many_arguments)]
-async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &crate::sde::Sde, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
+async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &crate::sde::Sde, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, buyer_sales_tax: f64, now: i64) -> Result<(i32, f64), CallError> {
     let rows = orders::asks(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, cap).await.map_err(db_err)?;
     let (mut left, mut spent) = (quantity, 0.0);
+    let mut seller_taxes = HashMap::new();
+    seller_taxes.insert(buyer, buyer_sales_tax);
     for mut ask in rows {
         if left == 0 {
             break;
@@ -377,7 +376,14 @@ async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffe
             }
         }
         if let Some(seller) = ask.char_id {
-            let tax = skills(db, seller).await?.sales_tax;
+            let tax = match seller_taxes.get(&seller) {
+                Some(&tax) => tax,
+                None => {
+                    let tax = skills(db, sde, seller, now).await?.sales_tax;
+                    seller_taxes.insert(seller, tax);
+                    tax
+                }
+            };
             credit(db, outbox, seller, round2(value * (1.0 - tax))).await?;
         }
         deliver(db, sde, outbox, buyer, ask.at.id, type_id, q).await?;
@@ -410,7 +416,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
-    let skills = skills(db, me).await?;
+    let skills = skills(db, &sde, me, now).await?;
     let broker_rate = if duration > 0 {
         check_order_slots(db, me, &skills).await?;
         let rate = station_broker_rate(db, &sde, me, at.owner, skills.broker_fee).await?;
@@ -420,7 +426,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     } else {
         skills.broker_fee
     };
-    let (bought, _) = lift_asks(db, outbox, &sde, me, &at, range, type_id, price, quantity, true, now).await?;
+    let (bought, _) = lift_asks(db, outbox, &sde, me, &at, range, type_id, price, quantity, true, skills.sales_tax, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -482,9 +488,9 @@ pub(crate) async fn place_sell(identity: &Identity, db: &Db, world: &World, sde:
     }
     let (type_id, quantity) = (item.type_id, quantity.min(item.quantity as i64) as i32);
     let at = station(&sde, station_id)?;
-    let skills = skills(db, me).await?;
+    let skills = skills(db, &sde, me, now).await?;
     if duration == 0 {
-        let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, now).await?;
+        let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, skills.sales_tax, now).await?;
         if sold == 0 {
             return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
         }
@@ -512,7 +518,7 @@ pub(crate) async fn place_sell(identity: &Identity, db: &Db, world: &World, sde:
     require_balance(db, me, broker_fee(broker_rate, price * quantity as f64)).await?;
     // The items go into escrow first; what the bids don't take stays listed.
     take_items(db, outbox, item, quantity).await?;
-    let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, now).await?;
+    let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, skills.sales_tax, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -553,7 +559,7 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
     let mut o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
-    let skills = skills(db, me).await?;
+    let skills = skills(db, &sde, me, now).await?;
     let owner = station(&sde, o.at.id)?.owner;
     let broker_rate = station_broker_rate(db, &sde, me, owner, skills.broker_fee).await?;
     let volume = o.vol_remaining as f64;
@@ -571,12 +577,12 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     trading::reprice(db, o.id, o.price, o.escrow, o.issued).await.map_err(db_err)?;
     outbox.operation(MarketEffect::Repriced { owner: me, order: o.id, price: new_price });
     let traded = if o.bid {
-        let (bought, spent) = lift_asks(db, outbox, &sde, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
+        let (bought, spent) = lift_asks(db, outbox, &sde, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, skills.sales_tax, now).await?;
         // The escrow paid this order's price; cheaper asks leave change.
         credit(db, outbox, me, round2(o.price * bought as f64 - spent)).await?;
         bought
     } else {
-        hit_bids(db, outbox, &sde, me, &o.at, o.type_id, o.price, o.vol_remaining, now).await?
+        hit_bids(db, outbox, &sde, me, &o.at, o.type_id, o.price, o.vol_remaining, skills.sales_tax, now).await?
     };
     if traded > 0 {
         consume(db, outbox, &mut o, traded, now).await?;

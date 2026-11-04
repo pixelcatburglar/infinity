@@ -108,6 +108,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     let (groups, requested, title, description) = &*input;
     if for_corp { ownership::authorize_corporate_action(db, me, corp, wallet_key).await?; }
     let source = custody::issuer_source(db, me, corp, for_corp, start_id, source_flag).await?;
+    let skills = super::super::skills::effective::snapshot_at(db, &sde, me, now).await?;
     let counts = shared::outstanding_counts(db, me, corp, STATUS_OUTSTANDING).await.map_err(db_err)?;
     let internal = assignee != 0 && (assignee == corp || crate::dao::characters::members::active_ids(db, corp).await.map_err(db_err)?.contains(&assignee));
     let open = match (for_corp, internal) {
@@ -116,7 +117,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         (false, true) => counts.my_char_total,
         (false, false) => counts.non_corp_for_my_char,
     };
-    let cap = if internal { MAX_INTERNAL_CONTRACTS } else { max_outstanding(db, me, for_corp).await? };
+    let cap = if internal { MAX_INTERNAL_CONTRACTS } else { max_outstanding(&skills, for_corp) };
     if open + groups.len() as i64 > cap {
         return Err(notify_error(&messages::contract_limit(open, cap)));
     }
@@ -143,8 +144,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
     }
     let escrow_isk = if kind == TYPE_AUCTION { 0.0 } else { reward };
-    let skill_rows = crate::dao::skills::levels::levels_of(db, me, &[crate::consts::SKILL_ACCOUNTING, crate::consts::SKILL_BROKER_RELATIONS]).await.map_err(db_err)?;
-    let skill = |id| skill_rows.iter().find(|row| row.type_id == id).map_or(0, |row| row.level.clamp(0, crate::consts::dogma::MAX_SKILL_LEVEL));
+    let skill = |id| skills.level(id).clamp(0, crate::consts::dogma::MAX_SKILL_LEVEL);
     let fees = super::fees::calculate(kind, assignee != 0, price, reward, minutes, skill(crate::consts::SKILL_ACCOUNTING), skill(crate::consts::SKILL_BROKER_RELATIONS));
     let creation_fee = fees.brokers_fee + fees.deposit + if kind == TYPE_ITEM_EXCHANGE { fees.sales_tax } else { 0.0 };
     let mut created = vec![];

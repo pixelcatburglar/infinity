@@ -48,6 +48,8 @@ async fn corporate_lists_counts_search_and_wire() {
     db.execute("UPDATE game.characters SET corporation_id = $1 WHERE character_id = ANY($2)", &[&corp, &vec![actor.character, ceo.character]]).await.unwrap();
     client.session.apply(vec![("corpid", Value::Int(corp)), ("corpAccountKey", Value::Int(i64::from(ACCOUNT_CASH + 2))), ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system))]);
     let task_db = db.clone();
+    let sde = client.sde.clone();
+    let at = filetime_now();
     let task = tokio::spawn(async move {
         let db = task_db;
         let future = filetime_now() + FILETIME_DAY;
@@ -67,13 +69,16 @@ async fn corporate_lists_counts_search_and_wire() {
         assert_eq!(number(&page, "numBiddingOnCorp"), 1);
         assert_eq!(number(&page, "numInProgressCorp"), 1);
         assert_eq!(number(&page, "numRequiresAttentionCorp"), 1);
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, false).await), 1);
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, true).await), 10);
+        let skills = success(crate::services::skills::effective::snapshot_at(&db, &sde, actor.character, at).await);
+        assert_eq!(super::super::super::max_outstanding(&skills, false), 1);
+        assert_eq!(super::super::super::max_outstanding(&skills, true), 10);
         for skill in [SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING, SKILL_CORPORATION_CONTRACTING] {
-            db.execute("INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, 5, 0)", &[&actor.character, &skill]).await.unwrap();
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&actor.character, &skill];
+            db.execute("INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, 5, 0)", &params).await.unwrap();
         }
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, false).await), 41);
-        assert_eq!(success(super::super::super::max_outstanding(&db, actor.character, true).await), 60);
+        let skills = success(crate::services::skills::effective::snapshot_at(&db, &sde, actor.character, at).await);
+        assert_eq!(super::super::super::max_outstanding(&skills, false), 41);
+        assert_eq!(super::super::super::max_outstanding(&skills, true), 60);
         let kwargs = Value::Dict(vec![]);
         for (owner, included, excluded) in [(corp, corporate, personal), (actor.character, personal, corporate), (corp + 1, 0, corporate)] {
             let args = [Value::Int(owner), Value::Int(i64::from(STATUS_OUTSTANDING)), Value::Int(CONTYPE_ALL), Value::Bool(false)];

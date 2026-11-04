@@ -280,10 +280,9 @@ async fn destroy_escrow(db: &(impl Executor + ?Sized), contract_id: i64) -> Resu
 }
 
 
-async fn max_outstanding(db: &(impl Executor + ?Sized), char_id: i64, for_corp: bool) -> Result<i64, CallError> {
-    let rows = crate::dao::skills::levels::levels_of(db, char_id, &[SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING, SKILL_CORPORATION_CONTRACTING]).await.map_err(db_err)?;
-    let level = |skill: i32| rows.iter().find(|r| r.type_id == skill).map(|r| r.level.clamp(0, 5) as usize).unwrap_or(0);
-    Ok(if for_corp { NUM_CONTRACTS_BY_SKILL_CORP[level(SKILL_CORPORATION_CONTRACTING)] } else { NUM_CONTRACTS_BY_SKILL[level(SKILL_CONTRACTING)] + NUM_CONTRACTS_BY_ADVSKILL[level(SKILL_ADVANCED_CONTRACTING)] })
+fn max_outstanding(snapshot: &super::skills::effective::SkillSnapshot, for_corp: bool) -> i64 {
+    let level = |skill: i32| snapshot.level(skill).clamp(0, 5) as usize;
+    if for_corp { NUM_CONTRACTS_BY_SKILL_CORP[level(SKILL_CORPORATION_CONTRACTING)] } else { NUM_CONTRACTS_BY_SKILL[level(SKILL_CONTRACTING)] + NUM_CONTRACTS_BY_ADVSKILL[level(SKILL_ADVANCED_CONTRACTING)] }
 }
 
 async fn outstanding_counts(db: &(impl Executor + ?Sized), char_id: i64, corp_id: i64) -> Result<shared::OutstandingCounts, CallError> {

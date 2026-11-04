@@ -88,9 +88,9 @@ pub(super) async fn broadcast_sites(world: &World, system: i64, added: &[Site], 
 
 /// A pilot's probe strength (baseSensorStrength with the Astrometrics skills) and scan
 /// time (ms, Astrometric Acquisition).
-pub(super) async fn probe_skills(db: &Db, char_id: i64) -> Result<(f64, f64), CallError> {
-    let rows = crate::dao::skills::levels::levels_of(db, char_id, &[SKILL_ASTROMETRICS, SKILL_RANGEFINDING, SKILL_ACQUISITION]).await.map_err(db_err)?;
-    let level = |skill: i32| rows.iter().find(|r| r.type_id == skill).map(|r| r.level as f64).unwrap_or(0.0);
+pub(super) async fn probe_skills(ex: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<(f64, f64), CallError> {
+    let skills = crate::services::skills::effective::snapshot_at(ex, sde, char_id, at).await?;
+    let level = |skill: i32| skills.level(skill) as f64;
     let strength = (1.0 + 0.05 * level(SKILL_ASTROMETRICS)) * (1.0 + 0.05 * level(SKILL_RANGEFINDING));
     let scan_ms = 10_000.0 * (1.0 - 0.1 * level(SKILL_ACQUISITION));
     Ok((strength, scan_ms))
@@ -190,7 +190,7 @@ pub(super) fn result_value(s: &Site, certainty: f64, spread: f64) -> Value {
 pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Ok(Value::None) };
     ensure_loaded(&c.db, &c.world, system).await?;
-    let (_, scan_ms) = probe_skills(&c.db, char_id).await?;
+    let (_, scan_ms) = probe_skills(&c.db, &c.sde, char_id, filetime_now()).await?;
     // (probeID, destination, range)
     let mut moved = vec![];
     if let Some(Value::Dict(probes)) = call.args.first() {

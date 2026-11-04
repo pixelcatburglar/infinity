@@ -41,6 +41,7 @@ mod combat;
 mod social;
 mod info;
 mod wormholes;
+mod expert_systems;
 mod hitchance;
 mod subscriptions;
 
@@ -73,6 +74,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("heal", messages::gm::GM_HELP_HEAL),
     ("dogma", messages::gm::GM_HELP_DOGMA),
     ("jobs", messages::scheduler::HELP),
+    ("expertsystem", messages::gm::GM_HELP_EXPERT_SYSTEM),
     ("effects", messages::gm::GM_HELP_EFFECTS),
     ("hitchance", messages::gm::GM_HELP_HITCHANCE),
     ("giveskill", messages::gm::GM_HELP_GIVESKILL),
@@ -344,6 +346,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "jobs" => jobs::command(&c.db, args).await,
         "effects" => effects::command(args),
         "hitchance" => hitchance::command(c, args).await,
+        "expertsystem" => expert_systems::command(c, args).await,
         "giveskill" | "allskills" | "removeskill" | "givestarterskills" => skills::command(c, &command, args).await,
         // eve/devtools/script/dna.py:118-124 creates and returns the item ID without boarding; the caller must board separately.
         "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),

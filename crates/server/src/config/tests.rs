@@ -99,6 +99,23 @@ fn shared_settings_policy_defaults_validation_and_snapshot() {
 }
 
 #[test]
+fn expert_system_feature_policy_defaults_and_global_config() {
+    let fixture = Fixture::new();
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert!(!defaults.expert_systems.enabled);
+    assert_eq!(defaults.global_config().get("expert_system_feature_enabled").and_then(|v| v.as_text()).map(|v| v.into_owned()), Some("0".to_owned()));
+    for value in [false, true] {
+        fixture.write(&format!("[expert_systems]\nenabled = {value}"));
+        let config = Config::load_with(&fixture.path(), |_| None).unwrap();
+        assert_eq!(config.game_config().expert_systems.enabled, value);
+        assert_eq!(config.global_config().get("expert_system_feature_enabled").and_then(|v| v.as_text()).map(|v| v.into_owned()), Some(if value { "1".to_owned() } else { "0".to_owned() }));
+        assert_eq!(config == defaults, !value);
+    }
+    assert!(load_error("[expert_systems]\nenabled = 1").contains("enabled"));
+    assert!(load_error("[expert_systems]\nunknown = true").contains("unknown"));
+}
+
+#[test]
 fn gm_spawn_policy_rejects_invalid_limits() {
     let mut config = Config::default();
     assert!(config.validate().is_ok());

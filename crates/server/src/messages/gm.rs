@@ -173,6 +173,16 @@ pub(crate) fn gm_skill_not_skill(skill: &str) -> String { format!("{skill} 不�
 pub(crate) fn gm_skill_done(command: &str, target: i64) -> String { format!("{command} 已应用于角色 {target}。") }
 
 
+// Expert-system administration.
+pub(crate) const GM_HELP_EXPERT_SYSTEM: &str = "/expertsystem add|remove <typeID> — 添加或移除专家系统";
+pub(crate) const GM_EXPERT_SYSTEM_USAGE: &str = "用法：/expertsystem add|remove <typeID>";
+/// Invalid GM type ID argument.
+pub(crate) fn gm_expert_system_type_id_invalid(text: &str) -> String { format!("专家系统 typeID 必须是整数：{text}") }
+/// GM removal result.
+pub(crate) fn gm_expert_system_removed(type_id: i32) -> String { format!("已移除专家系统 {type_id}。") }
+/// GM addition result.
+pub(crate) fn gm_expert_system_added(type_id: i32) -> String { format!("已添加专家系统 {type_id}。") }
+
 // Item administration.
 pub(crate) const GM_HELP_SHIP: &str = "/ship <类型> [角色] — 创建飞船";
 pub(crate) const GM_HELP_SPAWN: &str = "/spawn <类型> — 停靠时创建飞船并返回物品ID";

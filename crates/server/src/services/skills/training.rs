@@ -114,19 +114,6 @@ pub(super) fn skill_type(sde: &crate::sde::Sde, type_id: i32) -> SkillType {
         secondary: attribute(ATTR_SECONDARY).map(|v| v as i64).unwrap_or(CHAR_ATTRIBUTES[2]),
     }
 }
-pub(super) fn skill_info(sde: &crate::sde::Sde, type_id: i32, level: i32, points: i64, now: i64) -> Value {
-    keyval([
-        ("typeID", Value::Int(type_id as i64)),
-        ("trainedSkillLevel", Value::Int(level as i64)),
-        ("effectiveSkillLevel", Value::Int(level as i64)),
-        ("virtualSkillLevel", Value::None),
-        ("trainedSkillPoints", Value::Int(points)),
-        ("skillPoints", Value::Int(points)),
-        ("skillLevel", Value::Int(level as i64)),
-        ("skillRank", Value::Float(skill_type(sde, type_id).rank)),
-        ("timeStamp", Value::Int(now)),
-    ])
-}
 
 
 // None level means banking only: it must not create a missing skill row.
@@ -203,23 +190,6 @@ pub(super) async fn in_training_sp(db: &(impl Executor + ?Sized), char_id: i64, 
     }))
 }
 
-pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
-    let now = filetime_now();
-    let training = in_training_sp(&c.db, char_id, now).await?;
-    let rows = training_dao::current(&c.db, char_id).await.map_err(db_err)?;
-    let now = filetime_now();
-    Ok(Value::Dict(
-        rows.iter()
-            .map(|r| {
-                let (type_id, level, mut sp) = (r.type_id, r.level, r.skill_points);
-                if let Some((t, trained)) = training {
-                    if t == type_id { sp = sp.max(trained); }
-                }
-                (Value::Int(type_id as i64), skill_info(&c.sde, type_id, level, sp, now))
-            })
-            .collect(),
-    ))
-}
 
 pub(crate) async fn queue_list(identity: &Identity, db: &(impl Executor + ?Sized)) -> Result<Vec<queue_dao::QueueEntry>, CallError> {
     queue_dao::list(db, identity.char_id).await.map_err(db_err)

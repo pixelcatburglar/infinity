@@ -1,6 +1,7 @@
 //! Durable queue completion and replay regressions.
 use super::*;
 mod reconciliation;
+mod expert_expiry;
 use crate::services::tests::{client, fixture};
 
 async fn state(ex: &(impl crate::db::executor::Executor + ?Sized), character: i64) -> String {

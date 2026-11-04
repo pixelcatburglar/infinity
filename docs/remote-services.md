@@ -141,6 +141,16 @@ Epic-arc availability follows the selected character's active missions and unloc
 
 The bound skill handler returns the bought type IDs in request order and sends the same committed skill updates as skillbook injection. Skills in the client's hidden skill groups cannot be bought.
 
+## Expert systems
+
+| service | method | status | handler file |
+|---|---|---|---|
+| expertSystemMgr | GetMyExpertSystems | handled | `crates/server/src/services/expert_systems.rs` |
+| expertSystemMgr | ConsumeExpertSystem | handled | `crates/server/src/services/expert_systems.rs` |
+| expertSystemMgr | RemoveMyExpertSystem | handled | `crates/server/src/services/expert_systems.rs` |
+
+The installed expert systems are returned by type ID with their install and expiry times as FILETIME. Consuming takes an item ID and removing a type ID; both return `None` once the change is saved, and otherwise refuse with a message and change nothing. Every change sends `OnExpertSystemsUpdated` with the full set.
+
 ## Clone grade
 
 | service | method | status | handler file |

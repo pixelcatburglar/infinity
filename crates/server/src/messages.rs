@@ -21,6 +21,7 @@ pub(crate) mod exploration;
 pub(crate) mod fitting;
 pub(crate) mod fleets;
 pub(crate) mod gm;
+pub(crate) mod expert_systems;
 pub(crate) mod heat;
 pub(crate) mod industry;
 pub(crate) mod mining;

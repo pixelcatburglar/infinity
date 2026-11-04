@@ -161,7 +161,7 @@ impl Fit {
 
     /// Load an unpiloted fitted hull with explicit incoming projections.
     pub(crate) async fn load_unpiloted_projected(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, ship: i64, projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, None, ship, projections, crate::client::filetime_now(), None).await
+        Self::load_at(db, sde, None, ship, projections, crate::client::filetime_now(), None, None).await
     }
 
     /// Snapshot incoming effects and their revision for an unpiloted hull.
@@ -215,27 +215,45 @@ impl Fit {
 
     /// Load the fit and explicit source-effective incoming projected effects.
     pub(crate) async fn load_projected(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, Some(char_id), ship, projections, crate::client::filetime_now(), None).await
+        Self::load_at(db, sde, Some(char_id), ship, projections, crate::client::filetime_now(), None, None).await
     }
 
     /// Load a character-only snapshot at an explicit FILETIME.
     pub async fn load_character_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, at: i64) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, Some(char_id), 0, Vec::new(), at, None).await
+        Self::load_at(db, sde, Some(char_id), 0, Vec::new(), at, None, None).await
     }
 
-    /// Evaluate the same character fit using a borrowed skill snapshot instead
-    /// of persisted skills. Levels are still derived from skill points.
-    pub(crate) async fn load_character_with_skills_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, at: i64, skills: &[crate::dao::skills::training::Skill]) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, Some(char_id), 0, Vec::new(), at, Some(skills)).await
+    /// Evaluate a character fit from supplied trained rows and expert grants.
+    pub(crate) async fn load_character_with_skills_at(
+        db: &(impl crate::db::executor::Executor + ?Sized),
+        sde: Arc<Sde>,
+        char_id: i64,
+        at: i64,
+        skills: &[crate::dao::skills::training::Skill],
+        installations: &[crate::dao::skills::expert_systems::ExpertSystem],
+    ) -> Result<Fit, CallError> {
+        Self::load_at(db, sde, Some(char_id), 0, Vec::new(), at, Some(skills), Some(installations)).await
     }
 
-    async fn load_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: Option<i64>, ship: i64, projections: Vec<super::effects::projection::Projection>, at: i64, supplied_skills: Option<&[crate::dao::skills::training::Skill]>) -> Result<Fit, CallError> {
+    async fn load_at(
+        db: &(impl crate::db::executor::Executor + ?Sized),
+        sde: Arc<Sde>,
+        char_id: Option<i64>,
+        ship: i64,
+        projections: Vec<super::effects::projection::Projection>,
+        at: i64,
+        supplied_skills: Option<&[crate::dao::skills::training::Skill]>,
+        supplied_installations: Option<&[crate::dao::skills::expert_systems::ExpertSystem]>,
+    ) -> Result<Fit, CallError> {
         let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
-        let loaded_skills;
-        let skills: &[crate::dao::skills::training::Skill] = if let Some(skills) = supplied_skills { skills } else if let Some(char_id) = char_id {
-            loaded_skills = crate::dao::skills::training::current(db, char_id).await.map_err(db_err)?;
-            &loaded_skills
-        } else { &[] };
+        let skill_snapshot = if let Some(skills) = supplied_skills {
+            let installations = supplied_installations.unwrap_or(&[]);
+            super::skills::effective::project(skills, installations, &sde, at)
+        } else if let Some(char_id) = char_id {
+            super::skills::effective::snapshot_at(db, &sde, char_id, at).await?
+        } else {
+            super::skills::effective::project(&[], &[], &sde, at)
+        };
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
         let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
         let brain = if let Some(char_id) = char_id { fit_dao::brain_items(db, char_id, at).await.map_err(db_err)? } else { Vec::new() };
@@ -264,10 +282,17 @@ impl Fit {
         };
         if let Some(character) = character { nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character)); }
         nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
-        for r in skills {
-            let rank = sde.types.get(r.type_id).and_then(|d| d.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap_or(0.0);
-            let level = super::skills::formulas::level_from_points(r.skill_points, rank);
-            nodes.insert(Key::Skill(r.type_id), node(r.type_id, Location::Char, true, false, Some(level), vec![(ATTR_SKILL_POINTS, r.skill_points as f64)]));
+        for (type_id, entry) in skill_snapshot.iter() {
+            let rank = sde.types.get(type_id).and_then(|d| d.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap_or(0.0);
+            let trained_points = entry.trained.as_ref().map_or(0, |skill| skill.skill_points);
+            let trained_level = super::skills::formulas::level_from_points(trained_points, rank);
+            let level = entry.effective_level();
+            let points = if entry.virtual_level.is_some_and(|virtual_level| virtual_level > trained_level) {
+                trained_points.max(super::skills::formulas::sp_for_level(rank, i64::from(level)))
+            } else {
+                trained_points
+            };
+            nodes.insert(Key::Skill(type_id), node(type_id, Location::Char, true, false, Some(level), vec![(ATTR_SKILL_POINTS, points as f64)]));
         }
         let mut module_by_flag = HashMap::new();
         for r in &modules {
@@ -297,13 +322,14 @@ impl Fit {
         }
         Self::insert_projections(&sde, &mut nodes, Key::Ship, projections);
         let mut skill_effects = Vec::new();
-        for r in skills {
-            if nodes.get(&Key::Skill(r.type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
-            if let Some(data) = sde.types.get(r.type_id) {
-                for entry in data.effects() {
-                    if entry.effect_id == EFFECT_SKILL { continue; }
-                    if sde.dogma.effect(entry.effect_id).is_some_and(|effect| effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE && chance_enabled(&selected_effects, Key::Skill(r.type_id), data, effect)) {
-                        skill_effects.push((r.type_id, entry.effect_id));
+        for (type_id, entry) in skill_snapshot.iter() {
+            if entry.trained.is_none() { continue; }
+            if nodes.get(&Key::Skill(type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
+            if let Some(data) = sde.types.get(type_id) {
+                for effect_entry in data.effects() {
+                    if effect_entry.effect_id == EFFECT_SKILL { continue; }
+                    if sde.dogma.effect(effect_entry.effect_id).is_some_and(|effect| effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE && chance_enabled(&selected_effects, Key::Skill(type_id), data, effect)) {
+                        skill_effects.push((type_id, effect_entry.effect_id));
                     }
                 }
             }

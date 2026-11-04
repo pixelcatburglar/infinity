@@ -1,9 +1,12 @@
-//! Shared skill level reads, presence, training, queue and plan persistence using `game.skills`,
-//! `game.skill_queue` and `game.skill_plans`.
+//! Shared skill level reads, presence, training, queue, plan and expert-system lifecycle
+//! persistence using `game.skills`, `game.skill_queue`, `game.skill_plans` and
+//! `game.character_expert_systems`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
-//! Training policy, transactions, refusals, notifications and World are caller concerns.
+//! Training and expert-system policy, transactions, refusals, notifications and World are
+//! caller concerns.
 
 pub(crate) mod alpha_injections;
+pub(crate) mod expert_systems;
 pub(crate) mod history;
 pub(crate) mod levels;
 pub(crate) mod plans;

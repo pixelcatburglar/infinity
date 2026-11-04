@@ -16,7 +16,7 @@ pub(in crate::services) struct BodyChange {
 /// The caller holds the character lock and supplies a consistent transaction.
 pub(in crate::services) async fn projected_fit_tx(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, now: i64) -> Result<crate::services::fit::Fit, CallError> {
     let plan = super::timeline::plan_tx(ex, sde, owner, now).await?;
-    crate::services::fit::Fit::load_character_with_skills_at(ex, Arc::clone(sde), owner, now, &plan.skills).await
+    crate::services::fit::Fit::load_character_with_skills_at(ex, Arc::clone(sde), owner, now, &plan.skills, &plan.initial_installations).await
 }
 
 
