@@ -10,6 +10,7 @@
   - moon mining observers and the corporation tab of the mining ledger, which stays empty; the personal mining ledger works
   - fleet boosts, loading a saved fleet setup, removing unqualified members when arranging a wing by ship type, fleet warp to a bookmark, and cynosural beacon broadcasts
   - beacon counts and faction-warfare kills on the star map
+  - faction warfare enlistment, occupation, victory points and rewards, and shipcaster construction and travel; direct enlistment and leaving are refused, while dashboard reads return closed-state information
   - in chat: password-protected channels, granting channel access to a whole corporation or alliance, taking over ownership of a system channel, and the local chat blackout in null-security space
   - access groups owned by a corporation, and access lists for structures
   - Alpha clone limits on skills, training speed, ships and modules, and planetary colony extraction rules: an Alpha account plays as an Omega one, except for seasonal login rewards and the daily Alpha skill injector

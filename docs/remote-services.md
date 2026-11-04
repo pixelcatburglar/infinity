@@ -43,6 +43,20 @@ NPC station and solar-system data comes from static data; alliance sovereignty i
 
 These replies are empty because insurgency, roaming weather, minor-victory and fortress systems, and campaign snapshots are not modelled. Each has the shape its client reader expects: a list for the insurgency membership check, a dictionary for roaming weather, and lists for the others.
 
+## Faction warfare and shipcasters
+
+| service | method | status | handler file |
+|---|---|---|---|
+| fwWarzoneSolarsystem | GetHQSystemIDs | handled | `crates/server/src/services/station/fw_warzone_solarsystem.rs` |
+| fwVictoryPointMgr | GetLocalVictoryPointState, GetAllVictoryPointStates | fixed | `crates/server/src/services/fw_victory_point_mgr.rs` |
+| fwCharacterEnlistmentMgr | CreateMyDirectEnlistment, RemoveMyDirectEnlistment | fixed | `crates/server/src/services/agency/fw_character_enlistment_mgr.rs` |
+| map | GetFacWarZoneInfo | fixed | `crates/server/src/services/fixed.rs` |
+| facWarMgr | GetStats_TopAndAllKillsAndVPs, GetStats_Character, GetStats_Corp, GetStats_Alliance | fixed | `crates/server/src/services/fixed.rs` |
+| shipCasterLandingPadMgr | GetFactionLandingPads, GetAllLandingPads | fixed | `crates/server/src/services/fixed.rs` |
+| shipCasterLauncherMgr | GetFactionsWithShipcaster | fixed | `crates/server/src/services/fixed.rs` |
+
+Direct enlistment and leaving return explicit unavailable errors; corporation whitelist operations remain available. As server policy, headquarters locations use each warfare faction's static-data home system, not official warzone HQ data. Victory-point reads return compatibility empty states, shipcaster lists are empty, and the closed warzone has zero points with a nonzero maximum. These compatibility answers and refusals do not implement faction warfare: occupation, rewards and shipcaster travel are not implemented.
+
 ## Mining ledger
 
 | service | method | status | handler file |

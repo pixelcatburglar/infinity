@@ -68,6 +68,14 @@ pub const DRONE_STATE_APPROACHING: i32 = 3;
 pub const DRONE_STATE_DEPARTING: i32 = 4;
 
 // SDE inventory type, group and category IDs.
+/// SDE invGroups and `inventorycommon/const.py` groupCharacter.
+pub const GROUP_CHARACTER: i64 = 1;
+/// SDE invGroups and `inventorycommon/const.py` groupCorporation.
+pub const GROUP_CORPORATION: i64 = 2;
+/// SDE invGroups and `inventorycommon/const.py` groupAlliance.
+pub const GROUP_ALLIANCE: i64 = 32;
+/// `facwarCommon.py` _ALL_WARFARE_FACTIONS.
+pub(crate) const WARFARE_FACTIONS: [i64; 6] = [FACTION_CALDARI, FACTION_MINMATAR, FACTION_AMARR, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_ANGEL_CARTEL];
 /// SDE invTypes: Velator, the fallback rookie ship.
 pub const FALLBACK_ROOKIE_SHIP: i32 = 606;
 /// Client `inventorycommon.const.typeBrokerRelations`.

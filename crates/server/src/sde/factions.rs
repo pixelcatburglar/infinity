@@ -1,6 +1,7 @@
 //! Immutable faction records shared by gameplay features.
 //! This server-startup dataset has no direct client mirror.
-//! Source: `sde.chr_factions`. Dynamic faction state and other faction fields are unsupported.
+//! Source: `sde.chr_factions`, including home solar systems for the warzone dashboard.
+//! Dynamic faction state and other faction fields are unsupported.
 
 use crate::{dao, db::Db};
 
@@ -9,6 +10,7 @@ pub(crate) struct Faction {
     pub name: Option<String>,
     pub lower_name: Option<String>,
     pub corporation_id: Option<i64>,
+    pub solar_system_id: Option<i64>,
 }
 
 pub(crate) struct Factions {
