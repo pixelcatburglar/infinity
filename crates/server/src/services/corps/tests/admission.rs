@@ -2,6 +2,7 @@
 use crate::{client::Client, consts::ROLE_DIRECTOR, db::Db, services::{Call, CallResult, tests::{self, fixture}}};
 mod admission_events;
 mod creation_capacity;
+mod locking;
 use marshal::Value;
 
 async fn rpc(client: &mut Client, method: &str, args: &[Value], bind: i64) -> CallResult {

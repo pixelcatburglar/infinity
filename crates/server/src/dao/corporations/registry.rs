@@ -21,10 +21,15 @@ pub(crate) async fn membership(ex: &(impl Executor + ?Sized), char_id: i64) -> R
     let row = ex.query_one(&format!("SELECT ch.corporation_id, {EFFECTIVE_ROLES_SQL} AS effective_roles FROM game.characters ch WHERE ch.character_id = $1"), &[&char_id]).await?;
     Ok(Membership::from_row(&row))
 }
-/// Lock organizations, characters and their applications in the global admission order.
-pub(crate) async fn lock_admission(ex: &(impl Executor + ?Sized), corps: &[i64], characters: &[i64]) -> Result<bool, db::Error> {
+/// Lock the union of explicit and corporation-derived alliances in ascending ID order,
+/// before corporations, characters and applications in their respective ascending orders.
+/// Return false if a corporation's alliance association changed while acquiring locks.
+/// Missing explicit alliances are tolerated; callers decide whether they must exist.
+pub(crate) async fn lock_admission(ex: &(impl Executor + ?Sized), alliances: &[i64], corps: &[i64], characters: &[i64]) -> Result<bool, db::Error> {
     let before = ex.query("SELECT corporation_id, alliance_id FROM game.corporations WHERE corporation_id = ANY($1) ORDER BY corporation_id", &[&corps]).await?;
-    let alliances: Vec<i64> = before.iter().filter_map(|r| r.get::<_, Option<i64>>("alliance_id")).collect();
+    let mut alliances: Vec<i64> = alliances.iter().copied().chain(before.iter().filter_map(|r| r.get::<_, Option<i64>>("alliance_id"))).collect();
+    alliances.sort_unstable();
+    alliances.dedup();
     ex.query("SELECT alliance_id FROM game.alliances WHERE alliance_id = ANY($1) ORDER BY alliance_id FOR UPDATE", &[&alliances]).await?;
     let after = ex.query("SELECT corporation_id, alliance_id FROM game.corporations WHERE corporation_id = ANY($1) ORDER BY corporation_id FOR UPDATE", &[&corps]).await?;
     if before.len() != after.len() || before.iter().zip(&after).any(|(a, b)| a.get::<_, i64>("corporation_id") != b.get::<_, i64>("corporation_id") || a.get::<_, Option<i64>>("alliance_id") != b.get::<_, Option<i64>>("alliance_id")) {

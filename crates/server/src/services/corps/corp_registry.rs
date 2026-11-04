@@ -248,7 +248,7 @@ async fn set_welcome_mail(c: &Client, call: &Call<'_>, corp: i64, me: i64) -> Ca
         |tx, outbox: &mut crate::db::outbox::Outbox| {
             let text = text.clone();
             Box::pin(async move {
-                if !registry::lock_admission(tx, &[corp], &[me]).await.map_err(db_err)? {
+                if !registry::lock_admission(tx, &[], &[corp], &[me]).await.map_err(db_err)? {
                     return Err(notify_error(messages::corps::WELCOME_MAIL_AUTHORITY_REQUIRED));
                 }
                 let (actual, roles) = membership(tx, me).await?;
@@ -320,7 +320,7 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
             let (name, ticker, description, url) = (name.clone(), ticker.clone(), description.clone(), url.clone());
             let sde = sde.clone();
             Box::pin(async move {
-                if !registry::lock_admission(tx, &[current], &[me]).await.map_err(db_err)?
+                if !registry::lock_admission(tx, &[], &[current], &[me]).await.map_err(db_err)?
                     || !registry::active_character(tx, me).await.map_err(db_err)?
                     || membership(tx, me).await?.0 != current {
                     return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
@@ -390,7 +390,7 @@ async fn insert_application(c: &Client, target: i64, text: String) -> CallResult
         |tx, outbox| {
             let text = text.clone();
             Box::pin(async move {
-                if !registry::lock_admission(tx, &[old, target], &[me]).await.map_err(db_err)? {
+                if !registry::lock_admission(tx, &[], &[old, target], &[me]).await.map_err(db_err)? {
                     return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
                 }
                 if membership(tx, me).await?.0 != old || !registry::active_character(tx, me).await.map_err(db_err)? {
@@ -421,7 +421,7 @@ async fn insert_invitation(c: &Client, target: i64) -> CallResult {
     let now = filetime_now();
     c.db.transaction(
         |tx, outbox| Box::pin(async move {
-            if !registry::lock_admission(tx, &[old, target_corp.unwrap_or(0)], &[me, target]).await.map_err(db_err)? {
+            if !registry::lock_admission(tx, &[], &[old, target_corp.unwrap_or(0)], &[me, target]).await.map_err(db_err)? {
                 return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
             }
             let (corp, roles) = membership(tx, me).await?;
@@ -511,7 +511,7 @@ async fn update_abilities(c: &Client, corp: i64, me: i64) -> CallResult {
         |tx, _outbox| {
             let sde = sde.clone();
             Box::pin(async move {
-                if !registry::lock_admission(tx, &[corp], &[me]).await.map_err(db_err)?
+                if !registry::lock_admission(tx, &[], &[corp], &[me]).await.map_err(db_err)?
                     || membership(tx, me).await?.0 != corp || ceo_of(tx, corp).await? != Some(me) {
                     return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED));
                 }
@@ -559,7 +559,7 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
             let text = text.clone();
             let sde = sde.clone();
             Box::pin(async move {
-                if !registry::lock_admission(tx, &[old, actor_corp, target_corp], &[me, applicant]).await.map_err(db_err)? {
+                if !registry::lock_admission(tx, &[], &[old, actor_corp, target_corp], &[me, applicant]).await.map_err(db_err)? {
                     return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
                 }
                 let Some(r) = registry::application(tx, app_id).await.map_err(db_err)? else {
