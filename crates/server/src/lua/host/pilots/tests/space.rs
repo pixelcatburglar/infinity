@@ -37,14 +37,14 @@ async fn spatial_operations_authorize_and_use_actor() {
         }
         assert!(lua.load("return pilots.condition(id)==nil and #pilots.targeters(id)==0").eval_async::<bool>().await?);
         lua.load("pilots.online(peer)").exec_async().await?;
-        let peer_session = r.world.chat_session(peer).unwrap();
+        let peer_session = r.world.online_session(peer).unwrap();
         let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
         r.world.register_pilot(peer, peer_tx);
-        r.world.set_chat_session(peer, Some(peer_session));
+        r.world.set_online_session(peer, Some(peer_session));
         lua.load("pilots.online(id)").exec_async().await?;
         let arrival = peer_rx.try_recv()?;
         assert_eq!(arrival.0, "OnCharNowInStation");
-        assert_eq!(arrival.1, vec![crate::services::presence::guest_record(&r.world.chat_session(id).unwrap())]);
+        assert_eq!(arrival.1, vec![crate::services::presence::guest_record(&r.world.online_session(id).unwrap())]);
         assert!(lua.load("local c=pilots.condition(id); return c == nil or c.capacitor == nil").eval_async::<bool>().await?);
         for call in ["pilots.orbit(id,station,-1)", "pilots.orbit(id,station,1e300)",
             "pilots.orbit(id,station,0/0)", "pilots.approach(id,0)",
@@ -52,11 +52,11 @@ async fn spatial_operations_authorize_and_use_actor() {
             assert!(lua.load(call).exec_async().await.is_err(), "invalid: {call}");
         }
         assert!(lua.load("pilots.dock(id,station)").exec_async().await.is_err());
-        assert_eq!(r.world.chat_session(id).unwrap().station_id, Some(station));
+        assert_eq!(r.world.online_session(id).unwrap().station_id, Some(station));
         lua.load("pilots.undock(id)").exec_async().await?;
         let (notice, args) = peer_rx.try_recv()?;
         assert_eq!(notice, "OnCharNoLongerInStation");
-        let mut departed = r.world.chat_session(id).unwrap();
+        let mut departed = r.world.online_session(id).unwrap();
         departed.station_id = Some(station);
         assert_eq!(args, vec![crate::services::presence::guest_record(&departed)]);
         let identity: Table = lua.load("return pilots.identity(id)").eval_async().await?;
@@ -71,7 +71,7 @@ async fn spatial_operations_authorize_and_use_actor() {
             let row = r.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2", &[&rock, &system]).await?;
             assert!(row.get::<_, i64>("quantity") > 0);
         }
-        assert_eq!(r.world.chat_session(id).unwrap().station_id, None);
+        assert_eq!(r.world.online_session(id).unwrap().station_id, None);
         assert_eq!(r.world.with(system, move |s| s.pilot_ball(id).map(|b| b.id)).await.flatten(), Some(ship));
         let location = r.db.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&id]).await?;
         assert_eq!(location.get::<_, Option<i64>>("station_id"), None);
@@ -162,7 +162,7 @@ async fn spatial_operations_authorize_and_use_actor() {
         r.world.with(system, move |s| s.set_ball_position(ship, [station_pos[0] + 1_000_000.0, station_pos[1], station_pos[2]], |_, _| true)).await.unwrap();
         assert!(r.world.after(system, 1100).await);
         assert!(lua.load("pilots.dock(id,station)").exec_async().await.is_err());
-        assert_eq!(r.world.chat_session(id).unwrap().station_id, None);
+        assert_eq!(r.world.online_session(id).unwrap().station_id, None);
         assert!(peer_rx.try_recv().is_err());
         assert!(r.world.ball(system, ship).await.is_some());
         let location = r.db.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&id]).await?;
@@ -170,7 +170,7 @@ async fn spatial_operations_authorize_and_use_actor() {
         r.world.with(system, move |s| s.set_ball_position(ship, station_pos, |_, _| true)).await.unwrap();
         assert!(r.world.after(system, 1100).await);
         lua.load("pilots.dock(id,station)").exec_async().await?;
-        let current = r.world.chat_session(id).unwrap();
+        let current = r.world.online_session(id).unwrap();
         assert_eq!((current.station_id, current.system_id), (Some(station), Some(system)));
         assert!(r.world.ball(system, ship).await.is_none());
         let location = r.db.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&id]).await?;

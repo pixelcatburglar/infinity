@@ -12,16 +12,16 @@ const VIRTUAL_RESOURCE: &str = "virtual";
 pub(super) enum JoinError { Forbidden, Conflict, Domain(CallError) }
 
 impl Hub {
-    pub(super) async fn join_room(&self, session: &crate::session::ChatSession, name: &str, full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
+    pub(super) async fn join_room(&self, session: &crate::session::OnlineSession, name: &str, full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
         let epoch = self.rooms.lock().unwrap().epoch;
         let admission = authority::admit(&self.db, self.world.sde(), session, name).await.map_err(JoinError::Domain)?.ok_or(JoinError::Forbidden)?;
         self.commit_admissions(session, epoch, &[(name.to_owned(), admission)], full, real)
     }
 
-    pub(super) fn commit_admissions(&self, session: &crate::session::ChatSession, epoch: u64, admissions: &[(String, authority::Admission)], full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
+    pub(super) fn commit_admissions(&self, session: &crate::session::OnlineSession, epoch: u64, admissions: &[(String, authority::Admission)], full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
         let nick = session.character_id.to_string();
         let mut rooms = self.rooms.lock().unwrap();
-        if rooms.epoch != epoch || self.world.chat_session(session.character_id).as_ref() != Some(session) { return Err(JoinError::Forbidden); }
+        if rooms.epoch != epoch || self.world.online_session(session.character_id).as_ref() != Some(session) { return Err(JoinError::Forbidden); }
         for (name, _) in admissions {
             let room = format!("{name}@{}", self.conference());
             if let Some(old) = rooms.entries.get(&room).and_then(|occupants| occupants.get(&nick)) {
@@ -54,7 +54,7 @@ impl Hub {
 
     pub(crate) async fn join_virtual(&self, character_id: i64) -> Result<(), CallError> {
         let denied = || crate::services::notify_error(crate::messages::chat::FORBIDDEN);
-        let session = self.world.chat_session(character_id).filter(|s| s.character_id == character_id).ok_or_else(denied)?;
+        let session = self.world.online_session(character_id).filter(|s| s.character_id == character_id).ok_or_else(denied)?;
         let epoch = self.rooms.lock().unwrap().epoch;
         let full = format!("{character_id}@{}/{VIRTUAL_RESOURCE}", self.host);
         let mut admissions = Vec::new();
@@ -100,7 +100,7 @@ impl Hub {
     }
 
     pub(crate) fn session_changed(&self, id: i64) {
-        let allowed = self.world.chat_session(id).map(|s| authority::system_channels(self.world.sde(), &s)).unwrap_or_default();
+        let allowed = self.world.online_session(id).map(|s| authority::system_channels(self.world.sde(), &s)).unwrap_or_default();
         self.remove_matching(|room, nick, _| {
             let channel = room.split('@').next().unwrap_or("");
             nick == id.to_string() && ["local_", "wormhole_", "nolocal_", "nullsec_", "triglavian_", "corp_", "alliance_", "faction_", "fleet_"].iter().any(|prefix| channel.starts_with(prefix)) && !allowed.iter().any(|name| name == channel)
@@ -136,7 +136,7 @@ impl Hub {
             let id = match nick.parse::<i64>() { Ok(id) => id, Err(_) => continue };
           loop {
             let epoch = self.rooms.lock().unwrap().epoch;
-            let session = self.world.chat_session(id);
+            let session = self.world.online_session(id);
             let admission = match &session {
                 Some(s) => match authority::admit(&self.db, self.world.sde(), s, channel).await {
                     Ok(admission) => admission,
@@ -145,7 +145,7 @@ impl Hub {
                 None => None,
             };
             let mut rooms = self.rooms.lock().unwrap();
-            if rooms.epoch != epoch || self.world.chat_session(id) != session { continue; }
+            if rooms.epoch != epoch || self.world.online_session(id) != session { continue; }
             let Some(occupants) = rooms.entries.get_mut(&room) else { break };
             if !occupants.get(&nick).is_some_and(|o| o.same_identity(&old)) { break; }
             if let Some(admission) = admission {

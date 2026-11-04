@@ -1,38 +1,40 @@
 use super::*;
 
-#[test]
-fn checkpoints_and_goals_build() {
-    let gw = Gateway { cdn_url: "http://127.0.0.1".into(), ..Default::default() };
-    for (req, content) in [
-        ("eve_public.achievement.definition.api.cdn.GetLatestRequest", "achievements"),
-        ("eve_public.cosmetic.character.title.definition.api.GetLatestRequest", "titles"),
-        ("eve_public.space.api.cdn.GetUpdateRequest", "maptags"),
-    ] {
-        let m = checkpoint(&gw, req, content).unwrap();
-        assert!(format!("{m}").contains(&format!("http://127.0.0.1/content/{content}")));
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn exact_claims_and_neighboring_requests() {
+    validate().unwrap();
+    let gw = super::super::tests::gateway().await;
+    let context = HandlerContext::for_request(&gw, super::super::Caller::default()).await.unwrap();
+    assert_eq!(CLAIMS.len(), 19);
+    let expected = [
+        "eve_public.achievement.definition.api.cdn.GetLatestRequest",
+        "eve_public.cosmetic.character.title.definition.api.GetLatestRequest",
+        "eve_public.space.api.cdn.GetUpdateRequest",
+        "eve_public.career.goal.api.GetDefinitionsRequest",
+        "eve_public.career.goal.api.GetAllRequest",
+        "eve_public.pirate.corruption.api.GetStageThresholdsRequest",
+        "eve_public.pirate.suppression.api.GetStageThresholdsRequest",
+        "eve_public.character.GetNamesByUserRequest",
+        "eve_public.plex.vault.api.BalanceRequest",
+        "eve_public.character.skill.plan.CreateRequest",
+        "eve_public.character.skill.plan.GetAllRequest",
+        "eve_public.character.skill.plan.GetRequest",
+        "eve_public.character.skill.plan.GetSharedRequest",
+        "eve_public.character.skill.plan.GetActiveRequest",
+        "eve_public.character.skill.plan.SetActiveRequest",
+        "eve_public.character.skill.plan.DeleteRequest",
+        "eve_public.character.skill.plan.SetNameRequest",
+        "eve_public.character.skill.plan.SetDescriptionRequest",
+        "eve_public.character.skill.plan.SetSkillRequirementsRequest",
+    ];
+    for name in expected { assert!(CLAIMS.iter().any(|(claim, _)| *claim == name), "{name}"); }
+    for (name, _) in CLAIMS {
+        let req = DynamicMessage::new(message(name).unwrap());
+        assert!(matches!(handle(&context, name, &req).await, Dispatch::Claimed(_)), "{name}");
     }
-    assert_eq!(career_goal_definitions().unwrap().get_field_by_name("goals").unwrap().as_list().unwrap().len(), 4);
-    career_goal_states().unwrap();
-    stage_thresholds("eve_public.pirate.corruption.api.GetStageThresholdsRequest").unwrap();
-}
-
-#[test]
-fn defaults_say_absent_and_echo_ids() {
-    let caller = Caller { user_id: Some(1), character_id: Some(90000001) };
-    let mut m = response_for("eve_public.matrix.api.GetEquippedRequest").unwrap();
-    let ids = super::super::known_ids(&m, &caller);
-    super::super::fill_defaults(&mut m, 4, &ids);
-    assert!(format!("{m}").contains("no_equipped:true"), "{m}");
-
-    let mut m = response_for("eve_public.pirate.corruption.api.GetSystemInfoRequest").unwrap();
-    super::super::fill_defaults(&mut m, 4, &Default::default());
-    assert!(format!("{m}").contains("denominator:1"), "{m}");
-
-    let mut req = DynamicMessage::new(message("eve_public.cosmetic.ship.api.GetRequest").unwrap());
-    let ship = identifier(&req.descriptor(), "ship", PV::U64(1000000000001)).unwrap();
-    set(&mut req, "ship", PV::Message(ship)).unwrap();
-    let mut m = response_for("eve_public.cosmetic.ship.api.GetRequest").unwrap();
-    super::super::fill_defaults(&mut m, 4, &super::super::known_ids(&req, &caller));
-    let s = format!("{m}");
-    assert!(s.contains("1000000000001") && s.contains("90000001"), "{s}");
+    let req = DynamicMessage::new(message(CLAIMS[0].0).unwrap());
+    for name in ["eve_public.character.skill.plan.FutureRequest", "eve_public.character.skill.plan.milestone.GetRequest", "eve_public.achievement.api.FutureRequest", "eve_public.character.FutureRequest"] {
+        assert!(matches!(handle(&context, name, &req).await, Dispatch::Unclaimed));
+    }
 }

@@ -467,7 +467,7 @@ pub(crate) fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Optio
 #[derive(Default)]
 pub struct Pilots {
     capacity: usize,
-    notify: Mutex<HashMap<i64, (NotifyTx, Option<crate::session::ChatSession>)>>,
+    notify: Mutex<HashMap<i64, (NotifyTx, Option<crate::session::OnlineSession>)>>,
     queues: Mutex<HashMap<i64, JumpQueue>>,
 }
 impl Pilots {
@@ -475,22 +475,39 @@ impl Pilots {
         self.notify.lock().unwrap().insert(char_id, (tx, None));
     }
 
-    pub(crate) fn set_chat_session(&self, char_id: i64, session: Option<crate::session::ChatSession>) {
-        if let Some(entry) = self.notify.lock().unwrap().get_mut(&char_id) { entry.1 = session; }
+    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<crate::session::OnlineSession>) {
+        let mut notify = self.notify.lock().unwrap();
+        let Some(entry) = notify.get_mut(&char_id) else { return };
+        if let (Some(live), Some(next)) = (entry.1.as_ref(), session.as_ref()) {
+            if live.session_id != next.session_id { return; }
+        } else if session.is_none() && entry.1.is_some() {
+            return;
+        }
+        entry.1 = session;
     }
 
-    pub(crate) fn chat_session(&self, char_id: i64) -> Option<crate::session::ChatSession> {
+    pub(crate) fn online_session(&self, char_id: i64) -> Option<crate::session::OnlineSession> {
         self.notify.lock().unwrap().get(&char_id).filter(|(tx, _)| !tx.is_closed()).and_then(|(_, session)| session.clone()).filter(|s| s.character_id == char_id)
     }
 
-    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::ChatSession> {
+    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::OnlineSession> {
         self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, session))| {
             session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id && s.station_id == Some(station_id)).cloned()
         }).collect()
     }
 
     pub fn unregister_pilot(&self, char_id: i64) {
-        self.notify.lock().unwrap().remove(&char_id);
+        self.unregister_pilot_generation(char_id, None);
+    }
+
+    pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: Option<i64>) {
+        let mut notify = self.notify.lock().unwrap();
+        let Some((_, session)) = notify.get(&char_id) else { return };
+        if let Some(sid) = session_id {
+            if session.as_ref().is_none_or(|live| live.session_id != sid) { return; }
+        }
+        notify.remove(&char_id);
+        drop(notify);
         for q in self.queues.lock().unwrap().values_mut() {
             q.waiting.retain(|c| *c != char_id);
         }
@@ -509,6 +526,7 @@ impl Pilots {
             let _ = tx.send((event.to_string(), args));
         }
     }
+
     /// May `char_id` jump into `system_id` now? `Err(position)` puts them in its jump queue
     /// (jumpQueue.py); a key issued from the queue lets them in within JUMP_KEY_LIFE.
     pub fn request_entry(&self, system_id: i64, char_id: i64, population: usize) -> Result<(), i64> {
@@ -591,9 +609,12 @@ impl World {
     }
     pub fn sde(&self) -> &Arc<Sde> { &self.sde }
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
-    pub(crate) fn set_chat_session(&self, char_id: i64, session: Option<crate::session::ChatSession>) { self.pilots.set_chat_session(char_id, session); }
-    pub(crate) fn chat_session(&self, char_id: i64) -> Option<crate::session::ChatSession> { self.pilots.chat_session(char_id) }
-    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::ChatSession> { self.pilots.station_guests(station_id) }
+    pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: i64) {
+        self.pilots.unregister_pilot_generation(char_id, Some(session_id));
+    }
+    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<crate::session::OnlineSession>) { self.pilots.set_online_session(char_id, session); }
+    pub(crate) fn online_session(&self, char_id: i64) -> Option<crate::session::OnlineSession> { self.pilots.online_session(char_id) }
+    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::OnlineSession> { self.pilots.station_guests(station_id) }
     pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
     pub fn is_online(&self, char_id: i64) -> bool { self.pilots.is_online(char_id) }
     pub fn online_pilots(&self) -> Vec<i64> { self.pilots.online_pilots() }

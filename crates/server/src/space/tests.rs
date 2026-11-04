@@ -27,10 +27,47 @@ fn presence_tracks_live_replaced_and_removed_channels() {
 }
 
 #[test]
+fn stale_generation_cannot_unregister_replacement() {
+    let pilots = Pilots::default();
+    let (old_tx, old_rx) = tokio::sync::mpsc::unbounded_channel();
+    pilots.register_pilot(1, old_tx);
+    pilots.set_online_session(1, Some(crate::session::OnlineSession {
+        character_id: 1, user_id: None, session_id: 2, ship_id: Some(20), station_id: None, system_id: None,
+        corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+    }));
+    drop(old_rx);
+    let (new_tx, _new_rx) = tokio::sync::mpsc::unbounded_channel();
+    pilots.register_pilot(1, new_tx);
+    pilots.set_online_session(1, Some(crate::session::OnlineSession {
+        character_id: 1, user_id: None, session_id: 3, ship_id: Some(21), station_id: None, system_id: None,
+        corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+    }));
+    pilots.unregister_pilot_generation(1, Some(2));
+    assert_eq!(pilots.online_session(1).unwrap().session_id, 3);
+}
+
+#[test]
+fn stale_session_update_cannot_replace_live_generation() {
+    let pilots = Pilots::default();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    pilots.register_pilot(1, tx);
+    let session = |sid, ship| crate::session::OnlineSession {
+        character_id: 1, user_id: Some(9), session_id: sid, ship_id: Some(ship),
+        station_id: None, system_id: None, corporation_id: None, alliance_id: None,
+        faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+    };
+    pilots.set_online_session(1, Some(session(2, 20)));
+    pilots.set_online_session(1, Some(session(1, 10)));
+    assert_eq!(pilots.online_session(1), Some(session(2, 20)));
+    pilots.set_online_session(1, None);
+    assert_eq!(pilots.online_session(1), Some(session(2, 20)));
+}
+
+#[test]
 fn station_guests_only_include_live_matching_sessions() {
     let pilots = Pilots::default();
-    let session = |id, station| crate::session::ChatSession {
-        character_id: id, station_id: station, system_id: None, corporation_id: None,
+    let session = |id, station| crate::session::OnlineSession {
+        character_id: id, user_id: None, session_id: 0, ship_id: None, station_id: station, system_id: None, corporation_id: None,
         alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     };
     let mut receivers = Vec::new();
@@ -38,7 +75,7 @@ fn station_guests_only_include_live_matching_sessions() {
         (3, None), (4, Some(session(5, Some(10)))), (5, Some(session(5, Some(10))))] {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         pilots.register_pilot(key, tx);
-        pilots.set_chat_session(key, value);
+        pilots.set_online_session(key, value);
         receivers.push(rx);
     }
     drop(receivers.pop());

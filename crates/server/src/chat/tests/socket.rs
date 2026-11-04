@@ -137,7 +137,7 @@ async fn socket_expiry_role_display_and_destroy() {
         guest_client.change_session(vec![("charid", Value::Int(guest.id))]);
         let channel = dao::create_player(&test_db, owner.id, &format!("SocketDisplay{}", owner.id)).await.unwrap();
         let room = format!("{}@conference.chat.test", channel.name);
-        let session = crate::session::ChatSession { character_id: owner.id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+        let session = crate::session::OnlineSession { character_id: owner.id, user_id: None, session_id: owner.id, ship_id: None, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
         crate::services::chat::authority::configure(&test_db, &hub, &session, &channel.name, crate::services::chat::authority::RoomConfig { display_name: channel.display_name.clone(), public: true, moderated: true, members_by_default: false }).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut tasks = Tasks(Vec::new());
@@ -172,7 +172,7 @@ async fn socket_expiry_role_display_and_destroy() {
         assert!(iq_request(&mut a, "unmute", &room, "set", &role("participant")).await.contains("type='result'"));
         assert!(dao::member(&test_db, &channel.name, guest.id).await.unwrap().unwrap().voice_expires_at.is_some());
         assert!(test_db.query_opt("SELECT job_id FROM game.jobs WHERE job_id = $1", &[&job]).await.unwrap().is_some());
-        let guest_session = hub.world.chat_session(guest.id).unwrap();
+        let guest_session = hub.world.online_session(guest.id).unwrap();
         assert_eq!(crate::services::chat::authority::admit(&test_db, hub.world.sde(), &guest_session, &channel.name).await.unwrap().unwrap().role, "visitor");
         assert!(iq_request(&mut a, "delete", "chat.test", "set", &expiry("delete", "mute", "")).await.contains("type='result'"));
         assert!(iq_request(&mut a, "delete-again", "chat.test", "set", &expiry("delete", "mute", "")).await.contains("type='result'"));

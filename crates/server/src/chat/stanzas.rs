@@ -41,11 +41,11 @@ fn channel<'a>(hub: &Hub, jid: &'a str) -> Option<&'a str> {
     if domain != hub.conference() || name.is_empty() || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') { return None; }
     Some(name)
 }
-fn session(c: &Conn) -> Option<crate::session::ChatSession> {
+fn session(c: &Conn) -> Option<crate::session::OnlineSession> {
     let id = c.user.as_deref()?.parse::<i64>().ok()?;
     c.full_jid.as_ref()?;
     if !c.hub.check(c.user.as_deref()?, c.password.as_deref()?) { return None; }
-    c.hub.world.chat_session(id).filter(|s| s.character_id == id)
+    c.hub.world.online_session(id).filter(|s| s.character_id == id)
 }
 fn reply(c: &Conn, el: &Element, payload: &str) {
     let _ = c.tx.send(format!("<iq type='result' id='{}' from='{}' to='{}'>{payload}</iq>", esc(el.attr("id").unwrap_or("")), esc(el.attr("to").unwrap_or(&c.hub.host)), esc(c.full_jid.as_deref().unwrap_or(""))));
@@ -79,7 +79,7 @@ fn bool_value(value: &str) -> Option<bool> { match value { "1" | "true" => Some(
 async fn iq(c: &mut Conn, el: &Element) -> Result<()> {
     let Some(user) = c.user.clone() else { error(c, el, "not-authorized", ""); return Ok(()) };
     if let Some(bind) = el.child("bind").filter(|e| e.attr("xmlns") == Some("urn:ietf:params:xml:ns:xmpp-bind")) {
-        if !c.password.as_deref().is_some_and(|password| c.hub.check(&user, password)) || user.parse::<i64>().ok().and_then(|id| c.hub.world.chat_session(id).filter(|s| s.character_id == id)).is_none() { error(c, el, "not-authorized", ""); return Ok(()); }
+        if !c.password.as_deref().is_some_and(|password| c.hub.check(&user, password)) || user.parse::<i64>().ok().and_then(|id| c.hub.world.online_session(id).filter(|s| s.character_id == id)).is_none() { error(c, el, "not-authorized", ""); return Ok(()); }
         let resource = bind.child("resource").map(|r| r.text.trim()).filter(|r| !r.is_empty()).unwrap_or("eve");
         let jid = format!("{user}@{}/{resource}", c.hub.host);
         c.hub.users.lock().unwrap().insert(format!("{user}@{}", c.hub.host), (jid.clone(), c.tx.clone()));
@@ -263,7 +263,7 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
         let admitted = match admitted { Ok(Some(admitted)) => admitted, Ok(None) => { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }, Err(e) => { domain_error(c, el, e); return Ok(()) } };
         if let Some(decline) = el.child("x").filter(|x| x.attr("xmlns") == Some(USER)).and_then(|x| x.child("decline")) {
             let rooms = c.hub.rooms.lock().unwrap();
-            if rooms.epoch != epoch || c.hub.world.chat_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
+            if rooms.epoch != epoch || c.hub.world.online_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
             let Some(id) = decline.attr("to").and_then(|v| target(&c.hub, v)) else { error(c, el, "bad-request", ""); return Ok(()) };
             let key = format!("{id}@{}", c.hub.host);
             if let Some((jid, tx)) = c.hub.users.lock().unwrap().get(&key) {
@@ -272,7 +272,7 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
             }
             return Ok(());
         }
-        let occupied = { let rooms = c.hub.rooms.lock().unwrap(); rooms.epoch == epoch && c.hub.world.chat_session(s.character_id).as_ref() == Some(&s) && rooms.entries.get(room).and_then(|o| o.get(&s.character_id.to_string())).is_some_and(|o| o.matches_socket(&full, &c.tx)) };
+        let occupied = { let rooms = c.hub.rooms.lock().unwrap(); rooms.epoch == epoch && c.hub.world.online_session(s.character_id).as_ref() == Some(&s) && rooms.entries.get(room).and_then(|o| o.get(&s.character_id.to_string())).is_some_and(|o| o.matches_socket(&full, &c.tx)) };
         if !occupied { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
         if let Some(x) = el.child("x").filter(|x| x.attr("xmlns") == Some(USER)) {
             if let Some(invite) = x.child("invite") {
@@ -286,7 +286,7 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
             if let Some(subject) = el.child("subject") { if let Err(e) = authority::set_subject(&c.hub.db, &c.hub, &s, name, &subject.text).await { domain_error(c, el, e); } return Ok(()) }
             if admitted.role == "visitor" || admitted.role == "none" { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
             let rooms = c.hub.rooms.lock().unwrap();
-            if rooms.epoch != epoch || c.hub.world.chat_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
+            if rooms.epoch != epoch || c.hub.world.online_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
             if let Some(occ) = rooms.entries.get(room) { if occ.get(&s.character_id.to_string()).is_some_and(|o| o.matches_socket(&full, &c.tx)) { let from = format!("{room}/{}", s.character_id); for o in occ.values() { o.send(el.to_xml_with(&[("from", &from), ("to", &o.full_jid)])); } } }
         } else { error(c, el, "feature-not-implemented", ""); }
         return Ok(());

@@ -506,4 +506,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;

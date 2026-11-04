@@ -1,8 +1,8 @@
-use crate::{services::{self, Call}, session::ChatSession};
+use crate::{services::{self, Call}, session::OnlineSession};
 use marshal::Value;
 
-fn guest(id: i64, station: i64, corporation: Option<i64>, alliance: Option<i64>, faction: Option<i64>) -> ChatSession {
-    ChatSession { character_id: id, station_id: Some(station), system_id: None, corporation_id: corporation,
+fn guest(id: i64, station: i64, corporation: Option<i64>, alliance: Option<i64>, faction: Option<i64>) -> OnlineSession {
+    OnlineSession { character_id: id, user_id: None, session_id: id, ship_id: None, station_id: Some(station), system_id: None, corporation_id: corporation,
         alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }
 }
 
@@ -36,7 +36,7 @@ async fn dispatch_get_guests_returns_live_real_and_server_owned_pilots() {
             (guest(offline.character, 20, Some(1), None, None), other_tx),
         ] {
             client.world.register_pilot(s.character_id, tx);
-            client.world.set_chat_session(s.character_id, Some(s));
+            client.world.set_online_session(s.character_id, Some(s));
         }
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "station", method: "GetGuests", args: &[], kwargs: &kwargs, bound: false, bind_params: None };

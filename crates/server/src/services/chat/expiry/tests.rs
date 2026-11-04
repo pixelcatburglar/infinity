@@ -1,10 +1,10 @@
 //! Durable chat moderation expiry regressions against a dedicated database.
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{services::{CallError, chat::authority::RoomConfig, tests::fixture}, session::ChatSession};
+use crate::{services::{CallError, chat::authority::RoomConfig, tests::fixture}, session::OnlineSession};
 
-fn session(id: i64) -> ChatSession {
-    ChatSession { character_id: id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
+fn session(id: i64) -> OnlineSession {
+    OnlineSession { character_id: id, user_id: None, session_id: id, ship_id: None, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
 }
 
 async fn job(db: &Db, room: &str, target: i64, kind: Restriction) -> Option<Job> {
@@ -46,7 +46,7 @@ async fn cleanup(db: &Db, owner: fixture::Fixture, target: fixture::Fixture, roo
     fixture::cleanup(db, owner).await.unwrap();
 }
 
-async fn public(db: &Db, hub: &Hub, owner: &ChatSession, room: &str) {
+async fn public(db: &Db, hub: &Hub, owner: &OnlineSession, room: &str) {
     authority::configure(db, hub, owner, room, RoomConfig { display_name: format!("Expiry {}", owner.character_id), public: true, moderated: false, members_by_default: false }).await.unwrap();
 }
 

@@ -29,7 +29,7 @@ async fn session_categories_and_unbound_connections() {
         let hub = Hub::new("chat.test", test_db.clone(), world.clone());
         let (mut client, _peer) = fixture::client(test_db.clone(), sde.clone(), world.clone(), hub.clone()).await;
         client.change_session(vec![("charid", Value::Int(actor.id)), ("solarsystemid2", Value::Int(system)), ("corpid", Value::Int(actor.id)), ("allianceid", Value::Int(actor.id)), ("warfactionid", Value::Int(actor.id)), ("fleetid", Value::Int(actor.id))]);
-        let session = world.chat_session(actor.id).unwrap();
+        let session = world.online_session(actor.id).unwrap();
         let channels = authority::system_channels(&sde, &session);
         assert_eq!(channels.len(), 5, "session facts: {session:?}");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -110,7 +110,7 @@ async fn discovery_hides_closed_rooms_and_restart_preserves_metadata() {
         a.change_session(vec![("charid", Value::Int(owner.id)), ("corpid", Value::Int(owner.id)), ("fleetid", Value::Int(owner.id))]); b.change_session(vec![("charid", Value::Int(guest.id))]); x.change_session(vec![("charid", Value::Int(outsider.id))]);
         let c = dao::create_player(&test_db, owner.id, &format!("Hidden{}", owner.id)).await.unwrap();
         let private = dao::create_private(&test_db, owner.id, guest.id).await.unwrap();
-        let s = world.chat_session(owner.id).unwrap(); authority::invite(&test_db, &hub, &s, &c.name, guest.id).await.unwrap();
+        let s = world.online_session(owner.id).unwrap(); authority::invite(&test_db, &hub, &s, &c.name, guest.id).await.unwrap();
         let room = format!("{}@conference.chat.test", c.name); let corp = format!("corp_{}@conference.chat.test", owner.id); let fleet = format!("fleet_{}@conference.chat.test", owner.id);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap(); let mut tasks = Tasks(Vec::new());
         let mut os = open(&listener, &hub, &mut tasks, owner.id).await; let mut xs = open(&listener, &hub, &mut tasks, outsider.id).await;
@@ -128,7 +128,7 @@ async fn discovery_hides_closed_rooms_and_restart_preserves_metadata() {
         }
         let restarted = Hub::new("chat.test", test_db.clone(), world.clone()); assert!(restarted.rooms.lock().unwrap().entries.is_empty());
         assert!(dao::get(&test_db, &c.name).await.unwrap().is_some()); assert!(dao::member(&test_db, &c.name, guest.id).await.unwrap().unwrap().invited);
-        assert!(authority::admit(&test_db, world.sde(), &world.chat_session(guest.id).unwrap(), &c.name).await.unwrap().is_some());
+        assert!(authority::admit(&test_db, world.sde(), &world.online_session(guest.id).unwrap(), &c.name).await.unwrap().is_some());
     }).await;
     fixture::cleanup(&db, &[owner, guest, outsider]).await; result.unwrap();
 }
@@ -148,7 +148,7 @@ async fn moderated_messages_subject_rollback_and_manager_destroy() {
         a.change_session(vec![("charid", Value::Int(owner.id))]); b.change_session(vec![("charid", Value::Int(guest.id))]); x.change_session(vec![("charid", Value::Int(outsider.id))]);
         let c = dao::create_player(&test_db, owner.id, &format!("Moderated{}", owner.id)).await.unwrap();
         let other = dao::create_player(&test_db, owner.id, &format!("Duplicate{}", owner.id)).await.unwrap();
-        let session = world.chat_session(owner.id).unwrap();
+        let session = world.online_session(owner.id).unwrap();
         authority::configure(&test_db, &hub, &session, &c.name, RoomConfig { display_name: c.display_name.clone(), public: true, moderated: true, members_by_default: false }).await.unwrap();
         let room = format!("{}@conference.chat.test", c.name);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap(); let mut tasks = Tasks(Vec::new());
