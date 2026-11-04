@@ -3,6 +3,7 @@ use crate::conn::Conn;
 use crate::handshake::Login;
 use marshal::Value;
 use std::sync::Arc;
+mod organization;
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with initialized SDE"]

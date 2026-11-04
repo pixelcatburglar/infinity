@@ -469,7 +469,8 @@ async fn queue_application<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut 
 async fn queue_application_id<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, id: i64) -> Result<(), CallError> {
     let r = registry::application(db, id).await.map_err(db_err)?
         .ok_or_else(|| notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED))?;
-    queue_application(db, outbox, &r).await
+    queue_application(db, outbox, &r).await?;
+    notifications::application(db, outbox, &r).await
 }
 
 async fn corporation_applications(db: &Db, me: i64, bound: i64, old: bool) -> CallResult {
@@ -634,6 +635,7 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
                     let withdrawn = registry::withdraw_applications(tx, character, app_id, APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION).await.map_err(db_err)?;
                     for application in &withdrawn {
                         queue_application(tx, outbox, application).await?;
+                        notifications::application(tx, outbox, application).await?;
                     }
                 }
                 queue_application_id(tx, outbox, app_id).await?;

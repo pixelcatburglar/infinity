@@ -56,6 +56,9 @@ async fn creation_saves_skill_capacity_and_charges_startup_cost() {
     let result = tokio::spawn(async move {
         let (mut client, _peer) = tests::client(test_db.clone(), ceo.character).await;
         client.session.apply(vec![("corpid", Value::Int(1)), ("stationid", Value::Int(1))]);
+        let old_corp = corp_of(&test_db, ceo.character).await;
+        let (founder_tx, mut founder_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.world.register_pilot(ceo.character, founder_tx);
         let (base, skills) = capacity_inputs(&client.sde);
         let skill = super::super::super::SKILL_CORPORATION_MANAGEMENT;
         let bonus = skills.iter().find(|(id, _)| *id == skill).unwrap().1;
@@ -67,6 +70,18 @@ async fn creation_saves_skill_capacity_and_charges_startup_cost() {
         let lp_tax = 0.25;
         let args = [Value::unicode(format!("Fixture Corporation {}", ceo.character)), Value::unicode(ticker), Value::unicode("description"), Value::unicode(""), Value::Float(0.0), Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::Bool(false), Value::Bool(true), Value::Float(lp_tax)];
         let corp = rpc(&mut client, "AddCorporation", &args, 1).await.unwrap().as_int().unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| founder_rx.try_recv().ok()).collect();
+        let session = events.iter().position(|e| e.0 == "__session").unwrap();
+        assert!(events[session].1.contains(&Value::tuple([Value::str("corpid"), Value::Int(corp)])));
+        assert!(events[session].1.contains(&Value::tuple([Value::str("corpAccountKey"), Value::Int(crate::consts::ACCOUNT_CASH as i64)])));
+        let members: Vec<_> = events.iter().enumerate().filter(|(_, e)| e.0 == "OnCorporationMemberChanged").collect();
+        assert_eq!(members.len(), 1);
+        assert!(session < members[0].0);
+        assert_eq!(members[0].1.1, vec![Value::Int(corp), Value::Int(ceo.character), Value::dict([("corporationID", Value::tuple([Value::Int(old_corp), Value::Int(corp)]))])]);
+        let counts: Vec<_> = events.iter().enumerate().filter(|(_, e)| e.0 == "OnCorporationChanged").collect();
+        assert_eq!(counts.len(), 1);
+        assert!(session < counts[0].0);
+        assert_eq!(counts[0].1.1, vec![Value::Int(corp), Value::dict([("memberCount", Value::tuple([Value::Int(0), Value::Int(1)]))])]);
         let row = test_db.query_one("SELECT member_limit,lp_tax_rate,is_recruiting,friendly_fire FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();
         assert_eq!(row.get::<_, Option<i64>>("member_limit"), Some((base + bonus * f64::from(level)) as i64));
         assert_eq!(row.get::<_, f64>("lp_tax_rate"), lp_tax);

@@ -107,6 +107,26 @@ impl Hub {
         }, false);
     }
 
+    pub(crate) fn refresh_profile(&self, session: &crate::session::OnlineSession) {
+        let nick = session.character_id.to_string();
+        let xml = {
+            let mut profiles = self.profiles.lock().unwrap();
+            let Some(profile) = profiles.get_mut(&nick) else { return };
+            profile.corp = session.corporation_id.unwrap_or(0);
+            profile.alliance = session.alliance_id;
+            profile.faction = session.faction_id;
+            profile.role = session.role;
+            profile.xml()
+        };
+        let rooms = self.rooms.lock().unwrap();
+        for (room, occupants) in &rooms.entries {
+            let Some(occupant) = occupants.get(&nick) else { continue };
+            let stanza = format!("<presence from='{}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{}' role='{}' jid='{}'/></x>{xml}</presence>",
+                esc(&format!("{room}/{nick}")), esc(&occupant.affiliation), esc(&occupant.role), esc(&occupant.full_jid));
+            for target in occupants.values() { target.send(stanza.clone()); }
+        }
+    }
+
     pub(crate) fn evict_room(&self, channel: &str) {
         let room = format!("{channel}@{}", self.conference());
         self.remove_matching(|r, _, _| r == room, true);

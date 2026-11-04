@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 #[path = "effects.rs"] mod effects;
 #[path = "boarding.rs"] pub(crate) mod boarding;
+mod affiliation;
 use effects::Tractor;
 
 /// carbonengine destiny Ballpark.cpp tick catchup policy.

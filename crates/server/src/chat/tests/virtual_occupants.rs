@@ -72,9 +72,9 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
         assert!(denied.contains("type='error'") && denied.contains("forbidden"), "{denied}");
         assert!(hub.rooms.lock().unwrap().entries[&room][&virtual_char.id.to_string()].tx.is_none());
         let mut with_corp = session.clone();
-        with_corp.corporation_id = Some(virtual_char.id);
+        with_corp.corporation_id = Some(1);
         world.set_online_session(virtual_char.id, Some(with_corp.clone()));
-        let corp = format!("corp_{}", virtual_char.id);
+        let corp = format!("corp_{}", 1);
         let corp_room = format!("{corp}@conference.chat.test");
         assert!(presence(&mut same, &corp_room, virtual_char.id, "corp-real").await.contains("code='110'"));
         read_until(&mut same, "</message>").await;

@@ -112,6 +112,21 @@ struct Rooms {
     entries: HashMap<String, HashMap<String, Occupant>>,
 }
 
+struct Profile {
+    info: String,
+    corp: i64,
+    alliance: Option<i64>,
+    faction: Option<i64>,
+    role: i64,
+}
+
+impl Profile {
+    fn xml(&self) -> String {
+        format!("<eve_user_data corpid='{}' allianceid='{}' warfactionid='{}' typeid='{TYPE_CHARACTER}' role='{}' info='{}'/>",
+            self.corp, self.alliance.unwrap_or(0), self.faction.unwrap_or(0), self.role, esc(&self.info))
+    }
+}
+
 /// Shared chat state: auth tokens, connected users, rooms.
 pub struct Hub {
     pub host: String,
@@ -121,7 +136,7 @@ pub struct Hub {
     users: Mutex<HashMap<String, (String, Tx)>>,
     rooms: Mutex<Rooms>,
     /// charID -> `<eve_user_data .../>` sent with presences and user data queries.
-    profiles: Mutex<HashMap<String, String>>,
+    profiles: Mutex<HashMap<String, Profile>>,
 }
 
 fn json_str(s: &str) -> String {
@@ -158,17 +173,11 @@ impl Hub {
     /// session role, and an eveowners row `[ownerID, ownerName, typeID, gender, ownerNameID]`.
     pub fn set_profile(&self, char_id: i64, name: &str, gender: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>, role: i64) {
         let info = format!("[{char_id}, {}, {TYPE_CHARACTER}, {gender}, null]", json_str(name));
-        let el = format!(
-            "<eve_user_data corpid='{corp}' allianceid='{}' warfactionid='{}' typeid='{TYPE_CHARACTER}' role='{role}' info='{}'/>",
-            alliance.unwrap_or(0),
-            faction.unwrap_or(0),
-            esc(&info)
-        );
-        self.profiles.lock().unwrap().insert(char_id.to_string(), el);
+        self.profiles.lock().unwrap().insert(char_id.to_string(), Profile { info, corp, alliance, faction, role });
     }
 
     fn profile(&self, user: &str) -> String {
-        self.profiles.lock().unwrap().get(user).cloned().unwrap_or_default()
+        self.profiles.lock().unwrap().get(user).map(Profile::xml).unwrap_or_default()
     }
 
     fn conference(&self) -> String {

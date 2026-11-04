@@ -1,6 +1,7 @@
 //! Player-facing corporation application state transitions.
 use crate::{client::Client, consts::ROLE_DIRECTOR, db::Db, services::{Call, CallResult, tests::{self, fixture}}};
 mod admission_events;
+mod effects;
 mod creation_capacity;
 mod locking;
 use marshal::Value;
@@ -30,6 +31,7 @@ async fn corp_of(db: &Db, character: i64) -> i64 {
 
 async fn cleanup(db: &Db, corp: i64, people: &[fixture::Fixture]) {
     let ids: Vec<i64> = people.iter().map(|p| p.character).collect();
+    db.execute("DELETE FROM game.notifications WHERE receiver_id=ANY($1)", &[&ids]).await.unwrap();
     db.execute("DELETE FROM game.mail_status WHERE message_id IN (SELECT message_id FROM game.mail_messages WHERE sender_id=$1)", &[&corp]).await.unwrap();
     db.execute("DELETE FROM game.mail_messages WHERE sender_id=$1", &[&corp]).await.unwrap();
     db.execute("DELETE FROM game.corp_applications WHERE corporation_id=$1 OR character_id=ANY($2)", &[&corp, &ids]).await.unwrap();
@@ -332,6 +334,65 @@ async fn grouped_applications_and_applicant_history_have_complete_rows() {
         }
     }).await;
     cleanup(&db, corp, &[ceo, applicant, member]).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
+async fn application_status_partition_matches_current_and_historical_queries() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let manager = fixture::create(&db).await.unwrap();
+    let applicant = fixture::create(&db).await.unwrap();
+    let corp = fixture::create_corporation(&db, manager.character, 1).await.unwrap();
+    fixture::assign_corporation(&db, manager.character, corp, ROLE_DIRECTOR).await.unwrap();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let (mut client, _peer) = tests::client(test_db.clone(), applicant.character).await;
+        let mut observed: [Vec<i64>; 4] = Default::default();
+        for state in 0..=8 {
+            let id = application(&test_db, corp, applicant.character, state).await;
+            client.session.apply(vec![("charid", Value::Int(applicant.character)), ("corpid", Value::Int(1))]);
+            for (index, method, bind, grouped, key) in [
+                (0, "GetMyApplications", 1, true, corp),
+                (1, "GetMyOldApplications", 1, false, corp),
+                (2, "GetApplications", corp, true, applicant.character),
+                (3, "GetOldApplications", corp, false, applicant.character),
+            ] {
+                if index == 2 {
+                    client.session.apply(vec![("charid", Value::Int(manager.character)), ("corpid", Value::Int(corp))]);
+                }
+                let reply = rpc(&mut client, method, &[], bind).await.unwrap();
+                let wire = marshal::loads(&marshal::dumps(&reply)).unwrap();
+                assert_eq!(wire, reply);
+                let rows = if grouped {
+                    let Value::Dict(entries) = &wire else { panic!("expected grouped applications") };
+                    assert!(entries.len() <= 1);
+                    if let Some((actual_key, rows)) = entries.first() {
+                        assert_eq!(*actual_key, Value::Int(key));
+                        rows.items().unwrap()
+                    } else {
+                        &[]
+                    }
+                } else {
+                    wire.items().unwrap()
+                };
+                let states: Vec<i64> = rows.iter().map(|row| {
+                    assert_eq!(crate::services::value_field(row, "applicationID"), Some(&Value::Int(id)));
+                    crate::services::value_field(row, "status").unwrap().as_int().unwrap()
+                }).collect();
+                let belongs = matches!(state, 0 | 6 | 8) == grouped;
+                assert_eq!(states, if belongs { vec![i64::from(state)] } else { vec![] });
+                observed[index].extend(states);
+            }
+            test_db.execute("DELETE FROM game.corp_applications WHERE application_id=$1", &[&id]).await.unwrap();
+        }
+        println!("application_status_partition={}", serde_json::json!({
+            "applicant_current": observed[0], "applicant_historical": observed[1],
+            "manager_current": observed[2], "manager_historical": observed[3],
+        }));
+    }).await;
+    cleanup(&db, corp, &[manager, applicant]).await;
     result.unwrap();
 }
 

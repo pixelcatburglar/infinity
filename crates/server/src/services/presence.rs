@@ -99,6 +99,27 @@ pub(crate) fn online(identity: &Identity, world: &World, chat: &Hub, notify_tx: 
     world.set_online_session(identity.char_id, Some(current.clone()));
     if only_ship_refresh { return; }
     chat.session_changed(identity.char_id);
+    if let Some(old) = previous {
+        if old.corporation_id != current.corporation_id || old.alliance_id != current.alliance_id
+            || old.faction_id != current.faction_id || old.role != current.role {
+            chat.refresh_profile(&current);
+            let old_channels = super::chat::authority::system_channels(world.sde(), old);
+            for channel in super::chat::authority::system_channels(world.sde(), &current) {
+                if (channel.starts_with("corp_") || channel.starts_with("alliance_")) && !old_channels.contains(&channel) {
+                    chat.invite(current.character_id, &channel);
+                }
+            }
+        }
+        if (old.corporation_id != current.corporation_id || old.alliance_id != current.alliance_id)
+            && current.station_id.is_none() {
+            if let (Some(system), Some(ship)) = (current.system_id, current.ship_id) {
+                let character = current.character_id;
+                let corp = current.corporation_id;
+                let alliance = current.alliance_id;
+                world.post(system, move |s| s.refresh_pilot_affiliation(character, ship, corp, alliance));
+            }
+        }
+    }
     if old_station != current.station_id {
         if let (Some(station), Some(old)) = (old_station, previous) {
             station_notice(world, station, old, "OnCharNoLongerInStation");

@@ -55,11 +55,13 @@ async fn inserts_refuse_duplicates_and_notify_managers_and_applicant() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let manager = fixture::create(&db).await.unwrap();
+    let second_manager = fixture::create(&db).await.unwrap();
     let applicant = fixture::create(&db).await.unwrap();
     let invitee = fixture::create(&db).await.unwrap();
     let member = fixture::create(&db).await.unwrap();
     let corp = fixture::create_corporation(&db, manager.character, 1).await.unwrap();
     fixture::assign_corporation(&db, manager.character, corp, ROLE_DIRECTOR).await.unwrap();
+    fixture::assign_corporation(&db, second_manager.character, corp, ROLE_DIRECTOR).await.unwrap();
     fixture::assign_corporation(&db, member.character, corp, 0).await.unwrap();
     db.execute("UPDATE game.corporations SET is_recruiting=true WHERE corporation_id=$1", &[&corp]).await.unwrap();
     let test_db = db.clone();
@@ -67,10 +69,12 @@ async fn inserts_refuse_duplicates_and_notify_managers_and_applicant() {
         let (mut client, _peer) = tests::client(test_db.clone(), applicant.character).await;
         let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel();
         let (mgr_tx, mut mgr_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mgr2_tx, mut mgr2_rx) = tokio::sync::mpsc::unbounded_channel();
         let (member_tx, mut member_rx) = tokio::sync::mpsc::unbounded_channel();
         let (invitee_tx, mut invitee_rx) = tokio::sync::mpsc::unbounded_channel();
         client.world.register_pilot(applicant.character, app_tx);
         client.world.register_pilot(manager.character, mgr_tx);
+        client.world.register_pilot(second_manager.character, mgr2_tx);
         client.world.register_pilot(member.character, member_tx);
         client.world.register_pilot(invitee.character, invitee_tx);
         let args = [Value::Int(corp), Value::unicode("申请")];
@@ -89,23 +93,39 @@ async fn inserts_refuse_duplicates_and_notify_managers_and_applicant() {
             ("status", Value::Int(status)), ("applicationDateTime", Value::Int(created)),
             ("customMessage", Value::unicode(message)),
         ])];
-        for rx in [&mut app_rx, &mut mgr_rx] {
-            assert_eq!(rx.try_recv().unwrap(), ("OnCorporationApplicationChanged".to_owned(), expected(0, "")));
-            assert!(rx.try_recv().is_err());
+        for (rx, notices) in [(&mut app_rx, 0), (&mut mgr_rx, 1), (&mut mgr2_rx, 1)] {
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(events.iter().filter(|e| e.0 == "OnNotificationReceived").count(), notices);
+            if notices == 1 {
+                assert!(events.iter().position(|e| e.0 == "OnCorporationApplicationChanged").unwrap() < events.iter().position(|e| e.0 == "OnNotificationReceived").unwrap());
+            }
+            let applications: Vec<_> = events.into_iter().filter(|e| e.0 == "OnCorporationApplicationChanged").collect();
+            assert_eq!(applications, vec![("OnCorporationApplicationChanged".to_owned(), expected(0, ""))]);
         }
         assert!(member_rx.try_recv().is_err());
         client.session.apply(vec![("charid", Value::Int(manager.character)), ("corpid", Value::Int(corp))]);
         assert_eq!(rpc(&mut client, "UpdateApplicationOffer", &offer(id, applicant.character, corp, 6), corp).await.unwrap(), Value::None);
-        for rx in [&mut app_rx, &mut mgr_rx] {
-            assert_eq!(rx.try_recv().unwrap(), ("OnCorporationApplicationChanged".to_owned(), expected(6, "response")));
+        for (rx, notices) in [(&mut app_rx, 1), (&mut mgr_rx, 0), (&mut mgr2_rx, 0)] {
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(events.iter().filter(|e| e.0 == "OnNotificationReceived").count(), notices);
+            if notices == 1 {
+                assert!(events.iter().position(|e| e.0 == "OnCorporationApplicationChanged").unwrap() < events.iter().position(|e| e.0 == "OnNotificationReceived").unwrap());
+            }
+            let applications: Vec<_> = events.into_iter().filter(|e| e.0 == "OnCorporationApplicationChanged").collect();
+            assert_eq!(applications, vec![("OnCorporationApplicationChanged".to_owned(), expected(6, "response"))]);
         }
         client.session.apply(vec![("charid", Value::Int(applicant.character)), ("corpid", Value::Int(1))]);
         let mut update = offer(id, applicant.character, corp, 3);
         update[5] = Value::None;
         assert_eq!(rpc(&mut client, "UpdateApplicationOffer", &update, 1).await.unwrap(), Value::None);
-        for rx in [&mut app_rx, &mut mgr_rx] {
-            assert_eq!(rx.try_recv().unwrap(), ("OnCorporationApplicationChanged".to_owned(), expected(3, "response")));
-            assert!(rx.try_recv().is_err());
+        for (rx, notices) in [(&mut app_rx, 0), (&mut mgr_rx, 1), (&mut mgr2_rx, 1)] {
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(events.iter().filter(|e| e.0 == "OnNotificationReceived").count(), notices);
+            if notices == 1 {
+                assert!(events.iter().position(|e| e.0 == "OnCorporationApplicationChanged").unwrap() < events.iter().position(|e| e.0 == "OnNotificationReceived").unwrap());
+            }
+            let applications: Vec<_> = events.into_iter().filter(|e| e.0 == "OnCorporationApplicationChanged").collect();
+            assert_eq!(applications, vec![("OnCorporationApplicationChanged".to_owned(), expected(3, "response"))]);
         }
         assert!(member_rx.try_recv().is_err());
         let empty_id = application(&test_db, corp, applicant.character, 6).await;
@@ -114,7 +134,12 @@ async fn inserts_refuse_duplicates_and_notify_managers_and_applicant() {
         empty[5] = Value::unicode("");
         assert_eq!(rpc(&mut client, "UpdateApplicationOffer", &empty, 1).await.unwrap(), Value::None);
         assert_eq!(test_db.query_one("SELECT custom_message FROM game.corp_applications WHERE application_id=$1", &[&empty_id]).await.unwrap().get::<_, String>("custom_message"), "previous");
-        while mgr_rx.try_recv().is_ok() {}
+        for (rx, notices) in [(&mut app_rx, 0), (&mut mgr_rx, 1), (&mut mgr2_rx, 1)] {
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let names: Vec<_> = events.iter().filter(|e| e.0 == "OnCorporationApplicationChanged" || e.0 == "OnNotificationReceived").map(|e| e.0.as_str()).collect();
+            let expected = if notices == 1 { vec!["OnCorporationApplicationChanged", "OnNotificationReceived"] } else { vec!["OnCorporationApplicationChanged"] };
+            assert_eq!(names, expected);
+        }
         client.session.apply(vec![("charid", Value::Int(member.character)), ("corpid", Value::Int(corp))]);
         assert!(rpc(&mut client, "InsertInvitation", &[Value::Int(invitee.character)], corp).await.is_err());
         client.session.apply(vec![("charid", Value::Int(manager.character)), ("corpid", Value::Int(corp))]);
@@ -133,13 +158,19 @@ async fn inserts_refuse_duplicates_and_notify_managers_and_applicant() {
                 ("customMessage", Value::unicode("")),
             ]),
         ]);
-        for rx in [&mut mgr_rx, &mut invitee_rx] {
-            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).filter(|e| e.0 == "OnCorporationApplicationChanged").collect();
-            assert_eq!(events, vec![invitation.clone()]);
+        for (rx, notices) in [(&mut mgr_rx, 0), (&mut mgr2_rx, 0), (&mut invitee_rx, 1)] {
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(events.iter().filter(|e| e.0 == "OnNotificationReceived").count(), notices);
+            if notices == 1 {
+                assert!(events.iter().position(|e| e.0 == "OnCorporationApplicationChanged").unwrap() < events.iter().position(|e| e.0 == "OnNotificationReceived").unwrap());
+            }
+            let applications: Vec<_> = events.into_iter().filter(|e| e.0 == "OnCorporationApplicationChanged").collect();
+            assert_eq!(applications, vec![invitation.clone()]);
         }
-        assert!(std::iter::from_fn(|| member_rx.try_recv().ok()).all(|e| e.0 != "OnCorporationApplicationChanged"));
+        assert!(member_rx.try_recv().is_err());
+        assert!(app_rx.try_recv().is_err());
     }).await;
-    cleanup(&db, corp, &[manager, applicant, invitee, member]).await;
+    cleanup(&db, corp, &[manager, second_manager, applicant, invitee, member]).await;
     result.unwrap();
 }
 

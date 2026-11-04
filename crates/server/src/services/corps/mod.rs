@@ -9,7 +9,8 @@
 //! chat channel. Confirmed admissions deliver the configured nonempty welcome body as automated
 //! mail in the membership transaction; edits invalidate online members' caches after commit.
 //! Application queries require current personnel authority; committed application changes
-//! notify the applicant and the target corporation's current personnel managers and directors.
+//! notify the applicant and current managers, with durable application notices. Membership
+//! changes also invalidate affected member and player-corporation counts after commit.
 //! A member's roles are one mask (game.characters.corp_roles) used for all locations.
 //! Static NPC corporations and schools come from the startup SDE. Alliances are
 //! services/alliances; titles, wallet divisions, offices, shares and general votes are supported.
@@ -92,6 +93,10 @@ pub(super) async fn ceo_of(db: &(impl Executor + ?Sized), corp: i64) -> Result<O
 /// Move a character into `corp` with `roles`, recording the employment and updating their
 /// session if they're online.
 async fn set_corp<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, char_id: i64, corp: i64, roles: i64, now: i64) -> Result<bool, CallError> {
+    let old = membership(db, char_id).await?.0;
+    if old == corp { return Ok(false); }
+    let old_members = crate::dao::characters::members::active_ids(db, old).await.map_err(db_err)?;
+    let new_members = crate::dao::characters::members::active_ids(db, corp).await.map_err(db_err)?;
     let (hq, alliance): (Option<i64>, Option<i64>) = if is_player_corp(corp) {
         registry::headquarters(db, corp).await.map_err(db_err)?
             .map(|row| (row.station_id, row.alliance_id)).unwrap_or_default()
@@ -113,9 +118,29 @@ async fn set_corp<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mu
             pair("rolesAtBase", Value::Int(roles)),
             pair("rolesAtHQ", Value::Int(roles)),
             pair("rolesAtOther", Value::Int(roles)),
+            pair("corpAccountKey", Value::Int(ACCOUNT_CASH as i64)),
             pair("hqID", hq.map(Value::Int).unwrap_or(Value::None)),
         ],
     );
+    let change = Value::dict([("corporationID", Value::tuple([Value::Int(old), Value::Int(corp)]))]);
+    for (audience, members) in [(old, &old_members), (corp, &new_members)] {
+        for &member in members {
+            if member != char_id {
+                outbox.notify_pilot(member, "OnCorporationMemberChanged", vec![Value::Int(audience), Value::Int(char_id), change.clone()]);
+            }
+        }
+    }
+    outbox.notify_pilot(char_id, "OnCorporationMemberChanged", vec![Value::Int(corp), Value::Int(char_id), change]);
+    for (audience, members, delta) in [(old, &old_members, -1), (corp, &new_members, 1)] {
+        if is_player_corp(audience) {
+            let before = members.len() as i64;
+            let args = vec![Value::Int(audience), Value::dict([("memberCount", Value::tuple([Value::Int(before), Value::Int(before + delta)]))])];
+            for &member in members {
+                if member != char_id { outbox.notify_pilot(member, "OnCorporationChanged", args.clone()); }
+            }
+            if audience == corp { outbox.notify_pilot(char_id, "OnCorporationChanged", args); }
+        }
+    }
     Ok(true)
 }
 
@@ -221,6 +246,7 @@ pub async fn corporation_line(db: &Db, sde: &Sde, corp: i64) -> Result<Option<Ve
 
 
 pub(crate) mod corp_registry;
+mod notifications;
 mod abilities;
 pub(crate) mod shares;
 mod dividends;
