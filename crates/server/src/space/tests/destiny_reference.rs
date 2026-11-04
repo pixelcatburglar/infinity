@@ -166,6 +166,8 @@ pub(super) fn replay_fractions(name: &str, fixture: &str, balls: Vec<Ball>, setu
                 assert_eq!(ball.old_pos, previous.pos, "{name} tick {tick} ball {id}: segment start position");
                 assert_eq!(ball.old_vel, previous.vel, "{name} tick {tick} ball {id}: segment start velocity");
             }
+            let actual_start = ball.state_at(tick * 1000).0;
+            let mut expected_start = None;
             for (sample, (fraction, offset)) in samples.iter().zip(fractions) {
                 assert_eq!(sample["fraction"].as_f64(), Some(fraction), "{name} tick {tick} ball {id}: invalid fraction order");
                 let position = sample["pos"].as_array().expect("missing fraction position");
@@ -173,11 +175,14 @@ pub(super) fn replay_fractions(name: &str, fixture: &str, balls: Vec<Ball>, setu
                 assert_eq!(position.len(), 3, "{name} tick {tick} ball {id}: invalid position length");
                 assert_eq!(velocity.len(), 3, "{name} tick {tick} ball {id}: invalid velocity length");
                 let expected: V3 = std::array::from_fn(|i| position[i].as_f64().filter(|v| v.is_finite()).expect("invalid position component"));
-                for component in velocity {
-                    assert!(component.as_f64().is_some_and(f64::is_finite), "{name} tick {tick} ball {id}: invalid velocity component");
-                }
-                let actual = ball.position_at(tick * 1000 + offset);
+                let expected_velocity: V3 = std::array::from_fn(|i| velocity[i].as_f64().filter(|v| v.is_finite()).expect("invalid velocity component"));
+                let (actual, actual_velocity) = ball.state_at(tick * 1000 + offset);
+                let start = *expected_start.get_or_insert(expected);
+                let actual_displacement = std::array::from_fn(|i| actual[i] - actual_start[i]);
+                let expected_displacement = std::array::from_fn(|i| expected[i] - start[i]);
                 compare_position(actual, expected, &format!("{name} tick {tick} fraction {fraction} ball {id}"));
+                compare_position(actual_velocity, expected_velocity, &format!("{name} tick {tick} fraction {fraction} ball {id} velocity"));
+                compare_position(actual_displacement, expected_displacement, &format!("{name} tick {tick} fraction {fraction} ball {id} displacement"));
             }
         }
     }
