@@ -13,7 +13,18 @@ fn triples(value: &Value) {
     for entry in value.items().unwrap() {
         let fields = entry.items().unwrap();
         assert_eq!(fields.len(), 3);
-        assert!(fields[2].as_int().unwrap() > 0);
+        assert!(matches!(&fields[2], Value::Int(quantity) if *quantity > 0));
+    }
+}
+
+// recruitment_crate_controller.py builds (typeID, count, None) locally;
+// crate preview consumers read the first two fields.
+fn preview_triples(value: &Value) {
+    assert_eq!(marshal::loads(&marshal::dumps(value)).unwrap(), *value);
+    for entry in value.items().unwrap() {
+        let fields = entry.items().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(&fields[2], Value::None) || matches!(&fields[2], Value::Int(quantity) if *quantity > 0));
     }
 }
 
@@ -36,7 +47,7 @@ async fn dispatch_refusals_and_adjacent_methods() {
     let (mut client, _peer) = crate::services::tests::client(db.clone(), actor.character).await;
     let value = rpc(&mut client, "crateService", "GetCrate", &[Value::Int(1)], false).await.unwrap();
     assert_eq!(value, Value::list([]));
-    triples(&value);
+    preview_triples(&value);
     for args in [&[][..], &[Value::Bool(true)][..], &[Value::Int(0)][..], &[Value::Int(i64::MAX)][..]] {
         refused(rpc(&mut client, "crateService", "GetCrate", args, false).await);
     }
@@ -80,7 +91,7 @@ async fn previews_require_access_and_preserve_items() {
     let ordinary = client.sde.crates.iter().find(|d| d.preview(false, Some(1)).is_ok_and(|v| !v.is_empty())).expect("catalogue requires an ordinary preview").type_id;
     let choice = client.sde.crates.iter().find(|d| d.preview(true, Some(1)).is_ok_and(|v| !v.is_empty())).expect("catalogue requires a choice preview").type_id;
     let type_preview = rpc(&mut client, "crateService", "PeekInsideCrate", &[Value::Int(i64::from(ordinary))], false).await.unwrap();
-    triples(&type_preview);
+    preview_triples(&type_preview);
     assert!(!type_preview.items().unwrap().is_empty());
     assert_eq!(rpc(&mut client, "crateService", "PeekInsideCrate", &[Value::Int(i64::from(ordinary))], false).await.unwrap(), type_preview);
     let container_type = client.sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
@@ -95,7 +106,7 @@ async fn previews_require_access_and_preserve_items() {
         let before = load_items(&db, ItemQuery::Ids(&ids)).await.unwrap().into_iter().map(|i| (i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton, i.custom_info)).collect::<Vec<_>>();
         let args = [Value::Int(local)];
         let first = rpc(&mut client, "crateService", method, &args, false).await.unwrap();
-        triples(&first);
+        preview_triples(&first);
         assert!(!first.items().unwrap().is_empty());
         if method == "PeekInsideFixedCrate" { assert_eq!(first, type_preview); }
         assert_eq!(rpc(&mut client, "crateService", method, &args, false).await.unwrap(), first);
@@ -177,7 +188,7 @@ async fn corporate_custody_previews_require_view_role_and_local_reachability() {
         refused(rpc(&mut client, "crateService", "PeekInsideFixedCrate", &[Value::Int(item)], false).await);
         fixture::assign_corporation(&db, actor.character, corp, role).await.unwrap();
         let result = rpc(&mut client, "crateService", "PeekInsideFixedCrate", &[Value::Int(item)], false).await.unwrap();
-        triples(&result);
+        preview_triples(&result);
         assert!(!result.items().unwrap().is_empty());
         client.session.apply(vec![("stationid", Value::Int(remote))]);
         refused(rpc(&mut client, "crateService", "PeekInsideFixedCrate", &[Value::Int(item)], false).await);
@@ -491,3 +502,66 @@ async fn opening_refuses_when_active_ship_cargo_is_full() {
     fixture::cleanup(&db, actor).await.unwrap();
 }
 
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn claim_loot_acknowledges_only_owned_receipts_and_survives_consumption() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let actor = fixture::create(&db).await.unwrap();
+    let other = fixture::create(&db).await.unwrap();
+    let (mut client, _peer) = crate::services::tests::client(db.clone(), actor.character).await;
+    let (mut second, _peer2) = crate::services::tests::client(db.clone(), actor.character).await;
+    let (mut foreign, _peer3) = crate::services::tests::client(db.clone(), other.character).await;
+    let station = client.sde.map.stations().next().unwrap().station_id;
+    let flag = crate::consts::FLAG_HANGAR;
+    let item = transfers::insert(&db, 34, actor.character, station, flag, 1).await.unwrap();
+    crate::dao::items::crates::insert(&db, crate::dao::items::crates::RewardReceipt {
+        item_id: item, character_id: actor.character, crate_type_id: 34,
+        destination_location: station, destination_flag: flag, opened_at: crate::client::filetime_now(),
+    }).await.unwrap();
+    let args = [Value::Int(item), Value::Int(station), Value::Int(i64::from(flag))];
+    let before = client.outbox.len();
+    refused(rpc(&mut foreign, "crateService", "ClaimLoot", &args, false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &[Value::Int(item), Value::Int(station + 1), Value::Int(i64::from(flag))], false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &[Value::Int(item), Value::Int(station), Value::Int(i64::from(flag) + 1)], false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &[Value::Int(i64::MAX), Value::Int(station), Value::Int(i64::from(flag))], false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &[Value::Int(-1), Value::Int(station), Value::Int(i64::from(flag))], false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &args[..2], false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &[Value::Int(item), Value::Int(station), Value::Bool(true)], false).await);
+    refused(rpc(&mut client, "crateService", "ClaimLoot", &[Value::Int(item), Value::Int(station), Value::Int(i64::MAX)], false).await);
+    assert_eq!(rpc(&mut client, "crateService", "ClaimLoot", &args, false).await.unwrap(), Value::None);
+    let timestamp: i64 = db.query_one("SELECT acknowledged_at FROM game.crate_rewards WHERE item_id=$1", &[&item]).await.unwrap().get("acknowledged_at");
+    assert_eq!(rpc(&mut client, "crateService", "ClaimLoot", &args, false).await.unwrap(), Value::None);
+    assert_eq!(rpc(&mut second, "crateService", "ClaimLoot", &args, false).await.unwrap(), Value::None);
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
+    assert_eq!(rpc(&mut second, "crateService", "ClaimLoot", &args, false).await.unwrap(), Value::None);
+    assert_eq!(db.query_one("SELECT acknowledged_at FROM game.crate_rewards WHERE item_id=$1", &[&item]).await.unwrap().get::<_, i64>("acknowledged_at"), timestamp);
+    let deleted = transfers::insert(&db, 34, actor.character, station, flag, 1).await.unwrap();
+    crate::dao::items::crates::insert(&db, crate::dao::items::crates::RewardReceipt {
+        item_id: deleted, character_id: actor.character, crate_type_id: 34,
+        destination_location: station, destination_flag: flag, opened_at: crate::client::filetime_now(),
+    }).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&deleted]).await.unwrap();
+    let deleted_args = [Value::Int(deleted), Value::Int(station), Value::Int(i64::from(flag))];
+    let items_before = load_items(&db, ItemQuery::Id(deleted)).await.unwrap();
+    assert!(items_before.is_empty());
+    let inventory_before = db.query("SELECT item_id, location_id, flag_id, quantity FROM game.items WHERE owner_id=$1 ORDER BY item_id", &[&actor.character]).await.unwrap()
+        .into_iter().map(|row| (row.get::<_, i64>("item_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id"), row.get::<_, i32>("quantity"))).collect::<Vec<_>>();
+    let outbox_before = second.outbox.len();
+    assert_eq!(rpc(&mut second, "crateService", "ClaimLoot", &deleted_args, false).await.unwrap(), Value::None);
+    let deleted_timestamp: i64 = db.query_one("SELECT acknowledged_at FROM game.crate_rewards WHERE item_id=$1", &[&deleted]).await.unwrap().get("acknowledged_at");
+    assert!(deleted_timestamp > 0);
+    assert_eq!(rpc(&mut second, "crateService", "ClaimLoot", &deleted_args, false).await.unwrap(), Value::None);
+    assert_eq!(db.query_one("SELECT acknowledged_at FROM game.crate_rewards WHERE item_id=$1", &[&deleted]).await.unwrap().get::<_, i64>("acknowledged_at"), deleted_timestamp);
+    assert!(load_items(&db, ItemQuery::Id(deleted)).await.unwrap().is_empty());
+    let inventory_after = db.query("SELECT item_id, location_id, flag_id, quantity FROM game.items WHERE owner_id=$1 ORDER BY item_id", &[&actor.character]).await.unwrap()
+        .into_iter().map(|row| (row.get::<_, i64>("item_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id"), row.get::<_, i32>("quantity"))).collect::<Vec<_>>();
+    assert_eq!(inventory_after, inventory_before);
+    assert_eq!(second.outbox.len(), outbox_before);
+    db.execute("DELETE FROM game.crate_rewards WHERE item_id=$1", &[&deleted]).await.unwrap();
+    assert_eq!(client.outbox.len(), before);
+    db.execute("DELETE FROM game.crate_rewards WHERE item_id=$1", &[&item]).await.unwrap();
+    fixture::cleanup(&db, actor).await.unwrap();
+    fixture::cleanup(&db, other).await.unwrap();
+}

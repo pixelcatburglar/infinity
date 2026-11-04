@@ -40,7 +40,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             },
             _ => Err(notify_error(messages::INVALID_SOURCE)),
         },
-        "GetCrateLocation" | "CustomOpenCrate" | "ClaimLoot" | "ClaimSkillBundle" | "ClaimFitting" => Err(notify_error(messages::OPENING_UNAVAILABLE)),
+        "ClaimLoot" => match super::claims::arguments(call) {
+            Some((item, destination, flag)) => super::claims::claim_loot(c, item, destination, flag).await,
+            None => Err(notify_error(messages::INVALID_SOURCE)),
+        },
+        "GetCrateLocation" | "CustomOpenCrate" | "ClaimSkillBundle" | "ClaimFitting" => Err(notify_error(messages::OPENING_UNAVAILABLE)),
         _ => return None,
     })
 }

@@ -1,8 +1,17 @@
 //! Crate service routing for eve/client/script/ui/crate/controller.py and
-//! recruitment_crate_controller.py. Previews use the startup catalogue and
-//! authenticated inventory; round-one direct-list opening is transactional.
+//! recruitment_crate_controller.py. Previews use the startup SDE catalogue,
+//! composed from native crate data and server-authored content, and instance
+//! previews check authenticated inventory access.
+//!
+//! Authorized, reachable ordinary direct-list crates are opened transactionally:
+//! source quantities are consumed, rewards are created at the destination, and
+//! durable receipts are recorded in `game.crate_rewards`. `ClaimLoot` only
+//! acknowledges a matching receipt; it neither creates nor moves items.
+//! Custom opening and special rewards such as skill bundles and fittings are
+//! unsupported.
 
 mod catalogue;
+mod claims;
 mod crate_service;
 mod opening;
 
