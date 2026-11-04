@@ -71,9 +71,14 @@ Corporate mining observers and structure ledger history are unsupported; their q
 | service | method | status | handler file |
 |---|---|---|---|
 | fleetObjectHandler | Reconnect | handled | `crates/server/src/services/fleets/fleet_object_handler.rs` |
+| beyonce | GetFleetLocationAndInfo | handled | `crates/server/src/services/ship/beyonce.rs` |
+| beyonce | GetFleetState | handled | `crates/server/src/services/ship/beyonce.rs` |
+| beyonce | CmdFleetTagTarget | handled | `crates/server/src/services/ship/beyonce.rs` |
 | sovDashboard | GetCynoJammerState | fixed | `crates/server/src/services/fixed.rs` |
 
 A disconnected member's fleet seat is kept for `fleets.reconnect_timeout_secs` (120 seconds by default, at most 120) so the client can rejoin automatically; seats do not survive a server restart.
+
+Fleet location queries include online, visible fleet members in the caller's current system. Fleet commanders (the fleet leader, wing commanders and squad commanders) can set or clear target tags for visible targets; members receive their current visible state and explicit clears. Fleet tags are held in process memory. Cynosural jamming is not modeled, so the dashboard reports no interference.
 
 ## External phone binding
 

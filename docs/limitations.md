@@ -49,7 +49,7 @@
 - An alliance application takes effect immediately when accepted, although the client's acceptance dialog says there is a delay.
 - Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
 - In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.
-- Fleet bubble broadcasts and fleet warp treat a whole solar system as one grid, because the server keeps one ballpark per system.
+- Fleet bubble broadcasts, fleet warp and fleet space visibility treat a whole solar system as one grid, because the server keeps one ballpark per system.
 - SKIN visibility uses the existing one-ballpark-per-system approximation and respects cloaking. Regional eligibility is checked at writes using `server.boot_region`, which is immutable during a process; changing the region across a restart is unsupported.
 - A license removal with no ship applications changes the database immediately but cannot send a ship removal event; the GM receives a policy message and an already displayed collection refreshes at the next login. A removal callback can arrive after the player selects another SKIN: the received legal cancel order remains authoritative, and there is no global ordering guarantee across Macho and gateway channels.
 - Gateway notices are immediate, best-effort and not durably replayed. A full or closed queue cancels the slow stream generation rather than silently dropping notices; reconnect and a Get recover committed state.
@@ -62,7 +62,7 @@
 - A public gateway request, such as a skill plan change, is checked against the calling account and character, not against one game session. A request sent just before a relog therefore applies to the character's state after it.
 - Live gateway notifications, unlike those persistent requests, are bound to the authoritative exact online session generation and cannot adopt a replacement session. Account and character ownership lookup is not token authentication: the public gateway requires a trusted network or authentication front door and must not be exposed directly to untrusted clients.
 - Some runtime state lives only in memory and is lost when the server restarts:
-  - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
+  - fleets, with their finder adverts, member options, watchlists and target tags; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space except ships (NPCs, wrecks, scheduled effects);
   - drone orders and control, the drone settings the client sends before each launch, and ore a mining drone is carrying back;
   - a ship's velocity, warp and cloak, so a restarted ship starts at rest;
