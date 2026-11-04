@@ -27,6 +27,7 @@ use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 
 pub(crate) mod alliance_registry;
+pub(crate) mod admission;
 
 /// Client appConst.allianceApplicationNew.
 pub(crate) const APP_NEW: i32 = 1;
@@ -244,17 +245,12 @@ async fn alliance_changed(db: &Db, world: &World, alliance: i64, old: Option<Vec
     dispatch_world((), outbox, world)
 }
 
-async fn queue_application_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
+pub(crate) async fn queue_application_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = application_line_of(db, alliance, corp).await?;
     let ch = change(APPLICATION_COLUMNS, old.as_deref(), new.as_deref());
     queue_tell(db, outbox, alliance, Some(corp), "OnAllianceApplicationChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
 }
 
-pub(crate) async fn application_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let mut outbox = Outbox::default();
-    queue_application_changed(db, &mut outbox, alliance, corp, old).await?;
-    dispatch_world((), outbox, world)
-}
 
 async fn queue_member_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
@@ -296,10 +292,11 @@ pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbo
     let old_member = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
     let old_alliance = alliance_line_of(db, alliance).await?;
     let ch = change(MEMBER_COLUMNS, old_member.as_deref(), None);
-    for char_id in pilots(db, Some(alliance), Some(corp)).await? {
+    let recipients = pilots(db, Some(alliance), Some(corp)).await?;
+    set_alliance(db, outbox, corp, None, now).await?;
+    for char_id in recipients {
         outbox.notify_pilot(char_id, "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch.clone()]);
     }
-    set_alliance(db, outbox, corp, None, now).await?;
     dao::clear_support(db, alliance, corp).await.map_err(db_err)?;
     if executor == Some(corp) {
         // The largest remaining member takes over; none left closes the alliance.

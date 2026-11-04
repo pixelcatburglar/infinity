@@ -6,6 +6,9 @@ use anyhow::{anyhow, ensure, Result};
 use std::{future::Future, task::Poll, time::Duration};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use crate::services::drones::tests::fixture::Fixture;
+mod protocol;
+mod rollback;
+mod creation;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 type Notices = UnboundedReceiver<(String, Vec<Value>)>;
@@ -66,8 +69,12 @@ impl Scenario {
     async fn cleanup(mut self) {
         self.f.db.execute("UPDATE game.characters SET corporation_id=1, corp_roles=0 WHERE user_id=$1", &[&self.f.account]).await.unwrap();
         self.f.client.session.apply(vec![("charid", Value::Int(self.f.owner)), ("corpid", Value::Int(1)), ("allianceid", Value::None)]);
+        for row in self.f.db.query("SELECT alliance_id FROM game.alliances WHERE creator_corp_id = ANY($1)", &[&self.corps]).await.unwrap() {
+            self.alliances.push(row.get("alliance_id"));
+        }
         self.f.db.execute("DELETE FROM game.alliance_history WHERE corporation_id = ANY($1)", &[&self.corps]).await.unwrap();
         self.f.db.execute("DELETE FROM game.alliance_applications WHERE corporation_id = ANY($1) OR alliance_id = ANY($2)", &[&self.corps, &self.alliances]).await.unwrap();
+        self.f.db.execute("DELETE FROM game.corp_wallets WHERE corporation_id = ANY($1)", &[&self.corps]).await.unwrap();
         self.f.db.execute("DELETE FROM game.corporations WHERE corporation_id = ANY($1)", &[&self.corps]).await.unwrap();
         self.f.db.execute("DELETE FROM game.alliances WHERE alliance_id = ANY($1)", &[&self.alliances]).await.unwrap();
         self.f.cleanup().await;
@@ -75,7 +82,11 @@ impl Scenario {
 }
 
 async fn dispatch_update(s: &mut Scenario, alliance: i64, corp: i64, state: i32, method: &str) -> bool {
-    let args = [Value::Int(corp), Value::unicode("application"), Value::Int(state as i64)];
+    let args = if method == "GMForceAcceptApplication" {
+        vec![Value::Int(corp)]
+    } else {
+        vec![Value::Int(corp), Value::unicode("manager edit"), Value::Int(state as i64)]
+    };
     let kwargs = Value::None;
     let bind = Value::tuple([Value::Int(alliance), Value::Bool(true)]);
     let call = Call { service: "allianceRegistry", method, args: &args, kwargs: &kwargs, bound: true, bind_params: Some(&bind) };
@@ -108,6 +119,7 @@ fn assert_success_notices(events: &[(String, Vec<Value>)], alliance: i64, corp: 
     }
     let member = notice(events, "OnAllianceMemberChanged", alliance).ok_or_else(|| anyhow!("missing member notice"))?;
     ensure!(member.get(1) == Some(&Value::Int(corp)) && pair(member, "corporationID", Value::None, Value::Int(corp)) && pair(member, "allianceID", Value::None, Value::Int(alliance)), "bad member notice: {member:?}");
+    ensure!(pair(member, "chosenExecutorID", Value::None, Value::None) && pair(member, "deleted", Value::None, Value::Bool(false)) && field(member, "startDate").is_some(), "incomplete member diff: {member:?}");
     let row = notice(events, "OnAllianceChanged", alliance).ok_or_else(|| anyhow!("missing alliance notice"))?;
     ensure!(pair(row, "memberCount", Value::Int(1), Value::Int(2)) && pair(row, "corporationCount", Value::Int(1), Value::Int(2)), "bad alliance counts: {row:?}");
     Ok(())
@@ -151,29 +163,43 @@ async fn acceptance_dispatch_and_refusals() -> Result<()> {
         let (joined, time, support, history) = state(&s, corp).await?;
         ensure!(joined == Some(alliance) && time.is_some_and(|v| v > 0) && support.is_none() && history == 1, "membership/history incorrect");
         ensure!(application(&s, alliance, corp).await? == Some(APP_EFFECTIVE) && application(&s, other, corp).await?.is_none() && application(&s, third, corp).await?.is_none(), "application changes incorrect");
+        let text: String = s.f.db.query_one("SELECT application_text FROM game.alliance_applications WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &corp]).await?.get("application_text");
+        ensure!(text == "manager edit", "manager-edited text was not stored");
         let a = drain(&mut s.joining); let b = drain(&mut s.existing);
         assert_success_notices(&a, alliance, corp, true)?;
         assert_success_notices(&b, alliance, corp, false)?;
         for events in [&a, &b] {
             let app = notice(events, "OnAllianceApplicationChanged", alliance).ok_or_else(|| anyhow!("missing acceptance notice"))?;
             ensure!(pair(app, "state", Value::Int(APP_NEW as i64), Value::Int(APP_EFFECTIVE as i64)), "bad state transition");
+            ensure!(pair(app, "allianceID", Value::Int(alliance), Value::Int(alliance)) && pair(app, "corporationID", Value::Int(corp), Value::Int(corp)) && pair(app, "applicationText", Value::unicode("application"), Value::unicode("manager edit")) && field(app, "applicationDateTime").is_some(), "incomplete application diff");
         }
         for id in [other, third] {
             let app = notice(&a, "OnAllianceApplicationChanged", id).ok_or_else(|| anyhow!("missing removal notice"))?;
             ensure!(pair(app, "state", Value::Int(APP_NEW as i64), Value::None), "bad removal notice");
         }
         ensure!(!dispatch_update(&mut s, alliance, corp, APP_ACCEPTED, "UpdateApplication").await, "repeat accepted");
-        ensure!(admit(&s.f.db, &s.f.world, alliance, -1, true).await.is_err(), "missing corporation accepted");
+        ensure!(!dispatch_update(&mut s, alliance, -1, APP_ACCEPTED, "UpdateApplication").await, "missing corporation accepted");
         let fresh = s.corp(s.f.owner).await?;
-        ensure!(admit(&s.f.db, &s.f.world, -1, fresh, false).await.is_err(), "missing alliance accepted");
-        ensure!(admit(&s.f.db, &s.f.world, alliance, fresh, true).await.is_err(), "missing application accepted");
+        ensure!(!dispatch_update(&mut s, -1, fresh, APP_ACCEPTED, "UpdateApplication").await, "missing alliance accepted");
+        ensure!(!dispatch_update(&mut s, alliance, fresh, APP_ACCEPTED, "UpdateApplication").await, "missing application accepted");
         ensure!(state(&s, corp).await?.3 == 1 && state(&s, fresh).await?.3 == 0 && drain(&mut s.joining).is_empty() && drain(&mut s.existing).is_empty(), "refusal had effects");
         s.app(alliance, fresh).await?;
         ensure!(dispatch_update(&mut s, alliance, fresh, APP_REJECTED, "UpdateApplication").await, "rejection refused");
         ensure!(application(&s, alliance, fresh).await? == Some(APP_REJECTED) && state(&s, fresh).await?.0.is_none() && state(&s, fresh).await?.3 == 0, "rejection changed membership");
         drain(&mut s.joining); drain(&mut s.existing);
-        ensure!(dispatch_update(&mut s, alliance, fresh, APP_NEW, "GMForceAcceptApplication").await, "GM force acceptance refused");
-        ensure!(application(&s, alliance, fresh).await? == Some(APP_EFFECTIVE) && state(&s, fresh).await?.0 == Some(alliance) && state(&s, fresh).await?.3 == 1, "GM force acceptance incorrect");
+        ensure!(!dispatch_update(&mut s, alliance, fresh, APP_NEW, "GMForceAcceptApplication").await, "director obtained GM authority");
+        s.f.client.login.role = crate::consts::GM_ROLES;
+        ensure!(!dispatch_update(&mut s, alliance, fresh, APP_NEW, "GMForceAcceptApplication").await, "GM force accepted terminal application");
+        ensure!(application(&s, alliance, fresh).await? == Some(APP_REJECTED) && state(&s, fresh).await?.3 == 0, "terminal force refusal had effects");
+        s.f.db.execute("UPDATE game.alliance_applications SET state=$3 WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &fresh, &APP_ACCEPTED]).await?;
+        ensure!(!dispatch_update(&mut s, alliance, fresh, APP_ACCEPTED, "UpdateApplication").await && !dispatch_update(&mut s, alliance, fresh, APP_NEW, "GMForceAcceptApplication").await, "legacy accepted state readmitted");
+        ensure!(state(&s, fresh).await?.3 == 0, "legacy refusal wrote history");
+        let gm_corp = s.corp(s.f.owner).await?;
+        s.app(alliance, gm_corp).await?;
+        ensure!(dispatch_update(&mut s, alliance, gm_corp, APP_NEW, "GMForceAcceptApplication").await, "GM force acceptance refused");
+        ensure!(application(&s, alliance, gm_corp).await? == Some(APP_EFFECTIVE) && state(&s, gm_corp).await?.0 == Some(alliance) && state(&s, gm_corp).await?.3 == 1, "GM force acceptance incorrect");
+        let text: String = s.f.db.query_one("SELECT application_text FROM game.alliance_applications WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &gm_corp]).await?.get("application_text");
+        ensure!(text == "application", "GM force acceptance changed stored text");
         Ok(())
     }).await;
     s.cleanup().await;
@@ -207,12 +233,22 @@ async fn gm_join_preserves_target_application() -> Result<()> {
     match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
 }
 
-async fn barrier() -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>, i32)> {
+struct AbortTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortTask<T> {
+    fn abort(&self) { self.0.abort(); }
+}
+
+impl<T> Drop for AbortTask<T> {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+async fn barrier() -> Result<(tokio_postgres::Client, AbortTask<()>, i32)> {
     let config = crate::config::tests::test_database().to_pg_config()?;
-    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-    let task = tokio::spawn(async move { let _ = connection.await; });
-    let pid = client.query_one("SELECT pg_backend_pid() AS pid", &[]).await?.get("pid");
-    client.batch_execute("BEGIN").await?;
+    let (client, connection) = tokio::time::timeout(TIMEOUT, config.connect(tokio_postgres::NoTls)).await??;
+    let task = AbortTask(tokio::spawn(async move { let _ = connection.await; }));
+    let pid = tokio::time::timeout(TIMEOUT, client.query_one("SELECT pg_backend_pid() AS pid", &[])).await??.get("pid");
+    tokio::time::timeout(TIMEOUT, client.batch_execute("BEGIN")).await??;
     Ok((client, task, pid))
 }
 
@@ -235,13 +271,16 @@ async fn concurrent_acceptances_have_one_winner() -> Result<()> {
         let (corp, executor, a) = setup(&mut s).await?;
         let b = s.alliance(executor).await?;
         s.app(a, corp).await?; s.app(b, corp).await?;
+        s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
         let (lock, connection, pid) = barrier().await?;
         lock.query_one("SELECT corporation_id FROM game.corporations WHERE corporation_id=$1 FOR UPDATE", &[&corp]).await?;
         let db = s.f.db.clone(); let world = s.f.world.clone();
-        let mut one = tokio::spawn(async move { admit(&db, &world, a, corp, true).await.is_ok() });
+        let identity = crate::services::identity::Identity::of_client(&s.f.client);
+        let mut one = tokio::spawn(async move { admission::decide(&db, &world, &identity, a, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_ok() });
         let db = s.f.db.clone(); let world = s.f.world.clone();
-        let mut two = tokio::spawn(async move { admit(&db, &world, b, corp, true).await.is_ok() });
-        let wait = blocked(&s.f.db, pid, "UPDATE game.corporations SET alliance_id%", 2).await;
+        let identity = crate::services::identity::Identity::of_client(&s.f.client);
+        let mut two = tokio::spawn(async move { admission::decide(&db, &world, &identity, b, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_ok() });
+        let wait = blocked(&s.f.db, pid, "SELECT %FOR UPDATE", 2).await;
         lock.batch_execute("COMMIT").await?; drop(lock); connection.abort();
         let x = match tokio::time::timeout(TIMEOUT, &mut one).await {
             Ok(result) => result?,
@@ -266,18 +305,20 @@ async fn concurrent_acceptances_have_one_winner() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
-async fn stale_application_rolls_back_late_admission() -> Result<()> {
+async fn stale_application_refused_before_admission() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, alliance) = setup(&mut s).await?;
         let other = s.alliance(executor).await?;
         s.app(alliance, corp).await?; s.app(other, corp).await?;
+        s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
         let before = state(&s, corp).await?;
         let (lock, connection, pid) = barrier().await?;
         lock.execute("UPDATE game.alliance_applications SET state=$3 WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &corp, &APP_REJECTED]).await?;
         let db = s.f.db.clone(); let world = s.f.world.clone();
-        let mut task = tokio::spawn(async move { admit(&db, &world, alliance, corp, true).await.is_ok() });
-        let wait = blocked(&s.f.db, pid, "UPDATE game.alliance_applications SET state%", 1).await;
+        let identity = crate::services::identity::Identity::of_client(&s.f.client);
+        let mut task = tokio::spawn(async move { admission::decide(&db, &world, &identity, alliance, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_ok() });
+        let wait = blocked(&s.f.db, pid, "SELECT alliance_id FROM game.alliance_applications%FOR UPDATE", 1).await;
         lock.batch_execute("COMMIT").await?; drop(lock); connection.abort();
         let joined = tokio::time::timeout(TIMEOUT, &mut task).await;
         if joined.is_err() { task.abort(); let _ = task.await; return Err(anyhow!("admission task timed out")); }

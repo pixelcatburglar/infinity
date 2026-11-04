@@ -90,12 +90,8 @@ pub(crate) const CORP_CEO_REQUIRED_TO_CHOOSE_EXECUTOR: &str = "只有军团 CEO 
 pub(crate) const CORP_NOT_ALLIANCE_MEMBER: &str = "该军团不是联盟成员。";
 /// Alliance lookup/application operation.
 pub(crate) const ALLIANCE_NOT_FOUND: &str = "该联盟已不存在。";
-/// Withdrawing alliance application.
-pub(crate) const CORP_CEO_REQUIRED_TO_WITHDRAW_ALLIANCE_APPLICATION: &str = "只有军团 CEO 才能撤回联盟申请。";
 /// Editing alliance information.
 pub(crate) const EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_EDIT_ALLIANCE: &str = "只有执行军团的董事才能修改联盟信息。";
-/// Handling alliance application.
-pub(crate) const EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_HANDLE_APPLICATION: &str = "只有执行军团的董事才能处理联盟申请。";
 /// Alliance application missing.
 pub(crate) const ALLIANCE_APPLICATION_NOT_FOUND: &str = "该申请已不存在。";
 /// Alliance application status validation.
