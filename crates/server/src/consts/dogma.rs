@@ -154,6 +154,8 @@ pub const ATTR_CHARGE: i32 = 18;
 pub const ATTR_SHIELD_CHARGE: i32 = 264;
 /// SDE dgmAttributeTypes: armorDamage.
 pub const ATTR_ARMOR_DAMAGE: i32 = 266;
+/// Client dogma/const.py: attributeCrystalDamageEnabled.
+pub const ATTR_CRYSTAL_DAMAGE_ENABLED: i32 = 786;
 /// SDE dgmAttributeTypes: damage (hull damage), not hitpoint capacity hp (9).
 pub const ATTR_HULL_DAMAGE: i32 = 3;
 /// SDE dgmAttributeTypes: requiredSkill1.

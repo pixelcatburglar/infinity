@@ -365,8 +365,8 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                 }
                 for (id, change) in &changes {
                     if change.quantity.is_some() {
-                        inventory::notify_item_change(tx, &sde, outbox, *id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
-                    } else if let Some(item) = originals.remove(id) { inventory::notify_item_removed(outbox, item); }
+                        inventory::notifications::notify_item_change(tx, &sde, outbox, *id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                    } else if let Some(item) = originals.remove(id) { inventory::notifications::notify_item_removed(outbox, item); }
                 }
                 if wallet_owner == me { wallets::debit(tx, outbox, me, p.fees.total()).await?; }
                 else { wallets::corp_debit(tx, outbox, wallet_owner, wallet_account_key, p.fees.total()).await?; }
@@ -374,15 +374,15 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                 if !bp.singleton {
                     let stack = load_items(tx, &sde, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
                     if stack.quantity > 1 {
-                        bp.item_id = inventory::split_stack(tx, &stack, 1, bp.owner, bp.location, bp.flag, true).await?;
+                        bp.item_id = inventory::stacks::split_stack(tx, &stack, 1, bp.owner, bp.location, bp.flag, true).await?;
                         set_blueprint(tx, bp.item_id, bp.me, bp.te, bp.runs).await?;
-                        inventory::notify_item_change(tx, &sde, outbox, stack.item_id, vec![(IX_STACK_SIZE, Value::Int(stack.quantity as i64))]).await?;
-                        inventory::notify_item_change(tx, &sde, outbox, bp.item_id, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
+                        inventory::notifications::notify_item_change(tx, &sde, outbox, stack.item_id, vec![(IX_STACK_SIZE, Value::Int(stack.quantity as i64))]).await?;
+                        inventory::notifications::notify_item_change(tx, &sde, outbox, bp.item_id, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
                     } else {
                         if !crate::dao::items::inventory::move_item(tx, &stack, bp.location, bp.flag, bp.owner, true).await.map_err(db_err)? {
                             return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
                         }
-                        inventory::notify_item_change(tx, &sde, outbox, bp.item_id, vec![(crate::consts::IX_SINGLETON, Value::Bool(false))]).await?;
+                        inventory::notifications::notify_item_change(tx, &sde, outbox, bp.item_id, vec![(crate::consts::IX_SINGLETON, Value::Bool(false))]).await?;
                     }
                 }
                 let mut j = Job {
@@ -428,7 +428,7 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
 async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
     if let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop() {
         industry_dao::delete_blueprint_item(db, item_id).await.map_err(db_err)?;
-        inventory::notify_item_removed(outbox, item);
+        inventory::notifications::notify_item_removed(outbox, item);
     }
     Ok(())
 }
@@ -439,7 +439,7 @@ async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: 
     for _ in 0..count {
         let id = industry_dao::insert_copy(db, type_id, j.owner, j.output_location, j.output_flag, BLUEPRINT_COPY_QUANTITY).await.map_err(db_err)?;
         set_blueprint(db, id, me, te, runs).await?;
-        inventory::notify_item_change(db, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
+        inventory::notifications::notify_item_change(db, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
     }
     Ok(())
 }

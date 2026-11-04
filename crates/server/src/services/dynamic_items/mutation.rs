@@ -100,10 +100,10 @@ pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mu
     }
     let metadata = dao::dynamic_items::MutationMetadata { item_id: result, source_item_id: source_id, mutator_item_id: mutator_id, source_type_id: source.type_id, mutator_type_id: mutator.type_id, result_type_id: result_type, creator_id: context.character, created_at: filetime_now(), modifiers: factors };
     dao::dynamic_items::insert(ex, &metadata).await.map_err(db_err)?;
-    inventory::notify_item_removed(outbox, source);
-    if mutator.quantity == 1 { inventory::notify_item_removed(outbox, mutator); } else {
-        inventory::notify_item_change(ex, sde, outbox, mutator_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(mutator.quantity)))]).await?;
+    inventory::notifications::notify_item_removed(outbox, source);
+    if mutator.quantity == 1 { inventory::notifications::notify_item_removed(outbox, mutator); } else {
+        inventory::notifications::notify_item_change(ex, sde, outbox, mutator_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(mutator.quantity)))]).await?;
     }
-    inventory::notify_item_change(ex, sde, outbox, result, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+    inventory::notifications::notify_item_change(ex, sde, outbox, result, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
     Ok(result)
 }

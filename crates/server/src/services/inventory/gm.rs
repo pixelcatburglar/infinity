@@ -2,7 +2,15 @@
 //! The slash command supplies a resolved type and optional item ID; game.items
 //! supplies the target's ship and inventory. Modules are not brought online.
 
-use super::*;
+use super::is_fitting_flag;
+use super::notifications::notify_item_change;
+use crate::client::Client;
+use crate::consts::{CATEGORY_SHIP, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID};
+use crate::dao::items::loading::{Item, ItemQuery};
+use crate::db::outbox::Outbox;
+use crate::messages;
+use crate::services::{db_err, items::load_items, notify_error, CallError};
+use marshal::Value;
 use super::movement::{dispatch_move, move_core, MoveEffect};
 use crate::db::outbox::Notification;
 use crate::services::identity::Identity;

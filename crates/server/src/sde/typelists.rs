@@ -9,9 +9,12 @@ use super::types::Types;
 const NON_TRADABLE_LIST: i64 = 36;
 /// inventoryrestrictions/common/checks.py: soulbound type list.
 const SOULBOUND_LIST: i64 = 142;
-/// Startup lists required by inventoryrestrictions/common/checks.py trade restrictions
-/// and evetypes/const.py direct skill purchase availability.
-const REQUIRED_LISTS: [i64; 3] = [NON_TRADABLE_LIST, SOULBOUND_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE];
+/// evetypes/const.py: type list used by inventory trash restrictions.
+const UNTRASHABLE_LIST: i64 = 298;
+/// evetypes/const.py: type list used by fitting strip restrictions.
+const UNSTRIPPABLE_LIST: i64 = 338;
+/// Startup lists required by inventory restrictions and direct skill purchase availability.
+const REQUIRED_LISTS: [i64; 5] = [NON_TRADABLE_LIST, SOULBOUND_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE, UNTRASHABLE_LIST, UNSTRIPPABLE_LIST];
 
 pub(crate) struct TypeLists(HashMap<i64, dao::TypeList>);
 
@@ -44,6 +47,9 @@ impl TypeLists {
 
     pub(crate) fn is_tradable(&self, type_id: i32, group_id: Option<i32>, category_id: Option<i32>) -> bool {
         ![NON_TRADABLE_LIST, SOULBOUND_LIST].into_iter().any(|list| self.contains(list, type_id, group_id, category_id))
+    }
+    pub(crate) fn is_untrashable(&self, type_id: i32, group_id: i32, category_id: i32) -> bool {
+        self.contains(UNTRASHABLE_LIST, type_id, Some(group_id), Some(category_id))
     }
 }
 

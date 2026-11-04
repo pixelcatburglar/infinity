@@ -174,15 +174,15 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                     if !apply(tx, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
                     for (&id, change) in &changes {
                         if change.quantity.is_some() {
-                            inventory::notify_item_change(tx, &sde, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                            inventory::notifications::notify_item_change(tx, &sde, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
                         } else {
                             let item = plan.0.iter().find(|(item, _)| item.item_id == id).expect("removed item is a source");
-                            inventory::notify_item_removed(outbox, item.0.clone());
+                            inventory::notifications::notify_item_removed(outbox, item.0.clone());
                         }
                     }
                     for (type_id, quantity) in inserts {
                         let id = crate::dao::items::transfers::insert(tx, type_id, char_id, out_location, out_flag, quantity).await.map_err(db_err)?;
-                        inventory::notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
+                        inventory::notifications::notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
                     }
                     if tax > 0.0 {
                         let balance = crate::dao::wallets::characters::debit(tx, char_id, tax).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::INSUFFICIENT_ISK_FOR_REPROCESSING_TAX))?;

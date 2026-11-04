@@ -51,7 +51,7 @@
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
-use super::inventory::{notify_item_change, notify_item_removed};
+use super::inventory::notifications::{notify_item_change, notify_item_removed};
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
 use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};

@@ -194,7 +194,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     assert!(dogma::online(&db, f.ship).await.unwrap().iter().any(|m| m.item_id == f.modules[0]));
     assert!(events.try_recv().is_err());
 
-    let moved = services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &services::inventory::Container::Item(f.ship), f.modules[0], Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("unfit running module");
+    let moved = services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &services::inventory::access::Container::Item(f.ship), f.modules[0], Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("unfit running module");
     assert_eq!(moved, Some(f.modules[0]));
     assert!(stop.load(Ordering::Relaxed));
     let row = db.query_one("SELECT location_id,flag_id,online FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.modules[0], &f.owner]).await.unwrap();

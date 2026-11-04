@@ -289,6 +289,7 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
 
 /// bound scanMgr.RecoverProbes(probeIDs) -> recovered probe IDs; they return to cargo.
 pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallResult {
+    let _lock = crate::services::market::lock().await;
     let (Some(ship), Some(char_id)) = (c.session.int("shipid"), c.session.int("charid")) else { return Ok(Value::list([])) };
     let ids = value_ids(call.args.first());
     let mut back: HashMap<i32, i32> = HashMap::new();

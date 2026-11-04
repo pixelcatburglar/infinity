@@ -2,7 +2,7 @@
 //! Uses game.items and game.characters through the item DAO and types from the loaded SDE.
 //! Callers own transactions; this helper does not implement general inventory policy.
 use super::{db_err, notify_error, CallError};
-use super::inventory::notify_item_change;
+use super::inventory::notifications::notify_item_change;
 use crate::consts::{FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::dao::items::{inventory, transfers};
 use crate::dao::items::loading::{self, Item, ItemQuery};

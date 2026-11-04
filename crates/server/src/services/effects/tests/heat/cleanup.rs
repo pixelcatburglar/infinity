@@ -1,6 +1,6 @@
 //! Committed and rolled-back inventory departures of primed modules.
 use super::*;
-use crate::{consts::{FLAG_CARGO, FLAG_HI_SLOT_FIRST}, services::inventory::{self, Container}};
+use crate::{consts::{FLAG_CARGO, FLAG_HI_SLOT_FIRST}, services::inventory::{self, access::Container}};
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]

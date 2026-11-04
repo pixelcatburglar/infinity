@@ -1,4 +1,16 @@
-use super::*;
+use super::{inventory, list};
+use super::super::{movement, CONTAINER_CORP_MARKET, INVENTORY};
+use super::super::access::{container_of, corp_hangar_role, may_take_corp_hangar, may_view_corp_hangar, Container};
+use super::super::inv_broker::broker;
+use super::super::notifications::notify_corp_item_change;
+use super::super::stacks::plan_merges;
+use super::super::tests::item;
+use crate::consts::{CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
+use crate::dao::items::loading::{Item, ItemQuery};
+use crate::db::outbox::Outbox;
+use crate::messages;
+use crate::services::{items::load_items, notify_error, Call, CallError};
+use marshal::Value;
 
 #[test]
 fn deliveries_binding_and_division_boundaries() {
@@ -96,7 +108,8 @@ async fn deliveries_roles_listing_and_take() {
     let merge_args = [Value::list([Value::tuple([Value::Int(id), Value::Int(id), Value::Int(1)])])];
     let merge_call = Call { service: INVENTORY, method: "MultiMerge", args: &merge_args, kwargs: &kwargs, bound: true, bind_params: Some(&direct) };
     assert!(inventory(&mut client, &merge_call).await.is_err());
-    assert!(trash_items(&mut client, &[id]).await.is_err());
+    let location = super::super::trashing::resolve_location(&client, id).await.unwrap();
+    assert!(super::super::trashing::trash_items(&mut client, &[id], location).await.is_err());
     assert!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_DIRECTOR]).await.unwrap();
     let (actor_tx, mut actor_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -167,7 +180,7 @@ async fn deliveries_roles_listing_and_take() {
         db.execute("UPDATE game.characters SET corp_roles = 0 WHERE character_id = $1", &[&actor.character]).await.unwrap();
         assert!(inventory(&mut client, &call).await.is_err());
         db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_DIRECTOR]).await.unwrap();
-        db.execute("UPDATE game.characters SET corporation_id = 1 WHERE character_id = $1", &[&actor.character]).await.unwrap();
+        db.execute("UPDATE game.characters SET corporation_id = $2 WHERE character_id = $1", &[&actor.character, &(corp + 1)]).await.unwrap();
         assert!(inventory(&mut client, &call).await.is_err());
         db.execute("UPDATE game.characters SET corporation_id = $2 WHERE character_id = $1", &[&actor.character, &corp]).await.unwrap();
     }
@@ -181,7 +194,8 @@ async fn deliveries_roles_listing_and_take() {
     assert!(nested_recipients.contains(&actor.character));
     assert!(nested_recipients.contains(&ceo.character));
     assert!(!nested_recipients.contains(&outsider.character));
-    assert!(trash_items(&mut client, &[root]).await.is_err());
+    let location = super::super::trashing::resolve_location(&client, root).await.unwrap();
+    assert!(super::super::trashing::trash_items(&mut client, &[root], location).await.is_err());
     assert_eq!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().unwrap(), Some(id));
     let moved = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (actor.character, station, FLAG_HANGAR));

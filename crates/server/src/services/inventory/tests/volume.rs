@@ -1,4 +1,4 @@
-use super::*;
+use super::{db_err, item_capacity_reply, keyval, CallError, Outbox, Value, ATTR_CAPACITY, FLAG_CARGO, TYPE_PLASTIC_WRAP};
 
 #[tokio::test]
 #[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with SDE"]

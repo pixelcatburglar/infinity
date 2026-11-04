@@ -197,9 +197,9 @@ async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized),
     for item in items {
         if let Some(change) = changes.get(&item.item_id) {
             if change.quantity.is_none() {
-                super::inventory::notify_item_removed(outbox, item);
+                super::inventory::notifications::notify_item_removed(outbox, item);
             } else {
-                super::inventory::notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                super::inventory::notifications::notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             }
         }
     }

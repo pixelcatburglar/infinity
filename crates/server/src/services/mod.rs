@@ -347,7 +347,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 
         ("trademgr", _) => trade::route(c, call).await,
-        (inventory::INVENTORY, _) => inventory::inventory(c, call).await,
+        (inventory::INVENTORY, _) => inventory::dispatch(c, call).await.expect("inventory route"),
 
         ("config", _) => config::dispatch(c, call).await,
 
@@ -363,7 +363,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = event_log::dispatch(c, call).await { return r; }
             if let Some(r) = settings_sharing::dispatch(c, call).await { return r; }
             if call.service == "invbroker" {
-                if let Some(r) = inventory::broker(c, call).await {
+                if let Some(r) = inventory::dispatch(c, call).await {
                     return r;
                 }
             }

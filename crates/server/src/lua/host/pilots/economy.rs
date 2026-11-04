@@ -2,7 +2,7 @@
 //! Mirrors invInventory and marketProxy; game items and orders are authoritative.
 //! Inventory and market operations require an online pilot.
 use mlua::{Lua, Table};
-use crate::{dao::items::loading::ItemQuery, messages, services::{self, effects, inventory::{Container, movement}, market}};
+use crate::{dao::items::loading::ItemQuery, messages, services::{self, effects, inventory::{access::Container, movement}, market}};
 use super::{lifecycle, lua_error, mutate, positive, space::actual_system, Resources};
 
 pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::Result<()> {

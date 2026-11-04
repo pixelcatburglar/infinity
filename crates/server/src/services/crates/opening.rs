@@ -15,8 +15,8 @@ pub(super) async fn open(c: &mut Client, source_id: i64, amount: i32, stack_resp
     let item = load_items(&c.db, &c.sde, ItemQuery::Id(source_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(invalid)?;
     if item.singleton || item.quantity < amount { return Err(invalid()); }
     if item.owner_id != identity.char_id {
-        let Some((corp, _, flag)) = inventory::corporate_custody(&c.db, Some(&c.sde), source_id).await? else { return Err(invalid()); };
-        if item.owner_id != corp || !inventory::may_take_corp_hangar(&c.db, identity.char_id, corp, flag).await? { return Err(invalid()); }
+        let Some((corp, _, flag)) = inventory::access::corporate_custody(&c.db, Some(&c.sde), source_id).await? else { return Err(invalid()); };
+        if item.owner_id != corp || !inventory::access::may_take_corp_hangar(&c.db, identity.char_id, corp, flag).await? { return Err(invalid()); }
     }
     let definition = c.sde.crates.get(item.type_id).ok_or_else(invalid)?;
     let rewards = definition.preview(false, None).map_err(|_| notify_error(messages::METADATA_UNAVAILABLE))?;
@@ -57,16 +57,16 @@ pub(super) async fn open(c: &mut Client, source_id: i64, amount: i32, stack_resp
                 changes.insert(source_id, QuantityChange::new(&source, (remaining > 0).then_some(remaining)));
                 if !quantities::apply(tx, &changes).await.map_err(db_err)? { return Err(invalid()); }
                 if remaining == 0 {
-                    inventory::notify_item_removed(outbox, source.clone());
+                    inventory::notifications::notify_item_removed(outbox, source.clone());
                 } else {
-                    inventory::notify_item_change(tx, &sde, outbox, source_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(remaining))) ]).await?;
+                    inventory::notifications::notify_item_change(tx, &sde, outbox, source_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(remaining))) ]).await?;
                 }
                 let now = crate::client::filetime_now();
                 let mut rows = Vec::with_capacity(quantities.len());
                 for (type_id, quantity) in quantities {
                     let id = transfers::insert(tx, type_id, recipient, destination_location, destination_flag, quantity).await.map_err(db_err)?;
                     receipt::insert(tx, receipt::RewardReceipt { item_id: id, character_id: recipient, crate_type_id: source.type_id, destination_location, destination_flag, opened_at: now }).await.map_err(db_err)?;
-                    inventory::notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(destination_location)), (crate::consts::IX_FLAG, Value::Int(i64::from(destination_flag))), (IX_STACK_SIZE, Value::Int(i64::from(quantity))) ]).await?;
+                    inventory::notifications::notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(destination_location)), (crate::consts::IX_FLAG, Value::Int(i64::from(destination_flag))), (IX_STACK_SIZE, Value::Int(i64::from(quantity))) ]).await?;
                     rows.push(Value::tuple([Value::Int(id), Value::Int(i64::from(type_id)), Value::Int(i64::from(quantity))]));
                 }
                 if stack_response { Ok(Value::tuple([Value::Int(i64::from(amount)), Value::Int(i64::from(amount))])) } else { Ok(Value::list(rows)) }

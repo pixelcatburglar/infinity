@@ -32,6 +32,7 @@ pub(in crate::services) async fn return_pending<X: Send>(tx: &(impl Executor + ?
 }
 
 pub(crate) async fn recover_pending_reloads(db: &Db, sde: &Arc<Sde>) -> Result<(), CallError> {
+    let _lock = crate::services::market::lock().await;
     for row in pending_reloads::all(db).await.map_err(db_err)? {
         let (reload_id, ship_id) = (row.reload_id, row.ship_id);
         db.transaction(

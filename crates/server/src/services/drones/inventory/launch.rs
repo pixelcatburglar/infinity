@@ -118,9 +118,9 @@ async fn launch_one(c: &mut Client, owner: i64, ship: i64, system: i64, id: i64,
                     change.push((IX_FLAG, Value::Int(i64::from(FLAG_DRONE_BAY))));
                     if !fresh.singleton { change.push((IX_SINGLETON, Value::Bool(false))); }
                 }
-                crate::services::inventory::notify_item_change(tx, &sde, outbox, id, change).await?;
+                crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, id, change).await?;
                 for &new_id in ids.iter().filter(|&&new_id| new_id != id) {
-                    crate::services::inventory::notify_item_change(tx, &sde, outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                    crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
                 }
                 Ok(ids)
             })

@@ -33,6 +33,7 @@
   - boarding a ship in space that someone else owns, and taking over its contents
   - wrecks, insurance payouts and killmails for an unpiloted ship destroyed in space; the ship and its contents are deleted
   - custom crate selection and special skill-bundle or fitting rewards: `CustomOpenCrate`, `GetCrateLocation`, `ClaimSkillBundle` and `ClaimFitting` are refused. The store does not sell crates. A crate whose contents are a skill bundle or a fitted ship cannot be previewed, and a crate whose contents are not known shows an empty preview.
+  - audit log secure containers: they work as ordinary containers, with no password, audit log or item locking, and saving their settings is refused
 - An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
 - Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100). Drones with no targeting range or scan resolution in the static data lock at once within control range.
 - The personal mining ledger starts with mining done after this version is installed.

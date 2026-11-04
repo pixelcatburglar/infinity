@@ -4,6 +4,7 @@
 //! the client's slash service. This module reads no database and does not
 //! implement localisation, data-derived names, or protocol identifiers.
 
+pub(crate) mod inventory;
 pub(crate) mod encoded_items;
 pub(crate) mod access_groups;
 pub(crate) mod bookmarks;
@@ -627,6 +628,8 @@ pub(crate) const MSG_CUSTOM_NOTIFY: &str = "CustomNotify";
 pub(crate) const MSG_CANNOT_APPLY_FREE_POINTS_DO_NOT_HAVE_SKILL: &str = "CannotApplyFreePointsDoNotHaveSkill";
 /// Client message `InjectorSkillPointLimitReached`.
 pub(crate) const MSG_INJECTOR_SKILL_POINT_LIMIT_REACHED: &str = "InjectorSkillPointLimitReached";
+/// Client inventory refusal key used by `invItemFunctions.TrashInvItems`.
+pub(crate) const MSG_CANNOT_TRASH_ITEM: &str = "CannotTrashItem";
 /// Client kill-right refusal keys.
 pub(crate) const MSG_NO_VALID_KILL_RIGHT: &str = "NoValidKillRight";
 pub(crate) const MSG_KILL_RIGHT_EXPIRED: &str = "KillRightExpired";

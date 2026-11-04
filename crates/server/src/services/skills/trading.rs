@@ -325,7 +325,7 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
                 }
             }
             let output = transfers::insert(tx, FULL_INJECTOR, char_id, location, flag, 1).await.map_err(db_err)?;
-            crate::services::inventory::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+            crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
             let changed: Vec<_> = selected.keys().copied().collect();
             super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &changed).await?;
             Ok(Value::None)
@@ -397,7 +397,7 @@ async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             let consumed = if split { qty } else { count * SMALL_DIVISOR as i32 };
             consume(tx, outbox, item, consumed).await?;
             let output = transfers::insert(tx, target, char_id, location, flag, count).await.map_err(db_err)?;
-            crate::services::inventory::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+            crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
             super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
             Ok(Value::None)
 }

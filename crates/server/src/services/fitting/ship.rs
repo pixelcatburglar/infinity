@@ -2,7 +2,7 @@
 //! Mirrors clientDogmaLocation.MakeShipActive and uses game items, characters and the SDE.
 //! Boarding preserves both hulls and their condition; foreign custody and structure access are unsupported.
 use crate::services::dogma::ship_state_core;
-use crate::services::inventory::notify_item_change;
+use crate::services::inventory::notifications::notify_item_change;
 use crate::services::{db_err, user_error, value_ids, Call, CallResult};
 use crate::dao::items::loading::ItemQuery;
 use crate::services::items::load_items;

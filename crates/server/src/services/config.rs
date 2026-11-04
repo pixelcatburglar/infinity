@@ -37,23 +37,41 @@ pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
     Ok(Value::tuple([header(&["ownerID", "ownerName", "typeID", "gender", "ownerNameID"]), Value::List(data)]))
 }
 
+/// Build an item-backed `evelocations` row in the client's seven-column descriptor order.
+///
+/// The location cache update is emitted only after the guarded mutation commits.
+pub(crate) fn location_row(id: i64, name: &str) -> Value {
+    Value::list([
+        Value::Int(id),
+        Value::unicode(name),
+        Value::None,
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::None,
+    ])
+}
+
 async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
-    // Static map objects resolve locally on the client; the server answers for
-    // anything else it knows (stations by name, player items such as ships).
     let rows = crate::dao::characters::social::locations(&c.db, ids).await.map_err(db_err)?;
-    let mut data: Vec<_> = rows.into_iter().map(|r| {
-        let name = r.name.as_deref().or_else(|| c.sde.types.get(r.type_id).and_then(|t| t.name.as_deref())).unwrap_or_default();
-        Value::list([Value::Int(r.id), Value::unicode(name), Value::None,
-            Value::Float(0.0), Value::Float(0.0), Value::Float(0.0), Value::None])
+    let mut data: Vec<_> = rows.iter().map(|r| {
+        let name = r.name.as_deref()
+            .or_else(|| c.sde.types.get(r.type_id).and_then(|t| t.name.as_deref()))
+            .unwrap_or_default();
+        location_row(r.id, name)
     }).collect();
     let keys: std::collections::HashSet<_> = ids.iter().copied().collect();
     data.extend(c.sde.map.systems().filter(|r| keys.contains(&r.solar_system_id)).map(|r| {
-        Value::list([Value::Int(r.solar_system_id), Value::unicode(r.name.as_deref().unwrap_or_default()),
-            Value::Int(r.solar_system_id), Value::Float(r.x.expect("solar system x is NULL")),
-            Value::Float(r.y.expect("solar system y is NULL")), Value::Float(r.z.expect("solar system z is NULL")), Value::None])
+        Value::list([
+            Value::Int(r.solar_system_id),
+            Value::unicode(r.name.as_deref().unwrap_or_default()),
+            Value::Int(r.solar_system_id),
+            Value::Float(r.x.expect("solar system x is NULL")),
+            Value::Float(r.y.expect("solar system y is NULL")),
+            Value::Float(r.z.expect("solar system z is NULL")),
+            Value::None,
+        ])
     }));
-    // The client files these into cfg.evelocations positionally with its own descriptor
-    // (eveCfg.GetLocationRowDescriptor), so the columns must match it exactly.
     Ok(Value::tuple([header(&["locationID", "locationName", "solarSystemID", "x", "y", "z", "locationNameID"]), Value::List(data)]))
 }
 

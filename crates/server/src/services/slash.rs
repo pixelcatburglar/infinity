@@ -213,6 +213,7 @@ async fn create(c: &mut Client, args: &[String]) -> Result<String, CallError> {
         (None, Some(ship)) => (ship, FLAG_CARGO),
         _ => return Err(slash_error(messages::gm::GM_NOWHERE_TO_PUT_ITEM.into())),
     };
+    let _lock = crate::services::market::lock().await;
     let mut outbox = crate::db::outbox::Outbox::default();
     super::items::deposit(&c.db, &c.sde, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
     crate::db::outbox::dispatch_client((), outbox, c)?;

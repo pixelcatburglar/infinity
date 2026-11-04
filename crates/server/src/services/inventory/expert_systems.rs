@@ -21,7 +21,7 @@ use crate::messages;
 use crate::sde::Sde;
 use crate::services::{db_err, identity::Identity, notify_error};
 
-use super::{notify_item_change, notify_item_removed};
+use super::notifications::{notify_item_change, notify_item_removed};
 use super::reachability::{Endpoint, Reachability};
 
 /// Validate and consume one expert-system item in the caller's transaction.
@@ -53,7 +53,7 @@ pub(in crate::services) async fn validate_and_consume<X: Send>(
 
     let endpoint = Endpoint { location: item.location_id, flag: item.flag_id };
     reachability.check(ex, sde, endpoint).await?;
-    if let Some(allowed) = super::custody_allowed(ex, sde, item.item_id, identity.char_id, identity.station_id, true).await? {
+    if let Some(allowed) = super::access::custody_allowed(ex, sde, item.item_id, identity.char_id, identity.station_id, true).await? {
         if !allowed {
             return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE));
         }

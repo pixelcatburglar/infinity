@@ -60,7 +60,7 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
                     || !drones::abandon(tx, id, owner, system).await.map_err(db_err)? {
                     return Err(refuse());
                 }
-                crate::services::inventory::notify_item_change(tx, &sde, outbox, id,
+                crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, id,
                     vec![(crate::consts::IX_OWNER_ID, Value::Int(owner))]).await?;
                 Ok(())
             })
