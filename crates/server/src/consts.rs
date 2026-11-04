@@ -78,6 +78,8 @@ pub const SKILL_ACCOUNTING: i32 = 16622;
 pub const TYPE_PLASTIC_WRAP: i32 = 3468;
 /// SDE invTypes: Character (Gallente), used for player owners.
 pub const TYPE_CHARACTER: i32 = 1373;
+/// SDE invTypes: Faction.
+pub const TYPE_FACTION: i64 = 30;
 /// SDE invTypes: Solar System.
 pub const TYPE_SOLAR_SYSTEM: i32 = 5;
 /// SDE invTypes: Capsule.
