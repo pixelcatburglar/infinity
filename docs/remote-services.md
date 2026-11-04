@@ -292,3 +292,41 @@ Single-track login campaigns are not open. Both the campaign-state query and cla
 | bannedwords | check_search_words_allowed | handled | `crates/server/src/services/bannedwords.rs` |
 
 Search-word checks use the captured retail moderation rules. Missing rules and unsupported or failing regular expressions refuse the request rather than bypassing moderation. Resource Wars channel creation has no handler: its instance gate is closed and the channel lifecycle is not modeled.
+
+## Ship SKINs
+
+| service | method | status | handler file |
+|---|---|---|---|
+| shipCosmeticsMgr | ApplySkinToShip | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | GiveSkin | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | GMExpireSkinLicense | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | RemoveSkin | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | ActivateSkinLicense | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | ActivateStructureSkinR | out-of-scope | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | GetFirstPartySkinData | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | GetLicencedSkins | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+| shipCosmeticsMgr | GetLicencedSkinsForShipType | handled | `crates/server/src/services/ship_cosmetics_mgr.rs` |
+
+The handled calls cover ordinary first-party non-single-use licenses and compatible ships, subject to ownership, reachability, regional and role checks where applicable. Structure activation is deferred and explicitly refused without consumption, not declared permanently unsupported. GML administration is current-character only.
+
+| gateway payload | kind | status | handler file |
+|---|---|---|---|
+| `eve_public.cosmetic.ship.api.GetRequest` | request | handled | `crates/server/src/gateway/ship_cosmetics.rs` |
+| `eve_public.cosmetic.ship.api.GetAllInBubbleRequest` | request | handled | `crates/server/src/gateway/ship_cosmetics.rs` |
+| `eve_public.cosmetic.ship.api.SetNotice` | notice | handled | `crates/server/src/gateway/ship_cosmetics.rs` |
+| `eve_public.cosmetic.ship.api.SetAllInBubbleNotice` | notice | handled | `crates/server/src/gateway/ship_cosmetics.rs` |
+
+Get returns 200 with explicit `no_skin` for a valid unskinned ship, 404 with no payload for an absent or invisible ship, and 500 for a missing actor or location. GetAll returns 200 with an empty `states` list for an empty valid scope. SetAll carries the repeated field `state`, not GetAll's `states`. Snapshots and post-commit updates use the same visibility facts as reads, including cloak visibility.
+
+## Gateway transport
+
+| service | method | status | handler file |
+|---|---|---|---|
+| eve_public.gateway.Requests | Send | handled | `crates/server/src/gateway/transport.rs` |
+| eve_public.gateway.Notices | Consume | handled | `crates/server/src/gateway/transport.rs` |
+| eve_public.gateway.Events | Publish | handled | `crates/server/src/gateway/transport.rs` |
+| eve_public.gateway.Requests | Ping | handled | `crates/server/src/gateway/transport.rs` |
+| eve_public.gateway.Notices | Ping | handled | `crates/server/src/gateway/transport.rs` |
+| eve_public.gateway.Events | Ping | handled | `crates/server/src/gateway/transport.rs` |
+
+Gateway transport uses HTTP/2 gRPC; request routing is in `crates/server/src/gateway/requests.rs`, and event handling is in `crates/server/src/gateway/events.rs`. Unclaimed client events are ignored with debug logging; client completion messages do not grant progress or rewards. Notices use the native target oneof for application, user, character, corporation, alliance or solar system, matched against current identity; application identifiers are 16-byte UUIDs. Replaced, closed or slow stream generations are cleaned up without unregistering a replacement. Delivery is best-effort after commit, with no durable replay; reconnect and Get recover committed state. Ownership lookup is not token authentication, so the gateway needs a trusted network or authentication front door.
