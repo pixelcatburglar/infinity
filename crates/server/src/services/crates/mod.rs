@@ -1,9 +1,10 @@
 //! Crate service routing for eve/client/script/ui/crate/controller.py and
 //! recruitment_crate_controller.py. Previews use the startup catalogue and
-//! authenticated inventory; opening and claiming rewards are not supported.
+//! authenticated inventory; round-one direct-list opening is transactional.
 
 mod catalogue;
 mod crate_service;
+mod opening;
 
 use crate::client::Client;
 use crate::services::{Call, CallResult};

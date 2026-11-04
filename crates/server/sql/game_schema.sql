@@ -2,6 +2,16 @@
 -- the server at startup. Static data lives in schema `sde` (sde_typed.sql).
 
 CREATE SCHEMA IF NOT EXISTS game;
+-- dao/items/crates: durable direct-list opening receipts.
+CREATE TABLE IF NOT EXISTS game.crate_rewards (
+    item_id bigint PRIMARY KEY,
+    character_id bigint NOT NULL,
+    crate_type_id integer NOT NULL,
+    destination_location bigint NOT NULL,
+    destination_flag integer NOT NULL,
+    opened_at bigint NOT NULL,
+    acknowledged_at bigint
+);
 -- dao/map_telemetry: immutable typed event receipts and cumulative arrival visits.
 -- Event kinds: 1 jump, 2 ship, 3 NPC, 4 pod. Sources: 1 jump occurrence,
 -- 2 killmail, 3 NPC occurrence, 4 unpiloted ship.

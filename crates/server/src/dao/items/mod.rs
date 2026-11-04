@@ -9,6 +9,7 @@
 pub(crate) mod brain;
 pub(crate) mod boarding;
 pub(crate) mod charges;
+pub(crate) mod crates;
 pub(crate) mod clones;
 pub(crate) mod combat;
 pub(crate) mod creation;
