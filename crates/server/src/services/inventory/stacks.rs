@@ -2,7 +2,7 @@
 //! `eve/client/script/environment/invCache.py`. Uses `game.items`, trade
 //! reservations, corporate custody and SDE data; staged trade items are not mutable.
 
-use super::access::{corporate_custody, custody_allowed, may_take_corp_hangar, Container};
+use super::access::{custody_allowed, may_take_corp_hangar, Container};
 use super::notifications::{notify_corp_item_change, notify_item_change, notify_item_removed};
 use super::reachability::{Endpoint, Reachability};
 use crate::client::Client;
@@ -187,43 +187,4 @@ pub(in crate::services) async fn split_stack(db: &(impl Executor + ?Sized), item
     }
     inventory_dao::split(db, item, quantity, owner, location, flag, singleton).await.map_err(db_err)?
         .ok_or_else(|| notify_error(messages::STACK_CANNOT_BE_SPLIT))
-}
-
-
-/// Apply the same ownership and active-ship policy as TrashItems.
-pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallError> {
-    let _lock = super::super::market::lock().await;
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let ship = c.session.int("shipid");
-    let db = c.db.clone();
-    let sde = c.sde.clone();
-    let ids = ids.to_vec();
-    db.transaction(
-        move |tx, outbox: &mut Outbox| {
-            let ids = ids.clone();
-            let sde = sde.clone();
-            Box::pin(async move {
-                if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
-                    return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
-                }
-                if crate::dao::industry::has_active_blueprint_job(tx, &ids).await.map_err(db_err)? {
-                    return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
-                }
-                let mut items = load_items(tx, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
-                items.sort_by_key(|item| item.item_id);
-                for item in items {
-                    if corporate_custody(tx, Some(&sde), item.item_id).await?.is_some() {
-                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-                    }
-                    if item.owner_id != char_id { continue; }
-                    if Some(item.item_id) != ship {
-                        inventory_dao::delete(tx, item.item_id).await.map_err(db_err)?;
-                        notify_item_removed(outbox, item);
-                    }
-                }
-                Ok(())
-            })
-        },
-        |value, outbox| async move { dispatch_client(value, outbox, c) },
-    ).await
 }

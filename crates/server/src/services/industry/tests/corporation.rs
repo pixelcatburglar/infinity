@@ -314,7 +314,8 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                     assert_eq!(fingerprint(&db, f).await, state);
                     assert!(client.outbox.is_empty());
 
-                    assert_active(crate::services::inventory::stacks::trash_items(&mut client, &[blueprint]).await);
+                    let location = crate::services::inventory::trashing::resolve_location(&client, blueprint).await.unwrap();
+                    assert_active(crate::services::inventory::trashing::trash_items(&mut client, &[blueprint], location).await);
                     assert_eq!(fingerprint(&db, f).await, state);
                     assert!(client.outbox.is_empty());
 
@@ -356,7 +357,8 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                 client.outbox.clear();
                 let destination = crate::services::inventory::access::Container::Item(f.office);
                 assert!(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, blueprint, Some(f.office), Some(output.flag_id), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
-                assert!(crate::services::inventory::stacks::trash_items(&mut client, &[blueprint]).await.is_err());
+                let location = crate::services::inventory::trashing::resolve_location(&client, blueprint).await.unwrap();
+                assert!(crate::services::inventory::trashing::trash_items(&mut client, &[blueprint], location).await.is_err());
                 let args = [Value::list([keyval([
                     ("stationID", Value::Int(f.station)), ("typeID", Value::Int(i64::from(f.bp))),
                     ("itemID", Value::Int(blueprint)), ("price", Value::Float(1.0)), ("quantity", Value::Int(1)),

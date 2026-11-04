@@ -3,13 +3,14 @@
 //! container types retain the existing generic binding; direct-trade PLEX is refused.
 
 use super::{CONTAINER_CORP_MARKET, CONTAINER_HANGAR, INVENTORY};
+use super::stacks::{mutation_corporate, split_stack};
 use super::crystals;
 use super::access::may_view_corp_hangar;
 use super::notifications::{notify_corp_item_change, notify_item_change};
-use super::stacks::{mutation_corporate, split_stack, trash_items};
+use super::{labels, trashing};
 use crate::client::Client;
 use crate::consts::{FLAG_CORP_DELIVERIES, IX_LOCATION_ID, IX_STACK_SIZE};
-use crate::dao::items::{inventory as inventory_dao, loading::{Item, ItemQuery}};
+use crate::dao::items::loading::{Item, ItemQuery};
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
 use crate::services::{db_err, items::load_items, notify_error, value_id_list, Call, CallError, CallResult};
@@ -99,32 +100,23 @@ pub(super) async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             ).await;
             return Some(r);
         }
-        // TrashItems(itemIDs, locationID) -> [error messages]
         "TrashItems" => {
             let ids = value_id_list(call.args.first());
-            let r = trash_items(c, &ids).await.map(|()| Value::list([]));
-            return Some(r);
+            let Some(location) = call.args.get(1).and_then(Value::as_int) else {
+                return Some(Err(notify_error(messages::inventory::ITEM_WRONG_LOCATION)));
+            };
+            return Some(match trashing::trash_items(c, &ids, location).await {
+                Ok(value) => Ok(value),
+                Err(error) => trashing::broker_refusal_key(&error)
+                    .map(|key| Ok(Value::list([Value::unicode(key)])))
+                    .unwrap_or(Err(error)),
+            });
         }
         // SetLabel(itemID, name): ship and container names.
         "SetLabel" => {
-            let _lock = super::super::market::lock().await;
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let name = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            let db = c.db.clone();
-            let r = db.transaction(
-                move |tx, _outbox: &mut Outbox| {
-                    let name = name.clone();
-                    Box::pin(async move {
-                        if !crate::dao::trades::reserved(tx, &[item_id]).await.map_err(db_err)?.is_empty() {
-                            return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
-                        }
-                        inventory_dao::rename(tx, item_id, &name, char_id).await.map_err(db_err)?;
-                        Ok(Value::None)
-                    })
-                },
-                |value, outbox| async move { dispatch_client(value, outbox, c) },
-            ).await;
-            return Some(r);
+            return Some(labels::set_label(c, item_id, name).await);
         }
         "WithdrawPlexFromVault" if call.args.get(2).and_then(Value::as_text).is_some_and(|v| v == "VaultToDirectTrade") => {
             return Some(Err(notify_error(messages::trade::TRADE_PLEX_UNSUPPORTED)));

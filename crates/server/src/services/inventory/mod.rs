@@ -17,6 +17,8 @@ pub(in crate::services) mod reachability;
 pub(crate) mod access;
 pub(in crate::services) mod notifications;
 pub(crate) mod stacks;
+pub(crate) mod labels;
+pub(crate) mod trashing;
 mod inv_broker;
 mod crystals;
 mod inv_inventory;

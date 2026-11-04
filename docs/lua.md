@@ -402,8 +402,9 @@ Mutators require the live invocation context as their first argument:
   merges a stack and returns nil.
 - `dao.items.move(ctx, item, container_item, flag_or_nil, quantity_or_nil)`
   returns the destination item ID or nil.
-- `dao.items.delete(ctx, item)` applies the caller's existing trash ownership
-  and active-ship policy and returns nil.
+- `dao.items.delete(ctx, item)` applies the caller's trash ownership and
+  active-ship policy; returns nil when deleted and raises `CannotTrashItem`
+  when refused.
 - `dao.mail.send(ctx, recipient_ids, title, body, list_or_nil, corp_or_nil,
   reply_to_or_nil, forwarded_from_or_nil)` returns the message ID. Mailing
   lists remain unsupported; corporation mail follows the native service policy.

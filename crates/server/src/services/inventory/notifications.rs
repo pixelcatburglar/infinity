@@ -46,3 +46,12 @@ pub(in crate::services) fn notify_item_removed<X: Send>(outbox: &mut Outbox<X>, 
     let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]);
     outbox.notify_client("OnItemChange", vec![gone.row(), change, Value::None]);
 }
+
+/// Queue deletion to corporate viewers using the item's captured pre-delete location.
+pub(in crate::services) async fn notify_corp_item_removed<X: Send>(
+    ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: &Item,
+) -> Result<(), CallError> {
+    let old = item.location_id;
+    let gone = Item { location_id: LOCATION_JUNKYARD, ..item.clone() };
+    notify_corp_item_change(ex, outbox, &gone, vec![(IX_LOCATION_ID, Value::Int(old))]).await
+}
