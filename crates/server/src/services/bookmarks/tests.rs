@@ -69,3 +69,32 @@ fn stored_creator_and_unicode_wire_rows_roundtrip() {
     ] { assert_eq!(crate::services::value_field(&b, key), Some(&value)); }
     for row in [f, s, b] { assert_eq!(marshal::loads(&marshal::dumps(&row)).unwrap(), row); }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with imported SDE"]
+async fn beyonce_bookmark_routes_create_once_and_validate_scan_results() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let owner = fixture::create(&db).await.unwrap();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let (mut client, _connection) = crate::services::tests::client(test_db.clone(), owner.character).await;
+        let args = [Value::Bool(true), Value::unicode("personal"), Value::unicode(""), Value::None, Value::None, Value::None, Value::None];
+        let row = rpc(&mut client, "accessGroupBookmarkMgr", "AddFolder", &args).await.unwrap();
+        let folder = crate::services::value_field(&row, "folderID").unwrap().as_int().unwrap();
+        let celestial = client.sde.map.all_celestials().find(|body| body.solar_system_id.is_some() && body.x.is_some() && body.y.is_some() && body.z.is_some()).unwrap();
+        let system = celestial.solar_system_id.unwrap();
+        let item = celestial.item_id;
+        client.world.system(system).await.unwrap();
+        client.session.apply(vec![("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
+        let result = rpc(&mut client, "beyonce", "BookmarkLocation", &[Value::Int(item), Value::Int(folder), Value::unicode("position"), Value::unicode(""), Value::None]).await.unwrap();
+        let rows = dao::bookmarks(&test_db, &[folder], i64::MIN).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(result.items().unwrap()[0].as_int(), Some(rows[0].bookmark_id));
+        assert!(rpc(&mut client, "beyonce", "BookmarkScanResult", &[Value::Int(system), Value::unicode("missing"), Value::unicode(""), Value::str("missing"), Value::Int(folder), Value::None]).await.is_err());
+        assert_eq!(dao::bookmarks(&test_db, &[folder], i64::MIN).await.unwrap().len(), 1);
+    }).await;
+    cleanup(&db, &[owner.character]).await;
+    fixture::cleanup(&db, owner).await.unwrap();
+    result.unwrap();
+}

@@ -4,14 +4,13 @@
 //! immediately evict previously cached folders from clients.
 mod access;
 mod access_group_bookmark_mgr;
-mod beyonce;
+pub(crate) mod beyonce;
 mod mutations;
 pub(crate) mod notifications;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
         "accessGroupBookmarkMgr" => access_group_bookmark_mgr::dispatch(c, call).await,
-        "beyonce" => beyonce::dispatch(c, call).await,
         _ => None,
     }
 }

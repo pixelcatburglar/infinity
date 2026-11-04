@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn cyno_jammer_state_is_none() {
+    let kwargs = Value::Dict(vec![]);
+    let call = Call { service: "sovDashboard", method: "GetCynoJammerState", args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+    assert_eq!(root(&call).unwrap().unwrap(), Value::None);
+}
+
+#[test]
 fn login_campaign_fixed_answers_do_not_match_other_calls() {
     let kwargs = Value::Dict(vec![]);
     for (service, method) in [

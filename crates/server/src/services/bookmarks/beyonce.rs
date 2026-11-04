@@ -1,10 +1,10 @@
-//! beyonce bookmark methods for `eve/client/script/ui/shared/bookmarks/bookmarkSvc.py`.
+//! Bookmark creation mechanisms for `eve/client/script/ui/shared/bookmarks/bookmarkSvc.py`.
 //! Uses bookmark tables and space state for personal and shared folders.
 //! Live location bookmarks use the system actor's sampled position.
 use super::*;
 /// beyonce `BookmarkLocation(itemID, folderID, name, comment, expiry, subfolderID=)`: something in
 /// space, or (the pilot's own ship) the spot they are at.
-async fn space_location(c: &Client, call: &Call<'_>) -> CallResult {
+pub(crate) async fn space_location(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let Some(system) = c.session.int("solarsystemid") else {
         return Err(CallError::User { msg: messages::MSG_BKM_MUST_BE_IN_FLIGHT.into(), dict: vec![] });
@@ -20,7 +20,7 @@ async fn space_location(c: &Client, call: &Call<'_>) -> CallResult {
 }
 
 /// beyonce `BookmarkScanResult(locationID, name, comment, resultID, folderID, expiry, subfolderID=)`.
-async fn scan_result(c: &Client, call: &Call<'_>) -> CallResult {
+pub(crate) async fn scan_result(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let system = call.args.first().and_then(|v| v.as_int()).or(c.session.int("solarsystemid2")).unwrap_or(0);
     let target = value_text(call.args.get(3), MAX_SCAN_RESULT_ID);
@@ -29,12 +29,4 @@ async fn scan_result(c: &Client, call: &Call<'_>) -> CallResult {
     };
     let folder = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0);
     mutations::add(c, me, folder, subfolder_arg(call, 6), None, Some(TYPE_SOLAR_SYSTEM), system, pos, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION), expiry(call, 5)?).await
-}
-
-pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    match call.method {
-        "BookmarkLocation" => Some(space_location(c, call).await),
-        "BookmarkScanResult" => Some(scan_result(c, call).await),
-        _ => None,
-    }
 }

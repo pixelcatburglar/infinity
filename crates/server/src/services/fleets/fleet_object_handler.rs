@@ -188,6 +188,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             };
             let pairs = session_pairs(Some(fleet_id), Some(&joined));
             set_own_session(c, &pairs);
+            if let Some(system) = c.session.int("solarsystemid") {
+                world.post(system, move |actor| space_state::observe(actor, system, me));
+            }
             info!("fleets: {me} joined fleet {fleet_id}");
             Ok(Value::None)
         }

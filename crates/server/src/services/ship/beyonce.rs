@@ -85,6 +85,14 @@ pub(crate) async fn warp_to_ball(
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let a = call.args;
     Some(match (call.service, call.method) {
+        ("beyonce", "BookmarkLocation") => super::super::bookmarks::beyonce::space_location(c, call).await,
+        ("beyonce", "BookmarkScanResult") => super::super::bookmarks::beyonce::scan_result(c, call).await,
+        // fleetSvc.py:GetFleetLocationAndInfo reads each member's pos as an (x, y, z) tuple.
+        ("beyonce", "GetFleetLocationAndInfo") => super::super::fleets::space_state::locations(c).await,
+        // michelle.py:GetFleetState caches the state; fleetSvc.py reads its targetTags.
+        ("beyonce", "GetFleetState") => super::super::fleets::space_state::get(c).await,
+        // menusvc.py:TagItem sends (itemID, tag); a None tag clears via OnFleetStateChange.
+        ("beyonce", "CmdFleetTagTarget") => super::super::fleets::space_state::tag(c, call).await,
         ("beyonce", "UpdateStateRequest") => send_state(c).await.map(|_| Value::None),
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];

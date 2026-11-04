@@ -251,6 +251,8 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {
         ("machoNet", "GetServiceInfo") => Ok(Value::Dict(vec![])),
         ("air_npe", "is_air_npe_enabled") => Ok(Value::Bool(false)),
+        // cynoJammerIcon.py treats None as no interference.
+        ("sovDashboard", "GetCynoJammerState") => Ok(Value::None),
 
         // menuFunctions.py:DecryptItem cannot open media without a supported source; refuse without consuming the item.
         ("encodedItems", "DecodeItem") => Err(notify_error(crate::messages::encoded_items::DECODE_UNAVAILABLE)),

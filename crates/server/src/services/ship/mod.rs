@@ -436,6 +436,9 @@ pub async fn send_state(c: &mut Client) -> Result<(), CallError> {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(()) };
     let set_state = c.world.observe(system, c.login.client_id, ship, c.destiny_tx.clone()).await.map_err(CallError::Internal)?;
     c.notify("DoDestinyUpdate", vec![Value::list([set_state]), Value::Bool(false)]);
+    if let Some(character) = c.session.int("charid") {
+        c.world.post(system, move |actor| super::fleets::space_state::observe(actor, system, character));
+    }
     Ok(())
 }
 
