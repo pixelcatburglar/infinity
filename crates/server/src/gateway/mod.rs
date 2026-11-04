@@ -20,6 +20,7 @@ mod career_goals;
 mod character_titles;
 mod characters;
 mod content;
+mod context;
 mod error;
 mod events;
 mod fallback;
@@ -29,12 +30,13 @@ mod message;
 mod plex;
 mod protocol;
 mod requests;
-mod resources;
 mod skill_plans;
 mod space_content;
 mod transport;
 
-use crate::db::Db;
+#[cfg(test)] mod tests;
+
+use crate::{config::Config, db::Db, space::World};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,6 +48,7 @@ use protocol::Notice;
 use transport::connection;
 
 /// Who sent a request.
+#[derive(Clone, Debug, Default)]
 pub struct Caller {
     pub user_id: Option<i64>,
     pub character_id: Option<i64>,
@@ -55,21 +58,20 @@ pub struct Caller {
 
 type NoticeTx = mpsc::UnboundedSender<Notice>;
 
-#[derive(Default)]
 pub struct Gateway {
-    pub db: Option<Db>,
-    /// Base URL of the content CDN, e.g. `http://127.0.0.1` (see crate::cdn).
-    pub cdn_url: String,
+    pub db: Db,
+    pub world: Arc<World>,
+    pub config: Arc<Config>,
     /// application instance uuid -> notice stream
     notice_streams: Mutex<HashMap<Vec<u8>, NoticeTx>>,
 }
-
 impl Gateway {
-    pub fn new(db: Db, cdn_url: String) -> Arc<Gateway> {
-        Arc::new(Gateway { db: Some(db), cdn_url, ..Default::default() })
+    pub fn new(db: Db, world: Arc<World>, config: Arc<Config>) -> Arc<Gateway> {
+        Arc::new(Gateway { db, world, config, notice_streams: Mutex::new(HashMap::new()) })
     }
-
 }
+
+
 
 pub async fn serve(bind: String, gw: Arc<Gateway>) -> Result<()> {
     handlers::validate()?;

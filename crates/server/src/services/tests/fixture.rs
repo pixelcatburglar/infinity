@@ -2,9 +2,9 @@
 use crate::db::{Db, Error};
 
 #[derive(Clone, Copy)]
-pub(in crate::services) struct Fixture { pub account: i64, pub character: i64 }
+pub(crate) struct Fixture { pub account: i64, pub character: i64 }
 
-pub(in crate::services) async fn create(db: &Db) -> Result<Fixture, Error> {
+pub(crate) async fn create(db: &Db) -> Result<Fixture, Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let seq: i64 = tx.query_one("SELECT nextval('game.accounts_user_id_seq') AS id", &[]).await?.get("id");
         let registered = crate::dao::accounts::authentication::register(tx, &format!("atomicity-{seq}"), b"fixture", 0, 0).await?;
@@ -58,7 +58,7 @@ pub(in crate::services) async fn remaining(db: &Db, f: Fixture) -> Result<i64, E
     Ok(db.query_one("SELECT (SELECT count(*) FROM game.accounts WHERE user_id = $1) + (SELECT count(*) FROM game.characters WHERE character_id = $2) + (SELECT count(*) FROM game.items WHERE owner_id = $2) + (SELECT count(*) FROM game.skills WHERE character_id = $2) + (SELECT count(*) FROM game.skill_queue WHERE character_id = $2) + (SELECT count(*) FROM game.agent_missions WHERE character_id = $2) + (SELECT count(*) FROM game.epic_arc_missions WHERE character_id = $2) AS remaining", &[&f.account, &f.character]).await?.get("remaining"))
 }
 
-pub(in crate::services) async fn cleanup(db: &Db, fixture: Fixture) -> Result<(), Error> {
+pub(crate) async fn cleanup(db: &Db, fixture: Fixture) -> Result<(), Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         tx.execute("DELETE FROM game.account_clone_grade_audit WHERE user_id = $1 OR actor_user_id = $1", &[&fixture.account]).await?;
         tx.execute("DELETE FROM game.jobs WHERE job_id = $1", &[&format!("subscription.clone_grade.expire:{}", fixture.account)]).await?;

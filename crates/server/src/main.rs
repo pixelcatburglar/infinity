@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
     let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
     scheduler::seed(&db).await?;
-    let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway.bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
+    let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway.bind.clone(), gateway::Gateway::new(db.clone(), world.clone(), cfg.clone()))));
     let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat.bind.clone(), hub.clone())));
     let upstream = images::Upstream::new(&cfg.images.upstream, cfg.images.upstream_timeout_secs);
     let upload_limit = cfg.images.upload_limit_bytes();

@@ -16,7 +16,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap());
         let mut categories = std::collections::HashMap::new();
-        let mut session = OnlineSession { character_id: virtual_char.id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+        let mut session = OnlineSession { character_id: virtual_char.id, user_id: None, session_id: virtual_char.id, ship_id: None, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
         for system in sde.map.systems() {
             session.system_id = Some(system.solar_system_id);
             if let Some(channel) = authority::system_channels(&sde, &session).first() {

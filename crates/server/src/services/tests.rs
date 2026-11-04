@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::Arc;
 
-pub(super) mod fixture;
+pub(crate) mod fixture;
 
 pub(super) fn database_message(error: &anyhow::Error) -> Option<&str> {
     match error.downcast_ref::<crate::db::Error>()? {

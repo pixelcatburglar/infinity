@@ -34,12 +34,13 @@ fn validates_metadata_and_fragmented_frames() {
 }
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn http2_rejects_bad_frames_and_unknown_methods() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        connection(sock, Arc::new(Gateway::default())).await.unwrap();
+        connection(sock, super::super::tests::gateway().await).await.unwrap();
     });
     let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
     let (mut client, conn) = h2::client::handshake(socket).await.unwrap();
@@ -59,13 +60,14 @@ async fn http2_rejects_bad_frames_and_unknown_methods() {
 }
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn event_stream_ends_without_per_event_responses() {
     use prost_reflect::{DynamicMessage, Value};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        connection(sock, Arc::new(Gateway::default())).await.unwrap();
+        connection(sock, super::super::tests::gateway().await).await.unwrap();
     });
     let (mut client, conn) = h2::client::handshake(tokio::net::TcpStream::connect(addr).await.unwrap()).await.unwrap();
     tokio::spawn(async move { conn.await.unwrap(); });
@@ -99,7 +101,7 @@ async fn status_for_frame(path: &str, metadata: Option<&str>, frame: Bytes) -> S
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        connection(socket, Arc::new(Gateway::default())).await.unwrap();
+        connection(socket, super::super::tests::gateway().await).await.unwrap();
     });
     let (mut client, driver) = h2::client::handshake(tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap(); });
@@ -113,6 +115,7 @@ async fn status_for_frame(path: &str, metadata: Option<&str>, frame: Bytes) -> S
 }
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn request_stream_rejects_invalid_envelopes_and_truncation() {
     let app = "00000000-0000-0000-0000-000000000002";
     assert_eq!(status_for_request_frame(None, Bytes::new()).await, "3");
@@ -139,6 +142,7 @@ async fn request_stream_rejects_invalid_envelopes_and_truncation() {
 }
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn event_stream_rejects_invalid_metadata_frames_and_envelopes() {
     let path = "http://localhost/eve_public.gateway.Events/Publish";
     let app = "00000000-0000-0000-0000-000000000002";
@@ -151,10 +155,11 @@ async fn event_stream_rejects_invalid_metadata_frames_and_envelopes() {
 }
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn consume_remains_ungated_and_drains() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let gateway = Arc::new(Gateway::default());
+    let gateway = super::super::tests::gateway().await;
     let server_gateway = gateway.clone();
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
@@ -179,13 +184,14 @@ async fn consume_remains_ungated_and_drains() {
 }
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn fragmented_request_stream_returns_correlated_responses() {
     use super::super::protocol::Response;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        connection(socket, Arc::new(Gateway::default())).await.unwrap();
+        connection(socket, super::super::tests::gateway().await).await.unwrap();
     });
     let (mut client, driver) = h2::client::handshake(tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap(); });

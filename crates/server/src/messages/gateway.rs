@@ -5,3 +5,4 @@ pub(crate) const INVALID_REQUEST: &str = "请求无效";
 pub(crate) const UNAUTHORIZED: &str = "未登录或未选择角色";
 pub(crate) const NOT_IMPLEMENTED: &str = "功能尚未实现";
 pub(crate) const INTERNAL_ERROR: &str = "服务器内部错误";
+pub(crate) const FORBIDDEN: &str = "无权执行此请求";

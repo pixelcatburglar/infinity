@@ -127,7 +127,7 @@ impl Client {
             let new_identity = Identity::of_client(self);
             if let Some(previous) = &old {
                 if new.as_ref().map(|s| s.character_id) != Some(previous.character_id) {
-                    presence::offline(&old_identity, &self.world, &self.chat);
+                    presence::offline_generation(&old_identity, &self.world, &self.chat, Some(previous.session_id));
                 }
             }
             if let Some(current) = new {
@@ -293,9 +293,9 @@ impl Client {
         }
         let identity = Identity::of_client(self);
         let system = self.session.int("solarsystemid");
-        let world = &self.world;
         let client_id = self.login.client_id;
-        presence::leave(&identity, &self.db, world, &self.chat, &self.sde, system,
+        let world = &self.world;
+        presence::leave(&identity, &self.db, world, &self.chat, &self.sde, system, Some(self.session.sid),
             move || world.unobserve(client_id)).await
     }
 

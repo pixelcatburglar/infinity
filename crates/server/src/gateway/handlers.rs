@@ -2,7 +2,7 @@
 //! Uses descriptors, CDN data and DAO-backed handlers; unknown requests retain
 //! the existing fallback behavior and do not claim future feature methods.
 use prost_reflect::DynamicMessage;
-use super::{Gateway, Caller, achievements, character_titles, space_content, career_goals, insurgency, characters, plex, skill_plans, error::GatewayError, message::{message, response_name}};
+use super::{context::HandlerContext, achievements, character_titles, space_content, career_goals, insurgency, characters, plex, skill_plans, error::GatewayError, message::{message, response_name}};
 
 #[derive(Clone, Copy)]
 enum Route {
@@ -51,19 +51,19 @@ pub(super) fn validate() -> anyhow::Result<()> {
 
 pub(super) enum Dispatch { Unclaimed, Claimed(Result<DynamicMessage, GatewayError>) }
 
-pub(super) async fn handle(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> Dispatch {
+pub(super) async fn handle(ctx: &HandlerContext<'_>, name: &str, req: &DynamicMessage) -> Dispatch {
     let Some((_, route)) = CLAIMS.iter().find(|(claim, _)| *claim == name) else { return Dispatch::Unclaimed };
     let result = match route {
-        Route::AchievementDefinition => achievements::definition::handle(gw, name).map_err(GatewayError::Internal),
-        Route::CharacterTitleDefinition => character_titles::definition::handle(gw, name).map_err(GatewayError::Internal),
-        Route::SpaceContent => space_content::handle(gw, name).map_err(GatewayError::Internal),
+        Route::AchievementDefinition => achievements::definition::handle(ctx, name).map_err(GatewayError::Internal),
+        Route::CharacterTitleDefinition => character_titles::definition::handle(ctx, name).map_err(GatewayError::Internal),
+        Route::SpaceContent => space_content::handle(ctx, name).map_err(GatewayError::Internal),
         Route::CareerGoalDefinitions => career_goals::career_goal_definitions().map_err(GatewayError::Internal),
         Route::CareerGoalStates => career_goals::career_goal_states().map_err(GatewayError::Internal),
         Route::Corruption => insurgency::corruption::handle(name).map_err(GatewayError::Internal),
         Route::Suppression => insurgency::suppression::handle(name).map_err(GatewayError::Internal),
-        Route::CharacterNamesByUser => characters::names_by_user(gw, caller).await,
-        Route::PlexBalance => plex::plex_balance(gw, caller).await,
-        Route::PersonalSkillPlan => skill_plans::personal::skill_plan(gw, caller, name, req).await,
+        Route::CharacterNamesByUser => characters::names_by_user(ctx).await,
+        Route::PlexBalance => plex::plex_balance(ctx).await,
+        Route::PersonalSkillPlan => skill_plans::personal::skill_plan(ctx, name, req).await,
     };
     Dispatch::Claimed(result)
 }

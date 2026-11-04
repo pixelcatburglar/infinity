@@ -1,11 +1,11 @@
 //! Personal plans for `requestsMessenger.py:create` and `requestsMessenger.py:get_all`.
-//! Uses the skills plan DAO and descriptors, not World; guarded missing-row
-//! refusals and transaction-based activation are not implemented here.
+//! Uses the skills plan DAO and descriptors; guarded ownership and activation
+//! are enforced by the gateway and DAO transaction boundaries.
 use anyhow::Result;
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage, Value as PV};
 use crate::dao::skills::plans;
-use super::super::{Gateway, Caller, resources::db, message::{UUID_LEN, new_uuid, msg_field, str_field, identifier, child, set, response_for}};
+use super::super::{context::HandlerContext, message::{UUID_LEN, new_uuid, msg_field, str_field, identifier, child, set, response_for}};
 use super::super::error::{GatewayError, FailureCode};
 
 /// `skill_plan.uuid` of a request.
@@ -14,17 +14,17 @@ fn plan_id(req: &DynamicMessage) -> Option<Vec<u8>> {
 }
 
 /// (skill type IDs, levels) of repeated `eve_public.skill.plan.SkillRequirement`.
-fn requirements(m: &DynamicMessage, field: &str) -> (Vec<i32>, Vec<i32>) {
+fn requirements(m: &DynamicMessage, field: &str) -> Option<(Vec<i32>, Vec<i32>)> {
     let (mut skills, mut levels) = (vec![], vec![]);
     if let Some(list) = m.get_field_by_name(field) {
-        for r in list.as_list().unwrap_or_default().iter().filter_map(|v| v.as_message()) {
-            let skill = msg_field(r, "skill_type").and_then(|t| t.get_field_by_name("sequential")?.as_u64()).unwrap_or(0);
-            let level = r.get_field_by_name("level").and_then(|v| v.as_u32()).unwrap_or(0);
+        for r in list.as_list()?.iter().filter_map(|v| v.as_message()) {
+            let skill = msg_field(r, "skill_type").and_then(|t| t.get_field_by_name("sequential")?.as_u64()).filter(|id| *id > 0 && *id <= i32::MAX as u64)?;
+            let level = r.get_field_by_name("level").and_then(|v| v.as_u32()).filter(|level| (1..=5).contains(level))?;
             skills.push(skill as i32);
             levels.push(level as i32);
         }
     }
-    (skills, levels)
+    Some((skills, levels))
 }
 
 /// An `eve_public.skill.plan.Attributes` for `desc.field`.
@@ -52,18 +52,21 @@ fn plan_identifier(desc: &MessageDescriptor, field: &str, id: Vec<u8>) -> Result
 }
 
 
-pub(in crate::gateway) async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> std::result::Result<DynamicMessage, GatewayError> {
+pub(in crate::gateway) async fn skill_plan(ctx: &HandlerContext<'_>, name: &str, req: &DynamicMessage) -> std::result::Result<DynamicMessage, GatewayError> {
     let invalid = || GatewayError::refusal(FailureCode::BadRequest, crate::messages::gateway::INVALID_REQUEST);
-    let me = caller.character_id.ok_or_else(|| GatewayError::refusal(FailureCode::Unauthorized, crate::messages::gateway::UNAUTHORIZED))?;
-    let db = db(gw).map_err(GatewayError::Internal)?;
+    let me = ctx.require_character()?.char_id;
+    let db = ctx.db;
     let mut rsp = response_for(name).map_err(GatewayError::Internal)?;
     let desc = rsp.descriptor();
     let method = name.rsplit('.').next().unwrap_or_default();
-    let id = plan_id(req);
+    let id = match plan_id(req) {
+        Some(id) if id.len() != UUID_LEN => return Err(GatewayError::refusal(FailureCode::PreconditionFailed, crate::messages::gateway::INVALID_REQUEST)),
+        id => id,
+    };
     match method {
         "CreateRequest" => {
             let plan = msg_field(req, "skill_plan").ok_or_else(invalid)?;
-            let (skills, levels) = requirements(&plan, "skill_requirements");
+            let (skills, levels) = requirements(&plan, "skill_requirements").ok_or_else(|| GatewayError::refusal(FailureCode::PreconditionFailed, crate::messages::gateway::INVALID_REQUEST))?;
             let new = new_uuid();
             plans::create(db, &new, me, &str_field(&plan, "name"), &str_field(&plan, "description"), &skills, &levels).await?;
             let value = plan_identifier(&desc, "skill_plan", new).map_err(GatewayError::Internal)?;
@@ -77,10 +80,9 @@ pub(in crate::gateway) async fn skill_plan(gw: &Gateway, caller: &Caller, name: 
         "GetRequest" | "GetSharedRequest" => {
             let owner = if method == "GetRequest" { Some(me) } else { None };
             let row = plans::get(db, &id.ok_or_else(invalid)?, owner).await?;
-            if let Some(row) = row {
-                let value = plan_attributes(&desc, "skill_plan", &row).map_err(GatewayError::Internal)?;
-                set(&mut rsp, "skill_plan", PV::Message(value)).map_err(GatewayError::Internal)?;
-            }
+            let row = row.ok_or_else(|| GatewayError::refusal(FailureCode::NotFound, crate::messages::gateway::INVALID_REQUEST))?;
+            let value = plan_attributes(&desc, "skill_plan", &row).map_err(GatewayError::Internal)?;
+            set(&mut rsp, "skill_plan", PV::Message(value)).map_err(GatewayError::Internal)?;
         }
         "GetActiveRequest" => {
             let row = plans::active(db, me).await?;
@@ -92,17 +94,33 @@ pub(in crate::gateway) async fn skill_plan(gw: &Gateway, caller: &Caller, name: 
                 set(&mut rsp, "skill_plan_info", PV::Message(value)).map_err(GatewayError::Internal)?;
             }
         }
-        "SetActiveRequest" => { plans::set_active(db, me, &id.unwrap_or_default()).await?; }
-        "DeleteRequest" => { plans::delete(db, me, &id.ok_or_else(invalid)?).await?; }
+        "SetActiveRequest" => {
+            let plan_id = id.ok_or_else(invalid)?;
+            let activated = db.transaction(|tx, _: &mut crate::db::outbox::Outbox| {
+                let plan_id = plan_id.clone();
+                Box::pin(async move { plans::activate(tx, me, &plan_id).await })
+            }, |value, _| async move { Ok(value) }).await?;
+            if !activated {
+                return Err(GatewayError::refusal(FailureCode::NotFound, crate::messages::gateway::INVALID_REQUEST));
+            }
+        }
+        "DeleteRequest" => {
+            let plan_id = id.ok_or_else(invalid)?;
+            if plans::delete(db, me, &plan_id).await? != 1 { return Err(GatewayError::refusal(FailureCode::NotFound, crate::messages::gateway::INVALID_REQUEST)); }
+        }
         "SetNameRequest" | "SetDescriptionRequest" => {
             let (field, column) = if method == "SetNameRequest" { (plans::Field::Name, "name") } else { (plans::Field::Description, "description") };
-            plans::set_field(db, me, &id.ok_or_else(invalid)?, field, &str_field(req, column)).await?;
+            let plan_id = id.ok_or_else(invalid)?;
+            if plans::set_field(db, me, &plan_id, field, &str_field(req, column)).await? != 1 { return Err(GatewayError::refusal(FailureCode::NotFound, crate::messages::gateway::INVALID_REQUEST)); }
         }
         "SetSkillRequirementsRequest" => {
-            let (skills, levels) = requirements(req, "requirements");
-            plans::set_requirements(db, me, &id.ok_or_else(invalid)?, &skills, &levels).await?;
+            let (skills, levels) = requirements(req, "requirements").ok_or_else(|| GatewayError::refusal(FailureCode::PreconditionFailed, crate::messages::gateway::INVALID_REQUEST))?;
+            let plan_id = id.ok_or_else(invalid)?;
+            if plans::set_requirements(db, me, &plan_id, &skills, &levels).await? != 1 { return Err(GatewayError::refusal(FailureCode::NotFound, crate::messages::gateway::INVALID_REQUEST)); }
         }
-        _ => unreachable!("router only claims known plan methods"),
+        _ => return Err(invalid()),
     }
     Ok(rsp)
 }
+#[cfg(test)]
+mod tests;

@@ -4,7 +4,7 @@ use prost_reflect::Value as PV;
 
 #[test]
 fn defaults_say_absent_and_echo_ids() {
-    let caller = Caller { user_id: Some(1), character_id: Some(90000001) };
+    let caller = Caller { user_id: Some(1), character_id: Some(90000001), ..Default::default() };
     let mut m = response_for("eve_public.matrix.api.GetEquippedRequest").unwrap();
     let ids = known_ids(&m, &caller);
     fill_defaults(&mut m, 4, &ids);

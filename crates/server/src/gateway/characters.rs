@@ -1,16 +1,16 @@
 //! Character names for `character_pb2.py:GetNamesByUserRequest`.
 //! Reads character names through the characters persistence DAO and descriptors,
 //! not World; only the caller's account is queried.
-use super::error::{GatewayError, FailureCode};
+use super::error::GatewayError;
 use prost_reflect::{DynamicMessage, ReflectMessage, Value as PV};
 use crate::dao::characters::persistence;
-use super::{Gateway, Caller, resources::db, message::{response_for, child, identifier, set}};
+use super::{context::HandlerContext, message::{response_for, child, identifier, set}};
 
 /// The account's characters (character rename search).
-pub(super) async fn names_by_user(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage, GatewayError> {
+pub(super) async fn names_by_user(ctx: &HandlerContext<'_>) -> Result<DynamicMessage, GatewayError> {
     let mut rsp = response_for("eve_public.character.GetNamesByUserRequest").map_err(GatewayError::Internal)?;
-    let user = caller.user_id.ok_or_else(|| GatewayError::refusal(FailureCode::Unauthorized, crate::messages::gateway::UNAUTHORIZED))?;
-    let rows = persistence::names(db(gw).map_err(GatewayError::Internal)?, user).await?;
+    let user = ctx.require_user()?;
+    let rows = persistence::names(ctx.db, user).await?;
     let mut out = vec![];
     for r in rows {
         let mut entry = child(&rsp.descriptor(), "characters").map_err(GatewayError::Internal)?;

@@ -3,8 +3,8 @@
 //! live map state.
 use anyhow::Result;
 use prost_reflect::DynamicMessage;
-use super::{Gateway, content::checkpoint};
+use super::{context::HandlerContext, content::checkpoint};
 
-pub(super) fn handle(gw: &Gateway, name: &str) -> Result<DynamicMessage> {
-    checkpoint(gw, name, "maptags")
+pub(super) fn handle(ctx: &HandlerContext<'_>, name: &str) -> Result<DynamicMessage> {
+    checkpoint(ctx, name, "maptags")
 }

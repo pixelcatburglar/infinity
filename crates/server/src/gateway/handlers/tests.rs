@@ -1,10 +1,11 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn exact_claims_and_neighboring_requests() {
     validate().unwrap();
-    let gw = Gateway::default();
-    let caller = Caller { user_id: None, character_id: None };
+    let gw = super::super::tests::gateway().await;
+    let context = HandlerContext::for_request(&gw, super::super::Caller::default()).await.unwrap();
     assert_eq!(CLAIMS.len(), 19);
     let expected = [
         "eve_public.achievement.definition.api.cdn.GetLatestRequest",
@@ -30,10 +31,10 @@ async fn exact_claims_and_neighboring_requests() {
     for name in expected { assert!(CLAIMS.iter().any(|(claim, _)| *claim == name), "{name}"); }
     for (name, _) in CLAIMS {
         let req = DynamicMessage::new(message(name).unwrap());
-        assert!(matches!(handle(&gw, &caller, name, &req).await, Dispatch::Claimed(_)), "{name}");
+        assert!(matches!(handle(&context, name, &req).await, Dispatch::Claimed(_)), "{name}");
     }
     let req = DynamicMessage::new(message(CLAIMS[0].0).unwrap());
     for name in ["eve_public.character.skill.plan.FutureRequest", "eve_public.character.skill.plan.milestone.GetRequest", "eve_public.achievement.api.FutureRequest", "eve_public.character.FutureRequest"] {
-        assert!(matches!(handle(&gw, &caller, name, &req).await, Dispatch::Unclaimed));
+        assert!(matches!(handle(&context, name, &req).await, Dispatch::Unclaimed));
     }
 }

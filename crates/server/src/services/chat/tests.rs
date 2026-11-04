@@ -4,7 +4,7 @@ use crate::{dao::chat_channels as dao, db::Db, services::{Call, CallError}, sess
 use marshal::Value;
 
 fn session(id: i64) -> OnlineSession {
-    OnlineSession { character_id: id, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
+    OnlineSession { character_id: id, user_id: None, session_id: id, ship_id: None, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }
 }
 
 async fn rpc(c: &mut crate::client::Client, method: &str, args: &[Value]) -> Result<Value, CallError> {

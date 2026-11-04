@@ -2,7 +2,7 @@ use crate::{services::{self, Call}, session::OnlineSession};
 use marshal::Value;
 
 fn guest(id: i64, station: i64, corporation: Option<i64>, alliance: Option<i64>, faction: Option<i64>) -> OnlineSession {
-    OnlineSession { character_id: id, station_id: Some(station), system_id: None, corporation_id: corporation,
+    OnlineSession { character_id: id, user_id: None, session_id: id, ship_id: None, station_id: Some(station), system_id: None, corporation_id: corporation,
         alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }
 }
 

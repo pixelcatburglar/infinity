@@ -53,7 +53,7 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
         Err(error) => { drain.abort(); return Err(error); }
     };
     let identity = Identity { char_id: id, corp_id: row.corporation_id, ship_id: Some(prepared.ship_id), station_id: row.station_id, system_id: Some(row.solar_system_id) };
-    let session = OnlineSession { character_id: id, station_id: row.station_id.filter(|id| *id > 0), system_id: Some(row.solar_system_id), corporation_id: Some(row.corporation_id), alliance_id: row.alliance_id.filter(|id| *id > 0), faction_id: None, fleet_id: None, role: 0, corporation_role: row.roles };
+    let session = OnlineSession { character_id: id, user_id: None, session_id: 0, ship_id: Some(prepared.ship_id), station_id: row.station_id.filter(|id| *id > 0), system_id: Some(row.solar_system_id), corporation_id: Some(row.corporation_id), alliance_id: row.alliance_id.filter(|id| *id > 0), faction_id: None, fleet_id: None, role: 0, corporation_role: row.roles };
     r.pilots.hub.set_profile(id, &row.name, i64::from(row.gender_id), row.corporation_id, row.alliance_id, None, 0);
     services::presence::online(&identity, &r.world, &r.pilots.hub, notify.clone(), None, session.clone());
     let admission = async {
@@ -61,7 +61,7 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
         entered_space(&r, &session).await
     }.await;
     if let Err(error) = admission {
-        if let Err(cleanup) = services::presence::leave(&identity, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), || {}).await {
+        if let Err(cleanup) = services::presence::leave(&identity, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), None, || {}).await {
             tracing::warn!(%cleanup, "simulated pilot admission cleanup failed");
         }
         drain.abort();
@@ -77,7 +77,7 @@ pub(super) async fn offline(r: Resources, id: i64) -> Result<(), CallError> {
     let (mut state, row) = locked(&r, id).await?;
     if state.is_none() { return Ok(()); }
     let identity = snapshot(&r, id, &row).await?;
-    let result = services::presence::leave(&identity, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), || {}).await;
+    let result = services::presence::leave(&identity, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), None, || {}).await;
     if let Some(pilot) = state.take() { pilot.drain.abort(); }
     result.map_err(CallError::Internal)?;
     selection::logoff(&r.db, id).await.map_err(services::db_err)?;

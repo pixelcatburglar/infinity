@@ -3,7 +3,7 @@
 //! requests have no payload and other unclaimed requests receive defaults.
 use prost_reflect::{DynamicMessage, ReflectMessage};
 use tracing::{debug, info, warn};
-use super::{Gateway, Caller, handlers, protocol::{Request, Response, now_timestamp}, message::{message, pack, response_name, type_name}, fallback::{known_ids, fill_defaults}};
+use super::{Gateway, Caller, context::HandlerContext, handlers, protocol::{Request, Response, now_timestamp}, message::{message, pack, response_name, type_name}, fallback::{known_ids, fill_defaults}};
 use super::error::{FailureCode, GatewayError};
 use crate::messages::gateway as text;
 
@@ -13,10 +13,9 @@ const LOG_EXCERPT_LEN: usize = 300;
 const DEFAULT_RESPONSE_DEPTH: u32 = 4;
 pub(super) async fn handle_request(gw: &Gateway, req: Request) -> Response {
     let ctx = req.authoritative_context.clone().unwrap_or_default();
-    let caller = Caller {
-        user_id: ctx.authenticated_user.map(|u| u.sequential as i64),
-        character_id: ctx.identity.and_then(|i| i.character).or(ctx.active_character).map(|c| c.sequential as i64),
-    };
+    let user_id = ctx.authenticated_user.map(|u| u.sequential as i64);
+    let character_id = ctx.identity.and_then(|i| i.character).or(ctx.active_character).map(|c| c.sequential as i64);
+    let caller = Caller { user_id, character_id };
     let mut rsp = Response {
         dispatched: Some(now_timestamp()),
         correlation_uuid: req.correlation_uuid.clone(),
@@ -47,7 +46,14 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request) -> Response {
             return rsp;
         }
     };
-    match handlers::handle(gw, &caller, &name, &payload).await {
+    let context = match HandlerContext::for_request(gw, caller.clone()).await {
+        Ok(context) => context,
+        Err(error) => {
+            apply_error(&mut rsp, &name, error);
+            return rsp;
+        }
+    };
+    match handlers::handle(&context, &name, &payload).await {
         handlers::Dispatch::Claimed(Ok(out)) => {
             info!("gateway: {name} (char {:?}) -> {}", caller.character_id, out.descriptor().full_name());
             rsp.payload = Some(pack(&out));

@@ -4,14 +4,14 @@
 use anyhow::{Context, Result};
 use prost_reflect::{DynamicMessage, ReflectMessage, Value as PV};
 use crate::cdn;
-use super::{Gateway, message::{response_for, child, set}};
+use super::{context::HandlerContext, message::{response_for, child, set}};
 
-/// `{checkpoint: {url, version, crc: {crc}}}` pointing at crate::cdn content.
-pub(super) fn checkpoint(gw: &Gateway, request: &str, content: &str) -> Result<DynamicMessage> {
+/// `{checkpoint: {url, version, crc}}` pointing at crate::cdn content.
+pub(super) fn checkpoint(ctx: &HandlerContext<'_>, request: &str, content: &str) -> Result<DynamicMessage> {
     let (data, (major, minor, patch)) = cdn::content(content).context("unknown content")?;
     let mut rsp = response_for(request)?;
     let mut cp = child(&rsp.descriptor(), "checkpoint")?;
-    set(&mut cp, "url", PV::String(format!("{}/content/{content}", gw.cdn_url)))?;
+    set(&mut cp, "url", PV::String(format!("{}/content/{content}", ctx.config.cdn_url())))?;
     let mut version = child(&cp.descriptor(), "version")?;
     set(&mut version, "major", PV::U32(major))?;
     set(&mut version, "minor", PV::U32(minor))?;
