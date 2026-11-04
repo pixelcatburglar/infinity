@@ -24,6 +24,7 @@ pub(crate) mod industry;
 pub(crate) mod localization;
 pub(crate) mod map;
 pub(crate) mod missions;
+pub(crate) mod ship_skins;
 pub(crate) mod store;
 pub(crate) mod types;
 pub(crate) mod typelists;
@@ -52,6 +53,7 @@ pub(crate) struct Sde {
     pub(crate) wrecks: wrecks::Wrecks,
     pub(crate) industry: industry::Industry,
     pub(crate) store: store::Store,
+    pub(crate) ship_skins: ship_skins::ShipSkins,
     pub(crate) characters: characters::Characters,
     pub(crate) typelists: typelists::TypeLists,
 }
@@ -64,11 +66,12 @@ impl Sde {
 
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
         let started = Instant::now();
-        let (mut types, dogma, map, factions, npc_corporations, localization, wrecks, industry, store, missions, mut dungeons, characters, graphic_locations, dynamic_rows) = tokio::try_join!(
+        let (mut types, dogma, map, factions, npc_corporations, localization, wrecks, industry, store, ship_skins, missions, mut dungeons, characters, graphic_locations, dynamic_rows) = tokio::try_join!(
             types::Types::load(db), dogma::Dogma::load(db), map::Map::load(db),
             factions::Factions::load(db), corporations::NpcCorporations::load(db), localization::Localization::load(db), wrecks::Wrecks::load(db),
             async { industry::Industry::load(db).await.map_err(anyhow::Error::from) },
             async { store::Store::load(db).await.map_err(anyhow::Error::from) },
+            async { ship_skins::ShipSkins::load(db).await.map_err(anyhow::Error::from) },
             missions::Missions::load(db), dungeons::Dungeons::load(db),
             characters::Characters::load(db),
             graphic_locations::GraphicLocations::load(db),
@@ -84,7 +87,7 @@ impl Sde {
         types.index_modifiers(&dogma);
         dungeons.index_map(&map);
         tracing::info!(types = types.len(), dogma_attributes = dogma.attribute_count(), dogma_effects = dogma.effect_count(), systems = map.systems().count(), stations = map.stations().count(), celestials = map.all_celestials().count(), factions = factions.len(), npc_corporations = npc_corporations.len(), localization = localization.len(), expert_systems = expert_systems.iter().count(), elapsed_ms = started.elapsed().as_millis(), "SDE loaded");
-        Ok(Self { types, crates, compression, dogma, dynamic_items, expert_systems, map, graphic_locations, factions, npc_corporations, localization, wrecks, industry, store, missions, dungeons, characters, typelists })
+        Ok(Self { types, crates, compression, dogma, dynamic_items, expert_systems, map, graphic_locations, factions, npc_corporations, localization, wrecks, industry, store, ship_skins, missions, dungeons, characters, typelists })
     }
     /// Mirrors the client's non-tradable and soulbound type-list checks.
     pub(crate) fn is_tradable(&self, type_id: i32) -> bool {

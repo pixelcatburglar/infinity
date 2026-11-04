@@ -196,6 +196,24 @@ CREATE TABLE IF NOT EXISTS game.items (
 );
 CREATE INDEX IF NOT EXISTS items_location_idx ON game.items (location_id, flag_id);
 CREATE INDEX IF NOT EXISTS items_owner_idx ON game.items (owner_id);
+
+-- Ship SKIN licenses and applications; expiry timestamps use FILETIME.
+CREATE TABLE IF NOT EXISTS game.ship_skin_licenses (
+    character_id bigint NOT NULL REFERENCES game.characters(character_id) ON DELETE CASCADE,
+    skin_id integer NOT NULL,
+    expires_at bigint,
+    PRIMARY KEY (character_id, skin_id)
+);
+CREATE INDEX IF NOT EXISTS ship_skin_licenses_expiry_idx
+    ON game.ship_skin_licenses (expires_at) WHERE expires_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS game.ship_skin_applications (
+    ship_item_id bigint PRIMARY KEY REFERENCES game.items(item_id) ON DELETE CASCADE,
+    character_id bigint NOT NULL,
+    skin_id integer NOT NULL,
+    FOREIGN KEY (character_id, skin_id) REFERENCES game.ship_skin_licenses(character_id, skin_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ship_skin_applications_license_idx
+    ON game.ship_skin_applications (character_id, skin_id);
 -- dao/items/brain: durable augmentation metadata on installed item rows.
 ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_slot integer;
 ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_activated_at bigint;

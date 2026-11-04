@@ -92,11 +92,12 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
         cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category: 201, price, daily: false });
     }
 
-    // Permanent SKINs visible on Serenity that traded there, by the hull's race.
-    for r in sde.store.skins() {
-        let Some(t) = sde.types.get(r.type_id).filter(|t| t.published == Some(true)) else { continue };
+    // Supported permanent SKINs visible in this region, by the first hull's race.
+    for r in sde.ship_skins.licenses().filter(|r| r.is_permanent() && !r.is_single_use) {
+        let Some(skin) = sde.ship_skins.skin(r.skin_id).filter(|skin| !skin.is_structure_skin && skin.visible(&c.cfg.server.boot_region)) else { continue };
+        let Some(t) = sde.types.get(r.license_type_id).filter(|t| t.published == Some(true)) else { continue };
         let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
-        let race = r.hull.and_then(|id| sde.types.get(id)).and_then(|h| h.race_id).unwrap_or(0);
+        let race = skin.type_ids.first().and_then(|id| sde.types.get(*id)).and_then(|h| h.race_id).unwrap_or(0);
         let category = match race { 4 => 101, 1 => 102, 8 => 103, 2 => 104, _ => 105 };
         let (name, image) = presentation(t.type_id)?;
         let type_id = t.type_id;
