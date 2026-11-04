@@ -198,10 +198,10 @@ Station clones keep their own implants. Ship clone bays and player structures ar
 | crateService | CustomGetLootFromFixedCrate | handled | `crates/server/src/services/crates/crate_service.rs` |
 | crateService | GetCrate | fixed | `crates/server/src/services/crates/crate_service.rs` |
 | crateService | GetCrateLocation | fixed | `crates/server/src/services/crates/crate_service.rs` |
-| crateService | OpenCrate | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | OpenCrate | handled | `crates/server/src/services/crates/crate_service.rs` |
 | crateService | CustomOpenCrate | fixed | `crates/server/src/services/crates/crate_service.rs` |
-| crateService | ClaimLootFromCrateStack | fixed | `crates/server/src/services/crates/crate_service.rs` |
-| crateService | ClaimLoot | fixed | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | ClaimLootFromCrateStack | handled | `crates/server/src/services/crates/crate_service.rs` |
+| crateService | ClaimLoot | handled | `crates/server/src/services/crates/crate_service.rs` |
 | crateService | ClaimSkillBundle | fixed | `crates/server/src/services/crates/crate_service.rs` |
 | crateService | ClaimFitting | fixed | `crates/server/src/services/crates/crate_service.rs` |
 | skillHandler | GetSkillBundleInfo | fixed | `crates/server/src/services/skills/skill_handler.rs` |
@@ -209,7 +209,9 @@ Station clones keep their own implants. Ship clone bays and player structures ar
 | storeManager | can_purchase_offer | handled | `crates/server/src/services/store/store_manager.rs` |
 | storeManager | is_offer_purchasable | handled | `crates/server/src/services/store/store_manager.rs` |
 
-The three preview calls return the crate's contents as `(typeID, quantity, None)` entries and change nothing; a preview of a crate item needs the same ownership, corporation hangar role and reachability as moving it. `GetCrate` returns an empty list. Opening, claiming, the crate location and the skill-bundle and fitting details are refused with a message. The store checks answer no for an unknown offer, a daily gift already claimed today, or a crate.
+The three preview calls return the crate's contents as `(typeID, quantity, None)` entries and change nothing; a preview of a crate item needs the same ownership, corporation hangar role and reachability as moving it. `GetCrate` returns an empty list. `OpenCrate` opens one ordinary direct-list crate. `ClaimLootFromCrateStack` opens up to 30 from one stack, all or nothing, and returns `(opened, requested)`; a larger stack opens 30 per call. Rewards are created immediately in the opener's personal hangar at the current station when docked, or in the active ship's cargo in space; the operation is refused if the cargo lacks room. A corporation-owned crate requires hangar Take permission and its rewards go to the opener. Source consumption, reward creation and receipts commit together, followed by notifications.
+
+`ClaimLoot(itemID, destinationID, destinationFlagID)` confirms the receipt recorded at opening only for the character who opened the crate and the exact destination. Repeats succeed, even after the reward is used or merged; the call never creates or moves items or sends notifications. There is no request-keyed replay protection for opening: client call IDs are fresh per call. `CustomOpenCrate`, `GetCrateLocation`, `ClaimSkillBundle` and `ClaimFitting`, as well as skill-bundle and fitting details, are refused with a message. The store checks answer no for an unknown offer, a daily gift already claimed today, or a crate.
 
 ## Item compatibility
 
