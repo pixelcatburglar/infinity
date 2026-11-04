@@ -20,8 +20,9 @@ pub(crate) fn kinematics(fit: &Fit, key: Key) -> Kinematics {
 pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematics) {
     system.command(ship, move |b, stamp, _| {
         let mut events = propulsion_transition(b, stamp, values.speed, values.mass, values.signature);
-        b.agility = values.agility as f32;
-        events.push(event(stamp, "SetBallAgility", vec![Value::Int(b.id), Value::Float(values.agility)]));
+        if b.set_ball_agility(values.agility) {
+            events.push(event(stamp, "SetBallAgility", vec![Value::Int(b.id), Value::Float(values.agility)]));
+        }
         events
     });
 }
@@ -46,14 +47,14 @@ pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<Atom
 }
 
 fn propulsion_transition(b: &mut Ball, stamp: i64, speed: f64, mass: f64, signature: f64) -> Vec<Value> {
-    b.set_max_speed(speed as f32);
-    b.set_ball_mass(mass);
+    let speed_accepted = b.set_max_speed(speed);
+    let mass_accepted = b.set_ball_mass(mass);
     b.signature_radius = Some(signature);
     let mut events = Vec::new();
-    if (speed as f32).is_finite() && speed >= 0.0 {
+    if speed_accepted {
         events.push(event(stamp, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]));
     }
-    if mass.is_finite() && mass > 0.0 {
+    if mass_accepted {
         events.push(event(stamp, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]));
     }
     events

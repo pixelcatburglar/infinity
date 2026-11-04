@@ -7,7 +7,7 @@
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
 use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER, CATEGORY_STARBASE, CATEGORY_STRUCTURE};
-use crate::consts::dogma::CHAR_ATTRIBUTES;
+use crate::consts::dogma::{CHAR_ATTRIBUTES, ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY};
 use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
 use crate::db::outbox::Outbox;
 use crate::services::effects::online::{self, OnlineChanged};
@@ -60,6 +60,16 @@ fn attribute(c: &Client, name: &str) -> Result<i32, CallError> {
         [id] => Ok(*id),
         [] => Err(slash_error(messages::gm::gm_dogma_attribute(name))),
         _ => Err(slash_error(messages::gm::gm_dogma_ambiguous(name, &ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))),
+    }
+}
+
+fn valid_kinematic_action(attr: i32, action: Action<'_>) -> bool {
+    let Action::Set(_, value) = action else { return true };
+    match attr {
+        ATTR_AGILITY => crate::space::Ball::valid_agility(value),
+        ATTR_MASS => crate::space::Ball::valid_mass(value),
+        ATTR_MAX_VELOCITY => crate::space::Ball::valid_max_speed(value),
+        _ => true,
     }
 }
 
@@ -129,6 +139,9 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     }
     let attr_name = match action { Action::Query(a) | Action::Reset(a) | Action::Set(a, _) => a, Action::List => unreachable!() };
     let attr = attribute(c, attr_name)?;
+    if !valid_kinematic_action(attr, action) {
+        return Err(slash_error(messages::gm::GM_DOGMA_KINEMATIC_INVALID.into()));
+    }
     if let Some(reason) = denied(attr, |name, id| c.sde.dogma.attributes_by_name(name).any(|a| a.attribute_id == id)) {
         return Err(slash_error(reason.into()));
     }

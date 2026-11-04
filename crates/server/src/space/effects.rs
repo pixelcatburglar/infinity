@@ -30,7 +30,7 @@ impl System {
             if source_ball.cloak != 0 || source_ball.mode == MODE_WARP { s.balls.insert(target, ball); s.tractors.remove(&target); return; }
             let saved = (ball.max_vel, ball.speed_fraction, ball.mode, ball.goto, ball.follow_id, ball.follow_range);
             if !ball.follow_ball(source_ball, stop_range) { s.balls.insert(target, ball); s.tractors.remove(&target); return; }
-            ball.max_vel = velocity;
+            let speed_accepted = ball.set_max_speed(f64::from(velocity));
             ball.set_speed_fraction(1.0);
             ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
             ball.interpolation_anchor_ms = s.ms;
@@ -40,11 +40,13 @@ impl System {
             let visibility = (target, ball.cloak);
             s.balls.insert(target, ball);
             s.tractors.get_mut(&target).unwrap().saved = Some(saved);
-            s.deliver(Some(visibility), vec![
-                event(stamp, "SetMaxSpeed", vec![Value::Int(target), Value::Float(f64::from(velocity))]),
-                event(stamp, "FollowBall", vec![Value::Int(target), Value::Int(source), Value::Float(f64::from(stop_range))]),
-                event(stamp, "SetSpeedFraction", vec![Value::Int(target), Value::Float(1.0)]),
-            ]);
+            let mut events = Vec::new();
+            if speed_accepted {
+                events.push(event(stamp, "SetMaxSpeed", vec![Value::Int(target), Value::Float(f64::from(velocity))]));
+            }
+            events.push(event(stamp, "FollowBall", vec![Value::Int(target), Value::Int(source), Value::Float(f64::from(stop_range))]));
+            events.push(event(stamp, "SetSpeedFraction", vec![Value::Int(target), Value::Float(1.0)]));
+            s.deliver(Some(visibility), events);
         })));
         true
     }
@@ -56,8 +58,10 @@ impl System {
         let Some(epoch) = self.tractor_epochs.get(&target).cloned() else { return };
         self.command(target, move |ball, stamp, system| {
             if !system.tractor_epochs.get(&target).is_some_and(|current| Arc::ptr_eq(current, &epoch)) { return Vec::new(); }
-            ball.max_vel = speed;
-            let mut events = vec![event(stamp, "SetMaxSpeed", vec![Value::Int(target), Value::Float(f64::from(speed))])];
+            let mut events = Vec::new();
+            if ball.set_max_speed(f64::from(speed)) {
+                events.push(event(stamp, "SetMaxSpeed", vec![Value::Int(target), Value::Float(f64::from(speed))]));
+            }
             let movement = if mode == MODE_GOTO && ball.goto_point(goto) {
                 event(stamp, "GotoPoint", vec![Value::Int(target), Value::Float(goto[0]), Value::Float(goto[1]), Value::Float(goto[2])])
             } else if matches!(mode, MODE_FOLLOW | MODE_ORBIT) && system.ball(follow).is_some_and(|other|

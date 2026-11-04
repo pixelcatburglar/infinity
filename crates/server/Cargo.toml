@@ -38,4 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 
 [dev-dependencies]
+# Parse native numerical fixture decimals with exact floating-point round trips.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 tokio = { workspace = true, features = ["test-util"] }

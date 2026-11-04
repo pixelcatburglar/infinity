@@ -55,15 +55,22 @@ fn stop_damps_y_before_tick_and_interpolation() {
 fn setters_reject_invalid_and_preserve_mode() {
     let mut b = ball();
     for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        b.set_speed_fraction(x); b.set_max_speed(x);
+        b.set_speed_fraction(x); assert!(!b.set_max_speed(f64::from(x)));
     }
-    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] { b.set_ball_mass(x); }
-    b.set_max_speed(-1.0);
-    assert_eq!((b.speed_fraction, b.max_vel, b.mass, b.mode), (0.75, 100.0, 1e6, MODE_GOTO));
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] { assert!(!b.set_ball_mass(x)); }
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0, f64::MAX, f64::MIN_POSITIVE] {
+        assert!(!b.set_ball_agility(x));
+    }
+    for x in [-1.0, f64::MAX] { assert!(!b.set_max_speed(x)); }
+    assert_eq!((b.speed_fraction, b.max_vel, b.mass, b.agility, b.mode, b.vel),
+        (0.75, 100.0, 1e6, 1.0, MODE_GOTO, [10.0, 20.0, 30.0]));
     b.set_speed_fraction(-2.0); assert_eq!(b.speed_fraction, 0.0);
     b.set_speed_fraction(2.0); assert_eq!(b.speed_fraction, 1.0);
-    b.set_max_speed(0.0); b.set_ball_mass(2.0);
-    assert_eq!((b.max_vel, b.mass, b.mode), (0.0, 2.0, MODE_GOTO));
+    assert!(b.set_max_speed(0.0)); assert!(b.set_ball_mass(2.0)); assert!(b.set_ball_agility(0.5));
+    assert_eq!((b.max_vel, b.mass, b.agility, b.mode, b.vel), (0.0, 2.0, 0.5, MODE_GOTO, [10.0, 20.0, 30.0]));
+    assert!(b.set_ball_agility(f64::from(f32::from_bits(1))));
+    assert!(b.set_max_speed(f64::MIN_POSITIVE));
+    assert!(b.set_ball_mass(f64::MIN_POSITIVE));
 }
 
 #[test]
