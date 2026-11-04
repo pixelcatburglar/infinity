@@ -85,6 +85,8 @@ pub(crate) async fn warp_to_ball(
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let a = call.args;
     Some(match (call.service, call.method) {
+        ("beyonce", "BookmarkLocation") => super::super::bookmarks::beyonce::space_location(c, call).await,
+        ("beyonce", "BookmarkScanResult") => super::super::bookmarks::beyonce::scan_result(c, call).await,
         ("beyonce", "UpdateStateRequest") => send_state(c).await.map(|_| Value::None),
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
