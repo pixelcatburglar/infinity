@@ -11,11 +11,12 @@ use crate::messages::gateway as text;
 const LOG_EXCERPT_LEN: usize = 300;
 /// Server limit for nesting when populating default gateway responses.
 const DEFAULT_RESPONSE_DEPTH: u32 = 4;
-pub(super) async fn handle_request(gw: &Gateway, req: Request) -> Response {
+pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&super::notices::registry::Lease>) -> Response {
     let ctx = req.authoritative_context.clone().unwrap_or_default();
     let user_id = ctx.authenticated_user.map(|u| u.sequential as i64);
     let character_id = ctx.identity.and_then(|i| i.character).or(ctx.active_character).map(|c| c.sequential as i64);
     let caller = Caller { user_id, character_id };
+    let admitted_session = character_id.and_then(|id| gw.world.online_session(id));
     let mut rsp = Response {
         dispatched: Some(now_timestamp()),
         correlation_uuid: req.correlation_uuid.clone(),
@@ -53,6 +54,11 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request) -> Response {
             return rsp;
         }
     };
+    if let (Some(lease), Some(user), Some(character), Some(session)) = (lease, caller.user_id, caller.character_id, admitted_session) {
+        if session.user_id == Some(user) && gw.world.online_session(character).is_some_and(|current| current.user_id == Some(user) && current.session_id == session.session_id) {
+            lease.bind(&session, |id| gw.world.online_session(id));
+        }
+    }
     match handlers::handle(&context, &name, &payload).await {
         handlers::Dispatch::Claimed(Ok(out)) => {
             info!("gateway: {name} (char {:?}) -> {}", caller.character_id, out.descriptor().full_name());

@@ -58,3 +58,11 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/help` | List the commands |
 
 Arguments may be quoted to include spaces. Lists longer than 50 rows show the first 50 and the number left out.
+
+## SKIN administration
+
+These are client GML tools using `shipCosmeticsMgr`, not slash commands. They require the exact GML role and operate on the current character:
+
+- `GiveSkin(skinID, duration=<positive integer days optional>, isSingleUse=<false optional>)` grants an ordinary first-party license. Omitted duration is permanent; `isSingleUse=true` is refused. Finite renewal is server policy: add the days to the later of now and the stored expiry. A permanent grant replaces a finite license; an existing permanent license cannot be granted again.
+- `GMExpireSkinLicense(skinID)` expires an existing license immediately through the shared cleanup.
+- `RemoveSkin(skinID, currentCharacterID)` removes an existing license immediately through the same cleanup. Missing licenses are refused. If there are no ship applications, a GM policy message explains that an already displayed collection refreshes at next login; no ship removal event is fabricated.

@@ -34,6 +34,8 @@
   - wrecks, insurance payouts and killmails for an unpiloted ship destroyed in space; the ship and its contents are deleted
   - custom crate selection and special skill-bundle or fitting rewards: `CustomOpenCrate`, `GetCrateLocation`, `ClaimSkillBundle` and `ClaimFitting` are refused. The store does not sell crates. A crate whose contents are a skill bundle or a fitted ship cannot be previewed, and a crate whose contents are not known shows an empty preview.
   - audit log secure containers: they work as ordinary containers, with no password, audit log or item locking, and saving their settings is refused
+  - structure SKIN activation and single-use SKIN license requests: these are deferred and explicitly refused without consuming an item; the store excludes unsupported single-use licenses
+  - third-party SKINs are not implemented
 - An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
 - Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100). Drones with no targeting range or scan resolution in the static data lock at once within control range.
 - The personal mining ledger starts with mining done after this version is installed.
@@ -47,6 +49,9 @@
 - Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
 - In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.
 - Fleet bubble broadcasts and fleet warp treat a whole solar system as one grid, because the server keeps one ballpark per system.
+- SKIN visibility uses the existing one-ballpark-per-system approximation and respects cloaking. Regional eligibility is checked at writes using `server.boot_region`, which is immutable during a process; changing the region across a restart is unsupported.
+- A license removal with no ship applications changes the database immediately but cannot send a ship removal event; the GM receives a policy message and an already displayed collection refreshes at the next login. A removal callback can arrive after the player selects another SKIN: the received legal cancel order remains authoritative, and there is no global ordering guarantee across Macho and gateway channels.
+- Gateway notices are immediate, best-effort and not durably replayed. A full or closed queue cancels the slow stream generation rather than silently dropping notices; reconnect and a Get recover committed state.
 - Shared item-filter and fleet-broadcast links are permanent and public: anyone signed in who has the whole link can open it, and a link cannot be made private, revoked or set to expire. Overview profile links are not supported.
 - A pilot who changes corporation or alliance gains or loses access to shared bookmark folders at once, but a shared folder the client already shows stays in its list until the pilot logs in again.
 - The daily Alpha skill injector can be used once per character in any 24 hours, counted from each use; this is the server's own rule.
@@ -54,6 +59,7 @@
 - Mailing lists are free: a request to charge for mail to a list is refused. A list's owner cannot hand it over. List names are compared after PostgreSQL folds their case, which can differ from the client for a few Unicode letters.
 - Search words are checked against the client's moderation rules. Where a rule ignores case, the server also treats the Kelvin sign (U+212A) and the long s (U+017F) as the letters k and s, which the client does not, so a search containing them can be refused where the client would allow it.
 - A public gateway request, such as a skill plan change, is checked against the calling account and character, not against one game session. A request sent just before a relog therefore applies to the character's state after it.
+- Live gateway notifications, unlike those persistent requests, are bound to the authoritative exact online session generation and cannot adopt a replacement session. Account and character ownership lookup is not token authentication: the public gateway requires a trusted network or authentication front door and must not be exposed directly to untrusted clients.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space except ships (NPCs, wrecks, scheduled effects);

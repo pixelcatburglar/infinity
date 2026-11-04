@@ -6,3 +6,5 @@ pub(crate) const UNAUTHORIZED: &str = "未登录或未选择角色";
 pub(crate) const NOT_IMPLEMENTED: &str = "功能尚未实现";
 pub(crate) const INTERNAL_ERROR: &str = "服务器内部错误";
 pub(crate) const FORBIDDEN: &str = "无权执行此请求";
+/// Server-authored gateway response text when a requested object is absent.
+pub(crate) const NOT_FOUND: &str = "请求的对象不存在";

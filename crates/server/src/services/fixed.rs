@@ -84,8 +84,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         // GetMarketDockableLocationsInRegion iterates the dict and reads each entry's
         // services; player structures are unsupported.
         ("structureDirectory", "GetMyCharacterStructures") => Value::Dict(vec![]),
-        // SKIN licences the character has activated: none yet.
-        ("shipCosmeticsMgr", "GetLicencedSkins") | ("shipCosmeticsMgr", "GetLicencedSkinsForShipType") => Value::list([]),
         ("structureDirectory", "GetJumpBridgesWithMyAccess") => Value::tuple([Value::list([]), Value::list([]), Value::list([])]),
         ("dynamicResourceCacheMgr", "GetDBSMapData") => Value::Dict(vec![]),
         // Bounty output range and its equilibrium (mapFilterDynamicBounty reads all three).

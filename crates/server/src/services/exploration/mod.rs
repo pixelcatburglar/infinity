@@ -542,6 +542,7 @@ pub(super) async fn set_container_state(world: &World, system: i64, container: i
 /// A won hack: the container opens to its hacker, and once every container of the site
 /// is open the site winds down.
 pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64, char_id: i64) -> Result<(), CallError> {
+    let _trading = super::market::lock().await;
     let Some(mut site) = state().sites.values().find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).cloned() else {
         return Ok(());
     };

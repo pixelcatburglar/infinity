@@ -43,6 +43,18 @@ fn load_error(contents: &str) -> String {
 }
 
 #[test]
+fn gateway_notice_capacity_file_environment_and_validation() {
+    let fixture = Fixture::new();
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().gateway.notice_queue_capacity, 256);
+    fixture.write("[gateway]\nnotice_queue_capacity = 9");
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().gateway.notice_queue_capacity, 9);
+    let config = Config::load_with(&fixture.path(), |key| (key == "GATEWAY_NOTICE_QUEUE_CAPACITY").then(|| "3".into())).unwrap();
+    assert_eq!(config.gateway.notice_queue_capacity, 3);
+    assert!(load_error("[gateway]\nnotice_queue_capacity = 0").contains("gateway.notice_queue_capacity"));
+    assert!(Config::load_with(&fixture.path(), |key| (key == "GATEWAY_NOTICE_QUEUE_CAPACITY").then(|| "0".into())).is_err());
+}
+
+#[test]
 fn clone_service_fee_policy_and_legacy_keys() {
     assert_eq!(Config::default().clones.service_fee_isk, 900_000.0);
     let fixture = Fixture::new();

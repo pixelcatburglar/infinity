@@ -48,6 +48,7 @@ pub(crate) mod identity;
 pub(crate) mod industry;
 mod insurance;
 pub(crate) mod inventory;
+pub(crate) mod ship_cosmetics_mgr;
 mod item_volume;
 pub(crate) mod items;
 pub(crate) mod mail;
@@ -96,6 +97,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
         crate::scheduler::register(corps::vote_close::KIND, corps::vote_close::handle),
         crate::scheduler::register(subscriptions::deadlines::KIND, subscriptions::deadlines::handle),
+        crate::scheduler::register(ship_cosmetics_mgr::expiry::KIND, ship_cosmetics_mgr::expiry::handle),
         crate::scheduler::register(skills::alpha_injections::KIND, skills::alpha_injections::handle),
     ]
 }
@@ -359,6 +361,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 
         _ => {
             if let Some(r) = bannedwords::dispatch(call) { return r; }
+            if let Some(r) = ship_cosmetics_mgr::dispatch(c, call).await { return r; }
             if let Some(r) = crates::dispatch(c, call).await { return r; }
             if let Some(r) = alert::dispatch(c, call).await { return r; }
             if let Some(r) = event_log::dispatch(c, call).await { return r; }

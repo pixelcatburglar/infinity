@@ -26,6 +26,7 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `images.bind` / `.port` / `.dir` | `IMAGE_BIND` / `IMAGE_PORT` / `IMAGE_DIR` | `0.0.0.0:26001` / `26001` / `/data/images` | Image server listener, the port advertised to clients, and its storage |
 | `images.upstream` | `IMAGE_UPSTREAM` | `https://images.evetech.net` | Where missing NPC, NPC corporation and type images are fetched from once (empty = never) |
 | `gateway.bind` | `GATEWAY_BIND` | `0.0.0.0:26002` | Public gateway listener |
+| `gateway.notice_queue_capacity` | `GATEWAY_NOTICE_QUEUE_CAPACITY` | `256` | Per-stream notice queue capacity; must be nonzero and no greater than Tokio's semaphore limit. A full queue cancels the stream rather than silently dropping notices. |
 | `cdn.bind` | `CDN_BIND` | `0.0.0.0:80` | Content CDN listener |
 | `server.macho_version`, `.boot_version`, `.boot_build`, `.boot_codename`, `.boot_region`, `.node_id` | `MACHO_VERSION`, `BOOT_VERSION`, `BOOT_BUILD`, `BOOT_CODENAME`, `BOOT_REGION`, `NODE_ID` | match build 3653293 | Values the client checks during the handshake |
 | `logging.filter` | `RUST_LOG` | `info,infinity_server=debug` | Log filter |
@@ -39,6 +40,8 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `lua.store_value_limit_bytes` | | `65536` | Largest value a script may keep in its persistent store |
 | `lua.data_file_limit_bytes` | | `4194304` | Maximum bytes in one `data.load` JSON file; must be nonzero. No environment override. |
 | `lua.scripts.<name>` | | none | Settings only the script `<name>` can read |
+
+SKIN expiry uses one durable scheduled deadline per character for the nearest finite license, at expiry plus one FILETIME tick: equality is still valid. The usual scheduler polling latency applies.
 
 Some keys switch behaviour on or off rather than set a number:
 

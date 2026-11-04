@@ -15,16 +15,17 @@ impl<E> Default for Outbox<E> {
     fn default() -> Self { Self { entries: Vec::new() } }
 }
 
-pub enum Effect<E> {
+pub(crate) enum Effect<E> {
     Notification(Notification),
     Operation(E),
     Event(crate::lua::events::GameEvent),
 }
 
-pub enum Notification {
+pub(crate) enum Notification {
     DirectClient { event: String, args: Vec<Value> },
     Pilot { char_id: i64, event: String, args: Vec<Value> },
     Sender { sender: NotifyTx, event: String, args: Vec<Value> },
+    Gateway(crate::gateway::notices::GatewayNotice),
 }
 
 impl<E> Outbox<E> {
@@ -37,9 +38,12 @@ impl<E> Outbox<E> {
     pub fn notify_sender(&mut self, sender: NotifyTx, event: &str, args: Vec<Value>) {
         self.entries.push(Effect::Notification(Notification::Sender { sender, event: event.into(), args }));
     }
+    pub(crate) fn notify_gateway(&mut self, notice: crate::gateway::notices::GatewayNotice) {
+        self.entries.push(Effect::Notification(Notification::Gateway(notice)));
+    }
     pub fn event(&mut self, event: crate::lua::events::GameEvent) { self.entries.push(Effect::Event(event)); }
     pub fn operation(&mut self, operation: E) { self.entries.push(Effect::Operation(operation)); }
-    pub fn into_entries(self) -> Vec<Effect<E>> { self.entries }
+    pub(crate) fn into_entries(self) -> Vec<Effect<E>> { self.entries }
 }
 
 impl Notification {
@@ -51,6 +55,7 @@ impl Notification {
             }
             Self::Pilot { char_id, event, args } => world.notify_pilot(char_id, &event, args),
             Self::Sender { sender, event, args } => { let _ = sender.send((event, args)); }
+            Self::Gateway(notice) => world.notice_hub().dispatch(notice, |id| world.online_session(id)),
         }
         Ok(())
     }

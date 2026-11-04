@@ -8,6 +8,10 @@ The database has four schemas:
 
 `game.crate_rewards` records one receipt per reward item ID, with the opening character, crate type, destination location and flag, opening FILETIME and nullable first-confirmation FILETIME. Receipts are written in the same transaction as the reward items. They have no foreign key to items and survive a reward item's deletion or merge.
 
+`game.ship_skin_licenses` stores dynamic licenses by the composite character and SKIN primary key; `expires_at` is a FILETIME, or NULL for permanent. `game.ship_skin_applications` is keyed by the actual ship item, with an item foreign key and a composite license foreign key, both cascading on deletion. Ownership changes and repackaging clear applications atomically but retain licenses. Ordinary SKIN definitions, license types, full compatible hull lists and regional flags come from static data loaded once at startup.
+
+The existing `game.jobs` scheduler keeps the nearest finite SKIN expiry per character; grants, upgrades and removals reschedule it to the nearest finite expiry, and cancel it only when no finite licenses remain. No separate SKIN cache or notice log table is used. The schema can be applied on fresh or existing databases and repeatedly; rollback retains the stored data, but consumed license items are not automatically reissued.
+
 Lifecycle:
 
 - **First start.** `scripts/db-init.sh` loads `db/<schema>/<table>.sql.gz` into an empty volume. Tables whose foreign keys aren't satisfied yet are retried until everything is loaded.

@@ -72,7 +72,7 @@ pub(in crate::services) async fn corporate_custody(ex: &(impl Executor + ?Sized)
     Ok(None)
 }
 
-pub(super) async fn custody_allowed(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64, me: i64, station: Option<i64>, take: bool) -> Result<Option<bool>, CallError> {
+pub(in crate::services) async fn custody_allowed(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64, me: i64, station: Option<i64>, take: bool) -> Result<Option<bool>, CallError> {
     let Some((corp, location, flag)) = corporate_custody(ex, Some(sde), id).await? else { return Ok(None) };
     let role = if take { may_take_corp_hangar(ex, me, corp, flag).await? } else { may_view_corp_hangar(ex, me, corp, flag).await? };
     Ok(Some(role && (flag != FLAG_CORP_DELIVERIES || station == Some(location))))

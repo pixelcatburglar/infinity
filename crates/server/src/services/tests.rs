@@ -10,7 +10,7 @@ pub(super) fn database_message(error: &anyhow::Error) -> Option<&str> {
     }
 }
 
-pub(super) async fn client(db: crate::db::Db, character: i64) -> (Client, tokio::net::TcpStream) {
+pub(crate) async fn client(db: crate::db::Db, character: i64) -> (Client, tokio::net::TcpStream) {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     let cfg = Arc::new(crate::config::Config::default());

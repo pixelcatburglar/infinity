@@ -1,14 +1,15 @@
 //! HTTP/2 streams and gRPC framing for requestBroker.py and eventPublisher.py.
-//! Uses gateway handlers and embedded descriptors; notice delivery remains
-//! unimplemented and client events cannot change game state.
+//! Uses gateway handlers and embedded descriptors; client events cannot change game state.
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
 use prost::Message;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
-use super::{Gateway, events, message::UUID_LEN, protocol::{Request, Notice}, requests::handle_request};
+use super::{Gateway, events, message::UUID_LEN, protocol::Request, requests::handle_request};
 
+/// HTTP/2's 31-bit flow-control window limit (RFC 9113 §6.9.1); h2 0.4.20
+/// casts reservations to WindowSize (share.rs) and uses this maximum (proto/mod.rs).
+const H2_MAX_WINDOW_RESERVATION: usize = (1 << 31) - 1;
 /// gRPC compression flag and four-byte message length.
 const GRPC_HEADER_LEN: usize = 5;
 
@@ -23,24 +24,16 @@ const GRPC_OK: &str = "0";
 const GRPC_INVALID_ARGUMENT: &str = "3";
 const GRPC_UNIMPLEMENTED: &str = "12";
 
-fn grpc_frame(msg: &[u8]) -> Bytes {
-    let mut b = BytesMut::with_capacity(GRPC_HEADER_LEN + msg.len());
-    b.extend_from_slice(&[0]);
-    b.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-    b.extend_from_slice(msg);
-    b.freeze()
+pub(super) fn grpc_frame(msg: &[u8]) -> Bytes {
+    grpc_frame_encoded(msg.len(), |b| b.extend_from_slice(msg))
 }
 
-// Consume retains its existing permissive framing.
-fn take_messages(buf: &mut BytesMut) -> Vec<Bytes> {
-    let mut out = Vec::new();
-    while buf.len() >= GRPC_HEADER_LEN {
-        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-        if buf.len() < GRPC_HEADER_LEN + len { break; }
-        buf.advance(GRPC_HEADER_LEN);
-        out.push(buf.split_to(len).freeze());
-    }
-    out
+pub(super) fn grpc_frame_encoded(len: usize, encode: impl FnOnce(&mut BytesMut)) -> Bytes {
+    let mut b = BytesMut::with_capacity(GRPC_HEADER_LEN + len);
+    b.extend_from_slice(&[0]);
+    b.extend_from_slice(&u32::try_from(len).expect("gRPC message exceeds wire limit").to_be_bytes());
+    encode(&mut b);
+    b.freeze()
 }
 
 fn checked_messages(buf: &mut BytesMut) -> Result<Vec<Bytes>, ()> {
@@ -100,6 +93,7 @@ async fn stream(path: String, application: Option<[u8; UUID_LEN]>, mut body: h2:
     match path.as_str() {
         "/eve_public.gateway.Requests/Send" | "/eve_public.gateway.Events/Publish" => {
             let Some(application) = application else { send.send_trailers(trailers(GRPC_INVALID_ARGUMENT))?; return Ok(()); };
+            let lease = gw.notice_hub.lease(application);
             let requests = path == "/eve_public.gateway.Requests/Send";
             while let Some(chunk) = body.data().await {
                 let chunk = chunk?;
@@ -115,7 +109,7 @@ async fn stream(path: String, application: Option<[u8; UUID_LEN]>, mut body: h2:
                             Ok(req) if req.correlation_uuid.len() == UUID_LEN && req.application_instance_uuid.as_slice() == application => req,
                             _ => { send.send_trailers(trailers(GRPC_INVALID_ARGUMENT))?; return Ok(()); }
                         };
-                        let rsp = handle_request(&gw, req).await;
+                        let rsp = handle_request(&gw, req, Some(&lease)).await;
                         send.send_data(grpc_frame(&rsp.encode_to_vec()), false)?;
                     } else if events::receive(&msg, &application).is_err() {
                         send.send_trailers(trailers(GRPC_INVALID_ARGUMENT))?;
@@ -126,27 +120,40 @@ async fn stream(path: String, application: Option<[u8; UUID_LEN]>, mut body: h2:
             send.send_trailers(trailers(if buf.is_empty() { GRPC_OK } else { GRPC_INVALID_ARGUMENT }))?;
         }
         "/eve_public.gateway.Notices/Consume" => {
-            let (tx, mut rx) = mpsc::unbounded_channel::<Notice>();
-            let mut app_uuid: Option<Vec<u8>> = None;
+            let Some(application) = application else { send.send_trailers(trailers(GRPC_INVALID_ARGUMENT))?; return Ok(()) };
+            let mut registration = gw.notice_hub.register(application, gw.config.gateway.notice_queue_capacity);
+            let mut pending: Option<Bytes> = None;
             loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut registration.cancelled => return Ok(()),
                     chunk = body.data() => {
                         let Some(chunk) = chunk else { break };
                         let chunk = chunk?;
                         body.flow_control().release_capacity(chunk.len()).ok();
                         buf.extend_from_slice(&chunk);
-                        take_messages(&mut buf);
-                        if app_uuid.is_none() {
-                            let key = crate::handshake::rand_i64().to_le_bytes().to_vec();
-                            gw.notice_streams.lock().unwrap().insert(key.clone(), tx.clone());
-                            app_uuid = Some(key);
+                        if checked_messages(&mut buf).is_err() {
+                            send.send_trailers(trailers(GRPC_INVALID_ARGUMENT))?;
+                            return Ok(());
                         }
                     }
-                    Some(n) = rx.recv() => { send.send_data(grpc_frame(&n.encode_to_vec()), false)?; }
+                    capacity = std::future::poll_fn(|cx| send.poll_capacity(cx)), if pending.is_some() => {
+                        let Some(capacity) = capacity else { return Ok(()) };
+                        let capacity = capacity?;
+                        let frame = pending.as_mut().unwrap();
+                        let chunk = frame.split_to(capacity.min(frame.len()));
+                        if !chunk.is_empty() { send.send_data(chunk, false)?; }
+                        if frame.is_empty() { pending = None; }
+                        else { send.reserve_capacity(frame.len().min(H2_MAX_WINDOW_RESERVATION)); }
+                    }
+                    frame = registration.rx.recv(), if pending.is_none() => {
+                        let Some(frame) = frame else { break };
+                        send.reserve_capacity(frame.len().min(H2_MAX_WINDOW_RESERVATION));
+                        pending = Some(frame);
+                    }
                 }
             }
-            if let Some(k) = app_uuid { gw.notice_streams.lock().unwrap().remove(&k); }
-            send.send_trailers(trailers(GRPC_OK))?;
+            send.send_trailers(trailers(if buf.is_empty() { GRPC_OK } else { GRPC_INVALID_ARGUMENT }))?;
         }
         "/eve_public.gateway.Requests/Ping" | "/eve_public.gateway.Notices/Ping" | "/eve_public.gateway.Events/Ping" => {
             while let Some(chunk) = body.data().await {

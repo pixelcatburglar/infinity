@@ -3,7 +3,7 @@
 //! Authentication and gameplay validation are handled by request consumers.
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum FailureCode { BadRequest, Unauthorized, Forbidden, NotFound, PreconditionFailed, NotImplemented, Internal }
+pub(crate) enum FailureCode { BadRequest, Unauthorized, Forbidden, NotFound, PreconditionFailed, NotImplemented, Internal }
 impl FailureCode {
     pub(super) fn status(&self) -> u32 {
         let status = match self {
@@ -19,7 +19,7 @@ impl FailureCode {
     }
 }
 #[derive(Debug)]
-pub(super) enum GatewayError {
+pub(crate) enum GatewayError {
     Refused { code: FailureCode, message: &'static str },
     Database(crate::db::Error),
     Internal(anyhow::Error),

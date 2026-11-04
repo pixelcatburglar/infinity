@@ -69,14 +69,26 @@ pub struct Response {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct TargetGroup {
-    #[prost(bytes = "vec", optional, tag = "1")]
-    pub application_instance_uuid: Option<Vec<u8>>,
-    #[prost(uint32, optional, tag = "2")]
-    pub solar_system: Option<u32>,
-    #[prost(sint32, optional, tag = "3")]
-    pub user: Option<i32>,
-    #[prost(uint32, optional, tag = "4")]
-    pub character: Option<u32>,
+    #[prost(oneof = "target_group::Target", tags = "1, 2, 3, 4, 5, 6")]
+    pub target: Option<target_group::Target>,
+}
+
+pub mod target_group {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Target {
+        #[prost(bytes, tag = "1")]
+        ApplicationInstanceUuid(Vec<u8>),
+        #[prost(uint32, tag = "2")]
+        SolarSystem(u32),
+        #[prost(sint32, tag = "3")]
+        User(i32),
+        #[prost(uint32, tag = "4")]
+        Character(u32),
+        #[prost(uint32, tag = "5")]
+        Corporation(u32),
+        #[prost(int32, tag = "6")]
+        Alliance(i32),
+    }
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -93,6 +105,20 @@ pub struct Notice {
     pub payload: Option<prost_types::Any>,
     #[prost(message, optional, tag = "6")]
     pub target_group: Option<TargetGroup>,
+}
+
+impl Notice {
+    /// Encode the already-serialized Any without copying its value into another message.
+    pub(super) fn encode_with_payload(&self, payload: &[u8], buf: &mut impl bytes::BufMut) {
+        self.encode_raw(buf);
+        prost::encoding::encode_key(5, prost::encoding::WireType::LengthDelimited, buf);
+        prost::encoding::encode_varint(payload.len() as u64, buf);
+        buf.put_slice(payload);
+    }
+
+    pub(super) fn encoded_len_with_payload(&self, payload: &[u8]) -> usize {
+        self.encoded_len() + 1 + prost::encoding::encoded_len_varint(payload.len() as u64) + payload.len()
+    }
 }
 
 pub fn now_timestamp() -> prost_types::Timestamp {

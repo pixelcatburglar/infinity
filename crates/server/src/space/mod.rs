@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 mod actor;
+pub(crate) mod ship_cosmetics;
 pub(crate) mod system;
 mod projections;
 mod npc;
@@ -509,18 +510,23 @@ pub struct World {
     observers: Mutex<HashMap<i64, i64>>,
     pilots: Arc<Pilots>,
     weak: std::sync::Weak<World>,
+    notice_hub: crate::gateway::notices::NoticeHub,
 }
 impl World {
     pub fn new(db: Db, sde: Arc<Sde>, capacity: usize) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self { db, sde, systems: Default::default(),
-            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }), weak: weak.clone() })
+            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }),
+            weak: weak.clone(), notice_hub: crate::gateway::notices::NoticeHub::new() })
     }
+    pub(crate) fn notice_hub(&self) -> crate::gateway::notices::NoticeHub { self.notice_hub.clone() }
     pub fn sde(&self) -> &Arc<Sde> { &self.sde }
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
     pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: i64) {
         self.pilots.unregister_pilot_generation(char_id, Some(session_id));
     }
-    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<crate::session::OnlineSession>) { self.pilots.set_online_session(char_id, session); }
+    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<crate::session::OnlineSession>) {
+        self.pilots.set_online_session(char_id, session);
+    }
     pub(crate) fn online_session(&self, char_id: i64) -> Option<crate::session::OnlineSession> { self.pilots.online_session(char_id) }
     pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::OnlineSession> { self.pilots.station_guests(station_id) }
     pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }

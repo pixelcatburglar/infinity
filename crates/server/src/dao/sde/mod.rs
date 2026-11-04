@@ -20,6 +20,7 @@ pub(crate) mod industry;
 pub(crate) mod localization;
 pub(crate) mod map;
 pub(crate) mod missions;
+pub(crate) mod ship_skins;
 pub(crate) mod store;
 pub(crate) mod types;
 pub(crate) mod typelists;
