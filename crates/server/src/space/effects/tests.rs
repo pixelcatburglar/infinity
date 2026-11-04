@@ -276,3 +276,49 @@ fn tractor_restores_previous_follow_and_target_removal_releases_owner() {
     s.tick(4000);
     assert_eq!(s.ball(2).unwrap().mode, MODE_STOP);
 }
+
+#[test]
+fn tractor_restores_follow_with_nonfinite_legacy_max_speed() {
+    use std::sync::atomic::AtomicBool;
+    for legacy_speed in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut s = System::new(0, Arc::default(), 1000);
+        s.insert(ball(1, None, 1000.0));
+        s.insert(ball(3, None, -1000.0));
+        let mut target = ball(2, None, 0.0);
+        target.max_vel = legacy_speed;
+        target.mode = MODE_FOLLOW;
+        target.follow_id = 3;
+        target.follow_range = 12.0;
+        target.speed_fraction = 0.5;
+        s.insert(target);
+        let mut rx = watch(&mut s, 1, 2);
+        let generation = Arc::new(AtomicBool::new(false));
+        assert!(s.begin_tractor(2, 10, generation.clone(), 20.0, 0.0, 1));
+        s.tick(2000);
+        assert_eq!(s.ball(2).unwrap().max_vel, 20.0);
+        let begin_events = rx.try_recv().unwrap();
+        assert_eq!(begin_events.len(), 3);
+        assert_eq!(name(&begin_events[0]), b"SetMaxSpeed");
+        assert_eq!(name(&begin_events[1]), b"FollowBall");
+        assert_eq!(name(&begin_events[2]), b"SetSpeedFraction");
+        assert!(rx.try_recv().is_err());
+
+        let restore_stamp = s.current_time();
+        s.end_tractor(2, 10, &generation);
+        assert!(rx.try_recv().is_err());
+        s.tick(3000);
+        let restored = s.ball(2).unwrap();
+        assert_eq!(restored.max_vel, 20.0);
+        assert_eq!((restored.mode, restored.follow_id, restored.follow_range), (MODE_FOLLOW, 3, 12.0));
+        assert_eq!(restored.speed_fraction, 0.5);
+        let events = rx.try_recv().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(name(&events[0]), b"FollowBall");
+        assert_eq!(name(&events[1]), b"SetSpeedFraction");
+        for event in &events {
+            let Value::Tuple(parts) = event else { panic!("event tuple") };
+            assert_eq!(parts[0].as_int(), Some(restore_stamp));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+}

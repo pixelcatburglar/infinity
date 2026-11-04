@@ -287,6 +287,12 @@ Finite cycles expire after their duration plus exactly one destiny tick of
 grace; an indefinite duration has no expiry. Refreshes reevaluate Fit outside
 the actor and queue kinematics through destiny. Runtime state is lost on restart.
 
+Queued kinematic changes accept finite positive mass, finite positive agility
+that remains finite and positive as a 32-bit float, and finite nonnegative
+maximum speed that remains finite as a 32-bit float. Rejected values leave the
+corresponding ball property unchanged and produce no property action. Accepted
+changes do not instantaneously reset or scale velocity.
+
 A scram-blocked microwarpdrive is removed from the active Fit input immediately,
 while its running cycle remains owned until the normal stop publishes the real
 stop notification and performs its teardown. Ordinary deactivation continues

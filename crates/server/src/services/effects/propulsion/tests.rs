@@ -18,6 +18,7 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     system.observe(1, 1, tx);
     queue_kinematics(&mut system, 1, Kinematics { speed: 20.0, mass: 30.0, agility: 0.25, signature: 40.0 });
+    queue_kinematics(&mut system, 1, Kinematics { speed: f64::MAX, mass: 0.0, agility: f64::MIN_POSITIVE, signature: 40.0 });
     system.tick(12_999);
     assert_eq!(system.ball(1).unwrap().max_vel, 1.0);
     assert_eq!(system.ball(1).unwrap().agility, 1.0);
@@ -30,6 +31,7 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     assert_eq!(events[0], event(12, "SetMaxSpeed", vec![Value::Int(1), Value::Float(20.0)]));
     assert_eq!(events[1], event(12, "SetBallMass", vec![Value::Int(1), Value::Float(30.0)]));
     assert_eq!(events[2], event(12, "SetBallAgility", vec![Value::Int(1), Value::Float(0.25)]));
+    assert!(rx.try_recv().is_err());
     assert_eq!(system.current_time(), 13);
     use crate::services::effects::{projection::Projection, EffectKind, JammingType};
     let source = Ball { id: 2, ..system.ball(1).unwrap().clone() };
@@ -55,6 +57,62 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.queue_projection_kinematics(1, restored, Kinematics { speed: 20.0, mass: 30.0, agility: 0.25, signature: 40.0 });
     system.tick(16_000);
     assert_eq!(system.ball(1).unwrap().max_vel, 20.0);
+}
+
+#[test]
+fn refused_kinematics_preserve_moving_segment_and_wire_state() {
+    crate::tests::init_config();
+    let mut control = System::new(0, Arc::default(), 12_345);
+    let mut refused = System::new(0, Arc::default(), 12_345);
+    let ball = Ball {
+        id: 1, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: Some(40.0), mode: crate::space::MODE_GOTO,
+        radius: 1.0, mass: 30.0, max_vel: 20.0, agility: 0.25, speed_fraction: 0.75,
+        pos: [3.0, 4.0, 5.0], vel: [2.0, 3.0, 4.0], goto: [100.0, 200.0, 300.0], follow_id: 0,
+        old_pos: [3.0, 4.0, 5.0], old_vel: [2.0, 3.0, 4.0], segment_acceleration: None,
+        follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
+        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
+        cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    };
+    control.insert(ball.clone());
+    refused.insert(ball);
+    control.tick(13_000);
+    refused.tick(13_000);
+    queue_kinematics(&mut refused, 1, Kinematics {
+        speed: f64::NAN, mass: 0.0, agility: f64::NAN, signature: 40.0,
+    });
+    for time in [14_000, 14_500] {
+        control.tick(time);
+        refused.tick(time);
+        assert_eq!(control.current_time(), refused.current_time());
+        let expected = control.ball(1).unwrap();
+        let actual = refused.ball(1).unwrap();
+        assert_eq!((actual.pos, actual.vel), (expected.pos, expected.vel));
+        assert_eq!((actual.old_pos, actual.old_vel, actual.segment_acceleration),
+            (expected.old_pos, expected.old_vel, expected.segment_acceleration));
+        assert_eq!((actual.mode, actual.speed_fraction), (expected.mode, expected.speed_fraction));
+        assert_eq!(actual.mode, crate::space::MODE_GOTO);
+        assert_eq!(actual.speed_fraction, 0.75);
+        let expected = control.sampled_ball(1).unwrap();
+        let actual = refused.sampled_ball(1).unwrap();
+        assert_eq!((actual.pos, actual.vel), (expected.pos, expected.vel));
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (refused_tx, _refused_rx) = tokio::sync::mpsc::unbounded_channel();
+        let control_state = control.observe(1, 1, control_tx);
+        let refused_state = refused.observe(1, 1, refused_tx);
+        assert_eq!(state_bytes(&control_state), state_bytes(&refused_state));
+    }
+}
+
+fn state_bytes(state: &Value) -> &[u8] {
+    let Value::Tuple(parts) = state else { panic!("event") };
+    let Value::Tuple(call) = &parts[1] else { panic!("call") };
+    let Value::Tuple(args) = &call[1] else { panic!("args") };
+    let Value::Instance(_, bag) = &args[0] else { panic!("bag") };
+    let Value::Dict(fields) = &**bag else { panic!("fields") };
+    let Value::Bytes(bytes) = &fields.iter().find(|(key, _)| key == &Value::str("state")).unwrap().1
+        else { panic!("state") };
+    bytes
 }
 
 #[tokio::test]

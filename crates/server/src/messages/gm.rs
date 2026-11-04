@@ -134,6 +134,7 @@ pub(crate) const GM_DOGMA_FORBIDDEN_TARGET: &str = "不能修改弹药、角色�
 pub(crate) const GM_DOGMA_RUNTIME: &str = "此属性由运行状态管理；护盾、装甲和结构请使用 /heal，在线状态请使用模块在线开关。";
 pub(crate) const GM_DOGMA_CHARACTER: &str = "角色属性不能通过 /dogma 修改。";
 pub(crate) const GM_DOGMA_ACTIVE_CYCLE: &str = "运行中的模块不能修改周期属性；请先关闭模块。";
+pub(crate) const GM_DOGMA_KINEMATIC_INVALID: &str = "运动属性数值无效：质量和灵活性必须为正数，最大速度不能为负数，且数值必须在可表示范围内。";
 pub(crate) const GM_DOGMA_VISIBILITY: &str = "模块或船体原本没有的属性不会显示在装配窗口和 HUD 最大值中。";
 pub(crate) const GM_DOGMA_BASE_ONLY: &str = "目标不在当前装配中；仅显示基础值，实际有效值取决于其装配和驾驶员。";
 pub(crate) const GM_DOGMA_EMPTY: &str = "没有属性覆盖。";

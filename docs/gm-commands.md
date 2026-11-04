@@ -59,6 +59,16 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 
 Arguments may be quoted to include spaces. Lists longer than 50 rows show the first 50 and the number left out.
 
+For `/dogma` writes, mass must be finite and positive; agility must be finite
+and remain finite and positive when converted to a 32-bit float; maximum velocity
+must be finite and nonnegative and remain finite as a 32-bit float. Invalid
+values are refused before writing, whether the attribute is named or identified
+numerically. Queries and resets remain available; reset can repair an existing
+invalid override, which is not rewritten automatically.
+Mass has no additional numerical floor or ceiling beyond the positive-finite
+server boundary. Extreme accepted masses follow native motion math, which does
+not guarantee finite motion for every finite mass.
+
 ## SKIN administration
 
 These are client GML tools using `shipCosmeticsMgr`, not slash commands. They require the exact GML role and operate on the current character:

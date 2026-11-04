@@ -31,14 +31,35 @@ impl Ball {
         if fraction.is_finite() { self.speed_fraction = fraction.clamp(0.0, 1.0); }
     }
 
+    pub(crate) fn valid_agility(value: f64) -> bool {
+        value.is_finite() && (value as f32).is_finite() && (value as f32) > 0.0
+    }
+
+    pub(crate) fn valid_mass(value: f64) -> bool { value.is_finite() && value > 0.0 }
+
+    pub(crate) fn valid_max_speed(value: f64) -> bool {
+        value.is_finite() && (value as f32).is_finite() && value >= 0.0
+    }
+
     /// Ballpark::SetMaxSpeed, with finite validation at the server boundary.
-    pub fn set_max_speed(&mut self, speed: f32) {
-        if speed.is_finite() && speed >= 0.0 { self.max_vel = speed; }
+    pub fn set_max_speed(&mut self, speed: f64) -> bool {
+        if !Self::valid_max_speed(speed) { return false; }
+        self.max_vel = speed as f32;
+        true
     }
 
     /// Ballpark::SetBallMass, with finite validation at the server boundary.
-    pub fn set_ball_mass(&mut self, mass: f64) {
-        if mass.is_finite() && mass > 0.0 { self.mass = mass; }
+    pub fn set_ball_mass(&mut self, mass: f64) -> bool {
+        if !Self::valid_mass(mass) { return false; }
+        self.mass = mass;
+        true
+    }
+
+    /// Ballpark::SetBallAgility, with finite validation at the server boundary.
+    pub fn set_ball_agility(&mut self, agility: f64) -> bool {
+        if !Self::valid_agility(agility) { return false; }
+        self.agility = agility as f32;
+        true
     }
 }
 
