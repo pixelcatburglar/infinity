@@ -3,6 +3,7 @@
 //! exercise only `game` rows and do not cover service or gateway behavior.
 use super::*;
 mod lifecycle;
+mod expiry;
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]

@@ -116,6 +116,7 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
 async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError> {
     let r = characters::selection::selected(&c.db, char_id, c.login.user_id).await.map_err(db_err)?
         .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
+    super::ship_cosmetics_mgr::expiry::converge(&c.db, &c.world, char_id, crate::client::filetime_now()).await?;
     let station = r.station_id;
     let system = r.solar_system_id;
     let race = r.race_id;

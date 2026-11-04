@@ -97,6 +97,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
         crate::scheduler::register(corps::vote_close::KIND, corps::vote_close::handle),
         crate::scheduler::register(subscriptions::deadlines::KIND, subscriptions::deadlines::handle),
+        crate::scheduler::register(ship_cosmetics_mgr::expiry::KIND, ship_cosmetics_mgr::expiry::handle),
         crate::scheduler::register(skills::alpha_injections::KIND, skills::alpha_injections::handle),
     ]
 }

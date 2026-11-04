@@ -22,6 +22,26 @@ impl License {
     }
 }
 
+pub(crate) struct Application {
+    pub ship_item_id: i64,
+    pub type_id: i32,
+    pub location_id: i64,
+}
+
+impl Application {
+    fn from_row(row: &Row) -> Self {
+        Self {
+            ship_item_id: row.get("ship_item_id"), type_id: row.get("type_id"),
+            location_id: row.get("location_id"),
+        }
+    }
+}
+
+pub(crate) struct RemovedLicense {
+    pub skin_id: i32,
+    pub applications: Vec<Application>,
+}
+
 pub(crate) struct ShipState {
     pub ship_item_id: i64,
     pub type_id: i32,
@@ -50,6 +70,30 @@ pub(crate) async fn get_license(ex: &(impl Executor + ?Sized), character_id: i64
 
 pub(crate) async fn get_stored_license(ex: &(impl Executor + ?Sized), character_id: i64, skin_id: i32) -> Result<Option<License>, Error> {
     Ok(ex.query_opt("SELECT skin_id, expires_at FROM game.ship_skin_licenses WHERE character_id=$1 AND skin_id=$2", &[&character_id, &skin_id]).await?.as_ref().map(License::from_row))
+}
+
+pub(crate) async fn applications_for_character(ex: &(impl Executor + ?Sized), character_id: i64) -> Result<Vec<Application>, Error> {
+    Ok(ex.query("SELECT a.ship_item_id, i.type_id, i.location_id FROM game.ship_skin_applications a JOIN game.items i ON i.item_id=a.ship_item_id WHERE a.character_id=$1 ORDER BY a.ship_item_id", &[&character_id]).await?.iter().map(Application::from_row).collect())
+}
+
+pub(crate) async fn due_licenses(ex: &(impl Executor + ?Sized), character_id: i64, now: i64) -> Result<Vec<License>, Error> {
+    Ok(ex.query("SELECT l.skin_id, l.expires_at FROM game.ship_skin_licenses l JOIN game.characters c ON c.character_id=l.character_id WHERE l.character_id=$1 AND NOT c.deleted AND l.expires_at < $2 ORDER BY l.skin_id", &[&character_id, &now]).await?.iter().map(License::from_row).collect())
+}
+
+pub(crate) async fn remove_license(ex: &(impl Executor + ?Sized), character_id: i64, skin_id: i32, expires_before: Option<i64>) -> Result<Option<RemovedLicense>, Error> {
+    let rows = ex.query("WITH applications AS MATERIALIZED (SELECT a.ship_item_id, i.type_id, i.location_id FROM game.ship_skin_applications a JOIN game.items i ON i.item_id=a.ship_item_id WHERE a.character_id=$1 AND a.skin_id=$2), removed AS (DELETE FROM game.ship_skin_licenses WHERE character_id=$1 AND skin_id=$2 AND ($3::bigint IS NULL OR expires_at < $3) RETURNING skin_id) SELECT r.skin_id AS removed_skin_id, a.ship_item_id, a.type_id, a.location_id FROM removed r LEFT JOIN applications a ON true ORDER BY a.ship_item_id", &[&character_id, &skin_id, &expires_before]).await?;
+    Ok(rows.first().map(|first| RemovedLicense {
+        skin_id: first.get("removed_skin_id"),
+        applications: rows.iter().filter(|row| row.get::<_, Option<i64>>("ship_item_id").is_some()).map(Application::from_row).collect(),
+    }))
+}
+
+pub(crate) async fn next_expiry(ex: &(impl Executor + ?Sized), character_id: i64) -> Result<Option<i64>, Error> {
+    Ok(ex.query_one("SELECT MIN(l.expires_at) AS expires_at FROM game.ship_skin_licenses l JOIN game.characters c ON c.character_id=l.character_id WHERE l.character_id=$1 AND NOT c.deleted", &[&character_id]).await?.get("expires_at"))
+}
+
+pub(crate) async fn finite_characters(ex: &(impl Executor + ?Sized)) -> Result<Vec<i64>, Error> {
+    Ok(ex.query("SELECT DISTINCT l.character_id FROM game.ship_skin_licenses l JOIN game.characters c ON c.character_id=l.character_id WHERE l.expires_at IS NOT NULL AND NOT c.deleted ORDER BY l.character_id", &[]).await?.iter().map(|row| row.get("character_id")).collect())
 }
 
 pub(crate) async fn update_expiry(ex: &(impl Executor + ?Sized), character_id: i64, skin_id: i32, expected: Option<i64>, expires: Option<i64>) -> Result<bool, Error> {

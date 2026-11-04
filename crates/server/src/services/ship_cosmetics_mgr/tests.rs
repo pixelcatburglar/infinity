@@ -1,6 +1,13 @@
 //! Argument and wire-shape coverage for first-party SKIN calls.
 use super::*;
 
+mod deadlines;
+mod removal;
+mod timed;
+
+fn call<'a>(method: &'a str, args: &'a [Value], kwargs: &'a Value) -> Call<'a> {
+    Call { service: "shipCosmeticsMgr", method, args, kwargs, bound: false, bind_params: None }
+}
 #[test]
 fn strict_activation_arguments() {
     assert_eq!(activation_ids(&[Value::list([Value::Int(2), Value::Int(1)])]).unwrap(), vec![1, 2]);
@@ -78,7 +85,7 @@ async fn permanent_activation_and_application() {
     let reach = Reachability::capture(&identity, &db, &c.world, None, &[endpoint]).await.unwrap();
     db.execute("UPDATE game.items SET location_id=$2 WHERE item_id=$1", &[&first, &fixture.character]).await.unwrap();
     let mut outbox: Outbox = Outbox::default();
-    assert!(licenses::activate_tx(&db, &identity, &c.sde, &c.cfg.server.boot_region, &reach, &[first], &mut outbox).await.is_err());
+    assert!(licenses::activate_tx(&db, &identity, &c.sde, &c.cfg.server.boot_region, &reach, &[first], filetime_now(), &mut outbox).await.is_err());
     db.execute("UPDATE game.items SET location_id=$2 WHERE item_id=$1", &[&first, &station]).await.unwrap();
     assert!(ship_skins::insert_license(&db, fixture.character, skin, Some(filetime_now() - 1)).await.unwrap());
     assert_eq!(activate(&mut c, vec![first]).await.unwrap(), Value::None);
