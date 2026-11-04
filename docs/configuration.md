@@ -37,6 +37,7 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `lua.mod_dirs` | | `[]` | More directories to load scripts from, each like `lua.scripts_dir`: its top-level scripts load in name order, and `require` finds modules only in the script's own directory. Two scripts with the same name stop the load |
 | `lua.memory_limit_mb`, `.call_budget_ms`, `.call_budget_instructions`, `.instruction_hook_interval` | | `64`, `1000`, `5000000`, `1000` | Lua VM memory, and the time and instructions one call may use (counted every `instruction_hook_interval` instructions). A call over budget fails; a game change it already started still completes. |
 | `lua.store_value_limit_bytes` | | `65536` | Largest value a script may keep in its persistent store |
+| `lua.data_file_limit_bytes` | | `4194304` | Maximum bytes in one `data.load` JSON file; must be nonzero. No environment override. |
 | `lua.scripts.<name>` | | none | Settings only the script `<name>` can read |
 
 Some keys switch behaviour on or off rather than set a number:

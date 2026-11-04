@@ -9,6 +9,24 @@ loading rules: subdirectories can contain text modules for `require`, but are
 not loaded as scripts. `require` is confined to the canonical root of the
 calling script and cannot resolve modules from another root.
 
+`data.load("catalog.items")` reads `catalog/items.json` under the calling
+script's canonical root. Names consist of nonempty dot-separated segments of
+ASCII letters, digits and underscores. It cannot read another root or follow
+symlinks outside its own root. JSON files and subdirectories are not discovered
+as scripts.
+
+JSON objects become string-keyed Lua tables and arrays become 1-based tables.
+Signed integers become Lua integers; other numbers become floats. Strings and
+booleans retain their values. JSON null and nesting deeper than 64 are rejected.
+The file is bounded before parsing by `lua.data_file_limit_bytes` (default
+4194304 bytes, 4 MiB), separately from the normal Lua VM memory limit, which
+also counts allocations for the decoded Lua result. Failures are runtime errors
+naming the data; JSON parse errors include the serde line and column.
+
+There is no host data cache: every `data.load` call reads the file afresh.
+If a module calls it at top level, `require` caches the module's result; reload
+recreates the modules and reads the data again.
+
 Script names are file stems and must be unique across all roots. Duplicate names
 fail startup or reload, reporting both source paths. Settings and persistent
 store namespaces remain keyed by script name, not by root. Set `[lua] enabled =

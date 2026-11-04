@@ -76,6 +76,7 @@ call_budget_ms = 1000               # Maximum wall-clock time per call.
 call_budget_instructions = 5000000  # Maximum Lua instructions per call.
 instruction_hook_interval = 1000    # Instruction hook frequency.
 store_value_limit_bytes = 65536     # Maximum encoded value size in the script store.
+data_file_limit_bytes = 4194304     # Maximum bytes in one data.load JSON file; must be nonzero.
 # [lua.scripts.motd]                # Arbitrary per-script TOML settings.
 
 # Game parameters have no environment overrides.

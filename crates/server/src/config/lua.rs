@@ -16,6 +16,8 @@ pub struct LuaConfig {
     pub call_budget_instructions: u64,
     pub instruction_hook_interval: u32,
     pub store_value_limit_bytes: usize,
+    /// Server policy: maximum bytes read for one authored Lua data snapshot; the measured 340636-byte snapshot is roughly twelve times smaller.
+    pub data_file_limit_bytes: usize,
     pub scripts: HashMap<String, toml::Table>,
 }
 
@@ -31,6 +33,7 @@ impl Default for LuaConfig {
             call_budget_instructions: 5_000_000,
             instruction_hook_interval: 1000,
             store_value_limit_bytes: 65536,
+            data_file_limit_bytes: 4 * 1024 * 1024,
             scripts: HashMap::new(),
         }
     }
@@ -46,6 +49,7 @@ impl LuaConfig {
         anyhow::ensure!(self.instruction_hook_interval > 0, "lua.instruction_hook_interval must be nonzero");
         anyhow::ensure!(u64::from(self.instruction_hook_interval) <= self.call_budget_instructions, "lua.instruction_hook_interval exceeds lua.call_budget_instructions");
         anyhow::ensure!(self.store_value_limit_bytes > 0, "lua.store_value_limit_bytes must be nonzero");
+        anyhow::ensure!(self.data_file_limit_bytes > 0, "lua.data_file_limit_bytes must be nonzero");
         Ok(())
     }
 }

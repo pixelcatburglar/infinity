@@ -4,7 +4,7 @@ use super::*;
 fn sandbox_hides_native_and_budget_escape_paths() -> mlua::Result<()> {
     let lua = Lua::new();
     let root = std::env::current_dir().unwrap().canonicalize().unwrap();
-    let env = environment(&lua, &root)?;
+    let env = environment(&lua, &root, LuaConfig::default().data_file_limit_bytes)?;
     let safe: bool = lua.load("return io == nil and debug == nil and package == nil and load == nil and loadfile == nil and dofile == nil and coroutine == nil and type(pcall) == 'function' and type(xpcall) == 'function' and getmetatable == nil and string.dump == nil and os.execute == nil and type(os.time) == 'function'").set_environment(env.clone()).eval()?;
     assert!(safe);
     assert!(lua.load("return require('../outside')").set_environment(env.clone()).eval::<mlua::Value>().is_err());
@@ -50,7 +50,7 @@ fn required_module_runs_under_callers_instruction_budget() -> mlua::Result<()> {
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("loop.lua"), "local x = 0; for i = 1, 10000000 do x = x + i end; return x").unwrap();
     let lua = Lua::new();
-    let env = environment(&lua, &dir.canonicalize().unwrap())?;
+    let env = environment(&lua, &dir.canonicalize().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..LuaConfig::default() };
     let function = lua.load("return require('loop')").set_environment(env).into_function()?;
     let result = budgeted_thread(&lua, function, &config, Instant::now() + Duration::from_secs(60))?.resume::<mlua::Value>(());
@@ -62,7 +62,7 @@ fn required_module_runs_under_callers_instruction_budget() -> mlua::Result<()> {
 #[test]
 fn protected_calls_preserve_results_and_ordinary_errors() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     lua.load(r#"
         local ok, err = pcall(function() error('ordinary') end)
         assert(not ok and string.find(err, 'ordinary', 1, true))
@@ -89,7 +89,7 @@ fn protected_calls_preserve_results_and_ordinary_errors() -> mlua::Result<()> {
 #[test]
 fn protected_calls_cannot_catch_typed_budget_errors() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..LuaConfig::default() };
     for source in [
         "pcall(function() while true do end end)",
@@ -107,7 +107,7 @@ fn protected_calls_cannot_catch_typed_budget_errors() -> mlua::Result<()> {
 #[test]
 fn protected_handler_budget_at_each_instruction_boundary() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     for maximum in 1..=128 {
         let config = LuaConfig { call_budget_instructions: maximum, instruction_hook_interval: 1, ..LuaConfig::default() };
         let function = lua.load("pcall(function() xpcall(function() error('ordinary') end, function() while true do end end) end)").set_environment(env.clone()).into_function()?;
@@ -120,7 +120,7 @@ fn protected_handler_budget_at_each_instruction_boundary() -> mlua::Result<()> {
 #[test]
 fn caught_memory_exhaustion_keeps_allocator_limit() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     let limit = lua.used_memory() + 256 * 1024;
     lua.set_memory_limit(limit)?;
     let (first, second, used): (bool, bool, f64) = lua.load(r#"
@@ -139,7 +139,7 @@ fn required_module_uses_safe_protected_calls() -> mlua::Result<()> {
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("module.lua"), "return pcall(function() return 42 end) and type(xpcall) == 'function'").unwrap();
     let lua = Lua::new();
-    let env = environment(&lua, &dir.canonicalize().unwrap())?;
+    let env = environment(&lua, &dir.canonicalize().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     let result = lua.load("return require('module')").set_environment(env).eval::<bool>();
     std::fs::remove_dir_all(dir).unwrap();
     assert!(result?);
@@ -149,7 +149,7 @@ fn required_module_uses_safe_protected_calls() -> mlua::Result<()> {
 #[tokio::test]
 async fn protected_calls_yield_and_retain_invocation_budget() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     env.set("wait", lua.create_async_function(|_, ()| async {
         tokio::task::yield_now().await;
         Ok(42)
@@ -175,7 +175,7 @@ async fn protected_calls_yield_and_retain_invocation_budget() -> mlua::Result<()
 #[tokio::test(start_paused = true)]
 async fn protected_async_call_obeys_no_context_deadline() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     env.set("wait", lua.create_async_function(|_, ()| async {
         std::future::pending::<mlua::Result<()>>().await
     })?)?;
@@ -196,7 +196,7 @@ async fn protected_async_call_obeys_no_context_deadline() -> mlua::Result<()> {
 #[test]
 fn retained_registration_is_closed_for_all_claims() -> mlua::Result<()> {
     let lua = Lua::new();
-    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let env = environment(&lua, &std::env::current_dir().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
     let open = Arc::new(AtomicBool::new(true));
     register_claims(&lua, &env, claims.clone(), "test".into(), open.clone())?;
@@ -315,7 +315,7 @@ fn bundled_reference_scripts_return_expected_wire_values() -> mlua::Result<()> {
     use marshal::Value as Wire;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("lua").canonicalize().unwrap();
     let lua = Lua::new();
-    let env = environment(&lua, &root)?;
+    let env = environment(&lua, &root, LuaConfig::default().data_file_limit_bytes)?;
     value::register(&lua, &env)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
     let open = Arc::new(AtomicBool::new(true));
@@ -351,7 +351,7 @@ fn bundled_reference_scripts_return_expected_wire_values() -> mlua::Result<()> {
 fn bundled_motd_uses_current_command_and_notification_protocol() -> mlua::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("lua").canonicalize().unwrap();
     let lua = Lua::new();
-    let env = environment(&lua, &root)?;
+    let env = environment(&lua, &root, LuaConfig::default().data_file_limit_bytes)?;
     value::register(&lua, &env)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
     let open = Arc::new(AtomicBool::new(true));
@@ -416,8 +416,8 @@ fn requires_are_isolated_by_root_and_reject_escape() -> mlua::Result<()> {
     std::fs::write(first.join("lib/shared.lua"), "return 'first'").unwrap();
     std::fs::write(second.join("lib/shared.lua"), "return 'second'").unwrap();
     let lua = Lua::new();
-    let a = environment(&lua, &first.canonicalize().unwrap())?;
-    let b = environment(&lua, &second.canonicalize().unwrap())?;
+    let a = environment(&lua, &first.canonicalize().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
+    let b = environment(&lua, &second.canonicalize().unwrap(), LuaConfig::default().data_file_limit_bytes)?;
     assert_eq!(lua.load("return require('lib.shared')").set_environment(a.clone()).eval::<String>()?, "first");
     assert_eq!(lua.load("return require('lib.shared')").set_environment(b.clone()).eval::<String>()?, "second");
     assert!(lua.load("return require('../second/lib/shared')").set_environment(a).eval::<String>().is_err());
@@ -437,7 +437,7 @@ fn require_and_script_symlinks_cannot_escape_their_root() -> mlua::Result<()> {
     std::fs::write(&outside, "return 42").unwrap();
     symlink(&outside, root.join("escape.lua")).unwrap();
     let lua = Lua::new();
-    let env = environment(&lua, &root.canonicalize().unwrap())?;
+    let env = environment(&lua, &root, LuaConfig::default().data_file_limit_bytes)?;
     let require: Function = env.get("require")?;
     assert!(require.call::<mlua::Value>("escape").is_err());
     let config = LuaConfig { scripts_dir: root.to_string_lossy().into_owned(), ..Default::default() };
@@ -445,3 +445,6 @@ fn require_and_script_symlinks_cannot_escape_their_root() -> mlua::Result<()> {
     std::fs::remove_dir_all(dir).unwrap();
     Ok(())
 }
+
+#[path = "data/tests.rs"]
+mod data;

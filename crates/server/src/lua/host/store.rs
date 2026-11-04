@@ -85,7 +85,7 @@ fn decode_stored(lua: &Lua, value: &str, key: &str, limit: usize) -> Result<Valu
     if value.len() > limit.saturating_mul(2) { return Err(mlua::Error::runtime(format!("store value at {key} exceeds {limit} bytes"))); }
     let value: serde_json::Value = serde_json::from_str(value).map_err(|error| mlua::Error::runtime(format!("invalid store value at {key}: {error}")))?;
     charge_json(&value, &mut limit.clone(), key)?;
-    decode(lua, value, key, 0)
+    decode(lua, value, &format!("store value at {key}"), 0)
 }
 
 fn sequence_keys(table: Table) -> Result<Vec<String>> {
