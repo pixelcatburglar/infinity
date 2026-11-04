@@ -28,6 +28,7 @@ pub(crate) mod expert_systems;
 pub(crate) mod heat;
 pub(crate) mod industry;
 pub(crate) mod mining;
+pub(crate) mod lookup;
 pub(crate) mod missions;
 pub(crate) mod mail;
 pub(crate) mod map;
