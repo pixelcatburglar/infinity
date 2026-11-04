@@ -20,6 +20,7 @@ pub(crate) mod drones;
 pub(crate) mod effects;
 pub(crate) mod dynamic_items;
 pub(crate) mod exploration;
+pub(crate) mod faction_warfare;
 pub(crate) mod fitting;
 pub(crate) mod fleets;
 pub(crate) mod gateway;

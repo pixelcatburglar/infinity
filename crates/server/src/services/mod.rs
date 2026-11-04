@@ -41,6 +41,7 @@ mod expert_systems;
 mod event_log;
 pub(crate) mod fit;
 mod fixed;
+mod fw_victory_point_mgr;
 pub(crate) mod fleets;
 mod fitting;
 mod hacking;
@@ -485,6 +486,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = agency::dispatch(c, call).await {
                 return r;
             }
+            if let Some(r) = fw_victory_point_mgr::dispatch(c, call) { return r; }
             if let Some(r) = npe::dispatch(c, call).await {
                 return r;
             }

@@ -17,12 +17,24 @@
 //! `loginrewards/client/loginCampaignService.py` receives no campaign or claim.
 //! Inventory configuration and item-price writes/reads are explicitly refused;
 //! crystal damage is handled by the inventory feature module.
+//! `facWarSvc.py`, `facwarCommon.py` and `shipcasterSvc.py` consume closed
+//! warfare statistics, warzone points and projector lists; no warfare or projector
+//! state is modelled.
 
-use super::{notify_error, rowset, Call, CallResult};
+use super::{keyval, notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
+use crate::consts::{GROUP_ALLIANCE, GROUP_CHARACTER, GROUP_CORPORATION};
 use marshal::Value;
 /// Client paperdoll.State.no_recustomization.
 const PAPERDOLL_NO_RECUSTOMIZATION: i64 = 0;
+/// Closed-warzone server policy: facwarCommon.GetDonationTax requires a nonzero denominator.
+const CLOSED_WARZONE_MAX_POINTS: i64 = 1;
+
+fn empty_warfare_stats() -> Value {
+    Value::Dict([GROUP_CHARACTER, GROUP_CORPORATION, GROUP_ALLIANCE].into_iter().map(|group| {
+        (Value::Int(group), Value::dict(["killsY", "killsLW", "killsTotal", "vpY", "vpLW", "vpTotal"].map(|key| (key, Value::Int(0)))))
+    }).collect())
+}
 
 /// CPython 2.7 code flags: CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE.
 const SETTINGS_CODE_FLAGS: i32 = 0x43;
@@ -74,6 +86,14 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("map", "GetBeaconCount") => Value::Dict(vec![]),
         ("map", "GetIndustryJobsOverLast") => rowset(&history_header, vec![]),
         ("map", "GetInsurgencySystem") => Value::list([]),
+        // facWarSvc reads the upgrade map and faction points; the denominator must be nonzero.
+        ("map", "GetFacWarZoneInfo") => keyval([("systemUpgradeLevel", Value::Dict(vec![])), ("factionPoints", Value::Int(0)), ("maxWarZonePoints", Value::Int(CLOSED_WARZONE_MAX_POINTS))]),
+        // facWarSvc reads killsY, killsLW, killsTotal, vpY, vpLW and vpTotal for each owner group.
+        ("facWarMgr", "GetStats_TopAndAllKillsAndVPs") => Value::tuple([empty_warfare_stats(), empty_warfare_stats()]),
+        ("facWarMgr", "GetStats_Character" | "GetStats_Corp" | "GetStats_Alliance") => Value::Dict(vec![]),
+        // shipcasterSvc iterates these lists; closed projectors have no pads or factions.
+        ("shipCasterLandingPadMgr", "GetFactionLandingPads" | "GetAllLandingPads")
+        | ("shipCasterLauncherMgr", "GetFactionsWithShipcaster") => Value::list([]),
         ("map", "GetAllRoamingWeatherSystems") => Value::Dict(vec![]),
         ("map", "GetTriglavianMinorVictorySystems") | ("map", "GetEdencomMinorVictorySystems") | ("map", "GetEdencomFortressSystems") => {
             Value::list([])

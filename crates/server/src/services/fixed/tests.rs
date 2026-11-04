@@ -92,3 +92,16 @@ fn character_structure_directory_is_an_empty_dict() {
         assert!(universe(&call).is_none());
     }
 }
+
+#[test]
+fn warfare_fixed_answers_only_claim_the_named_calls() {
+    let kwargs = Value::None;
+    for (service, method) in [
+        ("map", "unknown"), ("facWarMgr", "unknown"),
+        ("shipCasterLandingPadMgr", "unknown"), ("shipCasterLauncherMgr", "unknown"),
+        ("other", "GetFactionLandingPads"), ("other", "GetFacWarZoneInfo"),
+    ] {
+        let call = Call { service, method, args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+        assert!(universe(&call).is_none());
+    }
+}
