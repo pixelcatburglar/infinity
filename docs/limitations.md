@@ -47,6 +47,7 @@
 - The client reads the Omega end date in two units: its clone-grade service expects Unix nanoseconds and the character selection screen expects Windows FILETIME. The server sends Unix nanoseconds, so the Omega time left on character selection is wrong. An Omega grade with no end date is sent as 31 December 2100.
 - Mailing lists are free: a request to charge for mail to a list is refused. A list's owner cannot hand it over. List names are compared after PostgreSQL folds their case, which can differ from the client for a few Unicode letters.
 - Search words are checked against the client's moderation rules. Where a rule ignores case, the server also treats the Kelvin sign (U+212A) and the long s (U+017F) as the letters k and s, which the client does not, so a search containing them can be refused where the client would allow it.
+- A public gateway request, such as a skill plan change, is checked against the calling account and character, not against one game session. A request sent just before a relog therefore applies to the character's state after it.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, with their finder adverts, member options and watchlists; combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space except ships (NPCs, wrecks, scheduled effects);
