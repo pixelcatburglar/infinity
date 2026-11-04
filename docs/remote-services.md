@@ -189,6 +189,19 @@ The character's player-structure directory is empty because player structures ar
 
 Station clones keep their own implants. Ship clone bays and player structures are not implemented yet: the ship clone state is empty, the structure clone count is zero, and installing a clone in a structure is refused with a message.
 
+## Inventory
+
+| service | method | status | handler file |
+|---|---|---|---|
+| invbroker | GetDamageForCrystals | handled | `crates/server/src/services/inventory/inv_broker.rs` |
+| invbroker | SetLabel | handled | `crates/server/src/services/inventory/inv_broker.rs` |
+| invbroker | TrashItems | handled | `crates/server/src/services/inventory/inv_broker.rs` |
+| invInventory | ALSCConfigGet | fixed | `crates/server/src/services/fixed.rs` |
+| invInventory | ALSCConfigSet | out-of-scope | `crates/server/src/services/fixed.rs` |
+| invInventory | GetPriceForItems | out-of-scope | `crates/server/src/services/fixed.rs` |
+
+Audit log secure containers report that they are not configured; saving their configuration and `GetPriceForItems` are refused.
+
 ## Crates
 
 | service | method | status | handler file |
