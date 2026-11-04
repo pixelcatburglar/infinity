@@ -55,6 +55,7 @@ upstream_timeout_secs = 10          # server upstream image request timeout
 
 [gateway]
 bind = "0.0.0.0:26002"              # env: GATEWAY_BIND; existing public gateway listener
+notice_queue_capacity = 256         # env: GATEWAY_NOTICE_QUEUE_CAPACITY; per-stream bounded notice queue
 
 [cdn]
 bind = "0.0.0.0:80"                 # env: CDN_BIND; existing plain HTTP content listener

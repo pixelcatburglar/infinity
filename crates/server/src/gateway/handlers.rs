@@ -2,7 +2,7 @@
 //! Uses descriptors, CDN data and DAO-backed handlers; unknown requests retain
 //! the existing fallback behavior and do not claim future feature methods.
 use prost_reflect::DynamicMessage;
-use super::{context::HandlerContext, achievements, character_titles, space_content, career_goals, insurgency, characters, plex, skill_plans, error::GatewayError, message::{message, response_name}};
+use super::{context::HandlerContext, achievements, character_titles, space_content, career_goals, insurgency, characters, plex, skill_plans, ship_cosmetics, error::GatewayError, message::{message, response_name}};
 
 #[derive(Clone, Copy)]
 enum Route {
@@ -16,6 +16,7 @@ enum Route {
     CharacterNamesByUser,
     PlexBalance,
     PersonalSkillPlan,
+    ShipCosmetics,
 }
 
 const CLAIMS: &[(&str, Route)] = &[
@@ -28,6 +29,8 @@ const CLAIMS: &[(&str, Route)] = &[
     ("eve_public.pirate.suppression.api.GetStageThresholdsRequest", Route::Suppression),
     ("eve_public.character.GetNamesByUserRequest", Route::CharacterNamesByUser),
     ("eve_public.plex.vault.api.BalanceRequest", Route::PlexBalance),
+    ("eve_public.cosmetic.ship.api.GetRequest", Route::ShipCosmetics),
+    ("eve_public.cosmetic.ship.api.GetAllInBubbleRequest", Route::ShipCosmetics),
     ("eve_public.character.skill.plan.CreateRequest", Route::PersonalSkillPlan),
     ("eve_public.character.skill.plan.GetAllRequest", Route::PersonalSkillPlan),
     ("eve_public.character.skill.plan.GetRequest", Route::PersonalSkillPlan),
@@ -46,6 +49,7 @@ pub(super) fn validate() -> anyhow::Result<()> {
         let response = response_name(name).expect("claimed request name");
         anyhow::ensure!(message(&response).is_some(), "missing response descriptor {response}");
     }
+    ship_cosmetics::validate()?;
     Ok(())
 }
 
@@ -64,6 +68,7 @@ pub(super) async fn handle(ctx: &HandlerContext<'_>, name: &str, req: &DynamicMe
         Route::CharacterNamesByUser => characters::names_by_user(ctx).await,
         Route::PlexBalance => plex::plex_balance(ctx).await,
         Route::PersonalSkillPlan => skill_plans::personal::skill_plan(ctx, name, req).await,
+        Route::ShipCosmetics => ship_cosmetics::handle(ctx, name, req).await,
     };
     Dispatch::Claimed(result)
 }

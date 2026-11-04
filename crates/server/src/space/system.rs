@@ -444,12 +444,14 @@ impl System {
         self.actions.push_back((self.current_time, Box::new(move |s, _| s.drone_launch_acks.push(ack))));
     }
     pub fn add_ship(&mut self, mut ball: Ball) {
+        let ship = ball.id;
         ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
         if ball.cloak == 0 {
             let update = add_balls_event(self.current_time, &ball, collision::enabled());
             self.actions.push_back((self.current_time, Box::new(move |s, _| s.deliver(None, vec![update]))));
         }
         self.insert(ball);
+        super::ship_cosmetics::announce(self, ship);
     }
     /// Insert a neutral missile now, then launch and start its impact timer at the next destiny boundary.
     pub fn launch_missile(&mut self, ball: Ball, target: i64, launcher: i64, delay_ms: u64,
@@ -678,12 +680,14 @@ impl System {
                 tx.send(updates).is_ok()
             }
         });
+        super::ship_cosmetics::announce(self, ship);
     }
     pub fn observe(&mut self, client_id: i64, ego: i64, tx: DestinyTx) -> Value {
         let system_id = self.id;
         let tick = self.current_time;
         let collisions = collision::enabled();
         self.observers.insert(client_id, (ego, tx));
+        super::ship_cosmetics::observe(self, ego);
         let mut state = vec![DESTINY_FULLSTATE];
         state.extend_from_slice(&(tick as i32).to_le_bytes());
         let mut slims = Vec::new();

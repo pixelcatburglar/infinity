@@ -259,6 +259,38 @@ async fn real_database_events_and_intercepts() {
         assert_eq!(fixture::owned_item_count(&test_db, char_id).await.unwrap(), items_before_wire);
         assert_eq!(item_state(crate::dao::items::loading::load_items(&test_db, crate::dao::items::loading::ItemQuery::Owner(char_id)).await.unwrap()), items_before_wire_state);
         assert_eq!(services::wallets::balance(&test_db, char_id).await.ok(), balance);
+        let full_app = [21; 16];
+        let closed_app = [22; 16];
+        let mut full = world.notice_hub().register(full_app, 1);
+        let mut closed = world.notice_hub().register(closed_app, 1);
+        closed.rx.close();
+        let state = crate::services::ship_cosmetics_mgr::state::State { ship_id: capsule, character_id: char_id, skin_id: None };
+        let notice = crate::gateway::ship_cosmetics::notice(&state, &[char_id]).unwrap().remove(0);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let result: Result<(), CallError> = test_db.transaction(
+            |_, outbox: &mut Outbox| {
+                let first = notice.retarget(crate::gateway::protocol::target_group::Target::ApplicationInstanceUuid(full_app.to_vec())).unwrap();
+                let second = notice.retarget(crate::gateway::protocol::target_group::Target::ApplicationInstanceUuid(full_app.to_vec())).unwrap();
+                let third = notice.retarget(crate::gateway::protocol::target_group::Target::ApplicationInstanceUuid(closed_app.to_vec())).unwrap();
+                let sender = sender.clone();
+                Box::pin(async move {
+                    outbox.notify_gateway(first);
+                    outbox.notify_gateway(second);
+                    outbox.notify_gateway(third);
+                    outbox.notify_sender(sender, "acceptance", vec![marshal::Value::Int(char_id)]);
+                    outbox.event(GameEvent::CharacterSelected { user_id: 7, char_id });
+                    Ok(())
+                })
+            },
+            |value, outbox| { let world = world.clone(); async move { dispatch_world(value, outbox, &world) } },
+        ).await;
+        assert!(result.is_ok());
+        assert!(full.cancelled.try_recv().is_ok());
+        assert!(closed.cancelled.try_recv().is_ok());
+        assert!(full.rx.try_recv().is_ok());
+        assert_eq!(receiver.try_recv().unwrap(), ("acceptance".to_string(), vec![marshal::Value::Int(char_id)]));
+        await_count(&test_db, "selected_count", 7).await;
+        assert_eq!(get(&test_db, "selected_7").await.unwrap()["user_id"], 7);
     }).await;
     std::fs::remove_dir_all(dir).unwrap();
     fixture::cleanup(&db, fixture, SCRIPT).await.unwrap();

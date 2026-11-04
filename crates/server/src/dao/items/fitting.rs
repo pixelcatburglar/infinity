@@ -6,7 +6,7 @@ use crate::consts::{BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDU
 use std::collections::BTreeMap;
 use tokio_postgres::Row;
 
-use super::inventory::ItemId;
+use super::inventory::{ItemId, Matched};
 struct FittingId { fitting_id: i64 }
 impl FittingId { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id") } } }
 pub(crate) struct Fitting { pub fitting_id: i64, pub owner_id: i64, pub name: String, pub description: String, pub ship_type_id: i32, pub fit_types: Vec<i32>, pub fit_flags: Vec<i32>, pub fit_qty: Vec<i32> }
@@ -35,7 +35,8 @@ pub(crate) async fn lock_children(ex: &(impl Executor + ?Sized), parent: i64) ->
         .iter().map(|row| ItemId::from_row(row).item_id).collect())
 }
 pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), item: &Item) -> Result<u64, Error> {
-    ex.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND singleton = $7 AND singleton AND flag_id = $8", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton, &FLAG_HANGAR]).await
+    let row = ex.query_one("WITH changed AS (UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND singleton = $7 AND singleton AND flag_id = $8 RETURNING item_id, owner_id, singleton), removed AS (DELETE FROM game.ship_skin_applications a USING changed c WHERE a.ship_item_id = c.item_id AND (a.character_id <> c.owner_id OR NOT c.singleton)) SELECT EXISTS (SELECT 1 FROM changed) AS matched", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton, &FLAG_HANGAR]).await?;
+    Ok(u64::from(Matched::from_row(&row).matched))
 }
 pub(crate) async fn destroy_upgrade(ex: &(impl Executor + ?Sized), item: &Item) -> Result<bool, Error> {
     Ok(ex.execute("DELETE FROM game.items i WHERE i.item_id = $1 AND i.owner_id = $2 AND i.location_id = $3 AND i.flag_id = $4 AND i.type_id = $5 AND i.quantity = $6 AND i.singleton = $7 AND i.jump_clone_id IS NULL AND NOT EXISTS (SELECT 1 FROM game.items child WHERE child.location_id = i.item_id)", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton]).await? != 0)

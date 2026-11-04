@@ -12,7 +12,7 @@ fn notification_events(outbox: Outbox<OnlineChanged>) -> Vec<String> {
     use crate::db::outbox::{Effect, Notification};
     outbox.into_entries().into_iter().filter_map(|entry| match entry {
         Effect::Notification(Notification::DirectClient { event, .. } | Notification::Pilot { event, .. }) => Some(event),
-        Effect::Notification(Notification::Sender { .. }) => None,
+        Effect::Notification(Notification::Sender { .. } | Notification::Gateway(..)) => None,
         Effect::Event(crate::lua::events::GameEvent::SkillTrained { .. }) => panic!("manual item operation trained a skill"),
         Effect::Event(_) => None,
         Effect::Operation(_) => panic!("unexpected online reconciliation operation"),
@@ -113,7 +113,7 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
                 Effect::Notification(notification) => {
                     match &notification {
                         Notification::DirectClient { event, .. } | Notification::Pilot { event, .. } => events.push(event.clone()),
-                        Notification::Sender { .. } => {}
+                        Notification::Sender { .. } | Notification::Gateway(..) => {}
                     }
                     notification.dispatch(&c.world.clone(), Some(&mut *c))?;
                 }

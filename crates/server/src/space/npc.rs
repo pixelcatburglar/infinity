@@ -129,7 +129,10 @@ impl System {
     pub fn add_npc(&mut self, id: i64, mut brain: NpcBrain) -> bool {
         if !self.contains(id) { return false; }
         brain.next_think_ms = self.ms.saturating_add(id.rem_euclid(crate::config::game().combat.npc_think_ms));
-        self.brains.insert(id, brain);
+        let first = self.brains.insert(id, brain).is_none();
+        if first {
+            super::ship_cosmetics::announce(self, id);
+        }
         true
     }
     /// Whether the system has an NPC brain for this ball.

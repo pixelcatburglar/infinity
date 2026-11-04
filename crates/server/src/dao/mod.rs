@@ -1,7 +1,7 @@
 //! Plain data access for accounts, alliances, asteroids, bills, bookmarks, bounties, calendar,
 //! characters, chat channels, client errors and crashes, contracts, corporations, dynamic items,
 //! exploration, industry, insurance, items, kill rights, killmails, mail, market, mining ledger,
-//! missions, NPE, offices, orgs, skills, store, wars and wallets.
+//! missions, NPE, offices, orgs, ship SKINs, skills, store, wars and wallets.
 //! Aggregates read and write `game` tables and use typed `sde` and `sde_native`
 //! static data; individual headers describe their sources and coverage.
 //! This layer has no direct client mirror or wire contract; owning services supply those.
@@ -41,6 +41,7 @@ pub(crate) mod offices;
 pub(crate) mod orgs;
 pub(crate) mod sde;
 pub(crate) mod shared_settings;
+pub(crate) mod ship_skins;
 pub(crate) mod skills;
 pub(crate) mod slash;
 pub(crate) mod store;

@@ -6,13 +6,13 @@
 //! Services (eve_public/gateway.proto), all bidirectional streams:
 //! * `Requests.Send`: `eve_public.Request` -> `eve_public.Response`, correlated by uuid
 //! * `Notices.Consume`: server pushes `eve_public.Notice`
-//! * `Events.Publish`: client telemetry, accepted and dropped
+//! * `Events.Publish`: client telemetry, decoded when known and unclaimed
 //!
 //! Payloads are `google.protobuf.Any`; they are decoded with the client's own
 //! descriptors (extracted by tools/extract_protos.py) through prost-reflect.
 //! Responses use embedded protobuf descriptors, server CDN content and DAO data;
-//! these handlers do not read World. Unclaimed requests retain default responses;
-//! valid Events are decoded and dropped, notice delivery is not repaired, and
+//! notice delivery uses World to resolve current pilots and has no durable replay.
+//! Unclaimed requests retain default responses; valid Events are unclaimed, and
 //! career content is not complete.
 
 mod achievements;
@@ -27,24 +27,23 @@ mod fallback;
 mod handlers;
 mod insurgency;
 mod message;
+pub(crate) mod notices;
 mod plex;
-mod protocol;
+pub(crate) mod protocol;
 mod requests;
+pub(crate) mod ship_cosmetics;
 mod skill_plans;
 mod space_content;
 mod transport;
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;
 
 use crate::{config::Config, db::Db, space::World};
 use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 use message::pool;
-use protocol::Notice;
 use transport::connection;
 
 /// Who sent a request.
@@ -54,20 +53,15 @@ pub struct Caller {
     pub character_id: Option<i64>,
 }
 
-// ---- shared state: notice streams for server pushes ----
-
-type NoticeTx = mpsc::UnboundedSender<Notice>;
-
 pub struct Gateway {
     pub db: Db,
     pub world: Arc<World>,
     pub config: Arc<Config>,
-    /// application instance uuid -> notice stream
-    notice_streams: Mutex<HashMap<Vec<u8>, NoticeTx>>,
+    pub(crate) notice_hub: notices::NoticeHub,
 }
 impl Gateway {
     pub fn new(db: Db, world: Arc<World>, config: Arc<Config>) -> Arc<Gateway> {
-        Arc::new(Gateway { db, world, config, notice_streams: Mutex::new(HashMap::new()) })
+        Arc::new(Gateway { db, world: world.clone(), config, notice_hub: world.notice_hub() })
     }
 }
 

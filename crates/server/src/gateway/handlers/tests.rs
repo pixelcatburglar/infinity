@@ -6,7 +6,7 @@ async fn exact_claims_and_neighboring_requests() {
     validate().unwrap();
     let gw = super::super::tests::gateway().await;
     let context = HandlerContext::for_request(&gw, super::super::Caller::default()).await.unwrap();
-    assert_eq!(CLAIMS.len(), 19);
+    assert_eq!(CLAIMS.len(), 21);
     let expected = [
         "eve_public.achievement.definition.api.cdn.GetLatestRequest",
         "eve_public.cosmetic.character.title.definition.api.GetLatestRequest",
@@ -17,6 +17,8 @@ async fn exact_claims_and_neighboring_requests() {
         "eve_public.pirate.suppression.api.GetStageThresholdsRequest",
         "eve_public.character.GetNamesByUserRequest",
         "eve_public.plex.vault.api.BalanceRequest",
+        "eve_public.cosmetic.ship.api.GetRequest",
+        "eve_public.cosmetic.ship.api.GetAllInBubbleRequest",
         "eve_public.character.skill.plan.CreateRequest",
         "eve_public.character.skill.plan.GetAllRequest",
         "eve_public.character.skill.plan.GetRequest",

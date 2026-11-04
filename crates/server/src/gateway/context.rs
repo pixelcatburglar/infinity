@@ -4,6 +4,8 @@ use super::{Caller, error::{FailureCode, GatewayError}};
 pub struct HandlerContext<'a> {
     pub db: &'a Db,
     pub config: &'a Config,
+    pub world: &'a crate::space::World,
+    pub sde: &'a crate::sde::Sde,
     pub caller: Caller,
     pub identity: Identity,
 }
@@ -30,7 +32,7 @@ impl<'a> HandlerContext<'a> {
             station_id: online.as_ref().and_then(|s| s.station_id),
             system_id: online.as_ref().and_then(|s| s.system_id),
         };
-        Ok(Self { db: &gateway.db, config: gateway.config.as_ref(), caller, identity })
+        Ok(Self { db: &gateway.db, config: gateway.config.as_ref(), world: &gateway.world, sde: gateway.world.sde(), caller, identity })
     }
     pub fn require_user(&self) -> Result<i64, GatewayError> {
         self.caller.user_id.filter(|id| *id > 0).ok_or_else(|| GatewayError::refusal(FailureCode::Unauthorized, crate::messages::gateway::UNAUTHORIZED))
@@ -38,6 +40,13 @@ impl<'a> HandlerContext<'a> {
     pub fn require_character(&self) -> Result<&Identity, GatewayError> {
         if self.caller.character_id.is_none() { return Err(GatewayError::refusal(FailureCode::Unauthorized, crate::messages::gateway::UNAUTHORIZED)); }
         Ok(&self.identity)
+    }
+    pub fn require_online(&self) -> Result<Identity, GatewayError> {
+        let identity = self.require_character()?;
+        let online = self.world.online_session(identity.char_id)
+            .filter(|session| session.user_id == self.caller.user_id && session.character_id == identity.char_id)
+            .ok_or_else(|| GatewayError::refusal(FailureCode::Unauthorized, crate::messages::gateway::UNAUTHORIZED))?;
+        Ok(Identity { char_id: online.character_id, ship_id: online.ship_id, corp_id: online.corporation_id.unwrap_or_default(), station_id: online.station_id, system_id: online.system_id })
     }
 }
 

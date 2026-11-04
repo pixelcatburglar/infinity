@@ -9,7 +9,7 @@ async fn claimed_unauthorized_does_not_fall_back() {
         payload: Some(prost_types::Any { type_url: "type.googleapis.com/eve_public.character.GetNamesByUserRequest".into(), value: vec![] }),
     };
     let gateway = super::super::tests::gateway().await;
-    let response = handle_request(gateway.as_ref(), req).await;
+    let response = handle_request(gateway.as_ref(), req, None).await;
     assert_eq!(response.status_code, 401);
     assert_eq!(response.status_message, text::UNAUTHORIZED);
     assert!(response.payload.is_none());
@@ -24,7 +24,7 @@ async fn invalid_payload_does_not_expose_diagnostics() {
         payload: Some(prost_types::Any { type_url: "type.googleapis.com/eve_public.character.GetNamesByUserRequest".into(), value: vec![0xff] }),
     };
     let gateway = super::super::tests::gateway().await;
-    let response = handle_request(gateway.as_ref(), req).await;
+    let response = handle_request(gateway.as_ref(), req, None).await;
     assert_eq!(response.status_code, 400);
     assert_eq!(response.status_message, text::INVALID_REQUEST);
 }
@@ -52,7 +52,7 @@ async fn unclaimed_matrix_retains_default_response() {
         payload: Some(prost_types::Any { type_url: format!("type.googleapis.com/{name}"), value: vec![] }),
     };
     let gateway = super::super::tests::gateway().await;
-    let response = handle_request(gateway.as_ref(), req).await;
+    let response = handle_request(gateway.as_ref(), req, None).await;
     assert_eq!(response.status_code, 200);
     let payload = response.payload.unwrap();
     let desc = message(&response_name(name).unwrap()).unwrap();
@@ -107,4 +107,37 @@ fn empty_response_any_is_distinct_from_absent_payload() {
     let without_payload = Response::default();
     assert!(with_payload.payload.is_some());
     assert!(without_payload.payload.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn forged_character_ownership_never_binds_notice_stream() {
+    use crate::gateway::{notices::GatewayNotice, protocol::target_group::Target};
+    use crate::gateway::protocol::{AuthoritativeContext, Identifier32, UserIdentifier};
+    let gateway = super::super::tests::gateway().await;
+    let account: i64 = gateway.db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('gateway-test-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
+    let other: i64 = gateway.db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('gateway-test-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
+    let character: i64 = gateway.db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'gateway-test-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    gateway.world.register_pilot(character, tx);
+    gateway.world.set_online_session(character, Some(crate::session::OnlineSession {
+        character_id: character, user_id: Some(account), session_id: 1, ship_id: None, station_id: None,
+        system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+    }));
+    let app = [1;16];
+    let lease = gateway.notice_hub.lease(app);
+    let mut stream = gateway.notice_hub.register(app, 1);
+    let req = Request {
+        issued: None, correlation_uuid: vec![1;16], external_origin: String::new(), application_instance_uuid: app.to_vec(),
+        authoritative_context: Some(AuthoritativeContext { tenant: String::new(), authenticated_user: Some(UserIdentifier { sequential: i32::try_from(other).unwrap() }), active_character: Some(Identifier32 { sequential: u32::try_from(character).unwrap() }), identity: None }),
+        payload: Some(prost_types::Any { type_url: "type.googleapis.com/eve_public.character.GetNamesByUserRequest".into(), value: Vec::new() }),
+    };
+    assert_eq!(handle_request(&gateway, req, Some(&lease)).await.status_code, 403);
+    let payload = DynamicMessage::new(message("eve_public.Event").unwrap());
+    gateway.notice_hub.dispatch(GatewayNotice::new(Target::Character(u32::try_from(character).unwrap()), &payload).unwrap(), |id| gateway.world.online_session(id));
+    assert!(stream.rx.try_recv().is_err());
+    gateway.world.unregister_pilot(character);
+    gateway.db.execute("DELETE FROM game.characters WHERE character_id = $1", &[&character]).await.unwrap();
+    gateway.db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
+    gateway.db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&other]).await.unwrap();
 }

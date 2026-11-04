@@ -43,6 +43,7 @@ pub(crate) mod skills;
 pub(crate) mod store;
 pub(crate) mod subscriptions;
 pub(crate) mod wars;
+pub(crate) mod ship_skins;
 
 // Client moderation UserError catalogue keys.
 pub(crate) const MSG_BANNED_WORDS_DOWN: &str = "BannedWordsDown";
@@ -622,6 +623,10 @@ pub(crate) const MSG_CORP_BULLETIN_NOT_FOUND: &str = "CorpBulletinNotFound";
 pub(crate) const MSG_CORP_TOO_MANY_BULLETINS: &str = "CorpTooManyBulletins";
 /// Client message `CustomNotify`.
 pub(crate) const MSG_CUSTOM_NOTIFY: &str = "CustomNotify";
+/// `shipSkinApplicationSvc.py` catches this message to refresh the applied state.
+pub(crate) const MSG_SKIN_ALREADY_APPLIED: &str = "SkinAlreadyApplied";
+/// `shipskins/storage.py` raises this condition for an existing permanent license.
+pub(crate) const MSG_SKIN_ALREADY_LICENSED: &str = "SkinAlreadyLicensed";
 /// Client message `CannotApplyFreePointsDoNotHaveSkill`.
 pub(crate) const MSG_CANNOT_APPLY_FREE_POINTS_DO_NOT_HAVE_SKILL: &str = "CannotApplyFreePointsDoNotHaveSkill";
 /// Client message `InjectorSkillPointLimitReached`.

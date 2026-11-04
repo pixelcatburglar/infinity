@@ -8,6 +8,8 @@ use tokio_postgres::Row;
 
 pub(crate) struct ItemId { pub item_id: i64 }
 impl ItemId { pub(super) fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }
+pub(crate) struct Matched { pub(crate) matched: bool }
+impl Matched { pub(crate) fn from_row(r: &Row) -> Self { Self { matched: r.get("matched") } } }
 struct TypeId { type_id: i32 }
 impl TypeId { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id") } } }
 struct LockedItemId { item_id: i64 }
@@ -64,8 +66,15 @@ pub(crate) async fn lock_descendants(ex: &(impl Executor + ?Sized), roots: &[i64
     Ok(lock_item_ids(ex, &closure).await?.into_iter().map(|row| row.item_id).collect())
 }
 pub(crate) async fn move_item(ex: &(impl Executor + ?Sized), item: &Item, location: i64, flag: i32, owner: i64, singleton: bool) -> Result<bool, Error> {
-    Ok(ex.execute("UPDATE game.items SET location_id = $2, flag_id = $3, owner_id = $4, singleton = $5,
+    let row = ex.query_one("WITH changed AS (
+                   UPDATE game.items SET location_id = $2, flag_id = $3, owner_id = $4, singleton = $5,
                    x = NULL, y = NULL, z = NULL
-                   WHERE item_id = $1 AND owner_id = $6 AND location_id = $7 AND flag_id = $8 AND quantity = $9 AND singleton = $10 AND jump_clone_id IS NULL",
-        &[&item.item_id, &location, &flag, &owner, &singleton, &item.owner_id, &item.location_id, &item.flag_id, &item.quantity, &item.singleton]).await? != 0)
+                   WHERE item_id = $1 AND owner_id = $6 AND location_id = $7 AND flag_id = $8 AND quantity = $9 AND singleton = $10 AND jump_clone_id IS NULL
+                   RETURNING item_id, owner_id, singleton
+               ), removed AS (
+                   DELETE FROM game.ship_skin_applications a USING changed c
+                   WHERE a.ship_item_id = c.item_id AND (a.character_id <> c.owner_id OR NOT c.singleton)
+               ) SELECT EXISTS (SELECT 1 FROM changed) AS matched",
+        &[&item.item_id, &location, &flag, &owner, &singleton, &item.owner_id, &item.location_id, &item.flag_id, &item.quantity, &item.singleton]).await?;
+    Ok(Matched::from_row(&row).matched)
 }

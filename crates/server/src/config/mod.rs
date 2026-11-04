@@ -197,6 +197,7 @@ impl Config {
         override_env!("IMAGE_DIR", config.images.dir);
         override_env!("IMAGE_UPSTREAM", config.images.upstream);
         override_env!("GATEWAY_BIND", config.gateway.bind);
+        override_env!("GATEWAY_NOTICE_QUEUE_CAPACITY", config.gateway.notice_queue_capacity);
         override_env!("CDN_BIND", config.cdn.bind);
         secret_env!("DATABASE_URL", config.database.url);
         secret_env!("DATABASE_PASSWORD", config.database.password);

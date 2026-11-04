@@ -262,11 +262,18 @@ impl ImagesConfig {
 pub struct GatewayConfig {
     /// Gateway listener address.
     pub bind: String,
+    /// Maximum queued gateway notices per stream.
+    pub notice_queue_capacity: usize,
 }
 impl Default for GatewayConfig {
-    fn default() -> Self { Self { bind: "0.0.0.0:26002".into() } }
+    fn default() -> Self { Self { bind: "0.0.0.0:26002".into(), notice_queue_capacity: 256 } }
 }
-impl GatewayConfig { pub fn validate(&self) -> Result<()> { Ok(()) } }
+impl GatewayConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.notice_queue_capacity > 0 && self.notice_queue_capacity <= tokio::sync::Semaphore::MAX_PERMITS, "gateway.notice_queue_capacity is out of range");
+        Ok(())
+    }
+}
 
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
