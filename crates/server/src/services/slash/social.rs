@@ -67,7 +67,7 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             if args.len() != 2 { return Err(slash_error(messages::gm::GM_LP_CHANGE_USAGE.into())); }
             parsed.required(0).map_err(|_| slash_error(messages::gm::GM_LP_CHANGE_USAGE.into()))?;
             let corp = parsed.owner(c, 0).await?;
-            if c.sde.npc_corporations.get(corp).is_none() && corps::corporation_line(&c.db, corp).await?.is_none() {
+            if c.sde.npc_corporations.get(corp).is_none() && corps::corporation_line(&c.db, &c.sde, corp).await?.is_none() {
                 return Err(slash_error(messages::gm::GM_LP_CORPORATION_REQUIRED.into()));
             }
             let amount = parsed.i64(1).map_err(|_| slash_error(messages::gm::GM_LP_CHANGE_USAGE.into()))?;

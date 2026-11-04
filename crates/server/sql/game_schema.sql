@@ -657,6 +657,8 @@ CREATE TABLE IF NOT EXISTS game.corporations (
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_name_idx ON game.corporations (lower(name)) WHERE NOT deleted;
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_ticker_idx ON game.corporations (upper(ticker)) WHERE NOT deleted;
 SELECT setval('game.corporations_corporation_id_seq', GREATEST((SELECT max(corporation_id) FROM game.corporations), 98000000), true);
+-- NULL marks a legacy corporation whose CEO's abilities have not yet been captured.
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS member_limit bigint CHECK (member_limit >= 0);
 
 -- dao/corporations: issued shares, immutable receipts and general vote snapshots.
 ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS issued_shares bigint CHECK (issued_shares > 0);

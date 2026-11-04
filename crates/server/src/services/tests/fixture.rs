@@ -78,8 +78,8 @@ pub(in crate::services) async fn create_corporation(db: &Db, ceo: i64, station: 
     let name = format!("fixture-corporation-{ceo}");
     let ticker = format!("F{ceo}");
     crate::dao::corporations::registry::create(db, &crate::dao::corporations::registry::NewCorporation {
-        name: &name, ticker: &ticker, description: "", url: "", tax: 0.0, ceo,
-        station, recruiting: false, friendly: false, shapes: [None; 7], now: 0,
+        name: &name, ticker: &ticker, description: "", url: "", tax: 0.0, lp_tax: 0.0, ceo,
+        station, recruiting: false, friendly: false, shapes: [None; 7], now: 0, member_limit: None,
     }).await
 }
 

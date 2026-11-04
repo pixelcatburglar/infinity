@@ -116,7 +116,7 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("itemLocking", "GetLockedItemLocations") => Value::reduce("__builtin__.set", vec![Value::list([])], None),
         ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
         // A player character's corporation, or an NPC's (agents) from the SDE.
-        ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
+        ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),

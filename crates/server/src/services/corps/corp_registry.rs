@@ -2,8 +2,8 @@
 //! `eve/client/script/ui/services/corporation`.
 //! Uses the shared corporation mechanics in `services::corps` and its DAOs,
 //! including `game.corporations`, `game.characters`, `game.corp_applications` and startup SDE corporations.
-//! Founding uses effective management skill. Share ownership and dividends use the corporation
-//! ledger; alliance calls have separate handlers.
+//! Founding uses effective management skill and persists the supplied ISK and LP tax rates.
+//! Share ownership and dividends use the corporation ledger; alliance calls have separate handlers.
 
 use super::*;
 use crate::dao::corporations::dispatch as dispatch_dao;
@@ -79,38 +79,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             Ok(if call.method == "KickOutMembers" { Value::list([]) } else { Value::None })
         }
         // InsertApplication(corporationID, text)
-        "InsertApplication" => {
-            let target = int(0).unwrap_or(0);
-            let text = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            if !is_player_corp(target) {
-                return Some(Err(notify_error(messages::NPC_CORP_DOES_NOT_ACCEPT_APPLICATIONS)));
-            }
-            let recruiting: Option<bool> = match dispatch_dao::recruiting(db, target).await {
-                Ok(r) => r,
-                Err(e) => return Some(Err(db_err(e))),
-            };
-            if recruiting != Some(true) {
-                return Some(Err(notify_error(messages::CORP_NOT_RECRUITING)));
-            }
-            dispatch_dao::insert_application(db, target, me, &text, APP_APPLIED, filetime_now())
-                .await
-                .map(Value::Int)
-                .map_err(db_err)
-        }
+        "InsertApplication" => insert_application(c, int(0).unwrap_or(0), call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default()).await,
         // InsertInvitation(characterID)
-        "InsertInvitation" => {
-            let target = int(0).unwrap_or(0);
-            match membership(db, me).await {
-                Ok((my_corp, roles)) if is_player_corp(my_corp) && roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) != 0 => dispatch_dao::insert_invitation(db, my_corp, target, APP_INVITED_BY_CORPORATION, filetime_now())
-                    .await
-                    .map(|_| Value::None)
-                    .map_err(db_err),
-                Ok(_) => Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_TO_INVITE)),
-                Err(e) => Err(e),
-            }
-        }
+        "InsertInvitation" => insert_invitation(c, int(0).unwrap_or(0)).await,
         "GetMyApplications" => applications(db, registry::ApplicationFilter::Character, me, true).await,
-        "GetApplications" => applications(db, registry::ApplicationFilter::Corporation, corp, false).await,
+        "GetApplications" | "GetOldApplications" => corporation_applications(db, me, governance_bound, call.method == "GetOldApplications").await,
         "GetMyOldApplications" => old_applications(db, me).await,
         "UpdateApplicationOffer" => update_application(c, call).await,
         // [row(ownerID, ownerName, typeID, gender)] of the members.
@@ -192,8 +165,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 Err(e) => Err(e),
             }
         }
-        // The member limit follows the CEO's skills; it isn't enforced, so nothing to recompute.
-        "UpdateCorporationAbilities" => Ok(Value::Bool(true)),
+        "UpdateCorporationAbilities" => update_abilities(c, corp, me).await,
         // KeyVal(corpID, allianceID, title, title1..title16): a member's titles, for show info.
         "GetInfoWindowDataForChar" => info_window_data(db, int(0).unwrap_or(me)).await,
         "GetSharesByShareholder" => {
@@ -260,17 +232,39 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             Ok(r) => Ok(Value::unicode(r.unwrap_or_default())),
             Err(e) => Err(db_err(e)),
         },
-        "SetCorpWelcomeMail" => {
-            let text = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            dispatch_dao::set_welcome_mail(db, corp, &text, me)
-                .await
-                .map(|_| Value::None)
-                .map_err(db_err)
-        }
+        "SetCorpWelcomeMail" => set_welcome_mail(c, call, corp, me).await,
         _ => return None,
     })
 }
 
+/// Store the client-supplied welcome body and invalidate current members' caches after commit.
+async fn set_welcome_mail(c: &Client, call: &Call<'_>, corp: i64, me: i64) -> CallResult {
+    let [Value::Unicode(text)] = call.args else {
+        return Err(notify_error(messages::mail::INVALID_ARGUMENT));
+    };
+    super::super::mail::delivery::validate_content(messages::corps::WELCOME_MAIL_TITLE, text)?;
+    let now = filetime_now();
+    c.db.transaction(
+        |tx, outbox: &mut crate::db::outbox::Outbox| {
+            let text = text.clone();
+            Box::pin(async move {
+                if !registry::lock_admission(tx, &[corp], &[me]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::corps::WELCOME_MAIL_AUTHORITY_REQUIRED));
+                }
+                let (actual, roles) = membership(tx, me).await?;
+                if actual != corp || (roles & (ROLE_DIRECTOR | ROLE_PERSONNEL_MANAGER) == 0 && ceo_of(tx, corp).await? != Some(me))
+                    || dispatch_dao::set_welcome_mail(tx, corp, &text).await.map_err(db_err)? != 1 {
+                    return Err(notify_error(messages::corps::WELCOME_MAIL_AUTHORITY_REQUIRED));
+                }
+                for member in crate::dao::characters::members::active_ids(tx, corp).await.map_err(db_err)? {
+                    outbox.notify_pilot(member, "OnCorporationWelcomeMailChanged", vec![Value::Int(me), Value::Int(now)]);
+                }
+                Ok(Value::None)
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &c.world) },
+    ).await
+}
 
 /// `AddCorporation(name, ticker, description, url, taxRate, shape1..3, color1..3, typeface,
 /// applicationsEnabled, friendlyFire, lpTaxRate)` -> corporationID.
@@ -282,7 +276,11 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         description: trimmed_arg_text(call, 2),
         url: trimmed_arg_text(call, 3),
         tax: call.args.get(4).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0),
-        recruiting: call.args.get(12).and_then(|v| v.as_int()).unwrap_or(1) != 0,
+        lp_tax: call.args.get(14).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0),
+        recruiting: match call.args.get(12) {
+            Some(Value::Bool(value)) => *value,
+            value => value.and_then(|v| v.as_int()).unwrap_or(1) != 0,
+        },
         friendly: matches!(call.args.get(13), Some(Value::Bool(true))),
         shapes: [int(5), int(6), int(7), int(8), int(9), int(10), int(11)],
     };
@@ -295,6 +293,7 @@ struct FoundInput {
     description: String,
     url: String,
     tax: f64,
+    lp_tax: f64,
     recruiting: bool,
     friendly: bool,
     shapes: [Option<i32>; 7],
@@ -304,7 +303,7 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
     let (db, world) = (&c.db, &*c.world);
     let sde = c.sde.clone();
     let me = c.session.int("charid").unwrap_or(0);
-    let FoundInput { name, ticker, description, url, tax, recruiting, friendly, shapes } = input;
+    let FoundInput { name, ticker, description, url, tax, lp_tax, recruiting, friendly, shapes } = input;
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error(messages::STATION_DOCK_REQUIRED_TO_CREATE_CORP));
     };
@@ -314,38 +313,42 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
     if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&ticker.chars().count()) || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
-    if !gm {
-        let now = filetime_now();
-        let skill = crate::services::skills::effective::snapshot_at(db, &sde, me, now).await?.level(SKILL_CORPORATION_MANAGEMENT);
-        if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
-            return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
-        }
-    }
     let (current, _) = membership(db, me).await?;
-    if is_player_corp(current) && ceo_of(db, current).await? == Some(me) {
-        return Err(notify_error(messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE));
-    }
-    let result = registry::name_taken(db, &name, &ticker).await.map_err(db_err)?;
-    let taken = result.taken || sde.npc_corporations.iter().any(|corp| {
-        corp.lower_name.as_deref() == Some(result.lower_name.as_str())
-            || corp.upper_ticker.as_deref() == Some(ticker.as_str())
-    });
-    if taken {
-        return Err(notify_error(messages::CORP_NAME_OR_SHORT_NAME_TAKEN));
-    }
     let _trading = super::super::market::lock().await;
-    let now = filetime_now();
     let id = db.transaction(
         |tx, outbox| {
             let (name, ticker, description, url) = (name.clone(), ticker.clone(), description.clone(), url.clone());
             let sde = sde.clone();
             Box::pin(async move {
+                if !registry::lock_admission(tx, &[current], &[me]).await.map_err(db_err)?
+                    || !registry::active_character(tx, me).await.map_err(db_err)?
+                    || membership(tx, me).await?.0 != current {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                if is_player_corp(current) && ceo_of(tx, current).await? == Some(me) {
+                    return Err(notify_error(messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE));
+                }
+                let now = filetime_now();
+                if !gm {
+                    let skill = crate::services::skills::effective::snapshot_at(tx, &sde, me, now).await?.level(SKILL_CORPORATION_MANAGEMENT);
+                    if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
+                        return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
+                    }
+                }
+                let result = registry::name_taken(tx, &name, &ticker).await.map_err(db_err)?;
+                if result.taken || sde.npc_corporations.iter().any(|corp| {
+                    corp.lower_name.as_deref() == Some(result.lower_name.as_str())
+                        || corp.upper_ticker.as_deref() == Some(ticker.as_str())
+                }) {
+                    return Err(notify_error(messages::CORP_NAME_OR_SHORT_NAME_TAKEN));
+                }
+                let member_limit = abilities::capacity(tx, &sde, me, now).await?;
                 if !gm {
                     super::super::wallets::debit(tx, outbox, me, STARTUP_COST).await?;
                 }
                 let id = registry::create(tx, &registry::NewCorporation {
                     name: &name, ticker: &ticker, description: &description, url: &url,
-                    tax, ceo: me, station, recruiting, friendly, shapes, now,
+                    tax, lp_tax, ceo: me, station, recruiting, friendly, shapes, now, member_limit: Some(member_limit),
                 }).await.map_err(db_err)?;
                 if !crate::dao::corporations::shares::initialize(tx, id, crate::config::game().corporations.initial_shares).await.map_err(db_err)? {
                     return Err(CallError::Internal(anyhow::anyhow!("new corporation share issuance could not be initialized")));
@@ -368,12 +371,77 @@ pub(crate) async fn gm_found(c: &mut Client, name: &str, ticker: &str) -> Result
         description: String::new(),
         url: String::new(),
         tax: 0.0,
+        lp_tax: 0.0,
         recruiting: true,
         friendly: false,
         shapes: [None; 7],
     }, true).await
 }
 
+
+async fn insert_application(c: &Client, target: i64, text: String) -> CallResult {
+    if !is_player_corp(target) {
+        return Err(notify_error(messages::NPC_CORP_DOES_NOT_ACCEPT_APPLICATIONS));
+    }
+    let me = c.session.int("charid").unwrap_or(0);
+    let old = membership(&c.db, me).await?.0;
+    let now = filetime_now();
+    c.db.transaction(
+        |tx, outbox| {
+            let text = text.clone();
+            Box::pin(async move {
+                if !registry::lock_admission(tx, &[old, target], &[me]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                if membership(tx, me).await?.0 != old || !registry::active_character(tx, me).await.map_err(db_err)? {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                if old == target {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                match dispatch_dao::recruiting(tx, target).await.map_err(db_err)? {
+                    None => return Err(notify_error(messages::CORP_NOT_FOUND)),
+                    Some(false) => return Err(notify_error(messages::CORP_NOT_RECRUITING)),
+                    Some(true) => {}
+                }
+                let id = dispatch_dao::insert_application(tx, target, me, &text, APP_APPLIED, now, &OPEN_APPLICATION).await.map_err(db_err)?
+                    .ok_or_else(|| notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED))?;
+                queue_application_id(tx, outbox, id).await?;
+                Ok(Value::None)
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &c.world) },
+    ).await
+}
+
+async fn insert_invitation(c: &Client, target: i64) -> CallResult {
+    let me = c.session.int("charid").unwrap_or(0);
+    let old = membership(&c.db, me).await?.0;
+    let target_corp = registry::character_corp(&c.db, target).await.map_err(db_err)?;
+    let now = filetime_now();
+    c.db.transaction(
+        |tx, outbox| Box::pin(async move {
+            if !registry::lock_admission(tx, &[old, target_corp.unwrap_or(0)], &[me, target]).await.map_err(db_err)? {
+                return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+            }
+            let (corp, roles) = membership(tx, me).await?;
+            if corp != old || !is_player_corp(corp) || roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) == 0 || !registry::active_character(tx, me).await.map_err(db_err)? {
+                return Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_TO_INVITE));
+            }
+            if registry::character_corp(tx, target).await.map_err(db_err)? != target_corp {
+                return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+            }
+            if dispatch_dao::recruiting(tx, corp).await.map_err(db_err)?.is_none() {
+                return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+            }
+            let id = dispatch_dao::insert_invitation(tx, corp, target, APP_INVITED_BY_CORPORATION, now, &OPEN_APPLICATION).await.map_err(db_err)?
+                .ok_or_else(|| notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED))?;
+            queue_application_id(tx, outbox, id).await?;
+            Ok(Value::None)
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, &c.world) },
+    ).await
+}
 
 fn application_row(r: &registry::Application) -> Value {
     keyval([
@@ -385,6 +453,36 @@ fn application_row(r: &registry::Application) -> Value {
         ("applicationDateTime", Value::Int(r.created)),
         ("customMessage", Value::unicode(r.custom_message.clone())),
     ])
+}
+
+async fn queue_application<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, r: &registry::Application) -> Result<(), CallError> {
+    let args = vec![Value::Int(r.corporation_id), Value::Int(r.character_id), Value::Int(r.application_id), application_row(r)];
+    outbox.notify_pilot(r.character_id, "OnCorporationApplicationChanged", args.clone());
+    for manager in registry::application_managers(db, r.corporation_id, ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR).await.map_err(db_err)? {
+        if manager != r.character_id {
+            outbox.notify_pilot(manager, "OnCorporationApplicationChanged", args.clone());
+        }
+    }
+    Ok(())
+}
+
+async fn queue_application_id<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, id: i64) -> Result<(), CallError> {
+    let r = registry::application(db, id).await.map_err(db_err)?
+        .ok_or_else(|| notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED))?;
+    queue_application(db, outbox, &r).await
+}
+
+async fn corporation_applications(db: &Db, me: i64, bound: i64, old: bool) -> CallResult {
+    let (corp, roles) = membership(db, me).await?;
+    if corp != bound || roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) == 0 || !registry::active_character(db, me).await.map_err(db_err)? {
+        return Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_FOR_APPLICATION));
+    }
+    if old {
+        let rows = registry::old_corporation_applications(db, corp, &OPEN_APPLICATION).await.map_err(db_err)?;
+        Ok(Value::list(rows.iter().map(application_row)))
+    } else {
+        applications(db, registry::ApplicationFilter::Corporation, corp, false).await
+    }
 }
 
 /// Open applications grouped by `key` (corporation or character): {id: [application]}.
@@ -406,56 +504,145 @@ async fn old_applications(db: &Db, me: i64) -> CallResult {
     Ok(Value::list(rows.iter().map(application_row)))
 }
 
+async fn update_abilities(c: &Client, corp: i64, me: i64) -> CallResult {
+    let sde = c.sde.clone();
+    let now = filetime_now();
+    c.db.transaction(
+        |tx, _outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                if !registry::lock_admission(tx, &[corp], &[me]).await.map_err(db_err)?
+                    || membership(tx, me).await?.0 != corp || ceo_of(tx, corp).await? != Some(me) {
+                    return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED));
+                }
+                let limit = abilities::capacity(tx, &sde, me, now).await?;
+                if registry::set_member_limit(tx, corp, me, limit).await.map_err(db_err)? != 1 {
+                    return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED));
+                }
+                Ok(Value::Bool(true))
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &c.world) },
+    ).await
+}
+
 /// `UpdateApplicationOffer(applicationID, characterID, corporationID, text, status, customMessage, date)`.
 async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
     let sde = c.sde.clone();
     let me = c.session.int("charid").unwrap_or(0);
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-    let (app_id, status) = (int(0), int(4) as i32);
-    let message = call.args.get(5).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let Some(r) = registry::application(db, app_id).await.map_err(db_err)? else {
-        return Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND));
-    };
-    let (corp, applicant, current) = (r.corporation_id, r.character_id, r.status);
-    if !OPEN_APPLICATION.contains(&current) {
+    if call.args.len() != 7 {
         return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
     }
-    let by_character = matches!(status, APP_ACCEPTED_BY_CHARACTER | APP_REJECTED_BY_CHARACTER | APP_WITHDRAWN_BY_CHARACTER | APP_RENEGOTIATED_BY_CHARACTER);
-    if by_character && applicant != me {
-        return Err(notify_error(messages::CORP_APPLICATION_NOT_OWNED));
-    }
-    if !by_character {
-        let (my_corp, roles) = membership(db, me).await?;
-        if my_corp != corp || roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) == 0 {
-            return Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_FOR_APPLICATION));
-        }
-    }
-    let joins = (status == APP_ACCEPTED_BY_CORPORATION && current != APP_INVITED_BY_CORPORATION)
-        || (status == APP_ACCEPTED_BY_CHARACTER && current == APP_INVITED_BY_CORPORATION);
+    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
+    let (Some(app_id), Some(character), Some(corporation), Some(status)) = (int(0), int(1), int(2), int(4).map(|v| v as i32)) else {
+        return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+    };
+    let text = call.args.get(3).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
+    let message = call.args.get(5).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
+    let date = call.args.get(6).and_then(|v| v.as_int());
+    let Some(r) = registry::application(db, app_id).await.map_err(db_err)? else {
+        return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+    };
+    let applicant = r.character_id;
+    let target_corp = r.corporation_id;
+    let old = membership(db, applicant).await?.0;
+    let actor_corp = membership(db, me).await?.0;
+    let bound = match call.bind_params {
+        Some(p) => p.as_int().or_else(|| p.items().and_then(|t| t.first()?.as_int())).unwrap_or(0),
+        None => actor_corp,
+    };
     let now = filetime_now();
-    db.transaction(
+    let full = db.transaction(
         |tx, outbox| {
             let message = message.clone();
+            let text = text.clone();
             let sde = sde.clone();
             Box::pin(async move {
-                let affected = registry::update_application(tx, app_id, status, &message, current).await.map_err(db_err)?;
+                if !registry::lock_admission(tx, &[old, actor_corp, target_corp], &[me, applicant]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                let Some(r) = registry::application(tx, app_id).await.map_err(db_err)? else {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                };
+                if r.corporation_id != corporation || r.character_id != character || r.application_text != text || date.is_some_and(|d| d != r.created)
+                    || membership(tx, applicant).await?.0 != old || membership(tx, me).await?.0 != actor_corp || bound != actor_corp
+                    || !registry::active_character(tx, applicant).await.map_err(db_err)?
+                    || !registry::active_character(tx, me).await.map_err(db_err)?
+                    || dispatch_dao::recruiting(tx, corporation).await.map_err(db_err)?.is_none() {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                let current = r.status;
+                let valid = match (current, status) {
+                    (APP_APPLIED, APP_ACCEPTED_BY_CORPORATION | APP_REJECTED_BY_CORPORATION) => true,
+                    (APP_ACCEPTED_BY_CORPORATION | APP_INVITED_BY_CORPORATION, APP_ACCEPTED_BY_CHARACTER | APP_REJECTED_BY_CHARACTER | APP_WITHDRAWN_BY_CHARACTER) => true,
+                    (APP_APPLIED, APP_WITHDRAWN_BY_CHARACTER) => true,
+                    _ => false,
+                };
+                if !valid { return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED)); }
+                let by_character = matches!(status, APP_ACCEPTED_BY_CHARACTER | APP_REJECTED_BY_CHARACTER | APP_WITHDRAWN_BY_CHARACTER);
+                if by_character && character != me {
+                    return Err(notify_error(messages::CORP_APPLICATION_NOT_OWNED));
+                }
+                if !by_character {
+                    let (my_corp, roles) = membership(tx, me).await?;
+                    if my_corp != corporation || roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) == 0 {
+                        return Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_FOR_APPLICATION));
+                    }
+                }
+                if status == APP_ACCEPTED_BY_CHARACTER && old == corporation {
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                }
+                if status == APP_ACCEPTED_BY_CHARACTER && is_player_corp(corporation) {
+                    let Some((ceo, saved, count)) = registry::capacity(tx, corporation).await.map_err(db_err)? else {
+                        return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                    };
+                    let limit = match saved {
+                        Some(limit) => limit,
+                        None => {
+                            let ceo = ceo.ok_or_else(|| CallError::Internal(anyhow::anyhow!("legacy corporation has no CEO for capacity snapshot")))?;
+                            let limit = abilities::capacity(tx, &sde, ceo, now).await?;
+                            if registry::set_member_limit(tx, corporation, ceo, limit).await.map_err(db_err)? != 1 {
+                                return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                            }
+                            limit
+                        }
+                    };
+                    if count >= limit { return Ok(true); }
+                }
+                let message = if message.is_empty() { &r.custom_message } else { &message };
+                let affected = registry::update_application(tx, app_id, status, message, current).await.map_err(db_err)?;
                 if affected == 0 {
                     return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
                 }
-                if joins {
-                    let (old, _) = membership(tx, applicant).await?;
-                    if is_player_corp(old) && ceo_of(tx, old).await? == Some(applicant) {
+                if status == APP_ACCEPTED_BY_CHARACTER {
+                    let (old, _) = membership(tx, character).await?;
+                    if is_player_corp(old) && ceo_of(tx, old).await? == Some(character) {
                         return Err(notify_error(messages::CEO_MUST_LEAVE_CORP_BEFORE_JOINING));
                     }
-                    set_corp(tx, &sde, outbox, applicant, corp, 0, now).await?;
-                    registry::withdraw_applications(tx, applicant, app_id, APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION).await.map_err(db_err)?;
+                    if !set_corp(tx, &sde, outbox, character, corporation, 0, now).await? {
+                        return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
+                    }
+                    if let Some(body) = dispatch_dao::welcome_mail(tx, corporation).await.map_err(db_err)?.filter(|body| !body.is_empty()) {
+                        let input = super::super::mail::delivery::Delivery {
+                            sender: corporation, to_chars: vec![character], to_list: None, to_corp: None,
+                            title: messages::corps::WELCOME_MAIL_TITLE.to_owned(), body, sent: now,
+                            recipients: Vec::new(), automated: true,
+                        };
+                        super::super::mail::delivery::deliver(tx, outbox, &input).await?;
+                    }
+                    let withdrawn = registry::withdraw_applications(tx, character, app_id, APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION).await.map_err(db_err)?;
+                    for application in &withdrawn {
+                        queue_application(tx, outbox, application).await?;
+                    }
                 }
-                Ok(())
+                queue_application_id(tx, outbox, app_id).await?;
+                Ok(false)
             })
         },
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await?;
+    if full { return Err(notify_error(messages::corps::CORPORATION_FULL)); }
     Ok(Value::None)
 }
 

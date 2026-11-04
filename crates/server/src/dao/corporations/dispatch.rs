@@ -46,13 +46,28 @@ pub(crate) async fn recruiting(ex: &(impl Executor + ?Sized), corp: i64) -> Resu
         .await?.map(|row| Recruiting::from_row(&row).is_recruiting))
 }
 
-pub(crate) async fn insert_application(ex: &(impl Executor + ?Sized), corp: i64, character: i64, text: &str, status: i32, created: i64) -> Result<i64, db::Error> {
-    let row = ex.query_one("INSERT INTO game.corp_applications (corporation_id, character_id, application_text, status, created) VALUES ($1, $2, $3, $4, $5) RETURNING application_id", &[&corp, &character, &text, &status, &created]).await?;
-    Ok(ApplicationId::from_row(&row).application_id)
+pub(crate) async fn insert_application(ex: &(impl Executor + ?Sized), corp: i64, character: i64, text: &str, status: i32, created: i64, open: &[i32]) -> Result<Option<i64>, db::Error> {
+    let row = ex.query_opt(
+        "INSERT INTO game.corp_applications (corporation_id, character_id, application_text, status, created)
+         SELECT $1, $2, $3, $4, $5
+         WHERE EXISTS (SELECT 1 FROM game.corporations WHERE corporation_id = $1 AND NOT deleted)
+           AND NOT EXISTS (SELECT 1 FROM game.corp_applications WHERE corporation_id = $1 AND character_id = $2 AND status = ANY($6))
+         RETURNING application_id",
+        &[&corp, &character, &text, &status, &created, &open],
+    ).await?;
+    Ok(row.map(|row| ApplicationId::from_row(&row).application_id))
 }
 
-pub(crate) async fn insert_invitation(ex: &(impl Executor + ?Sized), corp: i64, character: i64, status: i32, created: i64) -> Result<u64, db::Error> {
-    ex.execute("INSERT INTO game.corp_applications (corporation_id, character_id, application_text, status, created) VALUES ($1, $2, '', $3, $4)", &[&corp, &character, &status, &created]).await
+pub(crate) async fn insert_invitation(ex: &(impl Executor + ?Sized), corp: i64, character: i64, status: i32, created: i64, open: &[i32]) -> Result<Option<i64>, db::Error> {
+    let row = ex.query_opt(
+        "INSERT INTO game.corp_applications (corporation_id, character_id, application_text, status, created)
+         SELECT $1, $2, '', $3, $4
+         WHERE EXISTS (SELECT 1 FROM game.characters WHERE character_id = $2 AND NOT deleted AND corporation_id <> $1)
+           AND NOT EXISTS (SELECT 1 FROM game.corp_applications WHERE corporation_id = $1 AND character_id = $2 AND status = ANY($5))
+         RETURNING application_id",
+        &[&corp, &character, &status, &created, &open],
+    ).await?;
+    Ok(row.map(|row| ApplicationId::from_row(&row).application_id))
 }
 
 pub(crate) async fn owners(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Vec<Owner>, db::Error> {
@@ -78,6 +93,6 @@ pub(crate) async fn welcome_mail(ex: &(impl Executor + ?Sized), corp: i64) -> Re
         .await?.map(|row| WelcomeMail::from_row(&row).welcome_mail))
 }
 
-pub(crate) async fn set_welcome_mail(ex: &(impl Executor + ?Sized), corp: i64, text: &str, ceo: i64) -> Result<u64, db::Error> {
-    ex.execute("UPDATE game.corporations SET welcome_mail = $2 WHERE corporation_id = $1 AND ceo_id = $3", &[&corp, &text, &ceo]).await
+pub(crate) async fn set_welcome_mail(ex: &(impl Executor + ?Sized), corp: i64, text: &str) -> Result<u64, db::Error> {
+    ex.execute("UPDATE game.corporations SET welcome_mail = $2 WHERE corporation_id = $1 AND NOT deleted", &[&corp, &text]).await
 }

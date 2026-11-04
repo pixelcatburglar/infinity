@@ -81,7 +81,7 @@ const CORP_HEADER: &[&str] = &[
 /// A corporation row: NPC corporations from the SDE, player corporations from game.corporations.
 async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
     let Some(r) = c.sde.npc_corporations.get(corp_id) else {
-        return Ok(super::corps::corporation_line(&c.db, corp_id).await?.map(|line| row(Value::list(CORP_HEADER.iter().map(|h| Value::str(*h))), line)).unwrap_or(Value::None));
+        return Ok(super::corps::corporation_line(&c.db, &c.sde, corp_id).await?.map(|line| row(Value::list(CORP_HEADER.iter().map(|h| Value::str(*h))), line)).unwrap_or(Value::None));
     };
     let member_count = crate::dao::characters::routing::npc_member_count(&c.db, corp_id).await.map_err(db_err)?;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
