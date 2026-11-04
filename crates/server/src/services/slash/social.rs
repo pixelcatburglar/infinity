@@ -14,7 +14,7 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             let id = if command == "corpcreate" {
                 corps::corp_registry::gm_found(c, &args[0], &args[1]).await?
             } else {
-                crate::services::alliances::corp_registry::gm_create(c, &args[0], &args[1]).await?
+                crate::services::corps::alliance_corp_registry::gm_create(c, &args[0], &args[1]).await?
             };
             Ok(messages::gm::gm_org_created(id))
         }
@@ -22,7 +22,7 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             if args.len() != 1 { return Err(slash_error(messages::gm::GM_JOINALLIANCE_USAGE.into())); }
             parsed.required(0).map_err(|_| slash_error(messages::gm::GM_JOINALLIANCE_USAGE.into()))?;
             let alliance = parsed.owner(c, 0).await?;
-            crate::services::alliances::corp_registry::gm_join(c, alliance).await?;
+            crate::services::corps::alliance_corp_registry::gm_join(c, alliance).await?;
             Ok(messages::gm::gm_joinalliance(alliance))
         }
         "missioncomplete" => {

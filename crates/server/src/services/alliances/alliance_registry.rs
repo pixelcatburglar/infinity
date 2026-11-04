@@ -5,8 +5,10 @@
 //! `game.alliance_history`.
 //! Mutual wars are supported separately; bills, sovereignty, capital systems and prime time are not.
 use super::*;
+use super::super::corps::{ceo_of, is_player_corp};
+use tracing::info;
 /// Join a corporation and, when required, make its application effective atomically.
-pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64, require_application: bool) -> Result<(), CallError> {
+pub(crate) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64, require_application: bool) -> Result<(), CallError> {
     let now = filetime_now();
     db.transaction(
         |tx, outbox| Box::pin(async move {

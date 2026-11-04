@@ -189,7 +189,7 @@ async fn gm_join_preserves_target_application() -> Result<()> {
         let other = s.alliance(executor).await?;
         s.app(other, corp).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
-        ensure!(super::super::corp_registry::gm_join(&mut s.f.client, alliance).await.is_ok(), "GM join refused");
+        ensure!(super::super::super::corps::alliance_corp_registry::gm_join(&mut s.f.client, alliance).await.is_ok(), "GM join refused");
         ensure!(application(&s, alliance, corp).await?.is_none() && application(&s, other, corp).await?.is_none() && state(&s, corp).await?.3 == 1, "GM application/history incorrect");
         assert_success_notices(&drain(&mut s.joining), alliance, corp, true)?;
         assert_success_notices(&drain(&mut s.existing), alliance, corp, false)?;
@@ -197,7 +197,7 @@ async fn gm_join_preserves_target_application() -> Result<()> {
         s.pilot(s.f.owner, second, 0).await?;
         s.f.client.session.apply(vec![("corpid", Value::Int(second)), ("allianceid", Value::None)]);
         s.app(alliance, second).await?; s.app(other, second).await?;
-        ensure!(super::super::corp_registry::gm_join(&mut s.f.client, alliance).await.is_ok(), "GM join with application refused");
+        ensure!(super::super::super::corps::alliance_corp_registry::gm_join(&mut s.f.client, alliance).await.is_ok(), "GM join with application refused");
         ensure!(application(&s, alliance, second).await? == Some(APP_NEW) && application(&s, other, second).await?.is_none() && state(&s, second).await?.3 == 1, "GM changed target application");
         let events = drain(&mut s.joining);
         ensure!(events.first().is_some_and(|e| e.0 == "__session") && notice(&events, "OnAllianceMemberChanged", alliance).is_some(), "missing ordered GM notices");

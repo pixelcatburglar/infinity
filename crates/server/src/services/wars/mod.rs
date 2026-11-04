@@ -8,9 +8,8 @@ pub(crate) mod classification;
 pub(crate) mod statistics;
 pub(super) mod deadlines;
 mod lifecycle;
-mod lookup_svc;
-mod mutual_war_invite_mgr;
 mod peace_treaty_mgr;
+mod mutual_war_invite_mgr;
 mod war_registry;
 mod wars_info_mgr;
 mod wire;
@@ -22,7 +21,6 @@ pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "warsInfoMgr" => wars_info_mgr::dispatch(c, call).await,
         "warRegistry" => war_registry::dispatch(c, call).await,
         "peaceTreatyMgr" => peace_treaty_mgr::dispatch(c, call).await,
-        "lookupSvc" => lookup_svc::dispatch(c, call).await,
         _ => None,
     }
 }

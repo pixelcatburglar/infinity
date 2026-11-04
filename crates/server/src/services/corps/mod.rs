@@ -217,10 +217,12 @@ pub(crate) mod shares;
 mod dividends;
 pub(crate) mod votes;
 pub(crate) mod vote_close;
+pub(crate) mod alliance_corp_registry;
 mod roles;
 use roles::{delete_title, execute_actions, info_window_data, potential_ceos, resign_ceo, rowset_lines, titles, update_member, update_titles};
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
+    if let Some(result) = alliance_corp_registry::dispatch(c, call).await { return Some(result); }
     if let Some(result) = corp_registry::dispatch(c, call).await { return Some(result); }
     votes::dispatch(c, call).await
 }

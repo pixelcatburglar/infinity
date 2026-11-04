@@ -4,6 +4,16 @@
 //! `game.corporations` and `game.alliance_applications` through the DAO.
 //! Wars, bills, sovereignty, capital systems and prime time are not supported.
 use super::*;
+use crate::dao::alliances as dao;
+use crate::services::alliances::{self, application_changed, application_header, application_line, application_line_of, indexed_rowset, set_alliance, APP_NEW};
+use crate::services::{db_err, keyval, notify_error, trimmed_arg_text, Call, CallError, CallResult};
+use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH};
+use crate::db::Db;
+use crate::db::outbox::dispatch_world;
+use crate::messages;
+use marshal::Value;
+use tracing::info;
 /// appConst.allianceCreationCost
 const CREATION_COST: f64 = 1_000_000_000.0;
 /// The CEO of a player corporation that isn't in an alliance yet.
@@ -69,11 +79,11 @@ pub(crate) async fn gm_join(c: &mut Client, alliance: i64) -> Result<(), CallErr
     let db = &c.db;
     let me = c.session.int("charid").unwrap_or(0);
     let corp = unallied_ceo_corp(db, me).await?;
-    super::alliance_registry::admit(db, &c.world, alliance, corp, false).await
+    alliances::alliance_registry::admit(db, &c.world, alliance, corp, false).await
 }
 /// GetSuggestedAllianceShortNames(name) -> [KeyVal(shortName)]
 fn suggested_short_names(name: &str) -> Value {
-    Value::list(suggested_names(name).into_iter().map(|t| keyval([("shortName", Value::unicode(t))])))
+    Value::list(alliances::suggested_names(name).into_iter().map(|t| keyval([("shortName", Value::unicode(t))])))
 }
 /// The alliance side of corpRegistry.
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
