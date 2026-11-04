@@ -54,6 +54,7 @@ pub(crate) mod mail;
 pub(crate) mod market;
 pub(crate) mod map;
 mod npe;
+mod lookup_svc;
 mod offices;
 pub(crate) mod online_status;
 mod orgs;
@@ -410,6 +411,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = bills::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = lookup_svc::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = alliances::dispatch(c, call).await {

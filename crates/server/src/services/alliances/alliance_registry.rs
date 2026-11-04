@@ -5,44 +5,8 @@
 //! `game.alliance_history`.
 //! Mutual wars are supported separately; bills, sovereignty, capital systems and prime time are not.
 use super::*;
-/// Join a corporation and, when required, make its application effective atomically.
-pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64, require_application: bool) -> Result<(), CallError> {
-    let now = filetime_now();
-    db.transaction(
-        |tx, outbox| Box::pin(async move {
-            let allied = dao::live_corporation_alliance(tx, corp).await.map_err(db_err)?
-                .ok_or_else(|| notify_error(messages::CORP_NOT_FOUND))?;
-            if allied.is_some() {
-                return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
-            }
-            if !dao::exists(tx, alliance).await.map_err(db_err)? {
-                return Err(notify_error(messages::ALLIANCE_NOT_FOUND));
-            }
-            let old_alliance = alliance_line_of(tx, alliance).await?;
-            let application = if require_application {
-                Some(dao::application(tx, alliance, corp).await.map_err(db_err)?
-                    .ok_or_else(|| notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND))?)
-            } else {
-                None
-            };
-            set_alliance(tx, outbox, corp, Some(alliance), now).await?;
-            let others = dao::delete_other_applications(tx, corp, alliance).await.map_err(db_err)?;
-            if let Some(application) = application {
-                if dao::update_application(tx, alliance, corp, APP_EFFECTIVE, application.state).await.map_err(db_err)? == 0 {
-                    return Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND));
-                }
-                queue_application_changed(tx, outbox, alliance, corp, Some(application_line(application))).await?;
-            }
-            for application in others {
-                let other_alliance = application.alliance;
-                queue_application_changed(tx, outbox, other_alliance, corp, Some(application_line(application))).await?;
-            }
-            queue_member_changed(tx, outbox, alliance, corp, None).await?;
-            queue_alliance_changed(tx, outbox, alliance, old_alliance).await
-        }),
-        |value, outbox| async move { dispatch_world(value, outbox, world) },
-    ).await
-}
+use super::super::corps::{ceo_of, is_player_corp};
+use tracing::info;
 /// A member corporation backs `candidate` as executor; one backed by corporations holding
 /// more than half the alliance's pilots takes over.
 async fn support_executor(db: &Db, world: &World, me: i64, alliance: i64, candidate: i64) -> Result<(), CallError> {
@@ -140,38 +104,25 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             indexed_rowset(&header, "corporationID", lines.into_iter().map(|(corp, l)| (corp, header.row(&l))).collect())
         }),
         // {corporationID: application}
-        "GetApplications" => match dao::applications(db, dao::ApplicationFilter::Alliance(alliance)).await {
-            Ok(rows) => {
-                let header = application_header();
-                let rows = rows.into_iter().map(|r| (r.corporation, header.row(&application_line(r)))).collect();
-                Ok(indexed_rowset(&header, "corporationID", rows))
+        "GetApplications" => {
+            let identity = crate::services::identity::Identity::of_client(c);
+            if !call.bound || !matches!(call.bind_params, Some(Value::Tuple(parts)) if parts.len() == 2 && parts[0].as_int() == Some(alliance) && matches!(parts[1], Value::Bool(_))) || !call.args.is_empty() {
+                return Some(Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION)));
             }
-            Err(e) => Err(db_err(e)),
-        },
-        // UpdateApplication(corpID, applicationText, state): accepting admits the corporation.
+            admission::applications(db, &identity, alliance).await
+        }
         "UpdateApplication" | "GMForceAcceptApplication" => {
-            let corp = int(0);
-            let state = if call.method == "GMForceAcceptApplication" { APP_ACCEPTED } else { int(2) as i32 };
-            if !executor_director(db, me, alliance).await.unwrap_or(false) {
-                return Some(Err(notify_error(messages::EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_HANDLE_APPLICATION)));
+            if !call.bound || !matches!(call.bind_params, Some(Value::Tuple(parts)) if parts.len() == 2 && parts[0].as_int() == Some(alliance) && matches!(parts[1], Value::Bool(_))) {
+                return Some(Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION)));
             }
-            if state == APP_ACCEPTED {
-                admit(db, world, alliance, corp, true).await.map(|_| Value::None)
-            } else {
-                let old = match dao::application(db, alliance, corp).await {
-                    Ok(Some(old)) => old,
-                    Ok(None) => return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND))),
-                    Err(e) => return Some(Err(db_err(e))),
-                };
-                if state != APP_REJECTED {
-                    return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_STATUS_INVALID)));
+            let decision = match (call.method, call.args) {
+                ("UpdateApplication", [corp, Value::Unicode(text), state]) if corp.as_int().is_some() && state.as_int().and_then(|v| i32::try_from(v).ok()).is_some() && !text.contains('\0') => {
+                    (corp.as_int().unwrap(), admission::Decision::Manager { text: text.clone(), state: i32::try_from(state.as_int().unwrap()).unwrap() })
                 }
-                match dao::update_application(db, alliance, corp, APP_REJECTED, old.state).await {
-                    Ok(0) => Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND)),
-                    Ok(_) => application_changed(db, world, alliance, corp, Some(application_line(old))).await.map(|_| Value::None),
-                    Err(e) => Err(db_err(e)),
-                }
-            }
+                ("GMForceAcceptApplication", [corp]) if corp.as_int().is_some() => (corp.as_int().unwrap(), admission::Decision::Force { role: c.login.role }),
+                _ => return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_STATUS_INVALID))),
+            };
+            admission::decide(db, world, &crate::services::identity::Identity::of_client(c), alliance, decision.0, decision.1).await.map(|_| Value::None)
         }
         "DeclareExecutorSupport" => support_executor(db, world, me, alliance, int(0)).await.map(|_| Value::None),
         // DeleteMember(corpID): leave (the corporation's CEO) or remove (executor directors).

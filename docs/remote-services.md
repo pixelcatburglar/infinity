@@ -245,6 +245,46 @@ Encoded-item decoding is deferred and currently returns an explicit refusal with
 
 Single-track login campaigns are not open. Both the campaign-state query and claim request return None, meaning no campaign and no reward claimed. Seasonal login campaigns use their separate implementation and are unchanged.
 
+## Corporations, alliances and owner lookup
+
+| service | method | status | handler file |
+|---|---|---|---|
+| corpRegistry | InsertApplication | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | InsertInvitation | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | GetMyApplications | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | GetApplications | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | GetMyOldApplications | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | GetOldApplications | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | UpdateApplicationOffer | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | GetCorpWelcomeMail | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | SetCorpWelcomeMail | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | UpdateCorporationAbilities | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | AddCorporation | handled | `crates/server/src/services/corps/corp_registry.rs` |
+| corpRegistry | CreateAlliance | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
+| corpRegistry | GetSuggestedAllianceShortNames | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
+| corpRegistry | ApplyToJoinAlliance | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
+| corpRegistry | GetAllianceApplications | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
+| corpRegistry | DeleteAllianceApplication | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
+| allianceRegistry | GetApplications | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | UpdateApplication | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GMForceAcceptApplication | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetAlliance | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetAlliancePublicInfo | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetRankedAlliances | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetAllianceMembers | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetEmploymentRecord | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetMembers | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| lookupSvc | LookupEvePlayerCharacters | handled | `crates/server/src/services/lookup_svc.rs` |
+| lookupSvc | LookupOwners | handled | `crates/server/src/services/lookup_svc.rs` |
+| lookupSvc | LookupPCOwners | handled | `crates/server/src/services/lookup_svc.rs` |
+| lookupSvc | LookupWarableCorporationsOrAlliances | handled | `crates/server/src/services/lookup_svc.rs` |
+| lookupSvc | LookupNoneNPCAccountOwners | fixed | `crates/server/src/services/fixed.rs` |
+| lookupSvc | LookupKnownLocationsByGroup | fixed | `crates/server/src/services/fixed.rs` |
+| lookupSvc | LookupLocationsByGroup | fixed | `crates/server/src/services/fixed.rs` |
+| lookupSvc | LookupCharacters | fixed | `crates/server/src/services/fixed.rs` |
+| lookupSvc | LookupCorporations | fixed | `crates/server/src/services/fixed.rs` |
+| lookupSvc | LookupFactions | fixed | `crates/server/src/services/fixed.rs` |
+
 ## Search-word moderation
 
 | service | method | status | handler file |

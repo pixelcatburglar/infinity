@@ -21,6 +21,7 @@ async fn session_categories_and_unbound_connections() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let actor = fixture::create(&db).await;
     let other = fixture::create(&db).await;
+    let (corp, alliance) = fixture::organization(&db, actor.id).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap());
@@ -28,7 +29,7 @@ async fn session_categories_and_unbound_connections() {
         let world = World::new(test_db.clone(), sde.clone(), 1);
         let hub = Hub::new("chat.test", test_db.clone(), world.clone());
         let (mut client, _peer) = fixture::client(test_db.clone(), sde.clone(), world.clone(), hub.clone()).await;
-        client.change_session(vec![("charid", Value::Int(actor.id)), ("solarsystemid2", Value::Int(system)), ("corpid", Value::Int(actor.id)), ("allianceid", Value::Int(actor.id)), ("warfactionid", Value::Int(actor.id)), ("fleetid", Value::Int(actor.id))]);
+        client.change_session(vec![("charid", Value::Int(actor.id)), ("solarsystemid2", Value::Int(system)), ("corpid", Value::Int(corp)), ("allianceid", Value::Int(alliance)), ("warfactionid", Value::Int(actor.id)), ("fleetid", Value::Int(actor.id))]);
         let session = world.online_session(actor.id).unwrap();
         let channels = authority::system_channels(&sde, &session);
         assert_eq!(channels.len(), 5, "session facts: {session:?}");
@@ -91,6 +92,7 @@ async fn session_categories_and_unbound_connections() {
         let task = tasks.0.pop().unwrap(); tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap();
         assert!(hub.rooms.lock().unwrap().entries.get(&first).unwrap().contains_key(&actor.id.to_string()));
     }).await;
+    fixture::cleanup_organization(&db, corp, alliance).await;
     fixture::cleanup(&db, &[actor, other]).await;
     result.unwrap();
 }
@@ -101,22 +103,23 @@ async fn discovery_hides_closed_rooms_and_restart_preserves_metadata() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let owner = fixture::create(&db).await; let guest = fixture::create(&db).await; let outsider = fixture::create(&db).await;
+    let (corp, alliance) = fixture::organization(&db, owner.id).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap()); let world = World::new(test_db.clone(), sde.clone(), 1); let hub = Hub::new("chat.test", test_db.clone(), world.clone());
         let (mut a, _a) = fixture::client(test_db.clone(), sde.clone(), world.clone(), hub.clone()).await;
         let (mut b, _b) = fixture::client(test_db.clone(), sde.clone(), world.clone(), hub.clone()).await;
         let (mut x, _x) = fixture::client(test_db.clone(), sde, world.clone(), hub.clone()).await;
-        a.change_session(vec![("charid", Value::Int(owner.id)), ("corpid", Value::Int(owner.id)), ("fleetid", Value::Int(owner.id))]); b.change_session(vec![("charid", Value::Int(guest.id))]); x.change_session(vec![("charid", Value::Int(outsider.id))]);
+        a.change_session(vec![("charid", Value::Int(owner.id)), ("corpid", Value::Int(corp)), ("fleetid", Value::Int(owner.id))]); b.change_session(vec![("charid", Value::Int(guest.id))]); x.change_session(vec![("charid", Value::Int(outsider.id))]);
         let c = dao::create_player(&test_db, owner.id, &format!("Hidden{}", owner.id)).await.unwrap();
         let private = dao::create_private(&test_db, owner.id, guest.id).await.unwrap();
         let s = world.online_session(owner.id).unwrap(); authority::invite(&test_db, &hub, &s, &c.name, guest.id).await.unwrap();
-        let room = format!("{}@conference.chat.test", c.name); let corp = format!("corp_{}@conference.chat.test", owner.id); let fleet = format!("fleet_{}@conference.chat.test", owner.id);
+        let room = format!("{}@conference.chat.test", c.name); let corp_room = format!("corp_{}@conference.chat.test", corp); let fleet = format!("fleet_{}@conference.chat.test", owner.id);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap(); let mut tasks = Tasks(Vec::new());
         let mut os = open(&listener, &hub, &mut tasks, owner.id).await; let mut xs = open(&listener, &hub, &mut tasks, outsider.id).await;
-        for (i, r) in [&room, &corp, &fleet].iter().enumerate() { assert!(presence(&mut os, r, owner.id, &format!("join{i}")).await.contains("code='110'")); }
+        for (i, r) in [&room, &corp_room, &fleet].iter().enumerate() { assert!(presence(&mut os, r, owner.id, &format!("join{i}")).await.contains("code='110'")); }
         a.change_session(vec![("corpid", Value::Int(guest.id)), ("fleetid", Value::Int(guest.id))]);
-        { let rooms = hub.rooms.lock().unwrap(); assert!(rooms.entries.contains_key(&room)); assert!(!rooms.entries.contains_key(&corp)); assert!(!rooms.entries.contains_key(&fleet)); }
+        { let rooms = hub.rooms.lock().unwrap(); assert!(rooms.entries.contains_key(&room)); assert!(!rooms.entries.contains_key(&corp_room)); assert!(!rooms.entries.contains_key(&fleet)); }
         let list = iq_request(&mut xs, "forme-hidden", "conference.chat.test", "get", "<query xmlns='http://jabber.org/protocol/disco#items' node='forme'/>").await;
         assert!(!list.contains(&c.name) && !list.contains(&private.name));
         let byname = iq_request(&mut xs, "byname-hidden", "conference.chat.test", "get", &format!("<query xmlns='http://jabber.org/protocol/disco#items' node='byname/{}'/>", c.display_name)).await; assert!(!byname.contains(&c.name));
@@ -130,6 +133,7 @@ async fn discovery_hides_closed_rooms_and_restart_preserves_metadata() {
         assert!(dao::get(&test_db, &c.name).await.unwrap().is_some()); assert!(dao::member(&test_db, &c.name, guest.id).await.unwrap().unwrap().invited);
         assert!(authority::admit(&test_db, world.sde(), &world.online_session(guest.id).unwrap(), &c.name).await.unwrap().is_some());
     }).await;
+    fixture::cleanup_organization(&db, corp, alliance).await;
     fixture::cleanup(&db, &[owner, guest, outsider]).await; result.unwrap();
 }
 

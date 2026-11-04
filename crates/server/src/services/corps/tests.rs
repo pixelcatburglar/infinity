@@ -6,3 +6,4 @@ mod dividends;
 mod votes;
 mod races;
 mod protocol;
+mod admission;

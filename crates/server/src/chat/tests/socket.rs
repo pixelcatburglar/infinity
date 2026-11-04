@@ -56,6 +56,7 @@ async fn authenticated_socket_rejects_forged_rooms_without_occupants() {
     let owner = fixture::create(&db).await;
     let outsider = fixture::create(&db).await;
     let third = fixture::create(&db).await;
+    let (corp, alliance) = fixture::organization(&db, owner.id).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap());
@@ -63,7 +64,7 @@ async fn authenticated_socket_rejects_forged_rooms_without_occupants() {
         let hub = Hub::new("chat.test", test_db.clone(), world.clone());
         let (mut owner_client, _owner_game_socket) = fixture::client(test_db.clone(), sde.clone(), world.clone(), hub.clone()).await;
         let (mut outsider_client, _outsider_game_socket) = fixture::client(test_db.clone(), sde, world, hub.clone()).await;
-        owner_client.change_session(vec![("charid", Value::Int(owner.id)), ("corpid", Value::Int(owner.id)), ("fleetid", Value::Int(owner.id))]);
+        owner_client.change_session(vec![("charid", Value::Int(owner.id)), ("corpid", Value::Int(corp)), ("fleetid", Value::Int(owner.id))]);
         outsider_client.change_session(vec![("charid", Value::Int(outsider.id)), ("corpid", Value::Int(outsider.id)), ("fleetid", Value::Int(outsider.id))]);
         let private = dao::create_private(&test_db, owner.id, outsider.id).await.unwrap();
         let restricted_private = dao::create_private(&test_db, owner.id, third.id).await.unwrap();
@@ -75,7 +76,7 @@ async fn authenticated_socket_rejects_forged_rooms_without_occupants() {
         let mut outsider_socket = open(&listener, &hub, &mut tasks, outsider.id).await;
         let own_room = format!("{}@conference.chat.test", closed.name);
         assert!(presence(&mut owner_socket, &own_room, owner.id, "owner").await.contains("code='110'"));
-        let corp_room = format!("corp_{}@conference.chat.test", owner.id);
+        let corp_room = format!("corp_{}@conference.chat.test", corp);
         assert!(presence(&mut owner_socket, &corp_room, owner.id, "current").await.contains("code='110'"));
         owner_client.change_session(vec![("corpid", Value::Int(third.id))]);
         {
@@ -83,7 +84,7 @@ async fn authenticated_socket_rejects_forged_rooms_without_occupants() {
             assert!(!rooms.entries.contains_key(&corp_room));
             assert!(rooms.entries.get(&own_room).unwrap().contains_key(&owner.id.to_string()));
         }
-        let forged = [format!("corp_{}", owner.id), format!("fleet_{}", owner.id), closed.name.clone(), restricted_private.name.clone()];
+        let forged = [format!("corp_{}", corp), format!("fleet_{}", owner.id), closed.name.clone(), restricted_private.name.clone()];
         for (index, name) in forged.iter().enumerate() {
             let room = format!("{name}@conference.chat.test");
             let response = presence(&mut outsider_socket, &room, outsider.id, &format!("deny{index}")).await;
@@ -108,6 +109,7 @@ async fn authenticated_socket_rejects_forged_rooms_without_occupants() {
         let disconnected = presence(&mut outsider_socket, &format!("corp_{}@conference.chat.test", outsider.id), outsider.id, "disconnected").await;
         assert!(disconnected.contains("type='error'") && disconnected.contains("not-authorized"));
     }).await;
+    fixture::cleanup_organization(&db, corp, alliance).await;
     fixture::cleanup(&db, &[owner, outsider, third]).await;
     result.unwrap();
 }

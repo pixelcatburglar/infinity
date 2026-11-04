@@ -115,8 +115,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         // eve/client/script/ui/services/corporation/itemLocking.py:73-77 caches and mutates the set of locations containing locked items.
         ("itemLocking", "GetLockedItemLocations") => Value::reduce("__builtin__.set", vec![Value::list([])], None),
         ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
-        // A player character's corporation, or an NPC's (agents) from the SDE.
-        ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
@@ -127,7 +125,18 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("rewardMgr", "GetRewardLPLogs") => Value::list([]),
         ("account", "GetJournal") | ("account", "GetJournalForAccounts") | ("account", "GetTransactions") => Value::list([]),
         ("account", "GetWalletDivisionsInfo") => Value::list([]),
-        ("lookupSvc", _) => Value::list([]),
+        // Wallet owner picker has no modelled account-owner search.
+        ("lookupSvc", "LookupNoneNPCAccountOwners") => Value::list([]),
+        // Legacy location search has no modelled group lookup.
+        ("lookupSvc", "LookupKnownLocationsByGroup") => Value::list([]),
+        // Developer location search has no modelled group lookup.
+        ("lookupSvc", "LookupLocationsByGroup") => Value::list([]),
+        // Developer character search has no modelled generic lookup.
+        ("lookupSvc", "LookupCharacters") => Value::list([]),
+        // Developer corporation search has no modelled generic lookup.
+        ("lookupSvc", "LookupCorporations") => Value::list([]),
+        // Developer faction search has no modelled generic lookup.
+        ("lookupSvc", "LookupFactions") => Value::list([]),
 
         // ---- mail, notifications, contracts ----
         // Client-side settings blobs (yaml); nothing reads them back yet.

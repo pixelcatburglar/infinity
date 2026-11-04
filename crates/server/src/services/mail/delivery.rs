@@ -36,7 +36,7 @@ pub(crate) struct SendMail {
     pub forwarded_from: i64,
 }
 
-pub(super) struct Delivery {
+pub(crate) struct Delivery {
     pub sender: i64,
     pub to_chars: Vec<i64>,
     pub to_list: Option<i64>,
@@ -48,7 +48,7 @@ pub(super) struct Delivery {
     pub automated: bool,
 }
 
-pub(super) fn validate_content(title: &str, body: &str) -> Result<(), CallError> {
+pub(crate) fn validate_content(title: &str, body: &str) -> Result<(), CallError> {
     let configured = usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX);
     if title.chars().count() > configured.min(MAX_TITLE) || body.chars().count() > MAX_BODY {
         return Err(notify_error(messages::mail::INVALID_CONTENT));
@@ -57,7 +57,7 @@ pub(super) fn validate_content(title: &str, body: &str) -> Result<(), CallError>
 }
 
 /// Insert one message and its deduplicated status rows in the caller's transaction.
-pub(super) async fn deliver(ex: &(impl Executor + ?Sized), outbox: &mut Outbox, input: &Delivery) -> Result<i64, CallError> {
+pub(crate) async fn deliver(ex: &(impl Executor + ?Sized), outbox: &mut Outbox, input: &Delivery) -> Result<i64, CallError> {
     deliver_to(ex, outbox, input, &input.recipients).await
 }
 

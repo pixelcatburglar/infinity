@@ -40,6 +40,10 @@
 - Crate contents that the static data does not list come from the server's own content, inferred from each crate's description; they are not the live server's reward tables.
 - Crate opening has no request-keyed replay protection; client call IDs are fresh per call.
 - A corporation at war that joins an alliance keeps its war, but the war no longer applies to its pilots, who now fight as the alliance, as the client also shows. The corporation's own CEO or directors can still retract it.
+- A GM-created corporation can keep its CEO even if its saved member capacity is zero. Corporation capacity does not enforce racial membership restrictions.
+- Membership changes are saved before live refreshes are delivered. If the server stops immediately after a commit, the live updates can be missed; reconnecting rebuilds the saved state.
+- Legacy corporation application renegotiation statuses remain readable but cannot be used to join.
+- An alliance application takes effect immediately when accepted, although the client's acceptance dialog says there is a delay.
 - Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
 - In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.
 - Fleet bubble broadcasts and fleet warp treat a whole solar system as one grid, because the server keeps one ballpark per system.

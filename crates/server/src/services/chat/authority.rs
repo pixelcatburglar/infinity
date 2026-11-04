@@ -1,6 +1,7 @@
 //! Channel admission and durable room authority for `xmppchatclient/xmppchatsvc.py`
-//! and `xmppchannelsettings.py`. Session facts come from the online pilot registry,
-//! local categories from the SDE map, and room metadata, ACLs and special MOTDs from
+//! and `xmppchannelsettings.py`. Organization authority comes from current game
+//! membership, other session facts from the online pilot registry, local categories
+//! from the SDE map, and room metadata, ACLs and special MOTDs from
 //! `game.chat_channels`, `game.chat_channel_members` and `game.chat_system_motds`.
 //! Occupants and messages are runtime transport state. Restriction deadlines persist
 //! and use the durable scheduler. Passwords, corporation/alliance ACL grants,
@@ -117,7 +118,16 @@ fn voice(c: &dao::Channel, m: Option<&dao::Member>, aff: &str, now: i64) -> &'st
 pub(crate) async fn admit(db: &Db, sde: &Sde, session: &OnlineSession, channel: &str) -> Result<Option<Admission>, CallError> {
     let id = session.character_id;
     if id <= 0 { return Ok(None); }
-    if matches_system_channel(sde, session, channel) || channel == DEFAULT_HELP || channel == ROOKIE || HELP_ROOMS.iter().any(|(_, room)| *room == channel) {
+    let system_match = if channel.starts_with("corp_") || channel.starts_with("alliance_") {
+        let Some(org) = crate::dao::characters::members::organization(db, id).await? else { return Ok(None); };
+        let mut actual = session.clone();
+        actual.corporation_id = Some(org.corporation_id);
+        actual.alliance_id = org.alliance_id;
+        matches_system_channel(sde, &actual, channel)
+    } else {
+        matches_system_channel(sde, session, channel)
+    };
+    if system_match || channel == DEFAULT_HELP || channel == ROOKIE || HELP_ROOMS.iter().any(|(_, room)| *room == channel) {
         let motd = dao::get_system_motd(db, channel).await?.unwrap_or_default();
         return Ok(Some(Admission { affiliation: "member".into(), role: "participant".into(), motd }));
     }

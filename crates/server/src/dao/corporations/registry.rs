@@ -21,6 +21,32 @@ pub(crate) async fn membership(ex: &(impl Executor + ?Sized), char_id: i64) -> R
     let row = ex.query_one(&format!("SELECT ch.corporation_id, {EFFECTIVE_ROLES_SQL} AS effective_roles FROM game.characters ch WHERE ch.character_id = $1"), &[&char_id]).await?;
     Ok(Membership::from_row(&row))
 }
+/// Lock the union of explicit and corporation-derived alliances in ascending ID order,
+/// before corporations, characters and applications in their respective ascending orders.
+/// Return false if a corporation's alliance association changed while acquiring locks.
+/// Missing explicit alliances are tolerated; callers decide whether they must exist.
+pub(crate) async fn lock_admission(ex: &(impl Executor + ?Sized), alliances: &[i64], corps: &[i64], characters: &[i64]) -> Result<bool, db::Error> {
+    let before = ex.query("SELECT corporation_id, alliance_id FROM game.corporations WHERE corporation_id = ANY($1) ORDER BY corporation_id", &[&corps]).await?;
+    let mut alliances: Vec<i64> = alliances.iter().copied().chain(before.iter().filter_map(|r| r.get::<_, Option<i64>>("alliance_id"))).collect();
+    alliances.sort_unstable();
+    alliances.dedup();
+    ex.query("SELECT alliance_id FROM game.alliances WHERE alliance_id = ANY($1) ORDER BY alliance_id FOR UPDATE", &[&alliances]).await?;
+    let after = ex.query("SELECT corporation_id, alliance_id FROM game.corporations WHERE corporation_id = ANY($1) ORDER BY corporation_id FOR UPDATE", &[&corps]).await?;
+    if before.len() != after.len() || before.iter().zip(&after).any(|(a, b)| a.get::<_, i64>("corporation_id") != b.get::<_, i64>("corporation_id") || a.get::<_, Option<i64>>("alliance_id") != b.get::<_, Option<i64>>("alliance_id")) {
+        return Ok(false);
+    }
+    ex.query("SELECT character_id FROM game.characters WHERE character_id = ANY($1) ORDER BY character_id FOR UPDATE", &[&characters]).await?;
+    ex.query("SELECT application_id FROM game.corp_applications WHERE character_id = ANY($1) ORDER BY application_id FOR UPDATE", &[&characters]).await?;
+    Ok(true)
+}
+
+pub(crate) async fn active_character(ex: &(impl Executor + ?Sized), id: i64) -> Result<bool, db::Error> {
+    Ok(ex.query_opt("SELECT character_id FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&id]).await?.is_some())
+}
+pub(crate) async fn character_corp(ex: &(impl Executor + ?Sized), id: i64) -> Result<Option<i64>, db::Error> {
+    Ok(ex.query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&id]).await?.map(|r| r.get("corporation_id")))
+}
+
 
 struct CeoRow { ceo_id: Option<i64> }
 impl CeoRow {
@@ -76,14 +102,15 @@ pub(crate) async fn headquarters(ex: &(impl Executor + ?Sized), corp: i64) -> Re
         .as_ref().map(HeadquartersRow::from_row))
 }
 
-pub(crate) async fn set_corp(ex: &(impl Executor + ?Sized), char_id: i64, corp: i64, roles: i64, now: i64) -> Result<(), db::Error> {
-    ex.execute(
+pub(crate) async fn set_corp(ex: &(impl Executor + ?Sized), char_id: i64, corp: i64, roles: i64, now: i64) -> Result<bool, db::Error> {
+    let changed = ex.execute(
         "UPDATE game.characters SET corporation_id = $2, corp_roles = $3, corp_grantable_roles = 0, corp_title_mask = 0, corp_title = ''
-             WHERE character_id = $1",
+             WHERE character_id = $1 AND corporation_id IS DISTINCT FROM $2",
         &[&char_id, &corp, &roles],
     ).await?;
+    if changed == 0 { return Ok(false); }
     ex.execute("INSERT INTO game.employment_history (char_id, corporation_id, start_date) VALUES ($1, $2, $3)", &[&char_id, &corp, &now]).await?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) async fn school(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<SchoolRow, db::Error> {
@@ -113,21 +140,23 @@ pub(crate) struct NewCorporation<'a> {
     pub(crate) description: &'a str,
     pub(crate) url: &'a str,
     pub(crate) tax: f64,
+    pub(crate) lp_tax: f64,
     pub(crate) ceo: i64,
     pub(crate) station: i64,
     pub(crate) recruiting: bool,
     pub(crate) friendly: bool,
     pub(crate) shapes: [Option<i32>; 7],
     pub(crate) now: i64,
+    pub(crate) member_limit: Option<i64>,
 }
 
 pub(crate) async fn create(ex: &(impl Executor + ?Sized), corp: &NewCorporation<'_>) -> Result<i64, db::Error> {
     Ok(CreatedRow::from_row(&ex.query_one(
         "INSERT INTO game.corporations (name, ticker, description, url, tax_rate, ceo_id, creator_id, station_id, is_recruiting, friendly_fire,
-                                                    shape1, shape2, shape3, color1, color2, color3, typeface, created)
-                     VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING corporation_id",
+                                                    shape1, shape2, shape3, color1, color2, color3, typeface, created, member_limit, lp_tax_rate)
+                     VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING corporation_id",
         &[&corp.name, &corp.ticker, &corp.description, &corp.url, &corp.tax, &corp.ceo, &corp.station, &corp.recruiting, &corp.friendly,
-          &corp.shapes[0], &corp.shapes[1], &corp.shapes[2], &corp.shapes[3], &corp.shapes[4], &corp.shapes[5], &corp.shapes[6], &corp.now],
+          &corp.shapes[0], &corp.shapes[1], &corp.shapes[2], &corp.shapes[3], &corp.shapes[4], &corp.shapes[5], &corp.shapes[6], &corp.now, &corp.member_limit, &corp.lp_tax],
     ).await?).corporation_id)
 }
 
@@ -159,6 +188,14 @@ pub(crate) async fn applications(ex: &(impl Executor + ?Sized), filter: Applicat
 pub(crate) async fn old_applications(ex: &(impl Executor + ?Sized), character: i64, open: &[i32], limit: i64) -> Result<Vec<Application>, db::Error> {
     Ok(ex.query(&format!("{APPLICATION_SELECT} WHERE character_id = $1 AND NOT (status = ANY($2)) ORDER BY application_id DESC LIMIT $3"), &[&character, &open, &limit]).await?.iter().map(Application::from_row).collect())
 }
+pub(crate) async fn old_corporation_applications(ex: &(impl Executor + ?Sized), corp: i64, open: &[i32]) -> Result<Vec<Application>, db::Error> {
+    Ok(ex.query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1 AND NOT (status = ANY($2)) ORDER BY application_id DESC"), &[&corp, &open]).await?.iter().map(Application::from_row).collect())
+}
+
+pub(crate) async fn application_managers(ex: &(impl Executor + ?Sized), corp: i64, roles: i64) -> Result<Vec<i64>, db::Error> {
+    Ok(ex.query(&format!("SELECT ch.character_id FROM game.characters ch WHERE ch.corporation_id = $1 AND NOT ch.deleted AND ({EFFECTIVE_ROLES_SQL} & $2) <> 0 ORDER BY ch.character_id"), &[&corp, &roles]).await?.iter().map(|r| r.get("character_id")).collect())
+}
+
 
 pub(crate) async fn application(ex: &(impl Executor + ?Sized), id: i64) -> Result<Option<Application>, db::Error> {
     Ok(ex.query_opt(&format!("{APPLICATION_SELECT} WHERE application_id = $1"), &[&id]).await?.as_ref().map(Application::from_row))
@@ -168,9 +205,8 @@ pub(crate) async fn update_application(ex: &(impl Executor + ?Sized), id: i64, s
     ex.execute("UPDATE game.corp_applications SET status = $2, custom_message = $3 WHERE application_id = $1 AND status = $4", &[&id, &status, &message, &current]).await
 }
 
-pub(crate) async fn withdraw_applications(ex: &(impl Executor + ?Sized), applicant: i64, id: i64, status: i32, open: &[i32]) -> Result<(), db::Error> {
-    ex.execute("UPDATE game.corp_applications SET status = $3 WHERE character_id = $1 AND application_id <> $2 AND status = ANY($4)", &[&applicant, &id, &status, &open]).await?;
-    Ok(())
+pub(crate) async fn withdraw_applications(ex: &(impl Executor + ?Sized), applicant: i64, id: i64, status: i32, open: &[i32]) -> Result<Vec<Application>, db::Error> {
+    Ok(ex.query("UPDATE game.corp_applications SET status = $3 WHERE character_id = $1 AND application_id <> $2 AND status = ANY($4) RETURNING application_id, corporation_id, character_id, application_text, status, created, custom_message", &[&applicant, &id, &status, &open]).await?.iter().map(Application::from_row).collect())
 }
 
 pub(crate) enum MemberFilter { All, Include, Exclude }
@@ -245,6 +281,7 @@ pub(crate) struct Corporation {
     pub(crate) created: i64,
     pub(crate) deleted: bool,
     pub(crate) member_count: i64,
+    pub(crate) member_limit: Option<i64>,
     pub(crate) alliance_id: Option<i64>,
     pub(crate) chosen_executor_id: Option<i64>,
     pub(crate) division_names: Option<Vec<Option<String>>>,
@@ -257,7 +294,7 @@ impl Corporation {
             tax_rate: r.get("tax_rate"), lp_tax_rate: r.get("lp_tax_rate"), creator_id: r.get("creator_id"),
             ceo_id: r.get("ceo_id"), station_id: r.get("station_id"), is_recruiting: r.get("is_recruiting"),
             friendly_fire: r.get("friendly_fire"), logo: [r.get("shape1"), r.get("shape2"), r.get("shape3"), r.get("color1"), r.get("color2"), r.get("color3"), r.get("typeface")],
-            created: r.get("created"), deleted: r.get("deleted"), member_count: r.get("member_count"),
+            created: r.get("created"), deleted: r.get("deleted"), member_count: r.get("member_count"), member_limit: r.get("member_limit"),
             alliance_id: r.get("alliance_id"), chosen_executor_id: r.get("chosen_executor_id"), division_names: r.get("division_names"),
         }
     }
@@ -267,8 +304,18 @@ pub(crate) async fn corporation(ex: &(impl Executor + ?Sized), corp: i64) -> Res
     Ok(ex.query_opt(
         "SELECT name, description, ticker, url, tax_rate, lp_tax_rate, creator_id, ceo_id, station_id, is_recruiting, friendly_fire,
                     shape1::bigint AS shape1, shape2::bigint AS shape2, shape3::bigint AS shape3, color1::bigint AS color1, color2::bigint AS color2, color3::bigint AS color3, typeface::bigint AS typeface, created, deleted,
-                    (SELECT count(*) FROM game.characters ch WHERE ch.corporation_id = $1 AND NOT ch.deleted) AS member_count, alliance_id, chosen_executor_id, division_names
+                    (SELECT count(*) FROM game.characters ch WHERE ch.corporation_id = $1 AND NOT ch.deleted) AS member_count, member_limit, alliance_id, chosen_executor_id, division_names
              FROM game.corporations WHERE corporation_id = $1",
         &[&corp],
     ).await?.as_ref().map(Corporation::from_row))
+}
+
+/// Callers lock the corporation row before reading or changing its ability snapshot.
+pub(crate) async fn capacity(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Option<(Option<i64>, Option<i64>, i64)>, db::Error> {
+    Ok(ex.query_opt("SELECT ceo_id, member_limit, (SELECT count(*) FROM game.characters WHERE corporation_id = $1 AND NOT deleted) AS member_count FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp])
+        .await?.map(|r| (r.get("ceo_id"), r.get("member_limit"), r.get("member_count"))))
+}
+
+pub(crate) async fn set_member_limit(ex: &(impl Executor + ?Sized), corp: i64, ceo: i64, limit: i64) -> Result<u64, db::Error> {
+    ex.execute("UPDATE game.corporations SET member_limit = $3 WHERE corporation_id = $1 AND ceo_id = $2 AND NOT deleted", &[&corp, &ceo, &limit]).await
 }

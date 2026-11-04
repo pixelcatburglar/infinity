@@ -14,30 +14,29 @@
 //! OnAlliance*Changed row updates. Mutual wars are supported separately; bills,
 //! sovereignty, capital systems and prime time aren't supported.
 
-use super::corps::{ceo_of, is_player_corp, membership};
+use super::corps::membership;
 use crate::dao::alliances as dao;
-use super::{crowset, db_err, keyval, notify_error, trimmed_arg_text, Call, CallError, CallResult};
+use super::{crowset, db_err, notify_error, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR};
+use crate::consts::ROLE_DIRECTOR;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
-use tracing::info;
 
-pub(crate) mod corp_registry;
-mod alliance_registry;
+pub(crate) mod alliance_registry;
+pub(crate) mod admission;
 
 /// Client appConst.allianceApplicationNew.
-const APP_NEW: i32 = 1;
+pub(crate) const APP_NEW: i32 = 1;
 /// Client appConst.allianceApplicationAccepted.
-const APP_ACCEPTED: i32 = 2;
+pub(crate) const APP_ACCEPTED: i32 = 2;
 /// Client appConst.allianceApplicationEffective.
-const APP_EFFECTIVE: i32 = 3;
+pub(crate) const APP_EFFECTIVE: i32 = 3;
 /// Client appConst.allianceApplicationRejected.
-const APP_REJECTED: i32 = 4;
+pub(crate) const APP_REJECTED: i32 = 4;
 /// Server policy: default number of ranked alliances returned.
 const DEFAULT_RANKED_LIMIT: i64 = 100;
 /// Server policy: maximum number of ranked alliances returned.
@@ -59,7 +58,7 @@ pub(super) async fn executor_director(db: &(impl Executor + ?Sized), me: i64, al
 }
 
 /// `dbutil.CIndexedRowset(header, column)` filled with `rows` keyed by their `column` value.
-fn indexed_rowset(header: &DbRowDescriptor, column: &str, rows: Vec<(i64, Value)>) -> Value {
+pub(crate) fn indexed_rowset(header: &DbRowDescriptor, column: &str, rows: Vec<(i64, Value)>) -> Value {
     Value::Reduce {
         data: Box::new(Value::tuple([
             Value::global("carbon.common.script.sys.crowset.CIndexedRowset"),
@@ -182,7 +181,7 @@ async fn member_lines(db: &(impl Executor + ?Sized), alliance: i64) -> Result<Ve
 
 const APPLICATION_COLUMNS: &[&str] = &["allianceID", "corporationID", "applicationText", "applicationDateTime", "state"];
 
-fn application_header() -> DbRowDescriptor {
+pub(crate) fn application_header() -> DbRowDescriptor {
     DbRowDescriptor::new([
         ("allianceID", DbType::I4),
         ("corporationID", DbType::I4),
@@ -193,7 +192,7 @@ fn application_header() -> DbRowDescriptor {
 }
 
 
-fn application_line(r: dao::Application) -> Vec<Value> {
+pub(crate) fn application_line(r: dao::Application) -> Vec<Value> {
     vec![
         Value::Int(r.alliance),
         Value::Int(r.corporation),
@@ -203,7 +202,7 @@ fn application_line(r: dao::Application) -> Vec<Value> {
     ]
 }
 
-async fn application_line_of(db: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<Option<Vec<Value>>, CallError> {
+pub(crate) async fn application_line_of(db: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<Option<Vec<Value>>, CallError> {
     Ok(dao::application(db, alliance, corp).await.map_err(db_err)?.map(application_line))
 }
 
@@ -246,17 +245,12 @@ async fn alliance_changed(db: &Db, world: &World, alliance: i64, old: Option<Vec
     dispatch_world((), outbox, world)
 }
 
-async fn queue_application_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
+pub(crate) async fn queue_application_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = application_line_of(db, alliance, corp).await?;
     let ch = change(APPLICATION_COLUMNS, old.as_deref(), new.as_deref());
     queue_tell(db, outbox, alliance, Some(corp), "OnAllianceApplicationChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
 }
 
-async fn application_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let mut outbox = Outbox::default();
-    queue_application_changed(db, &mut outbox, alliance, corp, old).await?;
-    dispatch_world((), outbox, world)
-}
 
 async fn queue_member_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
@@ -271,7 +265,7 @@ async fn member_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: O
 }
 
 /// Put `corp` in `alliance` (or none): history, and every member's session.
-async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, alliance: Option<i64>, now: i64) -> Result<(), CallError> {
+pub(crate) async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, alliance: Option<i64>, now: i64) -> Result<(), CallError> {
     if dao::set_corporation_alliance(db, corp, alliance, now).await.map_err(db_err)? == 0 {
         return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
     }
@@ -298,10 +292,11 @@ pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbo
     let old_member = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
     let old_alliance = alliance_line_of(db, alliance).await?;
     let ch = change(MEMBER_COLUMNS, old_member.as_deref(), None);
-    for char_id in pilots(db, Some(alliance), Some(corp)).await? {
+    let recipients = pilots(db, Some(alliance), Some(corp)).await?;
+    set_alliance(db, outbox, corp, None, now).await?;
+    for char_id in recipients {
         outbox.notify_pilot(char_id, "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch.clone()]);
     }
-    set_alliance(db, outbox, corp, None, now).await?;
     dao::clear_support(db, alliance, corp).await.map_err(db_err)?;
     if executor == Some(corp) {
         // The largest remaining member takes over; none left closes the alliance.
@@ -334,7 +329,7 @@ fn bound_alliance(c: &Client, call: &Call<'_>) -> Option<i64> {
 // ---------------------------------------------------------------- calls
 
 /// Server suggestion algorithm shared by corporation tickers and alliance short names.
-pub(super) fn suggested_names(name: &str) -> Vec<String> {
+pub(crate) fn suggested_names(name: &str) -> Vec<String> {
     let initials: String = name.split_whitespace().filter_map(|w| w.chars().find(|c| c.is_ascii_alphanumeric())).collect::<String>().to_uppercase();
     let compact: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
     let mut out: Vec<String> = vec![];
@@ -351,7 +346,6 @@ pub(super) fn suggested_names(name: &str) -> Vec<String> {
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
-        "corpRegistry" => corp_registry::dispatch(c, call).await,
         "allianceRegistry" => alliance_registry::dispatch(c, call).await,
         _ => None,
     }

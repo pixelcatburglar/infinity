@@ -14,6 +14,21 @@ pub(super) async fn create(db: &Db) -> Character {
     }), |v, ()| async move { Ok(v) }).await.unwrap()
 }
 
+pub(super) async fn organization(db: &Db, character: i64) -> (i64, i64) {
+    let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('chat-org-' || nextval('game.corporations_corporation_id_seq')::text, 'CO' || currval('game.corporations_corporation_id_seq')::text, $1,$1,1,1) RETURNING corporation_id", &[&character]).await.unwrap().get("corporation_id");
+    let alliance: i64 = db.query_one("INSERT INTO game.alliances (name,short_name,executor_corp_id,creator_corp_id,creator_char_id,created) VALUES ('chat-org-' || nextval('game.alliances_alliance_id_seq')::text, 'CO' || currval('game.alliances_alliance_id_seq')::text, $1,$1,$2,1) RETURNING alliance_id", &[&corp, &character]).await.unwrap().get("alliance_id");
+    db.execute("UPDATE game.corporations SET alliance_id=$1 WHERE corporation_id=$2", &[&alliance, &corp]).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&corp, &character]).await.unwrap();
+    (corp, alliance)
+}
+
+pub(super) async fn cleanup_organization(db: &Db, corp: i64, alliance: i64) {
+    db.execute("UPDATE game.characters SET corporation_id=1 WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    db.execute("UPDATE game.corporations SET alliance_id=NULL WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    db.execute("DELETE FROM game.alliances WHERE alliance_id=$1", &[&alliance]).await.unwrap();
+    db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();
+}
+
 pub(super) async fn cleanup(db: &Db, chars: &[Character]) {
     let ids: Vec<i64> = chars.iter().map(|c| c.id).collect();
     db.execute("DELETE FROM game.chat_channels WHERE owner_id = ANY($1)", &[&ids]).await.unwrap();

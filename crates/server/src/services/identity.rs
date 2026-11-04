@@ -8,6 +8,7 @@
 use crate::client::Client;
 use crate::session::Session;
 
+#[derive(Clone, Copy)]
 pub struct Identity {
     pub char_id: i64,
     pub ship_id: Option<i64>,

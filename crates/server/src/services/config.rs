@@ -6,12 +6,10 @@
 
 use super::{db_err, value_ids, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{TYPE_CHARACTER, TYPE_CORPORATION, TYPE_ALLIANCE};
+use crate::consts::{TYPE_CHARACTER, TYPE_CORPORATION, TYPE_ALLIANCE, TYPE_FACTION};
 use marshal::Value;
 use tracing::warn;
 
-/// SDE invTypes: Faction.
-const TYPE_FACTION: i64 = 30;
 /// Client cfg ticker row: remaining optional fields after owner ID and ticker.
 const TICKER_OPTIONAL_FIELDS: usize = 6;
 
