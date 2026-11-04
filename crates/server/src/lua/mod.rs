@@ -5,6 +5,7 @@
 pub mod host;
 pub mod events;
 pub mod value;
+mod json;
 mod registry;
 mod reload;
 mod runner;

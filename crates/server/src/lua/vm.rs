@@ -1,6 +1,8 @@
 //! Builds a generation in an isolated Lua 5.4 VM. Scripts use separate globals,
-//! text-only modules under each configured root and invocation-local budgets.
-//! Native modules, binary chunks and script-created coroutines are not supported.
+//! root-confined text modules and authored JSON data files, with invocation-local
+//! budgets. JSON null and values beyond the decoder's depth limit are unsupported.
+//! Native modules, binary chunks and script-created coroutines are not supported;
+//! these server facilities have no client analogue.
 
 use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
 use anyhow::{Context, Result};
@@ -65,7 +67,16 @@ pub fn budgeted_invocation(lua: &Lua, handler: Function, config: &LuaConfig, dea
     Ok(Invocation { function: factory.call((setup, handler, running))?, hook_thread })
 }
 
-fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
+fn resolve(root: &Path, name: &str, extension: &str) -> mlua::Result<std::path::PathBuf> {
+    if name.is_empty() || !name.split('.').all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')) {
+        return Err(mlua::Error::runtime("invalid module name"));
+    }
+    let path = root.join(format!("{}.{}", name.replace('.', "/"), extension)).canonicalize().map_err(mlua::Error::external)?;
+    if !path.starts_with(root) { return Err(mlua::Error::runtime("module escapes scripts directory")); }
+    Ok(path)
+}
+
+fn environment(lua: &Lua, root: &Path, data_file_limit_bytes: usize) -> mlua::Result<Table> {
     let env = lua.create_table()?;
     let globals = lua.globals();
     for name in ["assert", "error", "ipairs", "next", "pairs", "select", "tonumber", "tostring", "type", "rawequal", "rawget", "rawlen", "rawset", "setmetatable", "_VERSION"] {
@@ -117,14 +128,11 @@ fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
         Ok(lua.used_memory() as f64 / 1024.0)
     })?)?;
     env.set("_G", env.clone())?;
+    let data_root = root.to_owned();
     let root = root.to_owned();
     let module_env = env.clone();
     let loader = lua.create_function(move |lua, name: String| {
-        if name.is_empty() || !name.split('.').all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')) {
-            return Err(mlua::Error::runtime("invalid module name"));
-        }
-        let path = root.join(format!("{}.lua", name.replace('.', "/"))).canonicalize().map_err(mlua::Error::external)?;
-        if !path.starts_with(&root) { return Err(mlua::Error::runtime("module escapes scripts directory")); }
+        let path = resolve(&root, &name, "lua")?;
         let text = std::fs::read(&path).map_err(mlua::Error::external)?;
         lua.load(text.as_slice()).set_name(path.to_string_lossy()).set_mode(ChunkMode::Text).set_environment(module_env.clone()).into_function()
     })?;
@@ -144,6 +152,26 @@ fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
         end
     "#).eval()?;
     env.set("require", factory.call::<Function>(loader)?)?;
+
+    let data = lua.create_table()?;
+    data.set("load", lua.create_function(move |lua, name: String| {
+        let path = resolve(&data_root, &name, "json").map_err(|error| mlua::Error::runtime(format!("invalid data {name}: {error}")))?;
+        let limit = data_file_limit_bytes;
+        let result = (|| {
+            let file = std::fs::File::open(&path).map_err(mlua::Error::external)?;
+            let metadata = file.metadata().map_err(mlua::Error::external)?;
+            if metadata.len() > limit as u64 { return Err(mlua::Error::runtime(format!("data file exceeds {limit} bytes"))); }
+            let capacity = usize::try_from(metadata.len()).unwrap_or(limit).saturating_add(1).min(limit.saturating_add(1));
+            let mut bytes = Vec::with_capacity(capacity);
+            use std::io::Read;
+            file.take(limit.saturating_add(1) as u64).read_to_end(&mut bytes).map_err(mlua::Error::external)?;
+            if bytes.len() > limit { return Err(mlua::Error::runtime(format!("data file exceeds {limit} bytes"))); }
+            let value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(mlua::Error::external)?;
+            super::json::decode(lua, value, &format!("data {name}"), 0)
+        })();
+        result.map_err(|error| mlua::Error::runtime(format!("invalid data {name}: {error}")))
+    })?)?;
+    env.set("data", data)?;
     Ok(env)
 }
 
@@ -250,7 +278,7 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
     lua.set_memory_limit(config.memory_limit_mb * 1024 * 1024)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
     for (root, path, script) in scripts {
-        let env = environment(&lua, &root)?;
+        let env = environment(&lua, &root, config.data_file_limit_bytes)?;
         value::register(&lua, &env)?;
         let settings = config.scripts.get(&script).cloned().unwrap_or_default();
         host::register(&lua, &env, &script, &settings, resources)?;

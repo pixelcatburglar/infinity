@@ -6,8 +6,7 @@ use mlua::{Lua, Result, Table, Value};
 use serde_json::{Map, Number};
 use crate::{dao::lua_store, db::Db};
 
-/// Server policy: limit host recursion below serde_json's default parse ceiling.
-const MAX_DEPTH: usize = 64;
+use super::super::json::{decode, MAX_DEPTH};
 
 fn charge(remaining: &mut usize, amount: usize, path: &str) -> Result<()> {
     *remaining = remaining.checked_sub(amount).ok_or_else(|| mlua::Error::runtime(format!("store value at {path} exceeds size limit")))?;
@@ -80,33 +79,13 @@ fn encode(value: Value, path: &str, active: &mut HashSet<usize>, remaining: &mut
     }
 }
 
-fn decode(lua: &Lua, value: serde_json::Value, key: &str, depth: usize) -> Result<Value> {
-    if depth > MAX_DEPTH { return Err(mlua::Error::runtime(format!("store value at {key} exceeds nesting limit"))); }
-    Ok(match value {
-        serde_json::Value::Null => return Err(mlua::Error::runtime(format!("invalid null in store value at {key}"))),
-        serde_json::Value::Bool(v) => Value::Boolean(v),
-        serde_json::Value::Number(v) => if let Some(n) = v.as_i64() { Value::Integer(n) } else { Value::Number(v.as_f64().ok_or_else(|| mlua::Error::runtime("invalid store number"))?) },
-        serde_json::Value::String(v) => Value::String(lua.create_string(v)?),
-        serde_json::Value::Array(items) => {
-            let table = lua.create_table()?;
-            for (i, v) in items.into_iter().enumerate() { table.set(i + 1, decode(lua, v, key, depth + 1)?)?; }
-            Value::Table(table)
-        }
-        serde_json::Value::Object(items) => {
-            let table = lua.create_table()?;
-            for (field, v) in items { table.set(field, decode(lua, v, key, depth + 1)?)?; }
-            Value::Table(table)
-        }
-    })
-}
-
 fn decode_stored(lua: &Lua, value: &str, key: &str, limit: usize) -> Result<Value> {
     // PostgreSQL renders JSONB with spaces after separators; allow that
     // representation before applying the cap to compact JSON.
     if value.len() > limit.saturating_mul(2) { return Err(mlua::Error::runtime(format!("store value at {key} exceeds {limit} bytes"))); }
     let value: serde_json::Value = serde_json::from_str(value).map_err(|error| mlua::Error::runtime(format!("invalid store value at {key}: {error}")))?;
     charge_json(&value, &mut limit.clone(), key)?;
-    decode(lua, value, key, 0)
+    decode(lua, value, &format!("store value at {key}"), 0)
 }
 
 fn sequence_keys(table: Table) -> Result<Vec<String>> {
