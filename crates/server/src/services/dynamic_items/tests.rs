@@ -1,16 +1,16 @@
 //! Mutation regressions using the loaded SDE and a dedicated disposable database.
 use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
-use crate::{consts::{dogma::ATTR_HULL_DAMAGE, CATEGORY_SHIP, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HANGAR, CARGO_CONTAINER_GROUPS}, dao::{dynamic_items, items::dogma}, db::{Db, outbox::Outbox}, sde::Sde, services::{CallError, fit::base_attribute, keyval, market}};
+use infinity_core::{consts::{dogma::ATTR_HULL_DAMAGE, CATEGORY_SHIP, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_SHIP_HANGAR, CARGO_CONTAINER_GROUPS}};
+use crate::{dao::{dynamic_items, items::dogma}, db::{Db, outbox::Outbox}, sde::Sde, services::{CallError, fit::base_attribute, keyval, market}};
 use marshal::Value;
 use super::{dynamic_item_service, mutation::{self, Context}};
 
 mod custody;
 mod fitting;
+mod container_capacity;
 
-/// Client inventorycommon.const.flagShipHangar.
-const FLAG_SHIP_HANGAR: i32 = 90;
 /// Client dogma rack effects: loPower, hiPower and medPower.
-const MODULE_RACK_EFFECTS: [(i32, i32); 3] = [(11, FLAG_FITTING_FIRST), (12, crate::consts::FLAG_HI_SLOT_FIRST), (13, crate::consts::FLAG_MED_SLOT_FIRST)];
+const MODULE_RACK_EFFECTS: [(i32, i32); 3] = [(11, FLAG_FITTING_FIRST), (12, infinity_core::consts::FLAG_HI_SLOT_FIRST), (13, infinity_core::consts::FLAG_MED_SLOT_FIRST)];
 
 struct Fixture {
     db: Db, sde: Arc<Sde>, account: i64, owner: i64, station: i64, ship: i64,
@@ -26,8 +26,8 @@ impl Fixture {
             mutation.mappings.iter().find_map(|(&source, &result)| {
                 let data = sde.types.get(source)?;
                 let result_data = sde.types.get(result)?;
-                (data.category_id == Some(crate::consts::CATEGORY_MODULE)
-                    && result_data.category_id == Some(crate::consts::CATEGORY_MODULE)
+                (data.category_id == Some(infinity_core::consts::CATEGORY_MODULE)
+                    && result_data.category_id == Some(infinity_core::consts::CATEGORY_MODULE)
                     && sde.types.effects(result).iter().any(|effect| MODULE_RACK_EFFECTS.iter().any(|(id, _)| *id == effect.effect_id))
                     && mutation.attributes.keys().any(|id| sde.types.attributes(source).any(|(attr, _)| attr == *id))
                     && sde.types.attributes(source).any(|(id, _)| !mutation.attributes.contains_key(&id) && id != ATTR_HULL_DAMAGE))
@@ -39,9 +39,9 @@ impl Fixture {
         let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
         let owner: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,balance) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,0) RETURNING character_id", &[&account, &station]).await.unwrap().get("character_id");
         let insert = "INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,$5,$6) RETURNING item_id";
-        let ship = db.query_one(insert, &[&ship_type, &owner, &station, &FLAG_HANGAR, &1_i32, &true]).await.unwrap().get("item_id");
-        let source = db.query_one(insert, &[&source_type, &owner, &station, &FLAG_HANGAR, &1_i32, &true]).await.unwrap().get("item_id");
-        let mutator = db.query_one(insert, &[&mutator_type, &owner, &station, &FLAG_HANGAR, &3_i32, &false]).await.unwrap().get("item_id");
+        let ship = db.query_one(insert, &[&ship_type, &owner, &station, &FLAG_HANGAR, &1_i64, &true]).await.unwrap().get("item_id");
+        let source = db.query_one(insert, &[&source_type, &owner, &station, &FLAG_HANGAR, &1_i64, &true]).await.unwrap().get("item_id");
+        let mutator = db.query_one(insert, &[&mutator_type, &owner, &station, &FLAG_HANGAR, &3_i64, &false]).await.unwrap().get("item_id");
         Self { db, sde, account, owner, station, ship, mutator, source, mutator_type, source_type, result_type }
     }
 
@@ -55,11 +55,14 @@ impl Fixture {
     async fn create(&self, context: Context, mutator: i64, source: i64, fail: bool, dispatched: Arc<AtomicBool>) -> Result<i64, CallError> {
         let _lock = market::lock().await;
         let sde = self.sde.clone();
+        let mutator = crate::services::items::load_items(&self.db, &sde, crate::dao::items::loading::ItemQuery::Id(mutator)).await.map_err(crate::services::db_err)?.into_iter().next().ok_or_else(|| crate::services::notify_error(infinity_core::messages::dynamic_items::INVALID_ITEMS))?;
+        let source = crate::services::items::load_items(&self.db, &sde, crate::dao::items::loading::ItemQuery::Id(source)).await.map_err(crate::services::db_err)?.into_iter().next().ok_or_else(|| crate::services::notify_error(infinity_core::messages::dynamic_items::INVALID_ITEMS))?;
         let draws = self.draws();
         self.db.transaction(move |tx, outbox: &mut Outbox| {
             let sde = sde.clone(); let context = context.clone(); let draws = draws.clone();
+            let mutator = mutator.clone(); let source = source.clone();
             Box::pin(async move {
-                let result = mutation::create(tx, &sde, outbox, &context, mutator, source, &draws).await?;
+                let result = mutation::create(tx, &sde, outbox, &context, &mutator, &source, &draws).await?;
                 if fail { return Err(CallError::Internal(anyhow::anyhow!("injected rollback"))); }
                 Ok(result)
             })
@@ -199,16 +202,18 @@ async fn creation_persists_info_and_rejections_and_injected_failure_roll_back() 
         f.db.execute("UPDATE game.items SET location_id=$2,flag_id=$3 WHERE item_id=$1", &[&f.source, &f.station, &FLAG_HANGAR]).await.unwrap();
         let mutation = f.sde.dynamic_items.get(f.mutator_type).unwrap();
         let (attributes, factors) = mutation::attributes(&f.sde, f.source_type, mutation, &f.draws()).ok().unwrap();
+        let large_quantity = i64::from(i32::MAX) + 2;
+        f.db.execute("UPDATE game.items SET quantity=$2 WHERE item_id=$1", &[&f.mutator, &large_quantity]).await.unwrap();
         let result = f.create(context, f.mutator, f.source, false, dispatched.clone()).await.ok().unwrap();
         assert!(dispatched.load(Ordering::SeqCst));
         let row = f.db.query_one("SELECT type_id,quantity,singleton,location_id,flag_id FROM game.items WHERE item_id=$1", &[&result]).await.unwrap();
         assert_eq!(row.get::<_, i32>("type_id"), f.result_type);
-        assert_eq!(row.get::<_, i32>("quantity"), 1);
+        assert_eq!(row.get::<_, i64>("quantity"), 1);
         assert!(row.get::<_, bool>("singleton"));
         assert_eq!(row.get::<_, i64>("location_id"), f.station);
         assert_eq!(row.get::<_, i32>("flag_id"), FLAG_HANGAR);
         assert!(f.db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&f.source]).await.unwrap().is_none());
-        assert_eq!(f.db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&f.mutator]).await.unwrap().get::<_, i32>("quantity"), 2);
+        assert_eq!(f.db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&f.mutator]).await.unwrap().get::<_, i64>("quantity"), large_quantity - 1);
         let reopened = Db::connect(&crate::config::tests::test_database()).await.unwrap();
         let metadata = dynamic_items::get(&reopened, result).await.unwrap().unwrap();
         assert_eq!((metadata.source_item_id, metadata.mutator_item_id, metadata.creator_id), (f.source, f.mutator, f.owner));

@@ -11,6 +11,7 @@ pub(crate) use registry::NoticeHub;
 use std::sync::Arc;
 use prost::Message;
 use prost_reflect::{DynamicMessage, ReflectMessage};
+use infinity_core::consts::UUID_LEN;
 use super::{error::GatewayError, message, protocol::{self, target_group::Target}};
 
 /// Server design name for its single deployment.
@@ -22,7 +23,7 @@ const TIMESTAMP_ENCODED_GROWTH_BUDGET: usize = 20;
 
 fn validate_target(target: &Target) -> Result<(), GatewayError> {
     if let Target::ApplicationInstanceUuid(uuid) = target {
-        if uuid.len() != message::UUID_LEN {
+        if uuid.len() != UUID_LEN {
             return Err(GatewayError::Internal(anyhow::anyhow!("invalid gateway notice application UUID length")));
         }
     }

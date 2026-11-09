@@ -33,7 +33,7 @@ async fn exchange_private_courier_and_deletion_refunds() {
     let station = stations.next().unwrap();
     let end = stations.find(|s| s.station_id != station.station_id).unwrap().station_id;
     let (start, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, start, station_type).await;
     let buyer = f::setup(&db, start, station_type).await;
     let test_db = db.clone();
@@ -97,7 +97,7 @@ async fn auction_snapshots_tax_and_cap_and_private_auction_is_exempt() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (start, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, start, station_type).await;
     let buyer = f::setup(&db, start, station_type).await;
     let test_db = db.clone();
@@ -108,13 +108,13 @@ async fn auction_snapshots_tax_and_cap_and_private_auction_is_exempt() {
         f::session(&mut seller, issuer, start, system, ACCOUNT_CASH + 1);
         f::session(&mut bidder, buyer, start, system, ACCOUNT_CASH + 1);
         db.execute("UPDATE game.corp_wallets SET balance=300000000000 WHERE corporation_id=ANY($1)", &[&vec![issuer.id, buyer.id]]).await.unwrap();
-        for skill in [crate::consts::SKILL_ACCOUNTING, crate::consts::SKILL_BROKER_RELATIONS] {
+        for skill in [infinity_core::consts::SKILL_ACCOUNTING, infinity_core::consts::SKILL_BROKER_RELATIONS] {
             crate::dao::skills::training::set_level(&db, issuer.actor.character, skill, 5, 0).await.unwrap();
         }
         let root = transfers::insert(&db, kind, issuer.id, start, f::DELIVERIES, 1).await.unwrap();
         let id = f::id(create(&seller, &request(TYPE_AUCTION, start, 0, &[root], true, 0, 100_000_000_000.0, 0.0, 200_000_000_000.0, false)).await);
         assert_eq!(balance(&db, issuer.id, true, ACCOUNT_CASH + 1).await, 299_825_000_000.0);
-        crate::dao::skills::training::set_level(&db, issuer.actor.character, crate::consts::SKILL_ACCOUNTING, 0, 0).await.unwrap();
+        crate::dao::skills::training::set_level(&db, issuer.actor.character, infinity_core::consts::SKILL_ACCOUNTING, 0, 0).await.unwrap();
         f::session(&mut seller, issuer, start, system, ACCOUNT_CASH + 2);
         assert!(place_bid(&bidder, id, 200_000_000_000.0, true).await.is_ok());
         assert_eq!(balance(&db, issuer.id, true, ACCOUNT_CASH + 1).await, 499_425_000_000.0);
@@ -168,7 +168,7 @@ async fn multicontract_charges_each_and_insufficient_funds_rollback_everything()
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (start, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, start, station_type).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -215,7 +215,7 @@ async fn multicontract_charges_each_and_insufficient_funds_rollback_everything()
         let result = create(&seller, &input).await.unwrap();
         assert_eq!(result.items().unwrap().len(), 2);
         assert_eq!(balance(&db, issuer.id, true, ACCOUNT_CASH + 1).await, 0.0);
-        seller.world.unregister_pilot(issuer.actor.character);
+        seller.world.unregister_pilot_generation(issuer.actor.character, None);
     }).await;
     f::cleanup(&db, issuer).await;
     result.unwrap();

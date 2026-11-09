@@ -4,7 +4,7 @@
 //! The client does not specify the server's target selection algorithm.
 
 use super::*;
-use crate::consts::OWNER_UNOWNED;
+use infinity_core::consts::OWNER_UNOWNED;
 
 pub(in crate::space) struct Aggressors {
     ship: i64,

@@ -5,18 +5,19 @@
 //! Selecting a character registers process-local presence; appearance editing is not interpreted here.
 //! Selection reconciles the active fit before restoring the ship's persisted condition.
 //! Ships restored in space arrive with the actor-managed restoring cloak and timer.
-//! Successful selection and logoff hand off lifecycle events after session changes.
+//! Selection hands off its lifecycle event after session changes; logoff commits with presence cleanup.
 //! First selection serializes rookie ship grants on the character row and grants a
 //! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
+//! Final deletion is serialized with market writes and refuses open personal orders.
 
 use crate::dao::{accounts, characters, skills};
 use super::character::creation::{self, NewPilot, NAME_VALID};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ACCOUNT_CASH, FALLBACK_ROOKIE_SHIP, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
-use crate::db::outbox::{dispatch_client, Outbox};
+use infinity_core::consts::{ACCOUNT_CASH, FALLBACK_ROOKIE_SHIP, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
+use crate::db::outbox::Outbox;
 use crate::lua::events::GameEvent;
-use crate::messages;
+use infinity_core::messages;
 use marshal::Value;
 use tracing::{info, warn};
 
@@ -84,7 +85,6 @@ pub async fn log_off(c: &mut Client) -> CallResult {
     let Some(char_id) = c.session.int("charid") else { return Ok(Value::Bool(true)) };
     super::combat::reset(c);
     c.leave_world().await.map_err(CallError::Internal)?;
-    characters::selection::logoff(&c.db, char_id).await.map_err(db_err)?;
     let cleared = [
         "charid", "corpid", "corprole", "rolesAtAll", "rolesAtBase", "rolesAtHQ", "rolesAtOther", "corpAccountKey", "allianceid", "warfactionid",
         "genderID", "bloodlineID", "raceID", "hqID", "stationid", "solarsystemid", "solarsystemid2", "constellationid", "regionid", "shipid",
@@ -96,9 +96,6 @@ pub async fn log_off(c: &mut Client) -> CallResult {
         };
         (k, value)
     }).collect());
-    let mut outbox = Outbox::default();
-    outbox.event(GameEvent::CharacterLoggedOff { user_id: c.login.user_id, char_id });
-    dispatch_client((), outbox, c)?;
     info!(user = c.login.user_id, "character {char_id} logged off to character selection");
     Ok(Value::Bool(true))
 }
@@ -114,7 +111,14 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
 
 /// Select a character and restore its station or space session (eveSessions.GetSessionValuesFromRowset).
 async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError> {
-    let r = characters::selection::selected(&c.db, char_id, c.login.user_id).await.map_err(db_err)?
+    let user = c.login.user_id;
+    let r = c.db.transaction(
+        |tx, _: &mut ()| Box::pin(async move {
+            characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
+            characters::selection::selected(tx, char_id, user).await.map_err(db_err)
+        }),
+        |value, ()| async move { Ok(value) },
+    ).await?
         .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
     super::ship_cosmetics_mgr::expiry::converge(&c.db, &c.world, char_id, crate::client::filetime_now()).await?;
     let station = r.station_id;
@@ -126,23 +130,24 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     ).await?;
     let int = Value::Int;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
-    let corp = r.corporation_id;
+    let mut corp = r.corporation_id;
     let roles = r.roles;
-    let alliance = r.alliance_id;
+    let authority = &r.authority;
+    let mut alliance = r.alliance_id;
     c.change_session(vec![
         ("charid", int(char_id)),
         ("corpid", int(corp)),
         ("allianceid", opt(alliance)),
         ("corprole", int(roles)),
         ("rolesAtAll", int(roles)),
-        ("rolesAtBase", int(roles)),
-        ("rolesAtHQ", int(roles)),
-        ("rolesAtOther", int(roles)),
+        ("rolesAtBase", int(authority.roles[2])),
+        ("rolesAtHQ", int(authority.roles[1])),
+        ("rolesAtOther", int(authority.roles[3])),
         ("corpAccountKey", int(ACCOUNT_CASH as i64)),
         ("genderID", int(r.gender_id as i64)),
         ("bloodlineID", int(r.bloodline_id as i64)),
         ("raceID", int(race as i64)),
-        ("hqID", opt(station)),
+        ("hqID", opt(authority.headquarters.or_else(|| c.sde.npc_corporations.get(corp).and_then(|row| row.station_id)))),
         ("stationid", opt(station)),
         ("solarsystemid", if station.is_none() { int(system) } else { Value::None }),
         ("solarsystemid2", int(system)),
@@ -150,6 +155,23 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         ("regionid", int(r.region_id)),
         ("shipid", int(ship)),
     ]);
+    // Re-read after publication so a concurrent corporation move cannot leave
+    // the newly registered session carrying its pre-publication membership.
+    let fresh = characters::selection::selected(&c.db, char_id, user).await.map_err(db_err)?
+        .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
+    corp = fresh.corporation_id;
+    alliance = fresh.alliance_id;
+    let current = &fresh.authority;
+    let hq = current.headquarters.or_else(|| c.sde.npc_corporations.get(corp).and_then(|row| row.station_id));
+    let values = [
+        ("corpid", Some(corp)), ("allianceid", alliance), ("corprole", Some(current.roles[0])),
+        ("rolesAtAll", Some(current.roles[0])), ("rolesAtHQ", Some(current.roles[1])),
+        ("rolesAtBase", Some(current.roles[2])), ("rolesAtOther", Some(current.roles[3])), ("hqID", hq),
+    ];
+    let updates: Vec<_> = values.into_iter().filter(|(name, value)| c.session.int(name) != *value)
+        .map(|(name, value)| (name, opt(value))).collect();
+    if !updates.is_empty() { c.change_session(updates); }
+    characters::selection::logon(&c.db, char_id).await.map_err(db_err)?;
     let now = crate::client::filetime_now();
     let active = skills::expert_systems::active(&c.db, char_id, now).await.map_err(db_err)?;
     let active = super::skills::expert_systems::map(&active);
@@ -160,9 +182,17 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     super::online_status::presence_changed(&c.db, &c.world, char_id, true).await;
     let role = c.session.int("role").unwrap_or(0);
     c.chat.set_profile(char_id, &r.name, r.gender_id as i64, corp, alliance, None, role);
-    let mut outbox = Outbox::default();
-    outbox.event(GameEvent::CharacterSelected { user_id: c.login.user_id, char_id });
-    dispatch_client((), outbox, c)?;
+    let world = c.world.clone();
+    let user_id = c.login.user_id;
+    if let Err(error) = c.db.transaction(
+        |_, outbox: &mut Outbox| Box::pin(async move {
+            outbox.event(GameEvent::CharacterSelected { user_id, char_id });
+            Ok::<_, CallError>(())
+        }),
+        |value, outbox| async move { crate::db::outbox::dispatch_world(value, outbox, &world) },
+    ).await {
+        tracing::warn!(?error, char_id, "character selection event dispatch failed");
+    }
     info!(user = c.login.user_id, "character {char_id} entering game at station {station:?} / system {system}");
     Ok(())
 }
@@ -210,12 +240,27 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         // DeleteCharacter(charID) -> an error message key, or None once deleted.
         "DeleteCharacter" => {
             let char_id = own_character(c, call).await?;
-            let deleted = characters::selection::delete(&c.db, char_id, crate::client::filetime_now()).await.map_err(db_err)?;
-            if deleted == 0 {
-                return Ok(Value::str(messages::MSG_CHARACTER_NOT_READY_FOR_DELETION));
+            let user_id = c.login.user_id;
+            let now = crate::client::filetime_now();
+            let _market = super::market::lock().await;
+            let db = c.db.clone();
+            let result = db.transaction(
+                |tx, _: &mut Outbox| Box::pin(async move {
+                    if !characters::selection::owns(tx, char_id, user_id).await.map_err(db_err)? {
+                        return Err(CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] });
+                    }
+                    if crate::dao::market::orders::has_open_owner_orders(tx, char_id).await.map_err(db_err)?
+                        || characters::selection::delete(tx, char_id, now).await.map_err(db_err)? == 0 {
+                        return Ok(Value::str(messages::MSG_CHARACTER_NOT_READY_FOR_DELETION));
+                    }
+                    Ok(Value::None)
+                }),
+                |value, outbox| async move { crate::db::outbox::dispatch_client(value, outbox, c) },
+            ).await?;
+            if matches!(result, Value::None) {
+                info!(user = user_id, "character {char_id} deleted");
             }
-            info!(user = c.login.user_id, "character {char_id} deleted");
-            Ok(Value::None)
+            Ok(result)
         }
         // The client consumes a historical lapsed-Omega flag; current authority
         // tracks eligibility, not whether a downgrade occurred previously.

@@ -90,7 +90,10 @@ async fn sde_dispatch_contract() {
     let missing = [Value::Int(i64::MAX)];
     assert_eq!(crate::services::dispatch(&mut client, &call("GetStation", &missing, &kwargs)).await.unwrap(), Value::None);
     assert!(matches!(crate::services::dispatch(&mut client, &call("GetSolarSystem", &missing, &kwargs)).await, Err(CallError::User { .. })));
-    assert!(dispatch(&mut client, &call("GetSystemsForAlliance", &missing, &kwargs)).await.is_none());
+    let expected = crate::services::sovereignty::queries::read(&client.db, &client.sde,
+        crate::services::sovereignty::queries::Query::SystemsForAlliance { alliance_id: i64::MAX }).await.unwrap();
+    assert_eq!(wire(crate::services::dispatch(&mut client, &call("GetSystemsForAlliance", &missing, &kwargs)).await.unwrap()), wire(expected));
+    assert!(matches!(dispatch(&mut client, &call("GetAllianceSystems", &missing, &kwargs)).await, Some(Err(CallError::User { .. }))));
     assert!(dispatch(&mut client, &call("unknown", &missing, &kwargs)).await.is_none());
     client.session.apply(vec![("stationid", Value::Int(station_id))]);
     let row = client.sde.map.station(station_id).unwrap();

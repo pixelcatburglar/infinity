@@ -4,7 +4,8 @@
 use super::mailing_lists::{self, MemberAction};
 use super::{text_argument, ACCESS_ALLOWED, ACCESS_BLOCKED, MAX_MEMBER_BATCH, ROLE_MUTED, ROLE_OPERATOR, ROLE_OWNER};
 use super::super::{keyval, notify_error, Call, CallError, CallResult};
-use crate::{client::Client, dao::mailing_lists::List, messages};
+use infinity_core::messages;
+use crate::{client::Client, dao::mailing_lists::List};
 use marshal::Value;
 use std::collections::BTreeMap;
 

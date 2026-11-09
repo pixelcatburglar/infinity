@@ -72,12 +72,6 @@ impl SchoolRow {
     }
 }
 
-struct CountRow { count: i64 }
-impl CountRow {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { count: row.get("count") }
-    }
-}
 
 pub(crate) struct TakenRow { pub(crate) taken: bool, pub(crate) lower_name: String }
 impl TakenRow {
@@ -102,11 +96,13 @@ pub(crate) async fn headquarters(ex: &(impl Executor + ?Sized), corp: i64) -> Re
         .as_ref().map(HeadquartersRow::from_row))
 }
 
-pub(crate) async fn set_corp(ex: &(impl Executor + ?Sized), char_id: i64, corp: i64, roles: i64, now: i64) -> Result<bool, db::Error> {
+pub(crate) async fn set_corp(ex: &(impl Executor + ?Sized), char_id: i64, corp: i64, roles: [i64; 4], now: i64) -> Result<bool, db::Error> {
     let changed = ex.execute(
-        "UPDATE game.characters SET corporation_id = $2, corp_roles = $3, corp_grantable_roles = 0, corp_title_mask = 0, corp_title = ''
+        "UPDATE game.characters SET corporation_id = $2, corp_roles = $3, corp_grantable_roles = 0, corp_title_mask = 0, corp_title = '',
+             corp_roles_hq=$4, corp_roles_base=$5, corp_roles_other=$6, corp_grantable_hq=0, corp_grantable_base=0, corp_grantable_other=0,
+             corp_base_id=NULL, corp_block_roles=false, corp_roles_removed_at=NULL, corp_division_id=0, corp_squadron_id=0
              WHERE character_id = $1 AND corporation_id IS DISTINCT FROM $2",
-        &[&char_id, &corp, &roles],
+        &[&char_id, &corp, &roles[0], &roles[1], &roles[2], &roles[3]],
     ).await?;
     if changed == 0 { return Ok(false); }
     ex.execute("INSERT INTO game.employment_history (char_id, corporation_id, start_date) VALUES ($1, $2, $3)", &[&char_id, &corp, &now]).await?;
@@ -118,9 +114,6 @@ pub(crate) async fn school(ex: &(impl Executor + ?Sized), char_id: i64) -> Resul
     Ok(SchoolRow::from_row(&row))
 }
 
-pub(crate) async fn other_member_count(ex: &(impl Executor + ?Sized), corp: i64, char_id: i64) -> Result<i64, db::Error> {
-    Ok(CountRow::from_row(&ex.query_one("SELECT count(*) AS count FROM game.characters WHERE corporation_id = $1 AND character_id <> $2 AND NOT deleted", &[&corp, &char_id]).await?).count)
-}
 
 pub(crate) async fn close_corp(ex: &(impl Executor + ?Sized), corp: i64) -> Result<(), db::Error> {
     ex.execute("UPDATE game.corporations SET deleted = true, ceo_id = NULL WHERE corporation_id = $1", &[&corp]).await?;
@@ -209,6 +202,7 @@ pub(crate) async fn withdraw_applications(ex: &(impl Executor + ?Sized), applica
     Ok(ex.query("UPDATE game.corp_applications SET status = $3 WHERE character_id = $1 AND application_id <> $2 AND status = ANY($4) RETURNING application_id, corporation_id, character_id, application_text, status, created, custom_message", &[&applicant, &id, &status, &open]).await?.iter().map(Application::from_row).collect())
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum MemberFilter { All, Include, Exclude }
 
 pub(crate) struct Member {
@@ -217,24 +211,33 @@ pub(crate) struct Member {
     pub(crate) start_date: i64,
     pub(crate) station_id: Option<i64>,
     pub(crate) solar_system_id: Option<i64>,
-    pub(crate) logoff_date: i64,
+    pub(crate) logon_date: Option<i64>, pub(crate) logoff_date: Option<i64>,
     pub(crate) ship_type_id: Option<i32>,
     pub(crate) grantable_roles: i64,
+    pub(crate) roles_hq: i64, pub(crate) roles_base: i64, pub(crate) roles_other: i64,
+    pub(crate) grantable_hq: i64, pub(crate) grantable_base: i64, pub(crate) grantable_other: i64,
+    pub(crate) base: Option<i64>, pub(crate) blocked: bool,
+    pub(crate) division: i64, pub(crate) squadron: i64,
     pub(crate) title_mask: i64,
     pub(crate) title: String,
 }
 
 impl Member {
     fn from_row(r: &tokio_postgres::Row) -> Self {
-        Self { character_id: r.get("character_id"), roles: r.get("corp_roles"), start_date: r.get("start_date"), station_id: r.get("station_id"), solar_system_id: r.get("solar_system_id"), logoff_date: r.get("logoff_date"), ship_type_id: r.get("ship_type_id"), grantable_roles: r.get("corp_grantable_roles"), title_mask: r.get("corp_title_mask"), title: r.get("corp_title") }
+        Self { character_id: r.get("character_id"), roles: r.get("corp_roles"), start_date: r.get("start_date"), station_id: r.get("station_id"), solar_system_id: r.get("solar_system_id"), logon_date: r.get("logon_date"), logoff_date: r.get("logoff_date"), ship_type_id: r.get("ship_type_id"), grantable_roles: r.get("corp_grantable_roles"), title_mask: r.get("corp_title_mask"), title: r.get("corp_title"),
+            roles_hq: r.get("corp_roles_hq"), roles_base: r.get("corp_roles_base"), roles_other: r.get("corp_roles_other"),
+            grantable_hq: r.get("corp_grantable_hq"), grantable_base: r.get("corp_grantable_base"), grantable_other: r.get("corp_grantable_other"),
+            base: r.get("corp_base_id"), blocked: r.get("corp_block_roles"), division: r.get("corp_division_id"), squadron: r.get("corp_squadron_id") }
     }
 }
 
 const MEMBER_SELECT: &str = "SELECT ch.character_id, ch.corp_roles,
         COALESCE((SELECT max(e.start_date) FROM game.employment_history e WHERE e.char_id = ch.character_id AND e.corporation_id = ch.corporation_id),
                  (extract(epoch FROM ch.created_at) * $3::bigint)::bigint + $4::bigint) AS start_date,
-        ch.station_id, ch.solar_system_id, (extract(epoch FROM ch.logoff_at) * $3::bigint)::bigint + $4::bigint AS logoff_date,
-        (SELECT type_id FROM game.items WHERE item_id = ch.ship_id) AS ship_type_id, ch.corp_grantable_roles, ch.corp_title_mask, ch.corp_title
+        ch.station_id, ch.solar_system_id, (extract(epoch FROM ch.observed_logon_at) * $3::bigint)::bigint + $4::bigint AS logon_date,
+        (extract(epoch FROM ch.observed_logoff_at) * $3::bigint)::bigint + $4::bigint AS logoff_date,
+        (SELECT type_id FROM game.items WHERE item_id = ch.ship_id) AS ship_type_id, ch.corp_grantable_roles, ch.corp_title_mask, ch.corp_title,
+        ch.corp_roles_hq,ch.corp_roles_base,ch.corp_roles_other,ch.corp_grantable_hq,ch.corp_grantable_base,ch.corp_grantable_other,ch.corp_base_id,ch.corp_block_roles,ch.corp_division_id,ch.corp_squadron_id
     FROM game.characters ch";
 
 pub(crate) async fn members(ex: &(impl Executor + ?Sized), corp: i64, filter: MemberFilter, ids: &[i64], second: i64, epoch: i64) -> Result<Vec<Member>, db::Error> {
@@ -242,6 +245,25 @@ pub(crate) async fn members(ex: &(impl Executor + ?Sized), corp: i64, filter: Me
     let sql = format!("{MEMBER_SELECT} WHERE ch.corporation_id = $1 AND NOT ch.deleted {extra} ORDER BY ch.character_id");
     Ok(ex.query(&sql, &[&corp, &ids, &second, &epoch]).await?.iter().map(Member::from_row).collect())
 }
+struct MemberCount { count: i64 }
+impl MemberCount {
+    fn from_row(row: &tokio_postgres::Row) -> Self { Self { count: row.get("count") } }
+}
+/// Stable one-based corporation member page and total membership.
+pub(crate) async fn member_page(ex: &(impl Executor + ?Sized), corp: i64, page: i64, per_page: i64, second: i64, epoch: i64) -> Result<(Vec<Member>, i64), db::Error> {
+    let count = MemberCount::from_row(&ex.query_one("SELECT count(*) AS count FROM game.characters WHERE corporation_id=$1 AND NOT deleted", &[&corp]).await?).count;
+    let ids: &[i64] = &[];
+    let offset = (page - 1) * per_page;
+    let sql = format!("{MEMBER_SELECT} WHERE ch.corporation_id=$1 AND NOT ch.deleted AND $2::bigint[] IS NOT NULL ORDER BY ch.character_id LIMIT $5 OFFSET $6");
+    let rows = ex.query(&sql, &[&corp, &ids, &second, &epoch, &per_page, &offset]).await?;
+    Ok((rows.iter().map(Member::from_row).collect(), count))
+}
+/// Persisted station and role-removal timestamp used by leave/kick admission.
+pub(crate) async fn exit_facts(ex: &(impl Executor + ?Sized), character: i64) -> Result<(Option<i64>, Option<i64>), db::Error> {
+    let row = ex.query_one("SELECT station_id, corp_roles_removed_at FROM game.characters WHERE character_id=$1", &[&character]).await?;
+    Ok((row.get("station_id"), row.get("corp_roles_removed_at")))
+}
+
 
 pub(crate) struct Employment {
     pub(crate) corporation_id: i64,

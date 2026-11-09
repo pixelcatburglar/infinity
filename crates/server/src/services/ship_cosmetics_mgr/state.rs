@@ -2,7 +2,8 @@
 //! Applications and licenses come from the game DAO; static compatibility comes
 //! from the SDE. Region eligibility is enforced on writes, not projections.
 use std::collections::HashMap;
-use crate::{consts::CATEGORY_SHIP, dao::{items::loading::ItemQuery, ship_skins}, db::{executor::Executor, Db}, sde::Sde, services::{db_err, identity::Identity, inventory::reachability::{Endpoint, Reachability}, items::load_items, CallError}, space::{ship_cosmetics::{self, Ship}, World}};
+use infinity_core::consts::CATEGORY_SHIP;
+use crate::{dao::{items::loading::ItemQuery, ship_skins}, db::{executor::Executor, Db}, sde::Sde, services::{db_err, identity::Identity, inventory::reachability::{Endpoint, Reachability}, items::load_items, CallError}, space::{ship_cosmetics::{self, Ship}, World}};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct State { pub ship_id: i64, pub character_id: i64, pub skin_id: Option<i32> }

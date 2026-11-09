@@ -1,5 +1,11 @@
 use super::*;
 
+fn session(character: i64, session_id: i64) -> infinity_core::session::OnlineSession {
+    infinity_core::session::OnlineSession { character_id: character, user_id: None, session_id, ship_id: None,
+        station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None,
+        fleet_id: None, role: 0, corporation_role: 0 }
+}
+
 #[test]
 fn presence_tracks_live_replaced_and_removed_channels() {
     let pilots = Pilots::default();
@@ -21,7 +27,7 @@ fn presence_tracks_live_replaced_and_removed_channels() {
     assert!(pilots.online_pilots().is_empty());
     let (new_tx, _new_rx) = tokio::sync::mpsc::unbounded_channel();
     pilots.register_pilot(1, new_tx);
-    pilots.unregister_pilot(1);
+    pilots.unregister_pilot_generation(1, None);
     assert!(!pilots.is_online(1));
     assert!(pilots.online_pilots().is_empty());
 }
@@ -31,19 +37,17 @@ fn stale_generation_cannot_unregister_replacement() {
     let pilots = Pilots::default();
     let (old_tx, old_rx) = tokio::sync::mpsc::unbounded_channel();
     pilots.register_pilot(1, old_tx);
-    pilots.set_online_session(1, Some(crate::session::OnlineSession {
-        character_id: 1, user_id: None, session_id: 2, ship_id: Some(20), station_id: None, system_id: None,
-        corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
-    }));
+    pilots.set_online_session(1, Some(session(1, 2)));
     drop(old_rx);
     let (new_tx, _new_rx) = tokio::sync::mpsc::unbounded_channel();
     pilots.register_pilot(1, new_tx);
-    pilots.set_online_session(1, Some(crate::session::OnlineSession {
-        character_id: 1, user_id: None, session_id: 3, ship_id: Some(21), station_id: None, system_id: None,
-        corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
-    }));
-    pilots.unregister_pilot_generation(1, Some(2));
+    pilots.set_online_session(1, Some(session(1, 3)));
+    assert_eq!(pilots.online_sessions(), vec![session(1, 3)]);
+    assert!(!pilots.unregister_pilot_generation(1, Some(2)));
     assert_eq!(pilots.online_session(1).unwrap().session_id, 3);
+    assert_eq!(pilots.online_sessions(), vec![session(1, 3)]);
+    assert!(pilots.unregister_pilot_generation(1, Some(3)));
+    assert!(!pilots.unregister_pilot_generation(1, Some(3)));
 }
 
 #[test]
@@ -51,7 +55,7 @@ fn stale_session_update_cannot_replace_live_generation() {
     let pilots = Pilots::default();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     pilots.register_pilot(1, tx);
-    let session = |sid, ship| crate::session::OnlineSession {
+    let session = |sid, ship| infinity_core::session::OnlineSession {
         character_id: 1, user_id: Some(9), session_id: sid, ship_id: Some(ship),
         station_id: None, system_id: None, corporation_id: None, alliance_id: None,
         faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
@@ -66,7 +70,7 @@ fn stale_session_update_cannot_replace_live_generation() {
 #[test]
 fn station_guests_only_include_live_matching_sessions() {
     let pilots = Pilots::default();
-    let session = |id, station| crate::session::OnlineSession {
+    let session = |id, station| infinity_core::session::OnlineSession {
         character_id: id, user_id: None, session_id: 0, ship_id: None, station_id: station, system_id: None, corporation_id: None,
         alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     };
@@ -81,7 +85,12 @@ fn station_guests_only_include_live_matching_sessions() {
     drop(receivers.pop());
     assert_eq!(pilots.station_guests(10), vec![session(1, Some(10))]);
     assert_eq!(pilots.station_guests(20), vec![session(2, Some(20))]);
-    pilots.unregister_pilot(1);
+    let mut online = pilots.online_sessions();
+    online.sort_by_key(|s| s.character_id);
+    assert_eq!(online, vec![session(1, Some(10)), session(2, Some(20))]);
+    pilots.unregister_pilot_generation(2, None);
+    assert_eq!(pilots.online_sessions(), vec![session(1, Some(10))]);
+    pilots.unregister_pilot_generation(1, None);
     assert!(pilots.station_guests(10).is_empty());
 }
 
@@ -136,7 +145,7 @@ fn effect_stamp_balls() -> (Ball, Ball) {
         pos: [1.0, 2.0, 3.0], vel: [4.0, 5.0, 6.0], goto: [7.0, 8.0, 9.0],
         old_pos: [1.0, 2.0, 3.0], old_vel: [4.0, 5.0, 6.0], segment_acceleration: None,
         follow_id: 987, follow_range: 42.0, free: true, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 3, last_ms: 1_234_567, interpolation_anchor_ms: 1_234_567, effect_stamp: 1_234, cloak: 0, cloak_until: 0,
+        warp: WarpState::default(), last_ms: 1_234_567, interpolation_anchor_ms: 1_234_567, effect_stamp: 1_234, cloak: 0, cloak_until: 0,
         health: [1.0; DAMAGE_LAYER_COUNT], launcher: 654, slim: vec![],
     };
     let mut warp = missile.clone();

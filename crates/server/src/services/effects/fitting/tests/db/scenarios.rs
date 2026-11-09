@@ -3,9 +3,11 @@
 //! Actor-driven weapon cycles are covered by the separate lifecycle bank integration test.
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
+use infinity_core::{
+    consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_SKILL, dogma::EFFECT_ONLINE, FLAG_CARGO, FLAG_HI_SLOT_FIRST},
+};
 use crate::{
     client::Client,
-    consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_SKILL, dogma::EFFECT_ONLINE, FLAG_CARGO, FLAG_HI_SLOT_FIRST},
     dao::items::{combat as item_combat, dogma},
     sde::Sde,
     services::{self, CallError, effects::online::{self, OnlineChanged}, fit::{Fit, Key}, skills::gm::{self, Change}},
@@ -34,7 +36,7 @@ struct ForeignCaller<'a> {
 
 impl Drop for ForeignCaller<'_> {
     fn drop(&mut self) {
-        self.client.world.unregister_pilot(self.owner);
+        self.client.world.unregister_pilot_generation(self.owner, None);
         self.client.session.apply(vec![("charid", self.char_id.clone())]);
         self.client.notify_tx = self.sender.clone();
     }
@@ -149,10 +151,12 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     item_combat::move_bank(&db, f.ship, f.modules[0], f.modules[1]).await.unwrap();
     while events.try_recv().is_ok() {}
     let scenario_sde = sde.clone();
+    let fences = online::capture_online_fences(&client.world, &[f.owner]).await;
     let rolled_back: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<OnlineChanged>| {
         let sde = scenario_sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
-            online::reconcile_core(tx, &sde, outbox, f.owner, f.ship).await?;
+            online::reconcile_core(tx, &sde, outbox, &fences, f.owner, f.ship).await?;
             assert!(crate::dao::items::charges::banks(tx, f.ship).await.map_err(services::db_err)?.is_empty());
             Err(CallError::Internal(anyhow::anyhow!("intentional fixture rollback")))
         })
@@ -161,7 +165,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     assert_eq!(dogma::online(&db, f.ship).await.unwrap().len(), 2);
     assert_eq!(crate::dao::items::charges::banks(&db, f.ship).await.unwrap().len(), 1);
     assert!(events.try_recv().is_err());
-    online::reconcile_ship(&client.db, &client.sde, f.owner, f.ship, |n| online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("committed overload reconciliation");
+    online::reconcile_ship(&client.db, &client.world, &client.sde, f.owner, f.ship, |n| online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("committed overload reconciliation");
     assert!(dogma::online(&db, f.ship).await.unwrap().is_empty());
     assert!(crate::dao::items::charges::banks(&db, f.ship).await.unwrap().is_empty());
     assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|(name, _)| name == "OnWeaponBanksChanged"));
@@ -181,11 +185,13 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     let policy = online::OnlinePolicy::from_identity(&services::identity::Identity::of_client(client), client.notify_tx.clone()).ok().unwrap();
     let scenario_sde = sde.clone();
     while events.try_recv().is_ok() {}
+    let fences = online::capture_online_fences(&client.world, &[f.owner]).await;
     let rollback: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<OnlineChanged>| {
         let policy = policy.clone();
         let sde = scenario_sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
-            assert!(online::set_online_core(tx, &sde, &policy, outbox, f.ship, f.modules[0], false).await?);
+            assert!(online::set_online_core(tx, &sde, &policy, outbox, &fences, f.ship, f.modules[0], false).await?.0);
             Err(CallError::Internal(anyhow::anyhow!("intentional unfit rollback")))
         })
     }, |(), _| async move { panic!("rolled-back unfit dispatched") }).await;

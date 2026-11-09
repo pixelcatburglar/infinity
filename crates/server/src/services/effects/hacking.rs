@@ -5,10 +5,10 @@
 //! Accepted analyzer activation cancels arrival jump cloak after validation.
 
 use crate::client::filetime_now;
-use crate::consts::dogma::EFFECT_HACKING;
+use infinity_core::consts::dogma::EFFECT_HACKING;
 use crate::sde::Sde;
 use crate::services::effects::online::OnlinePolicy;
-use crate::messages;
+use infinity_core::messages;
 use crate::services::{combat, notify_error, CallResult};
 use crate::space::{ms_to_seconds, seconds_to_ms};
 use marshal::Value;

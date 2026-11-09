@@ -3,7 +3,8 @@
 //! Subcommands operate on the current system; remote and universe scopes are unsupported.
 
 use super::{slash_error, CallError, Client};
-use crate::{messages, services::exploration::{self, wormhole_mgr}};
+use infinity_core::messages;
+use crate::{services::exploration::{self, wormhole_mgr}};
 
 fn parse(args: &[String]) -> Result<(&str, usize), CallError> {
     let usage = || slash_error(messages::gm::GM_WH_USAGE.into());

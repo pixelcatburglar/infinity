@@ -3,7 +3,8 @@
 //! Identity data comes from active game owners and the startup SDE snapshot.
 //! Quotes group text but shell escapes and single-quote syntax are not supported.
 use super::{slash_error, CallError, Client};
-use crate::{dao, messages, services::db_err};
+use infinity_core::messages;
+use crate::{dao, services::db_err};
 
 pub(super) fn tokenize(line: &str) -> Result<Vec<String>, CallError> {
     let mut words = Vec::new();

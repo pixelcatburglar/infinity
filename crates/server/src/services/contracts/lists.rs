@@ -2,6 +2,7 @@
 //! Uses game contracts and items plus immutable SDE stations and types; corporate inventory
 //! access follows live membership and division view/take authority.
 //! Search and owner listing limits use the configured contracts pagination policy.
+//! `OnItemChange` stack quantities are projected to the client display limit.
 
 use super::*;
 
@@ -200,10 +201,10 @@ pub(super) async fn escrow(c: &Client) -> CallResult {
 async fn picker_root(ex: &(impl Executor + ?Sized), sde: &Sde, me: i64, owner: i64, station: i64, for_corp: bool, flag: i32, take: bool) -> Result<Option<(i64, i32)>, CallError> {
     if sde.map.station(station).is_none() { return Ok(None); }
     if !for_corp { return Ok(Some((station, FLAG_HANGAR))); }
-    let flag = if flag == FLAG_HANGAR { crate::consts::FLAG_CORP_SAG1 } else { flag };
-    let allowed = if take { super::super::inventory::access::may_take_corp_hangar(ex, me, owner, flag).await? } else { super::super::inventory::access::may_view_corp_hangar(ex, me, owner, flag).await? };
+    let flag = if flag == FLAG_HANGAR { infinity_core::consts::FLAG_CORP_SAG1 } else { flag };
+    let allowed = if take { super::super::inventory::access::may_take_corp_hangar(ex, me, owner, station, flag).await? } else { super::super::inventory::access::may_view_corp_hangar(ex, me, owner, station, flag).await? };
     if !allowed { return Ok(None); }
-    let location = if flag == crate::consts::FLAG_CORP_DELIVERIES { Some(station) } else { super::super::offices::office_at(ex, owner, station).await? };
+    let location = if flag == infinity_core::consts::FLAG_CORP_DELIVERIES { Some(station) } else { super::super::offices::office_at(ex, owner, station).await? };
     Ok(location.map(|location| (location, flag)))
 }
 
@@ -222,7 +223,7 @@ pub(super) async fn items_in(c: &Client, station: i64, container: Option<i64>, f
     let me = c.session.int("charid").unwrap_or(0);
     if container.is_none() && for_corp {
         let mut items = Vec::new();
-        for division in (crate::consts::FLAG_CORP_SAG1..crate::consts::FLAG_CORP_SAG1 + crate::consts::CORP_HANGAR_DIVISIONS).chain(std::iter::once(crate::consts::FLAG_CORP_DELIVERIES)) {
+        for division in (infinity_core::consts::FLAG_CORP_SAG1..infinity_core::consts::FLAG_CORP_SAG1 + infinity_core::consts::CORP_HANGAR_DIVISIONS).chain(std::iter::once(infinity_core::consts::FLAG_CORP_DELIVERIES)) {
             if let Some(root) = picker_root(&c.db, &c.sde, me, owner, station, true, division, false).await? {
                 items.extend(load_items(&c.db, &c.sde, ItemQuery::OwnerLocationFlag(owner, root.0, root.1)).await.map_err(db_err)?);
             }
@@ -268,10 +269,9 @@ pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quant
             }
             let root = picker_root(db, sde, me, owner, station_id, for_corp, flag, true).await?.ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
             let item = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-            if item.owner_id != owner || item.location_id != root.0 || item.flag_id != root.1 || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
+            if item.owner_id != owner || item.location_id != root.0 || item.flag_id != root.1 || item.singleton || quantity < 1 || quantity >= item.quantity {
                 return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
             }
-            let quantity = quantity as i32;
             let id = super::super::inventory::stacks::split_stack(db, &item, quantity, owner, root.0, root.1, false).await?;
             let old_quantity = item.quantity;
             let left = Item { quantity: old_quantity - quantity, ..item };
@@ -281,7 +281,7 @@ pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quant
                 let new_item = load_items(db, sde, ItemQuery::Id(id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
                 super::super::inventory::notifications::notify_corp_item_change(db, outbox, &new_item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
             } else {
-                outbox.notify_pilot(me, "OnItemChange", vec![left.row(), Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect()), Value::None]);
+                outbox.notify_pilot(me, "OnItemChange", vec![left.row(), super::super::inventory::notifications::item_change_dict(change), Value::None]);
                 if crate::dao::items::transfers::docked(db, me).await.map_err(db_err)? == Some(station_id) {
                     let new_item = load_items(db, sde, ItemQuery::Id(id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
                     outbox.notify_pilot(me, "OnItemChange", vec![new_item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(LOCATION_JUNKYARD))]), Value::None]);

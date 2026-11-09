@@ -1,6 +1,6 @@
-//! Persistent corporation application notices, using notificationUtil.py and notificationconst.py.
-//! Rows are stored in game.notifications by the mail service in the caller's transaction.
-//! Only application and invitation transitions are covered.
+//! Persistent corporation application and governance notices, using the existing
+//! mail notification producer and notificationUtil.py/notificationconst.py types.
+//! Rows are written in the caller's transaction and roll back with its business change.
 use super::*;
 
 /// notificationconst notificationGroupCorp.
@@ -21,6 +21,40 @@ const CHAR_WITHDRAW: i32 = 130;
 const INVITED: i32 = 139;
 /// notificationconst notificationTypeCorpAppCustomReject.
 const CUSTOM_REJECT: i32 = 142;
+/// notificationconst CharLeftCorpMsg, CorpNewCEOMsg, CorpLiquidationMsg and CorpKicked.
+const LEFT: i32 = 21;
+const NEW_CEO: i32 = 22;
+const LIQUIDATION: i32 = 85;
+const KICKED: i32 = 92;
+
+pub(super) async fn kicked<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receiver: i64, corporation: i64) -> Result<(), CallError> {
+    let payload = serde_json::json!({"corpID": corporation}).to_string();
+    super::super::mail::notify(db, outbox, receiver, KICKED, GROUP_CORP, corporation, &payload).await
+}
+
+pub(super) async fn voluntary<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, character: i64, corporation: i64) -> Result<(), CallError> {
+    let payload = serde_json::json!({"corpID": corporation}).to_string();
+    for receiver in registry::application_managers(db, corporation, ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR).await.map_err(db_err)? {
+        super::super::mail::notify(db, outbox, receiver, LEFT, GROUP_CORP, character, &payload).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn ceo<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receivers: &[i64], corporation: i64) -> Result<(), CallError> {
+    let payload = serde_json::json!({"corpID": corporation}).to_string();
+    for &receiver in receivers {
+        super::super::mail::notify(db, outbox, receiver, NEW_CEO, GROUP_CORP, corporation, &payload).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn liquidation<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receivers: &[i64], corporation: i64) -> Result<(), CallError> {
+    let payload = serde_json::json!({"corpID": corporation}).to_string();
+    for &receiver in receivers {
+        super::super::mail::notify(db, outbox, receiver, LIQUIDATION, GROUP_CORP, corporation, &payload).await?;
+    }
+    Ok(())
+}
 
 pub(super) async fn application<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, row: &registry::Application) -> Result<(), CallError> {
     let (kind, managers) = match row.status {

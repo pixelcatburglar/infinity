@@ -101,27 +101,45 @@ async fn admission_session_precedes_member_events_and_late_mail_failure_rolls_ba
     let old = fixture::create_corporation(&db, old_manager.character, 1).await.unwrap();
     fixture::assign_corporation(&db, manager.character, corp, ROLE_DIRECTOR).await.unwrap();
     fixture::assign_corporation(&db, old_manager.character, old, ROLE_DIRECTOR).await.unwrap();
-    fixture::assign_corporation(&db, applicant.character, old, 128).await.unwrap();
+    fixture::assign_corporation(&db, applicant.character, old, 0).await.unwrap();
     db.execute("UPDATE game.characters SET corp_title_mask=1,corp_title='test' WHERE character_id=$1", &[&applicant.character]).await.unwrap();
+    let authority = crate::dao::characters::roles::authority(&db, applicant.character).await.unwrap().unwrap();
+    assert_eq!(authority.roles, [0; 4]);
+    assert_eq!(authority.grantable, [0; 4]);
+    let (mut client, peer) = tests::client(db.clone(), applicant.character).await;
+    let station = client.sde.map.stations().find(|station| station.solar_system_id.is_some()).unwrap();
+    let station_id = station.station_id;
+    let system_id = station.solar_system_id.unwrap();
+    crate::dao::characters::ship::dock(&db, applicant.character, station_id, system_id).await.unwrap();
     db.execute("UPDATE game.corporations SET member_limit=10,welcome_mail='Welcome' WHERE corporation_id=$1", &[&corp]).await.unwrap();
     let id = application(&db, corp, applicant.character, 6).await;
     let constraint = format!("admission_mail_reject_{corp}");
     db.execute(&format!("ALTER TABLE game.mail_messages ADD CONSTRAINT {constraint} CHECK (sender_id <> {corp}) NOT VALID"), &[]).await.unwrap();
     let test_db = db.clone();
+    let expected_constraint = constraint.clone();
     let result = tokio::spawn(async move {
-        let (mut client, _peer) = tests::client(test_db.clone(), applicant.character).await;
-        client.session.apply(vec![("corpid", Value::Int(old))]);
+        let _peer = peer;
+        client.session.apply(vec![("corpid", Value::Int(old)), ("stationid", Value::Int(station_id)), ("solarsystemid2", Value::Int(system_id))]);
         let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel();
         let (old_tx, mut old_rx) = tokio::sync::mpsc::unbounded_channel();
         let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
         client.world.register_pilot(applicant.character, app_tx);
         client.world.register_pilot(old_manager.character, old_tx);
         client.world.register_pilot(manager.character, new_tx);
-        assert!(rpc(&mut client, "UpdateApplicationOffer", &offer(id, applicant.character, corp, 2), old).await.is_err());
+        match rpc(&mut client, "UpdateApplicationOffer", &offer(id, applicant.character, corp, 2), old).await {
+            Err(crate::services::CallError::Internal(error)) => match error.downcast_ref::<crate::db::Error>() {
+                Some(crate::db::Error::Postgres(error)) => {
+                    assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
+                    assert_eq!(error.as_db_error().and_then(|e| e.constraint()), Some(expected_constraint.as_str()));
+                }
+                other => panic!("expected PostgreSQL constraint failure, got {other:?}"),
+            },
+            other => panic!("expected the fixture constraint failure, got {other:?}"),
+        }
         assert_eq!(status(&test_db, id).await, 6);
         let row = test_db.query_one("SELECT corporation_id,corp_roles,corp_title_mask,corp_title FROM game.characters WHERE character_id=$1", &[&applicant.character]).await.unwrap();
         assert_eq!(row.get::<_, i64>("corporation_id"), old);
-        assert_eq!(row.get::<_, i64>("corp_roles"), 128);
+        assert_eq!(row.get::<_, i64>("corp_roles"), 0);
         assert_eq!(row.get::<_, i64>("corp_title_mask"), 1);
         assert_eq!(row.get::<_, String>("corp_title"), "test");
         let row = test_db.query_one("SELECT (SELECT count(*) FROM game.employment_history WHERE char_id=$1 AND corporation_id=$2) AS jobs, (SELECT count(*) FROM game.mail_messages WHERE sender_id=$2) AS mail, (SELECT count(*) FROM game.notifications WHERE receiver_id=ANY($3)) AS notices", &[&applicant.character, &corp, &vec![applicant.character, manager.character, old_manager.character]]).await.unwrap();
@@ -134,7 +152,7 @@ async fn admission_session_precedes_member_events_and_late_mail_failure_rolls_ba
     let test_db = db.clone();
     let success = tokio::spawn(async move {
         let (mut client, _peer) = tests::client(test_db.clone(), applicant.character).await;
-        client.session.apply(vec![("corpid", Value::Int(old))]);
+        client.session.apply(vec![("corpid", Value::Int(old)), ("stationid", Value::Int(station_id)), ("solarsystemid2", Value::Int(system_id))]);
         let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel();
         let (old_tx, mut old_rx) = tokio::sync::mpsc::unbounded_channel();
         let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -146,7 +164,7 @@ async fn admission_session_precedes_member_events_and_late_mail_failure_rolls_ba
         let old_events: Vec<_> = std::iter::from_fn(|| old_rx.try_recv().ok()).collect();
         let new_events: Vec<_> = std::iter::from_fn(|| new_rx.try_recv().ok()).collect();
         assert_eq!(app[0].0, "__session");
-        assert!(app[0].1.contains(&Value::tuple([Value::str("corpAccountKey"), Value::Int(crate::consts::ACCOUNT_CASH as i64)])));
+        assert!(app[0].1.contains(&Value::tuple([Value::str("corpAccountKey"), Value::Int(infinity_core::consts::ACCOUNT_CASH as i64)])));
         let change = Value::dict([("corporationID", Value::tuple([Value::Int(old), Value::Int(corp)]))]);
         let member = |audience| ("OnCorporationMemberChanged".to_owned(), vec![Value::Int(audience), Value::Int(applicant.character), change.clone()]);
         let member_events: Vec<_> = app.iter().filter(|e| e.0 == "OnCorporationMemberChanged").collect();

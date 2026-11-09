@@ -1,9 +1,9 @@
-//! Server-owned simulated-pilot account persistence in `game.accounts`.
+//! Server-owned simulated-pilot account and clone authority persistence.
 //! This server facility has no client counterpart and does not support client login.
-//! The service role identifies server-owned accounts; ordinary registration never grants it.
+//! New or missing authority is initialized to unlimited Omega; existing grades are preserved.
 //! Startup rejects a conflicting player account without modifying it.
 
-use crate::consts::ROLE_SERVICE;
+use infinity_core::consts::ROLE_SERVICE;
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 
@@ -27,6 +27,8 @@ pub(crate) async fn account_id(ex: &(impl Executor + ?Sized)) -> Result<i64, db:
 
 pub(crate) async fn ensure(ex: &(impl Executor + ?Sized)) -> Result<bool, db::Error> {
     let password: &[u8] = &[];
-    ex.execute("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&ACCOUNT_NAME, &password, &ROLE_SERVICE]).await?;
-    Ok(ex.query_opt("SELECT (role & $2) != 0 AS valid FROM game.accounts WHERE lower(user_name) = lower($1)", &[&ACCOUNT_NAME, &ROLE_SERVICE]).await?.as_ref().is_some_and(|row| Ownership::from_row(row).valid))
+    let row = ex.query_one(initial_authority_sql!("WITH account AS (INSERT INTO game.accounts AS existing (user_name, password_hash, role) VALUES ($1, $2, $3) ON CONFLICT (lower(user_name)) DO UPDATE SET user_name = existing.user_name WHERE (existing.role & $3) != 0 RETURNING user_id), ", "SELECT EXISTS (SELECT 1 FROM account) AS valid"), &[&ACCOUNT_NAME, &password, &ROLE_SERVICE]).await?;
+    Ok(Ownership::from_row(&row).valid)
 }
+
+#[cfg(test)] mod tests;

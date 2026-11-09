@@ -1,5 +1,10 @@
 use super::*;
-use crate::dao::items::creation;
+use super::info::{active_effect, cap_client_quantity, overlay_overrides, ship_info, ship_state_core, wire_quantity, ONLINE_EFFECT_DURATION, ONLINE_EFFECT_REPEAT};
+use crate::services::{combat, fit, item_descriptor};
+use crate::dao::items::loading::Item;
+use infinity_core::consts::{dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE}, BLUEPRINT_COPY_QUANTITY, CLIENT_MAX_SHORT_AMOUNT, SINGLETON_QUANTITY, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
+use marshal::Value;
+use std::collections::BTreeMap;
 
 #[path = "../combat/groups_health/tests/fixture.rs"]
 mod fixture;
@@ -36,9 +41,40 @@ fn item_row_preserves_type_aware_wire_quantity() {
     assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(-500_000)));
     item.type_id = TYPE_CHARACTER;
     assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(SINGLETON_QUANTITY)));
-    item.quantity = BLUEPRINT_COPY_QUANTITY as i32;
+    item.quantity = BLUEPRINT_COPY_QUANTITY;
     assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(BLUEPRINT_COPY_QUANTITY)));
     item.singleton = false;
     item.quantity = 42;
     assert_eq!(descriptor.get(&item.row(), "quantity"), Some(Value::Int(42)));
+}
+
+#[test]
+fn wire_quantity_caps_only_ordinary_stacks_above_the_client_limit() {
+    let limit = CLIENT_MAX_SHORT_AMOUNT;
+    for (quantity, expected) in [
+        (0, 0),
+        (1, 1),
+        (42, 42),
+        (limit - 1, limit - 1),
+        (limit, limit),
+        (limit + 1, limit),
+        (i64::MAX, limit),
+        (-1, -1),
+        (-2, -2),
+        (i64::MIN, i64::MIN),
+    ] {
+        assert_eq!(cap_client_quantity(quantity), expected, "{quantity}");
+        assert_eq!(wire_quantity(TYPE_CHARACTER, false, quantity), expected, "{quantity}");
+    }
+    for (type_id, quantity, expected) in [
+        (TYPE_PLASTIC_WRAP, -500_000, -500_000),
+        (TYPE_PLASTIC_WRAP, -(limit + 1), -(limit + 1)),
+        (TYPE_PLASTIC_WRAP, i64::MIN, i64::MIN),
+        (TYPE_CHARACTER, 1, SINGLETON_QUANTITY),
+        (TYPE_CHARACTER, i64::MAX, SINGLETON_QUANTITY),
+        (TYPE_CHARACTER, BLUEPRINT_COPY_QUANTITY, BLUEPRINT_COPY_QUANTITY),
+        (TYPE_PLASTIC_WRAP, BLUEPRINT_COPY_QUANTITY, BLUEPRINT_COPY_QUANTITY),
+    ] {
+        assert_eq!(wire_quantity(type_id, true, quantity), expected, "{type_id} {quantity}");
+    }
 }

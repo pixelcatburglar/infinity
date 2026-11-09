@@ -26,7 +26,10 @@ async fn personal_escrow_departure_and_docked_arrival_notify_once() {
             let result: Result<(), CallError> = test_db.transaction(
                 |tx, outbox: &mut Outbox| {
                     let sde = sde.clone();
-                    Box::pin(async move { hand_over(tx, &sde, outbox, &[root], dest, source).await })
+                    Box::pin(async move {
+                        let preparation = prepare(tx, &sde, &[root], &[]).await?;
+                        hand_over(tx, &sde, outbox, &[root], dest, source, &preparation, &[]).await
+                    })
                 },
                 |value, outbox| {
                     let world = &world;
@@ -48,7 +51,7 @@ async fn personal_escrow_departure_and_docked_arrival_notify_once() {
             ]), Value::None]);
             assert!(receiver.try_recv().is_err(), "duplicate item notification");
         }
-        world.unregister_pilot(pilot.character);
+        world.unregister_pilot_generation(pilot.character, None);
     }).await;
     fixture::cleanup(&db, pilot).await.unwrap();
     assert_eq!(fixture::remaining(&db, pilot).await.unwrap(), 0);

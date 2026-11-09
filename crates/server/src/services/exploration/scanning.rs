@@ -1,28 +1,62 @@
 //! Exploration scanning mechanics.
 //! Shared exploration state and data sources are documented in the parent module.
 //! Unresolved scan results use the configured uncertainty floor.
+//! First signature resolutions journal facts atomically with scan records, using locked site
+//! data and session context; partial scans and anomalies do not produce resolution facts.
 
 use super::*;
 
-/// Persist a batch before publishing any in-memory authorization.
-pub(super) async fn complete_scans(db: &Db, char_id: i64, site_ids: &[i64]) -> Result<(), CallError> {
-    let mut ids = site_ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.is_empty() {
-        return Ok(());
+#[derive(Clone)]
+pub(super) struct ResolvedSignature {
+    id: i64, system: i64, target: String, strength_attr: i64,
+}
+
+impl From<&Site> for ResolvedSignature {
+    fn from(site: &Site) -> Self {
+        Self { id: site.id, system: site.system, target: site.target.clone(), strength_attr: site.strength_attr }
     }
-    let ids = Arc::new(ids);
-    db.transaction(|tx, _: &mut ()| {
-        let ids = Arc::clone(&ids);
+}
+
+/// Resolve only current signature rows and publish authorization after commit.
+pub(super) async fn complete_scans(db: &Db, char_id: i64, sites: &[ResolvedSignature], context: &FactContext) -> Result<(), CallError> {
+    let mut sites = sites.to_vec();
+    sites.sort_by_key(|site| site.id);
+    sites.dedup_by_key(|site| site.id);
+    if sites.is_empty() { return Ok(()); }
+    let sites = Arc::new(sites);
+    let context = context.clone();
+    let committed = db.transaction(|tx, outbox: &mut Outbox<()>| {
+        let sites = Arc::clone(&sites);
+        let mut context = context.clone();
         Box::pin(async move {
-            for &id in ids.iter() {
-                crate::dao::exploration::mark_scanned(tx, char_id, id).await.map_err(db_err)?;
+            let org = crate::dao::characters::members::organization(tx, char_id).await.map_err(db_err)?;
+            context.corporation_id = org.as_ref().map(|o| o.corporation_id);
+            context.alliance_id = org.and_then(|o| o.alliance_id);
+            if let Some(ship) = context.ship_id {
+                context.ship_type_id = crate::dao::items::loading::load_items(tx, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.first().map(|item| item.type_id);
             }
-            Ok::<(), CallError>(())
+            let mut committed = Vec::new();
+            for candidate in sites.iter() {
+                let Some(site) = crate::dao::exploration::lock_site(tx, candidate.id).await.map_err(db_err)? else {
+                    return Err(CallError::Internal(anyhow::anyhow!("resolved site no longer exists")));
+                };
+                if site.kind != 1 || site.system != candidate.system || site.target != candidate.target || site.strength_attr != candidate.strength_attr {
+                    return Err(CallError::Internal(anyhow::anyhow!("resolved site no longer matches")));
+                }
+                if crate::dao::exploration::mark_scanned(tx, char_id, site.id).await.map_err(db_err)? {
+                    let mut fact = context.clone();
+                    fact.system_id = Some(site.system);
+                    outbox.event(crate::lua::events::GameEvent::SignatureResolved {
+                        char_id, site_id: site.id, signature_id: site.target, signature_type: site.strength_attr,
+                        archetype: site.archetype, dungeon_type: site.dungeon_id, occurred_at: filetime_now(), context: fact,
+                    });
+                }
+                committed.push(site.id);
+            }
+            Ok::<_, CallError>(committed)
         })
-    }, |(), ()| async { Ok(()) }).await?;
-    state().scanned.extend(ids.iter().map(|&id| (char_id, id)));
+    }, |ids, _: Outbox<()>| async move { Ok(ids) }).await?;
+    state().scanned.extend(committed.into_iter().map(|id| (char_id, id)));
     Ok(())
 }
 
@@ -218,6 +252,7 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
     c.notify("OnSystemScanStarted", vec![Value::Int(now), Value::Int(scan_ms as i64), sent]);
     let ids: Vec<i64> = probe_ids.iter().map(|(id, _)| *id).collect();
     let (world, db) = (c.world.clone(), c.db.clone());
+    let context = fact_context(c, FactOrigin::Natural);
     tokio::spawn(async move {
         if !world.after(system, scan_ms as u64).await {
             return;
@@ -252,11 +287,11 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
             }
             let newly_complete = !known && c >= 1.0 && s.kind == Kind::Signature;
             if newly_complete {
-                complete.push(s.id);
+                complete.push(ResolvedSignature::from(s));
             }
             candidates.push((s, c, spread, newly_complete));
         }
-        let committed = match complete_scans(&db, char_id, &complete).await {
+        let committed = match complete_scans(&db, char_id, &complete, &context).await {
             Ok(()) => true,
             Err(e) => {
                 warn!("scan completion failed: {}", err_text(e));
@@ -292,26 +327,52 @@ pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: boo
     let _lock = crate::services::market::lock().await;
     let (Some(ship), Some(char_id)) = (c.session.int("shipid"), c.session.int("charid")) else { return Ok(Value::list([])) };
     let ids = value_ids(call.args.first());
-    let mut back: HashMap<i32, i32> = HashMap::new();
+    let mut back: HashMap<i32, i64> = HashMap::new();
     let mut done = vec![];
     let mut recovered_by_system: HashMap<i64, Vec<i64>> = HashMap::new();
     {
-        let mut st = state();
+        let st = state();
+        let snapshot_now = filetime_now();
         for id in ids {
-            if st.probes.get(&id).is_some_and(|p| p.char_id == char_id) {
-                let p = st.probes.remove(&id).unwrap();
+            if let Some(p) = st.probes.get(&id).filter(|p| p.char_id == char_id && p.expiry > snapshot_now) {
+                if done.contains(&id) { continue; }
                 *back.entry(p.type_id).or_default() += 1;
                 recovered_by_system.entry(p.system).or_default().push(id);
                 done.push(id);
             }
         }
+        // A concurrent expiry sweep only removes memory, never creates an item.
+        // The admitted snapshot deposits once; the recovery lock prevents duplicates.
     }
     if !destroy {
-        let mut outbox = Outbox::default();
-        for (type_id, n) in back {
-            crate::services::items::deposit(&c.db, &c.sde, &mut outbox, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
-        }
-        dispatch_client((), outbox, c)?;
+        let db = c.db.clone();
+        let sde = c.sde.clone();
+        let committed_ids = done.clone();
+        let dispatch_client_ref = &mut *c;
+        db.transaction(
+            |tx, outbox| {
+                let sde = sde.clone();
+                let back = back.clone();
+                Box::pin(async move {
+                    let destination = crate::services::inventory::destination::Destination::owned(char_id, ship, FLAG_CARGO);
+                    for (type_id, n) in back {
+                        crate::services::items::deposit_held(tx, &sde, outbox, &destination, type_id, n, ship, None, None).await?;
+                    }
+                    Ok(())
+                })
+            },
+            |value, outbox| async move {
+                {
+                    let mut st = state();
+                    for id in &committed_ids { st.probes.remove(id); }
+                }
+                dispatch_client(value, outbox, dispatch_client_ref)
+            },
+        ).await?;
+    }
+    if destroy {
+        let mut st = state();
+        for id in &done { st.probes.remove(id); }
     }
     for (system, gone) in recovered_by_system {
         if destroy {

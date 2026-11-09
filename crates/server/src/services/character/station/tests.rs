@@ -1,4 +1,5 @@
-use crate::{services::{self, Call}, session::OnlineSession};
+use infinity_core::session::OnlineSession;
+use crate::{services::{self, Call}};
 use marshal::Value;
 
 fn guest(id: i64, station: i64, corporation: Option<i64>, alliance: Option<i64>, faction: Option<i64>) -> OnlineSession {
@@ -69,8 +70,8 @@ async fn dispatch_get_guests_returns_live_real_and_server_owned_pilots() {
             assert!(matches!(real_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
             assert!(matches!(sim_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
         }
-        client.world.unregister_pilot(caller.character);
-        client.world.unregister_pilot(offline.character);
+        client.world.unregister_pilot_generation(caller.character, None);
+        client.world.unregister_pilot_generation(offline.character, None);
         let reply = services::dispatch(&mut client, &call).await.unwrap();
         if let Value::List(rows) = reply { assert_eq!(rows.len(), 2); } else { panic!("expected tuple list"); }
         client.session.apply(vec![("stationid", Value::None)]);

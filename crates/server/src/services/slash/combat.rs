@@ -3,7 +3,7 @@
 //! This command operates on the caller's active ship only.
 
 use super::{slash_error, CallError, Client};
-use crate::messages;
+use infinity_core::messages;
 use crate::services::fit::PERCENT_SCALE;
 
 pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> Result<String, CallError> {

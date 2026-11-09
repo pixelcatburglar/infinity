@@ -2,26 +2,26 @@
 //! `eve/client/script/ui/services/alliances` and `eve/client/script/ui/services/corporation`.
 //! Shared alliance mechanics in `services::alliances` use `game.alliances`,
 //! `game.corporations` and `game.alliance_applications` through the DAO.
-//! Wars, bills, sovereignty, capital systems and prime time are not supported.
+//! Wars, bills, ordinary capital changes and prime time are not supported.
 use super::*;
 use crate::dao::alliances as dao;
 use crate::services::alliances::{self, admission, queue_application_changed, application_header, application_line, application_line_of, indexed_rowset, set_alliance, APP_NEW, APP_REJECTED};
 use crate::services::{db_err, keyval, notify_error, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH};
+use infinity_core::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH};
 use crate::db::Db;
 use crate::db::outbox::dispatch_world;
-use crate::messages;
+use infinity_core::messages;
 use marshal::Value;
 use crate::services::identity::Identity;
 use crate::dao::corporations::registry;
 use tracing::info;
 /// appConst.allianceCreationCost
-const CREATION_COST: f64 = 1_000_000_000.0;
+const CREATION_COST: i128 = 1_000_000_000;
 /// The CEO of a player corporation that isn't in an alliance yet.
 async fn unallied_ceo_corp(db: &Db, me: i64) -> Result<i64, CallError> {
     let (corp, _) = membership(db, me).await?;
-    if !is_player_corp(corp) || ceo_of(db, corp).await? != Some(me) {
+    if !is_player_corp(corp) || !permissions::is_active_ceo(db, me, corp).await? {
         return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED));
     }
     let allied = dao::corporation_alliance(db, corp).await.map_err(db_err)?;
@@ -59,8 +59,13 @@ async fn create_core(c: &Client, name: String, short_name: String, description: 
     if taken {
         return Err(notify_error(messages::ALLIANCE_NAME_OR_SHORT_NAME_TAKEN));
     }
-    let _trading = super::super::market::lock().await;
     let now = filetime_now();
+    let prepared = crate::services::sovereignty::governance::prepare(db, corp, now).await?;
+    if !matches!(prepared, crate::services::sovereignty::governance::PreparedAllianceChange::NoOwnershipChange) {
+        return Err(notify_error(messages::CORP_ALREADY_IN_ALLIANCE));
+    }
+    let _trading = super::super::market::lock().await;
+    let admitted = std::sync::Arc::new(crate::services::sovereignty::governance::admit(world, prepared, Some(me))?);
     let identity = Identity::of_client(c);
     let mut applications: Vec<i64> = dao::applications(db, dao::ApplicationFilter::Corporation(corp)).await.map_err(db_err)?.into_iter().map(|a| a.alliance).collect();
     applications.sort_unstable(); applications.dedup();
@@ -69,6 +74,7 @@ async fn create_core(c: &Client, name: String, short_name: String, description: 
             let (name, short_name, description, url) = (name.clone(), short_name.clone(), description.clone(), url.clone());
             let applications = applications.clone();
             let identity = identity;
+            let admitted = std::sync::Arc::clone(&admitted);
             Box::pin(async move {
                 if !registry::lock_admission(tx, &applications, &[corp], &[me]).await.map_err(db_err)? { return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED)); }
                 admission::ceo(tx, &identity, corp).await?;
@@ -79,10 +85,10 @@ async fn create_core(c: &Client, name: String, short_name: String, description: 
                     return Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION));
                 }
                 if !gm {
-                    super::super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, CREATION_COST).await?;
+                    super::super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, crate::isk::IskAmount::from_whole_isk(CREATION_COST).ok_or(crate::isk::AmountError)?).await?;
                 }
                 let id = dao::create(tx, &name, &short_name, &description, &url, corp, me, now).await.map_err(db_err)?;
-                set_alliance(tx, outbox, corp, Some(id), now).await?;
+                set_alliance(tx, outbox, corp, Some(id), now, &admitted).await?;
                 for app in dao::delete_other_applications(tx, corp, id, APP_NEW).await.map_err(db_err)? {
                     queue_application_changed(tx, outbox, app.alliance, corp, Some(application_line(app))).await?;
                 }

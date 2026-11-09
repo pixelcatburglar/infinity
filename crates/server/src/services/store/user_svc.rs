@@ -2,7 +2,10 @@
 //! Uses game redeem tokens, characters, items and SDE types and stations. Invalid
 //! tokens remain queued; database write failures roll back the entire claim.
 //! Licenses and ISK rewards are not supported.
+//! Wire token and `itemsCreated` quantities are projected to the client display
+//! limit; stored token and item quantities stay exact.
 use super::*;
+use crate::services::notify_error;
 /// Skill points granted per redeemed type (redeem/data.py `get_redeem_data`).
 const SKILL_POINT_TYPES: &[(i32, i64)] = &[
     (60550, 100), (60551, 500), (54652, 1000), (54653, 2500), (63303, 4000), (63304, 4500), (54650, 5000), (63305, 5500),
@@ -22,7 +25,7 @@ async fn redeem_tokens(c: &Client) -> CallResult {
             ("tokenID", Value::Int(r.token_id)),
             ("massTokenID", Value::None),
             ("typeID", Value::Int(r.type_id as i64)),
-            ("quantity", Value::Int(r.quantity as i64)),
+            ("quantity", Value::Int(crate::services::dogma::info::cap_client_quantity(r.quantity))),
             ("blueprintRuns", Value::None),
             ("blueprintMaterialLevel", Value::None),
             ("blueprintProductivityLevel", Value::None),
@@ -107,7 +110,8 @@ async fn claim_in_transaction(
     let mut skill_points = 0i64;
     for token in valid {
         if let Some((_, sp)) = SKILL_POINT_TYPES.iter().find(|(id, _)| *id == token.type_id) {
-            skill_points += sp * i64::from(token.quantity);
+            skill_points = sp.checked_mul(token.quantity).and_then(|points| skill_points.checked_add(points))
+                .ok_or_else(|| notify_error(messages::store::REDEEM_FAILED))?;
             successful.push(token.token_id);
             continue;
         }
@@ -117,18 +121,19 @@ async fn claim_in_transaction(
         created.push(Value::dict([
             ("itemID", Value::Int(item_id)),
             ("typeID", Value::Int(i64::from(token.type_id))),
-            ("quantity", Value::Int(i64::from(token.quantity))),
+            ("quantity", Value::Int(crate::services::dogma::info::cap_client_quantity(token.quantity))),
             ("stationID", Value::Int(destination)),
         ]));
         if selected && current_station == station {
-            crate::services::inventory::notifications::notify_item_change(tx, sde, outbox, item_id, vec![(crate::consts::IX_LOCATION_ID, Value::Int(0))]).await?;
+            crate::services::inventory::notifications::notify_item_change(tx, sde, outbox, item_id, vec![(infinity_core::consts::IX_LOCATION_ID, Value::Int(0))]).await?;
         }
     }
     if purchases::trash(tx, user, &successful).await.map_err(db_err)? != successful.len() as u64 {
         return Err(db_err(anyhow::anyhow!("redeem token deletion mismatch")));
     }
     if skill_points > 0 {
-        let free = purchases::add_points(tx, char_id, skill_points).await.map_err(db_err)?;
+        let free = crate::dao::characters::attributes::grant_free_points(tx, char_id, skill_points).await.map_err(db_err)?
+            .ok_or_else(|| notify_error(messages::store::REDEEM_FAILED))?;
         if selected {
             outbox.notify_client("OnFreeSkillPointsChanged", vec![Value::Int(free)]);
         }

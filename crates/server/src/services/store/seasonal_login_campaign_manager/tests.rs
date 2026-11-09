@@ -18,6 +18,7 @@ async fn seasonal_account_settlement_and_rollback() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let seq: i64 = db.query_one("SELECT nextval('game.accounts_user_id_seq') AS id", &[]).await.unwrap().get("id");
     let user = crate::dao::accounts::authentication::register(&db, &format!("seasonal-test-{seq}"), b"fixture", 0, 0).await.unwrap().user_id;
+    let result = crate::tests::catch_scenario(async {
     let (client, _peer) = crate::services::tests::client(db.clone(), 0).await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut campaign = Campaign { id: 1, alpha: vec![(101, 1), (102, 1), (103, 1)], omega: vec![(201, 1), (202, 1), (203, 1)], retro_claim: true };
@@ -61,12 +62,17 @@ async fn seasonal_account_settlement_and_rollback() {
     assert_eq!(rewards::history(&db, user, campaign.id).await.unwrap()[0].clone_grade, 1);
     assert_eq!(purchases::tokens(&db, user).await.unwrap().len(), 6);
 
-    // The second token cannot fit its database representation; the first grant and claim roll back.
+    // A fresh Omega claim grants both the Alpha reward and the full-width Omega quantity.
     campaign.id = 5;
     campaign.omega[0].1 = i64::MAX;
-    assert!(claim_reward(&db, &client.world, &campaign, user, sender.clone()).await.is_err());
-    assert!(rewards::history(&db, user, campaign.id).await.unwrap().is_empty());
-    assert_eq!(purchases::tokens(&db, user).await.unwrap().len(), 6);
+    assert!(claim_reward(&db, &client.world, &campaign, user, sender.clone()).await.unwrap());
+    let history = rewards::history(&db, user, campaign.id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].clone_grade, 1);
+    let tokens = purchases::tokens(&db, user).await.unwrap();
+    assert_eq!(tokens.len(), 8);
+    assert_eq!((tokens[6].type_id, tokens[6].quantity), (101, 1));
+    assert_eq!((tokens[7].type_id, tokens[7].quantity), (201, i64::MAX));
     // An existing audit key forces an audit INSERT failure after the mark and grant.
     campaign.id = 6;
     campaign.omega[0].1 = 1;
@@ -74,6 +80,9 @@ async fn seasonal_account_settlement_and_rollback() {
     db.execute("INSERT INTO game.login_reward_retro_grants (user_id,campaign_id,day,type_id,quantity,granted_at) VALUES ($1,$2,current_date-1,203,1,0)", &[&user, &campaign.id]).await.unwrap();
     assert!(claim_reward(&db, &client.world, &campaign, user, sender.clone()).await.is_err());
     assert_eq!(rewards::history(&db, user, campaign.id).await.unwrap()[2].clone_grade, 0);
-    assert_eq!(purchases::tokens(&db, user).await.unwrap().len(), 6);
-    cleanup(&db, user).await;
+    assert_eq!(purchases::tokens(&db, user).await.unwrap().len(), 8);
+    }).await;
+    let cleanup_result = crate::tests::catch_scenario(cleanup(&db, user)).await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup_result { std::panic::resume_unwind(panic); }
 }

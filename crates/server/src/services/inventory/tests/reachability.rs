@@ -42,7 +42,7 @@ async fn station_dispatch_rejects_remote_moves_and_merges() {
     let station = stations.next().unwrap().station_id;
     let remote = stations.find(|s| s.station_id != station).unwrap().station_id;
     drop(stations);
-    let type_id = client.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let type_id = client.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let ship_type = client.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
     client.session.apply(vec![("stationid", Value::Int(station)), ("corpid", Value::Int(1))]);
     let insert = |location, flag, quantity| {
@@ -128,7 +128,7 @@ async fn ancestry_rechecks_roots_and_rejects_cycles_and_missing_parents() {
     let remote = stations.find(|s| s.station_id != station).unwrap().station_id;
     drop(stations);
     client.session.apply(vec![("stationid", Value::Int(station))]);
-    let ty = client.sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
+    let ty = client.sde.types.iter().find(|t| t.group_id == Some(infinity_core::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
     let root = crate::dao::items::transfers::insert(&db, ty, actor.character, station, FLAG_HANGAR, 1).await.unwrap();
     let nested = crate::dao::items::transfers::insert(&db, ty, actor.character, root, FLAG_CARGO, 1).await.unwrap();
     let alternate = crate::dao::items::transfers::insert(&db, ty, actor.character, station, FLAG_HANGAR, 1).await.unwrap();
@@ -177,6 +177,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let actor = fixture::create(&db).await.unwrap();
+    let guest = fixture::create(&db).await.unwrap();
     let (mut client, _peer) = crate::services::tests::client(db.clone(), actor.character).await;
     let mut notifications = spy_notifications(&mut client);
     let system = -101_i64;
@@ -184,7 +185,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     let maintenance_type = client.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && t.attribute(908).is_some_and(|v| v.is_finite() && v > 0.0)).unwrap().type_id;
     let fleet_type = client.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && t.attribute(912).is_some_and(|v| v.is_finite() && v > 0.0)).unwrap().type_id;
     let no_bay_type = client.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && !t.attribute(908).is_some_and(|v| v.is_finite() && v > 0.0) && !t.attribute(912).is_some_and(|v| v.is_finite() && v > 0.0)).unwrap().type_id;
-    let can_type = client.sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER) && t.attribute(715).is_none()).unwrap().type_id;
+    let can_type = client.sde.types.iter().find(|t| t.group_id == Some(infinity_core::consts::GROUP_CARGO_CONTAINER) && t.attribute(715).is_none()).unwrap().type_id;
     let ship = crate::dao::items::transfers::insert(&db, ship_type, actor.character, system, FLAG_HANGAR, 1).await.unwrap();
     let other_ship = crate::dao::items::transfers::insert(&db, maintenance_type, actor.character, system, FLAG_HANGAR, 1).await.unwrap();
     let fleet_ship = crate::dao::items::transfers::insert(&db, fleet_type, actor.character, system, FLAG_HANGAR, 1).await.unwrap();
@@ -192,7 +193,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     let can = crate::dao::items::transfers::insert(&db, can_type, actor.character, system, FLAG_HANGAR, 1).await.unwrap();
     let nested = crate::dao::items::transfers::insert(&db, can_type, actor.character, can, FLAG_CARGO, 1).await.unwrap();
     let override_type = client.sde.types.iter().find(|t| {
-        t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)
+        t.group_id == Some(infinity_core::consts::GROUP_CARGO_CONTAINER)
             && t.attribute(715).is_some_and(|distance| distance.is_finite() && distance > 0.0 && distance != 2500.0)
     }).expect("SDE must contain a cargo container with a non-default operational distance");
     let override_distance = override_type.attribute(715).unwrap();
@@ -212,7 +213,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
         mode: crate::space::MODE_STOP, radius: 50.0, signature_radius: None, mass: 1.0, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3], follow_id: 0, follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
-        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: vec![],
     };
     let mut unpiloted = ball(ship, 0.0);
@@ -247,7 +248,7 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     let wrong_endpoint = Endpoint { location: wrong, flag: FLAG_CARGO };
     let wrong_reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[wrong_endpoint]).await.unwrap();
     assert!(wrong_reach.check(&db, &client.sde, wrong_endpoint).await.is_err());
-    let commodity = client.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let commodity = client.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let source = crate::dao::items::transfers::insert(&db, commodity, actor.character, nested, FLAG_CARGO, 10).await.unwrap();
     let source2 = crate::dao::items::transfers::insert(&db, commodity, actor.character, nested, FLAG_CARGO, 10).await.unwrap();
     let bare_source = crate::dao::items::transfers::insert(&db, commodity, actor.character, can, FLAG_CARGO, 10).await.unwrap();
@@ -310,6 +311,179 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
         let moved = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
         assert_eq!(moved.location_id, ship);
     }
+    let guest_ship = crate::dao::items::creation::rookie_ship(&db, ship_type, guest.character, system, FLAG_HANGAR).await.unwrap();
+    let mut guest_ball = ball(guest_ship, 2600.0);
+    guest_ball.owner_id = guest.character;
+    guest_ball.char_id = Some(guest.character);
+    client.world.with(system, move |s| { s.insert(guest_ball); }).await.unwrap();
+    let (guest_sender, mut guest_notices) = tokio::sync::mpsc::unbounded_channel();
+    client.world.register_pilot(guest.character, guest_sender);
+    crate::dao::items::ship_configuration::patch(&db, fleet_ship, actor.character,
+        &crate::dao::items::ship_configuration::Patch { fleet_hangar_corp: Some(true), ..Default::default() }).await.unwrap();
+    // The host can take guest property, including guest descendants of an
+    // already host-owned root, through the real bound Add dispatch.
+    let guest_stack = crate::dao::items::transfers::insert(&db, commodity, guest.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 2).await.unwrap();
+    let root = crate::dao::items::transfers::insert(&db, can_type, actor.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 1).await.unwrap();
+    let root_row = load_items(&db, &client.sde, ItemQuery::Id(root)).await.unwrap().pop().unwrap();
+    assert!(crate::dao::items::inventory::move_item(&db, &root_row, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, actor.character, true).await.unwrap());
+    let child = crate::dao::items::transfers::insert(&db, commodity, guest.character, root, FLAG_CARGO, 1).await.unwrap();
+    assert!(crate::dao::items::dogma::set_override(&db, ship, infinity_core::consts::dogma::ATTR_CAPACITY, 1_000_000.0).await.unwrap());
+    let observed = load_items(&db, &client.sde, ItemQuery::Ids(&[aboard, guest_stack, root])).await.unwrap();
+    let input = vec![observed.iter().find(|item| item.item_id == aboard).unwrap().clone(),
+        observed.iter().find(|item| item.item_id == root).unwrap().clone(),
+        observed.iter().find(|item| item.item_id == guest_stack).unwrap().clone()];
+    let source_endpoint = Endpoint { location: fleet_ship, flag: infinity_core::consts::FLAG_FLEET_HANGAR };
+    let destination_endpoint = Endpoint { location: ship, flag: FLAG_CARGO };
+    let identity = crate::services::identity::Identity::of_client(&client);
+    let batch_reach = Reachability::capture(&identity, &db, &client.world, Some(system), &[source_endpoint, destination_endpoint]).await.unwrap();
+    let results = super::super::movement::authorize_moves(&db, &client.sde, &identity, &batch_reach, &input,
+        None, &Container::Item(ship), Some(FLAG_CARGO)).await.unwrap().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].1, super::super::destination::Custody::Preserve);
+    assert_eq!(results[1].1, super::super::destination::Custody::TakeSubtree);
+    assert_eq!(results[2].1, super::super::destination::Custody::TakeSubtree);
+    assert!(results.iter().all(|(destination, _)| destination.item_owner == actor.character));
+    let mut stale = input.clone();
+    stale[2].quantity += 1;
+    assert!(super::super::movement::authorize_moves(&db, &client.sde, &identity, &batch_reach, &stale,
+        None, &Container::Item(ship), Some(FLAG_CARGO)).await.unwrap().is_none());
+    for id in [guest_stack, root] {
+        let args = [Value::Int(id), Value::Int(fleet_ship)];
+        let call = Call { service: INVENTORY, method: "Add", args: &args, kwargs: &kwargs, bound: true, bind_params: Some(&ship_bind) };
+        assert!(inventory(&mut client, &call).await.is_ok());
+    }
+    let mut guest_removal = false;
+    while let Ok((event, args)) = guest_notices.try_recv() {
+        if event == "OnItemChange" && args.first().is_some_and(|row|
+            crate::services::item_descriptor().get(row, "itemID") == Some(Value::Int(guest_stack))) {
+            assert_eq!(crate::services::item_descriptor().get(&args[0], "locationID"), Some(Value::Int(infinity_core::consts::LOCATION_JUNKYARD)));
+            assert!(!guest_removal, "source-only viewer must be deduplicated");
+            guest_removal = true;
+        }
+    }
+    let deposit = crate::dao::items::transfers::insert(&db, commodity, actor.character, ship, FLAG_CARGO, 1).await.unwrap();
+    let fleet_bind = Value::tuple([Value::Int(fleet_ship)]);
+    let fleet_kwargs = Value::Dict(vec![(Value::str("flag"), Value::Int(i64::from(infinity_core::consts::FLAG_FLEET_HANGAR)))]);
+    let deposit_args = [Value::Int(deposit), Value::Int(ship)];
+    let deposit_call = Call { service: INVENTORY, method: "Add", args: &deposit_args, kwargs: &fleet_kwargs, bound: true, bind_params: Some(&fleet_bind) };
+    inventory(&mut client, &deposit_call).await.unwrap();
+    let mut guest_destination = false;
+    while let Ok((event, args)) = guest_notices.try_recv() {
+        if event == "OnItemChange" && args.first().is_some_and(|row|
+            crate::services::item_descriptor().get(row, "itemID") == Some(Value::Int(deposit))) {
+            assert_eq!(crate::services::item_descriptor().get(&args[0], "locationID"), Some(Value::Int(fleet_ship)));
+            assert!(!guest_destination, "destination viewer must be deduplicated");
+            guest_destination = true;
+        }
+    }
+    assert!(guest_destination);
+    crate::dao::items::ship_configuration::patch(&db, fleet_ship, actor.character,
+        &crate::dao::items::ship_configuration::Patch { fleet_hangar_corp: Some(false), ..Default::default() }).await.unwrap();
+    let revoked = crate::dao::items::transfers::insert(&db, commodity, actor.character, ship, FLAG_CARGO, 1).await.unwrap();
+    let revoked_args = [Value::Int(revoked), Value::Int(ship)];
+    let revoked_call = Call { service: INVENTORY, method: "Add", args: &revoked_args, kwargs: &fleet_kwargs, bound: true, bind_params: Some(&fleet_bind) };
+    inventory(&mut client, &revoked_call).await.unwrap();
+    assert!(guest_notices.try_recv().is_err(), "revoked viewer received a bay change");
+    crate::dao::items::inventory::delete(&db, deposit).await.unwrap();
+    crate::dao::items::inventory::delete(&db, revoked).await.unwrap();
+    assert!(guest_removal, "source-only viewer must receive removal, not the private destination");
+    let transferred = load_items(&db, &client.sde, ItemQuery::Ids(&[guest_stack, root, child])).await.unwrap();
+    assert_eq!(transferred.len(), 3);
+    assert!(transferred.iter().all(|item| item.owner_id == actor.character));
+    assert_eq!(transferred.iter().find(|item| item.item_id == child).unwrap().location_id, root);
+    let rejected = crate::dao::items::transfers::insert(&db, commodity, actor.character, ship, FLAG_CARGO, 1).await.unwrap();
+    assert!(crate::dao::items::dogma::set_override(&db, fleet_ship, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, 0.0).await.unwrap());
+    clear_notifications(&mut client, &mut notifications);
+    let rejected_args = [Value::Int(rejected), Value::Int(ship)];
+    let rejected_call = Call { service: INVENTORY, method: "Add", args: &rejected_args, kwargs: &fleet_kwargs, bound: true, bind_params: Some(&fleet_bind) };
+    assert!(inventory(&mut client, &rejected_call).await.is_err());
+    let unchanged = load_items(&db, &client.sde, ItemQuery::Id(rejected)).await.unwrap().pop().unwrap();
+    assert_eq!((unchanged.owner_id, unchanged.location_id, unchanged.quantity), (actor.character, ship, 1));
+    assert_no_notifications(&mut client, &mut notifications);
+    assert!(guest_notices.try_recv().is_err());
+    assert!(crate::dao::items::dogma::set_override(&db, fleet_ship, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, 1_000_000.0).await.unwrap());
+    let split_source = crate::dao::items::transfers::insert(&db, commodity, guest.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 4).await.unwrap();
+    let actor_stack = crate::dao::items::transfers::insert(&db, commodity, actor.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 2).await.unwrap();
+    let split_args = [Value::Int(fleet_ship), Value::Int(split_source), Value::Int(1), Value::Int(guest.character)];
+    let split_call = Call { service: "invbroker", method: "SplitStack", args: &split_args, kwargs: &kwargs, bound: true, bind_params: None };
+    let split_id = super::super::inv_broker::broker(&mut client, &split_call).await.unwrap().unwrap().as_int().unwrap();
+    let split = load_items(&db, &client.sde, ItemQuery::Id(split_id)).await.unwrap().pop().unwrap();
+    assert_eq!(split.owner_id, guest.character);
+    let mut previous_owner_quantity = false;
+    while let Ok((event, args)) = guest_notices.try_recv() {
+        if event == "OnItemChange" && args.first().is_some_and(|row|
+            crate::services::item_descriptor().get(row, "itemID") == Some(Value::Int(split_source))) {
+            assert_eq!(crate::services::item_descriptor().get(&args[0], "locationID"), Some(Value::Int(fleet_ship)));
+            assert_eq!(crate::services::item_descriptor().get(&args[0], "quantity"), Some(Value::Int(3)));
+            assert!(!previous_owner_quantity);
+            previous_owner_quantity = true;
+        }
+    }
+    assert!(previous_owner_quantity, "original owner must receive the changed source quantity even after access revocation");
+    let fleet_bind = Value::tuple([Value::Int(fleet_ship)]);
+    let fleet_flag = [Value::Int(i64::from(infinity_core::consts::FLAG_FLEET_HANGAR))];
+    let stack_call = Call { service: INVENTORY, method: "StackAll", args: &fleet_flag, kwargs: &kwargs, bound: true, bind_params: Some(&fleet_bind) };
+    inventory(&mut client, &stack_call).await.unwrap();
+    let stacked = load_items(&db, &client.sde, ItemQuery::LocationFlags(fleet_ship, &[infinity_core::consts::FLAG_FLEET_HANGAR])).await.unwrap();
+    assert_eq!(stacked.iter().filter(|item| item.owner_id == guest.character && item.type_id == commodity).map(|item| i128::from(item.quantity)).sum::<i128>(), 4);
+    assert_eq!(stacked.iter().filter(|item| item.owner_id == actor.character && item.type_id == commodity).map(|item| i128::from(item.quantity)).sum::<i128>(), 2);
+    let guest_id = stacked.iter().find(|item| item.owner_id == guest.character && item.type_id == commodity).unwrap().item_id;
+    let trash_args = [Value::list([Value::Int(guest_id)]), Value::Int(system)];
+    let trash_call = Call { service: "invbroker", method: "TrashItems", args: &trash_args, kwargs: &kwargs, bound: true, bind_params: None };
+    assert_eq!(super::super::inv_broker::broker(&mut client, &trash_call).await.unwrap().unwrap(), Value::list([]));
+    assert!(load_items(&db, &client.sde, ItemQuery::Id(guest_id)).await.unwrap().is_empty());
+    assert_eq!(load_items(&db, &client.sde, ItemQuery::Id(actor_stack)).await.unwrap().pop().unwrap().owner_id, actor.character);
+    let second_fleet = crate::dao::items::creation::rookie_ship(&db, fleet_type, actor.character, system, FLAG_HANGAR).await.unwrap();
+    let second_ball = ball(second_fleet, 2600.0);
+    client.world.with(system, move |s| { s.insert(second_ball); }).await.unwrap();
+    assert!(crate::dao::items::dogma::set_override(&db, second_fleet, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, 1_000_000.0).await.unwrap());
+    let cross_bay = crate::dao::items::transfers::insert(&db, commodity, guest.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 1).await.unwrap();
+    let second_bind = Value::tuple([Value::Int(second_fleet)]);
+    let cross_args = [Value::Int(cross_bay), Value::Int(fleet_ship)];
+    let cross_call = Call { service: INVENTORY, method: "Add", args: &cross_args, kwargs: &fleet_kwargs, bound: true, bind_params: Some(&second_bind) };
+    inventory(&mut client, &cross_call).await.unwrap();
+    let cross = load_items(&db, &client.sde, ItemQuery::Id(cross_bay)).await.unwrap().pop().unwrap();
+    assert_eq!((cross.owner_id, cross.location_id), (actor.character, second_fleet));
+    // An ordinary container still belongs to the same shared bay.
+    let box_in_bay = crate::dao::items::creation::rookie_ship(&db, can_type, actor.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR).await.unwrap();
+    let guest_leaf = crate::dao::items::transfers::insert(&db, commodity, guest.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 1).await.unwrap();
+    let box_bind = Value::tuple([Value::Int(box_in_bay)]);
+    let box_args = [Value::Int(guest_leaf), Value::Int(fleet_ship)];
+    let box_call = Call { service: INVENTORY, method: "Add", args: &box_args, kwargs: &kwargs, bound: true, bind_params: Some(&box_bind) };
+    inventory(&mut client, &box_call).await.unwrap();
+    let leaf = load_items(&db, &client.sde, ItemQuery::Id(guest_leaf)).await.unwrap().pop().unwrap();
+    assert_eq!((leaf.owner_id, leaf.location_id, leaf.flag_id), (guest.character, box_in_bay, FLAG_HANGAR));
+
+    // An actor-owned stored ship's private cargo is a different custody boundary.
+    let inner_ship = crate::dao::items::creation::rookie_ship(&db, fleet_type, actor.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR).await.unwrap();
+    assert!(crate::dao::items::dogma::set_override(&db, inner_ship, infinity_core::consts::dogma::ATTR_CAPACITY, 1_000_000_000.0).await.unwrap());
+    let guest_root = crate::dao::items::creation::rookie_ship(&db, can_type, guest.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR).await.unwrap();
+    let guest_child = crate::dao::items::transfers::insert(&db, commodity, guest.character, guest_root, FLAG_CARGO, 1).await.unwrap();
+    let inner_bind = Value::tuple([Value::Int(inner_ship)]);
+    let inner_args = [Value::Int(guest_root), Value::Int(fleet_ship)];
+    let inner_call = Call { service: INVENTORY, method: "Add", args: &inner_args, kwargs: &kwargs, bound: true, bind_params: Some(&inner_bind) };
+    inventory(&mut client, &inner_call).await.unwrap();
+    let taken = load_items(&db, &client.sde, ItemQuery::Ids(&[guest_root, guest_child])).await.unwrap();
+    assert_eq!(taken.len(), 2);
+    assert!(taken.iter().all(|row| row.owner_id == actor.character));
+    assert_eq!(taken.iter().find(|row| row.item_id == guest_root).unwrap().location_id, inner_ship);
+    assert_eq!(taken.iter().find(|row| row.item_id == guest_child).unwrap().location_id, guest_root);
+    let stored = crate::dao::items::creation::rookie_ship(&db, ship_type, guest.character, other_ship, infinity_core::consts::FLAG_SHIP_HANGAR).await.unwrap();
+    let hidden = crate::dao::items::transfers::insert(&db, commodity, actor.character, stored, FLAG_CARGO, 1).await.unwrap();
+    let hidden_args = [Value::Int(hidden), Value::Int(stored)];
+    let hidden_call = Call { service: INVENTORY, method: "Add", args: &hidden_args, kwargs: &kwargs, bound: true, bind_params: Some(&ship_bind) };
+    clear_notifications(&mut client, &mut notifications);
+    assert!(inventory(&mut client, &hidden_call).await.is_err());
+    assert_eq!(load_items(&db, &client.sde, ItemQuery::Id(hidden)).await.unwrap().pop().unwrap().location_id, stored);
+    assert_no_notifications(&mut client, &mut notifications);
+    let partial = crate::dao::items::transfers::insert(&db, commodity, guest.character, fleet_ship, infinity_core::consts::FLAG_FLEET_HANGAR, 1).await.unwrap();
+    let partial_args = [Value::list([Value::Int(partial), Value::Int(hidden)])];
+    let partial_call = Call { service: INVENTORY, method: "MultiAdd", args: &partial_args, kwargs: &kwargs, bound: true, bind_params: Some(&ship_bind) };
+    assert!(inventory(&mut client, &partial_call).await.is_err());
+    let moved = load_items(&db, &client.sde, ItemQuery::Id(partial)).await.unwrap().pop().unwrap();
+    assert_eq!((moved.owner_id, moved.location_id), (actor.character, ship));
+    assert_eq!(load_items(&db, &client.sde, ItemQuery::Id(hidden)).await.unwrap().pop().unwrap().location_id, stored);
+    assert!(has_item_change(&mut client, &mut notifications));
     let absent = Endpoint { location: missing_ball, flag: FLAG_CARGO };
     let no_ball = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &[absent]).await.unwrap();
     assert!(no_ball.check(&db, &client.sde, absent).await.is_err());
@@ -336,6 +510,8 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&can, &(system - 1)]).await.unwrap();
     let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &endpoints).await.unwrap();
     assert!(reach.check(&db, &client.sde, endpoints[1]).await.is_err());
+    client.world.unregister_pilot_generation(guest.character, None);
+    fixture::cleanup(&db, guest).await.unwrap();
     fixture::cleanup(&db, actor).await.unwrap();
     assert_eq!(fixture::remaining(&db, actor).await.unwrap(), 0);
 }
@@ -356,9 +532,10 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     let corp: i64 = db.query_one("INSERT INTO game.corporations (name, ticker, ceo_id, creator_id, station_id, created) VALUES ('reach-' || nextval('game.corporations_corporation_id_seq')::text, 'R' || nextval('game.corporations_corporation_id_seq')::text, $1, $1, $2, 0) RETURNING corporation_id", &[&actor.character, &station]).await.unwrap().get("corporation_id");
     db.execute("UPDATE game.characters SET corporation_id = $2, corp_roles = $3 WHERE character_id = $1", &[&actor.character, &corp, &ROLE_DIRECTOR]).await.unwrap();
     client.session.apply(vec![("stationid", Value::Int(station)), ("corpid", Value::Int(corp))]);
-    let ty = client.sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
-    let office = crate::dao::items::transfers::insert(&db, ty, corp, station, FLAG_HANGAR, 1).await.unwrap();
-    let distant_office = crate::dao::items::transfers::insert(&db, ty, corp, remote, FLAG_HANGAR, 1).await.unwrap();
+    let ty = client.sde.types.iter().find(|t| t.group_id == Some(infinity_core::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
+    let office_type = client.sde.types.get(27).expect("office type missing from SDE").type_id;
+    let office = crate::dao::items::transfers::insert(&db, office_type, corp, station, FLAG_HANGAR, 1).await.unwrap();
+    let distant_office = crate::dao::items::transfers::insert(&db, office_type, corp, remote, FLAG_HANGAR, 1).await.unwrap();
     crate::dao::offices::insert(&db, office, corp, station, 1).await.unwrap();
     crate::dao::offices::insert(&db, distant_office, corp, remote, 1).await.unwrap();
     let local = crate::dao::items::transfers::insert(&db, ty, corp, office, FLAG_CORP_SAG1, 1).await.unwrap();
@@ -368,7 +545,7 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     let reach = Reachability::capture(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, client.session.int("solarsystemid"), &endpoints).await.unwrap();
     assert!(reach.check(&db, &client.sde, endpoints[0]).await.is_ok());
     assert!(reach.check(&db, &client.sde, endpoints[1]).await.is_err());
-    let commodity = client.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let commodity = client.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let local_stack = crate::dao::items::transfers::insert(&db, commodity, corp, local, FLAG_CARGO, 10).await.unwrap();
     let remote_stack = crate::dao::items::transfers::insert(&db, commodity, corp, distant, FLAG_CARGO, 10).await.unwrap();
     let personal = crate::dao::items::transfers::insert(&db, commodity, actor.character, station, FLAG_HANGAR, 10).await.unwrap();
@@ -388,14 +565,15 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, local_stack, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     assert_eq!(move_fingerprint(&db).await, before);
     assert_no_notifications(&mut client, &mut notifications);
-    db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles_hq = $2 WHERE character_id = $1", &[&actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
     clear_notifications(&mut client, &mut notifications);
     assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, local_stack, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
     let moved = load_items(&db, &client.sde, ItemQuery::Id(local_stack)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id), (actor.character, station));
     assert!(has_item_change(&mut client, &mut notifications));
     clear_notifications(&mut client, &mut notifications);
-    assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(office), personal, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_ok());
+    let result = move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &Container::Item(office), personal, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await;
+    assert!(result.is_ok(), "local office deposit failed: {result:?}");
     let moved = load_items(&db, &client.sde, ItemQuery::Id(personal)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id), (corp, office));
     assert!(has_item_change(&mut client, &mut notifications));

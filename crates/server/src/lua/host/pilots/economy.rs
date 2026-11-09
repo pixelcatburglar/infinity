@@ -2,7 +2,8 @@
 //! Mirrors invInventory and marketProxy; game items and orders are authoritative.
 //! Inventory and market operations require an online pilot.
 use mlua::{Lua, Table};
-use crate::{dao::items::loading::ItemQuery, messages, services::{self, effects, inventory::{access::Container, movement}, market}};
+use infinity_core::messages;
+use crate::{dao::items::loading::ItemQuery, services::{self, effects, inventory::{access::Container, movement}, market}};
 use super::{lifecycle, lua_error, mutate, positive, space::actual_system, Resources};
 
 pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::Result<()> {
@@ -14,7 +15,7 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
                 if v < 0 { return Err(mlua::Error::runtime("invalid flag")); }
                 i32::try_from(v).map_err(|_| mlua::Error::runtime("invalid flag"))
             }).transpose()?;
-            if let Some(q) = qty { if q <= 0 || i32::try_from(q).is_err() { return Err(mlua::Error::runtime("invalid quantity")); } }
+            if let Some(q) = qty { if q <= 0 { return Err(mlua::Error::runtime("invalid quantity")); } }
             mutate(async move {
                 let (state, row) = lifecycle::locked(&r, id).await?;
                 let pilot = state.as_ref().ok_or_else(|| services::notify_error(messages::lua::PILOT_OFFLINE))?;
@@ -31,14 +32,17 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
     api.set("sell", lua.create_async_function(move |_, (id, item, station, price, quantity, duration): (i64, i64, i64, f64, i64, i64)| {
         let r = r.clone(); async move {
             positive(id)?; positive(item)?; positive(station)?;
-            if !price.is_finite() || price <= 0.0 || quantity <= 0 || i32::try_from(quantity).is_err() { return Err(mlua::Error::runtime("invalid price or quantity")); }
+            if !price.is_finite() || price <= 0.0 || quantity <= 0 { return Err(mlua::Error::runtime("invalid price or quantity")); }
             mutate(async move {
                 let (state, row) = lifecycle::locked(&r, id).await?;
                 let _pilot = state.as_ref().ok_or_else(|| services::notify_error(messages::lua::PILOT_OFFLINE))?;
                 let identity = lifecycle::snapshot(&r, id, &row).await?;
                 let item_row = services::items::load_items(&r.db, &r.sde, ItemQuery::Id(item)).await.map_err(services::db_err)?
                     .into_iter().next().ok_or_else(|| services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-                market::place_sell(&identity, &r.db, &r.world, &r.sde, item, station, i64::from(item_row.type_id), price, quantity, duration).await
+                market::trading::place_sell(&identity, &r.db, &r.world, &r.sde, market::SellRequest {
+                    item_id: item, station_id: station, type_id: i64::from(item_row.type_id), price, quantity, duration,
+                    office_id: None, expected_brokers_fee: None,
+                }, None).await
             }).await.map_err(lua_error)
         }
     })?)?;

@@ -3,9 +3,10 @@
 //! Completions precede booster and expert expiries at equal timestamps.
 //! Historical Fit snapshots cannot reconstruct brain items already removed from the database.
 use std::{collections::HashMap, sync::Arc};
-use crate::{consts::FLAG_BOOSTER, dao::{items::brain::BrainItem, skills::{expert_systems::ExpertSystem, queue::QueueEntry, training::Skill}}, db::executor::Executor, sde::Sde, services::{db_err, fit::{Fit, Key}, CallError}};
+use infinity_core::consts::FLAG_BOOSTER;
+use crate::{dao::{items::brain::BrainItem, skills::{expert_systems::ExpertSystem, queue::QueueEntry, training::Skill}}, db::executor::Executor, sde::Sde, services::{db_err, fit::{Fit, Key}, CallError}};
 use super::training;
-use crate::consts::dogma::CHAR_ATTRIBUTES;
+use infinity_core::consts::dogma::CHAR_ATTRIBUTES;
 
 pub(super) struct Completion { pub type_id: i32, pub level: i32, pub points: i64, pub end_time: i64 }
 pub(super) enum Event { Completion(Completion), Expiry { at: i64, items: Vec<BrainItem> }, ExpertExpiry { installations: Vec<ExpertSystem> } }

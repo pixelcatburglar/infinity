@@ -6,13 +6,13 @@
 //! those of its executor corporation do.
 //! The bulletin limit is an operator policy for both corporations and alliances.
 
-use super::corps::membership;
+use super::corps::permissions;
 use super::{crowset, db_err, keyval, notify_error, value_ids, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::ROLE_DIRECTOR;
+use infinity_core::consts::ROLE_DIRECTOR;
 use crate::dao::{alliances, orgs};
-use crate::db::Db;
-use crate::messages;
+use crate::db::{Db, executor::Executor};
+use infinity_core::messages;
 
 mod alliance_registry;
 mod corp_registry;
@@ -38,14 +38,14 @@ fn owner(c: &Client, call: &Call<'_>) -> Option<i64> {
 
 /// Whether `me` holds one of `roles` in `owner` (a corporation) or in its executor
 /// corporation (an alliance).
-async fn may(db: &Db, me: i64, owner: i64, roles: i64) -> Result<bool, CallError> {
-    let (corp, my_roles) = membership(db, me).await?;
+async fn may(db: &(impl Executor + ?Sized), me: i64, owner: i64, expected_corp: i64, roles: i64) -> Result<bool, CallError> {
+    let Some(authority) = permissions::load(db, me).await? else { return Ok(false) };
     let acting_corp = if owner >= FIRST_PLAYER_ALLIANCE {
         alliances::executor_corp(db, owner).await.map_err(db_err)?
     } else {
         Some(owner)
     };
-    Ok(acting_corp == Some(corp) && my_roles & (roles | ROLE_DIRECTOR) != 0)
+    Ok(authority.live && authority.corporation == expected_corp && acting_corp == Some(authority.corporation) && authority.roles[0] & (roles | ROLE_DIRECTOR) != 0)
 }
 
 fn bulletin_header() -> DbRowDescriptor {
@@ -82,7 +82,7 @@ async fn bulletins(db: &Db, owner: i64) -> CallResult {
 
 /// AddBulletin(title, body, bulletinID=None, editDateTime=None): a new bulletin, or an edit of
 /// `bulletinID` unless someone saved it after `editDateTime`.
-async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResult {
+async fn add_bulletin(db: &(impl Executor + ?Sized), me: i64, owner: i64, call: &Call<'_>) -> CallResult {
     let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let (title, body) = (text(0), text(1));
     let edit_of = call.kwargs.get("bulletinID").or_else(|| call.args.get(2)).and_then(|v| v.as_int());
@@ -140,90 +140,81 @@ async fn labels(db: &Db, owner: i64) -> CallResult {
     ))
 }
 
-async fn dispatch_shared(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let me = c.session.int("charid").unwrap_or(0);
-    let db = &c.db;
-    let owner = owner(c, call)?;
+async fn mutate(ex: &(impl Executor + ?Sized), me: i64, owner: i64, call: &Call<'_>) -> CallResult {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let relationship = |i: usize| call.kwargs.get("relationshipID").or_else(|| call.args.get(i)).and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
-    // The edits below need these roles.
-    let needed = match call.method {
-        "AddBulletin" | "DeleteBulletin" | "UpdateBulletinOrder" => Some(ROLE_CHAT_MANAGER),
-        "AddCorporateContact" | "AddAllianceContact" | "EditCorporateContact" | "EditAllianceContact" | "RemoveCorporateContacts"
-        | "RemoveAllianceContacts" | "EditContactsRelationshipID" | "CreateLabel" | "DeleteLabel" | "EditLabel" | "AssignLabels" | "RemoveLabels" => {
-            Some(ROLE_DIPLOMAT)
-        }
-        "GetBulletins" | "GetCorporateContacts" | "GetAllianceContacts" | "GetLabels" => None,
-        _ => return None,
-    };
-    if let Some(roles) = needed {
-        match may(db, me, owner, roles).await {
-            Ok(true) => {}
-            Ok(false) => return Some(Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION))),
-            Err(e) => return Some(Err(e)),
-        }
-    }
-    let done = |r: Result<u64, crate::db::Error>| r.map(|_| Value::None).map_err(db_err);
-    Some(match call.method {
-        "GetBulletins" => bulletins(db, owner).await,
-        "AddBulletin" => add_bulletin(db, me, owner, call).await,
-        "DeleteBulletin" => done(orgs::delete_bulletin(db, int(0).unwrap_or(0), owner).await),
-        // UpdateBulletinOrder([bulletinID, ...])
-        "UpdateBulletinOrder" => orgs::order_bulletins(db, owner, &value_ids(call.args.first())).await.map(|_| Value::None).map_err(db_err),
-        "GetCorporateContacts" | "GetAllianceContacts" => contacts(db, owner).await,
-        // Add/Edit*Contact(contactID, relationshipID)
-        "AddCorporateContact" | "AddAllianceContact" | "EditCorporateContact" | "EditAllianceContact" => done(
-            orgs::upsert_contact(db, owner, int(0).unwrap_or(0), relationship(1).unwrap_or(0.0)).await,
-        ),
-        "RemoveCorporateContacts" | "RemoveAllianceContacts" => {
-            done(orgs::delete_contacts(db, owner, &value_ids(call.args.first())).await)
-        }
-        // EditContactsRelationshipID(contactIDs, relationshipID)
-        "EditContactsRelationshipID" => done(
-            orgs::update_relationship(db, owner, &value_ids(call.args.first()), relationship(1).unwrap_or(0.0)).await,
-        ),
-        "GetLabels" => labels(db, owner).await,
-        // CreateLabel(name, color) -> labelID
+    let done = |result: Result<u64, crate::db::Error>| result.map(|_| Value::None).map_err(db_err);
+    match call.method {
+        "AddBulletin" => add_bulletin(ex, me, owner, call).await,
+        "DeleteBulletin" => done(orgs::delete_bulletin(ex, int(0).unwrap_or(0), owner).await),
+        "UpdateBulletinOrder" => orgs::order_bulletins(ex, owner, &value_ids(call.args.first())).await.map(|_| Value::None).map_err(db_err),
+        "AddCorporateContact" | "AddAllianceContact" | "EditCorporateContact" | "EditAllianceContact" =>
+            done(orgs::upsert_contact(ex, owner, int(0).unwrap_or(0), relationship(1).unwrap_or(0.0)).await),
+        "RemoveCorporateContacts" | "RemoveAllianceContacts" =>
+            done(orgs::delete_contacts(ex, owner, &value_ids(call.args.first())).await),
+        "EditContactsRelationshipID" =>
+            done(orgs::update_relationship(ex, owner, &value_ids(call.args.first()), relationship(1).unwrap_or(0.0)).await),
         "CreateLabel" => {
             let name = call.args.first().and_then(|v| v.as_text()).map(|t| t.trim().to_string()).unwrap_or_default();
             let color = int(1).map(|c| c as i32);
-            if name.is_empty() {
-                return Some(Err(CallError::User { msg: messages::MSG_MAIL_LABEL_MUST_PROVIDE_NAME.into(), dict: vec![] }));
-            }
-            // A label's ID is its bit in the contacts' labelMask: the lowest free one.
-            let used: Vec<i64> = match orgs::label_ids(db, owner).await {
-                Ok(rows) => rows,
-                Err(e) => return Some(Err(db_err(e))),
-            };
-            let Some(id) = (0..LABEL_BIT_END).map(|b| 1i64 << b).find(|b| !used.contains(b)) else {
-                return Some(Err(notify_error(messages::LABEL_LIMIT_REACHED)));
-            };
-            orgs::insert_label(db, owner, id, &name, color).await
-                .map(|_| Value::Int(id))
-                .map_err(db_err)
+            if name.is_empty() { return Err(CallError::User { msg: messages::MSG_MAIL_LABEL_MUST_PROVIDE_NAME.into(), dict: vec![] }); }
+            let used = orgs::label_ids(ex, owner).await.map_err(db_err)?;
+            let Some(id) = (0..LABEL_BIT_END).map(|b| 1i64 << b).find(|b| !used.contains(b)) else { return Err(notify_error(messages::LABEL_LIMIT_REACHED)); };
+            orgs::insert_label(ex, owner, id, &name, color).await.map(|_| Value::Int(id)).map_err(db_err)
         }
         "DeleteLabel" => {
             let id = int(0).unwrap_or(0);
-            if let Err(e) = orgs::clear_label(db, owner, id).await {
-                return Some(Err(db_err(e)));
-            }
-            done(orgs::delete_label(db, id, owner).await)
+            orgs::clear_label(ex, owner, id).await.map_err(db_err)?;
+            done(orgs::delete_label(ex, id, owner).await)
         }
-        // EditLabel(labelID, name, color): None keeps the current value.
         "EditLabel" => {
             let name = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.trim().to_string());
-            let color = int(2).map(|c| c as i32);
-            done(
-                orgs::edit_label(db, int(0).unwrap_or(0), owner, name, color).await,
-            )
+            done(orgs::edit_label(ex, int(0).unwrap_or(0), owner, name, int(2).map(|c| c as i32)).await)
         }
-        // AssignLabels / RemoveLabels(contactIDs, labelMask)
         "AssignLabels" | "RemoveLabels" => {
             let change = if call.method == "AssignLabels" { orgs::LabelChange::Assign } else { orgs::LabelChange::Remove };
-            done(orgs::change_labels(db, owner, &value_ids(call.args.first()), int(1).unwrap_or(0), change).await)
+            done(orgs::change_labels(ex, owner, &value_ids(call.args.first()), int(1).unwrap_or(0), change).await)
         }
+        _ => Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION)),
+    }
+}
+
+async fn dispatch_shared(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
+    let me = c.session.int("charid").unwrap_or(0);
+    let owner = owner(c, call)?;
+    let roles = match call.method {
+        "AddBulletin" | "DeleteBulletin" | "UpdateBulletinOrder" => ROLE_CHAT_MANAGER,
+        "AddCorporateContact" | "AddAllianceContact" | "EditCorporateContact" | "EditAllianceContact" | "RemoveCorporateContacts"
+        | "RemoveAllianceContacts" | "EditContactsRelationshipID" | "CreateLabel" | "DeleteLabel" | "EditLabel" | "AssignLabels" | "RemoveLabels" => ROLE_DIPLOMAT,
+        "GetBulletins" => return Some(bulletins(&c.db, owner).await),
+        "GetCorporateContacts" | "GetAllianceContacts" => return Some(contacts(&c.db, owner).await),
+        "GetLabels" => return Some(labels(&c.db, owner).await),
         _ => return None,
-    })
+    };
+    let corp = match permissions::load(&c.db, me).await {
+        Ok(Some(authority)) if authority.live => authority.corporation,
+        Ok(_) => return Some(Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION))),
+        Err(error) => return Some(Err(error)),
+    };
+    let method = call.method.to_owned();
+    let args = call.args.to_vec();
+    let kwargs = call.kwargs.clone();
+    Some(c.db.transaction(
+        |tx, _: &mut ()| {
+            let method = method.clone();
+            let args = args.clone();
+            let kwargs = kwargs.clone();
+            Box::pin(async move {
+                let alliances = if owner >= FIRST_PLAYER_ALLIANCE { vec![owner] } else { Vec::new() };
+                let corps = if owner >= FIRST_PLAYER_ALLIANCE { vec![corp] } else { vec![corp, owner] };
+                if !crate::dao::corporations::registry::lock_admission(tx, &alliances, &corps, &[me]).await.map_err(db_err)?
+                    || !may(tx, me, owner, corp, roles).await? { return Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION)); }
+                let call = Call { service: "", method: &method, args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+                mutate(tx, me, owner, &call).await
+            })
+        },
+        |value, ()| async move { Ok(value) },
+    ).await)
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

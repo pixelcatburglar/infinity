@@ -50,7 +50,7 @@ async fn courier_volume_limit_and_wrap_persistence() {
         }
         assert_eq!(f::fingerprint(&db, issuer).await, before);
         assert!(rx.try_recv().is_err());
-        seller.world.unregister_pilot(issuer.actor.character);
+        seller.world.unregister_pilot_generation(issuer.actor.character, None);
         db.execute("UPDATE game.items SET quantity=-120000000 WHERE item_id=$1", &[&root]).await.unwrap();
         let id = f::id(create(&seller, &f::payload(TYPE_COURIER, start, end, f::DELIVERIES, root, 0.0, 20.0, 50.0)).await);
         let row = db.query_one("SELECT volume FROM game.contracts WHERE contract_id=$1", &[&id]).await.unwrap();
@@ -72,7 +72,7 @@ async fn courier_volume_limit_and_wrap_persistence() {
         assert!(accept(&courier, fractional_id, true).await.is_ok());
         let row = db.query_one("SELECT i.quantity, c.volume FROM game.contracts c JOIN game.items i ON i.item_id=c.package_id WHERE c.contract_id=$1", &[&fractional_id]).await.unwrap();
         assert_eq!(row.get::<_, f64>("volume"), fractional_volume);
-        assert_eq!(row.get::<_, i32>("quantity"), -(fractional_volume * 100.0).ceil() as i32);
+        assert_eq!(row.get::<_, i64>("quantity"), -(fractional_volume * 100.0).ceil() as i64);
     }).await;
     f::cleanup(&db, issuer).await;
     f::cleanup(&db, buyer).await;

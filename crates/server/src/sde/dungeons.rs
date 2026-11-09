@@ -3,7 +3,8 @@
 //! Sources are `sde_native.dungeons` and the loaded SDE map; live dungeon layouts are excluded.
 
 use std::collections::HashMap;
-use crate::{consts::{GROUP_PLANET, WORMHOLE_SYSTEM_START}, dao, db::Db, sde::map::Map};
+use infinity_core::{consts::{GROUP_PLANET, WORMHOLE_SYSTEM_START}};
+use crate::{dao, db::Db, sde::map::Map};
 /// Existing exploration SQL's exclusive destination-system upper bound.
 const DESTINATION_SYSTEM_END: i64 = 31_002_605;
 /// Existing exploration SQL excludes Jove regions from destinations.
@@ -49,6 +50,7 @@ pub(crate) fn system_info(map: &Map, system: i64) -> Option<SystemInfo> {
     };
     Some(SystemInfo { security: system.security.unwrap_or(0.0), faction: system.faction_id, region: region.region_id, class })
 }
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Dungeons {
     rows: Vec<Dungeon>,
     classes: HashMap<i64, Vec<i64>>,

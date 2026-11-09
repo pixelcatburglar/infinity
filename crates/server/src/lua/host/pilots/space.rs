@@ -3,7 +3,8 @@
 //! Space-entry environment initialization reuses the normal entry rule; docked pilots have no in-space capacitor snapshot.
 
 use mlua::{Lua, Table, Value};
-use crate::{messages, services::{self, CallError, identity::Identity, ship}, space::V3};
+use infinity_core::messages;
+use crate::{services::{self, identity::Identity, ship}, space::V3};
 use super::{lifecycle::{self, OnlinePilot}, lua_error, mutate, positive, Resources};
 
 pub(super) async fn actual_system(r: &Resources, identity: &Identity) -> Option<i64> {
@@ -14,22 +15,13 @@ pub(super) async fn actual_system(r: &Resources, identity: &Identity) -> Option<
         .filter(|matched| *matched).map(|_| system)
 }
 
-fn apply(r: &Resources, identity: &Identity, pilot: &mut OnlinePilot, change: ship::SessionChange) -> Result<(), CallError> {
+fn apply(r: &Resources, identity: &Identity, pilot: &mut OnlinePilot, change: ship::SessionChange) {
     let previous = pilot.session.clone();
     let mut current = previous.clone();
-    for (key, value) in change.updates {
-        match (key, value) {
-            ("stationid", marshal::Value::None) => current.station_id = None,
-            ("stationid", marshal::Value::Int(id)) => current.station_id = Some(id),
-            ("solarsystemid", marshal::Value::None) => {},
-            ("solarsystemid", marshal::Value::Int(id)) => current.system_id = Some(id),
-            (key, _) => return Err(CallError::Internal(anyhow::anyhow!("unexpected spatial session update {key}"))),
-        }
+    if current.apply_updates(change.updates.iter().map(|(key, value)| (*key, value))) {
+        services::presence::online(identity, &r.world, &r.pilots.hub, pilot.notify.clone(), Some(&previous), current.clone());
+        pilot.session = current;
     }
-    services::presence::online(identity, &r.world, &r.pilots.hub, pilot.notify.clone(), Some(&previous), current.clone());
-    pilot.session = current;
-    if let Some(event) = change.event { crate::lua::on_event(event); }
-    Ok(())
 }
 
 fn point(table: Table) -> mlua::Result<V3> {
@@ -56,7 +48,7 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
                 let identity = lifecycle::snapshot(&r, id, &row).await?;
                 let system = actual_system(&r, &identity).await;
                 let result = ship::ship::undock(&identity, &r.db, &r.world, &r.sde, system, pilot.session.alliance_id).await?;
-                apply(&r, &identity, pilot, result.change)?;
+                apply(&r, &identity, pilot, result.change);
                 drop(result.economy);
                 lifecycle::entered_space(&r, &pilot.session).await?;
                 Ok(())
@@ -73,7 +65,8 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
                 let identity = lifecycle::snapshot(&r, id, &row).await?;
                 let system = actual_system(&r, &identity).await;
                 let change = ship::dock(&identity, &r.db, &r.world, system, station, None::<&mut crate::client::Client>).await?;
-                apply(&r, &identity, pilot, change)
+                apply(&r, &identity, pilot, change);
+                Ok(())
             }).await.map_err(lua_error)
         }
     })?)?;
@@ -127,7 +120,7 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
                 state.as_ref().ok_or_else(|| services::notify_error(messages::lua::PILOT_OFFLINE))?;
                 let identity = lifecycle::snapshot(&r, id, &row).await?;
                 let system = actual_system(&r, &identity).await;
-                ship::warp_to(&identity, &r.db, &r.world, system, None, point, 0.0, None).await?; Ok(())
+                ship::warp_to(&identity, &r.db, &r.world, system, crate::space::system::warp::WarpDestination::Exact(point), None).await?; Ok(())
             }).await.map_err(lua_error)
         }
     })?)?;
@@ -151,8 +144,21 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
             let (_state, row) = lifecycle::locked(&r, id).await.map_err(lua_error)?;
             let identity = lifecycle::snapshot(&r, id, &row).await.map_err(lua_error)?;
             let Some(ship) = identity.ship_id else { return Ok(None); };
-            let Some((shield, armor, hull)) = services::combat::ship_condition(ship) else { return Ok(None); };
-            let capacitor = if let Some(system) = actual_system(&r, &identity).await {
+            let system = actual_system(&r, &identity).await;
+            let (shield, armor, hull) = if let Some(system) = system {
+                let character = identity.char_id;
+                r.world.with(system, move |s| {
+                    if !s.pilot_ball(character).is_some_and(|ball| ball.id == ship) { return None; }
+                    s.ship_condition(ship)
+                }).await.flatten().ok_or_else(|| mlua::Error::runtime("active ship condition is unavailable"))?
+            } else {
+                if identity.station_id.is_none() && r.world.is_online(identity.char_id) {
+                    return Err(mlua::Error::runtime("active ship membership is unavailable"));
+                }
+                let fit = services::fit::Fit::load(&r.db, r.sde.clone(), identity.char_id, ship).await.map_err(lua_error)?;
+                services::combat::prepare_condition_with_fit(&r.db, ship, &fit).await.map_err(lua_error)?.scalars()
+            };
+            let capacitor = if let Some(system) = system {
                 services::combat::groups_health::capacitor_snapshot(&r.db, &r.world, system, ship).await.map_err(lua_error)?.map(|c| c.level)
             } else { None };
             let table = lua.create_table()?;

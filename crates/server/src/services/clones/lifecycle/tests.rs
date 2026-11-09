@@ -1,5 +1,6 @@
 use super::*;
-use crate::{consts::FLAG_IMPLANT, db::outbox::{Effect, Notification}};
+use infinity_core::consts::FLAG_IMPLANT;
+use crate::{db::outbox::{Effect, Notification}};
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
@@ -67,7 +68,7 @@ async fn installation_charges_once_creates_empty_body_and_rejects_duplicate() {
     let owner = fixture.character;
     let fee = policy::service_fee();
     db.execute("UPDATE game.characters SET station_id=$2,balance=$3::float8 WHERE character_id=$1", &[&owner, &station, &(fee * 2.0)]).await.unwrap();
-    crate::dao::skills::training::starting_skill(&db, owner, crate::consts::SKILL_INFOMORPH_PSYCHOLOGY, 1, 250).await.unwrap();
+    crate::dao::skills::training::starting_skill(&db, owner, infinity_core::consts::SKILL_INFOMORPH_PSYCHOLOGY, 1, 250).await.unwrap();
     let id = Identity { char_id: owner, ship_id: None, corp_id: 0, station_id: Some(station), system_id: None };
     let now = crate::client::filetime_now();
     let _guard = crate::services::market::lock().await;
@@ -79,10 +80,10 @@ async fn installation_charges_once_creates_empty_body_and_rejects_duplicate() {
     let rows = clone_dao::clones(&db, owner).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert!(item_dao::list(&db, owner, rows[0].clone_id).await.unwrap().is_empty());
-    assert_eq!(wallets::balance(&db, owner).await.unwrap(), fee);
+    assert_eq!(wallets::balance(&db, owner).await.unwrap(), crate::isk::IskAmount::from_isk(fee).unwrap());
     let mut outbox = Outbox::default();
     assert!(install_tx(&db, &mut outbox, &client.sde, &id, now).await.is_err());
-    assert_eq!(wallets::balance(&db, owner).await.unwrap(), fee);
+    assert_eq!(wallets::balance(&db, owner).await.unwrap(), crate::isk::IskAmount::from_isk(fee).unwrap());
     assert_eq!(clone_dao::destroy(&db, rows[0].clone_id, owner).await.unwrap(), 1);
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
 }
@@ -110,7 +111,7 @@ async fn restricted_facility_checks_real_standings_and_missing_facility_is_refus
     let now = crate::client::filetime_now();
     let fee = policy::service_fee();
     db.execute("UPDATE game.characters SET station_id=$2,balance=$3::float8 WHERE character_id=$1", &[&owner, &restricted.0, &(fee * 2.0)]).await.unwrap();
-    crate::dao::skills::training::starting_skill(&db, owner, crate::consts::SKILL_INFOMORPH_PSYCHOLOGY, 1, 250).await.unwrap();
+    crate::dao::skills::training::starting_skill(&db, owner, infinity_core::consts::SKILL_INFOMORPH_PSYCHOLOGY, 1, 250).await.unwrap();
     let id = Identity { char_id: owner, ship_id: None, corp_id: 0, station_id: Some(restricted.0), system_id: None };
     let _guard = crate::services::market::lock().await;
     for &(from, required) in &restricted.1 {

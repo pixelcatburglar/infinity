@@ -2,18 +2,17 @@
 //! `carbon/common/script/net/machoNet.py` defines transport usurp behavior.
 //! Session state uses the game database and in-memory world; account ownership
 //! is process-local and does not coordinate separate server processes.
-//! A successful disconnect cleanup hands off the selected character's logoff event.
+//! A successful disconnect cleanup commits the selected character's logoff event.
 //! Actor-timed transitions flush queued notifications and forward destiny batches while waiting.
+//! Each destiny notification contains one logical stamp, retaining action order within that stamp.
 
 use crate::conn::{Conn, Writer};
-use crate::consts::{FILETIME_DAY, FILETIME_HOUR, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
+use infinity_core::consts::{FILETIME_DAY, FILETIME_HOUR, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::Db;
-use crate::db::outbox::{dispatch_client, Outbox};
-use crate::lua::events::GameEvent;
 use crate::handshake::Login;
 use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
 use crate::services::{self, identity::Identity, presence, Call, CallError};
-use crate::session::Session;
+use infinity_core::session::Session;
 use crate::config::Config;
 use anyhow::{anyhow, Result};
 use marshal::Value;
@@ -117,12 +116,12 @@ impl Client {
     /// Change session attributes and queue a SessionChangeNotification for the client.
     pub fn change_session(&mut self, updates: Vec<(&str, Value)>) {
         let old_identity = Identity::of_client(self);
-        let old = crate::session::OnlineSession::from_session(&self.session);
+        let old = infinity_core::session::OnlineSession::from_session(&self.session);
         let change = self.session.apply(updates);
         if change.is_empty() {
             return;
         }
-        let new = crate::session::OnlineSession::from_session(&self.session);
+        let new = infinity_core::session::OnlineSession::from_session(&self.session);
         if old != new {
             let new_identity = Identity::of_client(self);
             if let Some(previous) = &old {
@@ -147,6 +146,56 @@ impl Client {
 
     /// Queue a broadcast notification (`sm.ScatterEvent(event, *args)` on the client).
     pub fn notify(&mut self, event: &str, args: Vec<Value>) {
+        if event == "DoDestinyUpdate" && matches!(args.as_slice(), [Value::List(_), Value::Bool(_)]) {
+            let mut args = args.into_iter();
+            let Value::List(events) = args.next().unwrap() else { unreachable!() };
+            let Value::Bool(wait) = args.next().unwrap() else { unreachable!() };
+            self.queue_destiny_updates(events, wait);
+        } else {
+            self.queue_notification(event, args);
+        }
+    }
+
+    fn queue_destiny_updates(&mut self, mut events: Vec<Value>, wait_for_bubble: bool) {
+        let stamp = |event: &Value| match event {
+            Value::Tuple(fields) => match fields.as_slice() {
+                [Value::Int(stamp), Value::Tuple(call)]
+                    if matches!(call.as_slice(), [Value::Bytes(_) | Value::Unicode(_), Value::Tuple(_)]) => Some(*stamp),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut previous = None;
+        let mut mixed = false;
+        let mut ordered = true;
+        for event in &events {
+            let Some(current) = stamp(event) else {
+                self.queue_notification("DoDestinyUpdate", vec![Value::List(events), Value::Bool(wait_for_bubble)]);
+                return;
+            };
+            if let Some(last) = previous {
+                mixed |= current != last;
+                ordered &= current >= last;
+            }
+            previous = Some(current);
+        }
+        if !mixed {
+            self.queue_notification("DoDestinyUpdate", vec![Value::List(events), Value::Bool(wait_for_bubble)]);
+            return;
+        }
+        if !ordered { events.sort_by_key(|event| stamp(event).unwrap()); }
+        let mut events = events.into_iter().peekable();
+        while let Some(first) = events.next() {
+            let current = stamp(&first).unwrap();
+            let mut group = vec![first];
+            while events.peek().is_some_and(|event| stamp(event) == Some(current)) {
+                group.push(events.next().unwrap());
+            }
+            self.queue_notification("DoDestinyUpdate", vec![Value::List(group), Value::Bool(wait_for_bubble)]);
+        }
+    }
+
+    fn queue_notification(&mut self, event: &str, args: Vec<Value>) {
         let payload = Value::tuple([Value::Int(1), Value::Tuple(args)]);
         let packet = Packet::new(
             cmd::NOTIFICATION,
@@ -240,13 +289,7 @@ impl Client {
                             }
                         } else if event == "__session" {
                             // Another task changed this pilot's session (corporation membership): [(key, value)].
-                            let pairs: Vec<(String, Value)> = args
-                                .iter()
-                                .filter_map(|p| match p.items()? {
-                                    [k, v] => Some((k.as_text()?.into_owned(), v.clone())),
-                                    _ => None,
-                                })
-                                .collect();
+                            let pairs = infinity_core::session::decode_pairs(&args);
                             self.change_session(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
                         } else {
                             self.notify(&event, args);
@@ -265,16 +308,9 @@ impl Client {
                 warn!(user = self.login.user_id, "usurp close failed: {e:#}");
             }
         }
-        let char_id = self.session.int("charid");
         let cleanup = self.leave_world().await;
         if let Err(e) = &cleanup {
             warn!(user = self.login.user_id, "leave world failed: {e:#}");
-        } else if let Some(char_id) = char_id {
-            let mut outbox = Outbox::default();
-            outbox.event(GameEvent::CharacterLoggedOff { user_id: self.login.user_id, char_id });
-            if dispatch_client((), outbox, &mut self).is_err() {
-                warn!(user = self.login.user_id, "logoff event dispatch failed");
-            }
         }
         let close = self.conn.close().await;
         if let Err(e) = &close {
@@ -294,9 +330,9 @@ impl Client {
         let identity = Identity::of_client(self);
         let system = self.session.int("solarsystemid");
         let client_id = self.login.client_id;
-        let world = &self.world;
-        presence::leave(&identity, &self.db, world, &self.chat, &self.sde, system, Some(self.session.sid),
-            move || world.unobserve(client_id)).await
+        let world = std::sync::Arc::downgrade(&self.world);
+        presence::leave(&identity, Some(self.login.user_id), &self.db, &self.world, &self.chat, &self.sde, system, Some(self.session.sid),
+            move || { if let Some(world) = world.upgrade() { world.unobserve(client_id); } }).await
     }
 
     async fn handle(&mut self, p: Packet) -> Result<()> {
@@ -440,6 +476,14 @@ pub fn ms_from_filetime_ticks(ticks: i64) -> i64 {
 /// Convert a FILETIME timestamp to Unix seconds, truncating toward zero.
 pub fn unix_seconds_from_filetime(ticks: i64) -> i64 {
     ((i128::from(ticks) - i128::from(FILETIME_UNIX_EPOCH)) / i128::from(FILETIME_SECOND)) as i64
+}
+
+/// Convert FILETIME to Unix seconds and nanoseconds using standard protobuf Timestamp normalization.
+pub(crate) fn unix_parts_from_filetime(ticks: i64) -> (i64, i32) {
+    let delta = i128::from(ticks) - i128::from(FILETIME_UNIX_EPOCH);
+    let second = i128::from(FILETIME_SECOND);
+    // The full i64 FILETIME domain fits in i64 seconds and the subsecond remainder fits in i32 nanoseconds.
+    (delta.div_euclid(second) as i64, (delta.rem_euclid(second) * i128::from(FILETIME_TICK_NS)) as i32)
 }
 
 /// Convert a FILETIME timestamp to checked Unix nanoseconds without losing ticks.

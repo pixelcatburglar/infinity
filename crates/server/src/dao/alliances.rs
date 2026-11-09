@@ -108,6 +108,20 @@ pub(crate) async fn corporation_alliance(ex: &(impl Executor + ?Sized), corp: i6
 pub(crate) async fn live_corporation_alliance(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Option<Option<i64>>, Error> {
     Ok(ex.query_opt("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await?.map(|r| AllianceId::from_row(&r).id))
 }
+
+pub(crate) struct LiveCorporationAlliance {
+    pub(crate) corporation_id: i64,
+    pub(crate) alliance_id: Option<i64>,
+}
+impl LiveCorporationAlliance {
+    fn from_row(r: &Row) -> Self {
+        Self { corporation_id: r.get("corporation_id"), alliance_id: r.get("alliance_id") }
+    }
+}
+pub(crate) async fn live_corporation_alliances(ex: &(impl Executor + ?Sized), corps: &[i64]) -> Result<Vec<LiveCorporationAlliance>, Error> {
+    Ok(ex.query("SELECT corporation_id, alliance_id FROM game.corporations WHERE corporation_id = ANY($1) AND NOT deleted ORDER BY corporation_id", &[&corps])
+        .await?.iter().map(LiveCorporationAlliance::from_row).collect())
+}
 struct Taken { value: bool }
 impl Taken { fn from_row(r: &Row) -> Self { Self { value: r.get("taken") } } }
 pub(crate) async fn name_taken(ex: &(impl Executor + ?Sized), name: &str, short_name: &str) -> Result<bool, Error> {
@@ -212,7 +226,4 @@ struct BillAmount { amount: f64 }
 impl BillAmount { fn from_row(r: &Row) -> Self { Self { amount: r.get("amount") } } }
 pub(crate) async fn bill_amount(ex: &(impl Executor + ?Sized), bill: i64, alliance: i64) -> Result<Option<f64>, Error> {
     Ok(ex.query_opt("SELECT amount::float8 AS amount FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &alliance]).await?.map(|r| BillAmount::from_row(&r).amount))
-}
-pub(crate) async fn is_executor(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<bool, Error> {
-    Ok(ex.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND executor_corp_id = $2", &[&alliance, &corp]).await?.is_some())
 }

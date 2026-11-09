@@ -100,7 +100,7 @@ pub(super) async fn send(c: &mut Client, bound: Option<i64>, call: &Call<'_>, de
         let kind = actual_type.and_then(|id| i32::try_from(id).ok()).and_then(|id| c.sde.types.get(id)).ok_or_else(invalid)?;
         if name == "JumpTo" {
             if item.is_none_or(|id| c.sde.map.stargate(id).is_none()) { return Err(invalid()); }
-        } else if matches!(kind.category_id, Some(crate::consts::CATEGORY_ENTITY | crate::consts::CATEGORY_DRONE | crate::consts::CATEGORY_SHIP | CATEGORY_FIGHTER)) {
+        } else if matches!(kind.category_id, Some(infinity_core::consts::CATEGORY_ENTITY | infinity_core::consts::CATEGORY_DRONE | infinity_core::consts::CATEGORY_SHIP | CATEGORY_FIGHTER)) {
             return Err(invalid());
         }
         if supplied_type.is_none() { return Err(invalid()); }

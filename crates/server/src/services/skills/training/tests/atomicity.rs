@@ -23,16 +23,18 @@ async fn shared_completion_transaction_rolls_back_after_database_failure() {
         let job = format!("{KIND}:{}", f.character);
         let before_all = snapshot(&test_db, f.character, &job).await;
         let sde = c.sde.clone();
+        let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
         let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = dispatched.clone();
         let _market = crate::services::market::lock().await;
         let failed: Result<(), crate::services::CallError> = test_db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
                 crate::dao::characters::selection::lock_character(tx, f.character).await.map_err(crate::services::db_err)?;
                 let now = crate::client::filetime_now();
                 let progress = completion::advance_tx(tx, outbox, &sde, f.character, now).await?;
-                completion::finish_tx(tx, outbox, &sde, f.character, now, &progress, &[]).await?;
+                completion::finish_tx(tx, outbox, &sde, &fences, f.character, now, &progress, &[]).await?;
                 assert_eq!(progress.completed, vec![(1, 1)]);
                 tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| crate::services::db_err(crate::db::Error::from(error)))?;
                 Ok(())
@@ -76,7 +78,8 @@ fn check_error(result: Result<(), crate::services::CallError>, expected: &str, c
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
     use super::super::{save_queue, save_queue_tx, MAX_QUEUE_ENTRIES, UE_TYPEID};
-    use crate::{consts::{CATEGORY_SKILL, dogma::MAX_SKILL_LEVEL}, db::outbox::Outbox, messages as m, services::CallError};
+    use infinity_core::{consts::{CATEGORY_SKILL, dogma::MAX_SKILL_LEVEL}, messages as m};
+    use crate::{db::outbox::Outbox, services::CallError};
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -113,7 +116,7 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
             Value::Dict(vec![(Value::Int(1), pair)]),
         ];
         for input in malformed {
-            check_error(save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.sde, &input, true, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await, m::MSG_QUEUE_INVALID_POSITION, None);
+            check_error(save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, &input, true, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await, m::MSG_QUEUE_INVALID_POSITION, None);
             assert_eq!(snapshot(&test_db, f.character, &job).await, before);
             assert!(c.outbox.is_empty());
         }
@@ -138,12 +141,14 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
             let dispatched = Arc::new(AtomicBool::new(false));
             let flag = dispatched.clone();
             let sde = c.sde.clone();
+            let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
             let _market = crate::services::market::lock().await;
             let result: Result<(), CallError> = test_db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
                 let sde = sde.clone();
                 let entries = entries.clone();
+                let fences = fences.clone();
                 Box::pin(async move {
-                    save_queue_tx(tx, outbox, &sde, f.character, entries, true, true, crate::client::filetime_now(), Default::default(), &[]).await?;
+                    save_queue_tx(tx, outbox, &sde, &fences, f.character, entries, true, true, crate::client::filetime_now(), Default::default(), &[]).await?;
                     Ok(())
                 })
             }, |(), _outbox| async move { flag.store(true, Ordering::SeqCst); Ok(()) }).await;
@@ -164,7 +169,7 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
     use super::super::{save_queue, MAX_QUEUE_ENTRIES};
-    use crate::{consts::{CATEGORY_SKILL, dogma::MAX_SKILL_LEVEL}, messages as m};
+    use infinity_core::{consts::{CATEGORY_SKILL, dogma::MAX_SKILL_LEVEL}, messages as m};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
@@ -194,7 +199,7 @@ async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
             }
         }
         assert_eq!(entries.len(), MAX_QUEUE_ENTRIES);
-        save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.sde, &queue(&entries), true, false, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("150-entry queue rejected"));
+        save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, &queue(&entries), true, false, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("150-entry queue rejected"));
         let rows = crate::dao::skills::queue::list(&test_db, f.character).await.unwrap();
         assert_eq!(rows.len(), MAX_QUEUE_ENTRIES);
         let active = crate::dao::skills::queue::active(&test_db, f.character).await.unwrap().unwrap();
@@ -206,7 +211,7 @@ async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
         assert_eq!(Some(due), active.end_time);
         let before = snapshot(&test_db, f.character, &job).await;
         entries.push((entries.len() as i64, i64::from(ids[count]), 1));
-        check_error(save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.sde, &queue(&entries), true, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await, m::MSG_QUEUE_TOO_MANY, Some(("num", Value::Int(MAX_QUEUE_ENTRIES as i64))));
+        check_error(save_queue(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, &queue(&entries), true, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await, m::MSG_QUEUE_TOO_MANY, Some(("num", Value::Int(MAX_QUEUE_ENTRIES as i64))));
         assert_eq!(snapshot(&test_db, f.character, &job).await, before);
         assert!(c.outbox.is_empty());
     }).await;

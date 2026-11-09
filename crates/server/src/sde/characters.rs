@@ -22,6 +22,7 @@ pub(crate) struct School {
     pub starting_stations: Vec<i64>,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Characters {
     races: Vec<Race>, bloodlines: Vec<Bloodline>, npc_characters: Vec<NpcCharacter>, schools: Vec<School>,
     schools_by_race: HashMap<i32, Vec<usize>>,
@@ -51,6 +52,7 @@ impl Characters {
     pub(crate) fn race(&self, id: i64) -> Option<&Race> {
         self.races.binary_search_by_key(&id, |row| row.race_id).ok().map(|index| &self.races[index])
     }
+    pub(crate) fn races(&self) -> impl Iterator<Item = &Race> { self.races.iter() }
     pub(crate) fn bloodline(&self, id: i64) -> Option<&Bloodline> {
         self.bloodlines.binary_search_by_key(&id, |row| row.bloodline_id).ok().map(|index| &self.bloodlines[index])
     }

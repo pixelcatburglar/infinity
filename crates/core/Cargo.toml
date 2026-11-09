@@ -1,0 +1,9 @@
+[package]
+name = "infinity-core"
+description = "Shared game constants, player messages and session data"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+marshal = { path = "../marshal" }

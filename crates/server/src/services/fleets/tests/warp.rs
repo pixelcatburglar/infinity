@@ -65,7 +65,7 @@ fn ball(id: i64, pilot: i64) -> space::Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: true, global: false, massive: false, interactive: true,
-        warp: space::WarpState::default(), warp_factor: 3000, last_ms: 1000,
+        warp: space::WarpState::default(), last_ms: 1000,
         interpolation_anchor_ms: 1000, effect_stamp: 0, cloak: 0, cloak_until: 0,
         health: [1.0; 3], launcher: 0, slim: vec![],
     }
@@ -157,6 +157,122 @@ fn character_target_is_current_visible_fleet_pilot_at_commit() {
     assert!(!s.fleet_broadcast_visible(3, 104));
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_some());
 }
+#[test]
+fn fleet_commits_keep_each_members_factor() {
+    crate::tests::init_config();
+    let st = setup();
+    let order = snapshot(&st, 3, 103).unwrap();
+    let mut s = space::System::new(1, std::sync::Arc::default(), 1000);
+    s.insert(ball(103, 3));
+    s.insert(ball(104, 4));
+    for (pilot, ship, factor) in [(3, 103, 4000), (4, 104, 4320)] {
+        let revision = s.projection_revision(ship);
+        assert_eq!(commit_in(&st, &mut s, &order, pilot, ship, |s| {
+            super::super::super::ship::commit_warp(s, ship, revision, false, factor, WarpDestination::Exact([1_000_000.0, 0.0, 0.0]), None)
+        }).unwrap(), super::super::super::ship::WarpCommit::Queued);
+    }
+    s.tick(2000);
+    assert_eq!(s.ball(103).unwrap().warp.factor, 4000);
+    assert_eq!(s.ball(104).unwrap().warp.factor, 4320);
+}
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated database with SDE; run serially"]
+async fn fleet_execute_uses_each_pilots_real_fitted_speed() {
+    use infinity_core::consts::{FLAG_IMPLANT, TYPE_CAPSULE};
+    use std::sync::Arc;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig {
+        schema_on_start: false, ..crate::config::tests::test_database()
+    }).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let system = -1;
+    let mut fixtures = Vec::new();
+    for _ in 0..2 {
+        let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+        let pilot: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
+        let ship = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, pilot, system, [0.0; 3]).await.unwrap();
+        fixtures.push((account, pilot, ship));
+    }
+    let (_, leader, leader_ship) = fixtures[0];
+    let (_, member, member_ship) = fixtures[1];
+    db.execute("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,brain_slot) VALUES ($1,$2,$2,$3,1,true,$4)", &[&3117_i32, &member, &FLAG_IMPLANT, &6_i32]).await.unwrap();
+    let world = space::World::new(db.clone(), sde, 1);
+    let fleet_id = leader;
+    let mut fleet = Fleet::new(leader, vec![]);
+    fleet.members.insert(leader, Member::new(NONE_ID, NONE_ID, ROLE_LEADER, JOB_NONE, 1));
+    fleet.members.insert(member, Member::new(NONE_ID, NONE_ID, ROLE_MEMBER, JOB_NONE, 1));
+    { let mut st = state(); st.fleets.insert(fleet_id, fleet); st.of.insert(leader, fleet_id); st.of.insert(member, fleet_id); }
+    let order = snapshot(&state(), leader, leader_ship).unwrap();
+    let w = world.clone();
+    let d = db.clone();
+    let result = tokio::spawn(async move {
+        w.system(system).await.unwrap();
+        for (pilot, ship) in [(leader, leader_ship), (member, member_ship)] {
+            let row = crate::dao::items::space_ships::FreeShip {
+                item_id: ship, type_id: TYPE_CAPSULE, owner_id: pilot, corporation_id: 1,
+                alliance_id: -1, pos: [0.0; 3],
+            };
+            let prepared = crate::services::ship::balls::piloted(&d, w.sde().clone(), &row, pilot, 0.0).await.unwrap();
+            w.with(system, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
+        }
+        execute(&d, &w, Some(system), order.clone(), WarpDestination::Exact([200_000_000.0, 0.0, 0.0]), None, Value::None).await.unwrap();
+        assert!(w.after(system, 1200).await);
+        assert_eq!(w.ball(system, leader_ship).await.unwrap().warp.factor, 4000);
+        assert_eq!(w.ball(system, member_ship).await.unwrap().warp.factor, 4320);
+        for ship in [leader_ship, member_ship] {
+            w.with(system, move |s| s.command(ship, |ball, _, _| { ball.stop(); Vec::new() })).await.unwrap();
+        }
+        assert!(w.after(system, 1200).await);
+        assert!(crate::dao::items::dogma::set_override(&d, leader_ship,
+            infinity_core::consts::dogma::ATTR_WARP_SPEED_MULTIPLIER, 0.0).await.unwrap());
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let callback: Timer = Box::new(move |_| { let _ = arrived_tx.send(()); });
+        let error = execute(&d, &w, Some(system), order, WarpDestination::Exact([200_000.0, 0.0, 0.0]),
+            Some(callback), Value::None).await;
+        assert!(error.is_err(), "later member's invalid fit must fail the order");
+        w.with(system, move |s| s.command(member_ship, |ball, _, _| {
+            ball.vel = [f64::from(ball.max_vel), 0.0, 0.0];
+            Vec::new()
+        })).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(45), arrived_rx).await
+            .expect("earlier accepted member did not complete").expect("arrival callback dropped");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+        let cancelled_world = w.clone();
+        let cancelled_db = d.clone();
+        let mut request = Box::pin(async move {
+            let guard = cancelled_world.begin_warp_arrival(system, Box::new(move |_| { let _ = arrival_tx.send(()); })).await.unwrap();
+            assert!(super::super::super::ship::warp_pilot(&cancelled_db, &cancelled_world, system, member, member_ship,
+                WarpDestination::Exact([1_000_000.0, 0.0, 0.0]), Some(guard.id()), None).await.unwrap());
+            accepted_tx.send(guard.id()).unwrap();
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        let arrival_id = tokio::select! {
+            _ = &mut request => panic!("producer completed before cancellation"),
+            accepted = accepted_rx => accepted.unwrap(),
+        };
+        drop(request);
+        w.with(system, move |s| s.command(member_ship, |ball, _, _| {
+            ball.vel = [f64::from(ball.max_vel), 0.0, 0.0];
+            Vec::new()
+        })).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(45), arrival_rx).await
+            .expect("accepted member did not complete after producer cancellation").expect("arrival callback dropped");
+        assert!(!w.with(system, move |s| s.retain_warp_arrival(arrival_id)).await.unwrap());
+    }).await;
+    { let mut st = state(); st.fleets.remove(&fleet_id); st.of.remove(&leader); st.of.remove(&member); }
+    for (account, pilot, ship) in fixtures {
+        world.remove_ball(system, ship).await;
+        db.execute("DELETE FROM game.item_attributes WHERE item_id IN (SELECT item_id FROM game.items WHERE owner_id=$1)", &[&pilot]).await.unwrap();
+        db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&pilot]).await.unwrap();
+        db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&pilot]).await.unwrap();
+        db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    }
+    result.unwrap();
+}
+
+
 
 #[test]
 fn revision_and_scramble_preserve_single_arrival_callback() {
@@ -170,23 +286,23 @@ fn revision_and_scramble_preserve_single_arrival_callback() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let callback: Timer = Box::new(move |_| { count.fetch_add(1, Ordering::SeqCst); });
+    let arrival = s.register_warp_arrival(callback);
     let stale = s.projection_revision(104);
     s.refresh_projection_target(104);
-    let (current, callback) = commit_in(&st, &mut s, &order, 4, 104, |s| {
-        super::super::super::ship::commit_warp(s, 104, stale, false, None, [1000.0, 0.0, 0.0], 0.0, Some(callback))
+    let result = commit_in(&st, &mut s, &order, 4, 104, |s| {
+        super::super::super::ship::commit_warp(s, 104, stale, false, 3000, WarpDestination::Exact([1000.0, 0.0, 0.0]), Some(arrival))
     }).unwrap();
-    assert!(!current);
+    assert_eq!(result, super::super::super::ship::WarpCommit::RetryProjection);
     let revision = s.projection_revision(104);
-    let (current, callback) = commit_in(&st, &mut s, &order, 4, 104, |s| {
-        super::super::super::ship::commit_warp(s, 104, revision, true, None, [1000.0, 0.0, 0.0], 0.0, callback)
+    let result = commit_in(&st, &mut s, &order, 4, 104, |s| {
+        super::super::super::ship::commit_warp(s, 104, revision, true, 3000, WarpDestination::Exact([1000.0, 0.0, 0.0]), Some(arrival))
     }).unwrap();
-    assert!(current);
-    assert!(callback.is_some());
-    let (current, callback) = commit_in(&st, &mut s, &order, 4, 104, |s| {
-        super::super::super::ship::commit_warp(s, 104, revision, false, None, [1000.0, 0.0, 0.0], 0.0, callback)
+    assert_eq!(result, super::super::super::ship::WarpCommit::Scrambled);
+    let result = commit_in(&st, &mut s, &order, 4, 104, |s| {
+        super::super::super::ship::commit_warp(s, 104, revision, false, 3000, WarpDestination::Exact([1000.0, 0.0, 0.0]), Some(arrival))
     }).unwrap();
-    assert!(current);
-    assert!(callback.is_none());
+    assert_eq!(result, super::super::super::ship::WarpCommit::Queued);
+    s.release_warp_arrival(arrival);
     s.tick(2000);
     s.tick(3000);
     assert_eq!(calls.load(Ordering::SeqCst), 1);

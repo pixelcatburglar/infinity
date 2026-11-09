@@ -2,7 +2,7 @@
 //! Shared exploration state and data sources are documented in the parent module.
 
 use super::*;
-use crate::consts::CATEGORY_ENTITY;
+use infinity_core::consts::CATEGORY_ENTITY;
 
 
 // ---------------------------------------------------------------- site content
@@ -138,6 +138,7 @@ pub(super) async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result
         combat_site(world.sde(), system, &info, old.kind, &mut taken)?
     };
     enum Replacement { Apply(Site, Option<Site>) }
+    crate::progress::leaf_effect!(Replacement);
     db.transaction(
         move |tx, outbox: &mut Outbox<Replacement>| {
             let (old, new) = (old.clone(), new.clone());
@@ -157,7 +158,6 @@ pub(super) async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(world, None)?,
-                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Replacement::Apply(old, new)) => {
                         info!("site {} in {system} done", old.target);
                         state().sites.remove(&old.id);
@@ -232,7 +232,6 @@ pub(super) fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         massive: false,
         interactive: false,
         warp: crate::space::WarpState::default(),
-        warp_factor: 0,
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
         effect_stamp: 0,
@@ -349,6 +348,7 @@ pub(super) async fn collapse(db: &Db, world: &World, site_id: i64) -> Result<(),
         (ids, sites)
     };
     enum Collapse { Remove(Vec<Site>) }
+    crate::progress::leaf_effect!(Collapse);
     db.transaction(
         move |tx, outbox: &mut Outbox<Collapse>| {
             let (mut ids, sites) = (ids.clone(), sites.clone());
@@ -362,7 +362,6 @@ pub(super) async fn collapse(db: &Db, world: &World, site_id: i64) -> Result<(),
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(world, None)?,
-                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Collapse::Remove(sites)) => for s in sites {
                         state().sites.remove(&s.id);
                         info!("wormhole {} in {} collapsed", s.target, s.system);
@@ -444,7 +443,6 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
         massive: true,
         interactive: false,
         warp: crate::space::WarpState::default(),
-        warp_factor: 0,
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
         effect_stamp: 0,
@@ -457,10 +455,6 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
     }
 }
 
-// PostgreSQL casts float8 to integer using round-to-nearest, ties-to-even.
-fn required_skill_matches(value: Option<f64>, skill: i32) -> bool {
-    value.is_some_and(|v| v.round_ties_even() == f64::from(skill))
-}
 
 fn select_loot<T>(mut rows: Vec<T>, limit: usize, eligible: impl Fn(&T) -> bool, mut random: impl FnMut() -> f64) -> Vec<T> {
     rows.retain(eligible);
@@ -489,7 +483,7 @@ pub(super) async fn spawn_containers(db: &Db, world: &Arc<World>, user_id: i64, 
     for t in sde.types.iter().filter(|t| t.group_id == Some(GROUP_SCATTER_CONTAINER)) {
         let Some(name) = t.name.as_deref() else { continue };
         if !(name.starts_with(&format!("{prefix} ")) || (sleeper && name.contains("Sleeper"))) { continue; }
-        if !required_skill_matches(t.attribute(ATTR_REQUIRED_SKILL_1), skill) { continue; }
+        if crate::services::hacking::required_analyzer_skill(t)? != Some(skill) { continue; }
         let matches = hackable.iter().filter(|&&id| t.attribute(id).is_some()).count();
         if matches == 0 { continue; }
         if duplicate_tier {
@@ -514,7 +508,7 @@ pub(super) async fn spawn_containers(db: &Db, world: &Arc<World>, user_id: i64, 
             .is_some_and(|t| t.published == Some(true) && t.group_id.is_some_and(|g| groups.contains(&g))), rand01);
         for r in &loot {
             let (loot_type, price) = (r.type_id, r.average);
-            let quantity = ((value / stacks as f64 / price.max(1.0)) * (0.5 + rand01())).round().clamp(1.0, 500.0) as i32;
+            let quantity = ((value / stacks as f64 / price.max(1.0)) * (0.5 + rand01())).round().clamp(1.0, 500.0) as i64;
             crate::dao::exploration::insert_loot(db, loot_type, id, quantity).await.map_err(db_err)?;
         }
         world.add_ship(site.system, container_ball(id, type_id, pos, radius as f32, 0)).await.map_err(CallError::Internal)?;

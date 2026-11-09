@@ -6,7 +6,7 @@ fn values(values: [i64; 5]) -> Value {
     Value::Dict(CHAR_ATTRIBUTES.into_iter().zip(values).map(|(id, value)| (Value::Int(id), Value::Int(value))).collect())
 }
 async fn use_real_skill(db: &crate::db::Db, character: i64, sde: &crate::sde::Sde) -> i32 {
-    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && super::super::requirements::requirements(sde, t.type_id).next().is_none()).expect("SDE must contain a skill without prerequisites").type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && super::super::requirements::requirements(sde, t.type_id).next().is_none()).expect("SDE must contain a skill without prerequisites").type_id;
     db.execute("UPDATE game.skills SET type_id=$2 WHERE character_id=$1", &[&character, &type_id]).await.unwrap();
     db.execute("UPDATE game.skill_queue SET type_id=$2 WHERE character_id=$1", &[&character, &type_id]).await.unwrap();
     type_id
@@ -27,7 +27,7 @@ fn exact_integer_attributes_and_total_are_required() {
     let mut float = match values([17, 17, 17, 21, 27]) { Value::Dict(pairs) => pairs, _ => unreachable!() };
     float[0].1 = Value::Float(f64::NAN);
     assert_eq!(parse(&Value::Dict(float)), Err(Invalid::Malformed));
-    for (reason, expected) in [(Invalid::Low, crate::messages::MSG_RESPEC_ATTRIBUTES_TOO_LOW), (Invalid::High, crate::messages::MSG_RESPEC_ATTRIBUTES_TOO_HIGH), (Invalid::Misallocated, crate::messages::MSG_RESPEC_ATTRIBUTES_MISALLOCATED)] {
+    for (reason, expected) in [(Invalid::Low, infinity_core::messages::MSG_RESPEC_ATTRIBUTES_TOO_LOW), (Invalid::High, infinity_core::messages::MSG_RESPEC_ATTRIBUTES_TOO_HIGH), (Invalid::Misallocated, infinity_core::messages::MSG_RESPEC_ATTRIBUTES_MISALLOCATED)] {
         match invalid_error(reason) { CallError::User { msg, dict } => { assert_eq!(msg, expected); assert!(dict.is_empty()); }, _ => panic!("expected user error") }
     }
 }
@@ -79,7 +79,7 @@ async fn entitlement_persists_and_paused_queue_remains_paused() {
         db.execute("UPDATE game.character_respec SET free_respecs=0 WHERE character_id=$1", &[&f.character]).await.unwrap();
         match apply(&mut c, f.character, &values([17, 17, 17, 21, 27])).await {
             Err(CallError::User { msg, dict }) => {
-                assert_eq!(msg, crate::messages::MSG_RESPEC_TOO_SOON);
+                assert_eq!(msg, infinity_core::messages::MSG_RESPEC_TOO_SOON);
                 assert!(matches!(dict.as_slice(), [(key, Value::Int(value))] if key == "nextTime" && Some(*value) == deadline));
             }
             _ => panic!("expected timed entitlement refusal"),
@@ -123,6 +123,7 @@ async fn remap_rolls_back_after_staged_writes_and_batches_overdue_completion() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let scenario = crate::tests::catch_scenario(async {
     fixture::seed_skill(&db, f.character).await.unwrap();
     let now = filetime_now();
     db.execute("INSERT INTO game.skill_queue (character_id, position, type_id, to_level, start_sp, dest_sp, start_time, end_time) VALUES ($1, 1, 1, 2, 100, 1415, $2, $3)", &[&f.character, &(now - FILETIME_DAY), &(now + FILETIME_DAY)]).await.unwrap();
@@ -134,13 +135,14 @@ async fn remap_rolls_back_after_staged_writes_and_batches_overdue_completion() {
     let snapshot_sql = "SELECT (SELECT row_to_json(r)::text FROM game.character_respec r WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') FROM game.skill_history h WHERE character_id=$1) || '|' || (SELECT COALESCE(row_to_json(j)::text, '') FROM game.jobs j WHERE job_id=$2) AS snapshot";
     let before: String = db.query_one(snapshot_sql, &[&f.character, &id]).await.unwrap().get("snapshot");
     let sde = c.sde.clone();
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
     let _market = crate::services::market::lock().await;
     let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone();
+        let sde = sde.clone(); let fences = fences.clone();
         Box::pin(async move {
-            let value = apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await?;
+            let value = apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], now).await?;
             let staged = attributes::respec(tx, f.character).await.map_err(db_err)?.expect("staged remap");
             assert_eq!(staged.bases.as_deref(), Some(&[17, 17, 17, 21, 27][..]));
             tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
@@ -158,24 +160,28 @@ async fn remap_rolls_back_after_staged_writes_and_batches_overdue_completion() {
     let after: String = db.query_one(snapshot_sql, &[&f.character, &id]).await.unwrap().get("snapshot");
     assert_eq!(before, after);
     let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone();
-        Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await })
+        let sde = sde.clone(); let fences = fences.clone();
+        Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], now).await })
     }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("remap transaction"));
-    let (mut changed, mut brains, mut trained) = (0, 0, 0);
+    let (mut changed, mut brains) = (0, 0);
+    let trained = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.into_iter().filter(|event| matches!(event, GameEvent::SkillTrained { char_id, type_id: trained_type, level: 1 } if *char_id == f.character && *trained_type == type_id)).count();
     for effect in effects {
         match effect {
             Effect::Notification(Notification::Pilot { char_id, event, .. }) if char_id == f.character => {
                 if event == "OnServerSkillsChanged" { changed += 1; }
                 if event == BRAIN_REFRESH { brains += 1; }
             }
-            Effect::Event(GameEvent::SkillTrained { char_id, type_id: trained_type, level: 1 }) if char_id == f.character && trained_type == type_id => trained += 1,
             _ => {}
         }
     }
     assert_eq!((changed, brains, trained), (1, 1, 1));
     assert!(queue::active(&db, f.character).await.unwrap().is_some());
+    }).await;
+    let id = format!("{}:{}", completion::KIND, f.character);
     crate::scheduler::cancel(&db, &id).await.unwrap();
+    db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -197,11 +203,14 @@ async fn stale_entitlement_write_is_refused() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
-    use crate::{consts::{dogma::ATTR_BOOSTERNESS, dogma::ATTR_SKILL_TIME_CONSTANT, FILETIME_MINUTE, FLAG_BOOSTER}, services::tests::{client, fixture}};
+    use infinity_core::{consts::{dogma::ATTR_BOOSTERNESS, dogma::ATTR_SKILL_TIME_CONSTANT, FILETIME_MINUTE, FLAG_BOOSTER}};
+    use crate::{services::tests::{client, fixture}};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let scenario = crate::tests::catch_scenario(async {
     let (c, _peer) = client(db.clone(), f.character).await;
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
     let existing = skill_dao::current(&db, f.character).await.unwrap();
     let now = filetime_now();
     let start = now - 20 * FILETIME_MINUTE;
@@ -231,8 +240,8 @@ async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
                     let expected = projected.trained_points().unwrap_or_else(|_| panic!("project points")) - existing.iter().map(|s| s.skill_points).sum::<i64>();
                     let _market = crate::services::market::lock().await;
                     let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
-                        let sde = c.sde.clone();
-                        Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await })
+                        let sde = c.sde.clone(); let fences = fences.clone();
+                        Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], now).await })
                     }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("remap"));
                     let saved = skill_dao::current(&db, f.character).await.unwrap();
                     assert_eq!(saved.iter().find(|s| s.type_id == skill.type_id).unwrap().skill_points, expected);
@@ -248,7 +257,10 @@ async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
             }
         }
     }
-    crate::scheduler::cancel(&db, &format!("{}:{}", completion::KIND, f.character)).await.unwrap();
-    fixture::cleanup(&db, f).await.unwrap();
     assert!(exercised, "no compatible training booster and skill in test SDE");
+    }).await;
+    crate::scheduler::cancel(&db, &format!("{}:{}", completion::KIND, f.character)).await.unwrap();
+    db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
+    fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }

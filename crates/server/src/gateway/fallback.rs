@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, ReflectMessage};
-use super::{Caller, message::{message, UUID_LEN}};
+use infinity_core::consts::UUID_LEN;
+use super::{Caller, message::message};
 
 /// Server limit for nesting when collecting request identifiers.
 const IDENTIFIER_DEPTH: u32 = 2;

@@ -1,7 +1,8 @@
 //! Daily Alpha injector cooldowns in `game.character_alpha_injections` and `game.jobs`.
 //! `skillsvc.py` consumes GetNextAlphaInjectionDateTime and OnAlphaInjectionAvailable;
 //! other Alpha gameplay restrictions are not modelled here.
-use crate::{client::filetime_now, consts::FILETIME_DAY, dao::skills::alpha_injections as dao, db::{executor::Executor, outbox::{dispatch_world, Outbox}, Db}, messages, scheduler::{self, Job}, services::{db_err, identity::Identity, notify_error, user_error, CallError}, space::World};
+use infinity_core::{consts::FILETIME_DAY, messages};
+use crate::{client::filetime_now, dao::skills::alpha_injections as dao, db::{executor::Executor, outbox::{dispatch_world, Outbox}, Db}, scheduler::{self, Job}, services::{db_err, identity::Identity, notify_error, user_error, CallError}, space::World};
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin, sync::Arc};
 

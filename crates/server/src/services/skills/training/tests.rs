@@ -13,11 +13,11 @@ fn malformed_queue_maps_are_refused_without_becoming_aborts() {
         Value::Dict(vec![(Value::Int(0), Value::tuple([Value::Int(1), Value::Int(1)])), (Value::Int(0), Value::tuple([Value::Int(2), Value::Int(1)]))]),
     ];
     for value in bad {
-        assert!(matches!(parse_queue(&value), Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_QUEUE_INVALID_POSITION));
+        assert!(matches!(parse_queue(&value), Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_QUEUE_INVALID_POSITION));
     }
     assert!(matches!(parse_queue(&Value::Dict(vec![])), Ok(entries) if entries.is_empty()));
     let entries = (0..151).map(|i| (Value::Int(i), Value::tuple([Value::Int(1), Value::Int(1)]))).collect();
-    assert!(matches!(parse_queue(&Value::Dict(entries)), Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_QUEUE_TOO_MANY));
+    assert!(matches!(parse_queue(&Value::Dict(entries)), Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_QUEUE_TOO_MANY));
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn queue_wire_preserves_optional_filetimes() {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn queue_validation_checks_real_skills_and_capacity() {
     use crate::services::tests::{client, fixture};
-    use crate::messages as m;
+    use infinity_core::messages as m;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
@@ -86,20 +86,20 @@ async fn queue_replacement_and_abort_bank_progress_and_update_deadline() {
     let f = fixture::create(&db).await.unwrap();
     fixture::seed_skill(&db, f.character).await.unwrap();
     let now = filetime_now();
-    db.execute("UPDATE game.skill_queue SET start_time=$2, end_time=$3 WHERE character_id=$1", &[&f.character, &(now - crate::consts::FILETIME_MINUTE), &(now + crate::consts::FILETIME_MINUTE)]).await.unwrap();
+    db.execute("UPDATE game.skill_queue SET start_time=$2, end_time=$3 WHERE character_id=$1", &[&f.character, &(now - infinity_core::consts::FILETIME_MINUTE), &(now + infinity_core::consts::FILETIME_MINUTE)]).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
     let type_id = c.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SKILL) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none()).expect("SDE must contain a skill without prerequisites").type_id;
     db.execute("UPDATE game.skills SET type_id=$2 WHERE character_id=$1", &[&f.character, &type_id]).await.unwrap();
     db.execute("UPDATE game.skill_queue SET type_id=$2 WHERE character_id=$1", &[&f.character, &type_id]).await.unwrap();
     let replacement = Value::Dict(vec![(Value::Int(0), Value::tuple([Value::Int(i64::from(type_id)), Value::Int(1)]))]);
-    save_queue(&Identity::of_client(&c), &c.db, &c.sde, &replacement, true, true, |n| online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("failed to replace skill queue"));
+    save_queue(&Identity::of_client(&c), &c.db, &c.world, &c.sde, &replacement, true, true, |n| online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("failed to replace skill queue"));
     let skills = training_dao::current(&db, f.character).await.unwrap();
     assert!(skills[0].skill_points >= 50);
     let id = format!("{}:{}", super::super::completion::KIND, f.character);
     let row = db.query_one("SELECT due_at FROM game.jobs WHERE job_id=$1", &[&id]).await.unwrap();
     let queued = queue_dao::active(&db, f.character).await.unwrap().unwrap();
     assert_eq!(Some(row.get::<_, i64>("due_at")), queued.end_time);
-    save_queue(&Identity::of_client(&c), &c.db, &c.sde, &Value::Dict(vec![]), false, false, |n| online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("failed to abort skill queue"));
+    save_queue(&Identity::of_client(&c), &c.db, &c.world, &c.sde, &Value::Dict(vec![]), false, false, |n| online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.unwrap_or_else(|_| panic!("failed to abort skill queue"));
     assert!(queue_dao::list(&db, f.character).await.unwrap().is_empty());
     assert!(db.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&id]).await.unwrap().is_none());
     assert!(training_dao::current(&db, f.character).await.unwrap()[0].skill_points >= 50);
@@ -123,12 +123,14 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
         let before = fixture::skill_fingerprint(&db, f.character).await.unwrap();
         let (c, _peer) = client(db.clone(), f.character).await;
         let sde = c.sde.clone();
+        let fences = online::capture_online_fences(&c.world, &[f.character]).await;
         let dispatched = Arc::new(AtomicBool::new(false));
         let flag = dispatched.clone();
         let result: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
+                save_queue_tx(tx, outbox, &sde, &fences, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
                 Err(CallError::Internal(anyhow::anyhow!("force rollback")))
             })
         }, |(), _outbox| async move {
@@ -142,13 +144,14 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
 
         let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
+                save_queue_tx(tx, outbox, &sde, &fences, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
                 Ok(())
             })
         }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("failed to save skill queue and collect effects"));
         let mut changed = 0;
-        let mut trained = 0;
+        let trained = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.into_iter().filter(|event| matches!(event, GameEvent::SkillTrained { char_id, type_id: 1, level: 1 } if *char_id == f.character)).count();
         let mut brains = 0;
         let mut queues = 0;
         for effect in effects {
@@ -158,7 +161,6 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
                     if event == crate::client::BRAIN_REFRESH { brains += 1; }
                     if event == "OnNewSkillQueueSaved" { queues += 1; }
                 }
-                Effect::Event(GameEvent::SkillTrained { char_id, type_id: 1, level: 1 }) if char_id == f.character => trained += 1,
                 _ => {}
             }
         }

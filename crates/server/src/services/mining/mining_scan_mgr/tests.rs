@@ -1,4 +1,18 @@
 use super::*;
+use infinity_core::consts::CATEGORY_ASTEROID;
+use crate::dao::asteroids::NewAsteroid;
+use crate::services::mining::tests::publish_fixture;
+use crate::space::{Ball, WarpState, MODE_STOP};
+
+fn ship_ball(id: i64, type_id: i32) -> Ball {
+    Ball { id, type_id, owner_id: 1, corp_id: 1, alliance_id: -1, char_id: None,
+        signature_radius: None, mode: MODE_STOP, radius: 1.0, mass: 1.0, max_vel: 0.0,
+        agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3],
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3],
+        follow_id: 0, follow_range: 0.0, free: false, global: false, massive: false,
+        interactive: false, warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
+        effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: vec![] }
+}
 
 #[test]
 fn survey_range_uses_largest_valid_fitted_scanner_or_integrated_range() {
@@ -7,11 +21,10 @@ fn survey_range_uses_largest_valid_fitted_scanner_or_integrated_range() {
     assert_eq!(scanner_range(42.0, [f64::INFINITY, -1.0].into_iter()), 42.0);
 }
 
-async fn fingerprint(db: &crate::db::Db) -> Vec<String> {
+async fn fingerprint(db: &crate::db::Db) -> Vec<Vec<String>> {
     let mut result = Vec::new();
     for table in ["accounts", "characters", "items", "item_attributes", "asteroids"] {
-        let sql = format!("SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY row_to_json(t)::text), '')) AS fingerprint FROM game.{table} t");
-        result.push(db.query_one(&sql, &[]).await.unwrap().get("fingerprint"));
+        result.push(crate::services::drones::tests::fixture::table_fingerprint(db, table).await.unwrap());
     }
     result
 }
@@ -19,7 +32,8 @@ async fn fingerprint(db: &crate::db::Db) -> Vec<String> {
 #[tokio::test]
 #[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with loaded SDE; run serially"]
 async fn perform_scan_uses_online_survey_range_then_integrated_range() {
-    use crate::{consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST}, dao::items::{combat, dogma}, services::effects::{registry, EffectKind}};
+    use infinity_core::{consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST}};
+    use crate::{dao::items::{combat, dogma}, services::effects::{registry, EffectKind}};
     crate::tests::init_config();
     let mut config = crate::config::tests::test_database();
     config.schema_on_start = false;
@@ -42,8 +56,8 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
             Ok::<_, crate::db::Error>((account, character, ship, module))
         }), |fixture, ()| async move { Ok(fixture) }).await.unwrap();
     let system = -character;
-    let inner = -ship;
-    let outer = -module;
+    let inner = crate::dao::asteroids::insert_batch(&db, system, &[NewAsteroid { field: system, type_id: ore, quantity: 17, radius: 1.0, pos: [configured * 0.5, 0.0, 0.0] }]).await.unwrap()[0].id;
+    let outer = crate::dao::asteroids::insert_batch(&db, system, &[NewAsteroid { field: system, type_id: ore, quantity: 29, radius: 1.0, pos: [configured * 0.9, 0.0, 0.0] }]).await.unwrap()[0].id;
     let world = World::new(db.clone(), sde.clone(), 1);
     let test_world = world.clone();
     let test_db = db.clone();
@@ -52,15 +66,8 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
         test_world.system(system).await.unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         test_world.register_pilot(character, tx);
-        let ship_ball = rock_ball(ship, hull, [0.0; 3], 1.0);
-        let inner_ball = rock_ball(inner, ore, [configured * 0.5, 0.0, 0.0], 1.0);
-        let outer_ball = rock_ball(outer, ore, [configured * 0.9, 0.0, 0.0], 1.0);
-        test_world.with(system, move |s| { s.insert(ship_ball); s.insert(inner_ball); s.insert(outer_ball); }).await.unwrap();
-        {
-            let mut state = state();
-            assert!(state.rocks.insert(inner, Rock { system, field: system, type_id: ore, quantity: 17 }).is_none());
-            assert!(state.rocks.insert(outer, Rock { system, field: system, type_id: ore, quantity: 29 }).is_none());
-        }
+        test_world.with(system, move |s| s.insert(ship_ball(ship, hull))).await.unwrap();
+        publish_fixture(&test_db, &test_world, system, system).await;
         let cfg = Arc::new(crate::config::Config::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -77,15 +84,17 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&expected_inner) && rows.contains(&expected_outer));
     }).await;
-    world.remove_ball(system, inner).await;
-    world.remove_ball(system, outer).await;
-    world.remove_ball(system, ship).await;
-    {
-        let mut state = state();
-        state.rocks.remove(&inner);
-        state.rocks.remove(&outer);
+    let actor = world.asteroid_actor(system);
+    for rock in [inner, outer] {
+        db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2 AND field_id=$3", &[&rock, &system, &system]).await.unwrap();
+        if let Some(actor) = &actor {
+            if actor.rock_field(rock).await == Some(system) {
+                assert!(crate::space::asteroids::publish_depletion(&world, system, actor, rock, system, None, None).await);
+            }
+        }
     }
-    world.unregister_pilot(character);
+    world.remove_ball(system, ship).await;
+    world.unregister_pilot_generation(character, None);
     let flush = world.flush_positions().await;
     drop(world);
     db.transaction(move |tx, _: &mut ()| Box::pin(async move {

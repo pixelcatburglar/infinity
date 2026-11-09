@@ -4,7 +4,8 @@
 //! Reads SDE school and race starting data and atomically writes characters and starting skills.
 //! An optional explicit station is validated against the SDE; client creation selects a school station.
 //! Ship provisioning is deferred to selection; appearance and portrait are opaque bytes.
-use crate::{dao::characters, db::Db, messages, sde::Sde};
+use infinity_core::messages;
+use crate::{dao::characters, db::Db, sde::Sde};
 use crate::services::{db_err, CallError};
 use anyhow::Context;
 use std::sync::Arc;

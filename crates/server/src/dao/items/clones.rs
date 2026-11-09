@@ -1,6 +1,6 @@
 //! Real implant custody in `game.items` for station jump clones.
 //! Client behavior belongs to jumpCloneSvc; callers own transactions and locks.
-use crate::consts::FLAG_IMPLANT;
+use infinity_core::consts::FLAG_IMPLANT;
 use crate::db::{self, executor::Executor};
 use super::{brain::BrainItem, dogma::AttributeOverride};
 

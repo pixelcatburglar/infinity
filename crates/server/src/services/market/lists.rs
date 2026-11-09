@@ -1,18 +1,18 @@
-//! Market order and transaction list formatting for marketProxy
-//! (`eve/client/script/ui/services/marketsvc.py`), backed by market DAO queries and
-//! the startup-loaded SDE map. Matching, order mutation and notification dispatch
-//! are handled separately.
+//! Order and transaction projections for `marketProxy`
+//! (`eve/client/script/ui/services/marketsvc.py`), using market and wallet queries
+//! and the startup-loaded SDE map. Public books use coherent version snapshots;
+//! matching, mutations and notifications are separate.
 use super::*;
 /// Columns of an order row; the client sets `jumps` itself (RefreshJumps).
 fn order_header() -> DbRowDescriptor {
     DbRowDescriptor::new([
         ("price", DbType::R8),
-        ("volRemaining", DbType::I4),
+        ("volRemaining", DbType::I8),
         ("typeID", DbType::I4),
         ("range", DbType::I2),
         ("orderID", DbType::I8),
-        ("volEntered", DbType::I4),
-        ("minVolume", DbType::I4),
+        ("volEntered", DbType::I8),
+        ("minVolume", DbType::I8),
         ("bid", DbType::Bool),
         ("issueDate", DbType::FileTime),
         ("duration", DbType::I2),
@@ -23,33 +23,49 @@ fn order_header() -> DbRowDescriptor {
         ("jumps", DbType::I2),
     ])
 }
-/// `GetOrders(typeID)` -> (asks, bids) in the session's region.
-pub(super) async fn orders(db: &Db, region: i64, type_id: i64) -> CallResult {
-    let rows = listings::orders(db, today(), type_id as i32, Area::Region, region, None).await.map_err(db_err)?;
+/// A coherent public book; generic calls include the regional session cache key.
+pub(super) async fn orders(db: &Db, region: i64, type_id: i32, regional_session: bool) -> CallResult {
+    let snapshot = crate::dao::market::versions::snapshot(db, orders::MarketScope::for_type(type_id), type_id, region, filetime_now(), FILETIME_DAY).await.map_err(db_err)?;
+    Ok(super::cache::wrap(book_rows(&snapshot.rows), &snapshot, regional_session))
+}
+
+fn book_rows(rows: &[Order]) -> Value {
+    // Seeded NPC dates are persisted for stable snapshots; legacy NULLs retain the baseline UTC-day fallback.
+    let fallback = today();
     let header = order_header();
     let (mut asks, mut bids) = (vec![], vec![]);
-    for r in &rows {
-        let line = [Value::Float(r.price), Value::Int(r.vol_remaining), Value::Int(r.type_id), Value::Int(r.range), Value::Int(r.order_id), Value::Int(r.vol_entered), Value::Int(r.min_volume), Value::Bool(r.bid), Value::Int(r.issued), Value::Int(r.duration), Value::Int(r.station_id), Value::Int(r.region_id), Value::Int(r.solar_system_id), Value::Int(r.constellation_id), Value::Int(0)];
+    for r in rows {
+        let line = [Value::Float(r.price.wire_isk()), Value::Int(r.vol_remaining), Value::Int(i64::from(r.type_id)), Value::Int(r.range), Value::Int(r.id), Value::Int(r.vol_entered), Value::Int(r.min_volume), Value::Bool(r.bid), Value::Int(r.issued.unwrap_or(fallback)), Value::Int(r.duration), Value::Int(r.at.id), Value::Int(r.at.region), Value::Int(r.at.system), Value::Int(r.at.constellation), Value::Int(0)];
         let row = header.row(&line);
-        if r.bid {
-            bids.push(row)
-        } else {
-            asks.push(row)
-        }
+        if r.bid { bids.push(row) } else { asks.push(row) }
     }
-    Ok(Value::tuple([crowset(&header, asks), crowset(&header, bids)]))
+    Value::tuple([crowset(&header, asks), crowset(&header, bids)])
+}
+
+/// The cheapest global PLEX ask and its coherent cache token.
+pub(super) async fn plex_best(db: &Db) -> CallResult {
+    let type_id = infinity_core::consts::TYPE_PLEX;
+    let snapshot = crate::dao::market::versions::best_ask_snapshot(db, orders::MarketScope::for_type(type_id), type_id, 0, filetime_now(), FILETIME_DAY).await.map_err(db_err)?;
+    let best = snapshot.rows.first();
+    let header = best_header();
+    let inner = Value::Dict(best.into_iter().map(|r| (Value::Int(i64::from(type_id)), header.row(&[Value::Float(r.price.wire_isk()), Value::Int(r.vol_remaining), Value::Int(i64::from(type_id)), Value::Int(r.at.id)]))).collect());
+    Ok(super::cache::wrap(inner, &snapshot, false))
+}
+
+fn best_header() -> DbRowDescriptor {
+    DbRowDescriptor::new([("price", DbType::R8), ("volRemaining", DbType::I8), ("typeID", DbType::I4), ("stationID", DbType::I8)])
 }
 
 /// Cheapest ask per type within `column = id`: {typeID: best}.
 pub(super) async fn best_asks(db: &Db, area: Area, id: i64, as_rows: bool) -> CallResult {
-    let rows = listings::best_asks(db, area, id).await.map_err(db_err)?;
+    let rows = listings::best_asks(db, filetime_now(), FILETIME_DAY, area, id, None).await.map_err(db_err)?;
     // Station/system answers are tuples (marketutil.ConvertTuplesToBestByOrders); the
     // region answer is used as-is, by attribute.
-    let header = DbRowDescriptor::new([("price", DbType::R8), ("volRemaining", DbType::I4), ("typeID", DbType::I4), ("stationID", DbType::I8)]);
+    let header = best_header();
     Ok(Value::Dict(
         rows.iter()
             .map(|r| {
-                let line = [Value::Float(r.price), Value::Int(r.vol_remaining), Value::Int(r.type_id), Value::Int(r.station_id)];
+                let line = [Value::Float(r.price.wire_isk()), Value::Int(r.vol_remaining), Value::Int(r.type_id), Value::Int(r.station_id)];
                 (Value::Int(r.type_id), if as_rows { header.row(&line) } else { Value::tuple(line) })
             })
             .collect(),
@@ -57,11 +73,24 @@ pub(super) async fn best_asks(db: &Db, area: Area, id: i64, as_rows: bool) -> Ca
 }
 // ---------------------------------------------------------------- order lists
 
-/// `GetCharOrders`: the character's open orders.
+/// Open orders issued by the character, including corporate orders.
 pub(super) async fn my_orders(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
+    let rows = orders::my_orders(&c.db, me).await.map_err(db_err)?;
+    Ok(order_rows(c, &rows))
+}
+
+/// Open corporate orders in the caller's currently readable divisions.
+pub(super) async fn corporation_orders(c: &Client) -> CallResult {
+    let identity = crate::services::identity::Identity::of_client(c);
+    let keys = super::authorization::readable_divisions(&c.db, &identity, None).await?;
+    let rows = orders::corporation_orders(&c.db, identity.corp_id, &keys).await.map_err(db_err)?;
+    Ok(order_rows(c, &rows))
+}
+
+fn order_rows(c: &Client, rows: &[Order]) -> Value {
     let here = c.session.int("solarsystemid2").unwrap_or(0);
-    let rows = orders::my_orders(&c.db, me, today()).await.map_err(db_err)?;
+    let fallback = today();
     let header = DbRowDescriptor::new([
         ("orderID", DbType::I8),
         ("typeID", DbType::I4),
@@ -73,10 +102,10 @@ pub(super) async fn my_orders(c: &Client) -> CallResult {
         ("range", DbType::I2),
         ("bid", DbType::Bool),
         ("price", DbType::R8),
-        ("volEntered", DbType::I4),
-        ("volRemaining", DbType::I4),
+        ("volEntered", DbType::I8),
+        ("volRemaining", DbType::I8),
         ("issueDate", DbType::FileTime),
-        ("minVolume", DbType::I4),
+        ("minVolume", DbType::I8),
         ("duration", DbType::I2),
         ("isCorp", DbType::Bool),
         ("escrow", DbType::R8),
@@ -89,27 +118,27 @@ pub(super) async fn my_orders(c: &Client) -> CallResult {
             header.row(&[
                 Value::Int(o.id),
                 Value::Int(o.type_id as i64),
-                Value::Int(me),
+                o.char_id.map(Value::Int).unwrap_or(Value::None),
                 Value::Int(o.at.region),
                 Value::Int(o.at.id),
                 Value::Int(o.at.system),
                 Value::Int(o.at.constellation),
                 Value::Int(o.range),
                 Value::Bool(o.bid),
-                Value::Float(o.price),
-                Value::Int(o.vol_entered as i64),
-                Value::Int(o.vol_remaining as i64),
-                Value::Int(o.issued),
-                Value::Int(o.min_volume as i64),
+                Value::Float(o.price.wire_isk()),
+                Value::Int(o.vol_entered),
+                Value::Int(o.vol_remaining),
+                Value::Int(o.issued.unwrap_or(fallback)),
+                Value::Int(o.min_volume),
                 Value::Int(o.duration),
-                Value::Bool(false),
-                Value::Float(o.escrow),
-                Value::Int(ACCOUNT_CASH as i64),
+                Value::Bool(o.corporation_id.is_some()),
+                Value::Float(o.escrow.wire_isk()),
+                Value::Int(i64::from(o.wallet_key)),
                 Value::Int(jumps(&c.sde.map, here, o.at.system, UNREACHABLE).unwrap_or(UNREACHABLE)),
             ])
         })
         .collect();
-    Ok(crowset(&header, lines))
+    crowset(&header, lines)
 }
 
 /// `GetMarketOrderHistory`: the character's closed orders of the last 90 days.
@@ -125,10 +154,10 @@ pub(super) async fn order_history(c: &Client) -> CallResult {
         ("range", DbType::I2),
         ("bid", DbType::Bool),
         ("price", DbType::R8),
-        ("volEntered", DbType::I4),
-        ("volRemaining", DbType::I4),
+        ("volEntered", DbType::I8),
+        ("volRemaining", DbType::I8),
         ("issueDate", DbType::FileTime),
-        ("minVolume", DbType::I4),
+        ("minVolume", DbType::I8),
         ("duration", DbType::I2),
         ("orderState", DbType::I4),
         ("lastStateChange", DbType::FileTime),
@@ -141,12 +170,12 @@ pub(super) async fn order_history(c: &Client) -> CallResult {
             header.row(&[
                 Value::Int(r.order_id),
                 Value::Int(r.type_id),
-                Value::Int(me),
+                Value::Int(r.char_id),
                 Value::Int(r.region_id),
                 Value::Int(r.station_id),
                 Value::Int(r.range),
                 Value::Bool(r.bid),
-                Value::Float(r.price),
+                Value::Float(r.price.wire_isk()),
                 Value::Int(r.vol_entered),
                 Value::Int(r.vol_remaining),
                 Value::Int(r.issued),
@@ -154,8 +183,8 @@ pub(super) async fn order_history(c: &Client) -> CallResult {
                 Value::Int(r.duration),
                 Value::Int(r.state),
                 Value::Int(r.closed),
-                Value::Bool(false),
-                Value::Int(ACCOUNT_CASH as i64),
+                Value::Bool(r.corporation_id.is_some()),
+                Value::Int(i64::from(r.wallet_key)),
             ])
         })
         .collect();
@@ -167,18 +196,31 @@ pub(super) async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let from = from.unwrap_or(filetime_now().saturating_sub(crate::config::game().market.transaction_history_days.saturating_mul(FILETIME_DAY)));
     let rows = listings::transactions(&c.db, me, from).await.map_err(db_err)?;
+    Ok(transaction_rows(&rows))
+}
+
+/// Corporate fills on each authorized wallet account side.
+pub(super) async fn corporation_transactions(c: &Client, from: Option<i64>, key: Option<i32>) -> CallResult {
+    let identity = crate::services::identity::Identity::of_client(c);
+    let keys = super::authorization::readable_divisions(&c.db, &identity, key).await?;
+    let from = from.unwrap_or(filetime_now().saturating_sub(crate::config::game().market.transaction_history_days.saturating_mul(FILETIME_DAY)));
+    let rows = listings::corporation_transactions(&c.db, identity.corp_id, &keys, from).await.map_err(db_err)?;
+    Ok(transaction_rows(&rows))
+}
+
+fn transaction_rows(rows: &[listings::Transaction]) -> Value {
     let header = DbRowDescriptor::new([
         ("transactionID", DbType::I8),
         ("transactionDate", DbType::FileTime),
         ("typeID", DbType::I4),
-        ("quantity", DbType::I4),
+        ("quantity", DbType::I8),
         ("price", DbType::R8),
         ("stationID", DbType::I8),
         ("buyerID", DbType::I8),
         ("sellerID", DbType::I8),
-        ("accountID", DbType::I4),
-        ("buyerAccountID", DbType::I4),
-        ("sellerAccountID", DbType::I4),
+        ("accountID", DbType::I8),
+        ("buyerAccountID", DbType::I8),
+        ("sellerAccountID", DbType::I8),
     ]);
     let lines = rows
         .iter()
@@ -188,24 +230,30 @@ pub(super) async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
                 Value::Int(r.date),
                 Value::Int(r.type_id),
                 Value::Int(r.quantity),
-                Value::Float(r.price),
+                Value::Float(r.price.wire_isk()),
                 Value::Int(r.station_id),
                 Value::Int(r.buyer_id),
                 Value::Int(r.seller_id),
-                Value::Int(ACCOUNT_CASH as i64),
-                Value::Int(ACCOUNT_CASH as i64),
-                Value::Int(ACCOUNT_CASH as i64),
+                r.account_id.map(Value::Int).unwrap_or(Value::None),
+                r.buyer_account_id.map(Value::Int).unwrap_or(Value::None),
+                r.seller_account_id.map(Value::Int).unwrap_or(Value::None),
             ])
         })
         .collect();
-    Ok(crowset(&header, lines))
+    crowset(&header, lines)
 }
 
 /// `GetCharEscrow`: ISK held by buy orders, and the value of items held by sell orders.
 pub(super) async fn escrow(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let r = listings::escrow(&c.db, me).await.map_err(db_err)?;
-    Ok(keyval([("iskEscrow", Value::Float(r.isk)), ("itemsEscrow", Value::Float(r.items))]))
+    Ok(keyval([("iskEscrow", Value::Float(aggregate_wire(&r.isk)?)), ("itemsEscrow", Value::Float(aggregate_wire(&r.items)?))]))
+}
+
+fn aggregate_wire(value: &str) -> Result<f64, CallError> {
+    let number: f64 = value.parse().map_err(|e| CallError::Internal(anyhow::anyhow!("invalid market aggregate: {e}")))?;
+    if !number.is_finite() { return Err(CallError::Internal(anyhow::anyhow!("non-finite market aggregate"))); }
+    Ok(number)
 }
 
 pub(super) fn history_header() -> DbRowDescriptor {
@@ -225,13 +273,21 @@ pub(super) async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMa
     let region = c.session.int("regionid").unwrap_or(0);
     let today = today();
     let rows = listings::price_history(&c.db, region, type_ids, FILETIME_DAY, today.saturating_sub(crate::config::game().market.price_history_days.saturating_mul(FILETIME_DAY))).await.map_err(db_err)?;
+    history_rows(type_ids, today, &rows)
+}
+
+fn history_rows(type_ids: &[i32], today: i64, rows: &[listings::PriceHistory]) -> Result<HashMap<i32, (Value, Value)>, CallError> {
     let header = history_header();
     let mut days: HashMap<i32, (Vec<Value>, Vec<Value>)> = type_ids.iter().map(|t| (*t, (vec![], vec![]))).collect();
-    for r in &rows {
+    for r in rows {
         let (type_id, day) = (r.type_id, r.day);
-        let row = header.row(&[Value::Int(day), Value::Float(r.low), Value::Float(r.high), Value::Float(r.average), Value::Int(r.volume), Value::Int(r.count)]);
+        let count = i32::try_from(r.count).map_err(|_| CallError::Internal(anyhow::anyhow!("market history order count exceeds protocol width")))?;
+        let row = header.row(&[Value::Int(day), Value::Float(r.low.wire_isk()), Value::Float(r.high.wire_isk()), Value::Float(aggregate_wire(&r.average)?), Value::Int(r.volume.min(i128::from(i64::MAX)) as i64), Value::Int(i64::from(count))]);
         let (old, new) = days.entry(type_id).or_default();
         (if day < today { old } else { new }).push(row);
     }
     Ok(days.into_iter().map(|(t, (old, new))| (t, (crowset(&header, old), crowset(&header, new)))).collect())
 }
+
+#[cfg(test)]
+mod tests;

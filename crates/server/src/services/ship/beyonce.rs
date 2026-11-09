@@ -2,7 +2,55 @@
 //! Belt rats spawn after actual warp exit; pending callbacks do not survive cancellation or restart.
 //! Explicit stop and movement commands cancel an arrival jump cloak.
 //! Warp target visibility comes from the space actor, independently of client observers.
+//! Point and bookmark navigation and diagnostics use the current system actor;
+//! bookmark access is resolved by the bookmark service.
+//! `michelle.py` receives a refusal for tutorial site positions; tutorial instances
+//! are not modelled and that query uses no data or space state.
 use super::*;
+use crate::client::short;
+use tracing::warn;
+
+fn wants_fleet(call: &Call<'_>) -> bool {
+    call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0))
+}
+
+async fn fleet_order(c: &Client, call: &Call<'_>) -> Result<Option<super::super::fleets::warp::Order>, CallError> {
+    if wants_fleet(call) {
+        super::super::fleets::warp::authorize(c).await.map(Some)
+    } else {
+        Ok(None)
+    }
+}
+fn lifecycle_args<const N: usize>(c: &Client, call: &Call<'_>) -> Result<[i64; N], CallError> {
+    let invalid = || super::super::notify_error(infinity_core::messages::STRUCTURE_OPERATION_INVALID);
+    let system = c.session.int("solarsystemid").ok_or_else(invalid)?;
+    if !call.bound || c.session.int("stationid").is_some()
+        || !matches!(call.bind_params, Some(Value::Int(id)) if *id == system)
+        || !(matches!(call.kwargs, Value::None) || matches!(call.kwargs, Value::Dict(v) if v.is_empty()))
+        || call.args.len() != N { return Err(invalid()); }
+    let mut ids = [0; N];
+    for (id, value) in ids.iter_mut().zip(call.args) {
+        match value { Value::Int(value) if *value > 0 => *id = *value, _ => return Err(invalid()) }
+    }
+    Ok(ids)
+}
+
+async fn lifecycle_command(c: &Client, call: &Call<'_>) -> CallResult {
+    let resources = crate::services::sovereignty::Resources { db: c.db.clone(), sde: c.sde.clone(), world: c.world.clone() };
+    let identity = Identity::of_client(c);
+    match call.method {
+        "CmdTransferCorpAssetOwnership" => {
+            let [item, old_owner, new_owner] = lifecycle_args(c, call)?;
+            crate::services::sovereignty::lifecycle::transfer(resources, identity, item, old_owner, new_owner).await?;
+        }
+        _ => {
+            let [item] = lifecycle_args(c, call)?;
+            crate::services::sovereignty::lifecycle::destruct(resources, identity, item, call.method == "CmdSelfDestructStructure").await?;
+        }
+    }
+    Ok(Value::None)
+}
+
 
 pub(crate) fn stop(identity: &Identity, world: &space::World, space_system: Option<i64>) -> CallResult {
     movement(identity, world, space_system, |b, t, _| {
@@ -77,14 +125,16 @@ pub(crate) async fn warp_to_ball(
         Value::dict([("celestialID", Value::Int(id))])
     } else { Value::Dict(vec![]) };
     match warp_in {
-        Some(point) => warp_destination(identity, db, world, space_system, order, None, point, min_range, on_exit, destination).await,
-        None => warp_destination(identity, db, world, space_system, order, Some((pos, radius)), pos, min_range, on_exit, destination).await,
+        Some(point) => warp_destination(identity, db, world, space_system, order, WarpDestination::Ordinary { point, object_radius: None, min_range }, on_exit, destination).await,
+        None => warp_destination(identity, db, world, space_system, order, WarpDestination::Ordinary { point: pos, object_radius: Some(radius), min_range }, on_exit, destination).await,
     }
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let a = call.args;
     Some(match (call.service, call.method) {
+        ("beyonce", "CmdTransferCorpAssetOwnership" | "CmdSelfDestructStructure" | "CmdAbortSelfDestructStructure") => lifecycle_command(c, call).await,
+        ("beyonce", "GetOperationSpawnpointPosition") => Err(super::super::notify_error(infinity_core::messages::npe::OPERATION_SITE_UNAVAILABLE)),
         ("beyonce", "BookmarkLocation") => super::super::bookmarks::beyonce::space_location(c, call).await,
         ("beyonce", "BookmarkScanResult") => super::super::bookmarks::beyonce::scan_result(c, call).await,
         // fleetSvc.py:GetFleetLocationAndInfo reads each member's pos as an (x, y, z) tuple.
@@ -94,6 +144,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         // menusvc.py:TagItem sends (itemID, tag); a None tag clears via OnFleetStateChange.
         ("beyonce", "CmdFleetTagTarget") => super::super::fleets::space_state::tag(c, call).await,
         ("beyonce", "UpdateStateRequest") => send_state(c).await.map(|_| Value::None),
+        ("beyonce", "CmdGotoPoint") => navigation::goto_point(c, [f(a.first()), f(a.get(1)), f(a.get(2))]),
+        ("beyonce", "CmdGotoBookmark") => navigation::goto_bookmark(c, a.first().and_then(|v| v.as_int()).unwrap_or(0)).await,
+        ("beyonce", "CmdFleetRegroup") => super::super::fleets::navigation::regroup(c).await,
+        ("beyonce", "AdminGetBubbleID") => navigation::bubble_id(c).await,
+        ("beyonce", "GetRelativity") => navigation::relativity(c, [f(a.first()), f(a.get(1)), f(a.get(2))]).await,
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
             if !dir.iter().all(|v| v.is_finite()) { return Some(Ok(Value::None)); }
@@ -105,6 +160,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             })
         }
         ("beyonce", "CmdAlignTo") => {
+            if let Some(id) = call.kwargs.get("bookmarkID").and_then(|v| v.as_int()) {
+                return Some(navigation::align_bookmark(c, id).await);
+            }
             let target = call.kwargs.get("dstID").and_then(|v| v.as_int()).or_else(|| a.first().and_then(|v| v.as_int()));
             movement(&Identity::of_client(c), &c.world, c.session.int("solarsystemid"), move |b, t, others| {
                 let Some(tp) = target.and_then(|id| others.ball(id)).map(|o| o.pos) else { return vec![] };
@@ -139,15 +197,25 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdWarpToStuff") if a.first().and_then(|v| v.as_text()).as_deref() == Some("scan") => {
             let target = a.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
-            let order = if call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
-                match super::super::fleets::warp::authorize(c).await { Ok(order) => Some(order), Err(err) => return Some(Err(err)) }
-            } else { None };
+            let order = match fleet_order(c, call).await { Ok(order) => order, Err(err) => return Some(Err(err)) };
             crate::services::exploration::warp_to_scan(c, &target, min_range, order).await
         }
-        ("beyonce", "CmdWarpToStuff") | ("beyonce", "CmdWarpToStuffAutopilot") => {
-            let order = if call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
-                match super::super::fleets::warp::authorize(c).await { Ok(order) => Some(order), Err(err) => return Some(Err(err)) }
-            } else { None };
+        ("beyonce", "CmdWarpToStuff") if a.first().and_then(|v| v.as_text()).as_deref() == Some("bookmark") => {
+            let id = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
+            let fleet = wants_fleet(call);
+            navigation::warp_bookmark(c, id, min_range, fleet).await
+        }
+        ("beyonce", "CmdWarpToStuffAutopilot") if a.len() == 1 => {
+            let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let order = match fleet_order(c, call).await { Ok(order) => order, Err(err) => return Some(Err(err)) };
+            let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
+            warp_to_ball(&Identity::of_client(c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"),
+                c.login.user_id, target, false, min_range, order).await
+        }
+        ("beyonce", "CmdWarpToStuff") | ("beyonce", "CmdWarpToStuffAutopilot")
+            if matches!(a.first().and_then(|v| v.as_text()).as_deref(), Some("item" | "char")) => {
+            let order = match fleet_order(c, call).await { Ok(order) => order, Err(err) => return Some(Err(err)) };
             let target = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
             // 'char': a fleet member's ship.
@@ -155,6 +223,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             warp_to_ball(&Identity::of_client(c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"),
                 c.login.user_id, target, by_pilot, min_range, order).await
         }
+        // Other subject kinds require their own authoritative destination resolver.
+        ("beyonce", "CmdWarpToStuff") | ("beyonce", "CmdWarpToStuffAutopilot") => Ok(Value::None),
         ("beyonce", "CmdStargateJump") => {
             let from_gate = a.first().and_then(|v| v.as_int()).unwrap_or(0);
             let to_gate = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
@@ -170,13 +240,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 Ok(change) => {
                     info!(user = c.login.user_id, "ship {} docked at {station}", identity.ship_id.unwrap());
                     c.change_session(change.updates);
-                    if let Some(event) = change.event {
-                        let mut outbox = Outbox::default();
-                        outbox.event(event);
-                        dispatch_client((), outbox, c).map(|_| Value::None)
-                    } else {
-                        Ok(Value::None)
-                    }
+                    Ok(Value::None)
                 }
                 Err(error) => Err(error),
             }

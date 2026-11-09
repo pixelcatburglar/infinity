@@ -30,7 +30,7 @@ pub(in crate::services) async fn begin_tx<E>(ex: &(impl Executor + ?Sized), outb
 
 /// Finish after the body mutations, with the same locks and timestamp as `begin_tx`.
 /// Notifications are queued in the transaction and dispatched by the caller.
-pub(in crate::services) async fn finish_tx<E: From<OnlineChanged> + Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, owner: i64, now: i64, mut change: BodyChange, implants_changed: bool, boosters_changed: bool) -> Result<(), CallError> {
+pub(in crate::services) async fn finish_tx<E: From<OnlineChanged> + Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, fences: &crate::services::effects::online::OnlineFences, owner: i64, now: i64, mut change: BodyChange, implants_changed: bool, boosters_changed: bool) -> Result<(), CallError> {
     training::retime_after_change_tx(ex, sde, owner, now, &change.before, &mut change.progress).await?;
     change.progress.brain_changed |= implants_changed || boosters_changed;
     change.progress.boosters_changed |= boosters_changed;
@@ -42,7 +42,7 @@ pub(in crate::services) async fn finish_tx<E: From<OnlineChanged> + Send>(ex: &(
         }
     }
     if implants_changed { outbox.notify_pilot(owner, "OnServerImplantsChanged", vec![]); }
-    completion::finish_tx(ex, outbox, sde, owner, now, &change.progress, &[]).await
+    completion::finish_tx(ex, outbox, sde, fences, owner, now, &change.progress, &[]).await
 }
 
 #[cfg(test)] mod tests;

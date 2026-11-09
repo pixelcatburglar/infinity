@@ -1,11 +1,11 @@
 //! Decode and route requests from `requestBroker.py:new_eve_public_request`.
-//! Uses embedded descriptors and gateway handlers, not World; unclaimed CDN
-//! requests have no payload and other unclaimed requests receive defaults.
+//! Uses embedded descriptors, gateway handlers and scoped Lua daily-goal calls;
+//! unclaimed CDN requests have no payload and other unclaimed requests receive defaults.
 use prost_reflect::{DynamicMessage, ReflectMessage};
 use tracing::{debug, info, warn};
 use super::{Gateway, Caller, context::HandlerContext, handlers, protocol::{Request, Response, now_timestamp}, message::{message, pack, response_name, type_name}, fallback::{known_ids, fill_defaults}};
 use super::error::{FailureCode, GatewayError};
-use crate::messages::gateway as text;
+use infinity_core::messages::gateway as text;
 
 /// Server limit for gateway request log excerpts, in bytes.
 const LOG_EXCERPT_LEN: usize = 300;
@@ -32,7 +32,18 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&su
         return rsp;
     };
     let name = type_name(&any.type_url).to_string();
+    if super::daily_goals::owns(&name)
+        && (!super::daily_goals::supported(&name)
+            || (name == super::daily_goals::ADMIN_PROGRESS && req.correlation_uuid.len() != infinity_core::consts::UUID_LEN))
+    {
+        apply_error(&mut rsp, &name, super::daily_goals::unavailable(&name, &req.correlation_uuid));
+        return rsp;
+    }
     let Some(desc) = message(&name) else {
+        if super::daily_goals::owns(&name) {
+            apply_error(&mut rsp, &name, GatewayError::Internal(anyhow::anyhow!("daily goal request descriptor unavailable")));
+            return rsp;
+        }
         warn!("gateway: unknown request type {name}");
         rsp.status_code = FailureCode::BadRequest.status();
         rsp.status_message = text::INVALID_REQUEST.into();
@@ -59,7 +70,12 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&su
             lease.bind(&session, |id| gw.world.online_session(id));
         }
     }
-    match handlers::handle(&context, &name, &payload).await {
+    let dispatch = if super::daily_goals::owns(&name) {
+        handlers::Dispatch::Claimed(super::daily_goals::handle(&context, &gw.world, &name, &payload, &req.correlation_uuid).await)
+    } else {
+        handlers::handle(&context, &name, &payload).await
+    };
+    match dispatch {
         handlers::Dispatch::Claimed(Ok(out)) => {
             info!("gateway: {name} (char {:?}) -> {}", caller.character_id, out.descriptor().full_name());
             rsp.payload = Some(pack(&out));

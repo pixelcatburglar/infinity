@@ -14,6 +14,8 @@ pub mod social;
 pub mod expert_systems;
 #[path = "gm.rs"]
 pub mod gm;
+#[path = "daily_goals.rs"]
+pub mod daily_goals;
 
 pub(super) fn duration(key: &str, value: i64, unit: i64, future: bool) -> Result<()> {
     let ticks = value.checked_mul(unit);
@@ -51,7 +53,7 @@ impl SalvageConfig {
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.salvage_material_stacks > 0, "salvage.salvage_material_stacks={} must be positive", self.salvage_material_stacks);
         anyhow::ensure!(self.salvage_quantity_min > 0, "salvage.salvage_quantity_min={} must be positive", self.salvage_quantity_min);
-        anyhow::ensure!(self.salvage_quantity_max >= self.salvage_quantity_min && self.salvage_quantity_max <= i32::MAX as u32, "salvage.salvage_quantity_max={} must be at least the minimum and fit an item quantity", self.salvage_quantity_max);
+        anyhow::ensure!(self.salvage_quantity_max >= self.salvage_quantity_min, "salvage.salvage_quantity_max={} must be at least the minimum", self.salvage_quantity_max);
         Ok(())
     }
 }
@@ -114,6 +116,8 @@ pub struct GameConfig {
     pub expert_systems: expert_systems::ExpertSystemsConfig,
     /// GM spawn policy.
     pub gm: gm::GmConfig,
+    /// Daily goals runtime policy.
+    pub daily_goals: daily_goals::DailyGoalsConfig,
 }
 
 impl GameConfig {
@@ -143,6 +147,7 @@ impl GameConfig {
         self.mail.validate()?;
         self.calendar.validate()?;
         self.space.validate()?;
+        self.daily_goals.validate()?;
         self.gm.validate()?;
         Ok(())
     }

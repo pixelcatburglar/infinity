@@ -5,13 +5,13 @@ use super::corporate_fixture as f;
 #[tokio::test]
 #[ignore = "requires a dedicated test database with SDE"]
 async fn requested_nested_active_blueprints_refuse_personal_and_corporate_acceptance() {
-    use crate::consts::{INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY};
+    use infinity_core::consts::{INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY};
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let root_type = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let root_type = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let bp_type = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(9)).unwrap().type_id;
     let issuer = f::setup(&db, station_id, station_type).await;
     let buyer = f::setup(&db, station_id, station_type).await;
@@ -57,8 +57,8 @@ async fn requested_nested_active_blueprints_refuse_personal_and_corporate_accept
                 let before_issuer = f::fingerprint(&db, issuer).await;
                 match accept(&client, id, corporate).await {
                     Err(CallError::User { msg, dict }) => {
-                        assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-                        assert_eq!(dict, vec![("notify".into(), Value::unicode(crate::messages::industry::BLUEPRINT_ACTIVE))]);
+                        assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                        assert_eq!(dict, vec![("notify".into(), Value::unicode(infinity_core::messages::industry::BLUEPRINT_ACTIVE))]);
                     }
                     _ => panic!("expected active blueprint refusal"),
                 }
@@ -72,8 +72,8 @@ async fn requested_nested_active_blueprints_refuse_personal_and_corporate_accept
                 assert!(issuer_rx.try_recv().is_err());
             }
         }
-        client.world.unregister_pilot(buyer.actor.character);
-        client.world.unregister_pilot(issuer.actor.character);
+        client.world.unregister_pilot_generation(buyer.actor.character, None);
+        client.world.unregister_pilot_generation(issuer.actor.character, None);
     }).await;
     f::cleanup(&db, buyer).await;
     f::cleanup(&db, issuer).await;

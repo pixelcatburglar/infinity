@@ -2,8 +2,11 @@ use super::*;
 
 mod acceptance;
 mod budget;
+pub(crate) mod daily_goals;
 mod fixture;
 mod roots;
+mod sovereignty;
+pub(crate) mod ship_adaption;
 
 #[tokio::test]
 async fn event_handlers_continue_in_order_after_errors_and_budget_exhaustion() -> mlua::Result<()> {
@@ -15,7 +18,7 @@ async fn event_handlers_continue_in_order_after_errors_and_budget_exhaustion() -
         handlers.push(Handler { script: "test".into(), function: lua.load(source).eval()? });
     }
     claims.events.insert("BallparkBound".into(), handlers);
-    let registry = Registry { lua, claims, overrides: std::sync::Mutex::new(Default::default()) };
+    let registry = Registry { lua, claims, content: Default::default(), overrides: std::sync::Mutex::new(Default::default()) };
     let config = crate::config::lua::LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..Default::default() };
     for _ in 0..2 {
         invoke_event(&registry, &config, &events::GameEvent::BallparkBound { char_id: 3, system_id: 9 }).await;

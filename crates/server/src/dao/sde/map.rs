@@ -77,6 +77,7 @@ impl Celestial {
             y: row.get("y"),
             z: row.get("z"),
             radius: row.get("radius"),
+            celestial_index: row.get("celestial_index"),
         }
     }
 }
@@ -125,8 +126,11 @@ pub(crate) async fn stations(ex: &(impl Executor + ?Sized)) -> Result<Vec<Statio
     Ok(ex.query("SELECT station_id::bigint, type_id::bigint, owner_id::bigint, solar_system_id::bigint, constellation_id::bigint, region_id::bigint, operation_id::bigint, x::float8, y::float8, z::float8, security::float8 FROM sde.sta_stations ORDER BY station_id", &[]).await?.iter().map(Station::from_row).collect())
 }
 pub(crate) async fn celestials(ex: &(impl Executor + ?Sized)) -> Result<Vec<Celestial>, db::Error> {
-    Ok(ex.query("SELECT item_id::bigint, type_id::bigint, solar_system_id::bigint, group_id::bigint, x::float8, y::float8, z::float8, radius::float8 FROM sde.map_celestials ORDER BY item_id", &[]).await?.iter().map(Celestial::from_row).collect())
+    Ok(ex.query("SELECT item_id::bigint, type_id::bigint, solar_system_id::bigint, group_id::bigint, x::float8, y::float8, z::float8, radius::float8, celestial_index::bigint FROM sde.map_celestials ORDER BY item_id", &[]).await?.iter().map(Celestial::from_row).collect())
 }
 pub(crate) async fn jumps(ex: &(impl Executor + ?Sized)) -> Result<Vec<Jump>, db::Error> {
     Ok(ex.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps ORDER BY from_solar_system_id, to_solar_system_id", &[]).await?.iter().map(Jump::from_row).collect())
 }
+
+#[cfg(test)]
+mod tests;

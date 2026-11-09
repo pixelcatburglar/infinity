@@ -1,6 +1,7 @@
 //! Custody transition regressions against initialized static and game data.
 use super::*;
-use crate::{client::filetime_now, consts::{CATEGORY_IMPLANT, GROUP_BOOSTER}, dao::items::transfers, services::tests::{client, fixture}};
+use infinity_core::{consts::{CATEGORY_IMPLANT, GROUP_BOOSTER}};
+use crate::{client::filetime_now, dao::items::transfers, services::tests::{client, fixture}};
 mod acceptance;
 /// inventorycommon.const.stationServiceJumpCloneFacility.
 const JUMP_CLONE_FACILITY: i32 = 24;
@@ -11,12 +12,14 @@ async fn body_round_trip_retains_real_item_and_override() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let fixture = fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
     let (client, _peer) = client(db.clone(), fixture.character).await;
     let sde = client.sde.clone();
     let implant = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_IMPLANT) && t.group_id != Some(GROUP_BOOSTER) && t.attribute(ATTR_IMPLANTNESS).is_some_and(|v| v > 0.0 && v.fract() == 0.0) && t.attribute(ATTR_FOLLOWS_JUMP_CLONES).unwrap_or(0.0) == 0.0).expect("ordinary implant");
     let slot = implant.attribute(ATTR_IMPLANTNESS).unwrap() as i32;
     let kind = implant.type_id;
     let owner = fixture.character;
+    let fences = online::capture_online_fences(&client.world, &[owner]).await;
     let _market = crate::services::market::lock().await;
     let config = crate::config::tests::test_database();
     let (mut pg, connection) = config.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
@@ -32,7 +35,7 @@ async fn body_round_trip_retains_real_item_and_override() {
     let now = filetime_now();
     let mut effects = Outbox::<OnlineChanged>::default();
     let change = body_change::begin_tx(&tx, &mut effects, &sde, owner, now).await.unwrap();
-    swap_body_into_source_tx(&tx, &mut effects, &sde, &id, &target, &source, now, change).await.unwrap();
+    swap_body_into_source_tx(&tx, &mut effects, &sde, &fences, &id, &target, &source, now, change).await.unwrap();
     assert!(brain::get(&tx, owner, item).await.unwrap().is_none());
     let parked = custody::list(&tx, owner, source.clone_id).await.unwrap();
     assert_eq!(parked.len(), 1);
@@ -40,12 +43,14 @@ async fn body_round_trip_retains_real_item_and_override() {
     assert_eq!(custody::overrides(&tx, owner, source.clone_id, &[item]).await.unwrap()[0].value, 0.0);
     let second_source = clones::create(&tx, owner, 3).await.unwrap();
     let change = body_change::begin_tx(&tx, &mut effects, &sde, owner, now).await.unwrap();
-    swap_body_into_source_tx(&tx, &mut effects, &sde, &id, &source, &second_source, now, change).await.unwrap();
+    swap_body_into_source_tx(&tx, &mut effects, &sde, &fences, &id, &source, &second_source, now, change).await.unwrap();
     let restored = brain::get(&tx, owner, item).await.unwrap().unwrap();
     assert_eq!((restored.item_id, restored.slot, restored.activated_at), (item, Some(slot), Some(42)));
     assert_eq!(dogma::overrides(&tx, item).await.unwrap()[0].value, 0.0);
     tx.rollback().await.unwrap();
+    }).await;
     fixture::cleanup(&db, fixture).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -54,6 +59,7 @@ async fn same_station_consumes_target_and_replay_does_not_debit() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let fixture = fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
     let (client, _peer) = client(db.clone(), fixture.character).await;
     let sde = client.sde.clone();
     let station = sde.map.stations().find(|station| {
@@ -61,6 +67,7 @@ async fn same_station_consumes_target_and_replay_does_not_debit() {
             && station.solar_system_id.and_then(|id| sde.map.system(id)).is_some_and(|system| system.faction_id.is_none_or(|faction| sde.map.required_station_standing(faction, JUMP_CLONE_FACILITY).is_none()))
             && station.constellation_id.is_some() && station.region_id.is_some()
     }).expect("unrestricted NPC station").station_id;
+    let fences = online::capture_online_fences(&client.world, &[fixture.character]).await;
     let _market = crate::services::market::lock().await;
     let config = crate::config::tests::test_database();
     let (mut pg, connection) = config.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
@@ -73,25 +80,25 @@ async fn same_station_consumes_target_and_replay_does_not_debit() {
     let id = Identity { char_id: owner, ship_id: Some(capsule), corp_id: 0, station_id: Some(station), system_id: None };
     let now = filetime_now();
     let mut outbox = Outbox::default();
-    assert!(jump_tx(&tx, &mut outbox, &sde, &id, station, target.clone_id, f64::NAN, false, now).await.is_err());
-    assert!(jump_tx(&tx, &mut outbox, &sde, &id, station, target.clone_id + 1, policy::service_fee(), false, now).await.is_err());
+    assert!(jump_tx(&tx, &mut outbox, &sde, &fences, &id, station, target.clone_id, f64::NAN, false, now).await.is_err());
+    assert!(jump_tx(&tx, &mut outbox, &sde, &fences, &id, station, target.clone_id + 1, policy::service_fee(), false, now).await.is_err());
     if policy::service_fee() > 0.0 {
         let save = tx.savepoint("insufficient_funds").await.unwrap();
         save.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&owner]).await.unwrap();
         let mut failed_effects = Outbox::default();
-        assert!(jump_tx(&save, &mut failed_effects, &sde, &id, station, target.clone_id, policy::service_fee(), false, now).await.is_err());
+        assert!(jump_tx(&save, &mut failed_effects, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), false, now).await.is_err());
         assert_eq!(clones::clones(&save, owner).await.unwrap().len(), 1);
         save.rollback().await.unwrap();
     }
     let save = tx.savepoint("injected_failure").await.unwrap();
     let mut discarded = Outbox::default();
-    jump_tx(&save, &mut discarded, &sde, &id, station, target.clone_id, policy::service_fee(), false, now).await.unwrap();
+    jump_tx(&save, &mut discarded, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), false, now).await.unwrap();
     assert!(save.execute("SELECT 1 / 0", &[]).await.is_err());
     save.rollback().await.unwrap();
     assert_eq!(clones::clones(&tx, owner).await.unwrap()[0].clone_id, target.clone_id);
     assert_eq!(clones::lock_character(&tx, owner).await.unwrap().unwrap().ship_id, Some(capsule));
     let before: f64 = tx.query_one("SELECT balance::float8 AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("balance");
-    let result = jump_tx(&tx, &mut outbox, &sde, &id, station, target.clone_id, policy::service_fee(), false, now).await.unwrap();
+    let result = jump_tx(&tx, &mut outbox, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), false, now).await.unwrap();
     assert_ne!(result.capsule, capsule);
     let rows = clones::clones(&tx, owner).await.unwrap();
     assert_eq!(rows.len(), 1);
@@ -100,11 +107,13 @@ async fn same_station_consumes_target_and_replay_does_not_debit() {
     assert_eq!(state.last_clone_jump, Some(42));
     let balance: f64 = tx.query_one("SELECT balance::float8 AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("balance");
     assert_eq!(balance, before - policy::service_fee());
-    assert!(jump_tx(&tx, &mut outbox, &sde, &id, station, target.clone_id, policy::service_fee(), true, now).await.is_err());
+    assert!(jump_tx(&tx, &mut outbox, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), true, now).await.is_err());
     let after: f64 = tx.query_one("SELECT balance::float8 AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("balance");
     assert_eq!(after, balance);
     tx.rollback().await.unwrap();
+    }).await;
     fixture::cleanup(&db, fixture).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -113,6 +122,7 @@ async fn cross_station_confirmation_and_round_trip_preserve_current_property() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let fixture = fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
     let (client, _peer) = client(db.clone(), fixture.character).await;
     let sde = client.sde.clone();
     let stations: Vec<_> = sde.map.stations().filter(|station| {
@@ -125,6 +135,7 @@ async fn cross_station_confirmation_and_round_trip_preserve_current_property() {
     let implant = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_IMPLANT) && t.group_id != Some(GROUP_BOOSTER) && t.attribute(ATTR_IMPLANTNESS).is_some_and(|v| v > 0.0 && v.fract() == 0.0) && t.attribute(ATTR_FOLLOWS_JUMP_CLONES).unwrap_or(0.0) == 0.0).unwrap();
     let kind = implant.type_id;
     let slot = implant.attribute(ATTR_IMPLANTNESS).unwrap() as i32;
+    let fences = online::capture_online_fences(&client.world, &[fixture.character]).await;
     let _market = crate::services::market::lock().await;
     let config = crate::config::tests::test_database();
     let (mut pg, connection) = config.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
@@ -143,12 +154,12 @@ async fn cross_station_confirmation_and_round_trip_preserve_current_property() {
     let id = Identity { char_id: owner, ship_id: Some(capsule), corp_id: 0, station_id: Some(a), system_id: None };
     let now = filetime_now();
     let mut outbox = Outbox::default();
-    let error = jump_tx(&tx, &mut outbox, &sde, &id, b, target.clone_id, policy::service_fee(), false, now).await.err().unwrap();
+    let error = jump_tx(&tx, &mut outbox, &sde, &fences, &id, b, target.clone_id, policy::service_fee(), false, now).await.err().unwrap();
     assert!(matches!(error, CallError::User { msg, dict } if msg == messages::clones::MSG_JUMP_CHECK_WILL_LOSE_EXISTING_CLONE && dict.is_empty()));
     assert_eq!(clones::clones(&tx, owner).await.unwrap().len(), 2);
     assert_eq!(custody::list(&tx, owner, existing.clone_id).await.unwrap()[0].item_id, lost);
     assert_eq!(tx.query_one("SELECT balance::float8 AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get::<_, f64>("balance"), balance);
-    let result = jump_tx(&tx, &mut outbox, &sde, &id, b, target.clone_id, policy::service_fee(), true, now).await.unwrap();
+    let result = jump_tx(&tx, &mut outbox, &sde, &fences, &id, b, target.clone_id, policy::service_fee(), true, now).await.unwrap();
     assert!(tx.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&lost]).await.unwrap().is_none());
     let rows = clones::clones(&tx, owner).await.unwrap();
     assert_eq!(rows.len(), 1);
@@ -158,10 +169,12 @@ async fn cross_station_confirmation_and_round_trip_preserve_current_property() {
     assert_eq!(custody::list(&tx, owner, return_target).await.unwrap()[0].item_id, item);
     tx.execute("UPDATE game.characters SET last_clone_jump=NULL WHERE character_id=$1", &[&owner]).await.unwrap();
     let back_id = Identity { char_id: owner, ship_id: Some(result.capsule), corp_id: 0, station_id: Some(b), system_id: None };
-    jump_tx(&tx, &mut outbox, &sde, &back_id, a, return_target, policy::service_fee(), false, now).await.unwrap();
+    jump_tx(&tx, &mut outbox, &sde, &fences, &back_id, a, return_target, policy::service_fee(), false, now).await.unwrap();
     let restored = brain::get(&tx, owner, item).await.unwrap().unwrap();
     assert_eq!((restored.item_id, restored.slot, restored.activated_at), (item, Some(slot), Some(42)));
     assert_eq!(dogma::overrides(&tx, item).await.unwrap()[0].value, 0.0);
     tx.rollback().await.unwrap();
+    }).await;
     fixture::cleanup(&db, fixture).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

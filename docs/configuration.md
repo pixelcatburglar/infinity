@@ -2,7 +2,7 @@
 
 The server reads `config.toml` from its working directory, or the file named by the `CONFIG` environment variable. Every key is optional: a missing file means the built-in defaults, and `config.example.toml` lists every key with its default and where the default comes from. The file is read once at start; changes need a restart. `docker-compose.yml` mounts `config.example.toml` as `/config.toml` and sets `DATABASE_URL`, `RUST_LOG` and `SYSTEM_CAPACITY`.
 
-A deployment key can also be set by its environment variable, which wins over the file; the file wins over the default. Game keys have no environment variables.
+Documented environment overrides, including the operational mining and daily goals settings, win over the file; the file wins over the default. Game keys without a documented environment override are set only in the file.
 
 The game sections, `[accounts]` through `[space]`, set the server's own rules: starting balances, fees and taxes, timers, limits, rewards, and spawn ranges and sizes. Their defaults are the values the server used before the file existed. Values the client checks itself, values from the static data, and the destiny physics constants cannot be changed. `characters.starting_isk` accepts 0 to 9,999,999,999,999.99 (an amount with more than 15 significant digits would not be stored exactly); `accounts.starting_plex` accepts 0 to 9,223,372,036,854,775,807.
 
@@ -13,10 +13,11 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `database.url` | `DATABASE_URL` | empty | PostgreSQL connection string or URL. When set, it wins over the five fields below. Keep passwords in the environment, not in the file. |
 | `database.host`, `.port`, `.user`, `.password`, `.name` | `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_NAME` | `127.0.0.1`, `5432`, `infinity`, empty, `infinity` | Connection used when `database.url` is empty |
 | `database.pool_size` | `DATABASE_POOL_SIZE` | `16` | Maximum number of PostgreSQL connections the server opens. Keep it below the server's `max_connections` (PostgreSQL's default is 100), leaving room for tools. |
+| `mining.progress_aggregation_secs` / `.progress_batch_rows` | `MINING_PROGRESS_AGGREGATION_SECS` / `MINING_PROGRESS_BATCH_ROWS` | `1` / `256` | Positive aggregation interval in seconds and maximum source rows per scheduled transaction. |
 | `database.application_name` | | `infinity-server` | Connection name shown in `pg_stat_activity` |
 | `database.connect_timeout_secs` / `.checkout_timeout_secs` | | `5` / `30` | Time limit for one connection attempt, and for waiting for a free pooled connection (`0` = wait forever) |
 | `database.startup_retry_secs` | | `[1, 16]` | First and longest wait between connection attempts at start; the wait doubles |
-| `database.schema_on_start` | | `true` | Apply `game_schema.sql` at every start. With `false` the server skips it and logs a warning; the schema must then already exist. |
+| `database.schema_on_start` | | `true` | Apply `game_schema.sql` and run the market cutover at start. Before setting `false`, complete at least one startup with `true`; manually applying DDL alone does not bind legacy player orders or complete the Rust cutover. With `false` startup refuses a missing cutover completion marker; the operator is responsible for the schema. |
 | `scheduler.poll_secs`, `.lease_secs`, `.max_concurrent` | | `5`, `60`, `8` | Scheduled jobs (market order expiry, auction settlement, bills): the longest wait before due jobs are picked up, how long a claimed job may run before another start may reclaim it (must exceed `poll_secs`), and how many run at once |
 | `scheduler.retry_base_secs`, `.dead_letter_attempts`, `.drain_secs` | | `30`, `25`, `10` | A failed job is retried after `retry_base_secs`, doubling up to 256 times that; a one-off job that fails `dead_letter_attempts` times stops and is kept for `/jobs`. The periodic jobs are never stopped. `drain_secs` bounds the wait for running jobs at shutdown. |
 | `server.public_host` | `PUBLIC_HOST` | `127.0.0.1` | Address clients use to reach this host (image server and CDN URLs). Set it when clients are not local. |
@@ -39,6 +40,7 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `lua.memory_limit_mb`, `.call_budget_ms`, `.call_budget_instructions`, `.instruction_hook_interval` | | `64`, `1000`, `5000000`, `1000` | Lua VM memory, and the time and instructions one call may use (counted every `instruction_hook_interval` instructions). A call over budget fails; a game change it already started still completes. |
 | `lua.store_value_limit_bytes` | | `65536` | Largest value a script may keep in its persistent store |
 | `lua.data_file_limit_bytes` | | `4194304` | Maximum bytes in one `data.load` JSON file; must be nonzero. No environment override. |
+| `lua.content_data_dir` | `LUA_CONTENT_DATA_DIR` | unset | Existing external publication root for immutable adaptation bundles. A configured missing or invalid bundle or consumer fails startup; a bad reload keeps the previous generation. See [setup](setup.md). |
 | `lua.scripts.<name>` | | none | Settings only the script `<name>` can read |
 
 SKIN expiry uses one durable scheduled deadline per character for the nearest finite license, at expiry plus one FILETIME tick: equality is still valid. The usual scheduler polling latency applies.
@@ -56,14 +58,35 @@ Some keys switch behaviour on or off rather than set a number:
 | `crimewatch.concord_enabled` | `true` | With `false`, CONCORD does not respond. Criminal flags, timers and security status penalties still apply. |
 | `bounty.kill_right_lifetime_days` / `.kill_right_suspect_secs` | `30` / `900` | How long an earned kill right lasts, and how long activating one makes the aggressor a suspect. Both must be positive. |
 | `gm.spawn_distance_m` / `.clear_radius_m` / `.max_spawn_count` | `5000` / `100000` / `100` | Default distance of GM-spawned NPCs, debris and ships, default radius of `/npcclear`, and the most NPCs one GM command may spawn |
-| `salvage.salvage_material_stacks` / `.salvage_quantity_min` / `.salvage_quantity_max` | `1` / `1` / `3` | What a successful salvage gives, since wreck yield tables do not ship with the client: this many stacks of a random published salvaged material, each of between the minimum and maximum units. All must be positive, and the maximum at least the minimum. |
-| `mining.ledger_retention_days` / `.ledger_maintenance_secs` | `90` / `3600` | How many days of personal mining ledger history are kept (90 is the client's chart range), and how often older entries are deleted. Both must be positive. Deleted history does not come back if the retention is raised later. |
+| `salvage.salvage_material_stacks` / `.salvage_quantity_min` / `.salvage_quantity_max` | `1` / `1` / `3` | What a successful salvage gives, since wreck yield tables do not ship with the client: this many stacks of a random published salvaged material, each of between the minimum and maximum units. All are unsigned 32-bit values and must be positive, and the maximum at least the minimum. |
+| `store.daily_gift` | server default | The gift's `type_id` must fit a positive signed 32-bit integer; its `quantity` must be positive and fit a signed 64-bit integer. |
+| `mining.ledger_retention_days` / `.ledger_maintenance_secs` | `90` / `3600` | How many days of personal mining ledger history are kept (90 is the client's chart range), and how often older aggregated entries are deleted. Pending entries are retained until aggregation succeeds. Both must be positive. Deleted history does not come back if the retention is raised later. |
 | `map.history_retention_hours` / `.maintenance_secs` | `48` / `3600` | How many hours of star-map jump and kill history are kept, and how often older events are deleted. The retention must be at least 24, the longest window the client asks for, and the interval positive. Visits are never deleted. |
 | `fleets.reconnect_timeout_secs` | `120` | How long a member who disconnects or logs off keeps their fleet seat for the client's automatic rejoin. Must be between 1 and 120, the client's own reconnect limit. |
+| `corporations.role_removal_cooldown_secs` | `86400` | How long a member must wait after losing all direct, grantable and title-derived corporation rights before they can leave or a pending removal can finish. Must be positive. Docking or logging off does not shorten it, and granting a right again restarts it. |
 | `shared_settings.max_payload_bytes` / `.max_nesting_depth` | `262144` / `64` | The largest shared item-filter or fleet-broadcast link the server stores, in bytes of encoded text, and how deeply its data may nest. Both must be positive, and the depth at most 64. |
 | `space.collisions` | `false` | Ball collisions, on the server and in the client. The server has no collision shapes, so with `true` every ship and celestial collides as one sphere. Missiles are not affected. Takes effect at the next start. |
 | `clones.service_fee_isk` | `900000` | ISK charged for installing a jump clone at an NPC station and for each clone jump, same-station swaps included, paid to the station. Must not be negative. The settings `clones.jump_cooldown_hours` and `clones.synchronizing_hours_per_level` no longer exist: the cooldown comes from the character's attributes, and a file that still sets either stops the start. |
-| `expert_systems.enabled` | `false` | Tells the client that expert systems are available, so it shows them. The expert system calls, the GM command and expiry work either way. |
+| `expert_systems.enabled` | `true` | Tells the client that expert systems are available, so it shows them. The expert system calls, the GM command and expiry work either way. |
+| `market.modification_delay_seconds` | `300` | Minimum delay in seconds before repricing an order; `0` disables the cooldown. Must be nonnegative. |
+| `market.broker_fee` / `market.sales_tax` | `0.03` / `0.08` | Base broker and sales tax rates, each between 0 and 1. Rates are used to 12 decimal places; higher precision is rounded half away from zero at the original input boundary. Skill and standing factors are applied before the final fee is rounded to cents. |
+| `market.broker_fee_min_isk` | `100.0` | Minimum broker fee in ISK, nonnegative. |
+
+The 100 ISK fee for changing a corporation logo is the client's fixed value and cannot be configured.
+
+The expert systems the store sells are server content in `crates/server/content/expert_system_store.json`, not a deployment setting: Mining Barge Operations for 15 PLEX and Brand Manager for 50 PLEX per item. These are observed historical retail prices, each recorded with its public source and the date it was observed; they are not a claim about current official prices. Other expert systems are not sold because no sourced price is known, and hidden or retired ones are never sold. Redeem tokens already bought stay deliverable after a product is no longer listed.
+
+## Daily goals
+
+The `[game.daily_goals]` runtime policy uses these defaults; environment variables override the file:
+
+| Key | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `history_page_maximum` | `DAILY_GOALS_HISTORY_PAGE_MAXIMUM` | `100` | Maximum history page size; at least 25, the client batch size. |
+| `rollover_batch_size` | `DAILY_GOALS_ROLLOVER_BATCH_SIZE` | `64` | Positive maximum number processed per rollover batch by the shared persistent jobs mechanism. |
+| `qa_account_ids` | `DAILY_GOALS_QA_ACCOUNT_IDS` | `[]` | Unique positive account IDs eligible for QA; the empty default is closed. The environment value is comma-separated, with whitespace trimmed; an empty value clears the list. |
+
+These settings do not enable daily goals or configure content or rewards.
 
 ## Logs
 

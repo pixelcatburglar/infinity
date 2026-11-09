@@ -15,15 +15,17 @@ async fn database_failure_after_install_rolls_back_stack_and_never_dispatches() 
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
     let draws: Vec<_> = candidates(&c.sde, ty).into_iter().map(|(id, _)| (id, 0.5)).collect();
+    let world = crate::space::World::new(db.clone(), c.sde.clone(), 1);
+    let fences = crate::services::effects::online::capture_online_fences(&world, &[f.character]).await;
     let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = c.sde.clone(); let draws = draws.clone();
+        let sde = c.sde.clone(); let draws = draws.clone(); let fences = fences.clone();
         Box::pin(async move {
-            let value = activate_tx(tx, outbox, &sde, f.character, None, source, Some(STATION), now, &draws, true).await?;
+            let value = activate_tx(tx, outbox, &sde, &fences, f.character, None, source, Some(STATION), now, &draws, true).await?;
             let installed = brain::list(tx, f.character).await.map_err(db_err)?;
             assert_eq!(installed.len(), 1);
             assert_ne!(installed[0].item_id, source);
             assert!(installed[0].expires_at.is_some());
-            assert_eq!(tx.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&source]).await.map_err(|error| db_err(crate::db::Error::from(error)))?.get::<_, i32>("quantity"), 1);
+            assert_eq!(tx.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&source]).await.map_err(|error| db_err(crate::db::Error::from(error)))?.get::<_, i64>("quantity"), 1);
             tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
             Ok(value)
         })

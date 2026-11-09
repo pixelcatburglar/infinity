@@ -9,8 +9,8 @@ use crate::client::Client;
 use crate::dao::lp_offers::Offer;
 use crate::dao::items::{loading::Item, quantities::{self, QuantityChange}};
 use crate::db::outbox::dispatch_client;
-use crate::messages;
-use crate::consts::IX_STACK_SIZE;
+use infinity_core::messages;
+use infinity_core::consts::IX_STACK_SIZE;
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::info;
@@ -27,8 +27,6 @@ const LP_PRICE_INCREMENT: i64 = 25;
 const MIN_LP_PRICE: i64 = 100;
 /// Server policy: maximum quantity per purchase.
 const MAX_OFFER_COUNT: i64 = 1000;
-/// Largest integer ISK amount represented exactly by the floating-point wallet.
-const MAX_EXACT_WALLET_ISK: i64 = 1_i64 << 53;
 
 async fn fallback(ex: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, corp: i64) -> Result<Vec<Offer>, CallError> {
     let Some(race) = sde.npc_corporations.get(corp).and_then(|c| c.race_id) else { return Ok(Vec::new()) };
@@ -65,11 +63,11 @@ fn wire(offer: Offer) -> Value {
     ])
 }
 
-struct Cost { lp: i64, isk: i64, output: i32, items: BTreeMap<i32, i64> }
+struct Cost { lp: i64, isk: i64, output: i64, items: BTreeMap<i32, i64> }
 fn scale(offer: &Offer, count: i64) -> Option<Cost> {
     if !(1..=MAX_OFFER_COUNT).contains(&count) || offer.quantity <= 0 || offer.type_id <= 0 || offer.lp_cost < 0 || offer.isk_cost < 0 || offer.ak_cost < 0 { return None; }
     offer.ak_cost.checked_mul(count)?;
-    let output = i32::try_from(i64::from(offer.quantity).checked_mul(count)?).ok()?;
+    let output = i64::from(offer.quantity).checked_mul(count)?;
     let mut items = BTreeMap::<i32, i64>::new();
     for r in &offer.required_items {
         if r.type_id <= 0 || r.quantity <= 0 { return None; }
@@ -78,7 +76,6 @@ fn scale(offer: &Offer, count: i64) -> Option<Cost> {
         *total = total.checked_add(n)?;
     }
     let isk = offer.isk_cost.checked_mul(count)?;
-    if isk > MAX_EXACT_WALLET_ISK { return None; }
     Some(Cost { lp: offer.lp_cost.checked_mul(count)?, isk, output, items })
 }
 
@@ -87,10 +84,10 @@ fn plan(items: &[Item], required: &BTreeMap<i32, i64>) -> Option<BTreeMap<i64, Q
     let mut changes = BTreeMap::new();
     for item in items {
         let Some(remaining) = left.get_mut(&item.type_id) else { continue };
-        let take = (*remaining).min(i64::from(item.quantity));
+        let take = (*remaining).min(item.quantity);
         if take <= 0 { continue; }
         *remaining -= take;
-        let quantity = item.quantity - take as i32;
+        let quantity = item.quantity - take;
         changes.insert(item.item_id, QuantityChange::new(item, (quantity > 0).then_some(quantity)));
     }
     left.values().all(|&n| n == 0).then_some(changes)
@@ -98,6 +95,8 @@ fn plan(items: &[Item], required: &BTreeMap<i32, i64>) -> Option<BTreeMap<i64, Q
 
 async fn take_offer(c: &mut Client, corp: i64, offer_id: i64, count: i64, corporation: bool) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
+    let fact_ship = c.session.int("shipid").filter(|id| *id > 0);
+    let fact_system = c.session.int("solarsystemid2").filter(|id| *id > 0);
     let Some(station) = c.session.int("stationid").filter(|&id| c.sde.map.station(id).is_some()) else { return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_LP_STORE)); };
     if c.sde.npc_corporations.get(corp).is_none() { return Err(notify_error(messages::LP_OFFER_UNAVAILABLE)); }
     let (owner, key) = if corporation {
@@ -127,12 +126,17 @@ async fn take_offer(c: &mut Client, corp: i64, offer_id: i64, count: i64, corpor
             for item in items {
                 if let Some(change) = changes.get(&item.item_id) {
                     if change.quantity.is_none() { super::super::inventory::notifications::notify_item_removed(outbox, item); }
-                    else { super::super::inventory::notifications::notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?; }
+                    else { super::super::inventory::notifications::notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity))]).await?; }
                 }
             }
-            if let Some(key) = key { super::super::wallets::corp_debit(tx, outbox, owner, key, cost.isk as f64).await?; }
-            else { super::super::wallets::debit(tx, outbox, owner, cost.isk as f64).await?; }
-            change_lp(tx, outbox, owner, corp, -cost.lp, corporation).await?;
+            let isk = crate::isk::IskAmount::from_whole_isk(i128::from(cost.isk)).ok_or(crate::isk::AmountError)?;
+            if let Some(key) = key { super::super::wallets::corp_debit(tx, outbox, owner, key, isk).await?; }
+            else { super::super::wallets::debit(tx, outbox, owner, isk).await?; }
+            change_lp(tx, outbox, owner, corp, -cost.lp, corporation, super::LoyaltyMutation {
+                reason: crate::lua::events::resources::LoyaltyReason::StorePurchase,
+                occurred_at: crate::client::filetime_now(),
+                context: crate::lua::events::resources::FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: fact_ship, ship_type_id: None, system_id: fact_system, station_id: Some(station), origin: crate::lua::events::resources::FactOrigin::Natural },
+            }).await?;
             crate::services::items::deliver(tx, &sde, outbox, me, station, offer.type_id, cost.output).await?;
             Ok(())
         })

@@ -3,7 +3,8 @@
 //! consumer or progress mutation is implemented.
 use prost_reflect::{DynamicMessage, ReflectMessage};
 use tracing::debug;
-use super::message::{message, type_name, UUID_LEN};
+use infinity_core::consts::UUID_LEN;
+use super::message::{message, type_name};
 
 pub(super) fn receive(bytes: &[u8], application: &[u8; UUID_LEN]) -> Result<(), ()> {
     let descriptor = message("eve_public.Event").ok_or(())?;

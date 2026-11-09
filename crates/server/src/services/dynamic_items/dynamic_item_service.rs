@@ -3,7 +3,8 @@
 //! rows from `game.dynamic_item_modifiers`, and item overrides; uses SDE ranges for
 //! creation only. Renewal, erase and roguelike variants are unsupported; deployed
 //! inputs require World removal and are refused.
-use crate::{client::Client, consts::dogma::ATTR_HULL_DAMAGE, dao::{dynamic_items, items::{dogma, loading::ItemQuery}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, messages::dynamic_items as msg, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, rand01, Call, CallError, CallResult}};
+use infinity_core::{consts::dogma::ATTR_HULL_DAMAGE, messages::dynamic_items as msg};
+use crate::{client::Client, dao::{dynamic_items, items::{dogma, loading::ItemQuery}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, rand01, Call, CallError, CallResult}};
 use marshal::Value;
 use super::mutation::{self, Context};
 
@@ -42,14 +43,7 @@ async fn create(c: &mut Client, mutator_id: i64, source_id: i64) -> CallResult {
         let mutator = mutator.clone();
         let source = source.clone();
         Box::pin(async move {
-            for expected in [&mutator, &source] {
-                let current = load_items(tx, &sde, ItemQuery::Id(expected.item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(msg::CHANGED))?;
-                if (current.type_id, current.owner_id, current.location_id, current.flag_id, current.quantity, current.singleton)
-                    != (expected.type_id, expected.owner_id, expected.location_id, expected.flag_id, expected.quantity, expected.singleton) {
-                    return Err(notify_error(msg::CHANGED));
-                }
-            }
-            mutation::create(tx, &sde, outbox, &context, mutator_id, source_id, &draws).await.map(Value::Int)
+            mutation::create(tx, &sde, outbox, &context, &mutator, &source, &draws).await.map(Value::Int)
         })
     }, |value, outbox| async move { dispatch_client(value, outbox, c) }).await
 }

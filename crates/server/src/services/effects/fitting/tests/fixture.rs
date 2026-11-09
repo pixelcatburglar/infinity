@@ -25,7 +25,7 @@ pub(super) async fn create(db: &Db, ship_type: i32, module_type: i32) -> Result<
         let ship = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,1,0,1,true) RETURNING item_id", &[&ship_type,&owner]).await?.get("item_id");
         let mut modules = [0; 2];
         for id in &mut modules {
-            *id = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,false) RETURNING item_id", &[&module_type,&owner,&ship,&crate::consts::FLAG_CARGO]).await?.get("item_id");
+            *id = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,false) RETURNING item_id", &[&module_type,&owner,&ship,&infinity_core::consts::FLAG_CARGO]).await?.get("item_id");
         }
         Ok(Fixture { account, owner, ship, modules })
     }), |f, ()| async move { Ok(f) }).await
@@ -38,17 +38,20 @@ pub(super) async fn cleanup(db: &Db, world: &World, f: Fixture) -> Result<(), Er
     for row in &rows {
         let id: i64 = row.get("item_id");
         let ty: i32 = row.get("type_id");
-        if world.sde().types.get(ty).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)) {
+        if world.sde().types.get(ty).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)) {
             world.remove_ball(row.get("location_id"), id).await;
             crate::services::combat::forget_ship(id);
         }
     }
     world.unobserve(f.owner);
-    world.unregister_pilot(f.owner);
+    world.unregister_pilot_generation(f.owner, None);
     let flush = world.flush_positions().await;
     let cleaned = db.transaction(|tx, _: &mut ()| {
         let ids = ids.clone();
         Box::pin(async move {
+        tx.execute("DELETE FROM game.progress_deliveries WHERE event_id IN (SELECT event_id FROM game.progress_events WHERE kind='ItemsMoved' AND (payload->'ItemsMoved'->>'item_id')::bigint=ANY($1))", &[&ids]).await?;
+        tx.execute("DELETE FROM game.progress_events WHERE kind='ItemsMoved' AND (payload->'ItemsMoved'->>'item_id')::bigint=ANY($1)", &[&ids]).await?;
+        crate::services::tests::fixture::cleanup_progress(tx, &[f.account, f.owner], &[f.owner]).await?;
         tx.execute("DELETE FROM game.weapon_banks WHERE ship_id=ANY($1)", &[&ids]).await?;
         tx.execute("DELETE FROM game.module_charges WHERE ship_id=ANY($1)", &[&ids]).await?;
         tx.execute("DELETE FROM game.skill_queue WHERE character_id=$1", &[&f.owner]).await?;

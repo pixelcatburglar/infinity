@@ -70,8 +70,8 @@ async fn lookup_dispatch_searches_active_owners_and_preserves_war_contract() {
         let kwargs = Value::Dict(vec![]);
         let invalid = Call { service: "lookupSvc", method: "LookupOwners", args: &invalid_args, kwargs: &kwargs, bound: false, bind_params: None };
         let crate::services::CallError::User { msg, dict } = crate::services::dispatch(&mut c, &invalid).await.unwrap_err() else { panic!("expected lookup refusal") };
-        assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-        assert_eq!(dict, vec![("notify".into(), Value::unicode(crate::messages::lookup::INVALID))]);
+        assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+        assert_eq!(dict, vec![("notify".into(), Value::unicode(infinity_core::messages::lookup::INVALID))]);
         let war = rpc(&mut c, "LookupWarableCorporationsOrAlliances", &base, Value::Bool(false)).await.unwrap();
         assert_eq!(marshal::loads(&marshal::dumps(&war)).unwrap(), war);
         for id in [corp, alliance] {

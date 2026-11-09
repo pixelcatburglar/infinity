@@ -33,6 +33,14 @@ pub(crate) struct DroneSpec {
     pub effect_id: Option<i32>,
 }
 
+pub(crate) struct PreparedDrone {
+    pub(crate) ball: Ball,
+    pub(crate) spec: DroneSpec,
+    pub(crate) condition: crate::services::combat::ConditionSeed,
+    pub(crate) fit: crate::services::fit::Fit,
+    pub(crate) key: crate::services::fit::Key,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingMining {
     pub rock: i64,
@@ -65,4 +73,4 @@ pub(crate) enum DroneAction {
     Contact { drone: DroneRecord, return_to_bay: bool },
 }
 
-pub(crate) type DroneEffects = Arc<dyn Fn(DroneAction) -> NpcFuture + Send + Sync>;
+pub(crate) type DroneEffects = Arc<dyn Fn(&mut System, DroneAction) -> Option<NpcFuture> + Send + Sync>;

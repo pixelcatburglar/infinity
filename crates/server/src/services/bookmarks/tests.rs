@@ -71,6 +71,51 @@ fn stored_creator_and_unicode_wire_rows_roundtrip() {
 }
 
 #[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
+async fn navigation_resolves_only_authorized_valid_bookmarks() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let owner = fixture::create(&db).await.unwrap();
+    let guest = fixture::create(&db).await.unwrap();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let (mut a, _) = crate::services::tests::client(test_db.clone(), owner.character).await;
+        let (b, _) = crate::services::tests::client(test_db.clone(), guest.character).await;
+        let system = a.sde.map.all_celestials().find_map(|body| body.solar_system_id).unwrap();
+        let admin = group(&mut a, "admin").await;
+        let manage = group(&mut a, "manage").await;
+        let use_group = group(&mut a, "use").await;
+        let view = group(&mut a, "view").await;
+        let shared = folder(&mut a, [Some(admin), Some(manage), Some(use_group), Some(view)]).await;
+        let id = mutations::add(&a, owner.character, shared, None, None, None, system, [1.0, 2.0, 3.0], "place", "", None).await.unwrap().items().unwrap()[0].as_int().unwrap();
+        assert!(navigation::resolve_for_use(&b, id).await.is_err());
+        grant(&mut a, view, guest.character).await;
+        assert!(navigation::resolve_for_use(&b, id).await.is_err());
+        for group in [use_group, manage, admin] {
+            grant(&mut a, group, guest.character).await;
+            let destination = navigation::resolve_for_use(&b, id).await.unwrap();
+            assert_eq!((destination.system, destination.pos, destination.bookmark_id), (system, [1.0, 2.0, 3.0], id));
+        }
+        assert!(navigation::resolve_for_use(&b, i64::MAX).await.is_err());
+        let args = [Value::Bool(true), Value::unicode("personal"), Value::unicode(""), Value::None, Value::None, Value::None, Value::None];
+        let row = rpc(&mut a, "accessGroupBookmarkMgr", "AddFolder", &args).await.unwrap();
+        let personal = crate::services::value_field(&row, "folderID").unwrap().as_int().unwrap();
+        let own = mutations::add(&a, owner.character, personal, None, None, None, system, [4.0, 5.0, 6.0], "own", "", None).await.unwrap().items().unwrap()[0].as_int().unwrap();
+        assert!(navigation::resolve_for_use(&a, own).await.is_ok());
+        assert!(navigation::resolve_for_use(&b, own).await.is_err());
+        test_db.execute("UPDATE game.bookmarks SET expiry = $2 WHERE bookmark_id = $1", &[&own, &filetime_now()]).await.unwrap();
+        assert!(navigation::resolve_for_use(&a, own).await.is_err());
+        test_db.execute("UPDATE game.bookmarks SET expiry = NULL, x = $2 WHERE bookmark_id = $1", &[&own, &f64::NAN]).await.unwrap();
+        assert!(navigation::resolve_for_use(&a, own).await.is_err());
+        test_db.execute("UPDATE game.bookmarks SET x = 0, location_id = 0 WHERE bookmark_id = $1", &[&own]).await.unwrap();
+        assert!(navigation::resolve_for_use(&a, own).await.is_err());
+    }).await;
+    cleanup(&db, &[owner.character, guest.character]).await;
+    for f in [owner, guest] { fixture::cleanup(&db, f).await.unwrap(); }
+    result.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with imported SDE"]
 async fn beyonce_bookmark_routes_create_once_and_validate_scan_results() {
     crate::tests::init_config();

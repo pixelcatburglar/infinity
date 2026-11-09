@@ -1,7 +1,7 @@
 //! Current-body augmentation metadata on `game.items`; dormant clone implants
 //! are accessed only through the clone custody DAO. Client consumers are the
 //! skill and dogma services; callers own locks and lifecycle policy.
-use crate::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
+use infinity_core::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 

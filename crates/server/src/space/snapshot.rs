@@ -1,9 +1,13 @@
-//! Periodic persistent ship and drone position and condition persistence for destiny's
-//! ballpark (michelle.py). Uses game.items and item_attributes on the system worker,
-//! including stationary hulls and shutdown flushes; the interval is operator-configured.
-//! Other ball state and persistent timers are not supported.
+//! Periodic persistent ship and drone position, condition and combat fact checkpoints
+//! for destiny's ballpark (michelle.py). Uses game.items, item_attributes and the
+//! progress journal on the system worker, including shutdown flushes; the interval
+//! is operator-configured. Other ball state and persistent timers are not supported.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod facts;
+pub(crate) use facts::{capture_fact_checkpoint, FactCheckpoint};
+#[cfg(test)] pub(crate) use facts::facts_test_init;
 
 #[derive(Clone)]
 pub(super) struct Context {
@@ -13,8 +17,31 @@ pub(super) struct Context {
     pub db: Db,
 }
 
+impl World {
+    /// Lock the running system's checkpoint gate without loading a system.
+    pub(crate) async fn lock_condition_snapshot(&self, system: i64) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let handle = self.running(system)
+            .ok_or_else(|| anyhow::anyhow!("system actor unavailable for condition snapshot"))?;
+        let guard = handle.gate.clone().lock_owned().await;
+        if !self.running(system).is_some_and(|current| Arc::ptr_eq(&current.gate, &handle.gate)) {
+            return Err(anyhow::anyhow!("system actor changed during condition snapshot lock"));
+        }
+        Ok(guard)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Position { id: i64, generation: u64, pos: V3 }
+
+struct SnapshotBatch {
+    system: i64,
+    positions: Vec<Position>,
+    conditions: Vec<combat::DirtyConditionCapture>,
+    facts: Option<Arc<FactCheckpoint>>,
+    position_ids: Vec<i64>,
+    condition_rows: Vec<(i64, [f64; 3], i64)>,
+    attribute_ids: [i32; 3],
+}
 
 fn candidates(s: &System) -> impl Iterator<Item = (i64, u64)> + '_ {
     s.persistent_balls().filter_map(|ball| {
@@ -31,11 +58,8 @@ pub(super) fn schedule(s: &System) {
     let db = ctx.db.clone();
     s.defer(async move {
         let _guard = guard;
-        if let Err(error) = write_conditions(&handle, &db).await {
-            tracing::warn!(%error, "condition snapshot failed");
-        }
-        if let Err(error) = write_positions(&handle, &db).await {
-            tracing::warn!(%error, "position snapshot failed");
+        if let Err(error) = write_snapshot(&handle, &db).await {
+            tracing::warn!(%error, "space snapshot failed");
         }
     });
 }
@@ -46,62 +70,82 @@ pub(super) async fn flush(handle: SystemHandle, db: Db) -> Result<u64> {
     let worker_handle = handle.clone();
     handle.send(Box::new(move |s| s.defer(async move {
         let _guard = worker_handle.gate.lock().await;
-        let result = match (write_positions(&worker_handle, &db).await, write_conditions(&worker_handle, &db).await) {
-            (Ok(_), Ok(())) => Ok(worker_handle.written.load(Ordering::SeqCst) - before),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        };
+        let result = write_snapshot(&worker_handle, &db).await
+            .map(|_| worker_handle.written.load(Ordering::SeqCst) - before);
         let _ = tx.send(result);
     }))).map_err(|_| anyhow::anyhow!("system actor stopped before position flush"))?;
     rx.await.map_err(|_| anyhow::anyhow!("position flush worker unavailable"))?
 }
 
-async fn write_conditions(handle: &SystemHandle, db: &Db) -> Result<()> {
-    let ids = handle.with(|s| s.persistent_balls().map(|ball| (ball.id, s.drone(ball.id).is_some())).collect::<Vec<_>>()).await
-        .ok_or_else(|| anyhow::anyhow!("system actor stopped during condition snapshot"))?;
-    let mut failure = None;
-    for (ship, drone) in ids {
-        let result = if drone { crate::services::combat::drone_health::save_condition(db, ship).await }
-            else { crate::services::combat::save_condition(db, ship).await };
-        if let Err(error) = result {
-            let error = match error {
-                crate::services::CallError::Internal(error) => error,
-                crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-            };
-            tracing::warn!(ship, %error, "saving ship condition failed");
-            failure = Some(error);
-        }
-    }
-    failure.map_or(Ok(()), Err)
-}
+async fn write_snapshot(handle: &SystemHandle, db: &Db) -> Result<u64> {
+    let (system, positions, conditions, facts) = handle.with(|s| {
+        let (facts, at) = facts::prepare_fact_checkpoint(s).map_err(|error| anyhow::anyhow!("combat fact capture refused: {error:?}"))?;
+        let positions = candidates(s).filter_map(|(id, generation)| {
+            s.ball(id).map(|ball| Position { id, generation, pos: ball.pos })
+        }).collect::<Vec<_>>();
+        let conditions = s.persistent_balls()
+            .filter_map(|ball| s.capture_dirty_condition(ball.id, true, at))
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>((s.id, positions, conditions, facts))
+    }).await.ok_or_else(|| anyhow::anyhow!("system actor stopped during space snapshot"))??;
+    if positions.is_empty() && conditions.is_empty() && facts.is_none() { return Ok(0); }
 
-async fn write_positions(handle: &SystemHandle, db: &Db) -> Result<u64> {
-    let (system, candidates) = handle.with(|s| (s.id, candidates(s).collect::<Vec<_>>())).await
-        .ok_or_else(|| anyhow::anyhow!("system actor stopped during position snapshot"))?;
-    if candidates.is_empty() { return Ok(0); }
-    let ids: Vec<i64> = candidates.iter().map(|&(id, _)| id).collect();
-    let tokens = crate::dao::items::positions::versions(db, &ids, system).await?;
-    if tokens.is_empty() { return Ok(0); }
-    let candidates: HashMap<i64, u64> = candidates.into_iter().collect();
-    let positions = handle.with(move |s| {
-        s.persistent_balls().filter_map(|ball| {
-            let &(generation, previous) = s.snapshot_positions.get(&ball.id)?;
-            (ball.pos != previous && candidates.get(&ball.id) == Some(&generation))
-                .then(|| Position { id: ball.id, generation, pos: ball.pos })
-        }).collect::<Vec<_>>()
-    }).await.ok_or_else(|| anyhow::anyhow!("system actor stopped during position snapshot"))?;
-    let positions: Vec<_> = positions.into_iter().filter(|p| tokens.contains_key(&p.id)).collect();
-    if positions.is_empty() { return Ok(0); }
-    let ids: Vec<i64> = positions.iter().map(|p| p.id).collect();
-    let versions: Vec<&str> = positions.iter().map(|p| tokens[&p.id].as_str()).collect();
-    let xs: Vec<f64> = positions.iter().map(|p| p.pos[0]).collect();
-    let ys: Vec<f64> = positions.iter().map(|p| p.pos[1]).collect();
-    let zs: Vec<f64> = positions.iter().map(|p| p.pos[2]).collect();
-    // xmin changes on every row write, so later writers win without coordination or schema changes.
-    let succeeded = crate::dao::items::positions::save_snapshot(db, &ids, &versions, &xs, &ys, &zs, system).await?;
-    let count = succeeded.len() as u64;
-    handle.with(move |s| acknowledge(s, positions, &succeeded)).await
-        .ok_or_else(|| anyhow::anyhow!("system actor stopped acknowledging position snapshot"))?;
+    let position_ids: Vec<_> = positions.iter().map(|p| p.id).collect();
+    let condition_rows: Vec<_> = conditions.iter().map(|c|
+        (c.item_id, [c.shield, c.armor_damage, c.hull_damage], c.sampled_at)
+    ).collect();
+    let attribute_ids = [
+        infinity_core::consts::dogma::ATTR_SHIELD_CHARGE,
+        infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE,
+        infinity_core::consts::dogma::ATTR_HULL_DAMAGE,
+    ];
+    let batch = Arc::new(SnapshotBatch { system, positions, conditions, facts, position_ids, condition_rows, attribute_ids });
+    let (written_positions, written_conditions) = db.transaction::<_, _, crate::db::Error, crate::db::outbox::Outbox<()>, _, _, _>(
+        |tx, outbox| {
+            let batch = Arc::clone(&batch);
+            Box::pin(async move {
+                if let Some(facts) = &batch.facts { facts.append(outbox); }
+                let tokens = if batch.position_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    crate::dao::items::positions::versions(tx, &batch.position_ids, batch.system).await?
+                };
+                let written_conditions = if batch.condition_rows.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::dao::items::dogma::save_conditions(tx, batch.system, &batch.attribute_ids, &batch.condition_rows).await?
+                };
+                let written_positions = if batch.position_ids.is_empty() {
+                    std::collections::HashSet::new()
+                } else {
+                    let eligible: Vec<_> = batch.positions.iter().filter(|p| tokens.contains_key(&p.id)).collect();
+                    let ids: Vec<_> = eligible.iter().map(|p| p.id).collect();
+                    let versions: Vec<_> = eligible.iter().map(|p| tokens[&p.id].as_str()).collect();
+                    let xs: Vec<_> = eligible.iter().map(|p| p.pos[0]).collect();
+                    let ys: Vec<_> = eligible.iter().map(|p| p.pos[1]).collect();
+                    let zs: Vec<_> = eligible.iter().map(|p| p.pos[2]).collect();
+                    // xmin changes on every row write, so later writers win without schema changes.
+                    crate::dao::items::positions::save_snapshot(tx, &ids, &versions, &xs, &ys, &zs, batch.system).await?
+                };
+                Ok((written_positions, written_conditions))
+            })
+        },
+        |result, _| async move { Ok(result) },
+    ).await?;
+    let SnapshotBatch { positions, conditions, facts, .. } = Arc::try_unwrap(batch)
+        .map_err(|_| anyhow::anyhow!("space snapshot batch still shared after transaction"))?;
+    let count = written_positions.len() as u64;
     handle.written.fetch_add(count, Ordering::SeqCst);
+    handle.with(move |s| {
+        acknowledge(s, positions, &written_positions);
+        let written: std::collections::HashSet<_> = written_conditions.into_iter().collect();
+        for condition in conditions {
+            if written.contains(&condition.item_id) {
+                s.acknowledge_condition(condition.item_id, condition.generation, condition.revision);
+            }
+        }
+        if let Some(facts) = facts { facts.acknowledge(s, &written); }
+    }).await.ok_or_else(|| anyhow::anyhow!("system actor stopped acknowledging space snapshot"))?;
     Ok(count)
 }
 

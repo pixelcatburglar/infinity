@@ -83,9 +83,9 @@ pub(crate) async fn update_corporation(ex: &(impl Executor + ?Sized), corp: i64,
     ex.execute("UPDATE game.corporations SET description = $2, url = $3, tax_rate = $4, is_recruiting = $5, lp_tax_rate = $6 WHERE corporation_id = $1", &[&corp, &description, &url, &tax, &recruiting, &lp_tax]).await
 }
 
-pub(crate) async fn update_logo(ex: &(impl Executor + ?Sized), corp: i64, shapes: [Option<i32>; 3], colors: [Option<i32>; 3], typeface: Option<i32>, ceo: i64) -> Result<u64, db::Error> {
+pub(crate) async fn update_logo(ex: &(impl Executor + ?Sized), corp: i64, shapes: [Option<i32>; 3], colors: [Option<i32>; 3], typeface: Option<i32>) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.corporations SET shape1 = $2, shape2 = $3, shape3 = $4, color1 = $5, color2 = $6, color3 = $7, typeface = $8
-                     WHERE corporation_id = $1 AND ceo_id = $9", &[&corp, &shapes[0], &shapes[1], &shapes[2], &colors[0], &colors[1], &colors[2], &typeface, &ceo]).await
+                     WHERE corporation_id = $1 AND NOT deleted", &[&corp, &shapes[0], &shapes[1], &shapes[2], &colors[0], &colors[1], &colors[2], &typeface]).await
 }
 
 pub(crate) async fn welcome_mail(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Option<String>, db::Error> {

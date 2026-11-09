@@ -2,19 +2,19 @@
 //! Client services own policy, transactions and notification ordering.
 use crate::db::{executor::Executor, Error};
 use crate::dao::items::loading::Item;
-use crate::consts::{BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY, FLAG_HANGAR};
+use infinity_core::consts::{BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY, FLAG_HANGAR};
 use std::collections::BTreeMap;
 use tokio_postgres::Row;
 
 use super::inventory::{ItemId, Matched};
 struct FittingId { fitting_id: i64 }
 impl FittingId { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id") } } }
-pub(crate) struct Fitting { pub fitting_id: i64, pub owner_id: i64, pub name: String, pub description: String, pub ship_type_id: i32, pub fit_types: Vec<i32>, pub fit_flags: Vec<i32>, pub fit_qty: Vec<i32> }
+pub(crate) struct Fitting { pub fitting_id: i64, pub owner_id: i64, pub name: String, pub description: String, pub ship_type_id: i32, pub fit_types: Vec<i32>, pub fit_flags: Vec<i32>, pub fit_qty: Vec<i64> }
 impl Fitting { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id"), owner_id: r.get("owner_id"), name: r.get("name"), description: r.get("description"), ship_type_id: r.get("ship_type_id"), fit_types: r.get("fit_types"), fit_flags: r.get("fit_flags"), fit_qty: r.get("fit_qty") } } }
-pub(crate) struct Blueprint { pub item_id: i64, pub type_id: i32, pub owner_id: i64, pub location_id: i64, pub flag_id: i32, pub quantity: i32, pub singleton: bool, pub location_type_id: Option<i32>, pub location_parent_id: Option<i64>, pub character_system_id: Option<i64>, pub material_efficiency: i64, pub time_efficiency: i64, pub runs: i64, pub job_id: Option<i64> }
+pub(crate) struct Blueprint { pub item_id: i64, pub type_id: i32, pub owner_id: i64, pub location_id: i64, pub flag_id: i32, pub quantity: i64, pub singleton: bool, pub location_type_id: Option<i32>, pub location_parent_id: Option<i64>, pub character_system_id: Option<i64>, pub material_efficiency: i64, pub time_efficiency: i64, pub runs: i64, pub job_id: Option<i64> }
 impl Blueprint { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), owner_id: r.get("owner_id"), location_id: r.get("location_id"), flag_id: r.get("flag_id"), quantity: r.get("quantity"), singleton: r.get("singleton"), location_type_id: r.get("location_type_id"), location_parent_id: r.get("location_parent_id"), character_system_id: r.get("character_system_id"), material_efficiency: r.get("material_efficiency"), time_efficiency: r.get("time_efficiency"), runs: r.get("runs"), job_id: r.get("job_id") } } }
 
-pub(crate) async fn assemble_sources(ex: &(impl Executor + ?Sized), sources: &BTreeMap<i64, (Item, Option<i32>)>, owner: i64, name: &Option<String>) -> Result<bool, Error> {
+pub(crate) async fn assemble_sources(ex: &(impl Executor + ?Sized), sources: &BTreeMap<i64, (Item, Option<i64>)>, owner: i64, name: &Option<String>) -> Result<bool, Error> {
     for (id, (item, remaining)) in sources {
         let Some(remaining) = remaining else { continue };
         let changed = if *remaining == 0 {
@@ -30,8 +30,9 @@ pub(crate) async fn insert_assembled(ex: &(impl Executor + ?Sized), item: &Item,
     Ok(ItemId::from_row(&ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, name)
                              VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id", &[&item.type_id, &owner, &item.location_id, &item.flag_id, name]).await?).item_id)
 }
-pub(crate) async fn lock_children(ex: &(impl Executor + ?Sized), parent: i64) -> Result<Vec<i64>, Error> {
-    Ok(ex.query("SELECT item_id FROM game.items WHERE location_id = $1 ORDER BY item_id FOR UPDATE", &[&parent]).await?
+/// Read direct children before the caller classifies and locks the complete set.
+pub(crate) async fn children(ex: &(impl Executor + ?Sized), parent: i64) -> Result<Vec<i64>, Error> {
+    Ok(ex.query("SELECT item_id FROM game.items WHERE location_id = $1 ORDER BY item_id", &[&parent]).await?
         .iter().map(|row| ItemId::from_row(row).item_id).collect())
 }
 pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), item: &Item) -> Result<u64, Error> {
@@ -45,7 +46,7 @@ const COLS: &str = "fitting_id, owner_id, name, description, ship_type_id, fit_t
 pub(crate) async fn fittings(ex: &(impl Executor + ?Sized), owner: i64) -> Result<Vec<Fitting>, Error> {
     Ok(ex.query(&format!("SELECT {COLS} FROM game.fittings WHERE owner_id = $1 ORDER BY fitting_id"), &[&owner]).await?.iter().map(Fitting::from_row).collect())
 }
-pub(crate) async fn save(ex: &(impl Executor + ?Sized), owner: i64, name: &str, description: &str, ship_type: i32, types: &[i32], flags: &[i32], qty: &[i32]) -> Result<i64, Error> {
+pub(crate) async fn save(ex: &(impl Executor + ?Sized), owner: i64, name: &str, description: &str, ship_type: i32, types: &[i32], flags: &[i32], qty: &[i64]) -> Result<i64, Error> {
     Ok(FittingId::from_row(&ex.query_one("INSERT INTO game.fittings (owner_id, name, description, ship_type_id, fit_types, fit_flags, fit_qty)
                              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING fitting_id", &[&owner, &name, &description, &ship_type, &types, &flags, &qty]).await?).fitting_id)
 }

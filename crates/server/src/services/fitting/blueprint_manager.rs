@@ -1,11 +1,11 @@
 //! Character blueprint inventory, mirroring blueprintManager and blueprintSvc.py.
 //! Uses game blueprints and items, industry jobs and SDE station data.
-use crate::services::dogma::wire_quantity;
+use crate::services::dogma::info::wire_quantity;
 use crate::services::{db_err, keyval, user_error, Call, CallError, CallResult};
 use crate::dao::items::fitting as fitting_dao;
 use crate::client::Client;
-use crate::consts::FLAG_HANGAR;
-use crate::messages;
+use infinity_core::consts::FLAG_HANGAR;
+use infinity_core::messages;
 use marshal::Value;
 /// SDE invCategories: Blueprint.
 const CATEGORY_BLUEPRINT: i64 = 9;

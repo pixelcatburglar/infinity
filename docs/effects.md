@@ -44,6 +44,26 @@ remaining ties by item ID. It reloads the effective fit after each offline so
 lost online bonuses can cause further changes. Notifications and bank stops
 are dispatched only after commit.
 
+Fitting operations publish one final effective-attribute batch per affected hull
+after inventory changes. In space the system actor merges committed fitting
+fields into its current fit and rebases current condition and capacitor without
+discarding live changes. For stored hulls the transaction samples condition
+before fitting and rebases it against the final fit; shield capacity or
+recharge-rate changes checkpoint the rebased condition in the same transaction.
+Capacity changes precede their current charge or damage values in the batch.
+Recharge-rate changes also publish the sampled current charge. Fitted motion is
+evaluated from the current actor fit and queued for the next destiny boundary;
+membership, live phase and projection revision fence the queued action.
+
+Charge first loads publish a complete sublocation prime after the reservation
+commits and, in space, after the actor deadline. Positive same-type refills
+publish only a quantity delta. A type switch removes the old key before the
+new key is primed; unloading publishes its zero quantity. Actual cold charge
+insertions and removals use the same before/final fitting boundary, without
+online-resource reconciliation. Shot and ordinary quantity consumption do not
+load or publish a new fit. Client verification of these charge notifications
+and modifier transitions remains outstanding.
+
 ## Behaviour status
 
 | Kind or family | Status |
@@ -79,6 +99,11 @@ All paths below are under `crates/server/src/`.
 - `services/combat/` retains targeting, ammunition, health, damage and NPC
   state. `services/fit.rs` evaluates attributes. Space actor timers schedule
   cycle work.
+- `space/asteroids.rs`: the solar-system actor owns asteroid identity, rock
+  quantities, field batches and regrowth timers. `services/mining.rs` keeps
+  yield settlement, specialized hold routing, inventory notifications and
+  ledger facts; mining validation checks rock identity and sampled range in one
+  actor query.
 - Capacitor transfer does not yet propagate Crimewatch assistance; neutralizers
   and nosferatu use the existing offensive aggression path. Reloads use the
   existing ammunition reservation and actor deadline mechanism. When an ancillary
@@ -94,8 +119,10 @@ All paths below are under `crates/server/src/`.
 
 Salvage yield tables do not ship with the client: the server substitutes a
 configurable random selection from published Salvaged Materials types, and
-preserves loose wreck contents in a positioned cargo container. Tractor beams
-follow to surface contact and restore the target's movement properties on stop.
+preserves loose wreck contents in a positioned cargo container. The committed
+salvage outcome is authoritative; live container publication is best effort and
+failures are warned, with no automatic recovery. Tractor beams follow to surface
+contact and restore the target's movement properties on stop.
 Bomb and micro-jump heading follows moving velocity; when stationary it uses
 the last GOTO direction, then the existing negative Z direction.
 
@@ -186,6 +213,7 @@ eligible aggressor ID; without it, sorted idle drone IDs are distributed
 round-robin over sorted eligible aggressor IDs. Explicit work, return and
 delegated orders are not retargeted. This deterministic selection is server
 policy: the client names the checkbox and hint but specifies no algorithm.
+An Assist or Guard cycle clears its delegated order when the delegate leaves the owner's fleet, is absent, warping or cloaked, before combat source admission and on revalidation before applying the cycle.
 
 Mining drones physically carry pending intent to the ship; asteroid extraction
 and hold delivery commit together at contact. A full hold changes neither.
@@ -279,6 +307,12 @@ and the target revision from the system actor; `Fit::load` remains for
 non-space and character-only loads. Deferred fit and kinematic commits check
 the revision, including at destiny application; warp entry retries when its
 snapshot becomes stale rather than committing an obsolete permission.
+Warp speed uses the same Fit attempt as scramble status and its projection revision; accepted requests retain that speed through alignment and flight.
+Ordinary warp uses the current fitted warp capacitor need, capacity and recharge rate at activation and debits the same in-memory balance as module effects. A positive partial debit shortens that ship's route proportionally; only a full arrival can trigger the destination callback. Zero need bypasses capacitor charging, including when the capacitor is empty.
+When an incoming projection makes the cached effective warp scramble status positive,
+an action cancels a pending or aligning warp at the next destiny boundary. It is
+fenced to the target's membership and leaves an already active warp untouched.
+Hull resistance and both disruption and scrambling use the same Fit evaluation.
 
 Projections are transient, target-keyed system-actor state, indexed by source
 module: each cycle replaces that module's contribution. Stop, target loss,
@@ -347,6 +381,38 @@ squared value, fitted tracking, optimal signature, target signature, optimal, fa
 chance. Values have at least 17 significant digits for hand evaluation of the
 native formula. Both balls are sampled together, and the source Fit includes
 incoming projections. This is a diagnostic, not a client UI comparison or a shot.
+
+## Damage and ship loss
+
+Ordinary hits and repairs, including remote repair, repair drones and GM
+commands, change shield charge, armor damage and hull damage in the system
+actor's memory. Dirty persistent ships and drones are batch-checkpointed with
+positions on the configured snapshot cycle (30 seconds by default), and at
+docking, jump or transfer, boarding or ship swap, logoff and shutdown. Drone
+condition is also saved on return to the bay. Shields recharge from the saved
+timestamp. A crash can lose condition changes since the last successful save.
+A ship with no condition attributes is at full health.
+
+Each attacker's contribution records the damage actually dealt, the attacking
+ship and weapon, and whether the aggression was illegal; once illegal, it stays
+illegal. Activating a weapon without dealing damage gives no contribution. These
+contributions live only in actor memory and are lost on restart; there is no
+`game.combat_contributions` table. The attacker of the lethal hit gets the
+final blow, and a missile or bomb keeps the ship and weapon it was launched
+from. Killmails list the attackers within the configured window.
+
+A lethal hit marks the ship as dying, preventing further hits while the loss is
+settled. For a piloted ship, one transaction deletes the ship and pending
+reloads, places the pilot in a capsule or at their home station, records the
+killmail with the actual final blow, settles insurance and wallet changes, and
+queues `ShipLost`, whether or not the pilot is connected. Unpiloted ship loss
+also uses a transaction. A killmail's victim item ID is unique. If settlement
+fails or its outcome is uncertain, reconciliation checks the stored state:
+a confirmed rollback restores the prior condition, while a committed loss is
+published or retired. An inconclusive result remains pending for reconciliation.
+
+This covers ordinary typed damage. Breacher damage over time and its defensive
+module are not implemented.
 
 ## SDE and Python modifiers
 

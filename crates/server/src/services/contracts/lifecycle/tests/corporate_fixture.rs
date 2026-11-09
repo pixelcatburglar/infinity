@@ -1,6 +1,6 @@
 //! Shared real database fixtures for corporate contract lifecycle tests.
 use super::super::*;
-use crate::consts::{ROLE_ACCOUNTANT, ROLE_CONTRACT_MANAGER, ROLE_HANGAR_CAN_TAKE_1};
+use infinity_core::consts::{ROLE_ACCOUNTANT, ROLE_ACCOUNT_CAN_TAKE_1, ROLE_CONTRACT_MANAGER, ROLE_HANGAR_CAN_TAKE_1};
 use crate::services::tests::fixture;
 
 #[derive(Clone, Copy)]
@@ -15,9 +15,9 @@ pub(super) async fn setup(db: &Db, station: i64, station_type: i32) -> Corp {
     let actor = fixture::create(db).await.unwrap();
     let ceo = fixture::create(db).await.unwrap();
     let id: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('contract-test-' || nextval('game.corporations_corporation_id_seq')::text,'CT' || nextval('game.corporations_corporation_id_seq')::text,$1,$1,$2,0) RETURNING corporation_id", &[&ceo.character, &station]).await.unwrap().get("corporation_id");
-    let roles = ROLE_ACCOUNTANT | ROLE_CONTRACT_MANAGER | ROLE_HANGAR_CAN_TAKE_1;
-    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2,station_id=$3,balance=1000000 WHERE character_id=$4", &[&id, &roles, &station, &actor.character]).await.unwrap();
-    db.execute("UPDATE game.characters SET corporation_id=$1,station_id=$2 WHERE character_id=$3", &[&id, &station, &ceo.character]).await.unwrap();
+    let roles = ROLE_ACCOUNTANT | ROLE_CONTRACT_MANAGER | ROLE_HANGAR_CAN_TAKE_1 | ROLE_ACCOUNT_CAN_TAKE_1 | (ROLE_ACCOUNT_CAN_TAKE_1 << 1) | (ROLE_ACCOUNT_CAN_TAKE_1 << 2);
+    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2::bigint & ~$5::bigint,corp_roles_hq=$2::bigint & $5::bigint,station_id=$3,balance=1000000 WHERE character_id=$4", &[&id, &roles, &station, &actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=$1,station_id=$2,corp_roles=$4 WHERE character_id=$3", &[&id, &station, &ceo.character, &infinity_core::consts::ROLE_DIRECTOR]).await.unwrap();
     for key in [ACCOUNT_CASH, ACCOUNT_CASH + 1, ACCOUNT_CASH + 2] {
         db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,1000000)", &[&id, &key]).await.unwrap();
     }
@@ -50,6 +50,9 @@ pub(super) async fn fingerprint(db: &Db, c: Corp) -> String {
 }
 
 pub(super) async fn cleanup(db: &Db, c: Corp) {
+    db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        fixture::cleanup_progress(tx, &[c.id], &[]).await
+    }), |(), ()| async move { Ok(()) }).await.unwrap();
     db.execute("DELETE FROM game.contract_bids WHERE contract_id IN (SELECT contract_id FROM game.contracts WHERE issuer_corp_id=$1 OR acceptor_id=$1)", &[&c.id]).await.unwrap();
     db.execute("DELETE FROM game.contract_items WHERE contract_id IN (SELECT contract_id FROM game.contracts WHERE issuer_corp_id=$1 OR acceptor_id=$1)", &[&c.id]).await.unwrap();
     db.execute("DELETE FROM game.contracts WHERE issuer_corp_id=$1 OR acceptor_id=$1", &[&c.id]).await.unwrap();
@@ -64,4 +67,4 @@ pub(super) async fn cleanup(db: &Db, c: Corp) {
     fixture::cleanup(db, c.ceo).await.unwrap();
 }
 
-pub(super) use crate::consts::{FLAG_CORP_DELIVERIES as DELIVERIES, FLAG_CORP_SAG1 as SAG};
+pub(super) use infinity_core::consts::{FLAG_CORP_DELIVERIES as DELIVERIES, FLAG_CORP_SAG1 as SAG};

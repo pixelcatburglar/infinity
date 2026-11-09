@@ -1,13 +1,14 @@
 //! Durable module heat injuries and burnout.
 //! Damage probability follows EVE University's published overheating research;
 //! effective attributes come from Fit and condition is stored in game.item_attributes.
+//! Burnout publishes one final fitting after all damage writes and offlines.
 //! Rack heat itself is transient; paste repair and structure repair are unsupported.
 
 use std::sync::Arc;
-use crate::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MED_SLOTS, dogma::ATTR_HI_SLOTS, dogma::ATTR_RIG_SLOTS, CATEGORY_MODULE, CATEGORY_SHIP};
+use infinity_core::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MED_SLOTS, dogma::ATTR_HI_SLOTS, dogma::ATTR_RIG_SLOTS, CATEGORY_MODULE, CATEGORY_SHIP};
 use crate::dao::items::{dogma, loading::ItemQuery};
 use crate::db::outbox::Outbox;
-use crate::messages;
+use infinity_core::messages;
 use crate::services::{combat::{self, Ctx}, db_err, fit::{Fit, Key}, items::load_items, market, notify_error, rand01, CallError};
 use crate::services::effects::online::{self, OnlineChanged, OnlinePolicy};
 use marshal::Value;
@@ -55,7 +56,7 @@ pub(crate) fn validate(fit: &Fit, module: i64) -> Result<(), CallError> {
 fn stale() -> CallError { CallError::Internal(anyhow::anyhow!("heat damage context changed")) }
 
 /// Apply every source in one completed cycle, with one captured roll per eligible pair.
-pub(in crate::services::effects) async fn apply(cx: &Ctx, mut sources: Vec<super::SourceSnapshot>) -> Result<(), CallError> {
+pub(in crate::services::effects) async fn apply(cx: &Ctx, membership: Option<u64>, mut sources: Vec<super::SourceSnapshot>) -> Result<(), CallError> {
     if sources.is_empty() { return Ok(()); }
     sources.sort_unstable_by_key(|source| source.module);
     let _lock = market::lock().await;
@@ -105,12 +106,24 @@ pub(in crate::services::effects) async fn apply(cx: &Ctx, mut sources: Vec<super
                     (id, flag, old, old.unwrap_or(0.0), fit.value(Key::Module(id), ATTR_STRUCTURE_HP))
                 }).collect();
                 accumulate(&sources, &mut damage, &rolls, total)?;
-                for &(id, _, old, new, hp) in &damage {
+                for &(id, _, old, new, _) in &damage {
                     if old.unwrap_or(0.0) == new { continue; }
                     if !dogma::set_override_if(tx, id, ATTR_HULL_DAMAGE, old, new).await.map_err(db_err)? { return Err(stale()); }
                     let attr = super::super::notify::attribute_change(owner, Value::Int(id), ATTR_HULL_DAMAGE, Value::Float(new), Value::Float(old.unwrap_or(0.0)));
                     outbox.notify_sender(policy.notify.clone(), "OnModuleAttributeChanges", vec![Value::list([attr])]);
-                    if exhausted(hp, new) { online::set_online_core(tx, &sde, &policy, outbox, ship, id, false).await?; }
+                }
+                let fences = online::OnlineFences::single(system, ship, membership);
+                let mut before = None;
+                let mut final_fit = None;
+                for &(id, _, old, new, hp) in &damage {
+                    if old.unwrap_or(0.0) != new && exhausted(hp, new) {
+                        if before.is_none() { before = Some(online::fitting::capture(tx, &sde, &fences, owner, ship).await?); }
+                        let (_, fit) = online::set_online_core(tx, &sde, &policy, outbox, &fences, ship, id, false).await?;
+                        final_fit = Some(fit);
+                    }
+                }
+                if let (Some(before), Some(fit)) = (before, final_fit) {
+                    online::fitting::finish(tx, before, fit, outbox).await?;
                 }
                 {
                     let state = combat::state();

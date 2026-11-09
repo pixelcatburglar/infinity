@@ -16,4 +16,4 @@ pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
 }
 
 #[cfg(test)]
-pub(in crate::services) mod tests;
+pub(crate) mod tests;

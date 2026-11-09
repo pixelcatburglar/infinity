@@ -2,7 +2,8 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
-use crate::{gateway::{notices::GatewayNotice, protocol::target_group::Target}, session::OnlineSession};
+use infinity_core::session::OnlineSession;
+use crate::{gateway::{notices::GatewayNotice, protocol::target_group::Target}};
 
 type Application = [u8; 16];
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -2,7 +2,7 @@
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Ship selection, character association, transactions, refusals, notifications and World are caller concerns.
 //! Rookie fitting does not insert charges; the supplied executor owns atomicity.
-use crate::consts::FLAG_DRONE_BAY;
+use infinity_core::consts::FLAG_DRONE_BAY;
 use crate::db::{self, executor::Executor};
 use super::inventory::ItemId;
 pub(crate) async fn rookie_ship(ex: &(impl Executor + ?Sized), ship_type: i32, character_id: i64, station_id: i64, flag: i32) -> Result<i64, db::Error> {
@@ -13,7 +13,7 @@ pub(crate) async fn fitted_items(ex: &(impl Executor + ?Sized), ship: i64, owner
     for &(type_id, flag_id, quantity) in items {
         let singleton = flag_id != FLAG_DRONE_BAY;
         ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, online)
-                    VALUES ($1, $2, $3, $4, $5, $6, $6)", &[&type_id, &owner, &ship, &flag_id, &quantity, &singleton]).await?;
+                    VALUES ($1, $2, $3, $4, $5, $6, $6)", &[&type_id, &owner, &ship, &flag_id, &i64::from(quantity), &singleton]).await?;
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! Database regression for extraction-driven fitting reconciliation.
 use super::*;
-use crate::{consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_SKILL, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST}, dao::items::dogma, services::{fit::{Fit, Key}, skills::{formulas, training}}};
+use infinity_core::{consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_SKILL, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST}};
+use crate::{dao::items::dogma, services::{fit::{Fit, Key}, skills::{formulas, training}}};
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -9,11 +10,13 @@ async fn extraction_reconciles_owned_hulls_and_rolls_back() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let scenario = crate::tests::catch_scenario(async {
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
     c.world.register_pilot(f.character, sender);
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
     let station = 60000001_i64;
     db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&f.character, &station]).await.unwrap();
     let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.attribute(14).is_some_and(|v| v >= 1.0)).unwrap().type_id;
@@ -72,9 +75,9 @@ async fn extraction_reconciles_owned_hulls_and_rolls_back() {
     let _lock = crate::services::market::lock().await;
     let before = super::fingerprint(&db, f.character).await;
     let rolled_back: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let selected = selected.clone(); let ships = ships.clone(); let receiver = receiver.clone();
+        let sde = sde.clone(); let selected = selected.clone(); let ships = ships.clone(); let receiver = receiver.clone(); let fences = fences.clone();
         Box::pin(async move {
-            extract_tx(tx, outbox, &sde, f.character, Some(ships[0]), item, crate::client::filetime_now(), &selected).await?;
+            extract_tx(tx, outbox, &sde, &fences, f.character, Some(ships[0]), item, crate::client::filetime_now(), &selected).await?;
             for ship in ships { assert!(dogma::online(tx, ship).await.map_err(db_err)?.is_empty()); }
             assert!(receiver.lock().unwrap().try_recv().is_err());
             tx.query_one("SELECT 1 / 0", &[]).await.map_err(db_err)?;
@@ -87,24 +90,27 @@ async fn extraction_reconciles_owned_hulls_and_rolls_back() {
     for &ship in &ships { assert_eq!(dogma::online(&db, ship).await.unwrap().len(), 1); }
     let active_ship = ships[0];
     let events = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let selected = selected.clone();
-        Box::pin(async move { extract_tx(tx, outbox, &sde, f.character, Some(active_ship), item, crate::client::filetime_now(), &selected).await })
-    }, |_, outbox| async move {
+        let sde = sde.clone(); let selected = selected.clone(); let fences = fences.clone();
+        Box::pin(async move { extract_tx(tx, outbox, &sde, &fences, f.character, Some(active_ship), item, crate::client::filetime_now(), &selected).await })
+    }, |_, outbox| { let world = &c.world; async move {
         let mut notifications = Vec::new();
-        for entry in outbox.into_entries() {
-            match entry {
-                crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { event, args, .. }) => notifications.push((event, args)),
-                crate::db::outbox::Effect::Operation(change) => online::apply_online_changed(change),
-                _ => {}
+        online::dispatch_entries((), outbox, world, |notification| {
+            if let crate::db::outbox::Notification::Pilot { event, args, .. } = notification {
+                notifications.push((event, args));
             }
-        }
+            Ok(())
+        })?;
         Ok(notifications)
-    }).await.unwrap_or_else(|_| panic!("extraction failed"));
+    }}).await.unwrap_or_else(|_| panic!("extraction failed"));
     for &ship in &ships { assert!(dogma::online(&db, ship).await.unwrap().is_empty()); }
     for &module in &modules {
         assert!(events.iter().any(|(event, args)| event == "OnGodmaShipEffect" && args.first().and_then(Value::as_int) == Some(module) && args.get(3).and_then(Value::as_int) == Some(0)));
-        assert!(events.iter().any(|(event, args)| event == "OnModuleAttributeChanges" && matches!(args.as_slice(), [Value::List(changes)] if changes.iter().any(|change| matches!(change, Value::Tuple(row) if row.get(2) == Some(&Value::Int(module)) && row.get(3) == Some(&Value::Int(i64::from(crate::consts::dogma::ATTR_IS_ONLINE))) && row.get(5) == Some(&Value::Int(0)))))));
+        assert!(events.iter().any(|(event, args)| event == "OnModuleAttributeChanges" && matches!(args.as_slice(), [Value::List(changes)] if changes.iter().any(|change| matches!(change, Value::Tuple(row) if row.get(2) == Some(&Value::Int(module)) && row.get(3) == Some(&Value::Int(i64::from(infinity_core::consts::dogma::ATTR_IS_ONLINE))) && row.get(5) == Some(&Value::Int(0)))))));
     }
-    c.world.unregister_pilot(f.character);
+    c.world.unregister_pilot_generation(f.character, None);
+    }).await;
+    crate::scheduler::cancel(&db, &format!("{}:{}", crate::services::skills::completion::KIND, f.character)).await.unwrap();
+    db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }

@@ -74,7 +74,7 @@ pub(crate) async fn tag(c: &Client, call: &Call<'_>) -> CallResult {
         let Some(target) = actor.ball(item) else { return false };
         if item == ship || actor.pilot_ball(me).is_none_or(|b| b.id != ship) || !actor.fleet_broadcast_visible(me, item) { return false; }
         let Some(group) = sde.types.get(target.type_id).and_then(|t| t.group_id) else { return false };
-        if matches!(group, crate::consts::GROUP_PLANET | crate::consts::GROUP_ASTEROID_BELT | crate::consts::GROUP_MOON) { return false; }
+        if matches!(group, infinity_core::consts::GROUP_PLANET | infinity_core::consts::GROUP_ASTEROID_BELT | infinity_core::consts::GROUP_MOON) { return false; }
         let mut st = state();
         let Some(&fleet_id) = st.of.get(&me) else { return false };
         if !st.is_member(fleet_id, me) || !st.fleets[&fleet_id].members.get(&me).is_some_and(|m| matches!(m.role, ROLE_LEADER | ROLE_WING_COMMANDER | ROLE_SQUAD_COMMANDER)) { return false; }

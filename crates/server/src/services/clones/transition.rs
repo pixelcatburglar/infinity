@@ -6,7 +6,8 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use marshal::Value;
 use super::{lifecycle, policy, CloneEffect, Transition};
 use super::super::{db_err, notify_error, user_error, CallError};
-use crate::{consts::{dogma::{ATTR_FOLLOWS_JUMP_CLONES, ATTR_IMPLANTNESS}, FLAG_BOOSTER, FLAG_HANGAR, FLAG_IMPLANT, TYPE_CAPSULE}, dao::{characters::clones::{self as clones, CloneRow}, items::{brain::{self, BrainItem}, clones as custody, creation, dogma, fit, loading::ItemQuery, ship}}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{effects::online::OnlineChanged, identity::Identity, inventory::notifications::notify_item_removed, items::load_items, skills::body_change, trade, wallets}};
+use infinity_core::{consts::{dogma::{ATTR_FOLLOWS_JUMP_CLONES, ATTR_IMPLANTNESS}, FLAG_BOOSTER, FLAG_HANGAR, FLAG_IMPLANT, TYPE_CAPSULE}, messages};
+use crate::{dao::{characters::clones::{self as clones, CloneRow}, items::{brain::{self, BrainItem}, clones as custody, creation, dogma, fit, loading::ItemQuery, ship}}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{effects::online::{self, OnlineChanged}, identity::Identity, inventory::notifications::notify_item_removed, items::load_items, skills::body_change, trade, wallets}};
 
 fn stale() -> CallError { notify_error(messages::clones::STALE_BODY) }
 fn invalid_slots() -> CallError { notify_error(messages::clones::INVALID_IMPLANT_SLOTS) }
@@ -29,7 +30,7 @@ fn follows(sde: &Sde, item: &BrainItem, overrides: &HashMap<(i64, i32), f64>) ->
 }
 
 /// Caller holds character, clone and implant locks and has created an empty source.
-pub(super) async fn swap_body_into_source_tx<E: From<OnlineChanged> + Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, identity: &Identity, target: &CloneRow, source: &CloneRow, now: i64, change: body_change::BodyChange) -> Result<(), CallError> {
+pub(super) async fn swap_body_into_source_tx<E: From<OnlineChanged> + Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, fences: &online::OnlineFences, identity: &Identity, target: &CloneRow, source: &CloneRow, now: i64, change: body_change::BodyChange) -> Result<(), CallError> {
     let owner = identity.char_id;
     if target.owner_id != owner || source.owner_id != owner || target.clone_id == source.clone_id { return Err(stale()); }
     let active = brain::list(ex, owner).await.map_err(db_err)?;
@@ -64,11 +65,11 @@ pub(super) async fn swap_body_into_source_tx<E: From<OnlineChanged> + Send>(ex: 
         if !brain::remove(ex, owner, item).await.map_err(db_err)? { return Err(stale()); }
         notify_item_removed(outbox, row);
     }
-    body_change::finish_tx(ex, outbox, sde, owner, now, change, !park.is_empty() || !dormant.is_empty(), !boosters.is_empty()).await
+    body_change::finish_tx(ex, outbox, sde, fences, owner, now, change, !park.is_empty() || !dormant.is_empty(), !boosters.is_empty()).await
 }
 
 /// The caller holds the market lock until all committed effects have been dispatched.
-pub(super) async fn jump_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<CloneEffect>, sde: &Arc<Sde>, id: &Identity, dest: i64, clone_id: i64, quote: f64, confirmed: bool, now: i64) -> Result<Transition, CallError> {
+pub(super) async fn jump_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<CloneEffect>, sde: &Arc<Sde>, fences: &online::OnlineFences, id: &Identity, dest: i64, clone_id: i64, quote: f64, confirmed: bool, now: i64) -> Result<Transition, CallError> {
     let owner = id.char_id;
     let source_station = id.station_id.ok_or_else(stale)?;
     let old_ship = id.ship_id.ok_or_else(stale)?;
@@ -96,14 +97,14 @@ pub(super) async fn jump_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<C
     if conflict.is_some() && !confirmed { return Err(user_error(messages::clones::MSG_JUMP_CHECK_WILL_LOSE_EXISTING_CLONE, vec![])); }
     let change = body_change::begin_tx(ex, outbox, sde, owner, now).await?;
     policy::check_cooldown_tx(ex, sde, owner, now, character.last_clone_jump, source_station == dest).await?;
-    wallets::debit(ex, outbox, owner, fee).await?;
+    wallets::debit(ex, outbox, owner, crate::isk::IskAmount::from_isk(fee)?).await?;
     let mut trade_effects = Outbox::default();
     trade::abort_for_char(ex, sde, &mut trade_effects, owner).await?;
     outbox.operation(CloneEffect::Trade(trade_effects));
     if let Some(conflict) = conflict { lifecycle::destroy_clone_and_implants_tx(ex, outbox, owner, conflict).await?; }
     clones::defer_location(ex).await.map_err(db_err)?;
     let source = lifecycle::create_empty_clone_tx(ex, owner, source_station).await?;
-    swap_body_into_source_tx(ex, outbox, sde, id, target, &source, now, change).await?;
+    swap_body_into_source_tx(ex, outbox, sde, fences, id, target, &source, now, change).await?;
     if !custody::list(ex, owner, target.clone_id).await.map_err(db_err)?.is_empty() || clones::destroy(ex, target.clone_id, owner).await.map_err(db_err)? != 1 { return Err(stale()); }
     clones::restore_location(ex).await.map_err(db_err)?;
     if custody::delete_capsule(ex, owner, old_ship, TYPE_CAPSULE).await.map_err(db_err)? != 1 { return Err(stale()); }

@@ -7,7 +7,7 @@ fn ball(id: i64, x: f64) -> Ball {
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
         old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
 

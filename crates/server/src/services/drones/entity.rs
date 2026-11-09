@@ -1,10 +1,11 @@
 //! Entity moniker commands used by the client drone menu. State is delivered by
-//! Michelle bootstrap and notifications, not a remote state-query method.
+//! Michelle bootstrap and notifications, not a remote state-query method. Mining
+//! orders require a visible asteroid owned by the current system.
 
 use std::collections::HashSet;
 use marshal::Value;
 use crate::client::Client;
-use crate::messages::{self, drones as text};
+use infinity_core::messages::{self, drones as text};
 use crate::services::{Call, CallError, CallResult, notify_error};
 use crate::space::{drone::DroneOrder, MODE_WARP};
 
@@ -70,9 +71,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 }
 
 async fn execute(c: &mut Client, system: i64, owner: i64, ship: i64, id: i64, command: Command) -> Result<(), CallError> {
-    let drone = c.world.with(system, move |s| s.drone(id).filter(|_| s.ball(id).is_some())).await
-        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?
-        .ok_or_else(|| notify_error(text::NOT_AVAILABLE))?;
+    let (drone, mineable) = c.world.with(system, move |s| {
+        let mineable = match command { Command::Order(DroneOrder::Mine(target)) => s.rock_type(target).is_some(), _ => true };
+        (s.drone(id).filter(|_| s.ball(id).is_some()), mineable)
+    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+    let drone = drone.ok_or_else(|| notify_error(text::NOT_AVAILABLE))?;
     if drone.owner != owner { return Err(notify_error(text::NOT_AVAILABLE)); }
     if command == Command::Abandon { return super::inventory::abandon(c, id).await; }
     let Command::Order(order) = command else { unreachable!() };
@@ -86,16 +89,16 @@ async fn execute(c: &mut Client, system: i64, owner: i64, ship: i64, id: i64, co
         if !crate::services::combat::targeting_charges::targets_of(owner).contains(&target) {
             return Err(crate::services::user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
         }
-        if matches!(order, DroneOrder::Mine(_)) && !crate::services::mining::is_rock(target) {
+        if !mineable {
             return Err(notify_error(text::NOT_AVAILABLE));
         }
     }
     if let DroneOrder::Assist(delegate) | DroneOrder::Guard(delegate) = order {
         if !crate::services::fleets::same_fleet(owner, delegate) { return Err(notify_error(text::DELEGATE_NOT_IN_FLEET)); }
         let sde = c.sde.clone();
-        let capsule_group = sde.types.get(crate::consts::TYPE_CAPSULE).and_then(|t| t.group_id);
+        let capsule_group = sde.types.get(infinity_core::consts::TYPE_CAPSULE).and_then(|t| t.group_id);
         let valid = c.world.with(system, move |s| s.pilot_ball(delegate).is_some_and(|b| {
-            sde.types.get(b.type_id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)
+            sde.types.get(b.type_id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
                 && t.group_id.is_some() && capsule_group.is_some() && t.group_id != capsule_group)
                 && b.mode != MODE_WARP && b.cloak == 0
         })).await

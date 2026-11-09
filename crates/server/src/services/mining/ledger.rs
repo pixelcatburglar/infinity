@@ -3,7 +3,8 @@
 //! Reads game.character_mining_ledger; corporate observers, RPC filters and
 //! arguments are unsupported. The client applies its own filters.
 
-use super::{db_err, filetime_now, keyval, messages, notify_error, Call, CallError, CallResult, Client, Value};
+use super::{db_err, filetime_now, keyval, notify_error, Call, CallError, CallResult, Client, Value};
+use infinity_core::messages;
 use crate::dao::mining_ledger::{self, Log};
 use crate::services::user_error;
 

@@ -4,8 +4,8 @@
 //! Survey results use the separately client-triggered miningScanMgr.perform_scan RPC;
 //! the modern overlay has no server-pushed survey result callback.
 use super::{EffectKind, lifecycle::{Cycle, CycleOutcome, Module, subject_valid}, registry::{Effect, EffectAttribute, EffectFlag}, notify::{fire_fx, cargo_scan_complete, ship_scan_completed}};
-use crate::consts::{dogma::ATTR_MAX_RANGE, CATEGORY_SHIP, FLAG_CARGO};
-use crate::messages;
+use infinity_core::consts::{dogma::ATTR_MAX_RANGE, CATEGORY_SHIP, FLAG_CARGO};
+use infinity_core::messages;
 use crate::services::{combat::{Ctx, state, targeting_charges::targets_of, groups_health::capacitor_snapshot}, fit::{Fit, Key}, items::load_items, user_error, db_err, CallError};
 use crate::dao::items::loading::ItemQuery;
 use crate::space::{dist, System, MODE_WARP};

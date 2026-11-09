@@ -8,7 +8,7 @@
 
 use super::{db_err, row, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{CORPORATION_TYPE_NPC, CORPORATION_UNLIMITED_MEMBER_LIMIT, CORP_DIVISION_NAME_COUNT, FACTION_AMARR, FACTION_CALDARI, FACTION_GALLENTE, FACTION_MINMATAR};
+use infinity_core::consts::{CORPORATION_TYPE_NPC, CORPORATION_UNLIMITED_MEMBER_LIMIT, CORP_DIVISION_NAME_COUNT, FACTION_AMARR, FACTION_CALDARI, FACTION_GALLENTE, FACTION_MINMATAR};
 use marshal::Value;
 
 /// Faction warfare warzones: (warzoneID, the two factions fighting over it).

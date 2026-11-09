@@ -2,15 +2,17 @@
 use super::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
-use crate::{
+use infinity_core::{
     consts::{CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_FUELED_SHIELD_BOOSTING, FLAG_FITTING_FIRST},
+};
+use crate::{
     db::{Db, Error},
     space::{Ball, World, WarpState, MODE_STOP},
 };
 
 const RELOAD_MS: f64 = 5_000.0;
-const CARGO_QUANTITY: i32 = 100_000;
-const INCOMPATIBLE_QUANTITY: i32 = 7;
+const CARGO_QUANTITY: i64 = 1_i64 << 32;
+const INCOMPATIBLE_QUANTITY: i64 = 7;
 
 #[derive(Clone, Copy)]
 struct Fixture { account: i64, character: i64, ship: i64, module: i64, cargo: i64, incompatible: i64 }
@@ -63,12 +65,12 @@ fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
 
-async fn quantity(db: &Db, item: i64) -> i32 {
+async fn quantity(db: &Db, item: i64) -> i64 {
     db.query_opt("SELECT quantity FROM game.items WHERE item_id = $1", &[&item]).await.unwrap()
         .map(|row| row.get("quantity")).unwrap_or(0)
 }
@@ -88,7 +90,7 @@ async fn ancillary_auto_reload_db_smoke() {
             let matches = |c: &crate::sde::types::TypeData| charge_matches(groups.iter().copied(), c.group_id, size, size_id.and_then(|id| c.attribute(id)));
             let capacity = m.capacity.unwrap_or(0.0).max(m.attribute(ATTR_CAPACITY).unwrap_or(0.0));
             let charge = sde.types.iter().find(|c| c.published == Some(true) && c.category_id == Some(CATEGORY_CHARGE)
-                && matches(c) && c.volume.is_some_and(|v| v > 0.0 && capacity >= v && capacity / v < f64::from(CARGO_QUANTITY)) )?;
+                && matches(c) && c.volume.is_some_and(|v| v > 0.0 && capacity >= v && capacity / v < CARGO_QUANTITY as f64) )?;
             let other = sde.types.iter().find(|c| c.published == Some(true) && c.category_id == Some(CATEGORY_CHARGE) && !matches(c))?;
             Some((m.type_id, charge.type_id, other.type_id))
         }).expect("published fueled shield module and compatible and incompatible charges");
@@ -102,12 +104,15 @@ async fn ancillary_auto_reload_db_smoke() {
     let test_started = started.clone();
     let test_db = db.clone();
     let test_world = world.clone();
+    let test_sde = sde.clone();
     let result = tokio::spawn(async move {
         test_world.register_pilot(fixture.character, tx.clone());
         test_world.add_ship(system, ball(fixture.ship, ship_type, fixture.character)).await.unwrap();
         let cx = Ctx { db: test_db.clone(), world: test_world, notify: tx, char_id: fixture.character, ship_id: fixture.ship, system_id: system };
-        let fit = Fit::load(&test_db, sde, fixture.character, fixture.ship).await.ok().expect("load fit");
+        let fit = Fit::load(&test_db, test_sde, fixture.character, fixture.ship).await.ok().expect("load fit");
         assert_eq!(fit.value(Key::Module(fixture.module), ATTR_RELOAD_TIME), RELOAD_MS);
+        let condition = crate::services::combat::prepare_condition_with_fit(&test_db, fixture.ship, &fit).await.unwrap();
+        cx.world.with(system, move |s| s.install_condition(fixture.ship, condition.into_condition(), fit)).await.unwrap();
         assert_eq!(loaded(&test_db, fixture.ship, FLAG_FITTING_FIRST).await.ok().expect("read empty magazine"), None);
         test_started.store(true, Ordering::Relaxed);
         auto_reload(&cx, fixture.module).await.ok().expect("automatic reload");
@@ -133,26 +138,20 @@ async fn ancillary_auto_reload_db_smoke() {
     let completion = if started.load(Ordering::Relaxed) {
         tokio::time::timeout(Duration::from_secs(20), async {
             while let Some((name, args)) = rx.recv().await {
-                if name == "OnModuleAttributeChanges" && args.len() == 1 {
-                    if let Value::List(changes) = &args[0] {
-                        if let [Value::Tuple(row)] = changes.as_slice() {
-                            if row.get(2) == Some(&Value::tuple([Value::Int(fixture.ship), Value::Int(i64::from(FLAG_FITTING_FIRST)), Value::Int(i64::from(charge_type))])) {
-                                return true;
-                            }
-                        }
-                    }
+                if name == "OnGodmaPrimeItem" {
+                    return Some(args);
                 }
             }
-            false
-        }).await.unwrap_or(false)
-    } else { false };
+            None
+        }).await.unwrap_or(None)
+    } else { None };
     let observed_at = crate::client::filetime_now();
     let final_loaded = loaded(&db, fixture.ship, FLAG_FITTING_FIRST).await.ok();
     let final_cargo = quantity(&db, fixture.cargo).await;
     let final_other = quantity(&db, fixture.incompatible).await;
     let final_pending = crate::dao::items::pending_reloads::for_flags(&db, fixture.ship, &[FLAG_FITTING_FIRST]).await;
     world.remove_ball(system, fixture.ship).await;
-    world.unregister_pilot(fixture.character);
+    world.unregister_pilot_generation(fixture.character, None);
     let flush = world.flush_positions().await;
     state().reloading.remove(&fixture.module);
     super::super::super::forget_ship(fixture.ship);
@@ -161,7 +160,10 @@ async fn ancillary_auto_reload_db_smoke() {
     assert_eq!(fingerprint(&db).await.unwrap(), before);
     flush.unwrap();
     let (reserved, marker) = result.unwrap();
-    assert!(completion, "actor reload completion notification");
+    let completion = completion.expect("actor reload completion notification");
+    super::charge_sync::assert_prime(&completion, &sde, fixture.ship, FLAG_FITTING_FIRST, charge_type, reserved);
+    let Value::Instance(_, info) = &completion[1] else { panic!("prime info") };
+    assert!(info.get("time").and_then(Value::as_int).unwrap() >= marker);
     assert!(observed_at >= marker);
     assert_eq!(final_loaded.expect("read loaded magazine"), Some((charge_type, reserved)));
     assert_eq!(final_cargo + reserved, CARGO_QUANTITY);
@@ -256,8 +258,8 @@ async fn actor_completes_passive_and_normal_locks_with_symmetric_notifications()
     state().active.remove(&fixture.module);
     world.remove_ball(system, fixture.ship).await;
     world.remove_ball(system, target).await;
-    world.unregister_pilot(fixture.character);
-    world.unregister_pilot(target_pilot);
+    world.unregister_pilot_generation(fixture.character, None);
+    world.unregister_pilot_generation(target_pilot, None);
     drop(cx);
     drop(world);
     cleanup(&db, fixture).await.unwrap();

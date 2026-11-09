@@ -19,7 +19,6 @@ mod map;
 mod activity_mgr;
 mod station_svc;
 mod jump_timers;
-mod ship;
 mod macho_net;
 mod chat_authentication_service;
 
@@ -40,7 +39,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "activityMgr" => activity_mgr::dispatch(c, call).await,
         "stationSvc" => station_svc::dispatch(c, call).await,
         "jumpTimers" => jump_timers::dispatch(c, call).await,
-        "ship" => ship::dispatch(c, call).await,
         _ => None,
     }
 }

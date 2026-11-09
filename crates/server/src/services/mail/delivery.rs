@@ -6,10 +6,10 @@
 use super::super::{db_err, notify_error, CallError};
 use super::{mailing_lists, MAX_BODY, MAX_RECIPIENTS, MAX_TITLE, STATUS_AUTOMATED, STATUS_READ};
 use crate::client::filetime_now;
-use crate::consts::FILETIME_MINUTE;
+use infinity_core::consts::FILETIME_MINUTE;
 use crate::dao::{characters, mail};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}, Db};
-use crate::messages;
+use infinity_core::messages;
 use crate::space::World;
 use marshal::Value;
 use std::collections::BTreeSet;

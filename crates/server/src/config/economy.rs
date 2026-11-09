@@ -43,7 +43,7 @@ impl Default for TradeConfig {
 impl TradeConfig {
     pub(super) fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.idle_timeout_secs > 0, "trade.idle_timeout_secs must be positive");
-        super::duration("trade.idle_timeout_secs", self.idle_timeout_secs, crate::consts::FILETIME_SECOND, true)?;
+        super::duration("trade.idle_timeout_secs", self.idle_timeout_secs, infinity_core::consts::FILETIME_SECOND, true)?;
         Ok(())
     }
 }
@@ -62,7 +62,7 @@ impl Default for DailyGift {
 impl DailyGift {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!((1..=i64::from(i32::MAX)).contains(&self.type_id), "store.daily_gift.type_id={} must fit a positive i32", self.type_id);
-        anyhow::ensure!((1..=i64::from(i32::MAX)).contains(&self.quantity), "store.daily_gift.quantity={} must fit a positive i32", self.quantity);
+        anyhow::ensure!(self.quantity > 0, "store.daily_gift.quantity={} must be positive", self.quantity);
         Ok(())
     }
 }
@@ -132,7 +132,7 @@ impl CharactersConfig {
         anyhow::ensure!(self.name_max_len > 0, "characters.name_max_len={} is outside its valid domain", self.name_max_len);
         anyhow::ensure!(self.name_max_spaces > 0, "characters.name_max_spaces={} is outside its valid domain", self.name_max_spaces);
         anyhow::ensure!(self.delete_delay_secs > 0, "characters.delete_delay_secs={} is outside its valid domain", self.delete_delay_secs);
-        super::duration("characters.delete_delay_secs", self.delete_delay_secs, crate::consts::FILETIME_SECOND, true)?;
+        super::duration("characters.delete_delay_secs", self.delete_delay_secs, infinity_core::consts::FILETIME_SECOND, true)?;
         anyhow::ensure!(self.free_respecs > 0, "characters.free_respecs={} is outside its valid domain", self.free_respecs);
         anyhow::ensure!(self.name_min_len <= self.name_max_len, "characters.name_min_len={} exceeds characters.name_max_len={}", self.name_min_len, self.name_max_len);
         Ok(())
@@ -151,6 +151,8 @@ pub struct MarketConfig {
     pub sales_tax: f64,
     /// Server design default for order duration in services/market/mod.rs.
     pub max_order_days: i64,
+    /// Server policy for order modification cooldown, default from appConst.mktModificationDelay; 0 disables it.
+    pub modification_delay_seconds: i64,
     /// Server market policy: NPC buy price as a fraction of sell price.
     pub npc_buy_ratio: f64,
     /// Server market order maintenance cadence.
@@ -170,6 +172,7 @@ impl Default for MarketConfig {
             broker_fee_min_isk: 100.0,
             sales_tax: 0.08,
             max_order_days: 90,
+            modification_delay_seconds: 300,
             npc_buy_ratio: 0.8,
             maintenance_secs: 60,
             order_history_days: 90,
@@ -185,13 +188,15 @@ impl MarketConfig {
         anyhow::ensure!(self.broker_fee_min_isk.is_finite() && self.broker_fee_min_isk >= 0.0, "market.broker_fee_min_isk={} is outside its valid domain", self.broker_fee_min_isk);
         anyhow::ensure!(self.sales_tax.is_finite() && (0.0..=1.0).contains(&self.sales_tax), "market.sales_tax={} is outside its valid domain", self.sales_tax);
         anyhow::ensure!((1..=i64::from(i16::MAX)).contains(&self.max_order_days), "market.max_order_days={} must fit a positive i16", self.max_order_days);
+        anyhow::ensure!(self.modification_delay_seconds >= 0, "market.modification_delay_seconds={} must be nonnegative", self.modification_delay_seconds);
+        super::duration("market.modification_delay_seconds", self.modification_delay_seconds, infinity_core::consts::FILETIME_SECOND, false)?;
         anyhow::ensure!(self.npc_buy_ratio.is_finite() && (0.0..=1.0).contains(&self.npc_buy_ratio), "market.npc_buy_ratio={} is outside its valid domain", self.npc_buy_ratio);
         anyhow::ensure!(self.maintenance_secs > 0, "market.maintenance_secs={} is outside its valid domain", self.maintenance_secs);
         anyhow::ensure!(self.order_history_days > 0, "market.order_history_days={} is outside its valid domain", self.order_history_days);
         anyhow::ensure!(self.transaction_history_days > 0, "market.transaction_history_days={} is outside its valid domain", self.transaction_history_days);
         anyhow::ensure!(self.price_history_days > 0, "market.price_history_days={} is outside its valid domain", self.price_history_days);
         for (key, value) in [("market.order_history_days", self.order_history_days), ("market.transaction_history_days", self.transaction_history_days), ("market.price_history_days", self.price_history_days)] {
-            super::duration(key, value, crate::consts::FILETIME_DAY, false)?;
+            super::duration(key, value, infinity_core::consts::FILETIME_DAY, false)?;
         }
         Ok(())
     }

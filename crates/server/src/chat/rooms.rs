@@ -7,18 +7,18 @@ use super::*;
 use crate::services::{chat::authority, CallError};
 
 /// Server-designated XMPP resource for protocol metadata, not an authenticated socket.
-const VIRTUAL_RESOURCE: &str = "virtual";
+pub(super) const VIRTUAL_RESOURCE: &str = "virtual";
 
 pub(super) enum JoinError { Forbidden, Conflict, Domain(CallError) }
 
 impl Hub {
-    pub(super) async fn join_room(&self, session: &crate::session::OnlineSession, name: &str, full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
+    pub(super) async fn join_room(&self, session: &infinity_core::session::OnlineSession, name: &str, full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
         let epoch = self.rooms.lock().unwrap().epoch;
         let admission = authority::admit(&self.db, self.world.sde(), session, name).await.map_err(JoinError::Domain)?.ok_or(JoinError::Forbidden)?;
         self.commit_admissions(session, epoch, &[(name.to_owned(), admission)], full, real)
     }
 
-    pub(super) fn commit_admissions(&self, session: &crate::session::OnlineSession, epoch: u64, admissions: &[(String, authority::Admission)], full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
+    pub(super) fn commit_admissions(&self, session: &infinity_core::session::OnlineSession, epoch: u64, admissions: &[(String, authority::Admission)], full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
         let nick = session.character_id.to_string();
         let mut rooms = self.rooms.lock().unwrap();
         if rooms.epoch != epoch || self.world.online_session(session.character_id).as_ref() != Some(session) { return Err(JoinError::Forbidden); }
@@ -53,7 +53,7 @@ impl Hub {
     }
 
     pub(crate) async fn join_virtual(&self, character_id: i64) -> Result<(), CallError> {
-        let denied = || crate::services::notify_error(crate::messages::chat::FORBIDDEN);
+        let denied = || crate::services::notify_error(infinity_core::messages::chat::FORBIDDEN);
         let session = self.world.online_session(character_id).filter(|s| s.character_id == character_id).ok_or_else(denied)?;
         let epoch = self.rooms.lock().unwrap().epoch;
         let full = format!("{character_id}@{}/{VIRTUAL_RESOURCE}", self.host);
@@ -77,26 +77,50 @@ impl Hub {
     fn remove_matching(&self, predicate: impl Fn(&str, &str, &Occupant) -> bool, destroy: bool) {
         let mut rooms = self.rooms.lock().unwrap();
         rooms.epoch = rooms.epoch.wrapping_add(1);
+        let mut console_rooms = Vec::new();
         for (room, occupants) in &mut rooms.entries {
+            let channel = room.split_once('@').map_or(room.as_str(), |(channel, _)| channel);
             let gone: Vec<_> = occupants.iter().filter(|(nick, o)| predicate(room, nick, o)).map(|(nick, _)| nick.clone()).collect();
             for nick in gone {
                 if let Some(removed) = occupants.remove(&nick) {
                     let stanza = unavailable(room, &nick, destroy);
                     removed.send(stanza.clone());
                     for occupant in occupants.values() { occupant.send(stanza.clone()); }
+                    if console::recipient(channel).is_some_and(|id| nick.parse::<i64>().ok() == Some(id)) {
+                        console_rooms.push(room.clone());
+                    }
                 }
             }
         }
+        for room in console_rooms { rooms.entries.remove(&room); }
         rooms.entries.retain(|_, occupants| !occupants.is_empty());
     }
 
     pub(super) fn leave_all(&self, full_jid: &str, tx: &Tx) {
-        self.remove_matching(|_, _, o| o.matches_socket(full_jid, tx), false);
+        let users = self.users.lock().unwrap();
+        let pending_room = full_jid.split_once('/').and_then(|(bare, _)| {
+            users.get(bare).is_some_and(|(current, current_tx)| current == full_jid && current_tx.same_channel(tx))
+                .then(|| bare.split_once('@').and_then(|(id, _)| id.parse::<i64>().ok()))
+                .flatten()
+        }).map(|id| format!("{}@{}", console::room(id), self.conference()));
+        self.remove_matching(|room, nick, occupant| {
+            occupant.matches_socket(full_jid, tx)
+                || pending_room.as_deref() == Some(room)
+                    && nick == console::SYSTEM_NICK
+        }, false);
+    }
+
+    pub(super) fn leave_room(&self, room: &str, full_jid: &str, tx: &Tx) {
+        self.remove_matching(|r, _, o| r == room && o.matches_socket(full_jid, tx), false);
     }
 
     pub(crate) fn disconnect_character(&self, id: i64) {
-        self.tokens.lock().unwrap().remove(&id.to_string());
-        self.remove_matching(|_, nick, _| nick == id.to_string(), false);
+        let character = id.to_string();
+        self.tokens.lock().unwrap().remove(&character);
+        self.users.lock().unwrap().remove(&format!("{character}@{}", self.host));
+        self.remove_matching(|_, nick, _| nick.parse::<i64>().ok() == Some(id), false);
+        let room = format!("{}@{}", console::room(id), self.conference());
+        self.rooms.lock().unwrap().entries.remove(&room);
     }
 
     pub(crate) fn session_changed(&self, id: i64) {
@@ -107,7 +131,7 @@ impl Hub {
         }, false);
     }
 
-    pub(crate) fn refresh_profile(&self, session: &crate::session::OnlineSession) {
+    pub(crate) fn refresh_profile(&self, session: &infinity_core::session::OnlineSession) {
         let nick = session.character_id.to_string();
         let xml = {
             let mut profiles = self.profiles.lock().unwrap();

@@ -3,7 +3,16 @@
 //! corporations and corp_titles. Policy and notifications are unsupported.
 
 use crate::db::{self, executor::Executor};
+/// Serialize the one-time legacy folded-role cutover using the validated static local mask.
+pub(crate) async fn migrate_scopes(ex: &(impl Executor + ?Sized), local: i64) -> Result<(), db::Error> {
+    let claimed = ex.execute("INSERT INTO game.corp_role_scope_migration(id) VALUES (true) ON CONFLICT DO NOTHING", &[]).await?;
+    if claimed == 0 { return Ok(()); }
+    ex.execute("UPDATE game.characters SET corp_roles_hq=corp_roles & $1, corp_roles_base=corp_roles & $1, corp_roles_other=corp_roles & $1, corp_grantable_hq=corp_grantable_roles & $1, corp_grantable_base=corp_grantable_roles & $1, corp_grantable_other=corp_grantable_roles & $1, corp_roles=corp_roles & ~$1, corp_grantable_roles=corp_grantable_roles & ~$1", &[&local]).await?;
+    ex.execute("UPDATE game.corp_titles SET roles_hq=roles_hq | (roles & $1), roles_base=roles_base | (roles & $1), roles_other=roles_other | (roles & $1), grantable_hq=grantable_hq | (grantable_roles & $1), grantable_base=grantable_base | (grantable_roles & $1), grantable_other=grantable_other | (grantable_roles & $1), roles=roles & ~$1, grantable_roles=grantable_roles & ~$1", &[&local]).await?;
+    Ok(())
+}
 
+#[derive(Clone)]
 pub(crate) struct Title {
     pub title_id: i64,
     pub name: String,
@@ -69,48 +78,55 @@ impl TitleName {
         }
     }
 }
-pub(crate) enum Field {
-    Roles,
-    Grantable,
-    TitleMask,
+
+#[derive(Clone)]
+pub(crate) struct MemberRoles {
+    pub(crate) character: i64,
+    pub(crate) roles: [i64; 4], pub(crate) grantable: [i64; 4],
+    pub(crate) base: Option<i64>, pub(crate) blocked: bool,
+    pub(crate) division: i64, pub(crate) squadron: i64,
+    pub(crate) title_mask: i64, pub(crate) title: String,
 }
-pub(crate) enum Action {
-    Add,
-    Remove,
-    Set,
+impl MemberRoles {
+    fn from_row(r: &tokio_postgres::Row) -> Self {
+        Self { character: r.get("character_id"), roles: [r.get("corp_roles"), r.get("corp_roles_hq"), r.get("corp_roles_base"), r.get("corp_roles_other")],
+            grantable: [r.get("corp_grantable_roles"), r.get("corp_grantable_hq"), r.get("corp_grantable_base"), r.get("corp_grantable_other")],
+            base: r.get("corp_base_id"), blocked: r.get("corp_block_roles"), division: r.get("corp_division_id"), squadron: r.get("corp_squadron_id"), title_mask: r.get("corp_title_mask"), title: r.get("corp_title") }
+    }
+}
+pub(crate) async fn members(ex: &(impl Executor + ?Sized), targets: &[i64]) -> Result<Vec<MemberRoles>, db::Error> {
+    Ok(ex.query("SELECT character_id,corp_roles,corp_roles_hq,corp_roles_base,corp_roles_other,corp_grantable_roles,corp_grantable_hq,corp_grantable_base,corp_grantable_other,corp_base_id,corp_block_roles,corp_division_id,corp_squadron_id,corp_title_mask,corp_title FROM game.characters WHERE character_id=ANY($1) AND NOT deleted ORDER BY character_id", &[&targets]).await?.iter().map(MemberRoles::from_row).collect())
+}
+pub(crate) async fn write_member(ex: &(impl Executor + ?Sized), target: i64, corporation: i64, m: &MemberRoles) -> Result<bool, db::Error> {
+    Ok(ex.execute("UPDATE game.characters SET corp_roles=$3,corp_roles_hq=$4,corp_roles_base=$5,corp_roles_other=$6,corp_grantable_roles=$7,corp_grantable_hq=$8,corp_grantable_base=$9,corp_grantable_other=$10,corp_base_id=$11,corp_block_roles=$12,corp_title_mask=$13,corp_title=$14,corp_division_id=$15,corp_squadron_id=$16 WHERE character_id=$1 AND corporation_id=$2",
+        &[&target,&corporation,&m.roles[0],&m.roles[1],&m.roles[2],&m.roles[3],&m.grantable[0],&m.grantable[1],&m.grantable[2],&m.grantable[3],&m.base,&m.blocked,&m.title_mask,&m.title,&m.division,&m.squadron]).await? != 0)
+}
+pub(crate) async fn removal_clock(ex: &(impl Executor + ?Sized), target: i64, value: Option<i64>) -> Result<(), db::Error> {
+    ex.execute("UPDATE game.characters SET corp_roles_removed_at=$2 WHERE character_id=$1", &[&target, &value]).await?;
+    Ok(())
 }
 
-pub(crate) async fn update_member(ex: &(impl Executor + ?Sized), target: i64, roles: Option<i64>, grantable: Option<i64>, title: Option<String>, title_mask: Option<i64>) -> Result<(), db::Error> {
-    ex.execute("UPDATE game.characters SET corp_roles = COALESCE($2, corp_roles), corp_grantable_roles = COALESCE($3, corp_grantable_roles),
-                    corp_title = COALESCE($4, corp_title), corp_title_mask = COALESCE($5, corp_title_mask)
-             WHERE character_id = $1", &[&target, &roles, &grantable, &title, &title_mask]).await?;
-    Ok(())
-}
-pub(crate) async fn action(ex: &(impl Executor + ?Sized), target: i64, field: Field, action: Action, value: i64) -> Result<(), db::Error> {
-    let column = match field {
-        Field::Roles => "corp_roles",
-        Field::Grantable => "corp_grantable_roles",
-        Field::TitleMask => "corp_title_mask",
-    };
-    let expr = match action {
-        Action::Add => format!("{column} | $2"),
-        Action::Remove => format!("{column} & ~$2"),
-        Action::Set => "$2".to_string(),
-    };
-    ex.execute(&format!("UPDATE game.characters SET {column} = {expr} WHERE character_id = $1"), &[&target, &value]).await?;
-    Ok(())
-}
 pub(crate) async fn titles(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Vec<Title>, db::Error> {
     Ok(ex.query("SELECT title_id, name, roles, grantable_roles, roles_hq, grantable_hq, roles_base, grantable_base, roles_other, grantable_other
              FROM game.corp_titles WHERE corporation_id = $1", &[&corp]).await?.iter().map(Title::from_row).collect())
 }
 pub(crate) async fn holders(ex: &(impl Executor + ?Sized), corp: i64, mask: i64, active: bool) -> Result<Vec<i64>, db::Error> {
     let sql = if active {
-        "SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0 AND NOT deleted"
+        "SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0 AND NOT deleted ORDER BY character_id"
     } else {
-        "SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0"
+        "SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0 ORDER BY character_id"
     };
     Ok(ex.query(sql, &[&corp, &mask]).await?.iter().map(|r| CharacterId::from_row(r).character_id).collect())
+}
+pub(crate) struct HolderMask { pub(crate) character: i64, pub(crate) mask: i64 }
+impl HolderMask {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self { character: row.get("character_id"), mask: row.get("corp_title_mask") }
+    }
+}
+pub(crate) async fn holder_masks(ex: &(impl Executor + ?Sized), characters: &[i64]) -> Result<Vec<HolderMask>, db::Error> {
+    Ok(ex.query("SELECT character_id,corp_title_mask FROM game.characters WHERE character_id=ANY($1) ORDER BY character_id", &[&characters]).await?
+        .iter().map(HolderMask::from_row).collect())
 }
 pub(crate) async fn save_titles(ex: &(impl Executor + ?Sized), corp: i64, titles: Vec<Title>) -> Result<(), db::Error> {
     for t in &titles {
@@ -123,22 +139,23 @@ pub(crate) async fn save_titles(ex: &(impl Executor + ?Sized), corp: i64, titles
 }
 pub(crate) async fn delete_title(ex: &(impl Executor + ?Sized), corp: i64, title: i64) -> Result<(), db::Error> {
     ex.execute("DELETE FROM game.corp_titles WHERE corporation_id = $1 AND title_id = $2", &[&corp, &title]).await?;
-    ex.execute("UPDATE game.characters SET corp_title_mask = corp_title_mask & ~$2 WHERE corporation_id = $1", &[&corp, &title]).await?;
+    ex.execute("UPDATE game.characters SET corp_title_mask = corp_title_mask & ~$2 WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0", &[&corp, &title]).await?;
     Ok(())
 }
 pub(crate) async fn potential_ceos(ex: &(impl Executor + ?Sized), corp: i64, ceo: i64) -> Result<Vec<i64>, db::Error> {
     Ok(ex.query("SELECT ch.character_id
              FROM game.characters ch
-             WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted
-             ORDER BY ch.character_id", &[&corp, &ceo]).await?.iter().map(|r| r.get("character_id")).collect())
+             WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted AND NOT ch.corp_block_roles
+             ORDER BY ch.character_id", &[&corp, &ceo]).await?.iter().map(|r| CharacterId::from_row(r).character_id).collect())
 }
-pub(crate) async fn transfer_ceo(ex: &(impl Executor + ?Sized), corp: i64, next: i64, mut writes: [(i64, i64); 2]) -> Result<(), db::Error> {
-    ex.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &next]).await?;
+pub(crate) async fn transfer_ceo(ex: &(impl Executor + ?Sized), corp: i64, old: i64, next: i64, roles: [i64; 4]) -> Result<bool, db::Error> {
+    if ex.execute("UPDATE game.corporations SET ceo_id=$3 WHERE corporation_id=$1 AND ceo_id=$2 AND NOT deleted", &[&corp,&old,&next]).await? != 1 { return Ok(false); }
+    let mut writes = [(old, [infinity_core::consts::ROLE_DIRECTOR, 0, 0, 0]), (next, roles)];
     writes.sort_by_key(|(id, _)| *id);
-    for (id, roles) in writes {
-        ex.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&id, &roles]).await?;
+    for (id, masks) in writes {
+        if ex.execute("UPDATE game.characters SET corp_roles=$3,corp_roles_hq=$4,corp_roles_base=$5,corp_roles_other=$6 WHERE character_id=$1 AND corporation_id=$2", &[&id,&corp,&masks[0],&masks[1],&masks[2],&masks[3]]).await? != 1 { return Ok(false); }
     }
-    Ok(())
+    Ok(true)
 }
 pub(crate) async fn info(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<Info>, db::Error> {
     Ok(ex.query_opt("SELECT ch.corporation_id, co.alliance_id, ch.corp_title, ch.corp_title_mask FROM game.characters ch

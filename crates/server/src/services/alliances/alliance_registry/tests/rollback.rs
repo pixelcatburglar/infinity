@@ -20,7 +20,7 @@ async fn history_failure_rolls_back_membership_and_outbox() -> Result<()> {
     let result = catch_scenario(async {
         let before = state(&s, corp).await?;
         let identity = crate::services::identity::Identity::of_client(&s.f.client);
-        ensure!(admission::decide(&s.f.db, &s.f.world, &identity, alliance, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_err(), "injected failure did not refuse admission");
+        ensure!(admission::decide(&s.f.db, &s.f.world, &identity, alliance, corp, admission::Decision::Force { role: infinity_core::consts::GM_ROLES }).await.is_err(), "injected failure did not refuse admission");
         ensure!(state(&s, corp).await? == before && application(&s, alliance, corp).await? == Some(APP_NEW), "failed admission changed persistent rows");
         ensure!(drain(&mut s.joining).is_empty() && drain(&mut s.existing).is_empty(), "failed admission emitted effects");
         Ok(())

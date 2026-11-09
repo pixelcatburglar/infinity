@@ -7,7 +7,7 @@
 
 use super::{keyval, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::messages;
+use infinity_core::messages;
 use crate::space::World;
 use marshal::Value;
 use std::collections::HashMap;
@@ -302,6 +302,7 @@ mod fleet_mgr;
 mod fleet_object_handler;
 mod fleet_proxy;
 pub(crate) mod lifecycle;
+pub(crate) mod navigation;
 pub(crate) mod space_state;
 pub(crate) mod warp;
 
@@ -324,13 +325,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 
 /// Apply session pairs to the calling client directly.
 fn set_own_session(c: &mut Client, pairs: &[Value]) {
-    let owned: Vec<(String, Value)> = pairs
-        .iter()
-        .filter_map(|p| match p.items()? {
-            [k, v] => Some((k.as_text()?.into_owned(), v.clone())),
-            _ => None,
-        })
-        .collect();
+    let owned = infinity_core::session::decode_pairs(pairs);
     c.change_session(owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
 }
 

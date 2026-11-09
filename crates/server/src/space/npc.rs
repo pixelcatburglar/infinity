@@ -24,9 +24,8 @@ use super::targeting::next_generation as next_npc_target_generation;
 /// Server NPC targeting policy: sentinel owner permitting targets among all pilots.
 pub const HOSTILE_TO_ALL: i64 = -1;
 pub type NpcFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-/// Called by the worker, not the actor. Capture Db and Weak<World>, upgrading
-/// only for a job, so an idle brain cannot keep its own World alive.
-pub type NpcEffects = Arc<dyn Fn(NpcAction) -> NpcFuture + Send + Sync>;
+/// Admit on the actor after brains are restored; futures retain only Weak<World>.
+pub type NpcEffects = Arc<dyn Fn(&mut System, NpcAction) -> Option<NpcFuture> + Send + Sync>;
 
 pub enum NpcAction {
     Shot { me: Ball, victim: Ball, generation: u64 },
@@ -85,17 +84,12 @@ pub(super) enum EffectJob {
     Drone { effects: drone::DroneEffects, action: drone::DroneAction },
 }
 pub(super) fn start_worker(system: &mut System) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<EffectJob>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<NpcFuture>();
     let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel::<NpcFuture>();
     system.effect_jobs = Some(tx);
     system.deferred_jobs = Some(deferred_tx);
     let worker = tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            match job {
-                EffectJob::Npc { effects, action } => effects(action).await,
-                EffectJob::Drone { effects, action } => effects(action).await,
-            }
-        }
+        while let Some(job) = rx.recv().await { job.await; }
     });
     tokio::spawn(async move {
         if let Err(error) = worker.await { tracing::warn!(%error, "space NPC worker failed"); }
@@ -128,6 +122,19 @@ impl System {
     /// Attach only to a live ball. First think is staggered over the configured interval.
     pub fn add_npc(&mut self, id: i64, mut brain: NpcBrain) -> bool {
         if !self.contains(id) { return false; }
+        if self.actor_combat.get(&id).is_some_and(|record| matches!(record.phase, super::combat::CombatPhase::Dying { .. })) {
+            self.actor_combat.remove(&id);
+        }
+        if !self.actor_combat.contains_key(&id) {
+            let Some(sde) = self.projection_sde.clone() else { return false };
+            let fit = crate::services::fit::Fit::for_space_type(sde, self.ball(id).map(|ball| ball.type_id).unwrap_or_default(), Vec::new());
+            let stats = crate::services::combat::groups_health::ShipStats::from_fit(&fit, crate::services::fit::Key::Ship);
+            let condition = crate::services::combat::groups_health::Condition {
+                now: stats.max, stats, shield_at: crate::client::filetime_now(),
+            };
+            self.install_condition(id, condition, fit);
+            if !self.actor_combat.contains_key(&id) { return false; }
+        }
         brain.next_think_ms = self.ms.saturating_add(id.rem_euclid(crate::config::game().combat.npc_think_ms));
         let first = self.brains.insert(id, brain).is_none();
         if first {
@@ -197,10 +204,21 @@ impl System {
             }
         }
     }
-    fn npc_effect(&self, brain: &NpcBrain, action: NpcAction) {
-        if let Some(tx) = &self.effect_jobs {
-            let _ = tx.send(EffectJob::Npc { effects: brain.effects.clone(), action });
+    fn npc_effect(&mut self, brain: &NpcBrain, action: NpcAction) {
+        if self.effect_jobs.is_some() {
+            self.effect_staging.push(EffectJob::Npc { effects: brain.effects.clone(), action });
         }
+    }
+    pub(super) fn admit_effect_jobs(&mut self) {
+        let mut staging = std::mem::take(&mut self.effect_staging);
+        for job in staging.drain(..) {
+            let future = match job {
+                EffectJob::Npc { effects, action } => effects(self, action),
+                EffectJob::Drone { effects, action } => effects(self, action),
+            };
+            if let (Some(tx), Some(future)) = (&self.effect_jobs, future) { let _ = tx.send(future); }
+        }
+        self.effect_staging = staging;
     }
     pub(super) fn think_npcs(&mut self) {
         // Reuse the scratch vector: no per-tick allocation after reaching capacity.
@@ -317,7 +335,9 @@ impl System {
             me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(target).unwrap(),
             effect_id: module.effect_id, source_module: module.source_module, duration_ms, generation,
         };
-        self.npc_effect(brain, action);
+        if self.effect_jobs.is_some() {
+            self.effect_staging.push(EffectJob::Npc { effects: brain.effects.clone(), action });
+        }
         if duration_ms > 0.0 {
             self.schedule_at(self.ms.saturating_add(duration_ms as i64), move |s|
                 s.npc_effect_cycle(id, target, generation, index));
@@ -337,7 +357,7 @@ impl System {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
             brain.announced = true;
             if let Some(char_id) = self.ball(ship).and_then(|ball| ball.char_id) {
-                crate::lua::on_event(crate::lua::events::GameEvent::Targeted {
+                crate::progress::publish_live(self.progress_registry(), &crate::lua::events::GameEvent::Targeted {
                     char_id, by_ball_id: id, system_id: self.id,
                 });
             }

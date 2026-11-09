@@ -6,7 +6,7 @@
 //! Character and corporation IDs of zero mean the respective identity is absent.
 
 use crate::client::Client;
-use crate::session::Session;
+use infinity_core::session::Session;
 
 #[derive(Clone, Copy)]
 pub struct Identity {

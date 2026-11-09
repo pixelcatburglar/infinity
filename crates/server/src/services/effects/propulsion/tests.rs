@@ -11,7 +11,7 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
         old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
-        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
         cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     system.insert(ball);
@@ -41,7 +41,7 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.upsert_projection(1, Projection {
         source_ship: 2, source_module: 3, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-        values: vec![], charge_values: vec![], charge_type: None,
+        values: vec![], charge_values: vec![], charge_type: None, scramble: None,
     });
     let current = system.projection_revision(1);
     system.queue_projection_kinematics(1, current, Kinematics { speed: 10.0, mass: 30.0, agility: 0.25, signature: 40.0 });
@@ -71,7 +71,7 @@ fn refused_kinematics_preserve_moving_segment_and_wire_state() {
         pos: [3.0, 4.0, 5.0], vel: [2.0, 3.0, 4.0], goto: [100.0, 200.0, 300.0], follow_id: 0,
         old_pos: [3.0, 4.0, 5.0], old_vel: [2.0, 3.0, 4.0], segment_acceleration: None,
         follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
-        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
         cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     control.insert(ball.clone());
@@ -122,7 +122,7 @@ async fn kinematics_reads_the_requested_fit_key() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let mut fit = Fit::for_space_type(sde, 587, vec![]);
     fit.include_drone(7, 2454, vec![(ATTR_MAX_VELOCITY, 123.0), (ATTR_MASS, 456.0),
-        (crate::consts::dogma::ATTR_AGILITY, 0.75), (ATTR_SIGNATURE_RADIUS, 9.0)]);
+        (infinity_core::consts::dogma::ATTR_AGILITY, 0.75), (ATTR_SIGNATURE_RADIUS, 9.0)]);
     let drone = kinematics(&fit, Key::Drone(7));
     assert_eq!((drone.speed, drone.mass, drone.agility, drone.signature), (123.0, 456.0, 0.75, 9.0));
     assert_ne!(kinematics(&fit, Key::Ship).speed, drone.speed);

@@ -3,7 +3,8 @@
 //! NPC definitions and debris types come from the startup SDE snapshot.
 
 use super::{args::Args, slash_error, CallError, Client};
-use crate::{consts::{CATEGORY_ENTITY, GROUP_WRECK}, messages, space::{dist, now_ms, V3}};
+use infinity_core::{consts::{CATEGORY_ENTITY, GROUP_WRECK}, messages};
+use crate::{space::{dist, now_ms, V3}};
 use std::{collections::HashSet, sync::{Mutex, OnceLock}};
 
 /// SDE invGroups: Cargo Container.

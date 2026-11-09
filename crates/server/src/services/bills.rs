@@ -14,10 +14,10 @@ use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, C
 use crate::dao::characters::members;
 use crate::dao::bills as bills_dao;
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
-use crate::db::Db;
+use infinity_core::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
+use crate::db::{Db, executor::Executor};
 use crate::db::outbox::dispatch_world;
-use crate::messages;
+use infinity_core::messages;
 use crate::space::World;
 use marshal::Value;
 use std::future::Future;
@@ -61,7 +61,7 @@ async fn announce(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
 
 /// Pay a bill from `corp`'s division `key` (or, with `corp` None, the debtor character's
 /// wallet), credit the creditor, and carry out what it paid for.
-pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, key: i32) -> Result<(), CallError> {
+pub(super) async fn pay(db: &Db, world: &World, bill: i64, expected_debtor: i64, corp: Option<i64>, key: i32, actor: Option<i64>) -> Result<(), CallError> {
     let _trading = super::market::lock().await;
     db.transaction(
         |tx, outbox| Box::pin(async move {
@@ -69,6 +69,30 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
                 return Err(notify_error(messages::BILL_ALREADY_PAID_OR_MISSING));
             };
             let (kind, debtor, creditor, amount, external) = (r.bill_type, r.debtor_id, r.creditor_id, r.amount, r.external_id);
+            if debtor != expected_debtor { return Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED)); }
+            if let Some(actor) = actor {
+                let alliance = corp.filter(|corp| *corp != debtor).map(|_| debtor);
+                let alliances: Vec<i64> = alliance.into_iter().collect();
+                let corps: Vec<i64> = corp.into_iter().collect();
+                if !crate::dao::corporations::registry::lock_admission(tx, &alliances, &corps, &[actor]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED));
+                }
+                match corp {
+                    Some(corp) => {
+                        let authority = super::corps::permissions::load(tx, actor).await?;
+                        if (alliance.is_some() && crate::dao::alliances::executor_corp(tx, debtor).await.map_err(db_err)? != Some(corp))
+                            || !authority.is_some_and(|authority| super::corps::permissions::allows(&authority, corp, ROLE_ACCOUNTANT)
+                                && super::corpwallet::can_take(&authority, corp, key)) {
+                            return Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED));
+                        }
+                    }
+                    None if debtor != actor => return Err(notify_error(messages::BILL_NOT_OWNED_BY_CHARACTER)),
+                    None => {}
+                }
+            } else if corp.is_some_and(|corp| corp != debtor) {
+                return Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED));
+            }
+            let amount = crate::isk::IskAmount::from_isk(amount)?;
             match corp {
                 Some(corp) => super::wallets::corp_debit(tx, outbox, corp, key, amount).await?,
                 None => super::wallets::debit(tx, outbox, debtor, amount).await?,
@@ -91,7 +115,7 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
         }),
         |(debtor, creditor, amount), outbox| async move {
             dispatch_world((), outbox, world)?;
-            info!("bills: {debtor} paid bill {bill} ({amount:.0} ISK to {creditor})");
+            info!("bills: {debtor} paid bill {bill} ({:.0} ISK to {creditor})", amount.wire_isk());
             Ok(())
         },
     ).await
@@ -118,7 +142,7 @@ async fn run(db: &Db, world: &World) -> Result<(), CallError> {
     let auto = bills_dao::automatic(db, UNPAID).await.map_err(db_err)?;
     for r in auto {
         let (bill, corp, key) = (r.bill_id, r.debtor_id, r.bill_division);
-        if let Err(e) = pay(db, world, bill, Some(corp), key).await {
+        if let Err(e) = pay(db, world, bill, corp, Some(corp), key, None).await {
             if let CallError::Internal(e) = e {
                 warn!("bills: paying {bill} automatically: {e:#}");
             }
@@ -136,7 +160,7 @@ pub(crate) fn run_billing(db: Db, world: Arc<World>, _: crate::scheduler::Job) -
 }
 
 /// An accountant, director or the CEO of `corp`.
-pub(super) async fn is_accountant(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
+pub(super) async fn is_accountant(db: &(impl Executor + ?Sized), me: i64, corp: i64) -> Result<bool, CallError> {
     has_role_or_is_ceo(db, me, corp, ROLE_ACCOUNTANT | ROLE_DIRECTOR).await
 }
 
@@ -154,19 +178,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // PayCorporationBill(billID, fromAccountKey=...)
         "PayCorporationBill" => {
             let key = call.kwargs.get("fromAccountKey").and_then(|v| v.as_int()).or(int(1)).unwrap_or(ACCOUNT_CASH as i64) as i32;
-            match (is_accountant(db, me, corp).await, super::corpwallet::may_take(db, me, corp, key).await) {
-                (Ok(true), Ok(true)) => pay(db, world, int(0).unwrap_or(0), Some(corp), key).await.map(|_| Value::None),
-                (Err(e), _) | (_, Err(e)) => Err(e),
-                _ => Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED)),
-            }
+            pay(db, world, int(0).unwrap_or(0), corp, Some(corp), key, Some(me)).await.map(|_| Value::None)
         }
         "CharPayBill" => {
             let bill = int(0).unwrap_or(0);
-            match bills_dao::owned(db, bill, me).await {
-                Ok(true) => pay(db, world, bill, None, 0).await.map(|_| Value::None),
-                Ok(false) => Err(notify_error(messages::BILL_NOT_OWNED_BY_CHARACTER)),
-                Err(e) => Err(db_err(e)),
-            }
+            pay(db, world, bill, me, None, 0, Some(me)).await.map(|_| Value::None)
         }
         // {ownerID: {billTypeID: bool, 'divisionID': accountKey}}
         "GetAutomaticPaySettings" => {
@@ -184,35 +200,38 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // SendAutomaticPaySettings({ownerID: {billTypeID: bool, 'divisionID': accountKey}})
         "SendAutomaticPaySettings" => {
-            match is_accountant(db, me, corp).await {
-                Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error(messages::ACCOUNTANT_REQUIRED_FOR_AUTOPAY_SETTINGS))),
-                Err(e) => return Some(Err(e)),
-            }
-            let Some(Value::Dict(owners)) = call.args.first() else { return Some(Ok(Value::None)) };
-            for (owner, settings) in owners {
-                if owner.as_int() != Some(corp) {
-                    continue;
-                }
-                let Value::Dict(settings) = settings else { continue };
-                for (k, v) in settings {
-                    let r = match (k.as_int(), k.as_text().as_deref()) {
-                        (Some(kind), _) => {
-                            let enabled = matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0);
-                            bills_dao::set_setting(db, corp, kind as i32, enabled).await
+            let mut changes = Vec::new();
+            if let Some(Value::Dict(owners)) = call.args.first() {
+                for (owner, settings) in owners {
+                    if owner.as_int() != Some(corp) { continue; }
+                    let Value::Dict(settings) = settings else { continue };
+                    for (key, value) in settings {
+                        if let Some(kind) = key.as_int() {
+                            let enabled = matches!(value, Value::Bool(true)) || value.as_int().is_some_and(|v| v != 0);
+                            changes.push((Some(kind as i32), i32::from(enabled)));
+                        } else if key.as_text().as_deref() == Some("divisionID") {
+                            changes.push((None, value.as_int().unwrap_or(ACCOUNT_CASH as i64) as i32));
                         }
-                        (None, Some("divisionID")) => {
-                            let key = v.as_int().unwrap_or(ACCOUNT_CASH as i64) as i32;
-                            bills_dao::set_division(db, corp, key).await
-                        }
-                        _ => continue,
-                    };
-                    if let Err(e) = r {
-                        return Some(Err(db_err(e)));
                     }
                 }
             }
-            Ok(Value::None)
+            db.transaction(
+                |tx, _: &mut ()| {
+                    let changes = changes.clone();
+                    Box::pin(async move {
+                        if !crate::dao::corporations::registry::lock_admission(tx, &[], &[corp], &[me]).await.map_err(db_err)?
+                            || !is_accountant(tx, me, corp).await? { return Err(notify_error(messages::ACCOUNTANT_REQUIRED_FOR_AUTOPAY_SETTINGS)); }
+                        for (kind, value) in changes {
+                            match kind {
+                                Some(kind) => { bills_dao::set_setting(tx, corp, kind, value != 0).await.map_err(db_err)?; }
+                                None => { bills_dao::set_division(tx, corp, value).await.map_err(db_err)?; }
+                            }
+                        }
+                        Ok(Value::None)
+                    })
+                },
+                |value, ()| async move { Ok(value) },
+            ).await
         }
         _ => return None,
     })

@@ -3,7 +3,7 @@
 //! Requires the dedicated test database and loaded SDE; no client integration is covered here.
 
 use super::super::*;
-use crate::consts::{CATEGORY_CHARGE, CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, ROLE_ACCOUNTANT, ROLE_CONTRACT_MANAGER, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1, ROLE_JUNIOR_ACCOUNTANT};
+use infinity_core::consts::{CATEGORY_CHARGE, CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, ROLE_ACCOUNTANT, ROLE_CONTRACT_MANAGER, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1, ROLE_JUNIOR_ACCOUNTANT};
 use crate::services::tests::fixture;
 
 fn success<T>(result: Result<T, CallError>) -> T {
@@ -146,6 +146,7 @@ async fn corporate_picker_roles_nested_custody_and_split_notifications() {
     let other_corp: i64 = db.query_one("INSERT INTO game.corporations (name, ticker, ceo_id, creator_id, station_id, created) VALUES ('contract-foreign-' || nextval('game.corporations_corporation_id_seq')::text, 'F' || nextval('game.corporations_corporation_id_seq')::text, $1, $1, $2, 0) RETURNING corporation_id", &[&other_ceo.character, &station]).await.unwrap().get("corporation_id");
     db.execute("UPDATE game.characters SET corporation_id = $2 WHERE character_id = $1", &[&other_ceo.character, &other_corp]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id = $1 WHERE character_id = ANY($2)", &[&corp, &vec![actor.character, ceo.character, observer.character]]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&ceo.character, &ROLE_DIRECTOR]).await.unwrap();
     client.session.apply(vec![("corpid", Value::Int(corp)), ("corpAccountKey", Value::Int(i64::from(ACCOUNT_CASH))), ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system))]);
     let task_db = db.clone();
     let task = tokio::spawn(async move {
@@ -167,7 +168,7 @@ async fn corporate_picker_roles_nested_custody_and_split_notifications() {
         let delivery_row = item_row(&db, &client.sde, deliveries).await;
         for n in 0..CORP_HANGAR_DIVISIONS {
             let role = ROLE_HANGAR_CAN_QUERY_1 << n;
-            db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &role]).await.unwrap();
+            db.execute("UPDATE game.characters SET corp_roles = 0, corp_roles_hq = $2 WHERE character_id = $1", &[&actor.character, &role]).await.unwrap();
             let listed = success(items_in(&client, station, None, true, FLAG_CORP_SAG1).await);
             let items = listed.items().unwrap();
             for (index, id) in divisions.iter().enumerate() {
@@ -175,12 +176,12 @@ async fn corporate_picker_roles_nested_custody_and_split_notifications() {
             }
             assert!(!items.contains(&delivery_row));
         }
-        db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+        db.execute("UPDATE game.characters SET corp_roles = 0, corp_roles_hq = $2 WHERE character_id = $1", &[&actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
         assert!(success(items_in(&client, station, None, true, FLAG_CORP_SAG1).await).items().unwrap().is_empty());
         let sag_split = success(split_stack(&client, station, divisions[0], 2, true, FLAG_CORP_SAG1).await).as_int().unwrap();
         let sag_row = load_items(&db, &client.sde, ItemQuery::Id(sag_split)).await.unwrap().pop().unwrap();
         assert_eq!((sag_row.owner_id, sag_row.location_id, sag_row.flag_id, sag_row.quantity), (corp, office, FLAG_CORP_SAG1, 2));
-        db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_JUNIOR_ACCOUNTANT]).await.unwrap();
+        db.execute("UPDATE game.characters SET corp_roles = $2, corp_roles_hq = 0 WHERE character_id = $1", &[&actor.character, &ROLE_JUNIOR_ACCOUNTANT]).await.unwrap();
         assert!(success(items_in(&client, station, None, true, FLAG_CORP_DELIVERIES).await).items().unwrap().contains(&delivery_row));
         assert!(success(items_in(&client, station, Some(root), true, FLAG_CORP_DELIVERIES).await).items().unwrap().contains(&item_row(&db, &client.sde, child).await));
         assert!(!success(items_in(&client, station, Some(root), true, FLAG_CORP_DELIVERIES).await).items().unwrap().contains(&item_row(&db, &client.sde, foreign).await));
@@ -223,8 +224,8 @@ async fn corporate_picker_roles_nested_custody_and_split_notifications() {
         db.execute("UPDATE game.characters SET corporation_id = 1 WHERE character_id = $1", &[&actor.character]).await.unwrap();
         assert!(success(items_in(&client, station, None, true, FLAG_CORP_DELIVERIES).await).items().unwrap().is_empty());
         assert!(split_stack(&client, station, deliveries, 1, true, FLAG_CORP_DELIVERIES).await.is_err());
-        client.world.unregister_pilot(ceo.character);
-        client.world.unregister_pilot(observer.character);
+        client.world.unregister_pilot_generation(ceo.character, None);
+        client.world.unregister_pilot_generation(observer.character, None);
     });
     let result = task.await;
     db.execute("DELETE FROM game.offices WHERE corporation_id = $1", &[&corp]).await.unwrap();

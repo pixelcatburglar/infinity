@@ -1,6 +1,7 @@
-//! Online module state and active-item dogma overrides in the game database.
-//! Dormant clone overrides are accessed by the clone custody DAO. This DAO has
-//! no direct client mirror; callers own policy, transactions and notifications.
+//! Online module state, active-item dogma overrides and condition checkpoints.
+//! Uses game.items and game.item_attributes; dormant clone overrides belong to
+//! the clone custody DAO. There is no direct client mirror: callers own policy,
+//! transaction boundaries, checkpoint serialization and notifications.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 pub(crate) struct OnlineModule { pub item_id: i64 }
@@ -48,8 +49,34 @@ pub(crate) async fn clear_overrides(ex: &(impl Executor + ?Sized), item: i64) ->
 }
 
 
-/// Atomically persist all ship layers in attribute-ID order.
-pub(crate) async fn save_condition(ex: &(impl Executor + ?Sized), item: i64, ids: &[i32], values: &[f64], shield: i32, at: i64) -> Result<(), Error> {
-    ex.execute("INSERT INTO game.item_attributes (item_id, attribute_id, value, updated_at) SELECT $1, a.id, a.value, CASE WHEN a.id = $4 THEN $5::bigint ELSE 0 END FROM unnest($2::integer[], $3::double precision[]) AS a(id, value) JOIN game.items i ON i.item_id = $1 AND i.singleton AND i.jump_clone_id IS NULL ORDER BY a.id ON CONFLICT (item_id, attribute_id) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at", &[&item, &ids, &values, &shield, &at]).await?;
-    Ok(())
+/// Persist complete condition snapshots for singleton items still at the expected location.
+/// Returned IDs are the items whose three attributes were written.
+pub(crate) async fn save_conditions(ex: &(impl Executor + ?Sized), location: i64, ids: &[i32; 3], rows: &[(i64, [f64; 3], i64)]) -> Result<Vec<i64>, Error> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::with_capacity(rows.len());
+    let mut shields = Vec::with_capacity(rows.len());
+    let mut armors = Vec::with_capacity(rows.len());
+    let mut hulls = Vec::with_capacity(rows.len());
+    let mut times = Vec::with_capacity(rows.len());
+    for &(item, values, at) in rows {
+        items.push(item);
+        shields.push(values[0]);
+        armors.push(values[1]);
+        hulls.push(values[2]);
+        times.push(at);
+    }
+    let written = ex.query(
+        "WITH input AS (SELECT * FROM unnest($2::bigint[], $3::float8[], $4::float8[], $5::float8[], $6::bigint[]) AS r(item_id, shield, armor, hull, shield_at)), \
+         target AS (SELECT i.item_id, r.shield, r.armor, r.hull, r.shield_at FROM game.items i JOIN input r ON r.item_id = i.item_id WHERE i.location_id = $1 AND i.singleton AND i.jump_clone_id IS NULL ORDER BY i.item_id FOR UPDATE OF i), \
+         written AS (INSERT INTO game.item_attributes (item_id, attribute_id, value, updated_at) \
+             SELECT t.item_id, a.id, CASE a.n WHEN 1 THEN t.shield WHEN 2 THEN t.armor ELSE t.hull END, CASE WHEN a.n = 1 THEN t.shield_at ELSE 0 END \
+             FROM target t CROSS JOIN unnest($7::integer[]) WITH ORDINALITY AS a(id, n) ORDER BY t.item_id, a.id \
+             ON CONFLICT (item_id, attribute_id) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at RETURNING item_id) \
+         SELECT item_id FROM written GROUP BY item_id HAVING count(*) = 3 ORDER BY item_id",
+        &[&location, &items, &shields, &armors, &hulls, &times, &&ids[..]],
+    ).await?;
+    Ok(written.iter().map(|row| row.get("item_id")).collect())
 }
+#[cfg(test)] mod tests;

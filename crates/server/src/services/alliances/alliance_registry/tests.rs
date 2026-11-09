@@ -188,7 +188,7 @@ async fn acceptance_dispatch_and_refusals() -> Result<()> {
         ensure!(application(&s, alliance, fresh).await? == Some(APP_REJECTED) && state(&s, fresh).await?.0.is_none() && state(&s, fresh).await?.3 == 0, "rejection changed membership");
         drain(&mut s.joining); drain(&mut s.existing);
         ensure!(!dispatch_update(&mut s, alliance, fresh, APP_NEW, "GMForceAcceptApplication").await, "director obtained GM authority");
-        s.f.client.login.role = crate::consts::GM_ROLES;
+        s.f.client.login.role = infinity_core::consts::GM_ROLES;
         ensure!(!dispatch_update(&mut s, alliance, fresh, APP_NEW, "GMForceAcceptApplication").await, "GM force accepted terminal application");
         ensure!(application(&s, alliance, fresh).await? == Some(APP_REJECTED) && state(&s, fresh).await?.3 == 0, "terminal force refusal had effects");
         s.f.db.execute("UPDATE game.alliance_applications SET state=$3 WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &fresh, &APP_ACCEPTED]).await?;
@@ -212,6 +212,7 @@ async fn gm_join_preserves_target_application() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, alliance) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         let other = s.alliance(executor).await?;
         s.app(other, corp).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
@@ -220,7 +221,7 @@ async fn gm_join_preserves_target_application() -> Result<()> {
         assert_success_notices(&drain(&mut s.joining), alliance, corp, true)?;
         assert_success_notices(&drain(&mut s.existing), alliance, corp, false)?;
         let second = s.corp(s.f.owner).await?;
-        s.pilot(s.f.owner, second, 0).await?;
+        s.pilot(s.f.owner, second, ROLE_DIRECTOR).await?;
         s.f.client.session.apply(vec![("corpid", Value::Int(second)), ("allianceid", Value::None)]);
         s.app(alliance, second).await?; s.app(other, second).await?;
         ensure!(super::super::super::corps::alliance_corp_registry::gm_join(&mut s.f.client, alliance).await.is_ok(), "GM join with application refused");
@@ -276,10 +277,10 @@ async fn concurrent_acceptances_have_one_winner() -> Result<()> {
         lock.query_one("SELECT corporation_id FROM game.corporations WHERE corporation_id=$1 FOR UPDATE", &[&corp]).await?;
         let db = s.f.db.clone(); let world = s.f.world.clone();
         let identity = crate::services::identity::Identity::of_client(&s.f.client);
-        let mut one = tokio::spawn(async move { admission::decide(&db, &world, &identity, a, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_ok() });
+        let mut one = tokio::spawn(async move { admission::decide(&db, &world, &identity, a, corp, admission::Decision::Force { role: infinity_core::consts::GM_ROLES }).await.is_ok() });
         let db = s.f.db.clone(); let world = s.f.world.clone();
         let identity = crate::services::identity::Identity::of_client(&s.f.client);
-        let mut two = tokio::spawn(async move { admission::decide(&db, &world, &identity, b, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_ok() });
+        let mut two = tokio::spawn(async move { admission::decide(&db, &world, &identity, b, corp, admission::Decision::Force { role: infinity_core::consts::GM_ROLES }).await.is_ok() });
         let wait = blocked(&s.f.db, pid, "SELECT %FOR UPDATE", 2).await;
         lock.batch_execute("COMMIT").await?; drop(lock); connection.abort();
         let x = match tokio::time::timeout(TIMEOUT, &mut one).await {
@@ -317,7 +318,7 @@ async fn stale_application_refused_before_admission() -> Result<()> {
         lock.execute("UPDATE game.alliance_applications SET state=$3 WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &corp, &APP_REJECTED]).await?;
         let db = s.f.db.clone(); let world = s.f.world.clone();
         let identity = crate::services::identity::Identity::of_client(&s.f.client);
-        let mut task = tokio::spawn(async move { admission::decide(&db, &world, &identity, alliance, corp, admission::Decision::Force { role: crate::consts::GM_ROLES }).await.is_ok() });
+        let mut task = tokio::spawn(async move { admission::decide(&db, &world, &identity, alliance, corp, admission::Decision::Force { role: infinity_core::consts::GM_ROLES }).await.is_ok() });
         let wait = blocked(&s.f.db, pid, "SELECT alliance_id FROM game.alliance_applications%FOR UPDATE", 1).await;
         lock.batch_execute("COMMIT").await?; drop(lock); connection.abort();
         let joined = tokio::time::timeout(TIMEOUT, &mut task).await;

@@ -27,6 +27,7 @@ pub(crate) struct Effect {
 impl Effect {
     pub(crate) fn modifiers(&self) -> &[Modifier] { &self.modifiers }
 }
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Dogma { attributes: Vec<Attribute>, effects: Vec<Effect>, attribute_ids: HashMap<i32, usize>, effect_ids: HashMap<i32, usize>, attribute_names: HashMap<String, Vec<usize>>, effect_names: HashMap<String, Vec<usize>> }
 impl Dogma {
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
@@ -68,3 +69,5 @@ impl Dogma {
     pub(crate) fn attribute_count(&self) -> usize { self.attributes.len() }
     pub(crate) fn effect_count(&self) -> usize { self.effects.len() }
 }
+
+#[cfg(test)] pub(crate) mod tests;

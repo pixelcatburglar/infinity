@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::Effect;
-use crate::consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, dogma::ATTR_MAX_RANGE};
+use infinity_core::consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, dogma::ATTR_MAX_RANGE};
 use crate::services::{combat::{self, Ctx}, fit::{Fit, Key}, CallError};
 use crate::space::System;
 

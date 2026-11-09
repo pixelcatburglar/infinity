@@ -1,7 +1,7 @@
 //! Corporate contract creation and source custody regressions.
 use super::super::*;
 use super::corporate_fixture as f;
-use crate::consts::{ROLE_ACCOUNTANT, ROLE_CONTRACT_MANAGER, ROLE_HANGAR_CAN_TAKE_1};
+use infinity_core::consts::{ROLE_ACCOUNTANT, ROLE_ACCOUNT_CAN_TAKE_1, ROLE_CONTRACT_MANAGER, ROLE_HANGAR_CAN_TAKE_1};
 
 #[tokio::test]
 #[ignore = "requires a dedicated test database with SDE"]
@@ -11,7 +11,7 @@ async fn corporate_creation_authority_and_office_return() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let corp = f::setup(&db, station_id, station_type).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -23,15 +23,15 @@ async fn corporate_creation_authority_and_office_return() {
         let item = transfers::insert(&db, kind, corp.id, corp.office, f::SAG, 1).await.unwrap();
         let child = transfers::insert(&db, kind, corp.id, item, FLAG_HANGAR, 1).await.unwrap();
         let request = f::payload(TYPE_ITEM_EXCHANGE, station_id, 0, f::SAG, item, 0.0, 0.0, 0.0);
-        for roles in [ROLE_ACCOUNTANT | ROLE_HANGAR_CAN_TAKE_1, ROLE_CONTRACT_MANAGER | ROLE_HANGAR_CAN_TAKE_1, ROLE_CONTRACT_MANAGER | ROLE_ACCOUNTANT] {
-            db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&corp.actor.character, &roles]).await.unwrap();
+        for roles in [ROLE_ACCOUNTANT | ROLE_HANGAR_CAN_TAKE_1 | (ROLE_ACCOUNT_CAN_TAKE_1 << 1), ROLE_CONTRACT_MANAGER | ROLE_HANGAR_CAN_TAKE_1, ROLE_CONTRACT_MANAGER | ROLE_ACCOUNTANT | (ROLE_ACCOUNT_CAN_TAKE_1 << 1), ROLE_CONTRACT_MANAGER | ROLE_ACCOUNTANT | ROLE_HANGAR_CAN_TAKE_1] {
+            db.execute("UPDATE game.characters SET corp_roles=$2::bigint & ~$3::bigint,corp_roles_hq=$2::bigint & $3::bigint WHERE character_id=$1", &[&corp.actor.character, &roles, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
             let before = f::fingerprint(&db, corp).await;
             assert!(create(&client, &request).await.is_err());
             assert_eq!(f::fingerprint(&db, corp).await, before);
             assert!(rx.try_recv().is_err());
         }
-        let roles = ROLE_ACCOUNTANT | ROLE_CONTRACT_MANAGER | ROLE_HANGAR_CAN_TAKE_1;
-        db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&corp.actor.character, &roles]).await.unwrap();
+        let roles = ROLE_ACCOUNTANT | ROLE_CONTRACT_MANAGER | ROLE_HANGAR_CAN_TAKE_1 | (ROLE_ACCOUNT_CAN_TAKE_1 << 1);
+        db.execute("UPDATE game.characters SET corp_roles=$2::bigint & ~$3::bigint,corp_roles_hq=$2::bigint & $3::bigint WHERE character_id=$1", &[&corp.actor.character, &roles, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
         db.execute("UPDATE game.characters SET corporation_id=1 WHERE character_id=$1", &[&corp.actor.character]).await.unwrap();
         let before = f::fingerprint(&db, corp).await;
         assert!(create(&client, &request).await.is_err());
@@ -56,7 +56,7 @@ async fn corporate_creation_authority_and_office_return() {
         let row = db.query_one("SELECT owner_id,location_id,flag_id FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
         assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (corp.id, station_id, f::DELIVERIES));
         assert_eq!(db.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&child]).await.unwrap().get::<_, i64>("location_id"), item);
-        client.world.unregister_pilot(corp.actor.character);
+        client.world.unregister_pilot_generation(corp.actor.character, None);
     }).await;
     f::cleanup(&db, corp).await;
     result.unwrap();
@@ -65,7 +65,7 @@ async fn corporate_creation_authority_and_office_return() {
 #[tokio::test]
 #[ignore = "requires a dedicated test database with SDE"]
 async fn active_blueprint_jobs_block_personal_and_corporate_escrow() {
-    use crate::consts::{INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY};
+    use infinity_core::consts::{INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY};
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
@@ -108,8 +108,8 @@ async fn active_blueprint_jobs_block_personal_and_corporate_escrow() {
                 let before = f::fingerprint(&db, corp).await;
                 match create(&client, &request).await {
                     Err(CallError::User { msg, dict }) => {
-                        assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-                        assert_eq!(dict, vec![("notify".into(), Value::unicode(crate::messages::industry::BLUEPRINT_ACTIVE))]);
+                        assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                        assert_eq!(dict, vec![("notify".into(), Value::unicode(infinity_core::messages::industry::BLUEPRINT_ACTIVE))]);
                     }
                     _ => panic!("expected active blueprint refusal"),
                 }
@@ -121,7 +121,7 @@ async fn active_blueprint_jobs_block_personal_and_corporate_escrow() {
             assert!(create(&client, &request).await.is_ok());
             while rx.try_recv().is_ok() {}
         }
-        client.world.unregister_pilot(corp.actor.character);
+        client.world.unregister_pilot_generation(corp.actor.character, None);
     }).await;
     f::cleanup(&db, corp).await;
     result.unwrap();
@@ -136,7 +136,7 @@ async fn corporate_exchange_transfers_requested_blueprint_and_descendants() {
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
     let bp_type = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(9)).unwrap().type_id;
-    let charge = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let charge = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, station_id, station_type).await;
     let buyer = f::setup(&db, station_id, station_type).await;
     let test_db = db.clone();
@@ -164,12 +164,12 @@ async fn corporate_exchange_transfers_requested_blueprint_and_descendants() {
         let before = f::fingerprint(&db, buyer).await;
         assert!(accept(&purchaser, id, true).await.is_err());
         assert_eq!(f::fingerprint(&db, buyer).await, before);
-        let roles = ROLE_CONTRACT_MANAGER | ROLE_ACCOUNTANT;
+        let roles = ROLE_CONTRACT_MANAGER | ROLE_ACCOUNTANT | (ROLE_ACCOUNT_CAN_TAKE_1 << 2);
         db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&buyer.actor.character, &roles]).await.unwrap();
         assert!(accept(&purchaser, id, true).await.is_ok());
         let row = db.query_one("SELECT i.owner_id,i.location_id,i.flag_id,i.quantity,i.singleton,b.material_efficiency,b.time_efficiency,b.runs FROM game.items i JOIN game.blueprints b USING(item_id) WHERE i.item_id=$1", &[&bp]).await.unwrap();
         assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (issuer.id, station_id, f::DELIVERIES));
-        assert_eq!((row.get::<_, i32>("quantity"), row.get::<_, bool>("singleton")), (-2, true));
+        assert_eq!((row.get::<_, i64>("quantity"), row.get::<_, bool>("singleton")), (-2, true));
         assert_eq!((row.get::<_, i32>("material_efficiency"), row.get::<_, i32>("time_efficiency"), row.get::<_, i32>("runs")), (7, 9, 3));
         let child_row = db.query_one("SELECT owner_id,location_id FROM game.items WHERE item_id=$1", &[&child]).await.unwrap();
         assert_eq!((child_row.get::<_, i64>("owner_id"), child_row.get::<_, i64>("location_id")), (issuer.id, bp));
@@ -194,7 +194,7 @@ async fn corporate_courier_member_moves_and_delivers_overdue_package() {
     let station = stations.next().unwrap();
     let end = stations.find(|s| s.station_id != station.station_id).unwrap().station_id;
     let (start, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, start, station_type).await;
     let buyer = f::setup(&db, start, station_type).await;
     let test_db = db.clone();

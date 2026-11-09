@@ -87,9 +87,9 @@ pub(super) async fn add(c: &Client, me: i64, folder_id: i64, sub: Option<i64>, i
     let now = filetime_now();
     let duration = match expiry_option {
         None | Some(EXPIRY_NONE) => None,
-        Some(EXPIRY_FOUR_HOURS) => Some(FOUR_HOURS * crate::consts::FILETIME_HOUR),
-        Some(EXPIRY_TWO_DAYS) => Some(TWO_DAYS * crate::consts::FILETIME_DAY),
-        Some(EXPIRY_DAY) => Some(DAY_HOURS * crate::consts::FILETIME_HOUR),
+        Some(EXPIRY_FOUR_HOURS) => Some(FOUR_HOURS * infinity_core::consts::FILETIME_HOUR),
+        Some(EXPIRY_TWO_DAYS) => Some(TWO_DAYS * infinity_core::consts::FILETIME_DAY),
+        Some(EXPIRY_DAY) => Some(DAY_HOURS * infinity_core::consts::FILETIME_HOUR),
         _ => return Err(notify_error(messages::bookmarks::BOOKMARK_INVALID_EXPIRY)),
     };
     let expiry = duration.map(|d| now.checked_add(d).ok_or_else(|| notify_error(messages::bookmarks::BOOKMARK_INVALID_EXPIRY))).transpose()?;

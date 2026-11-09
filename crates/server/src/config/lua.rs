@@ -11,6 +11,8 @@ pub struct LuaConfig {
     pub enabled: bool,
     pub scripts_dir: String,
     pub mod_dirs: Vec<String>,
+    /// Optional external published adaptation content root.
+    pub content_data_dir: Option<String>,
     pub memory_limit_mb: usize,
     pub call_budget_ms: u64,
     pub call_budget_instructions: u64,
@@ -27,6 +29,7 @@ impl Default for LuaConfig {
             enabled: true,
             scripts_dir: "crates/server/lua".into(),
             mod_dirs: Vec::new(),
+            content_data_dir: None,
             memory_limit_mb: 64,
             // Allow the slowest simulated pilot operation, bringing a pilot online, with headroom.
             call_budget_ms: 1000,
@@ -43,6 +46,7 @@ impl LuaConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.scripts_dir.is_empty(), "lua.scripts_dir must not be empty");
         anyhow::ensure!(self.mod_dirs.iter().all(|dir| !dir.is_empty()), "lua.mod_dirs entries must not be empty");
+        anyhow::ensure!(self.content_data_dir.as_ref().is_none_or(|dir| !dir.is_empty()), "lua.content_data_dir must not be empty");
         anyhow::ensure!(self.memory_limit_mb > 0 && self.memory_limit_mb.checked_mul(1024 * 1024).is_some(), "lua.memory_limit_mb={} is zero or overflows bytes", self.memory_limit_mb);
         anyhow::ensure!(self.call_budget_ms > 0 && std::time::Instant::now().checked_add(std::time::Duration::from_millis(self.call_budget_ms)).is_some(), "lua.call_budget_ms={} is zero or overflows the deadline", self.call_budget_ms);
         anyhow::ensure!(self.call_budget_instructions > 0, "lua.call_budget_instructions must be nonzero");

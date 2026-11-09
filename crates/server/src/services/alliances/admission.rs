@@ -3,7 +3,7 @@
 //! corporation membership and history through the DAOs. Governance is separate.
 use super::*;
 use crate::dao::corporations::registry;
-use crate::services::corps::{ceo_of, is_player_corp};
+use crate::services::corps::{is_player_corp, permissions};
 use crate::services::identity::Identity;
 
 #[derive(Clone)]
@@ -31,7 +31,7 @@ pub(crate) async fn director(ex: &(impl Executor + ?Sized), identity: &Identity,
 }
 
 pub(crate) async fn ceo(ex: &(impl Executor + ?Sized), identity: &Identity, corp: i64) -> Result<(), CallError> {
-    if actor_corp(ex, identity).await? != corp || !is_player_corp(corp) || ceo_of(ex, corp).await? != Some(identity.char_id) {
+    if actor_corp(ex, identity).await? != corp || !is_player_corp(corp) || !permissions::is_active_ceo(ex, identity.char_id, corp).await? {
         return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED));
     }
     Ok(())
@@ -56,16 +56,69 @@ pub(crate) async fn applications(db: &Db, identity: &Identity, alliance: i64) ->
 
 /// All entry points share the same ordered locks, guarded transition and membership effects.
 pub(crate) async fn decide(db: &Db, world: &World, identity: &Identity, alliance: i64, corp: i64, decision: Decision) -> Result<(), CallError> {
+    use crate::services::sovereignty::governance::{self, PreparedAllianceChange};
+    loop {
+        let now = filetime_now();
+        let prepared = if matches!(&decision, Decision::Manager { state, .. } if *state == APP_REJECTED) {
+            PreparedAllianceChange::NoOwnershipChange
+        } else {
+            match governance::prepare(db, corp, now).await {
+                Err(error) if crate::services::sovereignty::is_stale(&error) => continue,
+                result => result?,
+            }
+        };
+        if matches!(prepared, PreparedAllianceChange::NoOwnershipChange) {
+            let admitted = governance::admit(world, prepared, Some(identity.char_id))?;
+            match decide_inner(db, world, identity, alliance, corp, decision.clone(), now, admitted).await {
+                Err(error) if crate::services::sovereignty::is_stale(&error) => continue,
+                result => return result,
+            }
+        }
+        let db = db.clone();
+        let world = world.shared().ok_or_else(refused)?;
+        let identity = *identity;
+        return tokio::spawn(async move {
+            let mut prepared = prepared;
+            let mut now = now;
+            loop {
+                let result = if matches!(prepared, PreparedAllianceChange::NoOwnershipChange) {
+                    let admitted = governance::admit(&world, prepared, Some(identity.char_id))?;
+                    decide_inner(&db, &world, &identity, alliance, corp, decision.clone(), now, admitted).await
+                } else {
+                    let _market = crate::services::market::lock().await;
+                    let admitted = governance::admit(&world, prepared, Some(identity.char_id))?;
+                    decide_inner(&db, &world, &identity, alliance, corp, decision.clone(), now, admitted).await
+                };
+                match result {
+                    Err(error) if crate::services::sovereignty::is_stale(&error) => {
+                        now = filetime_now();
+                        prepared = loop {
+                            match governance::prepare(&db, corp, now).await {
+                                Err(error) if crate::services::sovereignty::is_stale(&error) => continue,
+                                result => break result?,
+                            }
+                        };
+                    }
+                    result => return result,
+                }
+            }
+        }).await.map_err(db_err)?;
+    }
+}
+
+async fn decide_inner(db: &Db, world: &World, identity: &Identity, alliance: i64, corp: i64, decision: Decision, now: i64, admitted: crate::services::sovereignty::governance::AdmittedAllianceChange) -> Result<(), CallError> {
     let actor = actor_corp(db, identity).await?;
     let mut alliances: Vec<i64> = dao::applications(db, dao::ApplicationFilter::Corporation(corp)).await.map_err(db_err)?.into_iter().map(|a| a.alliance).collect();
     alliances.push(alliance);
     alliances.sort_unstable(); alliances.dedup();
-    let now = filetime_now();
+    
     let identity = *identity;
+    let admitted = std::sync::Arc::new(admitted);
     db.transaction(|tx, outbox| {
         let alliances = alliances.clone();
         let decision = decision.clone();
         let identity = identity;
+        let admitted = std::sync::Arc::clone(&admitted);
         Box::pin(async move {
             if !registry::lock_admission(tx, &alliances, &[actor, corp], &[identity.char_id]).await.map_err(db_err)? { return Err(refused()); }
             dao::lock_applications(tx, corp).await.map_err(db_err)?;
@@ -73,7 +126,7 @@ pub(crate) async fn decide(db: &Db, world: &World, identity: &Identity, alliance
             if current.iter().any(|a| alliances.binary_search(&a.alliance).is_err()) { return Err(refused()); }
             match &decision {
                 Decision::Manager { .. } => director(tx, &identity, alliance).await?,
-                Decision::Force { role } => { actor_corp(tx, &identity).await?; if role & crate::consts::GM_ROLES == 0 { return Err(refused()); } },
+                Decision::Force { role } => { actor_corp(tx, &identity).await?; if role & infinity_core::consts::GM_ROLES == 0 { return Err(refused()); } },
                 Decision::Join => ceo(tx, &identity, corp).await?,
             }
             if !dao::exists(tx, alliance).await.map_err(db_err)? { return Err(notify_error(messages::ALLIANCE_NOT_FOUND)); }
@@ -88,7 +141,7 @@ pub(crate) async fn decide(db: &Db, world: &World, identity: &Identity, alliance
                 if *state != APP_ACCEPTED && *state != APP_REJECTED { return Err(notify_error(messages::ALLIANCE_APPLICATION_STATUS_INVALID)); }
             }
             let old_alliance = if rejecting { None } else { alliance_line_of(tx, alliance).await? };
-            if !rejecting { set_alliance(tx, outbox, corp, Some(alliance), now).await?; }
+            if !rejecting { set_alliance(tx, outbox, corp, Some(alliance), now, &admitted).await?; }
             if let Some(application) = application {
                 let text = match &decision { Decision::Manager { text, .. } => text.as_str(), _ => application.text.as_str() };
                 let state = if rejecting { APP_REJECTED } else { APP_EFFECTIVE };

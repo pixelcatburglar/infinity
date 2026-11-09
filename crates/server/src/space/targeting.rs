@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TARGET_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn next_generation() -> u64 {
+pub(crate) fn next_generation() -> u64 {
     NEXT_TARGET_GENERATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("target generation exhausted")
 }

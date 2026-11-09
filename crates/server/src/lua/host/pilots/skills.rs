@@ -86,7 +86,7 @@ pub(super) fn register(lua: &Lua, api: &Table, resources: &Resources) -> mlua::R
             mutate(async move {
                 let (_state, row) = lifecycle::locked(&r, id).await?;
                 let identity = lifecycle::snapshot(&r, id, &row).await?;
-                training::save_queue(&identity, &r.db, &r.sde, &queue, true, true, |n| n.dispatch(&r.world, None)).await
+                training::save_queue(&identity, &r.db, &r.world, &r.sde, &queue, true, true, |n| n.dispatch(&r.world, None)).await
             }).await.map_err(lua_error)
         }
     })?)?;

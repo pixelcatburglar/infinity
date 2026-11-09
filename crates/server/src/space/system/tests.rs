@@ -16,7 +16,7 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
         old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: pilot.is_some(),
-        massive: true, warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        massive: true, warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
         slim: Vec::new(),
     }
@@ -30,7 +30,7 @@ fn projection_replacement_expiry_and_departure_cleanup() {
     let projection = |module, deadline| Projection {
         source_ship: 1, source_module: module, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: deadline,
-        values: Vec::new(), charge_values: Vec::new(), charge_type: None,
+        values: Vec::new(), charge_values: Vec::new(), charge_type: None, scramble: None,
     };
     system.upsert_projection(2, projection(10, 1500));
     system.upsert_projection(3, projection(10, 2000));
@@ -224,6 +224,7 @@ fn nearest_hostile_via_pilot_index_matches_full_scan() {
 }
 
 fn watch(s: &mut System, client: i64, ego: i64) -> mpsc::UnboundedReceiver<Vec<Value>> {
+    crate::tests::init_config();
     let (tx, rx) = mpsc::unbounded_channel();
     s.observe(client, ego, tx);
     rx
@@ -726,7 +727,6 @@ fn warp_activation_releases_missiles_on_both_sides_of_sorted_target() {
     target.owner_id = 7;
     target.speed_fraction = 1.0;
     target.vel = [100.0, 0.0, 0.0];
-    target.warp_factor = 3000;
     assert_eq!(target.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000), WarpOutcome::Align);
     s.insert(target);
     for id in [1, 3] {
@@ -734,7 +734,6 @@ fn warp_activation_releases_missiles_on_both_sides_of_sorted_target() {
         missile.owner_id = 7;
         missile.speed_fraction = 1.0;
         missile.vel = [100.0, 0.0, 0.0];
-        missile.warp_factor = 3000;
         missile.mode = MODE_MISSILE;
         missile.follow_id = 2;
         missile.follow_range = -2.0;
@@ -761,12 +760,10 @@ fn warp_exit_callback_sees_completed_extra_step_and_fractional_segment() {
     ship.owner_id = 7;
     ship.speed_fraction = 1.0;
     ship.vel = [100.0, 0.0, 0.0];
-    ship.warp_factor = 3000;
     s.insert(ship);
     let mut other = ball(2, None, 0.0);
     other.owner_id = 7;
     other.speed_fraction = 1.0;
-    other.warp_factor = 3000;
     other.vel = [20.0, 0.0, 0.0];
     s.insert(other);
     s.command(1, |b, _, _| { b.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000); Vec::new() });

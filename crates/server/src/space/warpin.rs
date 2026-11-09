@@ -3,7 +3,7 @@
 //! these spots itself (michelle.GetWarpinPoints), so they must match exactly.
 
 use super::V3;
-use crate::consts::GROUP_WRECK;
+use infinity_core::consts::GROUP_WRECK;
 
 const CATEGORY_CELESTIAL: i32 = 2;
 const GROUP_SUN: i32 = 6;

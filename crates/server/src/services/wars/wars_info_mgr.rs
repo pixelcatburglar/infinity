@@ -2,7 +2,8 @@
 //! Mirrors `eve/client/script/ui/shared/neocom/corporation/war/warHistoryCont.py` and structure queries.
 //! Reads `game.wars`; mutual wars have no allies or headquarters.
 
-use crate::{client::Client, dao::wars, messages};
+use infinity_core::messages;
+use crate::{client::Client, dao::wars};
 use crate::services::{Call, CallError, CallResult, db_err, notify_error};
 use marshal::Value;
 use super::wire;

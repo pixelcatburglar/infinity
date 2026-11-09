@@ -27,7 +27,6 @@ pub(crate) async fn automatic(ex: &(impl Executor + ?Sized), unpaid: i32) -> Res
              JOIN game.bill_autopay a ON a.owner_id = b.debtor_id AND a.bill_type = b.bill_type AND a.enabled
              JOIN game.corporations co ON co.corporation_id = b.debtor_id
              WHERE b.status = $1", &[&unpaid]).await?.iter().map(Auto::from_row).collect()) }
-pub(crate) async fn owned(ex: &(impl Executor + ?Sized), bill: i64, owner: i64) -> Result<bool, Error> { Ok(ex.query_opt("SELECT 1 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &owner]).await?.is_some()) }
 pub(crate) async fn settings(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Vec<Setting>, Error> { Ok(ex.query("SELECT bill_type, enabled FROM game.bill_autopay WHERE owner_id = $1", &[&corp]).await?.iter().map(Setting::from_row).collect()) }
 pub(crate) async fn division(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Option<i32>, Error> { Ok(ex.query_opt("SELECT bill_division FROM game.corporations WHERE corporation_id = $1", &[&corp]).await?.as_ref().map(|r| Division::from_row(r).bill_division)) }
 pub(crate) async fn set_setting(ex: &(impl Executor + ?Sized), corp: i64, kind: i32, enabled: bool) -> Result<u64, Error> { ex.execute("INSERT INTO game.bill_autopay (owner_id, bill_type, enabled) VALUES ($1, $2, $3)

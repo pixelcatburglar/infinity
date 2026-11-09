@@ -5,14 +5,27 @@
 //! data come from the SDE; locations are persisted in game tables.
 //! Ship shield, armor and hull condition are persisted in item dogma overrides.
 //! Selected and unpiloted persistent hulls share fitted ball construction.
+//! Warp requests freeze effective fitted speed with their scramble snapshot. Capacitor
+//! pricing uses the current actor fit and mass at activation; a partial debit shortens
+//! only that ship's route. Only a full arrival completes its destination callback.
+//! Corruption warp-speed increases are not modeled. Queued warp movement is discarded
+//! if the ship's persistent or combat membership generation changes before the boundary.
 //! NPC undocks use static graphic exit channels and fitted ship movement values;
 //! locator rotations and Upwell-specific undock behavior are not modeled.
+//! `eve/client/script/ui/services/shipConfigSvc.py` reads persistent owner-bound
+//! bay settings; shared-bay ancestry uses current fleet and corporation authority.
+//! Physical hull dirt timestamps persist independently of owner-bound bay settings;
+//! the cleaning service does not implement a wallet charge or send a notification.
+//! Stored ships retain their contents and condition; boarding leaves the old hull
+//! unpiloted in space, while storing replaces it with a capsule. Launch placement
+//! is server-selected surface-tangent geometry, not a captured retail offset.
 //!
 //! Movement commands apply at destiny boundaries; jump and docking waits and arrival cloak
 //! expiry use the actor tick. During the four-second jump wait, the source ballpark
 //! receives jump-out effects before the session changes. In-range docking stops and
 //! uncloaks the ship, sends acceptance, then waits 5.5 seconds while forwarding destiny
-//! before persisting condition and changing session. Docking and gate ranges, as well as
+//! before persisting condition and changing session. Entosis links prevent warp, docking
+//! and jumps until their actor-owned cleanup. Docking and gate ranges, as well as
 //! live warp targets, use positions sampled at the system actor's time. GOTO stores an
 //! absolute point; direction commands project a point from the current position and send
 //! the raw direction.
@@ -25,24 +38,27 @@
 //! Ship loss commits before its independently best-effort killmail and insurance
 //! operations. NPC workers are outside this module's scope.
 //! Completed dock, undock, jump and committed ship loss hand off lifecycle events.
-//! Successful gate and wormhole arrivals record destination jumps and visits together;
-//! a crash between arrival and the telemetry transaction can leave an arrival unrecorded.
+//! Successful gate and wormhole arrivals record destination jumps and visits in
+//! the same transaction as the persisted ship and character locations.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::identity::Identity;
-use crate::client::{short, Client};
-use crate::consts::{FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE, UE_LOCID};
-use crate::db::outbox::{dispatch_client, Effect, Outbox};
+use crate::client::Client;
+use infinity_core::consts::{FILETIME_SECOND, UE_LOCID};
+use crate::db::outbox::Outbox;
 use crate::lua::events::GameEvent;
-use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
-use crate::messages;
+use crate::dao::{characters::ship as character_dao, items::ship as item_dao};
+use infinity_core::messages;
 use crate::space::{self, event, special_fx, Ball, V3, CLOAK_RESTORE, SPECIAL_FX_UNSPECIFIED_DURATION};
 use crate::space::system::Timer;
+use crate::space::system::{warp::WarpDestination, warp_arrival::WarpArrivalId};
 use marshal::Value;
-use tracing::{info, warn};
+use tracing::info;
+pub(crate) mod loss;
 
-/// Server gameplay policy: minimum clearance from an object when warping to it (m).
-const MIN_OBJECT_WARP_CLEARANCE: f64 = 2500.0;
+
+/// Existing server policy: round to nearest milli-AU/s and floor at 500.
+const MIN_SHIP_WARP_FACTOR: i64 = 500;
 
 /// Docking interaction range in metres (`menusvc.DEFAULT_INTERACTION_RANGE`).
 const DOCKING_RANGE: f64 = 2500.0;
@@ -80,11 +96,6 @@ fn f(v: Option<&Value>) -> f64 {
     v.and_then(|v| v.as_float()).unwrap_or(0.0)
 }
 
-/// Construct the selected ship using its pilot's fit and live projections.
-pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
-    balls::selected(&Identity::of_client(c), &c.db, &c.world, &c.sde,
-        c.session.int("solarsystemid"), c.session.int("allianceid"), ship_id, pos).await
-}
 
 /// Refuse docking and gate jumps while the pilot's weapons timer runs (crimewatch).
 fn check_weapons_timer(char_id: i64, what: &str) -> Result<(), CallError> {
@@ -100,26 +111,9 @@ fn check_weapons_timer(char_id: i64, what: &str) -> Result<(), CallError> {
     }
 }
 
-/// Dock and teleport remove the specified ball or fail if absent. The economy
-/// lock is released before saving condition; a save failure restores the ball.
-/// Unlike logout, this does not save position or continue departure on failure.
-async fn remove_and_save(db: &crate::db::Db, world: &space::World, system: i64, ship: i64) -> Result<(), CallError> {
-    let ball = {
-        let _lock = super::market::lock().await;
-        world.remove_ball(system, ship).await
-    }.ok_or_else(|| CallError::Internal(anyhow::anyhow!("ship {ship} is no longer in system {system}")))?;
-    if let Err(error) = super::combat::save_condition(db, ship).await {
-        if let Err(restore) = world.add_ship(system, ball).await {
-            tracing::warn!(ship, %restore, "failed to restore ship after condition save failure");
-        }
-        return Err(error);
-    }
-    Ok(())
-}
 
 pub(crate) struct SessionChange {
     pub updates: Vec<(&'static str, Value)>,
-    pub event: Option<GameEvent>,
 }
 
 pub(crate) async fn dock<O: observer::DockObserver>(
@@ -130,39 +124,54 @@ pub(crate) async fn dock<O: observer::DockObserver>(
         return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
     };
     check_weapons_timer(identity.char_id, messages::WEAPONS_TIMER_DOCK)?;
-    let gap = world.with(system, move |s| {
-        let (b, station) = (s.ball(ship)?, s.ball(station)?);
-        Some(space::dist(b.position_at(s.now_ms()), station.position_at(s.now_ms()))
-            - b.radius as f64 - station.radius as f64)
-    }).await.flatten();
-    if gap.is_none_or(|g| g > DOCKING_RANGE) {
-        return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
-    }
-    world.command(system, ship, |b, t, _| {
-        b.stop();
-        vec![event(t, "Stop", vec![Value::Int(b.id)])]
-    });
-    world.uncloak(system, ship).await;
+    let accepted = world.with(system, move |s| {
+        if space::sovereignty::links::blocks(s, ship) {
+            return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
+        }
+        let gap = s.ball(ship).zip(s.ball(station)).map(|(b, station)|
+            space::dist(b.position_at(s.now_ms()), station.position_at(s.now_ms()))
+                - b.radius as f64 - station.radius as f64);
+        if gap.is_none_or(|g| g > DOCKING_RANGE) {
+            return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
+        }
+        s.command(ship, |b, t, _| {
+            b.stop();
+            vec![event(t, "Stop", vec![Value::Int(b.id)])]
+        });
+        s.uncloak(ship);
+        Ok(())
+    }).await.ok_or_else(|| CallError::User {
+        msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![],
+    })?;
+    accepted?;
     if let Some(observer) = observer.as_mut() {
         observer.accepted(station);
         if !observer.wait_pumping(system, DOCK_DELAY_MS).await? {
             return Err(CallError::Internal(anyhow::anyhow!("system actor stopped during docking wait")));
         }
     }
-    if identity.char_id != 0 {
-        super::combat::reset_pilot(world, identity.char_id, Some((system, ship)));
-    }
-    remove_and_save(db, world, system, ship).await?;
+    let market = super::market::lock().await;
+    let gate = world.lock_condition_snapshot(system).await.map_err(db_err)?;
+    let char_id = identity.char_id;
+    let transition = world.with(system, move |s| {
+        if space::sovereignty::links::blocks(s, ship) {
+            return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
+        }
+        if char_id != 0 && s.pilot_ball(char_id).is_none_or(|ball| ball.id != ship) {
+            return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
+        }
+        s.begin_condition_transitions(&[ship]).ok_or_else(|| CallError::User {
+            msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![],
+        })
+    }).await.ok_or_else(|| CallError::User {
+        msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![],
+    })??;
+    world.checkpoint_dock(db.clone(), char_id, ship, system, station, transition, market, gate).await?;
     if let Some(observer) = observer {
         observer.unobserve();
     }
-    item_dao::dock(db, ship, station, FLAG_HANGAR).await.map_err(db_err)?;
-    character_dao::dock(db, identity.char_id, station, system).await.map_err(db_err)?;
     Ok(SessionChange {
         updates: vec![("solarsystemid", Value::None), ("stationid", Value::Int(station))],
-        event: (identity.char_id != 0).then_some(GameEvent::Docked {
-            char_id: identity.char_id, ship_id: ship, station_id: station, system_id: system,
-        }),
     })
 }
 
@@ -180,12 +189,69 @@ const WORMHOLE_EFFECT_STOP_DELAY_MS: u64 = 3000;
 /// Arrival cloak duration in seconds (`appConst.invulnerabilityRestoring`).
 const JUMP_CLOAK_SECONDS: i64 = 60;
 
+async fn publish_ship(world: &space::World, system: i64, ship: balls::PreparedShip,
+    market: &tokio::sync::MutexGuard<'static, ()>) -> Result<(), CallError> {
+    world.system_locked(system, market).await.map_err(CallError::Internal)?;
+    let installed = world.with(system, move |s| {
+        if s.contains(ship.ball.id) { return false; }
+        ship.install(s, |s, ball| s.add_ship(ball));
+        true
+    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+    if !installed { return Err(CallError::Internal(anyhow::anyhow!("ship already present in system"))); }
+    Ok(())
+}
+
+/// Checkpoint and transfer the same live hull while the caller holds market.
+async fn transfer_ship(c: &mut Client, system: i64, dest: i64, ship: i64, char_id: i64,
+    pos: V3, ancestry: (i64, i64), cloaked: bool, market: tokio::sync::MutexGuard<'static, ()>) -> Result<Option<i64>, CallError> {
+    c.world.system_locked(dest, &market).await.map_err(CallError::Internal)?;
+    if cloaked {
+        if let Err(position) = c.world.request_entry(dest, char_id).await {
+            info!(user = c.login.user_id, "jump into {dest} queued at {position}");
+            let msg = if position == 0 { "SystemCheck_JumpFailed_Loading" } else { "SystemCheck_JumpFailed_Queued" };
+            return Err(CallError::User {
+                msg: msg.into(),
+                dict: vec![("system".into(), Value::tuple([Value::Int(UE_LOCID), Value::Int(dest)])), ("position".into(), Value::Int(position.max(1)))],
+            });
+        }
+    }
+    let first = system.min(dest);
+    let second = system.max(dest);
+    let mut gates = vec![c.world.lock_condition_snapshot(first).await.map_err(db_err)?];
+    if second != first { gates.push(c.world.lock_condition_snapshot(second).await.map_err(db_err)?); }
+    let (transition, ball) = c.world.with(system, move |s| {
+        if cloaked && space::sovereignty::links::blocks(s, ship) {
+            return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
+        }
+        let ball = s.pilot_ball(char_id).filter(|ball| ball.id == ship)
+            .ok_or_else(|| super::notify_error(messages::MUST_BE_IN_SPACE))?.clone();
+        let transition = s.begin_condition_transitions(&[ship])
+            .ok_or_else(|| super::notify_error(messages::MUST_BE_IN_SPACE))?;
+        Ok((transition, ball))
+    }).await.ok_or_else(|| super::notify_error(messages::MUST_BE_IN_SPACE))??;
+    let row = crate::dao::items::space_ships::FreeShip {
+        item_id: ship, type_id: ball.type_id, owner_id: ball.owner_id,
+        corporation_id: ball.corp_id, alliance_id: ball.alliance_id, pos,
+    };
+    let security = super::crimewatch::security_status(&c.db, char_id).await?;
+    let mut prepared = balls::piloted(&c.db, c.sde.clone(), &row, char_id, security).await?;
+    let cloak_until = cloaked.then(|| crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND);
+    if let Some(until) = cloak_until {
+        prepared.ball.cloak = CLOAK_RESTORE;
+        prepared.ball.cloak_until = until;
+    }
+    c.world.checkpoint_transfer(c.db.clone(), char_id, ship, system, dest, pos, ancestry,
+        prepared, cloak_until, transition, market, gates).await?;
+    Ok(cloak_until)
+}
+
 /// Install an arriving ship with the actor-managed restoring cloak.
-pub(super) async fn arrive_cloaked(world: &crate::space::World, system: i64, mut ball: Ball) -> Result<i64, CallError> {
+pub(super) async fn arrive_cloaked(world: &crate::space::World, system: i64, mut ship: balls::PreparedShip,
+    market: &tokio::sync::MutexGuard<'static, ()>) -> Result<i64, CallError> {
     let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND;
-    ball.cloak = CLOAK_RESTORE;
-    ball.cloak_until = cloak_until;
-    world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+    ship.ball.cloak = CLOAK_RESTORE;
+    ship.ball.cloak_until = cloak_until;
+    publish_ship(world, system, ship, market).await?;
     Ok(cloak_until)
 }
 
@@ -240,37 +306,29 @@ pub(super) struct Jump {
 pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, char_id: i64, jump: Jump) -> Result<(), CallError> {
     let Jump { through, guid, other_type, dest_system, pos } = jump;
     let (constellation, region) = ancestry(&c.sde, dest_system)?;
-    c.world.system(dest_system).await.map_err(CallError::Internal)?;
-    // Room on the other side, or a place in its jump queue.
-    if let Err(position) = c.world.request_entry(dest_system, char_id).await {
-        info!(user = c.login.user_id, "jump into {dest_system} queued at {position}");
-        let msg = if position == 0 { "SystemCheck_JumpFailed_Loading" } else { "SystemCheck_JumpFailed_Queued" };
-        return Err(CallError::User {
-            msg: msg.into(),
-            dict: vec![("system".into(), Value::tuple([Value::Int(UE_LOCID), Value::Int(dest_system)])), ("position".into(), Value::Int(position.max(1)))],
-        });
-    }
 
     // Jump out where everyone can see it, and let the gate animation run.
-    c.world.uncloak(system, ship).await;
-    c.world.command(system, ship, move |b, t, _| {
-        b.stop();
-        vec![
-            event(t, "Stop", vec![Value::Int(b.id)]),
-            special_fx(t, b.id, Some(through), other_type, guid, 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, Some(Value::tuple([Value::Int(dest_system)]))),
-        ]
-    });
+    c.world.with(system, move |s| {
+        if space::sovereignty::links::blocks(s, ship) {
+            return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
+        }
+        s.uncloak(ship);
+        s.command(ship, move |b, t, _| {
+            b.stop();
+            vec![
+                event(t, "Stop", vec![Value::Int(b.id)]),
+                special_fx(t, b.id, Some(through), other_type, guid, 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, Some(Value::tuple([Value::Int(dest_system)]))),
+            ]
+        });
+        Ok(())
+    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("source system actor stopped")))??;
     if !c.wait_pumping(system, JUMP_DELAY_MS).await.map_err(CallError::Internal)? {
         return Err(CallError::Internal(anyhow::anyhow!("source system actor stopped during jump wait")));
     }
-
-    super::combat::reset(c);
-    remove_and_save(&c.db, &c.world, system, ship).await?;
+    let market = super::market::lock().await;
+    let cloak_until = transfer_ship(c, system, dest_system, ship, char_id, pos, (constellation, region), true, market).await?
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("jump cloak missing")))?;
     c.world.unobserve(c.login.client_id);
-    item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
-    character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
-    let ball = ship_ball(c, ship, pos).await?;
-    let cloak_until = arrive_cloaked(&c.world, dest_system, ball).await?;
     // The client rebinds its remote ballpark for the new system, which sends SetState.
     c.change_session(vec![
         ("solarsystemid", Value::Int(dest_system)),
@@ -296,10 +354,6 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
             );
         });
     }
-    super::map::events::arrived(&c.db, char_id, dest_system, crate::client::filetime_now()).await;
-    let mut outbox = Outbox::default();
-    outbox.event(GameEvent::Jumped { char_id, ship_id: ship, from_system_id: system, to_system_id: dest_system });
-    dispatch_client((), outbox, c)?;
     Ok(())
 }
 
@@ -310,19 +364,13 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
         return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::MUST_BE_IN_SPACE))] });
     };
-    c.world.system(dest_system).await.map_err(CallError::Internal)?;
-    super::combat::reset(c);
-    remove_and_save(&c.db, &c.world, system, ship).await?;
-    item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
-    let ball = ship_ball(c, ship, pos).await?;
+    let market = super::market::lock().await;
+    let (constellation, region) = ancestry(&c.sde, dest_system)?;
+    transfer_ship(c, system, dest_system, ship, char_id, pos, (constellation, region), false, market).await?;
     if dest_system == system {
-        c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
         return send_state(c).await;
     }
-    let (constellation, region) = ancestry(&c.sde, dest_system)?;
     c.world.unobserve(c.login.client_id);
-    character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
-    c.world.add_ship(dest_system, ball).await.map_err(CallError::Internal)?;
     c.change_session(vec![
         ("solarsystemid", Value::Int(dest_system)),
         ("solarsystemid2", Value::Int(dest_system)),
@@ -338,97 +386,23 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     Ok(())
 }
 
-/// The pilot's ship was destroyed in space (combat::damage_player): its fittings and
-/// cargo go with it and the pilot ejects in a capsule where it died.
-pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), CallError> {
-    let (Some(char_id), Some(system)) = (c.session.int("charid"), c.session.int("solarsystemid")) else { return Ok(()) };
-    if c.session.int("shipid") != Some(ship) {
-        return Ok(());
+/// Apply a committed ship loss to the connected pilot's session.
+pub async fn lose_ship(c: &mut Client, ship: i64, capsule: i64, home: Option<(i64, i64, i64, i64)>, _pos: [f64; 3]) -> Result<(), CallError> {
+    let (Some(char_id), Some(_system)) = (c.session.int("charid"), c.session.int("solarsystemid")) else { return Ok(()) };
+    if c.session.int("shipid") != Some(ship) { return Ok(()); }
+    if let Some((station, system, constellation, region)) = home {
+        c.world.unobserve(c.login.client_id);
+        c.change_session(vec![
+            ("solarsystemid", Value::None), ("stationid", Value::Int(station)),
+            ("solarsystemid2", Value::Int(system)), ("constellationid", Value::Int(constellation)),
+            ("regionid", Value::Int(region)), ("shipid", Value::Int(capsule)),
+        ]);
+        Ok(())
+    } else {
+        info!(user = c.login.user_id, "ship {ship} lost; {char_id} ejected in capsule {capsule}");
+        c.change_session(vec![("shipid", Value::Int(capsule))]);
+        send_state(c).await
     }
-    let corp = c.session.int("corpid").unwrap_or(0);
-    let db = c.db.clone();
-    let sde = c.sde.clone();
-    db.transaction(
-        |tx, outbox: &mut Outbox<()>| {
-            let sde = sde.clone();
-            Box::pin(async move {
-            if !item_dao::lock_reload_ship(tx, ship).await.map_err(db_err)? {
-                return Ok(None);
-            }
-            let lost_type = crate::dao::items::inventory::type_id(tx, ship).await.map_err(db_err)?;
-            // The killmail lists what went down with it: fittings, cargo and loaded charges.
-            let mut lost: super::crimewatch::Lost = item_dao::lost_items(tx, ship).await.map_err(db_err)?
-                .iter().map(|r| (r.type_id, r.flag_id, r.singleton, if r.singleton { 1 } else { r.quantity as i64 })).collect();
-            for r in item_dao::lost_charges(tx, ship).await.map_err(db_err)? {
-                lost.push((r.type_id, r.flag_id, false, r.quantity as i64));
-            }
-            let home = if lost_type == Some(TYPE_CAPSULE) {
-                let r = super::character::home_station::home(tx, &sde, char_id).await?;
-                Some((r.station_id, r.solar_system_id, r.constellation_id, r.region_id))
-            } else { None };
-            item_dao::delete_lost(tx, ship).await.map_err(db_err)?;
-            let capsule: i64 = if let Some((station, _, _, _)) = home {
-                creation::rookie_ship(tx, TYPE_CAPSULE, char_id, station, FLAG_HANGAR).await.map_err(db_err)?
-            } else {
-                crate::dao::items::creation::positioned(tx, TYPE_CAPSULE, char_id, system, pos).await.map_err(db_err)?
-            };
-            if let Some((station, system, constellation, region)) = home {
-                character_dao::set_home(tx, char_id, capsule, station, system, constellation, region).await.map_err(db_err)?;
-            } else {
-                selection::set_ship(tx, char_id, capsule).await.map_err(db_err)?;
-            }
-            outbox.operation(());
-            if let Some(type_id) = lost_type {
-                outbox.event(GameEvent::ShipLost { char_id, ship_id: ship, type_id, system_id: system });
-            }
-            Ok(Some((capsule, home, lost_type, lost)))
-            })
-        },
-        |result, outbox| async move {
-            let Some((capsule, home, lost_type, lost)) = result else { return Ok(()) };
-            for entry in outbox.into_entries() {
-                match entry {
-                    Effect::Notification(notification) => notification.dispatch(&c.world.clone(), Some(&mut *c))?,
-                    Effect::Event(event) => crate::lua::on_event(event),
-                    Effect::Operation(()) => {
-                        super::combat::reset(c);
-                        super::combat::forget_ship(ship);
-                        if let Some(ship_type) = lost_type {
-                            match super::crimewatch::ship_lost(&c.db, &c.world, system, char_id, corp, ship, ship_type, &lost).await {
-                                Err(CallError::Internal(e)) => warn!(user = c.login.user_id, "killmail for {ship}: {e:#}"),
-                                Err(CallError::User { msg, .. }) => warn!(user = c.login.user_id, "killmail for {ship}: {msg}"),
-                                Ok(()) => {}
-                            }
-                            match super::insurance::ship_destroyed(&c.db, &c.world, ship).await {
-                                Err(CallError::Internal(e)) => warn!(user = c.login.user_id, "insurance payout for {ship}: {e:#}"),
-                                Err(CallError::User { msg, .. }) => warn!(user = c.login.user_id, "insurance payout for {ship}: {msg}"),
-                                Ok(()) => {}
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((station, system, constellation, region)) = home {
-                c.world.unobserve(c.login.client_id);
-                info!(user = c.login.user_id, "{char_id} podded; new clone at {station}");
-                c.change_session(vec![
-                    ("solarsystemid", Value::None),
-                    ("stationid", Value::Int(station)),
-                    ("solarsystemid2", Value::Int(system)),
-                    ("constellationid", Value::Int(constellation)),
-                    ("regionid", Value::Int(region)),
-                    ("shipid", Value::Int(capsule)),
-                ]);
-                Ok(())
-            } else {
-                let ball = ship_ball(c, capsule, pos).await?;
-                c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-                info!(user = c.login.user_id, "ship {ship} lost; {char_id} ejected in capsule {capsule}");
-                c.change_session(vec![("shipid", Value::Int(capsule))]);
-                send_state(c).await
-            }
-        },
-    ).await
 }
 
 /// Push the full destiny state for the client's current system (on beyonce bind / UpdateStateRequest).
@@ -452,99 +426,79 @@ fn movement(identity: &Identity, world: &space::World, space_system: Option<i64>
     Ok(Value::None)
 }
 
-/// Warp the session's ship to `point`. With `object` (position, radius) it lands
-/// `min_range` (at least 2.5 km) off that object's surface on the near side; without,
-/// `min_range` short of the point itself (bookmarks, mission sites, warp-in points),
-/// as Ballpark::RealWarp places it.
-pub(super) fn valid_warp_geometry(object: Option<(V3, f64)>, point: V3, min_range: f64) -> bool {
-    point.iter().all(|v| v.is_finite()) && min_range.is_finite()
-        && object.is_none_or(|(pos, radius)| pos.iter().all(|v| v.is_finite()) && radius.is_finite())
-}
-
 pub(crate) async fn warp_to(identity: &Identity, db: &crate::db::Db, world: &space::World, space_system: Option<i64>,
-    object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
-    if !valid_warp_geometry(object, point, min_range) { return Ok(Value::None); }
+    destination: WarpDestination, on_arrival: Option<Timer>) -> CallResult {
+    if !destination.is_valid() { return Ok(Value::None); }
     let (Some(system), Some(ship)) = (space_system, identity.ship_id) else { return Ok(Value::None) };
-    warp_pilot(db, world, system, identity.char_id, ship, object, point, min_range, on_exit, None).await?;
+    let guard = match on_arrival {
+        Some(callback) => match world.begin_warp_arrival(system, callback).await {
+            Some(guard) => Some(guard), None => return Ok(Value::None),
+        },
+        None => None,
+    };
+    warp_pilot(db, world, system, identity.char_id, ship, destination, guard.as_ref().map(|g| g.id()), None).await?;
     Ok(Value::None)
 }
 
 pub(super) async fn warp_destination(identity: &Identity, db: &crate::db::Db, world: &space::World, space_system: Option<i64>,
-    order: Option<super::fleets::warp::Order>, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>, destination: Value) -> CallResult {
+    order: Option<super::fleets::warp::Order>, destination: WarpDestination, on_arrival: Option<Timer>, fleet_destination: Value) -> CallResult {
     match order {
-        Some(order) => super::fleets::warp::execute(db, world, space_system, order, object, point, min_range, on_exit, destination).await,
-        None => warp_to(identity, db, world, space_system, object, point, min_range, on_exit).await,
+        Some(order) => super::fleets::warp::execute(db, world, space_system, order, destination, on_arrival, fleet_destination).await,
+        None => warp_to(identity, db, world, space_system, destination, on_arrival).await,
     }
 }
 
-/// Load and fence each pilot's own fit; preserve the callback across stale revisions.
+fn fitted_warp_factor(fit: &super::fit::Fit) -> Result<i64, CallError> {
+    use infinity_core::consts::dogma::{ATTR_BASE_WARP_SPEED, ATTR_WARP_SPEED_MULTIPLIER};
+    let base = fit.value(super::fit::Key::Ship, ATTR_BASE_WARP_SPEED);
+    let multiplier = fit.value(super::fit::Key::Ship, ATTR_WARP_SPEED_MULTIPLIER);
+    if !base.is_finite() || base <= 0.0 || !multiplier.is_finite() || multiplier <= 0.0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid fitted warp speed attributes")));
+    }
+    Ball::warp_factor_from_speed(base * multiplier)
+        .map(|factor| factor.max(MIN_SHIP_WARP_FACTOR))
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("invalid fitted warp speed")))
+}
+
+/// Load and fence each pilot's own fit, retrying stale projection snapshots.
 pub(super) async fn warp_pilot(db: &crate::db::Db, world: &space::World, system: i64, pilot: i64, ship: i64,
-    object: Option<(V3, f64)>, point: V3, min_range: f64, mut on_exit: Option<Timer>,
-    order: Option<std::sync::Arc<super::fleets::warp::Order>>) -> Result<(bool, Option<Timer>), CallError> {
+    destination: WarpDestination, arrival: Option<WarpArrivalId>,
+    order: Option<std::sync::Arc<super::fleets::warp::Order>>) -> Result<bool, CallError> {
     loop {
         let fit = super::fit::Fit::load_in_space(db, world, system, pilot, ship).await?;
-        let Some(revision) = fit.projection_revision() else { return Ok((false, on_exit)) };
-        let scrambled = fit.value(super::fit::Key::Ship, crate::consts::dogma::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
+        let Some(revision) = fit.projection_revision() else { return Ok(false) };
+        let scrambled = fit.value(super::fit::Key::Ship, infinity_core::consts::dogma::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
+        let factor = fitted_warp_factor(&fit)?;
         let is_fleet = order.is_some();
         let guard = order.clone();
         let result = world.with(system, move |s| {
-            let mut callback = on_exit;
-            let result = if let Some(order) = guard {
-                super::fleets::warp::commit(s, &order, pilot, ship, |s| {
-                    commit_warp(s, ship, revision, scrambled, object, point, min_range, callback.take())
-                })
+            if let Some(order) = guard {
+                super::fleets::warp::commit(s, &order, pilot, ship, |s| commit_warp(s, ship, revision, scrambled, factor, destination, arrival))
             } else {
-                Some(commit_warp(s, ship, revision, scrambled, object, point, min_range, callback.take()))
-            };
-            match result {
-                Some((current, returned)) => (Some(current), returned),
-                None => (None, callback),
+                Some(commit_warp(s, ship, revision, scrambled, factor, destination, arrival))
             }
-        }).await;
-        let Some((current, callback)) = result else { return Ok((false, None)) };
-        on_exit = callback;
-        let Some(current) = current else { return Ok((false, on_exit)) };
-        if !current { continue; }
-        if scrambled {
-            if is_fleet { return Ok((false, on_exit)); }
-            return Err(super::notify_error(messages::effects::WARP_SCRAMBLED));
+        }).await.flatten().unwrap_or(WarpCommit::Unavailable);
+        match result {
+            WarpCommit::Queued => return Ok(true),
+            WarpCommit::RetryProjection => continue,
+            WarpCommit::Unavailable => return Ok(false),
+            WarpCommit::EntosisBlocked if !is_fleet => return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED)),
+            WarpCommit::Scrambled if !is_fleet => return Err(super::notify_error(messages::effects::WARP_SCRAMBLED)),
+            WarpCommit::EntosisBlocked | WarpCommit::Scrambled => return Ok(false),
         }
-        return Ok((true, on_exit));
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WarpCommit { Queued, RetryProjection, Scrambled, EntosisBlocked, Unavailable }
 
 pub(super) fn commit_warp(s: &mut space::System, ship: i64, revision: u64, scrambled: bool,
-    object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> (bool, Option<Timer>) {
-    if s.projection_revision(ship) != revision || scrambled {
-        return (s.projection_revision(ship) == revision, on_exit);
-    }
+    factor: i64, destination: WarpDestination, arrival: Option<WarpArrivalId>) -> WarpCommit {
+    if space::sovereignty::links::blocks(s, ship) { return WarpCommit::EntosisBlocked; }
+    if s.projection_revision(ship) != revision { return WarpCommit::RetryProjection; }
+    if scrambled { return WarpCommit::Scrambled; }
     s.drop_jump_cloak(ship);
-    s.clear_warp_exit(ship);
-    s.command(ship, move |b, t, _| warp_command(b, t, object, point, min_range));
-    if let Some(callback) = on_exit {
-        s.on_warp_exit(ship, callback);
-    }
-    (true, None)
-}
-
-fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_range: f64) -> Vec<Value> {
-    let stand_off = match object {
-        Some((_, radius)) => radius + b.radius as f64 + min_range.max(MIN_OBJECT_WARP_CLEARANCE),
-        None => min_range.max(0.0),
-    };
-    let factor = b.warp_factor.max(1);
-    match b.warp_to(point, stand_off, factor) {
-        space::WarpOutcome::Ignored => vec![],
-        space::WarpOutcome::Approach => vec![event(t, "GotoPoint", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])],
-        space::WarpOutcome::Align => {
-            b.set_speed_fraction(1.0);
-            vec![
-                event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2]), Value::Float(stand_off), Value::Int(factor)]),
-                event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
-                special_fx(t, b.id, None, None, "effects.Warping", 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, None),
-            ]
-        }
-    }
+    if s.queue_warp(ship, factor, destination, arrival) { WarpCommit::Queued } else { WarpCommit::Unavailable }
 }
 
 /// Ensure a stationary ship starts moving when given a heading (client sends 1.0 separately too).
@@ -556,10 +510,16 @@ fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
 }
 
 pub(crate) mod balls;
+pub(in crate::services) mod boarding;
+mod configuration;
+mod cleaning;
+mod stored;
 pub(crate) mod observer;
 pub(crate) mod ship;
+mod deployment;
 mod undock_point;
 pub(crate) mod beyonce;
+mod navigation;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {

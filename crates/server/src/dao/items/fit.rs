@@ -3,7 +3,7 @@
 //! Brain reads use an explicit FILETIME and exclude expired boosters, including before cleanup.
 //! Shared item type lookup lives in `items::inventory`; activation and consumption are not handled here.
 use crate::db::{executor::Executor, Error};
-use crate::consts::{FLAG_BOOSTER, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_IMPLANT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST};
+use infinity_core::consts::{FLAG_BOOSTER, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_IMPLANT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST};
 use super::brain::BrainItem;
 use tokio_postgres::Row;
 

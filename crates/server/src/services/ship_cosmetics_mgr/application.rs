@@ -1,7 +1,8 @@
 //! Ship SKIN application using game items and effective licenses.
 //! `shipSkinApplicationSvc.py` applies and cancels first-party SKINs.
 //! Structure and third-party applications are not supported.
-use crate::{consts::CATEGORY_SHIP, dao::{items::loading::ItemQuery, ship_skins::{self, ShipState}, trades}, db::executor::Executor, messages::{self, ship_skins as text}, sde::Sde, services::{db_err, identity::Identity, inventory::reachability::{Endpoint, Reachability}, items::load_items, notify_error, user_error, CallError}};
+use infinity_core::{consts::CATEGORY_SHIP, messages::{self, ship_skins as text}};
+use crate::{dao::{items::loading::ItemQuery, ship_skins::{self, ShipState}, trades}, db::executor::Executor, sde::Sde, services::{db_err, identity::Identity, inventory::reachability::{Endpoint, Reachability}, items::load_items, notify_error, user_error, CallError}};
 
 pub(super) async fn apply_tx(ex: &(impl Executor + ?Sized), identity: &Identity, sde: &Sde, region: &str, reachability: &Reachability, ship_id: i64, skin_id: Option<i32>, now: i64) -> Result<Option<ShipState>, CallError> {
     let ship = load_items(ex, sde, ItemQuery::Id(ship_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(text::INVALID_ITEM))?;

@@ -7,7 +7,8 @@
 //! 1000000, and detail arguments up to 64 KiB; larger or malformed calls are rejected.
 //! Detail log arguments escape control characters to keep one physical line per row.
 use std::{borrow::Cow, collections::HashMap, io::Write};
-use crate::{client::{Client, filetime_now, unix_seconds_from_filetime}, consts::FILETIME_UNIX_EPOCH, dao::{characters::selection, client_errors}, services::{Call, CallResult, db_err}};
+use infinity_core::consts::FILETIME_UNIX_EPOCH;
+use crate::{client::{Client, filetime_now, unix_seconds_from_filetime}, dao::{characters::selection, client_errors}, services::{Call, CallResult, db_err}};
 use marshal::Value;
 use tracing::{info, warn};
 

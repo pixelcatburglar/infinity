@@ -23,6 +23,7 @@ impl Mutation {
     pub(crate) fn result_type(&self, source: i32) -> Option<i32> { self.mappings.get(&source).copied() }
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct DynamicItems(HashMap<i32, Mutation>);
 
 #[derive(Debug, PartialEq, Eq)]

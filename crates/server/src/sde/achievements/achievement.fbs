@@ -1,0 +1,24 @@
+// Server declaration of the ACHV format read by the client achievement model.
+union RewardPayload { IskReward, SpReward, ItemReward, TitleReward }
+union ProgressConfig { CumulativeMode, ChecklistMode, SetMode }
+table IskReward { quantity:ulong; }
+table SpReward { quantity:ulong; }
+table ItemReward { type_id:uint; quantity:ulong; }
+table TitleReward { title_id:string; }
+table Reward { id:string; payload:RewardPayload; internal_name:string; }
+table AchievementMilestone { id:string; target:ulong; category_points:uint; rewards:[Reward]; internal_name:string; }
+table CategoryMilestone { id:string; target:uint; rewards:[Reward]; internal_name:string; }
+table MethodParamDefinition { key:string; type:string; accepted_value_types:[string]; optional:bool; name:uint; description:uint; icon_id:string; }
+table CumulativeMode { }
+table ChecklistMode { target_parameter:string; }
+table SetMode { target_value_type:string; }
+table ContributionMethodDefinition { id:string; name:uint; description:uint; icon_id:string; content_tags:[string]; progress_description:uint; parameters:[MethodParamDefinition]; progress:ProgressConfig; ui_annotations:[UiAnnotation]; }
+table MatcherValues { value_type:string; values:[string]; }
+table ContributionParam { key:string; matchers:[MatcherValues]; }
+table ContributionConfig { method_id:string; parameters:[ContributionParam]; }
+table UiAnnotation { key:string; value:string; }
+table Achievement { id:string; name:uint; description:uint; flavor_text:uint = null; icon_id:string; issuer_npc_corp:int = null; contribution:ContributionConfig; milestones:[AchievementMilestone]; release_date_unix_ms:long = null; expiration_date_unix_ms:long = null; ui_annotations:[UiAnnotation]; tags:[string]; archived:bool; internal_name:string; }
+table Category { id:string; name:uint; description:uint; icon_id:string; milestones:[CategoryMilestone]; categories:[Category]; achievements:[Achievement]; internal_name:string; ui_annotations:[UiAnnotation]; }
+table AchievementData { goals:Category; challenges:Category; time_limited:Category; contribution_methods:[ContributionMethodDefinition]; }
+root_type AchievementData;
+file_identifier "ACHV";

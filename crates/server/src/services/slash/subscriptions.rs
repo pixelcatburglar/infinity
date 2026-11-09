@@ -2,7 +2,8 @@
 //! The client forwards slash commands; authority and deadlines are persisted by
 //! the subscriptions service. Subscription commerce is not implemented here.
 use super::{args::Args, slash_error, CallError, Client};
-use crate::{messages, services::subscriptions::{management, rules}};
+use infinity_core::messages;
+use crate::{services::subscriptions::{management, rules}};
 
 fn parse(args: &[String]) -> Result<(i64, i16, Option<i64>, i64), CallError> {
     let invalid = || slash_error(messages::subscriptions::INVALID_GRADE_REQUEST.into());

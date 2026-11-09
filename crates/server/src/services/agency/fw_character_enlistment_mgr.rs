@@ -5,10 +5,10 @@
 
 use super::super::{db_err, has_role_or_is_ceo, notify_error, Call, CallResult};
 use crate::client::Client;
-use crate::consts::{ROLE_DIRECTOR, WARFARE_FACTIONS};
+use infinity_core::consts::{ROLE_DIRECTOR, WARFARE_FACTIONS};
 use crate::dao::corporations::enlistment;
 use crate::db::outbox::{dispatch_world, Outbox};
-use crate::messages;
+use infinity_core::messages;
 use marshal::Value;
 use tracing::info;
 
@@ -32,9 +32,6 @@ async fn set_allowed_factions(c: &Client, call: &Call<'_>) -> CallResult {
         return Ok(Value::None);
     };
     let me = c.session.int("charid").unwrap_or(0);
-    if !has_role_or_is_ceo(&c.db, me, corp_id, ROLE_DIRECTOR).await? {
-        return Err(notify_error(messages::DIRECTOR_REQUIRED_TO_EDIT_CORP_INFO));
-    }
     let mut factions: Vec<i64> = match call.args.first() {
         Some(Value::List(l) | Value::Tuple(l)) => l.iter().filter_map(|v| v.as_int()).filter(|f| WARFARE_FACTIONS.contains(f)).collect(),
         _ => vec![],
@@ -46,6 +43,10 @@ async fn set_allowed_factions(c: &Client, call: &Call<'_>) -> CallResult {
         |tx, _: &mut Outbox| {
             let factions = std::sync::Arc::clone(&factions);
             Box::pin(async move {
+                if !crate::dao::corporations::registry::lock_admission(tx, &[], &[corp_id], &[me]).await.map_err(db_err)?
+                    || !has_role_or_is_ceo(tx, me, corp_id, ROLE_DIRECTOR).await? {
+                    return Err(notify_error(messages::DIRECTOR_REQUIRED_TO_EDIT_CORP_INFO));
+                }
                 enlistment::clear(tx, corp_id).await.map_err(db_err)?;
                 for &faction in factions.iter() {
                     enlistment::insert(tx, corp_id, faction).await.map_err(db_err)?;

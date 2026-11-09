@@ -4,16 +4,22 @@
 //! are a configured random selection of published Salvaged Materials types.
 //! Cargo occupancy follows `inventorycommon.util.GetItemVolume` for each item.
 //! Loose wreck contents are retained in a positioned cargo container.
+//! Successful wreck recovery journals a WreckSalvaged fact atomically with inventory changes,
+//! using the wreck ball and transactional character/ship data. The durable outcome
+//! is authoritative; live container publication is best effort and failures are
+//! warned, with no automatic recovery.
 use super::{lifecycle::{Cycle, CycleOutcome, Module, subject_valid}, notify::fire_fx, registry::{Effect, EffectAttribute, EffectFlag}};
-use crate::consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, FLAG_CARGO, GROUP_CARGO_CONTAINER, GROUP_WRECK, IX_LOCATION_ID};
-use crate::dao::items::{creation, inventory, loading::{self, ItemQuery}, salvage, ship};
+use infinity_core::consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, FLAG_CARGO, GROUP_CARGO_CONTAINER, GROUP_WRECK, IX_LOCATION_ID};
+use crate::dao::items::{creation, inventory, loading::{self, ItemQuery}, salvage};
 use crate::db::outbox::{Effect as OutboxEffect, Outbox};
-use crate::messages;
-use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, db_err, fit::{Fit, Key, PERCENT_SCALE}, inventory::notifications::notify_item_change, items::{deposit, load_items}, market, rand01, user_error, CallError};
+use infinity_core::messages;
+use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, db_err, fit::{Fit, Key, PERCENT_SCALE}, inventory::notifications::notify_item_change, items::load_items, market, rand01, user_error, CallError};
 use crate::space::{dist, Ball, System, MODE_RIGID, MODE_WARP};
 use marshal::Value;
 use std::sync::Arc;
 use crate::lua::events::ModuleCycleOutcome;
+use crate::db::outbox::SourceKey;
+use crate::lua::events::{GameEvent, resources::{FactContext, FactOrigin}};
 
 /// SDE dgmAttributeTypes: accessDifficulty, highIsGood=true, unit 121 (realPercent).
 /// The additive sign and percent scaling are server policy.
@@ -90,12 +96,11 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
         pool.swap(i, j);
         let width = u64::from(policy.salvage_quantity_max) - u64::from(policy.salvage_quantity_min) + 1;
         let quantity = u64::from(policy.salvage_quantity_min) + (rand01() * width as f64) as u64;
-        yields.push((pool[i], quantity as i32));
+        yields.push((pool[i], quantity as i64));
     }
     let container = sde.types.iter().filter(|t| t.group_id == Some(GROUP_CARGO_CONTAINER)).min_by_key(|t| t.type_id).map(|t| (t.type_id, t.radius));
     let _lock = market::lock().await;
-    let capacity = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, source).await?
-        .value(Key::Ship, ATTR_CAPACITY);
+    let capacity = fit.value(Key::Ship, ATTR_CAPACITY);
     let world = cx.world.clone();
     let sender = cx.notify.clone();
     let system = cx.system_id;
@@ -104,16 +109,15 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
             let (sde, yields, ball, generation) = (sde.clone(), yields.clone(), ball.clone(), generation.clone());
             Box::pin(async move {
                 if !active(master, &generation, character, target) { return Ok(false); }
-                if !ship::lock_reload_ship(tx, source).await.map_err(db_err)? { return Ok(false); }
-                let cargo = loading::load_items(tx, ItemQuery::LocationFlags(source, &[FLAG_CARGO])).await.map_err(db_err)?;
-                let volume = |id, singleton, quantity| {
-                    let value = crate::services::item_volume::item_volume(&sde, id, singleton, quantity, None)?;
-                    if !value.is_finite() || value < 0.0 { return Err(CallError::Internal(anyhow::anyhow!("invalid item volume for type {id}"))); }
-                    Ok(value)
+                let additions: Vec<_> = yields.iter().map(|(type_id, quantity)| crate::services::inventory::hold_storage::Addition {
+                    type_id: *type_id, singleton: false, quantity: *quantity,
+                }).collect();
+                let locks = match crate::services::inventory::hold_storage::check_destination(tx, &sde, character, source, FLAG_CARGO, &additions, Default::default(), Some(capacity)).await {
+                    Ok(Some(locks)) => locks,
+                    Ok(None) => return Err(crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)),
+                    Err(CallError::User { msg, .. }) if msg == messages::MSG_NOT_ENOUGH_CARGO_SPACE => return Ok(false),
+                    Err(error) => return Err(error),
                 };
-                let used = cargo.iter().try_fold(0.0, |sum, item| Ok::<_, CallError>(sum + volume(item.type_id, item.singleton, i64::from(item.quantity))?))?;
-                let added = yields.iter().try_fold(0.0, |sum, (id, quantity)| Ok::<_, CallError>(sum + volume(*id, false, i64::from(*quantity))?))?;
-                if !capacity.is_finite() || !used.is_finite() || !added.is_finite() || used + added > capacity { return Ok(false); }
                 if !salvage::claim(tx, target, system, ball.type_id).await.map_err(db_err)? { return Ok(false); }
                 let loot = load_items(tx, &sde, ItemQuery::Location(target)).await.map_err(db_err)?;
                 if loot.len() != loading::load_items(tx, ItemQuery::Location(target)).await.map_err(db_err)?.len() {
@@ -133,10 +137,18 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
                     replacement.slim.clear();
                     Some(replacement)
                 };
-                for (kind, quantity) in yields { deposit(tx, &sde, outbox, character, source, FLAG_CARGO, kind, quantity, target).await?; }
+                for (kind, quantity) in yields {
+                    crate::services::items::deposit_held(tx, &sde, outbox, &crate::services::inventory::destination::Destination::owned(character, source, FLAG_CARGO), kind, quantity, target, Some(&locks), Some(capacity)).await?;
+                }
                 if !active(master, &generation, character, target) {
                     return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
                 }
+                let org = crate::dao::characters::members::organization(tx, character).await.map_err(db_err)?;
+                let ship_type_id = loading::load_items(tx, ItemQuery::Id(source)).await.map_err(db_err)?.first().map(|item| item.type_id);
+                outbox.event_from(SourceKey::new("WreckSalvaged", target), GameEvent::WreckSalvaged {
+                    char_id: character, wreck_id: target, wreck_type: ball.type_id, occurred_at: crate::client::filetime_now(),
+                    context: FactContext { corporation_id: org.as_ref().map(|o| o.corporation_id), alliance_id: org.and_then(|o| o.alliance_id), faction_id: None, ship_id: Some(source), ship_type_id, system_id: Some(system), station_id: None, origin: FactOrigin::Natural },
+                });
                 outbox.operation(preserved);
                 Ok(true)
             })
@@ -145,10 +157,14 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
             for entry in outbox.into_entries() {
                 match entry {
                     OutboxEffect::Notification(notification) => notification.dispatch_sender(&world, &sender)?,
-                    OutboxEffect::Event(event) => crate::lua::on_event(event),
                     OutboxEffect::Operation(replacement) => {
                         world.remove_ball(system, target).await;
-                        if let Some(ball) = replacement { world.add_ship(system, ball).await.map_err(CallError::Internal)?; }
+                        if let Some(ball) = replacement {
+                            let replacement_id = ball.id;
+                            if let Err(error) = world.add_ship_locked(system, ball, &_lock).await {
+                                tracing::warn!(system, wreck_id = target, replacement_id, %error, "failed to publish salvaged wreck container");
+                            }
+                        }
                     }
                 }
             }

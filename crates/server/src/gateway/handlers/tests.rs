@@ -6,7 +6,7 @@ async fn exact_claims_and_neighboring_requests() {
     validate().unwrap();
     let gw = super::super::tests::gateway().await;
     let context = HandlerContext::for_request(&gw, super::super::Caller::default()).await.unwrap();
-    assert_eq!(CLAIMS.len(), 21);
+    assert_eq!(CLAIMS.len(), 25);
     let expected = [
         "eve_public.achievement.definition.api.cdn.GetLatestRequest",
         "eve_public.cosmetic.character.title.definition.api.GetLatestRequest",
@@ -29,6 +29,10 @@ async fn exact_claims_and_neighboring_requests() {
         "eve_public.character.skill.plan.SetNameRequest",
         "eve_public.character.skill.plan.SetDescriptionRequest",
         "eve_public.character.skill.plan.SetSkillRequirementsRequest",
+        "eve_public.character.skill.plan.milestone.GetAllRequest",
+        "eve_public.character.skill.plan.milestone.CreateRequest",
+        "eve_public.character.skill.plan.milestone.DeleteRequest",
+        "eve_public.character.skill.plan.milestone.SetDescriptionRequest",
     ];
     for name in expected { assert!(CLAIMS.iter().any(|(claim, _)| *claim == name), "{name}"); }
     for (name, _) in CLAIMS {
@@ -39,4 +43,13 @@ async fn exact_claims_and_neighboring_requests() {
     for name in ["eve_public.character.skill.plan.FutureRequest", "eve_public.character.skill.plan.milestone.GetRequest", "eve_public.achievement.api.FutureRequest", "eve_public.character.FutureRequest"] {
         assert!(matches!(handle(&context, name, &req).await, Dispatch::Unclaimed));
     }
+}
+
+#[test]
+fn actual_rust_claims_are_distinct_from_daily_reservation() {
+    assert!(is_implemented("eve_public.character.GetNamesByUserRequest"));
+    assert!(is_implemented("eve_public.character.skill.plan.GetRequest"));
+    assert!(!is_implemented("eve_public.dailygoal.api.GetRequest"));
+    assert!(!is_implemented("eve_public.character.skill.plan.FutureRequest"));
+    assert!(super::super::daily_goals::supported("eve_public.dailygoal.api.GetRequest"));
 }

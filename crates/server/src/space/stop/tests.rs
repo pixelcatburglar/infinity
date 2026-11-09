@@ -1,5 +1,5 @@
 use super::*;
-use crate::consts::DAMAGE_LAYER_COUNT;
+use infinity_core::consts::DAMAGE_LAYER_COUNT;
 use crate::space::{DESTINY_FRICTION, MODE_GOTO, MODE_WARP, WarpState, integration_factor};
 use std::collections::HashMap;
 
@@ -10,7 +10,7 @@ fn ball() -> Ball {
         agility: 1.0, speed_fraction: 0.75, pos: [0.0; 3], vel: [10.0, 20.0, 30.0],
         old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         goto: [1000.0, 0.0, 0.0], follow_id: 5, follow_range: 6.0, free: true,
-        global: false, massive: false, interactive: false, warp: WarpState::default(), warp_factor: 3,
+        global: false, massive: false, interactive: false, warp: WarpState::default(), 
         last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 7, cloak: 0, cloak_until: 0,
         health: [1.0; DAMAGE_LAYER_COUNT], launcher: 8, slim: vec![],
     }

@@ -6,7 +6,8 @@
 //! complete-key holder can read; private access, revocation, expiry and overview
 //! links are unsupported.
 use marshal::Value;
-use crate::{client::Client, dao::shared_settings::{self, LinkKey, NewLink}, messages::settings_sharing as messages, services::{Call, CallResult, keyval, notify_error}};
+use infinity_core::messages::settings_sharing as messages;
+use crate::{client::Client, dao::shared_settings::{self, LinkKey, NewLink}, services::{Call, CallResult, keyval, notify_error}};
 use super::{codec, BROADCAST, ITEMS};
 
 /// Filter and condition triples, and broadcast entries, as unpacked by filterSvc and fleetSvc.

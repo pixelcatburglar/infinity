@@ -3,7 +3,8 @@
 //! handler provides balance only, not vault transactions.
 use super::error::GatewayError;
 use prost_reflect::{DynamicMessage, ReflectMessage, Value as PV};
-use crate::{consts::PLEX_HUNDREDTHS, dao::accounts::balances};
+use infinity_core::consts::PLEX_HUNDREDTHS;
+use crate::dao::accounts::balances;
 use super::{context::HandlerContext, message::{response_for, child, set}};
 
 /// The account's PLEX vault (crate::services::store), in hundredths of a PLEX.

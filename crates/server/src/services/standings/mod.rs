@@ -13,13 +13,16 @@
 //! Loyalty balances use game.lp_balances for both characters and corporations. Imported
 //! game.lp_offers are authoritative; only a globally empty catalogue uses synthesized
 //! faction offers derived from retail prices. Analysis Kredits cannot be spent.
+//! Positive natural character mission LP rewards journal LoyaltyPointsEarned with the balance
+//! mutation, using transactional organization/ship data; corporate LP and other reasons are excluded.
 
 use super::{db_err, notify_error, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::Outbox;
-use crate::messages;
+use infinity_core::messages;
+use crate::lua::events::{GameEvent, resources::{FactContext, FactOrigin, LoyaltyReason}};
 use marshal::Value;
 
 mod standing_mgr;
@@ -127,14 +130,29 @@ pub(crate) async fn lp_balances(db: &Db, char_id: i64) -> Result<Vec<(i64, i64)>
     Ok(crate::dao::wallets::loyalty::list(db, char_id).await.map_err(db_err)?
         .into_iter().map(|row| (row.corp_id, row.amount)).collect())
 }
+pub(crate) struct LoyaltyMutation {
+    pub reason: LoyaltyReason,
+    pub context: FactContext,
+    pub occurred_at: i64,
+}
+
 
 /// Change an owner's LP and queue the appropriate post-commit notification.
-pub(super) async fn change_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, issuer: i64, amount: i64, corporation: bool) -> Result<(), CallError> {
+pub(super) async fn change_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, issuer: i64, amount: i64, corporation: bool, mut mutation: LoyaltyMutation) -> Result<(), CallError> {
     if amount == 0 || issuer == 0 { return Ok(()); }
     let Some(after) = crate::dao::wallets::loyalty::add(db, owner, issuer, amount).await.map_err(db_err)? else {
         let before = lp_balance(db, owner, issuer).await?;
         return Err(notify_error(&messages::loyalty_balance_message(before)));
     };
+    if !corporation && amount > 0 && issuer != infinity_core::consts::CORP_HERALDRY && mutation.reason == LoyaltyReason::MissionReward && mutation.context.origin == FactOrigin::Natural {
+        let org = crate::dao::characters::members::organization(db, owner).await.map_err(db_err)?;
+        mutation.context.corporation_id = org.as_ref().map(|o| o.corporation_id);
+        mutation.context.alliance_id = org.and_then(|o| o.alliance_id);
+        if let Some(ship) = mutation.context.ship_id {
+            mutation.context.ship_type_id = crate::dao::items::loading::load_items(db, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.first().map(|item| item.type_id);
+        }
+        outbox.event(GameEvent::LoyaltyPointsEarned { char_id: owner, issuer_id: issuer, amount, reason: mutation.reason, occurred_at: mutation.occurred_at, context: mutation.context });
+    }
     if corporation {
         for member in crate::dao::characters::members::active_ids(db, owner).await.map_err(db_err)? {
             outbox.notify_pilot(member, "OnCorpLPChange", vec![Value::str("lp"), Value::Int(issuer)]);
@@ -146,8 +164,8 @@ pub(super) async fn change_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &m
 }
 
 /// Add or take character loyalty points.
-pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
-    change_lp(db, outbox, char_id, corp, amount, false).await
+pub(crate) async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64, mutation: LoyaltyMutation) -> Result<(), CallError> {
+    change_lp(db, outbox, char_id, corp, amount, false, mutation).await
 }
 
 pub(crate) async fn initialize(db: &crate::db::Db) -> Result<(), crate::db::Error> {

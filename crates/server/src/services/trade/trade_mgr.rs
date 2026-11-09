@@ -2,9 +2,12 @@
 //! `pvptradesvc.py`, `pvptradewnd.py` and the PlayerTrade inventory controller.
 //! Uses `game.trades`, `game.trade_items`, character wallets and station hangars.
 //! Fitted items, corporation hangars and PLEX vault transfers are unsupported.
+//! `OnItemChange` stack quantities are projected to the client display limit;
+//! staged and stored quantities stay exact.
 use std::collections::{BTreeMap, BTreeSet};
 use marshal::Value;
-use crate::{client::Client, consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE}, dao::{items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, trades::{self, Trade, TradeItem}}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, user_error, wallets, Call, CallError, CallResult}};
+use infinity_core::{consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE}, messages};
+use crate::{client::Client, dao::{items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, trades::{self, Trade, TradeItem}}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, user_error, wallets, Call, CallError, CallResult}};
 use super::{dispatch as dispatch_outbox, session, settle, timeout, TradeEffect};
 
 /// `eveexceptions.const.UE_TYPEIDL`: list of type IDs in a UserError argument.
@@ -22,7 +25,7 @@ pub(super) fn reset(outbox: &mut Outbox<TradeEffect>, trade: &mut Trade) {
     settle::tell(outbox, trade, "OnTradeOffer", vec![Value::Int(trade.id), acceptance(trade)]);
 }
 fn item_notice(outbox: &mut Outbox<TradeEffect>, trade: &Trade, item: &Item, changes: Vec<(i64, Value)>) {
-    settle::tell(outbox, trade, "OnItemChange", vec![item.row(), Value::Dict(changes.into_iter().map(|(i, v)| (Value::Int(i), v)).collect()), Value::None]);
+    settle::tell(outbox, trade, "OnItemChange", vec![item.row(), crate::services::inventory::notifications::item_change_dict(changes), Value::None]);
 }
 
 async fn initiate(c: &Client, target: i64) -> CallResult {
@@ -78,9 +81,9 @@ async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<Tra
         let q = quantity.unwrap_or(crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity)));
         let id = if !item.singleton && q < i64::from(item.quantity) {
             let mut changes = BTreeMap::new();
-            changes.insert(item.item_id, QuantityChange::new(item, Some(item.quantity - q as i32)));
+            changes.insert(item.item_id, QuantityChange::new(item, Some(item.quantity - q)));
             if !quantities::apply(ex, &changes).await.map_err(db_err)? { return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT)); }
-            let id = transfers::insert(ex, item.type_id, me, trade.id, item.flag_id, q as i32).await.map_err(db_err)?;
+            let id = transfers::insert(ex, item.type_id, me, trade.id, item.flag_id, q).await.map_err(db_err)?;
             if let Some(left) = load_items(ex, sde, ItemQuery::Id(item.item_id)).await.map_err(db_err)?.into_iter().next() { item_notice(outbox, trade, &left, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]); }
             id
         } else {
@@ -147,7 +150,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 }
                 "OfferMoney" => {
                     let amount = args.first().and_then(session::money).ok_or_else(|| notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR))?;
-                    if !crate::dao::wallets::characters::covers(tx, me, amount).await.map_err(db_err)? { return Err(wallets::not_enough_money(wallets::balance(tx, me).await?, amount)); }
+                    let exact_amount = crate::isk::IskAmount::from_isk(amount)?;
+                    if !crate::dao::wallets::characters::covers(tx, me, exact_amount).await.map_err(db_err)? { return Err(wallets::not_enough_money(wallets::balance(tx, me).await?, exact_amount)); }
                     if me == trade.a { trade.money_a = amount; } else { trade.money_b = amount; }
                     reset(outbox, &mut trade);
                     settle::tell(outbox, &trade, "OnTradeMoneyOffer", vec![Value::Int(id), amounts(&trade)]);

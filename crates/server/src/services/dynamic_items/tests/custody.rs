@@ -1,6 +1,6 @@
 //! Custody and reservation regressions for persisted mutation inputs.
 use super::*;
-use crate::consts::{FLAG_CORP_SAG1, INDUSTRY_JOB_STATUS_INSTALLED, ROLE_HANGAR_CAN_TAKE_1};
+use infinity_core::consts::{FLAG_CORP_SAG1, INDUSTRY_JOB_STATUS_INSTALLED, ROLE_HANGAR_CAN_TAKE_1};
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with loaded SDE; run serially"]
@@ -39,13 +39,13 @@ async fn office_custody_requires_current_division_take_role() {
     let scenario = f.clone();
     let outcome = tokio::spawn(async move {
         let f = scenario;
-        f.db.execute("UPDATE game.characters SET corporation_id=$2,corp_roles=0 WHERE character_id=$1", &[&f.owner, &corp]).await.unwrap();
+        f.db.execute("UPDATE game.characters SET corporation_id=$2,corp_roles=0,corp_roles_hq=0 WHERE character_id=$1", &[&f.owner, &corp]).await.unwrap();
         f.db.execute("UPDATE game.items SET location_id=$2,flag_id=$3 WHERE item_id=$1", &[&f.source, &office, &FLAG_CORP_SAG1]).await.unwrap();
         let dispatched = Arc::new(AtomicBool::new(false));
         let before = f.fingerprint().await;
         assert!(matches!(f.create(f.context(), f.mutator, f.source, false, dispatched.clone()).await, Err(CallError::User { .. })));
         assert_eq!(f.fingerprint().await, before);
-        f.db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&f.owner, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+        f.db.execute("UPDATE game.characters SET corp_roles_hq=$2 WHERE character_id=$1", &[&f.owner, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
         let before = f.fingerprint().await;
         assert!(matches!(f.create(f.context(), f.mutator, f.source, true, dispatched.clone()).await, Err(CallError::Internal(_))));
         assert_eq!(f.fingerprint().await, before);
@@ -60,7 +60,7 @@ async fn office_custody_requires_current_division_take_role() {
         assert_eq!(f.fingerprint().await, before);
         assert!(!dispatched.load(Ordering::SeqCst));
     }).await;
-    f.db.execute("UPDATE game.characters SET corporation_id=1,corp_roles=0 WHERE character_id=$1", &[&f.owner]).await.unwrap();
+    f.db.execute("UPDATE game.characters SET corporation_id=1,corp_roles=0,corp_roles_hq=0 WHERE character_id=$1", &[&f.owner]).await.unwrap();
     f.db.execute("DELETE FROM game.offices WHERE office_id=$1", &[&office]).await.unwrap();
     f.db.execute("DELETE FROM game.items WHERE item_id=$1", &[&office]).await.unwrap();
     f.db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();

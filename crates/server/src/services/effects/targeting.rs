@@ -2,7 +2,7 @@
 //! Passive targeting mirrors dogma/pythonEffects/migratedeffects.py AddTargetEx.
 //! Candidates are current incoming locks from combat's shared targeter query; no unrelated nearby ships are targeted.
 use super::{lifecycle::{Cycle, CycleOutcome, Module}, registry::Effect, EffectKind};
-use crate::messages;
+use infinity_core::messages;
 use crate::services::{combat::{self, state, Ctx}, combat::targeting_charges::add_target_for_cycle, fit::Fit, user_error, CallError};
 use std::sync::{Arc, atomic::Ordering};
 

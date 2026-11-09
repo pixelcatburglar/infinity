@@ -19,6 +19,7 @@ pub(crate) struct NpcCorporation {
     pub member_limit: Option<i64>,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct NpcCorporations {
     rows: Vec<NpcCorporation>,
 }

@@ -13,13 +13,16 @@
 //! scans in one process; leases are not renewed.
 
 mod access_groups;
+mod account;
 mod agency;
 mod alert;
 mod alliances;
+mod amplification_matrix;
 mod bannedwords;
 mod bills;
 mod bookmarks;
 pub(crate) mod bounty;
+mod brawl;
 mod calendar;
 pub(crate) mod character;
 pub(crate) mod chat;
@@ -32,6 +35,7 @@ pub(crate) mod corps;
 mod corpwallet;
 pub(crate) mod crimewatch;
 mod crates;
+pub(crate) mod daily_goals;
 pub(crate) mod dogma;
 pub(crate) mod drones;
 mod dynamic_items;
@@ -51,6 +55,7 @@ mod insurance;
 pub(crate) mod inventory;
 pub(crate) mod ship_cosmetics_mgr;
 mod item_volume;
+mod item_launch;
 pub(crate) mod items;
 pub(crate) mod mail;
 pub(crate) mod market;
@@ -62,9 +67,14 @@ pub(crate) mod online_status;
 mod orgs;
 pub(crate) mod mining;
 mod missions;
+mod planet_mgr;
 pub(crate) mod presence;
+pub(crate) mod plex_vault;
+mod repair;
 pub(crate) mod ship;
+pub(crate) mod sovereignty;
 mod settings_sharing;
+pub(crate) mod skill_plans;
 pub(crate) mod skills;
 pub(crate) mod standings;
 mod slash;
@@ -72,30 +82,36 @@ mod sql_pattern;
 mod station;
 pub(crate) mod subscriptions;
 mod store;
+mod structure_directory;
 pub(crate) mod trade;
 mod universe;
 pub(crate) mod wallets;
 pub(crate) mod wars;
+mod world_tasks;
+pub(crate) mod ship_adaption;
 
 pub(crate) use combat::recover_pending_reloads;
 pub use exploration::unbury_sites;
 
 pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
     let game = crate::config::game();
-    use crate::scheduler::{periodic, MARKET, CONTRACTS, BILLS, MINING_LEDGER, MAP_HISTORY};
+    use crate::scheduler::{periodic, MARKET, CONTRACTS, BILLS, MINING_LEDGER, MINING_PROGRESS, MAP_HISTORY};
     vec![
-        periodic(MARKET, market::expire_orders, game.market.maintenance_secs as u64),
+        periodic(MARKET, market::lifecycle::expire_orders, game.market.maintenance_secs as u64),
         periodic(CONTRACTS, contracts::settle_auctions, game.contracts.maintenance_secs as u64),
         periodic(BILLS, bills::run_billing, game.corporations.bills_maintenance_secs as u64),
         periodic(MINING_LEDGER, mining::retention::handle, game.mining.ledger_maintenance_secs as u64),
+        periodic(MINING_PROGRESS, mining::progress::handle, game.mining.progress_aggregation_secs as u64),
         periodic(MAP_HISTORY, map::retention::handle, game.map.maintenance_secs as u64),
         trade::timeout_registration(),
         crate::scheduler::register(bounty::kill_rights::EXPIRY_KIND, bounty::kill_rights::expire),
         crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
         crate::scheduler::register(skills::completion::KIND, skills::completion::handle),
+        crate::scheduler::register(skill_plans::recovery::KIND, skill_plans::recovery::handle),
         crate::scheduler::register(industry::completion::KIND, industry::completion::handle),
         crate::scheduler::register(chat::expiry::KIND, chat::expiry::handle),
         crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
+        crate::scheduler::register(corps::pending_kicks::KIND, corps::pending_kicks::handle),
         crate::scheduler::register(corps::vote_close::KIND, corps::vote_close::handle),
         crate::scheduler::register(subscriptions::deadlines::KIND, subscriptions::deadlines::handle),
         crate::scheduler::register(ship_cosmetics_mgr::expiry::KIND, ship_cosmetics_mgr::expiry::handle),
@@ -104,10 +120,10 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
 }
 
 use crate::client::{short, Client};
-use crate::consts::GROUP_PLANET;
+use infinity_core::consts::GROUP_PLANET;
 use marshal::{DbRowDescriptor, DbType, Value};
 use crate::db::executor::Executor;
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::space::V3;
 use tracing::warn;
@@ -125,7 +141,9 @@ const SITE_DIRECTION_EPSILON: f64 = 1e-9;
 pub async fn ship_destroyed(c: &mut Client, args: &[Value]) {
     let n = |i: usize| args.get(i).and_then(|v| v.as_float()).unwrap_or(0.0);
     let ship = args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    if let Err(CallError::Internal(e)) = ship::lose_ship(c, ship, [n(1), n(2), n(3)]).await {
+    let Some(capsule) = args.get(4).and_then(Value::as_int) else { return };
+    let home = args.get(5).and_then(Value::as_int).zip(args.get(6).and_then(Value::as_int)).zip(args.get(7).and_then(Value::as_int)).zip(args.get(8).and_then(Value::as_int)).map(|(((a, b), c), d)| (a, b, c, d));
+    if let Err(CallError::Internal(e)) = ship::lose_ship(c, ship, capsule, home, [n(1), n(2), n(3)]).await {
         warn!(user = c.login.user_id, "ejecting from {ship} failed: {e:#}");
     }
 }
@@ -237,11 +255,9 @@ pub fn value_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
     }
 }
 
-/// Accept a member of `corp_id` with any role in `role_mask` or who is its CEO.
-/// Membership and CEO lookup errors propagate; the CEO is queried only if needed.
+/// Check current global corporation roles against authoritative membership.
 pub(super) async fn has_role_or_is_ceo(db: &(impl Executor + ?Sized), char_id: i64, corp_id: i64, role_mask: i64) -> Result<bool, CallError> {
-    let (my_corp, roles) = corps::membership(db, char_id).await?;
-    Ok(my_corp == corp_id && (roles & role_mask != 0 || corps::ceo_of(db, corp_id).await? == Some(char_id)))
+    corps::permissions::has(db, char_id, corp_id, role_mask).await
 }
 
 
@@ -291,6 +307,7 @@ pub fn crowset(header: &DbRowDescriptor, rows: Vec<Value>) -> Value {
 }
 
 /// Columns of an inventory row (invbroker.GetItemDescriptor).
+/// Category IDs use I4 because real SDE categories can exceed the I1 range.
 pub fn item_descriptor() -> DbRowDescriptor {
     DbRowDescriptor::new([
         ("itemID", DbType::I8),
@@ -298,9 +315,9 @@ pub fn item_descriptor() -> DbRowDescriptor {
         ("ownerID", DbType::I4),
         ("locationID", DbType::I8),
         ("flagID", DbType::I2),
-        ("quantity", DbType::I4),
+        ("quantity", DbType::I8),
         ("groupID", DbType::I2),
-        ("categoryID", DbType::I1),
+        ("categoryID", DbType::I4),
         ("customInfo", DbType::Str),
     ])
     .with_virtual([("stacksize", "eve.common.script.sys.eveCfg.StackSize"), ("singleton", "eve.common.script.sys.eveCfg.Singleton")])
@@ -321,9 +338,16 @@ async fn bind_object(c: &mut Client, call: &Call<'_>) -> CallResult {
     if call.service == "beyonce" {
         ship::send_state(c).await?;
         if let (Some(char_id), Some(system_id)) = (c.session.int("charid"), c.session.int("solarsystemid")) {
-            let mut outbox = crate::db::outbox::Outbox::default();
-            outbox.event(crate::lua::events::GameEvent::BallparkBound { char_id, system_id });
-            crate::db::outbox::dispatch_client((), outbox, c)?;
+            let world = c.world.clone();
+            if let Err(error) = c.db.transaction(
+                |_, outbox: &mut crate::db::outbox::Outbox| Box::pin(async move {
+                    outbox.event(crate::lua::events::GameEvent::BallparkBound { char_id, system_id });
+                    Ok::<_, CallError>(())
+                }),
+                |value, outbox| async move { crate::db::outbox::dispatch_world(value, outbox, &world) },
+            ).await {
+                tracing::warn!(?error, char_id, system_id, "ballpark bind event dispatch failed");
+            }
         }
     }
     Ok(Value::tuple([object, ret]))
@@ -333,12 +357,17 @@ pub(crate) fn lua_fixed_claimed(call: &Call<'_>) -> bool { fixed::root(call).is_
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     // What the retail server answered for this build, where the client cached it.
-    if let Some(v) = crate::retail::cached_call(call.service, call.method, call.args) {
-        return Ok(v);
+    if !crate::lua::sovereignty_claimed(call) {
+        if let Some(v) = crate::retail::cached_call(call.service, call.method, call.args) {
+            return Ok(v);
+        }
     }
     if call.method != "MachoResolveObject" && call.method != "MachoBindObject" {
         if crate::lua::enabled() {
             if let Some(reply) = crate::lua::dispatch(c, call).await { return reply; }
+        }
+        if crate::lua::sovereignty_claimed(call) {
+            return Err(CallError::Internal(anyhow::anyhow!("sovereignty content unavailable")));
         }
         if let Some(reply) = fixed::root(call) { return reply; }
         if let Some(reply) = chat::root(c, call).await { return reply; }
@@ -361,7 +390,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         ("dogmaIM", _) => dogma::dispatch(c, call).await,
 
         _ => {
+            if let Some(r) = world_tasks::dispatch(c, call) { return r; }
+            if let Some(r) = ship_adaption::dispatch(c, call).await { return r; }
+            if let Some(r) = amplification_matrix::dispatch(c, call) { return r; }
+            if let Some(r) = brawl::dispatch(c, call) { return r; }
             if let Some(r) = bannedwords::dispatch(call) { return r; }
+            if let Some(r) = planet_mgr::dispatch(c, call) { return r; }
             if let Some(r) = ship_cosmetics_mgr::dispatch(c, call).await { return r; }
             if let Some(r) = crates::dispatch(c, call).await { return r; }
             if let Some(r) = alert::dispatch(c, call).await { return r; }
@@ -408,7 +442,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = orgs::dispatch(c, call).await {
                 return r;
             }
-            if let Some(r) = corpwallet::dispatch(c, call).await {
+            if let Some(r) = account::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = offices::dispatch(c, call).await {
@@ -495,6 +529,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             }
             if let Some(r) = fixed::social_early(call) { return r; }
             if let Some(r) = map::dispatch(c, call).await { return r; }
+            if let Some(r) = structure_directory::dispatch(call) { return r; }
             if let Some(r) = universe::dispatch(c, call).await {
                 return r;
             }

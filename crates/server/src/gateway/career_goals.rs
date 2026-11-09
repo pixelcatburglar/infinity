@@ -5,7 +5,8 @@
 use anyhow::Result;
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, ReflectMessage, Value as PV};
-use super::message::{UUID_LEN, UUID_VERSION_INDEX, UUID_VERSION_V4, UUID_VARIANT_INDEX, UUID_VARIANT_RFC4122, child, set, response_for};
+use infinity_core::consts::UUID_LEN;
+use super::message::{UUID_VERSION_INDEX, UUID_VERSION_V4, UUID_VARIANT_INDEX, UUID_VARIANT_RFC4122, child, set, response_for};
 
 /// eve_public.career.goal.Attributes.Career for the four career paths.
 const CAREERS: [i32; 4] = [1, 2, 3, 4];

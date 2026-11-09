@@ -15,18 +15,19 @@ async fn capacity_reply_counts_packaged_and_assembled_rifters() {
             let sde = sde.clone();
             Box::pin(async move {
                 let parent = crate::dao::items::transfers::insert(tx, hold_type, 1, 1, FLAG_CARGO, 1).await.map_err(db_err)?;
-                let empty = item_capacity_reply(tx, &sde, parent).await?;
+                let expected = crate::services::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::Id(parent)).await.map_err(db_err)?.pop().unwrap();
+                let empty = item_capacity_reply(tx, &sde, parent, Some(&expected)).await?;
                 assert_eq!(empty, keyval([("capacity", Value::Float(5000.0)), ("used", Value::Float(0.0))]));
                 let child = crate::dao::items::transfers::insert(tx, 587, 1, parent, FLAG_CARGO, 2).await.map_err(db_err)?;
-                let packaged = item_capacity_reply(tx, &sde, parent).await?;
+                let packaged = item_capacity_reply(tx, &sde, parent, Some(&expected)).await?;
                 assert_eq!(packaged, keyval([("capacity", Value::Float(5000.0)), ("used", Value::Float(5000.0))]));
                 tx.execute("UPDATE game.items SET singleton = true, quantity = 1 WHERE item_id = $1", &[&child]).await.unwrap();
-                let assembled = item_capacity_reply(tx, &sde, parent).await?;
+                let assembled = item_capacity_reply(tx, &sde, parent, Some(&expected)).await?;
                 assert_eq!(assembled, keyval([("capacity", Value::Float(5000.0)), ("used", Value::Float(assembled_volume))]));
                 let missing = crate::dao::items::transfers::insert(tx, i32::MAX, 1, parent, FLAG_CARGO, 1).await.map_err(db_err)?;
-                assert!(matches!(item_capacity_reply(tx, &sde, parent).await, Err(CallError::Internal(error)) if error.to_string() == "missing SDE type 2147483647"));
+                assert!(matches!(item_capacity_reply(tx, &sde, parent, Some(&expected)).await, Err(CallError::Internal(error)) if error.to_string() == "missing SDE type 2147483647"));
                 tx.execute("DELETE FROM game.items WHERE item_id = $1", &[&missing]).await.unwrap();
-                assert_eq!(item_capacity_reply(tx, &sde, i64::MAX).await?, keyval([("capacity", Value::Float(0.0)), ("used", Value::Float(0.0))]));
+                assert_eq!(item_capacity_reply(tx, &sde, i64::MAX, None).await?, keyval([("capacity", Value::Float(0.0)), ("used", Value::Float(0.0))]));
                 Err(CallError::Internal(anyhow::anyhow!("rollback test fixtures")))
             })
         },

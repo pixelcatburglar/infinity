@@ -115,3 +115,6 @@ async fn finish(db: &Db, settings: &SchedulerConfig, active: &mut HashMap<Id, Ac
     };
     match updated { Ok(0) => debug!(job = %claim.id, "stale scheduler outcome"), Err(error) => warn!(job = %claim.id, "scheduler outcome write failed: {error}"), _ => () }
 }
+
+#[cfg(test)]
+mod tests;

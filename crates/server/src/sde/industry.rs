@@ -20,6 +20,7 @@ pub(crate) struct Activity {
     pub max_production_limit: i32,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Industry {
     activities: HashMap<(i32, i32), Activity>,
     operations: HashMap<i64, Vec<i32>>,

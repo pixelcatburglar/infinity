@@ -16,8 +16,8 @@ impl Item {
         Self { item_id: row.get("item_id"), type_id: row.get("type_id"), owner_id: row.get("owner_id"), location_id: row.get("location_id"), flag_id: row.get("flag_id"), singleton: row.get("singleton") }
     }
 }
-/// Lock requested items, their containers, and directly fitted children in item ID order.
-pub(crate) async fn lock_items(ex: &(impl Executor + ?Sized), ids: &[i64], owner: i64) -> Result<Vec<Item>, Error> {
-    let rows = ex.query("SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE owner_id = $2 AND jump_clone_id IS NULL AND (item_id = ANY($1) OR location_id = ANY($1) OR item_id IN (SELECT location_id FROM game.items WHERE item_id = ANY($1) AND owner_id = $2 AND jump_clone_id IS NULL)) ORDER BY item_id FOR UPDATE", &[&ids, &owner]).await?;
+/// Read requested items, their containers, and directly fitted children without locking.
+pub(crate) async fn candidates(ex: &(impl Executor + ?Sized), ids: &[i64], owner: i64) -> Result<Vec<Item>, Error> {
+    let rows = ex.query("SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE owner_id = $2 AND jump_clone_id IS NULL AND (item_id = ANY($1) OR location_id = ANY($1) OR item_id IN (SELECT location_id FROM game.items WHERE item_id = ANY($1) AND owner_id = $2 AND jump_clone_id IS NULL)) ORDER BY item_id", &[&ids, &owner]).await?;
     Ok(rows.iter().map(Item::from_row).collect())
 }

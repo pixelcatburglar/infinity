@@ -1,8 +1,14 @@
 use std::{future::Future, task::Poll, time::Duration};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{Call, combat::ATTR_DAMAGE, drones::tests::fixture::Fixture,
-    effects::{propulsion, registry, EffectKind}, fit::{Fit, Key}}, space::drone::DroneOrder};
+use infinity_core::{
+    consts::{*, dogma::*},
+};
+use crate::{
+    services::{Call, combat::ATTR_DAMAGE, drones::tests::fixture::Fixture,
+    effects::{propulsion, registry, EffectKind}, fit::{Fit, Key}},
+    space::drone::DroneOrder,
+};
 
 async fn catch_scenario(future: impl Future<Output = Result<()>>) -> std::thread::Result<Result<()>> {
     let mut future = std::pin::pin!(future);

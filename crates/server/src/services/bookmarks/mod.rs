@@ -6,6 +6,7 @@ mod access;
 mod access_group_bookmark_mgr;
 pub(crate) mod beyonce;
 mod mutations;
+pub(crate) mod navigation;
 pub(crate) mod notifications;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -17,11 +18,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 
 use super::{db_err, keyval, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::TYPE_SOLAR_SYSTEM;
+use infinity_core::consts::TYPE_SOLAR_SYSTEM;
 use crate::dao::bookmarks as dao;
 use crate::db::executor::Executor;
 use crate::db::outbox::Outbox;
-use crate::messages;
+use infinity_core::messages;
 use marshal::Value;
 
 /// Server bookmark folder and memo name length limit, in characters.

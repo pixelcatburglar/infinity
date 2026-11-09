@@ -10,8 +10,6 @@ use std::collections::BTreeMap;
 
 /// Floating-point tolerance for normalized JSON probabilities in this server policy.
 const PROBABILITY_EPSILON: f64 = 1.0e-9;
-/// Maximum quantity represented by one game item row (`game.items.quantity`).
-const MAX_ITEM_QUANTITY: i64 = i32::MAX as i64;
 /// Client `raceFlags`: Amarr, Caldari, Gallente and Minmatar respectively.
 const RACE_AMARR: i32 = 4;
 const RACE_CALDARI: i32 = 1;
@@ -84,7 +82,6 @@ where F: FnMut(i32) -> bool {
         (None, Some(min), Some(max)) if min > 0 && min <= max => (min, max),
         _ => bail!("entry quantity must be a positive scalar or complete valid range"),
     };
-    if max > MAX_ITEM_QUANTITY { bail!("entry quantity exceeds i32 range"); }
     if let Some(probability) = raw.probability { if !probability.is_finite() || !(0.0..=1.0).contains(&probability) { bail!("entry probability must be finite and in [0,1]"); } }
     let race = raw.race.map(|r| match r.as_str() { "Amarr" => Ok(RACE_AMARR), "Caldari" => Ok(RACE_CALDARI), "Gallente" => Ok(RACE_GALLENTE), "Minmatar" => Ok(RACE_MINMATAR), _ => bail!("unknown race {r}"), }).transpose()?;
     Ok(Entry { type_id: raw.type_id, min, max, probability: raw.probability, race, soulbound: raw.soulbound.unwrap_or(false) })

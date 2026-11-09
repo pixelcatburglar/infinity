@@ -123,3 +123,36 @@ async fn fresh_login_profile_reloads_persisted_organization() {
     fixture::cleanup(&db, &[actor]).await;
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with initialized SDE"]
+async fn projected_headless_session_refreshes_existing_chat_profile() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let world = World::new(db.clone(), sde, 1);
+    let hub = Hub::new("chat.test", db, world.clone());
+    let id = 42;
+    let identity = crate::services::identity::Identity { char_id: id, corp_id: 11, ship_id: None, station_id: Some(60000001), system_id: Some(30000142) };
+    let old = infinity_core::session::OnlineSession { character_id: id, user_id: None, session_id: 0, ship_id: None,
+        station_id: Some(60000001), system_id: Some(30000142), corporation_id: Some(11), alliance_id: Some(14),
+        faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+    let (pilot_tx, _pilot_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::services::presence::online(&identity, &world, &hub, pilot_tx.clone(), None, old.clone());
+    hub.set_profile(id, "Headless", 1, 11, Some(14), None, 0);
+    let (observer_tx, mut observer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rooms = hub.rooms.lock().unwrap();
+    let occupants = rooms.entries.entry("help_zh@conference.chat.test".into()).or_default();
+    occupants.insert(id.to_string(), crate::chat::Occupant { full_jid: "42@chat.test/test".into(), tx: None, affiliation: "member".into(), role: "participant".into() });
+    occupants.insert("43".into(), crate::chat::Occupant { full_jid: "43@chat.test/test".into(), tx: Some(observer_tx), affiliation: "member".into(), role: "participant".into() });
+    drop(rooms);
+    let values = [("corpid", Value::Int(12)), ("allianceid", Value::Int(13)), ("rolesAtHQ", Value::Int(99))];
+    let mut current = old.clone();
+    assert!(current.apply_updates(values.iter().map(|(key, value)| (*key, value))));
+    crate::services::presence::online(&identity, &world, &hub, pilot_tx, Some(&old), current.clone());
+    assert_eq!(world.online_session(id), Some(current));
+    let profile = observer_rx.try_recv().unwrap();
+    assert!(profile.contains("corpid='12'") && profile.contains("allianceid='13'"), "{profile}");
+    let cached = hub.profile("42");
+    assert!(cached.contains("corpid='12'") && cached.contains("allianceid='13'"), "{cached}");
+}

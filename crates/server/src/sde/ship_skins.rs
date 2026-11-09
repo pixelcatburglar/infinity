@@ -23,6 +23,7 @@ pub(crate) struct License {
     pub is_single_use: bool,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct ShipSkins {
     skins: Vec<Skin>,
     licenses: Vec<License>,

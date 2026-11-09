@@ -36,7 +36,7 @@ async fn real_activation_draws_select_penalty_in_fit_and_brain_traversal() {
             let effect = c.sde.dogma.effect(effect_id).unwrap();
             if effect.effect_category.unwrap_or(0) != 0 { continue; }
             for modifier in effect.modifiers().iter().filter(|m| m.modified != m.modifying && m.op == 6 && m.domain == "shipID" && m.func == "ItemModifier") {
-                let Some(ship_type) = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_SHIP) && t.attribute(modifier.modified).is_some_and(|v| v.is_finite() && v != 0.0)).map(|t| t.type_id) else { continue };
+                let Some(ship_type) = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && t.attribute(modifier.modified).is_some_and(|v| v.is_finite() && v != 0.0)).map(|t| t.type_id) else { continue };
                 let ship_a = item(&db, selected.character, ship_type, STATION, 1).await;
                 let ship_b = item(&db, other.character, ship_type, STATION, 1).await;
                 for character in [selected.character, other.character] {

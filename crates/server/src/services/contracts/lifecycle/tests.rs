@@ -11,6 +11,7 @@ mod fees;
 mod volume;
 mod wrap;
 mod gm_expiry;
+mod mixed_ownership;
 
 
 #[test]

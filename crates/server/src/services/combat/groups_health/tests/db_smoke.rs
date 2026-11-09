@@ -1,7 +1,8 @@
 use super::*;
 use super::fixture;
 use std::sync::Arc;
-use crate::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP}, space::{Ball, World, WarpState, MODE_STOP}};
+use infinity_core::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP}};
+use crate::{space::{Ball, World, WarpState, MODE_STOP}};
 
 fn ball(id: i64, type_id: i32, pilot: Option<i64>) -> Ball {
     Ball {
@@ -11,11 +12,10 @@ fn ball(id: i64, type_id: i32, pilot: Option<i64>) -> Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
-
 fn check_notification(event: (String, Vec<Value>), pilot: i64, ship: i64, increase: bool) -> (f64, f64) {
     assert_eq!(event.0, "OnModuleAttributeChanges");
     let [Value::List(changes)] = event.1.as_slice() else { panic!("expected one attribute change list") };
@@ -26,92 +26,68 @@ fn check_notification(event: (String, Vec<Value>), pilot: i64, ship: i64, increa
     assert!(if increase { new > old } else { new < old });
     (*old, *new)
 }
-
-#[test]
-fn npc_take_replace_and_destroy_forget_combat_state_but_player_take_preserves_it() {
-    use crate::space::{NpcBrain, NpcConfig, System};
-    crate::tests::init_config();
-    let mut system = System::default();
-    let ids = [i64::MIN + 100, i64::MIN + 101, i64::MIN + 102, i64::MIN + 103];
-    for &id in &ids {
-        system.insert(ball(id, 1, None));
-        assert!(system.add_npc(id, NpcBrain::new(None, NpcConfig {
-            fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0,
-            scan_resolution: 1.0, repairs: (0.0, 0.0, 1.0),
-        }, Arc::new(|_| Box::pin(async {})))));
-    }
-    let player = i64::MIN + 104;
-    system.insert(ball(player, 1, Some(1)));
-    {
-        let mut st = state();
-        for id in ids.into_iter().chain([player]) {
-            st.capacitor.insert(id, (0.5, 0));
-            st.hp.insert(id, Hp { now: [0.5; 3], max: [1.0; 3], resonance: [[1.0; 4]; 3] });
-            st.condition.insert(id, Condition {
-                stats: ShipStats { max: [1.0; 3], resonance: [[1.0; 4]; 3], shield_tau_ms: 1.0 },
-                now: [0.5; 3], shield_at: 0,
-            });
-        }
-    }
-    system.take(ids[0]).unwrap();
-    system.insert(ball(ids[1], 1, None));
-    system.destroy_ball(ids[2]).unwrap();
-    system.remove_ball(ids[3]).unwrap();
-    system.take(player).unwrap();
-    let mut st = state();
-    for id in ids {
-        assert!(!st.capacitor.contains_key(&id));
-        assert!(!st.condition.contains_key(&id));
-        assert!(!st.hp.contains_key(&id));
-    }
-    assert!(st.capacitor.remove(&player).is_some());
-    assert!(st.condition.remove(&player).is_some());
-    assert!(st.hp.remove(&player).is_some());
-}
-
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
-async fn npc_damage_rechecks_replacements_and_applies_live_damage() {
+async fn actor_damage_keeps_checkpoint_unchanged_until_flush_and_records_positive_source() {
     crate::tests::init_config();
-    let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
-    let sde = crate::sde::Sde::load(&db).await.unwrap();
-    let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
-    let npc_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)).unwrap().type_id;
-    let mut system = crate::space::System::default();
-    let target = i64::MIN + 810;
-    for pilot in [Some(42), None] {
-        system.insert(ball(target, npc_type, None));
-        assert!(system.ball(target).unwrap().char_id.is_none());
-        system.take(target);
-        let replacement = ball(target, ship_type, pilot);
-        if pilot.is_some() { system.insert(replacement); } else { system.add_persistent_ship(replacement); }
-        let hp = Hp { now: [10.0; 3], max: [10.0; 3], resonance: [[1.0; 4]; 3] };
-        state().hp.insert(target, hp);
-        assert!(apply_npc_damage(&mut system, &sde, target, [100.0, 0.0, 0.0, 0.0], Some(9)).is_none());
-        assert_eq!(state().hp.remove(&target).unwrap().now, [10.0; 3]);
-        let current = system.ball(target).unwrap();
-        assert_eq!(current.char_id, pilot);
-        assert_eq!(current.health, [1.0; 3]);
-    }
-    system.insert(ball(target, npc_type, None));
-    state().hp.insert(target, Hp { now: [10.0; 3], max: [10.0; 3], resonance: [[1.0; 4]; 3] });
-    assert!(matches!(apply_npc_damage(&mut system, &sde, target, [5.0, 0.0, 0.0, 0.0], None),
-        Some(NpcDamage::Applied { dealt: 5.0, destroyed: None, .. })));
-    assert_eq!(system.ball(target).unwrap().health, [0.5, 1.0, 1.0]);
-    assert!(matches!(apply_npc_damage(&mut system, &sde, target, [30.0, 0.0, 0.0, 0.0], None),
-        Some(NpcDamage::Applied { destroyed: Some(_), .. })));
-    assert!(!system.contains(target));
-    assert!(!state().hp.contains_key(&target));
-
-    let spec = crate::space::drone::DroneSpec { type_id: npc_type, bandwidth: 1.0, scan_resolution: 1.0,
-        control_range: 1.0, max_target_range: 1.0, optimal_range: 1.0, orbit_range: 1.0,
-        duration_ms: 1.0, effect_id: None };
-    system.restore_drone(ball(target, npc_type, None), spec, Arc::new(|_| Box::pin(async {})));
-    assert!(matches!(apply_npc_damage(&mut system, &sde, target, [100.0, 0.0, 0.0, 0.0], None),
-        Some(NpcDamage::Drone { .. })));
-    assert!(system.contains(target));
-    assert!(!state().hp.contains_key(&target));
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)
+        && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|value| value > 0.0))
+        .expect("SDE must contain a ship with structure").type_id;
+    let system = 1;
+    let f = fixture::create(&db, ship_type, system).await.unwrap();
+    db.execute("UPDATE game.characters SET ship_id=$2, solar_system_id=$3, station_id=NULL WHERE character_id=$1",
+        &[&f.character, &f.ship, &system]).await.unwrap();
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let test_world = world.clone();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+    test_world.system(system).await.unwrap();
+    let row = crate::dao::items::space_ships::FreeShip {
+        item_id: f.ship, type_id: ship_type, owner_id: f.character,
+        corporation_id: 1, alliance_id: -1, pos: [0.0; 3],
+    };
+    let prepared = crate::services::ship::balls::piloted(&test_db, sde, &row, f.character, 0.0).await.ok().expect("prepare pilot ship");
+    test_world.with(system, move |s| prepared.install(s, |s, b| s.add_persistent_ship(b))).await.unwrap();
+    let world = test_world;
+    let db = test_db;
+    let before = crate::dao::items::dogma::overrides(&db, f.ship).await.unwrap();
+    let generation = crate::space::targeting::next_generation();
+    let weak = Arc::downgrade(&world);
+    let mut attempt = world.with(system, move |s| {
+        let facts = s.prepare_combat_source(f.ship, None, None, Some(ship_type),
+            crate::lua::events::resources::FactOrigin::Natural, generation, 1, 1,
+            move |s| s.pilot_ball(f.character).is_some_and(|ball| ball.id == f.ship)).unwrap();
+        crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system)
+    }).await.unwrap();
+    let source = crate::services::combat::damage::DamageSource {
+        attacker_id: Some(f.character), source_ship_id: Some(f.ship),
+        source_ship_type: Some(ship_type), weapon_type_id: Some(ship_type),
+        facts: Some(attempt.facts()), illegal: true, ..Default::default()
+    };
+    let outcome = crate::services::combat::damage::apply_damage_guarded(&db, &world, system, f.ship, [1.0, 0.0, 0.0, 0.0], source, false, |_| true).await.unwrap().unwrap();
+    attempt.disarm();
+    assert!(outcome.dealt > 0.0);
+    let snapshot = world.with(system, move |s| s.combat_condition_snapshot(f.ship).unwrap()).await.unwrap();
+    assert_eq!(snapshot.contributions.len(), 1);
+    assert!(snapshot.contributions[0].illegal);
+    let during = crate::dao::items::dogma::overrides(&db, f.ship).await.unwrap();
+    let values = |rows: &[crate::dao::items::dogma::AttributeOverride]| rows.iter().map(|row| (row.attribute_id, row.value, row.updated_at)).collect::<Vec<_>>();
+    assert_eq!(values(&during), values(&before));
+    world.flush_positions().await.unwrap();
+    let after = crate::dao::items::dogma::overrides(&db, f.ship).await.unwrap();
+    assert_ne!(values(&after), values(&before));
+    }).await;
+    world.remove_ball(system, f.ship).await;
+    world.flush_positions().await.unwrap();
+    db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&f.character]).await.unwrap();
+    fixture::cleanup(&db, f).await.unwrap();
+    result.unwrap();
 }
+
+
+
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -180,7 +156,7 @@ async fn capacitor_db_smoke() {
     }).await;
     world.remove_ball(system, fixture.ship).await;
     world.remove_ball(system, npc).await;
-    world.unregister_pilot(fixture.character);
+    world.unregister_pilot_generation(fixture.character, None);
     let flush = world.flush_positions().await;
     { let mut state = state(); state.capacitor.remove(&fixture.ship); state.capacitor.remove(&npc); }
     drop(world);
@@ -200,22 +176,29 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
     let f = Fixture::new().await;
     let system = f.system;
     let owner = f.owner;
-    let npc = -f.ship;
-    let other = npc - 1;
+    let npc = 9_000_000_000_000_i64 + f.ship;
+    let ship = f.ship;
+    let pilot = f.world.ball(system, ship).await.unwrap();
+    let ship_type = f.sde.types.get(pilot.type_id).unwrap().type_id;
+    let other = crate::dao::items::creation::positioned(&f.db, ship_type, owner, system, [0.0; 3]).await.unwrap();
     let npc_type = f.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)
         && t.attribute(ATTR_ENTITY_KILL_BOUNTY).is_some_and(|v| v > 0.0)
         && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0)
         && t.group_id.and_then(|group| f.sde.wrecks.get(group, t.race_id.unwrap_or(0))).is_some())
         .expect("bounty-bearing NPC with wreck").type_id;
     let drone_type = f.sde.types.iter().find(|t| t.published == Some(true)
-        && t.category_id == Some(crate::consts::CATEGORY_DRONE)
+        && t.category_id == Some(infinity_core::consts::CATEGORY_DRONE)
         && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0))
         .expect("published drone with structure").type_id;
     let drone = f.drone(drone_type, 1, true).await;
     let marker = map_telemetry::next_occurrence(&f.db).await.unwrap();
     let start = filetime_now();
-    let world2 = World::new(f.db.clone(), f.sde.clone(), 1);
-    let (db, world, second) = (f.db.clone(), f.world.clone(), world2.clone());
+    let db = f.db.clone();
+    let sde = f.sde.clone();
+    let world2 = World::new(db.clone(), sde.clone(), 1);
+    let (world, second) = (f.world.clone(), world2.clone());
+    let self_kill_events = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let captured = self_kill_events.clone();
     let result = tokio::spawn(async move {
         let add_npc = |world: Arc<World>, id| async move {
             let mut b = ball(id, npc_type, None);
@@ -224,22 +207,55 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
             assert!(world.with(system, move |s| s.add_npc(id, NpcBrain::new(None, NpcConfig {
                 fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0,
                 scan_resolution: 1.0, repairs: (0.0, 0.0, 1.0),
-            }, Arc::new(|_| Box::pin(async {}))))).await.unwrap());
+            }, Arc::new(|_, _| Some(Box::pin(async {})))))).await.unwrap());
         };
         let events = || async {
             db.query("SELECT source_id, solar_system_id, kind FROM game.map_events WHERE source=$1 AND source_id>$2 AND solar_system_id=$3 ORDER BY source_id",
                 &[&(EventSource::NpcOccurrence as i16), &marker, &system]).await.unwrap()
         };
+        let player_source = |world: Arc<World>| async move {
+            let weak = Arc::downgrade(&world);
+            let generation = crate::space::targeting::next_generation();
+            world.with(system, move |s| {
+                let facts = s.prepare_combat_source(ship, None, None, None, crate::lua::events::resources::FactOrigin::Natural,
+                    generation, 1, 1, move |s| s.pilot_ball(owner).is_some_and(|ball| ball.id == ship)).unwrap();
+                crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system)
+            }).await.unwrap()
+        };
         add_npc(world.clone(), npc).await;
-        damage(&db, &world, system, npc, [1e30; 4], None, None).await.ok().unwrap();
+        let weak = Arc::downgrade(&world);
+        let mut attempt = world.with(system, move |s| {
+            let facts = s.prepare_body_combat_source(npc, None, None, None,
+                crate::lua::events::resources::FactOrigin::Natural, move |s| s.is_npc(npc)).unwrap();
+            crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system)
+        }).await.unwrap();
+        crate::services::combat::damage::apply_damage_guarded(&db, &world, system, npc, [1e30; 4], crate::services::combat::damage::DamageSource {
+            facts: Some(attempt.facts()), ..Default::default()
+        }, false, |_| true).await.unwrap().unwrap();
+        attempt.disarm();
+        let rows = db.query("SELECT event_id::text AS id, kind FROM game.progress_events WHERE subject_character_id IS NULL AND ((kind='DamageApplied' AND (payload->'DamageApplied'->'source'->>'item_id')::bigint=$1 AND (payload->'DamageApplied'->'target'->>'item_id')::bigint=$1 AND payload->'DamageApplied'->'source'->'incarnation'=payload->'DamageApplied'->'target'->'incarnation' AND (payload->'DamageApplied'->'context'->>'system_id')::bigint=$2) OR (kind='NpcDestroyed' AND (payload->'NpcDestroyed'->'npc'->>'item_id')::bigint=$1 AND (payload->'NpcDestroyed'->>'system_id')::bigint=$2))",
+            &[&npc, &system]).await.unwrap();
+        let owned: Vec<(String, String)> = rows.iter().map(|row| (row.get("id"), row.get("kind"))).collect();
+        *captured.lock().unwrap() = owned.clone();
+        assert_eq!(owned.iter().filter(|(_, kind)| kind == "NpcDestroyed").count(), 1);
+        assert!(owned.iter().any(|(_, kind)| kind == "DamageApplied"));
         assert!(world.ball(system, npc).await.is_none());
         assert_eq!(events().await.len(), 1);
-        assert_eq!(damage(&db, &world, system, npc, [1e30, 0.0, 0.0, 0.0], None, None).await.ok().unwrap(), 0.0);
+        assert!(crate::services::combat::damage::apply_damage_guarded(&db, &world, system, npc, [1e30, 0.0, 0.0, 0.0], Default::default(), false, |_| true).await.unwrap().is_none());
         assert_eq!(events().await.len(), 1);
 
         let balance = crate::dao::wallets::characters::balance(&db, owner).await.unwrap();
+        second.add_ship(system, pilot).await.unwrap();
+        let fit = Fit::load(&db, sde.clone(), owner, ship).await.ok().expect("load pilot fit");
+        let condition = crate::services::combat::prepare_condition_with_fit(&db, ship, &fit).await.ok().expect("load pilot condition");
+        second.with(system, move |s| s.install_condition(ship, condition.into_condition(), fit)).await.unwrap();
         add_npc(second.clone(), npc).await;
-        damage(&db, &second, system, npc, [1e30; 4], Some(owner), None).await.ok().unwrap();
+        let mut attempt = player_source(second.clone()).await;
+        crate::services::combat::damage::apply_damage_guarded(&db, &second, system, npc, [1e30; 4], crate::services::combat::damage::DamageSource {
+            attacker_id: Some(owner), attacker_ball_id: Some(ship), source_ship_id: Some(ship),
+            source_ship_type: Some(ship_type), facts: Some(attempt.facts()), ..Default::default()
+        }, false, |_| true).await.unwrap().unwrap();
+        attempt.disarm();
         assert!(second.ball(system, npc).await.is_none());
         assert!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap() > balance);
         assert!(db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2 AND item_id<>$3",
@@ -253,11 +269,21 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         let row = history.iter().find(|row| row.solar_system_id == system).unwrap();
         assert_eq!((row.value1, row.value2, row.value3), (2, 2, 0));
 
-        let mut b = ball(other, npc_type, None);
-        b.owner_id = owner;
-        world.add_ship(system, b).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip {
+            item_id: other, type_id: ship_type, owner_id: owner,
+            corporation_id: 1, alliance_id: -1, pos: [0.0; 3],
+        };
+        let prepared = crate::services::ship::balls::unpiloted(&db, sde.clone(), &row).await.ok().expect("prepare unpiloted ship");
+        world.with(system, move |s| prepared.install(s, |s, b| s.add_persistent_ship(b))).await.unwrap();
+        assert!(world.with(system, move |s| s.persistent_generation(other).is_some()
+            && s.combat_membership_generation(other).is_some()).await.unwrap());
         assert!(!world.with(system, move |s| s.is_npc(other)).await.unwrap());
-        damage(&db, &world, system, other, [1e30; 4], None, None).await.ok().unwrap();
+        let mut attempt = player_source(world.clone()).await;
+        crate::services::combat::damage::apply_damage_guarded(&db, &world, system, other, [1e30; 4], crate::services::combat::damage::DamageSource {
+            attacker_id: Some(owner), attacker_ball_id: Some(ship), source_ship_id: Some(ship),
+            source_ship_type: Some(ship_type), facts: Some(attempt.facts()), ..Default::default()
+        }, false, |_| true).await.unwrap().unwrap();
+        attempt.disarm();
         assert!(world.ball(system, other).await.is_none());
         assert_eq!(events().await.len(), 2);
 
@@ -267,8 +293,16 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
             duration_ms: 1.0, effect_id: None };
         let mut b = ball(drone, drone_type, None);
         b.owner_id = owner;
-        world.with(system, move |s| s.restore_drone(b, spec, Arc::new(|_| Box::pin(async {})))).await.unwrap();
-        damage(&db, &world, system, drone, [1e30, 1e30, 1e30, 1e30], None, None).await.ok().unwrap();
+        let fit = Fit::for_space_type(sde.clone(), drone_type, Vec::new());
+        let condition = prepare_condition_with_fit_key(&db, drone, &fit, Key::Ship).await.unwrap();
+        let prepared = crate::space::drone::PreparedDrone { ball: b, spec, condition, fit, key: Key::Ship };
+        world.with(system, move |s| s.restore_drone(prepared, Arc::new(|_, _| Some(Box::pin(async {}))))).await.unwrap();
+        let mut attempt = player_source(world.clone()).await;
+        crate::services::combat::damage::apply_damage_guarded(&db, &world, system, drone, [1e30; 4], crate::services::combat::damage::DamageSource {
+            attacker_id: Some(owner), attacker_ball_id: Some(ship), source_ship_id: Some(ship),
+            source_ship_type: Some(ship_type), facts: Some(attempt.facts()), ..Default::default()
+        }, false, |_| true).await.unwrap().unwrap();
+        attempt.disarm();
         assert!(world.ball(system, drone).await.is_none());
         assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_none());
         assert_eq!(events().await.len(), 2);
@@ -279,6 +313,12 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
     world2.flush_positions().await.unwrap();
     f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id>$2 AND solar_system_id=$3",
         &[&(EventSource::NpcOccurrence as i16), &marker, &system]).await.unwrap();
+    f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id=$2",
+        &[&(EventSource::UnpilotedShip as i16), &other]).await.unwrap();
+    let ids: Vec<String> = self_kill_events.lock().unwrap().iter().map(|(id, _)| id.clone()).collect();
+    f.db.execute("DELETE FROM game.progress_deliveries WHERE event_id::text=ANY($1)", &[&ids]).await.unwrap();
+    let deleted = f.db.execute("DELETE FROM game.progress_events WHERE event_id::text=ANY($1)", &[&ids]).await.unwrap();
     f.cleanup().await;
+    assert_eq!(deleted as usize, ids.len(), "captured self-kill events were not all removed");
     result.unwrap();
 }

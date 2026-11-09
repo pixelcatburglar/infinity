@@ -2,7 +2,8 @@
 //! Membership follows `evetypes/__init__.py:GetTypeIDsFromTypeList`; other lists are not loaded.
 //! Startup fails if any requested trade, purchase or compressor list is missing.
 use std::collections::{HashMap, HashSet};
-use crate::{consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE}, dao::sde::typelists as dao, db::Db};
+use infinity_core::{consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE}};
+use crate::{dao::sde::typelists as dao, db::Db};
 use super::types::Types;
 
 /// inventoryrestrictions/common/checks.py: non-tradable type list.
@@ -16,6 +17,7 @@ const UNSTRIPPABLE_LIST: i64 = 338;
 /// Startup lists required by inventory restrictions and direct skill purchase availability.
 const REQUIRED_LISTS: [i64; 5] = [NON_TRADABLE_LIST, SOULBOUND_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE, UNTRASHABLE_LIST, UNSTRIPPABLE_LIST];
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct TypeLists(HashMap<i64, dao::TypeList>);
 
 impl TypeLists {

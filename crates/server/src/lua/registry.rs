@@ -27,6 +27,7 @@ pub struct Tick {
 #[derive(Default)]
 pub struct Claims {
     pub rpc: HashMap<(String, String), Handler>,
+    pub gateway: HashMap<String, Handler>,
     pub commands: HashMap<String, Command>,
     pub events: HashMap<String, Vec<Handler>>,
     pub intercepts: HashMap<(String, String), Handler>,
@@ -39,4 +40,5 @@ pub struct Registry {
     pub lua: Lua,
     pub overrides: Mutex<HashSet<(String, String)>>,
     pub claims: Claims,
+    pub(super) content: super::content::ContentDefinitions,
 }

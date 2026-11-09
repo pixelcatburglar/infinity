@@ -4,7 +4,7 @@
 //! and persistent site state are unsupported.
 use super::*;
 use crate::services::sql_pattern::matches_pattern;
-use crate::consts::CATEGORY_ENTITY;
+use infinity_core::consts::CATEGORY_ENTITY;
 use crate::sde::types::TypeData;
 
 struct Npc<'a> {

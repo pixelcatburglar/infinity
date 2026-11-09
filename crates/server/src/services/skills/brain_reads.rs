@@ -3,7 +3,7 @@
 //! Legacy boosters without timing metadata have no known expiry or duration.
 use super::{db_err, keyval, CallResult};
 use crate::client::{filetime_now, ms_from_filetime_ticks, Client};
-use crate::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
+use infinity_core::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
 use crate::dao::items::{brain, fit};
 use marshal::Value;
 

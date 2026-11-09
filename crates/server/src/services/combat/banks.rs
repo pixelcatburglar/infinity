@@ -8,11 +8,18 @@
 //! Membership persists; runtime cycles are not persisted or resumed after restart.
 //! Bank mutation and activation are serialized by the single live session in one server process.
 use super::*;
-use crate::consts::{CATEGORY_MODULE, CATEGORY_SHIP, GROUPABLE_GROUP_IDS};
+use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, GROUPABLE_GROUP_IDS};
 use crate::dao::items::{charges, combat, dogma, pending_reloads, ship as ship_dao};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::services) enum Operation {
+    LinkWeapons, LinkAllWeapons, UnlinkModule, UnlinkAllModules,
+    MergeModuleGroups, PeelAndLink, DestroyWeaponBank, GetWeaponBankInfoForShip,
+}
 
 /// A captured activation generation, stopped only after the transaction commits.
 pub(in crate::services) struct BankStop(Arc<AtomicBool>);
+crate::progress::leaf_effect!(BankStop);
 
 pub(in crate::services) fn apply_stop(stop: BankStop) {
     crate::services::effects::lifecycle::stop_generation(&stop.0);
@@ -59,7 +66,6 @@ pub(in crate::services) fn dispatch<T>(value: T, outbox: Outbox<BankStop>, c: &m
         match entry {
             crate::db::outbox::Effect::Operation(stop) => apply_stop(stop),
             crate::db::outbox::Effect::Notification(n) => n.dispatch(&world, Some(&mut *c))?,
-            crate::db::outbox::Effect::Event(e) => crate::lua::on_event(e),
         }
     }
     Ok(value)
@@ -69,18 +75,18 @@ pub(in crate::services) fn dispatch<T>(value: T, outbox: Outbox<BankStop>, c: &m
 struct Module {
     item: Item,
     online: bool,
-    charge: Option<(i32, i64)>,
+    charge: Option<(i32, i128)>,
 }
 
-fn effective_charge(current: Option<(i32, i32)>, pending: Option<(i32, i32)>) -> Option<(i32, i64)> {
+fn effective_charge(current: Option<(i32, i64)>, pending: Option<(i32, i64)>) -> Option<(i32, i128)> {
     let current = current.filter(|(_, quantity)| *quantity > 0);
     match pending {
         Some((kind, reserved)) => {
-            let have = current.filter(|(current_kind, _)| *current_kind == kind).map_or(0, |(_, quantity)| i64::from(quantity));
-            let quantity = have + i64::from(reserved);
+            let have = current.filter(|(current_kind, _)| *current_kind == kind).map_or(0, |(_, quantity)| i128::from(quantity));
+            let quantity = have + i128::from(reserved);
             (quantity > 0).then_some((kind, quantity))
         }
-        None => current.map(|(kind, quantity)| (kind, i64::from(quantity))),
+        None => current.map(|(kind, quantity)| (kind, i128::from(quantity))),
     }
 }
 
@@ -115,7 +121,7 @@ fn module(items: &[Module], id: i64) -> Result<&Module, CallError> {
 }
 
 fn grouped(items: &[Module], rows: &[charges::Bank]) -> Result<Vec<(i64, Vec<i64>)>, CallError> {
-    let mut groups: BTreeMap<(i32, Option<(i32, i64)>), Vec<&Module>> = BTreeMap::new();
+    let mut groups: BTreeMap<(i32, Option<(i32, i128)>), Vec<&Module>> = BTreeMap::new();
     for m in items.iter().filter(|m| GROUPABLE_GROUP_IDS.contains(&m.item.group_id)) {
         if !m.online { return Err(user_error(messages::MSG_CANT_LINK_MODULE_NOT_ONLINE, vec![])); }
         groups.entry((m.item.type_id, m.charge)).or_default().push(m);
@@ -127,31 +133,31 @@ fn grouped(items: &[Module], rows: &[charges::Bank]) -> Result<Vec<(i64, Vec<i64
     }).collect())
 }
 
-async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<BankStop>, ship: i64, owner: i64, method: &str, first: i64, second: i64) -> CallResult {
+async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<BankStop>, ship: i64, owner: i64, method: Operation, first: i64, second: i64) -> CallResult {
     if !ship_dao::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(notify_error(messages::combat::NOT_YOUR_SHIP)); }
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next();
     if !hull.is_some_and(|h| h.owner_id == owner && h.category_id == i64::from(CATEGORY_SHIP)) {
         return Err(notify_error(messages::combat::NOT_YOUR_SHIP));
     }
-    if method == "GetWeaponBankInfoForShip" { return banks(ex, ship).await; }
-    let extra: Vec<_> = if method == "LinkAllWeapons" {
+    if method == Operation::GetWeaponBankInfoForShip { return banks(ex, ship).await; }
+    let extra: Vec<_> = if method == Operation::LinkAllWeapons {
         load_items(ex, sde, ItemQuery::LocationOwner(ship, owner)).await.map_err(db_err)?.into_iter().map(|i| i.item_id).collect()
     } else { vec![first, second] };
     let before = snapshot(ex, ship, &extra).await?;
     let result = match method {
-        "UnlinkAllModules" => { combat::clear_banks(ex, ship).await.map_err(db_err)?; Ok(Value::None) }
-        "DestroyWeaponBank" => {
+        Operation::UnlinkAllModules => { combat::clear_banks(ex, ship).await.map_err(db_err)?; Ok(Value::None) }
+        Operation::DestroyWeaponBank => {
             let master = charges::bank_of(ex, ship, first).await.map_err(db_err)?;
             combat::destroy(ex, ship, master).await.map_err(db_err)?;
             Ok(Value::None)
         }
-        "UnlinkModule" => {
+        Operation::UnlinkModule => {
             let master = charges::bank_of(ex, ship, first).await.map_err(db_err)?;
             let peeled = combat::peel_first(ex, ship, master).await.map_err(db_err)?
                 .ok_or_else(|| notify_error(messages::combat::BANK_NOT_FOUND))?;
             Ok(Value::Int(peeled))
         }
-        "LinkAllWeapons" => {
+        Operation::LinkAllWeapons => {
             let items = modules(ex, sde, ship, owner).await?;
             let rows = charges::banks(ex, ship).await.map_err(db_err)?;
             let groups = grouped(&items, &rows)?;
@@ -159,19 +165,19 @@ async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox
             for (master, slaves) in groups { for slave in slaves { combat::move_bank(ex, ship, master, slave).await.map_err(db_err)?; } }
             banks(ex, ship).await
         }
-        "LinkWeapons" | "MergeModuleGroups" | "PeelAndLink" => {
+        Operation::LinkWeapons | Operation::MergeModuleGroups | Operation::PeelAndLink => {
             let target = charges::bank_of(ex, ship, first).await.map_err(db_err)?;
             let source = charges::bank_of(ex, ship, second).await.map_err(db_err)?;
             if target == source { return banks(ex, ship).await; }
             let items = modules(ex, sde, ship, owner).await?;
             let a = module(&items, target)?;
             let slaves = charges::slaves(ex, ship, source).await.map_err(db_err)?;
-            if method == "PeelAndLink" {
+            if method == Operation::PeelAndLink {
                 let Some(slave) = slaves.first() else { return banks(ex, ship).await; };
                 validate_pair(a, module(&items, slave.slave_id)?)?;
                 combat::remove_slave(ex, ship, slave.slave_id).await.map_err(db_err)?;
                 combat::move_bank(ex, ship, target, slave.slave_id).await.map_err(db_err)?;
-            } else if method == "LinkWeapons" && source != second {
+            } else if method == Operation::LinkWeapons && source != second {
                 validate_pair(a, module(&items, second)?)?;
                 combat::remove_slave(ex, ship, second).await.map_err(db_err)?;
                 combat::move_bank(ex, ship, target, second).await.map_err(db_err)?;
@@ -182,7 +188,7 @@ async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox
             }
             banks(ex, ship).await
         }
-        _ => unreachable!(),
+        Operation::GetWeaponBankInfoForShip => unreachable!(),
     }?;
     for stop in changes(ex, ship, before).await? { outbox.operation(stop); }
     Ok(result)
@@ -192,18 +198,16 @@ fn authorize_ship(requested: Option<i64>, active: Option<i64>) -> Result<i64, Ca
     requested.filter(|ship| Some(*ship) == active).ok_or_else(|| notify_error(messages::combat::NOT_YOUR_SHIP))
 }
 
-pub(super) async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
+pub(in crate::services) async fn weapon_groups(c: &mut Client, call: &Call<'_>, method: Operation) -> CallResult {
     let ship = authorize_ship(call.args.first().and_then(|v| v.as_int()), c.session.int("shipid"))?;
     let owner = c.session.int("charid").ok_or_else(|| notify_error(messages::combat::NOT_YOUR_SHIP))?;
     let first = call.args.get(1).and_then(|v| v.as_int()).unwrap_or_default();
     let second = call.args.get(2).and_then(|v| v.as_int()).unwrap_or_default();
-    let method = call.method.to_owned();
     let sde = c.sde.clone();
     let db = c.db.clone();
     db.transaction(|tx, outbox: &mut Outbox<BankStop>| {
         let sde = sde.clone();
-        let method = method.clone();
-        Box::pin(async move { operation(tx, &sde, outbox, ship, owner, &method, first, second).await })
+        Box::pin(async move { operation(tx, &sde, outbox, ship, owner, method, first, second).await })
     }, |value, outbox| async move { dispatch(value, outbox, c) }).await
 }
 

@@ -1,6 +1,7 @@
 //! Persisted weapon-bank burnout through real activation and heat injury.
 use super::*;
-use crate::{consts::{dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS}, dao::items::{charges, combat as item_combat}, services::{combat::targeting_charges::{add_target_ctx, clear_locks_on, loaded, targets_of}, effects::EffectKind}};
+use infinity_core::{consts::{dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS}};
+use crate::{dao::items::{charges, combat as item_combat}, services::{combat::targeting_charges::{add_target_ctx, clear_locks_on, loaded, targets_of}, effects::EffectKind}};
 
 /// SDE high-slot heat capacity and attenuation attributes.
 const HIGH_CAPACITY: i32 = 1178;
@@ -29,7 +30,7 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
             let groups: Vec<_> = ["chargeGroup1", "chargeGroup2", "chargeGroup3", "chargeGroup4", "chargeGroup5"].iter()
                 .flat_map(|name| sde.dogma.attributes_by_name(name)).filter_map(|a| m.attribute(a.attribute_id)).collect();
             let module_size = size.and_then(|id| m.attribute(id));
-            let capacity = m.capacity.or_else(|| m.attribute(crate::consts::dogma::ATTR_CAPACITY))?;
+            let capacity = m.capacity.or_else(|| m.attribute(infinity_core::consts::dogma::ATTR_CAPACITY))?;
             let ammo = sde.types.iter().find(|c| c.published == Some(true) && c.category_id == Some(CATEGORY_CHARGE)
                 && c.group_id.is_some_and(|g| groups.contains(&f64::from(g)))
                 && (module_size.is_none_or(|v| v <= 0.0) || size.and_then(|id| c.attribute(id)) == module_size)
@@ -45,6 +46,7 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
     let target = -f.ship;
     let result = tokio::spawn(async move {
         fixture::position(&d, f.ship, SYSTEM, [0.0; 3]).await.unwrap();
+        seed_module_prerequisites(&d, &sde, f.character, gun).await;
         for (item, attr, value) in [
             (f.ship, ATTR_HI_SLOTS, 2.0), (f.ship, ATTR_MED_SLOTS, 0.0), (f.ship, ATTR_LOW_SLOTS, 0.0), (f.ship, ATTR_RIG_SLOTS, 0.0),
             (f.ship, ATTR_CPU_OUTPUT, 1_000_000.0), (f.ship, ATTR_POWER_OUTPUT, 1_000_000.0), (f.ship, ATTR_CAPACITOR_CAPACITY, 1_000_000.0),
@@ -74,8 +76,8 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = tx.clone();
         w.register_pilot(f.character, tx.clone());
-        w.add_ship(SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await.unwrap();
-        w.add_ship(SYSTEM, fixture::ball(target, hull, f.character, None, 1000.0)).await.unwrap();
+        fixture::admit(&d, &w, SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await;
+        fixture::admit_npc(&w, SYSTEM, fixture::ball(target, hull, f.character, None, 1000.0)).await;
         let cx = combat::Ctx { db: d.clone(), world: w.clone(), notify: tx, char_id: f.character, ship_id: f.ship, system_id: SYSTEM };
         add_target_ctx(&cx, target, false).await.ok().expect("target request");
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -103,7 +105,7 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
         assert_eq!(fit.value(Key::Module(slave), ATTR_HULL_DAMAGE), 0.0);
         let online = dogma::online(&d, f.ship).await.unwrap();
         assert!(!online.iter().any(|m| m.item_id == f.module));
-        assert!(online.iter().any(|m| m.item_id == slave));
+        assert!(online.iter().any(|m| m.item_id == slave), "slave unexpectedly offline; online ids={:?}", online.iter().map(|m| m.item_id).collect::<Vec<_>>());
         assert!(w.after(SYSTEM, 2500).await);
         for flag in [FLAG_HI_SLOT_FIRST, FLAG_HI_SLOT_FIRST + 1] { assert_eq!(loaded(&d, f.ship, flag).await.ok().unwrap(), Some((ammo, 2))); }
         let mut counts = [(0, 0); 2];
@@ -119,7 +121,7 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
     heat::clear_character(f.character);
     clear_locks_on(&world, SYSTEM, f.ship, f.character);
     for id in [f.ship, target] { world.remove_ball(SYSTEM, id).await; combat::forget_ship(id); }
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     let flush = world.flush_positions().await;
     drop(world);
     db.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1", &[&f.ship]).await.unwrap();

@@ -17,7 +17,7 @@ async fn company_and_personal_sources_use_actual_authority() {
     let issuer = fixtures::corporation(&tx, issuer_ceo).await;
     let foreign = fixtures::corporation(&tx, foreign_ceo).await;
     let outsider_corp: i64 = tx.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&outsider]).await.unwrap().get("corporation_id");
-    for (character, corp, roles) in [(issuer_director, issuer, crate::consts::ROLE_DIRECTOR), (foreign_director, foreign, crate::consts::ROLE_DIRECTOR), (member, foreign, 0)] {
+    for (character, corp, roles) in [(issuer_director, issuer, infinity_core::consts::ROLE_DIRECTOR), (foreign_director, foreign, infinity_core::consts::ROLE_DIRECTOR), (member, foreign, 0)] {
         tx.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$3 WHERE character_id=$2", &[&corp, &character, &roles]).await.unwrap();
     }
     assert!(ledger::initialize(&tx, issuer, 1000).await.unwrap());

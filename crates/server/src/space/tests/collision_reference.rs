@@ -341,7 +341,7 @@ fn commands(system: &mut System, name: &str) {
             system.command(3, |b, _, _| { b.goto_direction([1.0, 0.0, 0.0]); vec![] });
         }
         "warp-through-obstacle" => {
-            system.command(1, |b, _, _| { b.warp_factor = 3000; b.warp_to([149597870700.0, 0.0, 0.0], 20000.0, 3000); vec![] });
+            system.command(1, |b, _, _| { b.warp_to([149597870700.0, 0.0, 0.0], 20000.0, 3000); vec![] });
         }
         "missile-owner-target" => {
             let missile = system.ball(2).unwrap().clone();

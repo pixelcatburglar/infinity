@@ -11,16 +11,20 @@
 //! Skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
 //! Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100).
+//! Committed fitting changes merge persisted fields into a current fit without
+//! replacing its projections or runtime activation state.
+
+pub(crate) mod attributes;
 
 use super::{db_err, CallError};
-use crate::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_REQUIRED_SKILLS, dogma::ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, dogma::EFFECT_AFTERBURNER, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, dogma::EFFECT_SKILL, TYPE_CHARACTER};
+use infinity_core::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_REQUIRED_SKILLS, dogma::ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, dogma::EFFECT_AFTERBURNER, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, dogma::EFFECT_SKILL, TYPE_CHARACTER};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_SKILL_LEVEL, dogma::ATTR_SKILL_POINTS, dogma::ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS, FLAG_IMPLANT};
+use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_SKILL_LEVEL, dogma::ATTR_SKILL_POINTS, dogma::ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS, FLAG_IMPLANT};
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 /// SDE dogma effect category: active.
@@ -149,6 +153,11 @@ pub struct Fit {
 impl Fit {
     pub(crate) fn sde(&self) -> &Sde { &self.sde }
 
+    /// Return the cached fitting state without reloading dogma data.
+    pub(crate) fn module_state(&self, item: i64) -> Option<(bool, bool)> {
+        self.nodes.get(&Key::Module(item)).map(|node| (node.online, node.active))
+    }
+
     /// Load a fit outside space, without incoming projections.
     pub async fn load(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         Self::load_projected(db, sde, char_id, ship, Vec::new()).await
@@ -164,14 +173,6 @@ impl Fit {
         Self::load_at(db, sde, None, ship, projections, crate::client::filetime_now(), None, None).await
     }
 
-    /// Snapshot incoming effects and their revision for an unpiloted hull.
-    pub(crate) async fn load_unpiloted_in_space(db: &(impl crate::db::executor::Executor + ?Sized), world: &crate::space::World, system: i64, ship: i64) -> Result<Fit, CallError> {
-        let (projections, revision) = world.with(system, move |s| (s.projections_on(ship), s.projection_revision(ship))).await
-            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
-        let mut fit = Self::load_unpiloted_projected(db, world.sde().clone(), ship, projections).await?;
-        fit.projection_revision = Some(revision);
-        Ok(fit)
-    }
 
     /// Snapshot incoming effects from the live system before loading the fit.
     pub(crate) async fn load_in_space(db: &(impl crate::db::executor::Executor + ?Sized), world: &crate::space::World, system: i64, char_id: i64, ship: i64) -> Result<Fit, CallError> {
@@ -384,6 +385,36 @@ impl Fit {
         true
     }
 
+
+    pub(crate) fn replace_projections_for(&mut self, receiver: Key, projections: Vec<super::effects::projection::Projection>, revision: Option<u64>) {
+        self.nodes.retain(|key, node| !matches!(key, Key::Projected(_)) || node.receiver != Some(receiver));
+        Self::insert_projections(&self.sde, &mut self.nodes, receiver, projections);
+        match receiver {
+            Key::Ship => self.projection_revision = revision,
+            Key::Drone(_) => self.drone_projection_revision = revision,
+            _ => {}
+        }
+        self.memo.get_mut().unwrap().clear();
+    }
+
+    pub(crate) fn set_module_active(&mut self, item: i64, active: bool) -> bool {
+        let Some(node) = self.nodes.get_mut(&Key::Module(item)) else { return false };
+        if node.active != active {
+            node.active = active;
+            self.memo.get_mut().unwrap().clear();
+        }
+        true
+    }
+
+    pub(crate) fn set_module_overloaded(&mut self, item: i64, overloaded: bool) -> bool {
+        let Some(node) = self.nodes.get_mut(&Key::Module(item)) else { return false };
+        if node.overloaded != overloaded {
+            node.overloaded = overloaded;
+            self.memo.get_mut().unwrap().clear();
+        }
+        true
+    }
+
     /// Load the selected character ship and one owned drone, including launched drones.
     pub(crate) async fn drone(db: &Db, sde: Arc<Sde>, char_id: i64, drone_item: i64) -> Result<Fit, CallError> {
         let ship = crate::dao::characters::selection::ship_id(db, char_id).await.map_err(db_err)?
@@ -407,7 +438,7 @@ impl Fit {
     /// Revision of the drone projection snapshot, if present.
     pub(crate) fn drone_projection_revision(&self) -> Option<u64> { self.drone_projection_revision }
 
-    pub(crate) async fn load_drone(db: &Db, sde: Arc<Sde>, char_id: i64, ship: i64, drone_item: i64,
+    pub(crate) async fn load_drone(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, drone_item: i64,
         ship_projections: Vec<super::effects::projection::Projection>, drone_projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
         use crate::dao::items::loading::{load_items, ItemQuery};
         let item = load_items(db, ItemQuery::Id(drone_item)).await.map_err(db_err)?
@@ -465,7 +496,7 @@ impl Fit {
 
     pub(crate) fn type_has_attribute(&self, key: Key, attr: i32) -> bool {
         self.nodes.get(&key).and_then(|node| node.data_position)
-            .is_some_and(|position| attr == crate::consts::dogma::ATTR_CAPACITY || self.sde.types.at_position(position).attribute(attr).is_some())
+            .is_some_and(|position| attr == infinity_core::consts::dogma::ATTR_CAPACITY || self.sde.types.at_position(position).attribute(attr).is_some())
     }
 
 

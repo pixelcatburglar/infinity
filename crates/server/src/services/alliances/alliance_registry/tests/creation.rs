@@ -1,6 +1,6 @@
 //! Alliance creation dispatch, fee, locking and rollback regressions.
 use super::*;
-use crate::consts::ACCOUNT_CASH;
+use infinity_core::consts::ACCOUNT_CASH;
 
 fn args(corp: i64, prefix: char) -> Vec<Value> {
     vec![Value::unicode(format!("Alliance {prefix}{corp}")), Value::unicode(format!("{prefix}{:04X}", corp % 65536)), Value::unicode("description"), Value::unicode("url")]
@@ -25,12 +25,23 @@ async fn created(s: &Scenario, corp: i64) -> Result<i64> {
     Ok(s.f.db.query_one("SELECT count(*) AS n FROM game.alliances WHERE creator_corp_id=$1", &[&corp]).await?.get("n"))
 }
 
+async fn cleanup(s: Scenario) {
+    s.f.db.transaction(|tx, _: &mut ()| {
+        let corps = s.corps.clone();
+        Box::pin(async move {
+            crate::services::tests::fixture::cleanup_progress(tx, &corps, &[]).await
+        })
+    }, |(), ()| async move { Ok(()) }).await.unwrap();
+    s.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
 async fn creation_dispatch_charges_exact_fee_and_checks_binding() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, _) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         wallet(&s, corp, 0).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
         ensure!(rpc(&mut s.f.client, executor, &args(corp, 'A')).await.is_err(), "forged binding founded alliance");
@@ -43,7 +54,7 @@ async fn creation_dispatch_charges_exact_fee_and_checks_binding() -> Result<()> 
         ensure!(balance(&s, corp).await? == 1_000_000_000.0 && state(&s, corp).await?.0 == Some(id) && state(&s, corp).await?.3 == 1 && created(&s, corp).await? == 1, "creation fee or membership incorrect");
         Ok(())
     }).await;
-    s.cleanup().await;
+    cleanup(s).await;
     match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
 }
 
@@ -53,6 +64,7 @@ async fn concurrent_same_corporation_creations_charge_once() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, _, _) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         wallet(&s, corp, 2_000_000_000).await?;
         let (mut a, peer_a) = crate::services::tests::client(s.f.db.clone(), s.f.owner).await;
         let (mut b, peer_b) = crate::services::tests::client(s.f.db.clone(), s.f.owner).await;
@@ -60,11 +72,11 @@ async fn concurrent_same_corporation_creations_charge_once() -> Result<()> {
         let first = args(corp, 'A'); let second = args(corp, 'B');
         let (x, y) = tokio::join!(rpc(&mut a, corp, &first), rpc(&mut b, corp, &second));
         drop((peer_a, peer_b));
-        ensure!(x.is_ok() != y.is_ok(), "expected one creation winner");
+        ensure!(x.is_ok() != y.is_ok(), "expected one creation winner: first={x:?}, second={y:?}");
         ensure!(created(&s, corp).await? == 1 && balance(&s, corp).await? == 1_000_000_000.0 && state(&s, corp).await?.3 == 1, "creation race charged twice or created extra history");
         Ok(())
     }).await;
-    s.cleanup().await;
+    cleanup(s).await;
     match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
 }
 
@@ -74,6 +86,7 @@ async fn creation_rechecks_ceo_and_alliance_after_lock_wait() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, alliance) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         wallet(&s, corp, 2_000_000_000).await?;
         for revoke_ceo in [true, false] {
             let (mut client, peer) = crate::services::tests::client(s.f.db.clone(), s.f.owner).await;
@@ -99,7 +112,7 @@ async fn creation_rechecks_ceo_and_alliance_after_lock_wait() -> Result<()> {
         let _ = executor;
         Ok(())
     }).await;
-    s.cleanup().await;
+    cleanup(s).await;
     match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
 }
 
@@ -108,12 +121,13 @@ async fn creation_rechecks_ceo_and_alliance_after_lock_wait() -> Result<()> {
 async fn creation_history_failure_rolls_back_fee_and_new_alliance() -> Result<()> {
     let mut s = Scenario::new().await?;
     let (corp, _, _) = setup(&mut s).await?;
+    s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
     wallet(&s, corp, 2_000_000_000).await?;
     s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
     let function = format!("alliance_create_fail_{corp}"); let trigger = function.clone();
     s.f.db.execute(&format!("CREATE FUNCTION game.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected creation failure'; END $$"), &[]).await?;
     if let Err(error) = s.f.db.execute(&format!("CREATE TRIGGER {trigger} BEFORE INSERT ON game.alliance_history FOR EACH ROW WHEN (NEW.corporation_id = {corp}) EXECUTE FUNCTION game.{function}()"), &[]).await {
-        s.f.db.execute(&format!("DROP FUNCTION game.{function}()"), &[]).await?; s.cleanup().await; return Err(error.into());
+        s.f.db.execute(&format!("DROP FUNCTION game.{function}()"), &[]).await?; cleanup(s).await; return Err(error.into());
     }
     let result = catch_scenario(async {
         let before = state(&s, corp).await?;
@@ -124,7 +138,7 @@ async fn creation_history_failure_rolls_back_fee_and_new_alliance() -> Result<()
     }).await;
     let trigger_result = s.f.db.execute(&format!("DROP TRIGGER {trigger} ON game.alliance_history"), &[]).await;
     let function_result = s.f.db.execute(&format!("DROP FUNCTION game.{function}()"), &[]).await;
-    s.cleanup().await;
+    cleanup(s).await;
     trigger_result?; function_result?;
     match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
 }
