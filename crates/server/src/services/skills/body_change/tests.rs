@@ -1,6 +1,7 @@
 //! Body transition training and notification regressions.
 use super::*;
-use crate::{client::filetime_now, consts::{dogma::{ATTR_IMPLANTNESS, CHAR_ATTRIBUTES}, CATEGORY_IMPLANT, FLAG_IMPLANT, GROUP_BOOSTER, FILETIME_MINUTE}, dao::{items::transfers, skills::{queue, training as skill_rows}}, db::outbox::{Effect, Notification}, services::tests::{client, fixture}};
+use infinity_core::{consts::{dogma::{ATTR_IMPLANTNESS, CHAR_ATTRIBUTES}, CATEGORY_IMPLANT, FLAG_IMPLANT, GROUP_BOOSTER, FILETIME_MINUTE}};
+use crate::{client::filetime_now, dao::{items::transfers, skills::{queue, training as skill_rows}}, db::outbox::{Effect, Notification}, services::tests::{client, fixture}};
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -14,7 +15,7 @@ async fn transition_preserves_unchanged_timeline_and_banks_old_rate_on_change() 
         .find_map(|(t, slot)| t.effects().iter().filter_map(|e| c.sde.dogma.effect(e.effect_id)).filter(|e| e.effect_category.unwrap_or(0) == 0).flat_map(|e| e.modifiers()).find(|m| m.func == "ItemModifier" && m.domain == "charID" && m.op == 2 && CHAR_ATTRIBUTES.contains(&(m.modified as i64)) && m.modified != m.modifying).map(|m| (t.type_id, m.modifying, m.modified, slot))).expect("training attribute implant");
     let primary = c.sde.dogma.attributes_by_name("primaryAttribute").next().unwrap().attribute_id;
     let secondary = c.sde.dogma.attributes_by_name("secondaryAttribute").next().unwrap().attribute_id;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && [primary, secondary].into_iter().any(|a| t.attribute(a) == Some(f64::from(modified)))).unwrap().type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && [primary, secondary].into_iter().any(|a| t.attribute(a) == Some(f64::from(modified)))).unwrap().type_id;
     skill_rows::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     let now = filetime_now();
     let item = transfers::insert(&db, implant, f.character, f.character, FLAG_IMPLANT, 1).await.unwrap();
@@ -27,13 +28,15 @@ async fn transition_preserves_unchanged_timeline_and_banks_old_rate_on_change() 
     assert!(end > now);
     queue::insert(&db, f.character, &row).await.unwrap();
     let owner = f.character;
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[owner]).await;
     let _market = crate::services::market::lock().await;
     let effects = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = c.sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, owner).await.map_err(super::super::db_err)?;
             let change = begin_tx(tx, outbox, &sde, owner, now).await?;
-            finish_tx(tx, outbox, &sde, owner, now, change, false, false).await
+            finish_tx(tx, outbox, &sde, &fences, owner, now, change, false, false).await
         })
     }, |(), outbox| async move { Ok(outbox.into_entries()) }).await.unwrap();
     let unchanged = queue::list(&db, owner).await.unwrap();
@@ -43,11 +46,12 @@ async fn transition_preserves_unchanged_timeline_and_banks_old_rate_on_change() 
     assert!(!effects.iter().any(|e| matches!(e, Effect::Notification(Notification::Pilot { event, .. }) if event == "OnNewSkillQueueSaved")));
     let effects = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = c.sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, owner).await.map_err(super::super::db_err)?;
             let change = begin_tx(tx, outbox, &sde, owner, now).await?;
             tx.execute("DELETE FROM game.items WHERE item_id=$1", &[&item]).await.map_err(super::super::db_err)?;
-            finish_tx(tx, outbox, &sde, owner, now, change, true, false).await
+            finish_tx(tx, outbox, &sde, &fences, owner, now, change, true, false).await
         })
     }, |(), outbox| async move { Ok(outbox.into_entries()) }).await.unwrap();
     let after = queue::list(&db, owner).await.unwrap();
@@ -75,20 +79,22 @@ async fn booster_loss_refreshes_remaining_credits_and_preserves_expiry() {
     let expiry = now + FILETIME_MINUTE;
     let mut ids = Vec::new();
     for (slot, uses) in [(1_i32, 2_f64), (2_i32, 3_f64)] {
-        let id = transfers::insert(&db, ty, owner, owner, crate::consts::FLAG_BOOSTER, 1).await.unwrap();
+        let id = transfers::insert(&db, ty, owner, owner, infinity_core::consts::FLAG_BOOSTER, 1).await.unwrap();
         db.execute("UPDATE game.items SET singleton=true, brain_slot=$2, brain_activated_at=$3, brain_expires_at=$4 WHERE item_id=$1", &[&id, &slot, &now, &expiry]).await.unwrap();
-        db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&id, &crate::consts::dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, &uses]).await.unwrap();
+        db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&id, &infinity_core::consts::dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, &uses]).await.unwrap();
         ids.push(id);
     }
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[owner]).await;
     let _market = crate::services::market::lock().await;
     let effects = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = c.sde.clone();
         let removed = ids[0];
+        let fences = fences.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, owner).await.map_err(super::super::db_err)?;
             let change = begin_tx(tx, outbox, &sde, owner, now).await?;
             tx.execute("DELETE FROM game.items WHERE item_id=$1", &[&removed]).await.map_err(super::super::db_err)?;
-            finish_tx(tx, outbox, &sde, owner, now, change, false, true).await
+            finish_tx(tx, outbox, &sde, &fences, owner, now, change, false, true).await
         })
     }, |(), outbox| async move { Ok(outbox.into_entries()) }).await.unwrap();
     let notices: Vec<_> = effects.iter().filter_map(|effect| match effect {
@@ -110,7 +116,8 @@ async fn booster_loss_refreshes_remaining_credits_and_preserves_expiry() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn projected_capacity_changes_at_completion_without_persisting() {
-    use crate::{consts::{dogma::ATTR_MAX_JUMP_CLONES, SKILL_INFOMORPH_PSYCHOLOGY}, services::fit::Key};
+    use infinity_core::{consts::{dogma::ATTR_MAX_JUMP_CLONES, SKILL_INFOMORPH_PSYCHOLOGY}};
+    use crate::services::fit::Key;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
@@ -157,7 +164,7 @@ async fn training_schedule_matches_client_duration_cases() {
     let (skill, primary, secondary) = c.sde.types.iter().find_map(|ty| {
         let primary = ty.attribute(primary_attr)? as i64;
         let secondary = ty.attribute(secondary_attr)? as i64;
-        (ty.category_id == Some(crate::consts::CATEGORY_SKILL) && primary != secondary).then_some((ty.type_id, primary, secondary))
+        (ty.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && primary != secondary).then_some((ty.type_id, primary, secondary))
     }).expect("skill with distinct training attributes");
     for (primary_value, secondary_value, remaining, expected) in [
         (20.0, 20.0, 1000, 20_000_000_000),

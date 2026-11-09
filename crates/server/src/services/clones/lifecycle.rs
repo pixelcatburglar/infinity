@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 use marshal::Value;
-use crate::{dao::{characters::clones as clone_dao, items::clones as item_dao}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{db_err, notify_error, CallError, identity::Identity, wallets}};
+use infinity_core::messages;
+use crate::{dao::{characters::clones as clone_dao, items::clones as item_dao}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{db_err, notify_error, CallError, identity::Identity, wallets}};
 use super::{policy, CloneEffect, MAX_CLONE_NAME_LENGTH};
 
 fn missing() -> CallError { notify_error(messages::JUMP_CLONE_NOT_FOUND) }
@@ -35,7 +36,7 @@ pub(super) async fn install_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbo
     policy::ensure_install_tx(ex, sde, id, now).await?;
     let station = id.station_id.ok_or_else(missing)?;
     create_empty_clone_tx(ex, id.char_id, station).await?;
-    wallets::debit(ex, outbox, id.char_id, policy::service_fee()).await?;
+    wallets::debit(ex, outbox, id.char_id, crate::isk::IskAmount::from_isk(policy::service_fee())?).await?;
     invalidate(outbox, id.char_id, station);
     Ok(())
 }

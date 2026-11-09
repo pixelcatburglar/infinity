@@ -81,6 +81,103 @@ async fn boarding_guards_and_rollback() {
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
+async fn moved_ship_selection_checks_account_position_and_occupancy() {
+    let mut client = connect().await;
+    let tx = client.transaction().await.unwrap();
+    let f = fixture(&tx).await;
+    assert!(!guard_current(&tx, f.character, f.account + 1, f.old, 1, 1).await.unwrap());
+    assert!(!guard_current(&tx, f.character, f.account, f.old, 1, 2).await.unwrap());
+    assert!(guard_current(&tx, f.character, f.account, f.old, 1, 1).await.unwrap());
+    assert!(!position_moved(&tx, f.target, f.character, 1, [f64::NAN, 0.0, 0.0]).await.unwrap());
+    assert!(!position_moved(&tx, f.target, f.other, 1, [1.0; 3]).await.unwrap());
+    assert!(position_moved(&tx, f.target, f.character, 1, [1.0; 3]).await.unwrap());
+    assert!(unselected(&tx, f.target).await.unwrap());
+    assert!(!select_moved(&tx, f.character, f.account + 1, f.old, f.target, 1).await.unwrap());
+    assert!(select_moved(&tx, f.character, f.account, f.old, f.target, 1).await.unwrap());
+    assert!(!unselected(&tx, f.target).await.unwrap());
+    assert!(!select_moved(&tx, f.character, f.account, f.old, f.spare, 1).await.unwrap());
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
+async fn recovery_proves_complete_state_or_returns_unknown() {
+    let mut client = connect().await;
+    let mut tx = client.transaction().await.unwrap();
+    let f = fixture(&tx).await;
+    let board = |user, system, old_type, target_type| RecoveryPlan::Board {
+        character: f.character, user, system, old: f.old, old_type, target: f.target, target_type,
+    };
+    assert!(matches!(recovery(&tx, &board(f.account, 1, 1, 1)).await.unwrap(), Recovery::Aborted));
+    for plan in [board(f.account + 1, 1, 1, 1), board(f.account, 2, 1, 1),
+        board(f.account, 1, 2, 1), board(f.account, 1, 1, 2)] {
+        assert!(matches!(recovery(&tx, &plan).await.unwrap(), Recovery::Unknown));
+    }
+    let stored = crate::dao::items::creation::rookie_ship(&tx, 1, f.other, f.spare, infinity_core::consts::FLAG_SHIP_HANGAR).await.unwrap();
+    let plan = |host, prior_owner| RecoveryPlan::BoardStored {
+        character: f.character, user: f.account, system: 1, old: f.old, old_type: 1,
+        host, target: stored, target_type: 1, prior_owner,
+    };
+    assert!(matches!(recovery(&tx, &plan(f.spare, f.other)).await.unwrap(), Recovery::Aborted));
+    assert!(matches!(recovery(&tx, &plan(f.target, f.other)).await.unwrap(), Recovery::Unknown));
+    assert!(matches!(recovery(&tx, &plan(f.spare, f.character)).await.unwrap(), Recovery::Unknown));
+    let packaged = crate::dao::items::transfers::insert(&tx, 1, f.other, f.spare, infinity_core::consts::FLAG_SHIP_HANGAR, 1).await.unwrap();
+    let wrong_flag = crate::dao::items::creation::rookie_ship(&tx, 1, f.other, f.spare, FLAG_HANGAR).await.unwrap();
+    crate::dao::items::creation::fitted_items(&tx, f.spare, f.other, &[(2, infinity_core::consts::FLAG_SHIP_HANGAR, 2)]).await.unwrap();
+    let rows = crate::dao::items::loading::load_items(&tx, crate::dao::items::loading::ItemQuery::Location(f.spare)).await.unwrap();
+    let too_many = rows.iter().find(|row| row.type_id == 2).unwrap().item_id;
+    for (target, target_type) in [(packaged, 1), (wrong_flag, 1), (too_many, 2)] {
+        let invalid = RecoveryPlan::BoardStored { character: f.character, user: f.account, system: 1,
+            old: f.old, old_type: 1, host: f.spare, target, target_type, prior_owner: f.other };
+        assert!(matches!(recovery(&tx, &invalid).await.unwrap(), Recovery::Unknown));
+    }
+    let clone = crate::dao::characters::clones::create(&tx, f.character, 1).await.unwrap();
+    let dormant = crate::dao::items::creation::rookie_ship(&tx, 1, f.character, f.character, infinity_core::consts::FLAG_IMPLANT).await.unwrap();
+    crate::dao::characters::clones::lock_character(&tx, f.character).await.unwrap().unwrap();
+    assert!(crate::dao::items::brain::install(&tx, dormant, f.character, f.character, infinity_core::consts::FLAG_IMPLANT,
+        infinity_core::consts::FLAG_IMPLANT, 1, None, None, None).await.unwrap());
+    assert!(crate::dao::items::clones::park(&tx, f.character, clone.clone_id, dormant).await.unwrap());
+    assert!(crate::dao::items::loading::load_items(&tx, crate::dao::items::loading::ItemQuery::Id(dormant)).await.unwrap().is_empty());
+    let cloned = RecoveryPlan::Board { character: f.character, user: f.account, system: 1,
+        old: f.old, old_type: 1, target: dormant, target_type: 1 };
+    assert!(matches!(recovery(&tx, &cloned).await.unwrap(), Recovery::Unknown));
+    assert!(!board_in_space(&tx, f.character, f.old, dormant, 1, 1, 1, [0.0; 3], [0.0; 3]).await.unwrap());
+    let store = RecoveryPlan::Store { character: f.character, user: f.account, system: 1,
+        old: f.old, old_type: 1, host: f.spare };
+    assert!(matches!(recovery(&tx, &store).await.unwrap(), Recovery::Aborted));
+    let save = tx.savepoint("stored_commit").await.unwrap();
+    let locks = crate::dao::items::parent_locks::lock(&save, &[stored], &[crate::dao::items::parent_locks::LockRequest {
+        item_id: stored, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }]).await.unwrap();
+    crate::dao::items::transfers::hand_over(&save, &[crate::dao::items::transfers::Transfer {
+        item_id: stored, owner: f.character, location: 1, flag: 0,
+    }], &[stored], &locks, &[]).await.unwrap();
+    assert!(position_moved(&save, stored, f.character, 1, [3.0; 3]).await.unwrap());
+    assert!(select_moved(&save, f.character, f.account, f.old, stored, 1).await.unwrap());
+    let Recovery::Committed { target, old: Some(old) } = recovery(&save, &plan(f.spare, f.other)).await.unwrap() else { panic!("expected committed stored boarding") };
+    assert_eq!((target.item_id, target.pos, old.item_id), (stored, [3.0; 3], f.old));
+    save.rollback().await.unwrap();
+    let save = tx.savepoint("store_commit").await.unwrap();
+    let locks = crate::dao::items::parent_locks::lock(&save, &[f.old], &[crate::dao::items::parent_locks::LockRequest {
+        item_id: f.old, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }]).await.unwrap();
+    crate::dao::items::transfers::hand_over(&save, &[crate::dao::items::transfers::Transfer {
+        item_id: f.old, owner: f.character, location: f.spare, flag: infinity_core::consts::FLAG_SHIP_HANGAR,
+    }], &[f.old], &locks, &[]).await.unwrap();
+    let capsule = crate::dao::items::creation::positioned(&save, infinity_core::consts::TYPE_CAPSULE, f.character, 1, [4.0; 3]).await.unwrap();
+    assert!(select_moved(&save, f.character, f.account, f.old, capsule, 1).await.unwrap());
+    let Recovery::Committed { target, old: None } = recovery(&save, &store).await.unwrap() else { panic!("expected committed store") };
+    assert_eq!((target.item_id, target.pos), (capsule, [4.0; 3]));
+    save.rollback().await.unwrap();
+    assert!(board_in_space(&tx, f.character, f.old, f.target, 1, 1, 1, [1.0; 3], [2.0; 3]).await.unwrap());
+    let Recovery::Committed { target, old: Some(old) } = recovery(&tx, &board(f.account, 1, 1, 1)).await.unwrap() else { panic!("expected committed boarding") };
+    assert_eq!((target.item_id, target.pos, old.item_id, old.pos), (f.target, [2.0; 3], f.old, [1.0; 3]));
+    assert!(matches!(recovery(&tx, &store).await.unwrap(), Recovery::Unknown));
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
 async fn competing_transactions_have_one_winner() {
     let mut first = connect().await;
     let setup = first.transaction().await.unwrap();

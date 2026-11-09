@@ -8,7 +8,7 @@ fn pilot(id: i64, character: i64) -> Ball {
         max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: true,
-        massive: true, warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        massive: true, warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
@@ -30,4 +30,19 @@ fn only_indexed_matching_ship_changes_affiliation() {
     system.refresh_pilot_affiliation(1, 10, Some(5), Some(6));
     assert!(rx.try_recv().is_err());
     assert_eq!((system.pilot_ball(2).unwrap().corp_id, system.pilot_ball(2).unwrap().alliance_id), (1, -1));
+}
+
+#[test]
+fn departed_pilot_scope_receipts_are_pruned_at_checkpoint() {
+    let mut system = System::new(1, Arc::default(), 1000);
+    system.combat_facts = Some(crate::space::combat_facts::CombatFacts::new(1, 1, 8, 4));
+    for character in 1..=2000 {
+        let ship = character + 10_000;
+        system.insert(pilot(ship, character));
+        system.close_combat_character_boundary(character).unwrap();
+        assert!(system.combat_facts.as_ref().unwrap().export_character_scope(character).is_some());
+        system.take(ship).unwrap();
+        system.checkpoint_combat_scrambles().unwrap();
+        assert!(system.combat_facts.as_ref().unwrap().export_character_scope(character).is_none());
+    }
 }

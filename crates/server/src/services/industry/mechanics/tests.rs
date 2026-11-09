@@ -66,3 +66,12 @@ fn separate_optional_quotes_must_be_finite_numeric_and_match() {
         assert!(validate_quote(None, Some(&bad), &f).is_err());
     }
 }
+
+#[test]
+fn manufacturing_output_uses_recipe_quantity_and_checks_overflow() {
+    for (per_run, runs, expected) in [(4, 3, 12), (i64::from(i32::MAX), 2, i64::from(i32::MAX) * 2), (i64::MAX, 1, i64::MAX)] {
+        assert_eq!(super::manufacturing_quantity(per_run, runs).ok(), Some(expected));
+    }
+    assert!(super::manufacturing_quantity(0, 3).is_err());
+    assert!(super::manufacturing_quantity(i64::MAX, 2).is_err());
+}

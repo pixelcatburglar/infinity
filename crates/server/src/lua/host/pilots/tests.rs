@@ -1,9 +1,11 @@
 //! Lua-facing simulated pilot lifecycle and cancellation coverage.
+mod daily_goals;
 mod economy;
 mod skills;
 mod effects;
 mod fixture;
 mod space;
+mod organization;
 use super::*;
 
 #[tokio::test]
@@ -106,7 +108,7 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         check_list.call_async::<()>(true).await?;
         assert!(r.world.is_online(id));
         assert!(r.world.online_session(id).is_some());
-        let fitted: i64 = r.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id <> $3", &[&id, &ship, &crate::consts::FLAG_CARGO]).await?.get("n");
+        let fitted: i64 = r.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id <> $3", &[&id, &ship, &infinity_core::consts::FLAG_CARGO]).await?.get("n");
         assert!(fitted > 0, "rookie ship must have its normal initial fit");
         for _ in 0..100 { r.world.notify_pilot(id, "OnTest", vec![]); }
         let dir = std::env::temp_dir().join(format!("lua-pilot-reload-{}-{id}", std::process::id()));

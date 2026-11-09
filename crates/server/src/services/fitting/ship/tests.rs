@@ -1,9 +1,8 @@
 use super::{assembly_source_change, assembly_step};
-use crate::consts::{IX_SINGLETON, IX_STACK_SIZE};
+use infinity_core::consts::{IX_SINGLETON, IX_STACK_SIZE};
 use marshal::Value;
 
 mod spawn;
-mod boarding;
 
 #[test]
 fn repeated_assembly_conserves_hulls_and_stops_after_conversion() {
@@ -15,6 +14,10 @@ fn repeated_assembly_conserves_hulls_and_stops_after_conversion() {
     assert_eq!(last, (0, false, 1));
     assert_eq!(assembly_step(3, Some(last.0)), None);
     assert_eq!(assembly_step(1, None), Some((0, false, 1)));
+    for quantity in [i64::from(i32::MAX) + 1, 1_i64 << 32, (1_i64 << 53) + 1, i64::MAX] {
+        assert_eq!(assembly_step(quantity, None), Some((quantity - 1, true, quantity)));
+        assert!(matches!(assembly_source_change(quantity, quantity - 1).as_slice(), [(IX_STACK_SIZE, Value::Int(old))] if *old == quantity));
+    }
 }
 
 #[test]

@@ -1,8 +1,9 @@
 //! Builds a generation in an isolated Lua 5.4 VM. Scripts use separate globals,
 //! root-confined text modules and authored JSON data files, with invocation-local
-//! budgets. JSON null and values beyond the decoder's depth limit are unsupported.
-//! Native modules, binary chunks and script-created coroutines are not supported;
-//! these server facilities have no client analogue.
+//! budgets. Sovereignty content captures its own bounded files and uses a closed
+//! evaluation environment. JSON null and values beyond the decoder's depth limit
+//! are unsupported; native modules, binary chunks and script-created coroutines
+//! are not supported. These server facilities have no client analogue.
 
 use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
 use anyhow::{Context, Result};
@@ -175,7 +176,7 @@ fn environment(lua: &Lua, root: &Path, data_file_limit_bytes: usize) -> mlua::Re
     Ok(env)
 }
 
-fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: String, open: Arc<AtomicBool>) -> mlua::Result<()> {
+pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: String, open: Arc<AtomicBool>) -> mlua::Result<()> {
     let register = lua.create_table()?;
     let rpc_claims = claims.clone();
     let rpc_script = script.clone();
@@ -186,6 +187,18 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
         let key = (service, method);
         if let Some(previous) = claims.rpc.get(&key) { return Err(mlua::Error::runtime(format!("duplicate RPC {}::{} in {} and {}", key.0, key.1, previous.script, rpc_script))); }
         claims.rpc.insert(key, Handler { script: rpc_script.clone(), function });
+        Ok(())
+    })?)?;
+    let gateway_claims = claims.clone();
+    let gateway_script = script.clone();
+    let gateway_open = open.clone();
+    register.set("gateway", lua.create_function(move |_, (name, function): (String, Function)| {
+        if !gateway_open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
+        super::content::protocol::gateway::descriptors(&name).map_err(mlua::Error::external)?;
+        if crate::gateway::handlers::is_implemented(&name) { return Err(mlua::Error::runtime("gateway request already implemented in Rust")); }
+        let mut claims = gateway_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        if claims.gateway.contains_key(&name) { return Err(mlua::Error::runtime(format!("duplicate gateway request {name}"))); }
+        claims.gateway.insert(name, Handler { script: gateway_script.clone(), function });
         Ok(())
     })?)?;
     let intercept_claims = claims.clone();
@@ -273,19 +286,30 @@ fn discover(config: &LuaConfig) -> Result<Vec<(std::path::PathBuf, std::path::Pa
 }
 
 pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry> {
+    let bundle = config.content_data_dir.as_ref().map(|root| {
+        super::content::bundle::Bundle::load(Path::new(root), config.data_file_limit_bytes).map(Arc::new)
+    }).transpose()?;
     let scripts = discover(config)?;
     let lua = Lua::new();
     lua.set_memory_limit(config.memory_limit_mb * 1024 * 1024)?;
     let claims = Arc::new(Mutex::new(Claims::default()));
+    let definitions = Arc::new(Mutex::new(super::content::ContentDefinitions::default()));
     for (root, path, script) in scripts {
         let env = environment(&lua, &root, config.data_file_limit_bytes)?;
         value::register(&lua, &env)?;
         let settings = config.scripts.get(&script).cloned().unwrap_or_default();
         host::register(&lua, &env, &script, &settings, resources)?;
         let open = Arc::new(AtomicBool::new(true));
+        super::content::install_data(&lua, &env, bundle.clone(), open.clone())?;
+        let bytes = if script == "sovereignty_content" || script == "ship_adaption_mgr" {
+            super::content::bytes(&root, &format!("{script}.lua"), config.data_file_limit_bytes)?
+        } else {
+            std::fs::read(&path)?
+        };
         register_claims(&lua, &env, claims.clone(), script.clone(), open.clone())?;
+        super::content::register(&lua, &env.get("register")?, definitions.clone(), open.clone(), &root, &script, if script == "sovereignty_content" || script == "ship_adaption_mgr" { bytes.clone() } else { Vec::new() }, config, bundle.clone(), resources.sde.clone())?;
         let result = (|| -> Result<()> {
-            let bytes = std::fs::read(&path)?;
+            let bytes = &bytes;
             let function = lua.load(bytes.as_slice()).set_name(path.to_string_lossy()).set_mode(ChunkMode::Text).set_environment(env.clone()).into_function()?;
             let deadline = Instant::now() + Duration::from_millis(config.call_budget_ms);
             let thread = budgeted_thread(&lua, function, config, deadline)?;
@@ -315,7 +339,11 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
     for tick in &claims.ticks {
         tracing::info!(script = %tick.handler.script, name = %tick.name, interval_ms = tick.interval.as_millis(), "Lua tick claim");
     }
-    Ok(Registry { lua, claims, overrides: Mutex::new(Default::default()) })
+    let content = std::mem::take(&mut *definitions.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?);
+    if bundle.is_some() && !content.packages.contains_key("ship_adaption") {
+        anyhow::bail!("configured adaptation bundle has no registered consumer");
+    }
+    Ok(Registry { lua, claims, content, overrides: Mutex::new(Default::default()) })
 }
 
 #[cfg(test)]

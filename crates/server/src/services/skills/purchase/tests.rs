@@ -1,13 +1,17 @@
 //! Purchase argument and transactional settlement coverage.
 use super::*;
-use crate::{consts::ACCOUNT_CASH, dao::{skills::history, wallets::characters}, db::outbox::{Effect, Notification}, lua::events::GameEvent, services::tests::{client, fixture}};
+use infinity_core::consts::ACCOUNT_CASH;
+use crate::{dao::{skills::history, wallets::characters}, db::outbox::{Effect, Notification}, lua::events::GameEvent, services::tests::{client, fixture}};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+mod display_cap;
+mod journal;
 
 async fn history_fingerprint(db: &crate::db::Db, character: i64) -> String {
     db.query_one("SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') AS state FROM game.skill_history h WHERE character_id=$1", &[&character]).await.unwrap().get("state")
 }
 
-fn sde_validate(sde: &Sde, ids: &[i64], known: &HashSet<i32>) -> Result<(BTreeSet<i32>, f64), CallError> {
+fn sde_validate(sde: &Sde, ids: &[i64], known: &HashSet<i32>) -> Result<(BTreeMap<i32, f64>, f64), CallError> {
     validate(ids, known,
         |id| i32::try_from(id).ok().and_then(|id| sde.types.get(id)).is_some_and(|ty| ty.category_id == Some(CATEGORY_SKILL)),
         |id| {
@@ -17,7 +21,7 @@ fn sde_validate(sde: &Sde, ids: &[i64], known: &HashSet<i32>) -> Result<(BTreeSe
         })
 }
 
-fn assert_error(result: Result<(BTreeSet<i32>, f64), CallError>, expected: &str, args: Vec<(String, Value)>) {
+fn assert_error(result: Result<(BTreeMap<i32, f64>, f64), CallError>, expected: &str, args: Vec<(String, Value)>) {
     match result {
         Err(CallError::User { msg, dict }) => { assert_eq!(msg, expected); assert_eq!(dict, args); }
         _ => panic!("unexpected validation result"),
@@ -69,15 +73,15 @@ async fn normalized_total_debits_exact_balance_and_zero_has_no_effects() {
     let balance = 0.3_f64;
     db.execute("UPDATE game.characters SET balance=$2::float8::numeric WHERE character_id=$1", &[&f.character, &balance]).await.unwrap();
     let effects = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        Box::pin(async move { wallets::debit(tx, outbox, f.character, 0.0).await })
+        Box::pin(async move { wallets::debit(tx, outbox, f.character, crate::isk::IskAmount::ZERO).await })
     }, |(), outbox| async move { Ok::<_, CallError>(outbox.into_entries()) }).await.unwrap();
     assert!(effects.is_empty());
-    assert_eq!(characters::balance(&db, f.character).await.unwrap(), balance);
-    let effects = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        Box::pin(async move { wallets::debit(tx, outbox, f.character, total).await })
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::from_cents(30).unwrap());
+    let _effects = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
+        Box::pin(async move { wallets::debit(tx, outbox, f.character, crate::isk::IskAmount::from_isk(total)?).await })
     }, |(), outbox| async move { Ok::<_, CallError>(outbox.into_entries()) }).await.unwrap();
-    assert_eq!(characters::balance(&db, f.character).await.unwrap(), 0.0);
-    assert!(effects.iter().any(|effect| matches!(effect, Effect::Event(GameEvent::WalletChanged { owner_id, account_key, balance, delta }) if *owner_id == f.character && *account_key == ACCOUNT_CASH && *balance == 0.0 && *delta == -0.3)));
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::ZERO);
+    assert!(crate::db::outbox::tests::wallet_events(&db, f.character).await.iter().any(|event| matches!(event, GameEvent::WalletChanged { owner_id, account_key, balance, delta } if *owner_id == f.character && *account_key == ACCOUNT_CASH && *balance == crate::isk::IskAmount::ZERO && *delta == crate::isk::IskAmount::from_cents(-30).unwrap())));
     fixture::cleanup(&db, f).await.unwrap();
 }
 
@@ -100,8 +104,10 @@ async fn purchase_settlement_and_rollback() {
     let _market = market::lock().await;
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let scenario = crate::tests::catch_scenario(async {
     let (c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
     let dependent = sde.types.iter().find(|ty| {
         let id = i64::from(ty.type_id);
         sde_validate(&sde, &[id], &HashSet::new()).ok().is_some_and(|(_, price)| price > 0.0 && price < 1_000_000_000.0)
@@ -112,7 +118,7 @@ async fn purchase_settlement_and_rollback() {
     }).expect("second purchasable skill").type_id;
     let mut ids = vec![i64::from(dependent), i64::from(other)];
     ids.sort_unstable_by(|a, b| b.cmp(a));
-    let (_, total) = sde_validate(&sde, &ids, &HashSet::new()).unwrap_or_else(|_| panic!("valid skills rejected"));
+    let (prices, total) = sde_validate(&sde, &ids, &HashSet::new()).unwrap_or_else(|_| panic!("valid skills rejected"));
     let unavailable = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SKILL) && sde_validate(&sde, &[i64::from(ty.type_id)], &HashSet::new()).is_err()).map(|ty| i64::from(ty.type_id)).expect("unavailable skill in SDE");
     let invalid = i64::MAX;
     let known = HashSet::from([ids[0] as i32]);
@@ -142,21 +148,21 @@ async fn purchase_settlement_and_rollback() {
     let flag = Arc::new(AtomicBool::new(false));
     let dispatched_refusal = flag.clone();
     let refused: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let ids = ids.clone();
-        Box::pin(async move { purchase_tx(tx, outbox, &sde, f.character, &ids, filetime_now()).await })
+        let sde = sde.clone(); let ids = ids.clone(); let fences = fences.clone();
+        Box::pin(async move { purchase_tx(tx, outbox, &sde, &fences, f.character, &ids, filetime_now()).await })
     }, |value, _| async move { dispatched_refusal.store(true, Ordering::SeqCst); Ok(value) }).await;
     assert!(matches!(refused, Err(CallError::User { msg, dict }) if msg == messages::MSG_NOT_ENOUGH_MONEY && dict == vec![("balance".into(), Value::Float(0.0)), ("amount".into(), Value::Float(total))]));
     assert!(!flag.load(Ordering::SeqCst));
-    assert_eq!(characters::balance(&db, f.character).await.unwrap(), zero);
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::ZERO);
     assert_eq!(before, fixture::skill_fingerprint(&db, f.character).await.unwrap());
     assert_eq!(history_fingerprint(&db, f.character).await, history_before);
     assert!(history::list(&db, f.character, 50).await.unwrap().is_empty());
     db.execute("UPDATE game.characters SET balance=$2::float8::numeric WHERE character_id=$1", &[&f.character, &funded]).await.unwrap();
     let flag = dispatched.clone();
     let failed: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let ids = ids.clone();
+        let sde = sde.clone(); let ids = ids.clone(); let fences = fences.clone();
         Box::pin(async move {
-            purchase_tx(tx, outbox, &sde, f.character, &ids, now).await?;
+            purchase_tx(tx, outbox, &sde, &fences, f.character, &ids, now).await?;
             tx.query_one("SELECT 1 / 0", &[]).await.map_err(|e| db_err(crate::db::Error::from(e)))?;
             Ok(())
         })
@@ -164,15 +170,15 @@ async fn purchase_settlement_and_rollback() {
     fixture::assert_division_by_zero(failed);
     assert!(!dispatched.load(Ordering::SeqCst));
     assert_eq!(before, fixture::skill_fingerprint(&db, f.character).await.unwrap());
-    assert_eq!(characters::balance(&db, f.character).await.unwrap(), funded);
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::from_isk(funded).unwrap());
     assert!(history::list(&db, f.character, 50).await.unwrap().is_empty());
     let (result, effects) = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let ids = ids.clone();
-        Box::pin(async move { purchase_tx(tx, outbox, &sde, f.character, &ids, now).await })
+        let sde = sde.clone(); let ids = ids.clone(); let fences = fences.clone();
+        Box::pin(async move { purchase_tx(tx, outbox, &sde, &fences, f.character, &ids, now).await })
     }, |result, outbox| async move { Ok::<_, CallError>((result, outbox.into_entries())) }).await.unwrap_or_else(|_| panic!("purchase failed"));
     assert_eq!(result, Value::list(ids.iter().copied().map(Value::Int)));
     assert_eq!(marshal::loads(&marshal::dumps(&result)).unwrap(), result);
-    assert!((characters::balance(&db, f.character).await.unwrap() - 100.0).abs() < 0.001);
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::from_cents(10_000).unwrap());
     let skills = training::current(&db, f.character).await.unwrap();
     assert_eq!(skills.len(), 2);
     assert!(skills.iter().all(|skill| skill.level == 0 && skill.skill_points == 0));
@@ -180,11 +186,25 @@ async fn purchase_settlement_and_rollback() {
     assert_eq!(history.len(), 2);
     assert!(history.iter().all(|entry| entry.event_type_id == super::super::history::INJECTED && entry.absolute_points == 0));
     let expected_balance = characters::balance(&db, f.character).await.unwrap();
-    assert!(effects.iter().any(|effect| matches!(effect, Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnAccountChange" && *args == vec![Value::str("cash"), Value::Int(f.character), Value::Float(expected_balance)])));
+    let mut running = crate::isk::IskAmount::from_isk(funded).unwrap();
+    let mut expected_events = Vec::new();
+    let mut expected_notices = Vec::new();
+    for price in prices.values().filter(|price| **price > 0.0) {
+        let amount = crate::isk::IskAmount::from_isk(*price).unwrap();
+        running = running.checked_sub(amount).unwrap();
+        expected_events.push((running, amount.checked_neg().unwrap()));
+        expected_notices.push(vec![Value::str("cash"), Value::Int(f.character), Value::Float(running.client_isk(crate::isk::personal_client_cap()))]);
+    }
+    let events: Vec<_> = crate::db::outbox::tests::wallet_events(&db, f.character).await.into_iter().filter_map(|event| match event { GameEvent::WalletChanged { owner_id, account_key, balance, delta } if owner_id == f.character && account_key == ACCOUNT_CASH => Some((balance, delta)), _ => None }).collect();
+    let notices: Vec<_> = effects.iter().filter_map(|effect| match effect { Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnAccountChange" => Some(args.clone()), _ => None }).collect();
+    assert_eq!(events, expected_events);
+    assert_eq!(notices, expected_notices);
+    assert_eq!(crate::isk::IskAmount::from_cents(events.iter().map(|(_, delta)| fixture::isk_cents(*delta)).sum()).unwrap(), crate::isk::IskAmount::from_isk(total).unwrap().checked_neg().unwrap());
+    assert_eq!(running, expected_balance);
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == crate::client::BRAIN_REFRESH && args.is_empty())));
     let expected_infos = Value::Dict(skills.iter().map(|skill| (Value::Int(i64::from(skill.type_id)), super::super::view::incremental_skill_info(&sde, skill.type_id, Some(0), Some(0), None, now))).collect());
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnServerSkillsChanged" && *args == vec![expected_infos.clone(), Value::None, Value::Int(now)])));
-    assert!(effects.iter().any(|effect| matches!(effect, Effect::Event(GameEvent::WalletChanged { owner_id, account_key, balance, delta }) if *owner_id == f.character && *account_key == ACCOUNT_CASH && *balance == expected_balance && *delta == -total)));
+
     let before = fixture::skill_fingerprint(&db, f.character).await.unwrap();
     let hidden = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SKILL) && ty.group_id.is_some_and(|group| [GROUP_CLOUD_COMPUTING, GROUP_SHIP_ADAPTION, GROUP_CHARACTER_ENHANCEMENT].contains(&group))).expect("hidden skill in SDE").type_id;
     let not_listed = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SKILL) && !sde.typelists.contains(TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE, ty.type_id, ty.group_id, ty.category_id)).expect("unlisted skill in SDE").type_id;
@@ -200,8 +220,8 @@ async fn purchase_settlement_and_rollback() {
             let flag = Arc::new(AtomicBool::new(false));
             let dispatched = flag.clone();
             let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-                let sde = sde.clone(); let request = request.clone();
-                Box::pin(async move { purchase_tx(tx, outbox, &sde, f.character, &request, now).await })
+                let sde = sde.clone(); let request = request.clone(); let fences = fences.clone();
+                Box::pin(async move { purchase_tx(tx, outbox, &sde, &fences, f.character, &request, now).await })
             }, |value, _| async move { dispatched.store(true, Ordering::SeqCst); Ok(value) }).await;
             assert!(matches!(result, Err(CallError::User { msg, dict }) if msg == expected && dict == vec![(argument.into(), Value::Int(bad))]));
             assert!(!flag.load(Ordering::SeqCst));
@@ -212,17 +232,19 @@ async fn purchase_settlement_and_rollback() {
     let flag = Arc::new(AtomicBool::new(false));
     let dispatched_refusal = flag.clone();
     let failed: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let ids = ids.clone();
-        Box::pin(async move { purchase_tx(tx, outbox, &sde, f.character, &ids, now).await })
+        let sde = sde.clone(); let ids = ids.clone(); let fences = fences.clone();
+        Box::pin(async move { purchase_tx(tx, outbox, &sde, &fences, f.character, &ids, now).await })
     }, |value, _| async move { dispatched_refusal.store(true, Ordering::SeqCst); Ok(value) }).await;
     assert!(matches!(failed, Err(CallError::User { msg, dict }) if msg == messages::MSG_CHARACTER_ALREADY_KNOWS_SKILL && dict == vec![("skillName".into(), Value::Int(ids[0]))]));
     assert!(!flag.load(Ordering::SeqCst));
     assert_eq!(characters::balance(&db, f.character).await.unwrap(), balance_before);
     assert_eq!(history_fingerprint(&db, f.character).await, history_before);
     assert_eq!(before, fixture::skill_fingerprint(&db, f.character).await.unwrap());
+    }).await;
     crate::scheduler::cancel(&db, &format!("{}:{}", super::super::completion::KIND, f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -248,7 +270,7 @@ async fn bound_route_empty_and_purchase_roundtrip() {
     assert_eq!(marshal::loads(&marshal::dumps(&result)).unwrap(), result);
     assert_eq!(fixture::skill_fingerprint(&db, f.character).await.unwrap(), before);
     assert_eq!(history_fingerprint(&db, f.character).await, history_before);
-    assert_eq!(characters::balance(&db, f.character).await.unwrap(), funded);
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::from_isk(funded).unwrap());
     assert_eq!(db.query_one("SELECT count(*) AS n FROM game.jobs WHERE job_id=$1", &[&job]).await.unwrap().get::<_, i64>("n"), jobs_before);
     let args = [Value::list([Value::Int(i64::from(skill))])];
     let call = crate::services::Call { args: &args, ..call };
@@ -256,7 +278,7 @@ async fn bound_route_empty_and_purchase_roundtrip() {
     assert_eq!(result, Value::list([Value::Int(i64::from(skill))]));
     assert_eq!(marshal::loads(&marshal::dumps(&result)).unwrap(), result);
     assert!(training::current(&db, f.character).await.unwrap().iter().any(|row| row.type_id == skill && row.level == 0 && row.skill_points == 0));
-    assert!((characters::balance(&db, f.character).await.unwrap() - 100.0).abs() < 0.001);
+    assert_eq!(characters::balance(&db, f.character).await.unwrap(), crate::isk::IskAmount::from_cents(10_000).unwrap());
     crate::scheduler::cancel(&db, &format!("{}:{}", super::super::completion::KIND, f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();

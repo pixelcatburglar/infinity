@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
-use crate::{client::filetime_ticks_from_hours, consts::{dogma::MAX_SKILL_LEVEL, CATEGORY_SHIP, CATEGORY_SKILL, FILETIME_DAY}, dao::sde::expert_systems::ExpertSystemRow, db::Db};
+use infinity_core::{consts::{dogma::MAX_SKILL_LEVEL, CATEGORY_SHIP, CATEGORY_SKILL, FILETIME_DAY}};
+use crate::{client::filetime_ticks_from_hours, dao::sde::expert_systems::ExpertSystemRow, db::Db};
 use super::types::Types;
 
 /// Client `inventorycommon/const.py:357` expert-system inventory category.
@@ -84,7 +85,7 @@ fn parse_row(key: &Option<String>, data: &str, category_of: &impl Fn(i32) -> Opt
 
     let days = object.get("durationDays").and_then(Value::as_f64).filter(|days| days.is_finite() && *days > 0.0 && days.fract() == 0.0).ok_or_else(|| anyhow!("expert-system {type_id} durationDays must be a positive integer"))?;
     let duration_days = i32::try_from(days as i64).map_err(|_| anyhow!("expert-system {type_id} durationDays is out of range"))?;
-    let duration_filetime = filetime_ticks_from_hours(days * (FILETIME_DAY / crate::consts::FILETIME_HOUR) as f64).ok_or_else(|| anyhow!("expert-system {type_id} duration overflows FILETIME"))?;
+    let duration_filetime = filetime_ticks_from_hours(days * (FILETIME_DAY / infinity_core::consts::FILETIME_HOUR) as f64).ok_or_else(|| anyhow!("expert-system {type_id} duration overflows FILETIME"))?;
 
     let grants = object.get("skillsGranted").and_then(Value::as_object).ok_or_else(|| anyhow!("expert-system {type_id} skillsGranted must be an object"))?;
     let mut skills = Vec::with_capacity(grants.len());

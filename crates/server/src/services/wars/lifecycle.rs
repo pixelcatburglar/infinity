@@ -2,7 +2,8 @@
 //! `eve/client/script/ui/services/wars/war_cso.py` and `mutualWarInvites.py`.
 //! Uses `game.wars`, `game.war_invites`, `game.war_invite_settings` and `game.jobs`.
 //! Aggressive wars, allies and paid surrender or treaties are unsupported.
-use crate::{client::filetime_now, consts::FILETIME_DAY, dao::{alliances, wars::{self, War}}, db::{Db, executor::Executor, outbox::{Outbox, dispatch_world}}, messages, scheduler, services::{CallError, notify_error}, space::World};
+use infinity_core::{consts::FILETIME_DAY, messages};
+use crate::{client::filetime_now, dao::{alliances, wars::{self, War}}, db::{Db, executor::Executor, outbox::{Outbox, dispatch_world}}, scheduler, services::{CallError, notify_error}, space::World};
 use marshal::Value;
 use super::{authority, deadlines, wire};
 
@@ -42,6 +43,7 @@ pub(super) async fn ended(ex: &(impl Executor + ?Sized), outbox: &mut Outbox, a:
 pub(crate) async fn retract(db: &Db, world: &World, actor: i64, war_id: i64) -> Result<(), CallError> {
     let now = filetime_now();
     db.transaction(|tx, outbox: &mut Outbox| Box::pin(async move {
+        authority::lock_actor(tx, actor).await?;
         let original = wars::get(tx, war_id).await?.ok_or_else(invalid)?;
         wars::lock_owners(tx, &[original.declared_by, original.against]).await?;
         let original = wars::get(tx, war_id).await?.ok_or_else(invalid)?;

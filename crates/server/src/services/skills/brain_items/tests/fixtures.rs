@@ -26,21 +26,25 @@ pub(super) fn booster(sde: &Sde) -> i32 {
         && requirements(sde, t.type_id).next().is_none()).expect("unrestricted published booster required").type_id
 }
 
-pub(super) async fn item(db: &Db, owner: i64, ty: i32, location: i64, quantity: i32) -> i64 {
-    crate::dao::items::transfers::insert(db, ty, owner, location, crate::consts::FLAG_HANGAR, quantity).await.unwrap()
+pub(super) async fn item(db: &Db, owner: i64, ty: i32, location: i64, quantity: i64) -> i64 {
+    crate::dao::items::transfers::insert(db, ty, owner, location, infinity_core::consts::FLAG_HANGAR, quantity).await.unwrap()
 }
 
 pub(super) async fn activate(db: &Db, sde: &Arc<Sde>, character: i64, item: i64, location: Option<i64>, now: i64, booster: bool, draws: Vec<(i32, f64)>) -> Result<(Value, Vec<Effect<OnlineChanged>>), CallError> {
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    let fences = crate::services::effects::online::capture_online_fences(&world, &[character]).await;
     db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone(); let draws = draws.clone();
-        Box::pin(async move { activate_tx(tx, outbox, &sde, character, None, item, location, now, &draws, booster).await })
+        let sde = sde.clone(); let draws = draws.clone(); let fences = fences.clone();
+        Box::pin(async move { activate_tx(tx, outbox, &sde, &fences, character, None, item, location, now, &draws, booster).await })
     }, |value, outbox| async move { Ok((value, outbox.into_entries())) }).await
 }
 
 pub(super) async fn destroy(db: &Db, sde: &Arc<Sde>, character: i64, item: i64, now: i64) -> Result<(Value, Vec<Effect<OnlineChanged>>), CallError> {
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    let fences = crate::services::effects::online::capture_online_fences(&world, &[character]).await;
     db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-        let sde = sde.clone();
-        Box::pin(async move { destroy_tx(tx, outbox, &sde, character, item, now).await })
+        let sde = sde.clone(); let fences = fences.clone();
+        Box::pin(async move { destroy_tx(tx, outbox, &sde, &fences, character, item, now).await })
     }, |value, outbox| async move { Ok((value, outbox.into_entries())) }).await
 }
 

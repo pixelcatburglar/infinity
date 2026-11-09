@@ -1,6 +1,7 @@
 //! Transactional salvage through the fitted effect, persistent inventory and system actor.
 use super::fixture;
-use crate::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_SALVAGING, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_CARGO_CONTAINER, GROUP_WRECK}, dao::items::{creation, dogma, loading::{self, ItemQuery}}, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, salvage}, fit::{Fit, Key}}, space::World};
+use infinity_core::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_SALVAGING, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_CARGO_CONTAINER, GROUP_WRECK}};
+use crate::{dao::items::{creation, dogma, loading::{self, ItemQuery}}, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, salvage}, fit::{Fit, Key}}, space::World};
 use std::{sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}}, time::Duration};
 
 // SDE dogma accessDifficulty and accessDifficultyBonus; invGroups Salvaged Materials.
@@ -11,8 +12,8 @@ const SYSTEM: i64 = 1;
 
 fn cycle(cx: &Ctx, module: i64, kind: i32, target: i64, effect: registry::Effect, generation: Arc<AtomicBool>) -> Cycle {
     Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: kind, flag: FLAG_HI_SLOT_FIRST }], effect,
-        target: Some(target), repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation, armed: false },
-        started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0 }
+        target: Some(target), repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
+        started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false }
 }
 
 #[tokio::test]
@@ -63,6 +64,12 @@ async fn salvage_preserves_loot_refuses_full_cargo_and_claims_once() {
             state.activation_generation.insert(f.module, generation.clone());
         }
         let fit = Fit::load(&test_db, sde.clone(), f.character, f.ship).await.ok().expect("load fit");
+        dogma::set_override(&test_db, f.module, BONUS, -1000000.0).await.unwrap();
+        let miss_fit = Fit::load(&test_db, sde.clone(), f.character, f.ship).await.ok().unwrap();
+        let mut miss = cycle(&cx, f.module, module, target, effect.clone(), generation.clone());
+        assert!(matches!(salvage::end(&cx, &miss_fit, &mut miss).await.ok().unwrap(), CycleOutcome::Continue));
+        assert!(crate::db::outbox::tests::events(&test_db, "WreckSalvaged", f.character).await.is_empty());
+        dogma::set_override(&test_db, f.module, BONUS, 1000.0).await.unwrap();
         assert!(fit.value(Key::Module(f.module), BONUS) + sde.types.attribute(wreck, DIFFICULTY).unwrap() >= 100.0);
         let mut first = cycle(&cx, f.module, module, target, effect.clone(), generation.clone());
         assert!(matches!(salvage::start(&cx, &fit, &mut first).await.ok().unwrap(), CycleOutcome::Continue));
@@ -73,12 +80,32 @@ async fn salvage_preserves_loot_refuses_full_cargo_and_claims_once() {
         assert_eq!(fixture::fingerprint(&test_db).await.unwrap(), full_before);
         assert!(test_world.ball(SYSTEM, target).await.is_some());
         assert!(rx.try_recv().is_err());
+        assert!(crate::db::outbox::tests::events(&test_db, "WreckSalvaged", f.character).await.is_empty());
         dogma::set_override(&test_db, f.ship, ATTR_CAPACITY, 1000000.0).await.unwrap();
         let fit = Fit::load(&test_db, sde.clone(), f.character, f.ship).await.ok().expect("reload fit");
+        test_db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&loot.item_id, &i32::MAX]).await.unwrap();
+        let rollback_before = fixture::fingerprint(&test_db).await.unwrap();
+        assert!(salvage::end(&cx, &fit, &mut first).await.is_err());
+        assert_eq!(fixture::fingerprint(&test_db).await.unwrap(), rollback_before);
+        assert!(loading::load_items(&test_db, ItemQuery::Id(target)).await.unwrap().len() == 1);
+        assert!(crate::db::outbox::tests::events(&test_db, "WreckSalvaged", f.character).await.is_empty());
+        assert!(loading::load_items(&test_db, ItemQuery::LocationFlags(f.ship, &[FLAG_CARGO])).await.unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+        test_db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&loot.item_id, &loot_type]).await.unwrap();
         let mut second = cycle(&cx, f.module, module, target, effect, generation);
         let (a, b) = tokio::join!(salvage::end(&cx, &fit, &mut first), salvage::end(&cx, &fit, &mut second));
         let outcomes = [a.ok().unwrap(), b.ok().unwrap()];
         assert_eq!(outcomes.iter().filter(|o| matches!(o, CycleOutcome::Ended { reason: "salvage complete", outcome: crate::lua::events::ModuleCycleOutcome::Completed })).count(), 1);
+        let events = crate::db::outbox::tests::events(&test_db, "WreckSalvaged", f.character).await;
+        assert!(matches!(events.as_slice(), [crate::lua::events::GameEvent::WreckSalvaged { char_id, wreck_id, wreck_type, context, .. }]
+            if *char_id == f.character && *wreck_id == target && *wreck_type == wreck
+                && context.ship_id == Some(f.ship) && context.ship_type_id == Some(hull)
+                && context.system_id == Some(SYSTEM) && context.origin == crate::lua::events::resources::FactOrigin::Natural));
+        let journal = test_db.query_one("SELECT source_namespace, source_key FROM game.progress_events WHERE kind=$1 AND subject_character_id=$2", &[&"WreckSalvaged", &f.character]).await.unwrap();
+        assert_eq!(journal.get::<_, String>("source_namespace"), "business");
+        assert_eq!(journal.get::<_, String>("source_key"), format!("WreckSalvaged:{target}"));
+        let _ = salvage::end(&cx, &fit, &mut first).await;
+        assert_eq!(crate::db::outbox::tests::events(&test_db, "WreckSalvaged", f.character).await.len(), 1);
         assert!(loading::load_items(&test_db, ItemQuery::Id(target)).await.unwrap().is_empty());
         assert!(test_world.ball(SYSTEM, target).await.is_none());
         let cargo = loading::load_items(&test_db, ItemQuery::LocationFlags(f.ship, &[FLAG_CARGO])).await.unwrap();
@@ -108,7 +135,7 @@ async fn salvage_preserves_loot_refuses_full_cargo_and_claims_once() {
     let target = target_id.load(Ordering::Relaxed);
     if target != 0 { world.remove_ball(SYSTEM, target).await; }
     combat::forget_ship(f.ship);
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     let flush = world.flush_positions().await;
     drop(world);
     fixture::cleanup(&db, f).await.unwrap();

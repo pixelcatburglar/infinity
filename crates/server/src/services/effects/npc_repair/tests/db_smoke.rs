@@ -1,10 +1,11 @@
 use super::*;
 use std::sync::Arc;
-use crate::{consts::{dogma::ATTR_ARMOR_HP, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_STRUCTURE_HP,
-    dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE,
-    dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, CATEGORY_ENTITY},
-    services::combat::groups_health::damage,
-    space::{NpcBrain, NpcConfig, WarpState, MODE_STOP}};
+use infinity_core::consts::CATEGORY_ENTITY;
+use crate::{
+    services::combat::{damage::apply_damage_guarded, groups_health::ShipStats},
+    services::fit::{Fit, Key},
+    space::{NpcBrain, NpcConfig, WarpState, MODE_STOP},
+};
 
 const CYCLE_MS: f64 = 500.0;
 const CYCLE_WAIT_MS: u64 = 800;
@@ -19,7 +20,7 @@ fn ball(id: i64, type_id: i32, owner: i64, pilot: Option<i64>) -> Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
@@ -28,11 +29,11 @@ fn brain(hostile: Option<i64>, shots: Option<tokio::sync::mpsc::UnboundedSender<
     let mut brain = NpcBrain::new(hostile.map(|_| crate::space::HOSTILE_TO_ALL), NpcConfig {
         fly_range: 1.0, aggro_range: 1000.0, rate_of_fire_ms: 1e9,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 1000.0),
-    }, Arc::new(move |action| {
+    }, Arc::new(move |_, action| {
         if let crate::space::NpcAction::Shot { generation, .. } = action {
             if let Some(tx) = &shots { let _ = tx.send(generation); }
         }
-        Box::pin(async {})
+        Some(Box::pin(async {}))
     }));
     if let Some(id) = hostile {
         brain.target = Some((id, 1, 0));
@@ -42,9 +43,23 @@ fn brain(hostile: Option<i64>, shots: Option<tokio::sync::mpsc::UnboundedSender<
 }
 async fn run_source(db: &crate::db::Db, world: &Arc<crate::space::World>, system: i64, me: &Ball, victim: &Ball, effect: &Effect, duration_ms: f64, generation: u64) -> Result<(), CallError> {
     let fit = crate::services::fit::Fit::for_space_type(world.sde().clone(), me.type_id, vec![]);
+    let source = me.id;
+    let target = victim.id;
+    let effect_id = effect.id;
+    let weak = Arc::downgrade(world);
+    let attempt = world.with(system, move |s| {
+        let facts = s.prepare_body_combat_source(source, None, Some(effect_id), None,
+            crate::lua::events::resources::FactOrigin::Natural,
+            move |s| s.npc_projection_valid(source, target, generation)).expect("native NPC admission");
+        PreparedCombatAttempt::new(facts, weak, system)
+    }).await.expect("NPC system");
+    assert_eq!(attempt.facts().entity.item_id, source);
+    assert_eq!(attempt.facts().actual_actor_character, None);
+    assert!(attempt.facts().source_is_npc);
+    assert_eq!(attempt.facts().effect_id, Some(effect_id));
     apply_source(&SourceContext { db, world, system, source: me, target: victim, module: 0, effect, duration_ms, fit: &fit,
         key: crate::services::fit::Key::Ship, guard: SourceGuard::Npc { source: me.id, target: victim.id, generation },
-        attacker: None, drone: None, phase: DronePhase::Begin }).await
+        attacker: None, drone: None, phase: DronePhase::Begin }, Some(attempt)).await
 }
 
 
@@ -54,23 +69,25 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let target_type = sde.types.iter().find(|ty| {
-        ty.category_id == Some(CATEGORY_ENTITY)
-            && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP].into_iter()
-                .all(|id| ty.attribute(id).is_some_and(|v| v.is_finite() && v > 0.0))
-            && [ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE].into_iter()
-                .all(|id| ty.attribute(id).unwrap_or(1.0) > 0.0)
-    }).expect("SDE NPC with all health layers").type_id;
-    let hp = [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP].map(|id| sde.types.attribute(target_type, id).unwrap());
-    let resonance = [ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE]
-        .map(|id| sde.types.attribute(target_type, id).unwrap_or(1.0));
+        if ty.category_id != Some(CATEGORY_ENTITY) { return false; }
+        let fit = Fit::for_space_type(sde.clone(), ty.type_id, vec![]);
+        let stats = ShipStats::from_fit(&fit, Key::Ship);
+        stats.max.iter().all(|v| v.is_finite() && *v > 0.0)
+            && stats.resonance.iter().flatten().all(|v| v.is_finite() && *v >= 0.0)
+            && stats.resonance.iter().all(|layer| layer[0] > 0.0)
+            && stats.shield_tau_ms.is_finite() && stats.shield_tau_ms > 60_000.0
+    }).expect("SDE NPC with fitted health layers and persistent shield damage").type_id;
+    let stats = ShipStats::from_fit(&Fit::for_space_type(sde.clone(), target_type, vec![]), Key::Ship);
+    let hp = stats.max;
+    let resonance = stats.resonance.map(|layer| layer[0]);
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     for (layer, effect_id) in [EFFECT_NPC_REMOTE_SHIELD_BOOSTER, EFFECT_NPC_REMOTE_ARMOR_REPAIRER, EFFECT_NPC_REMOTE_HULL_REPAIRER].into_iter().enumerate() {
         let effect = super::super::super::registry::resolve(&sde, effect_id).expect("NPC repair effect");
         let source_type = sde.types.iter().find(|ty| ty.effects().iter().any(|e| e.effect_id == effect_id)
             && supported_for_type(&sde, ty.type_id, &effect)
-            && ty.attribute(repair::amount_attribute(layer)).is_some_and(|v| v > 0.0))
+            && Fit::for_space_type(sde.clone(), ty.type_id, vec![]).value(Key::Ship, repair::amount_attribute(layer)) > 0.0)
             .expect("SDE NPC repair source").type_id;
-        let system = -30_000 - layer as i64;
+        let system = 30_000 + layer as i64;
         let source = system * 100;
         let hostile = source + 1;
         let ally = source + 2;
@@ -84,20 +101,64 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
             s.insert(ball(ally, target_type, 1, None));
             s.insert(ball(rival, target_type, 1, None));
             s.insert(ball(outsider, target_type, 2, None));
-            s.add_npc(source, brain(Some(hostile), Some(shot_tx)));
-            s.add_npc(ally, brain(None, None));
-            s.add_npc(rival, brain(None, None));
-            s.add_npc(outsider, brain(None, None));
+            assert!(s.add_npc(source, brain(Some(hostile), Some(shot_tx))));
+            assert!(s.add_npc(ally, brain(None, None)));
+            assert!(s.add_npc(rival, brain(None, None)));
+            assert!(s.add_npc(outsider, brain(None, None)));
         }).await.unwrap();
         let generation = tokio::time::timeout(std::time::Duration::from_secs(10), shot_rx.recv())
             .await.expect("NPC shot timed out").expect("NPC callback closed");
+        world.with(system, move |s| {
+            let first = s.prepare_body_combat_source(source, None, Some(i64::from(effect_id)), None,
+                crate::lua::events::resources::FactOrigin::Natural, move |s| s.npc_projection_valid(source, hostile, generation)).unwrap();
+            let second = s.prepare_body_combat_source(source, None, Some(i64::from(effect_id)), None,
+                crate::lua::events::resources::FactOrigin::Natural, move |s| s.npc_projection_valid(source, hostile, generation)).unwrap();
+            assert_eq!(first.sequence.checked_add(1), Some(second.sequence));
+            assert!(first.source_is_npc && first.actual_actor_character.is_none());
+            s.finish_combat_attempt(&second);
+            s.finish_combat_attempt(&first);
+        }).await.unwrap();
         let full_source = world.ball(system, source).await.unwrap();
         let full_victim = world.ball(system, hostile).await.unwrap();
         run_source(&db, &world, system, &full_source, &full_victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         let full = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(full, 1.0);
         let raw = (0..layer).map(|i| hp[i] / resonance[i]).sum::<f64>() + hp[layer] * 0.5 / resonance[layer];
-        for id in [ally, rival, outsider] { damage(&db, &world, system, id, [raw, 0.0, 0.0, 0.0], None, None).await.ok().unwrap(); }
+        for id in [ally, rival, outsider] {
+            let weak = Arc::downgrade(&world);
+            let mut attempt = world.with(system, move |s| {
+                let facts = s.prepare_body_combat_source(source, None, None, None,
+                    crate::lua::events::resources::FactOrigin::Natural,
+                    move |s| s.npc_projection_valid(source, hostile, generation)).unwrap();
+                PreparedCombatAttempt::new(facts, weak, system)
+            }).await.unwrap();
+            let outcome = apply_damage_guarded(&db, &world, system, id, [raw, 0.0, 0.0, 0.0],
+                crate::services::combat::damage::DamageSource { facts: Some(attempt.facts()), ..Default::default() }, false, |_| true).await.unwrap().unwrap();
+            attempt.disarm();
+            assert!(outcome.dealt > 0.0 && !outcome.lethal);
+        }
+        // Publish stored actor fractions, calibrating only if independently timed
+        // shield recharge made the real damage produce unequal raw conditions.
+        world.with(system, move |s| {
+            let ids = [ally, rival, outsider];
+            let raw = ids.map(|id| {
+                let condition = s.combat_condition_snapshot(id).unwrap().condition;
+                condition.now[layer] / condition.stats.max[layer]
+            });
+            if raw[0] != raw[1] || raw[0] != raw[2] {
+                for id in ids { s.set_condition_fraction_mask(id, 1 << layer, 0.5); }
+            }
+            let mut fractions = [0.0; 3];
+            for (index, id) in ids.into_iter().enumerate() {
+                let condition = s.combat_condition_snapshot(id).unwrap().condition;
+                fractions[index] = condition.now[layer] / condition.stats.max[layer];
+                let mut health = s.ball(id).unwrap().health;
+                health[layer] = fractions[index];
+                s.set_health(id, health);
+            }
+            assert_eq!(fractions[0], fractions[1], "actor selection fractions must tie");
+            assert_eq!(fractions[0], fractions[2], "wrong-owner fraction must match");
+        }).await.unwrap();
         let before = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert!(before < 1.0);
         assert!(world.after(system, CYCLE_WAIT_MS).await);
@@ -114,8 +175,38 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
         assert!(world.after(system, CYCLE_WAIT_MS).await);
         let unchanged = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(unchanged, before);
+        let source_fit = Fit::for_space_type(sde.clone(), source_type, vec![]);
+        let optimal = effect.attribute(EffectAttribute::Range).map_or(0.0, |attr| source_fit.value(Key::Ship, attr));
+        let falloff = effect.attribute(EffectAttribute::Falloff).map_or(0.0, |attr| source_fit.value(Key::Ship, attr));
+        let base = source_fit.value(Key::Ship, repair::amount_attribute(layer));
+        let facts = world.with(system, move |s| {
+            let me = s.sampled_ball(source).unwrap();
+            let a = s.sampled_ball(ally).unwrap();
+            let b = s.sampled_ball(rival).unwrap();
+            let other = s.sampled_ball(outsider).unwrap();
+            let a_gap = gap(&me, &a);
+            let b_gap = gap(&me, &b);
+            let selected = s.assist_target(source, |me, candidate| {
+                if candidate.id == hostile || me.mode == MODE_WARP || candidate.mode == MODE_WARP { return None; }
+                score(npc_health_fraction(candidate, layer), gap(me, candidate), optimal, falloff)
+            }).map(|ball| ball.id);
+            (s.npc_projection_valid(source, hostile, generation),
+                s.npc_assist_eligible(source, ally), s.npc_assist_eligible(source, rival),
+                s.npc_assist_eligible(source, outsider), a.health[layer], b.health[layer],
+                other.health[layer], a_gap, b_gap, selected)
+        }).await.unwrap();
+        let amount = repair::scaled_amount(base, facts.7, optimal, falloff);
+        assert!(facts.0 && facts.1 && facts.2 && !facts.3, "projection/eligibility: {facts:?}");
+        assert_eq!(facts.4, facts.5, "selection scores must tie: {facts:?}");
+        assert_eq!(facts.4, facts.6, "outsider must have the same published health: {facts:?}");
+        assert_eq!(facts.9, Some(ally), "lowest-ID selection: {facts:?}; optimal={optimal} falloff={falloff}");
+        assert!(amount.is_finite() && amount > 0.0, "repair amount={amount} base={base} optimal={optimal} falloff={falloff} facts={facts:?}");
+        let actor_before = world.with(system, move |s| s.combat_condition_snapshot(ally).unwrap().condition.now[layer]).await.unwrap();
         run_source(&db, &world, system, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         let (first, second) = world.with(system, move |s| (npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap(), npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap())).await.unwrap();
+        let actor_first = world.with(system, move |s| s.combat_condition_snapshot(ally).unwrap().condition.now[layer]).await.unwrap();
+        if layer == 0 { assert!(actor_first > actor_before, "shield repair changes actor condition: before={actor_before} after={actor_first} amount={amount} facts={facts:?}"); }
+        else { assert_eq!(actor_first, actor_before, "armor and hull do not repair at cycle start"); }
         if layer == 0 { assert!(first > before); } else { assert_eq!(first, before); }
         assert_eq!(second, before, "equal health ties choose the lower ID");
         let outsider_health = world.with(system, move |s| npc_health_fraction(s.ball(outsider).unwrap(), layer).unwrap()).await.unwrap();
@@ -123,6 +214,8 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
         if layer != 0 {
             assert!(world.after(system, CYCLE_WAIT_MS).await);
             let after = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
+            let actor_after = world.with(system, move |s| s.combat_condition_snapshot(ally).unwrap().condition.now[layer]).await.unwrap();
+            assert!(actor_after > actor_before, "cycle end changes actor condition");
             assert!(after > before, "armor and hull repair at cycle end");
             // The remaining damaged ally is selected, then made ineligible before the timer.
             run_source(&db, &world, system, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();

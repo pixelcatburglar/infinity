@@ -12,8 +12,8 @@
 //! descriptors (extracted by tools/extract_protos.py) through prost-reflect.
 //! Responses use embedded protobuf descriptors, server CDN content and DAO data;
 //! notice delivery uses World to resolve current pilots and has no durable replay.
-//! Unclaimed requests retain default responses; valid Events are unclaimed, and
-//! career content is not complete.
+//! Descriptors are validated before database startup. Unclaimed requests retain
+//! default responses; valid Events are unclaimed, and career content is not complete.
 
 mod achievements;
 mod career_goals;
@@ -21,12 +21,13 @@ mod character_titles;
 mod characters;
 mod content;
 mod context;
-mod error;
+pub(crate) mod daily_goals;
+pub(crate) mod error;
 mod events;
 mod fallback;
-mod handlers;
+pub(crate) mod handlers;
 mod insurgency;
-mod message;
+pub(crate) mod message;
 pub(crate) mod notices;
 mod plex;
 pub(crate) mod protocol;
@@ -67,9 +68,14 @@ impl Gateway {
 
 
 
-pub async fn serve(bind: String, gw: Arc<Gateway>) -> Result<()> {
+pub(crate) fn validate() -> Result<()> {
     handlers::validate()?;
+    daily_goals::validate()?;
     anyhow::ensure!(message::message("eve_public.Event").is_some(), "missing event descriptor eve_public.Event");
+    Ok(())
+}
+
+pub async fn serve(bind: String, gw: Arc<Gateway>) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     info!("public gateway (gRPC) listening on {bind}; {} message types loaded", pool().all_messages().count());
     loop {

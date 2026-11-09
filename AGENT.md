@@ -21,11 +21,11 @@ These rules apply to anyone changing this repository, coding agents and humans a
 - **Keep diffs minimal and on-topic.** No drive-by refactors, renames or reformatting of code you are not changing. Cleanups that the rules below require (removing a duplicate helper, naming a constant, migrating to the one mechanism) go into a commit of their own, never mixed into a feature commit.
 - **One architecture per concern.** Each concern is handled one way across the whole server. When a mechanism replaces another, migrate every caller and delete the old one in the same change: no parallel paths, compatibility shims, aliases, re-exports or flags that keep an old design alive. For example, space state is reached only through `World`, and timed effects in space run only on actor timers (see Shared state and concurrency).
 - **No hardcoding.** Logic contains no magic numbers and no literal type, group, attribute or item IDs.
-  - Name every value as a `const`. Its doc comment states the source: a client constant (file and name), an SDE ID, a carbonengine value, or a design decision of this server. A constant only one module uses sits at the top of that module. A game-data constant used by more than one module is defined once in `consts.rs`, or in `consts/dogma.rs` for dogma attribute and effect IDs, and imported (see Shared helpers); never redefine it locally, and never give two different meanings the same name (an effect ID and an effect category, seconds and FILETIME units).
+  - Name every value as a `const`. Its doc comment states the source: a client constant (file and name), an SDE ID, a carbonengine value, or a design decision of this server. A constant only one module uses sits at the top of that module. A game-data constant used by more than one module is defined once in `crates/core/src/consts.rs`, or in `crates/core/src/consts/dogma.rs` for dogma attribute and effect IDs, and imported through `infinity_core::consts` (see Shared helpers); never redefine it locally, and never give two different meanings the same name (an effect ID and an effect category, seconds and FILETIME units).
   - Values the SDE or dogma data provides are read from that data, not copied. For example, lock time comes from the ship's scan resolution and the target's signature radius, for players and NPCs alike.
   - Deployment settings (addresses, ports, capacities, the database connection) come from `Config` (`crates/server/src/config/`): the `config.toml` file, overridden by the environment variable named in `config.example.toml`. The server reads environment variables nowhere else.
   - Values an operator may tune (starting balances, fees and taxes, timers, limits, spawn ranges and sizes) are fields of the game configuration (`crates/server/src/config/`), each with a default and a comment naming its source, and are read through `config::game()`; they are never a module `const`. Values the client checks, values from the SDE and carbonengine destiny constants stay `const`.
-  - Player-visible text and client message names are never written inline; they are defined in the `messages` module (see Player-visible text).
+  - Player-visible text and client message names are never written inline; they are defined in `infinity_core::messages` (see Player-visible text).
   - Unit conversions go through the shared helpers, never inline factors such as `* 10_000` or `/ 1000`.
   - Exempt: `0` and `1` as identities, array indices, and test fixtures.
 - **No duplicated helpers.** Before writing a helper, search for an existing one. A helper needed by more than one module lives in one shared place (see Shared helpers); never copy it into another module.
@@ -37,13 +37,16 @@ The server crate embeds `crates/server/proto/eve_protos.desc` at compile time; i
 
 | Task | Command |
 |---|---|
-| Build everything | `cargo build --release` |
-| All unit tests | `cargo test --release` |
-| Tests for one crate | `cargo test --release -p marshal` (packages: `server`, `marshal`, `sde-import`, `blue-patch`) |
+| Build for deployment | `cargo build --release` |
+| Build every target for tests | `env CARGO_PROFILE_RELEASE_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked --workspace --all-targets` |
+| All unit tests | the same `env` overrides, then `cargo test --release --locked --workspace` |
+| Tests for one crate | `cargo test --release -p infinity-core` (packages: `server`, `infinity-core`, `marshal`, `sde-import`, `blue-patch`) |
 | Tests in Docker | `docker build --target test .` |
 | Rebuild and restart the server | `docker compose up -d --build server` |
 | End-to-end check with the client | `scripts/iterate.ps1` (`-Seconds`, `-AutoSelect`, `-NoBuild`) |
 | Inspect a marshal stream | `marshal-dump [--check] <file>...` |
+
+The test rows turn off link-time optimisation for that one command only, which makes test builds faster; never export the overrides. A binary left behind by those commands is for tests and local runs, never for deployment: deployment binaries come from `cargo build --release`, the Docker build or a release. `docs/development.md` explains the test lane and how to run the database tests.
 
 **CI.** Every change reaches `main` through a pull request.
 - `main` accepts a merge only when both checks of the `CI` workflow pass on a branch that is up to date with `main`:
@@ -71,12 +74,13 @@ Any other tag starts nothing.
 | Server logs | `logging.rs` (stdout, plus time-rotated server and client-error files when `logging.dir` is set; `main` keeps the writer guards until exit so the last lines are flushed) |
 | Client error reports | `services/alert.rs` (traceback upload, repeat counts and log-mode changes), `services/event_log.rs` (crash notes), `dao/client_errors.rs` (`game.client_errors`, `game.client_error_reports`, `game.client_crashes`) |
 | Login handshake | `handshake.rs` (GPS, Placebo crypto), `live_sessions.rs` (one live session per account) |
-| Packet loop, session changes, notifications | `client.rs`, `session.rs`, `macho.rs`, `conn.rs`, `framing.rs` |
+| Packet loop, session changes, notifications | `client.rs`, `macho.rs`, `conn.rs`, `framing.rs`; shared session data in `crates/core/src/session.rs` |
 | Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |
 | Lua scripts | `lua/` (VM, typed values, host functions and reload), `lua/host/pilots/` (simulated-pilot lifecycle and game-operation adapters), `dao/lua_store.rs` (`game.lua_store`); the shipped scripts are in `crates/server/lua/`, and `docs/lua.md` documents the script API |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM), `services/effects/` (effect registry, activation lifecycle and the effect families; see `docs/effects.md`) |
-| Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, integration and interpolation, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, destiny clock, action queue, tick, timers), `space/actor.rs` (per-system mailbox and the wall-aligned 100 ms loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/drone.rs` (drone orders, control and automatic engagement; drones use the NPC effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
+| Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, integration and interpolation, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, destiny clock, action queue, timers) and `space/system/tick.rs` (the tick), `space/actor.rs` (per-system mailbox and the wall-aligned 100 ms loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/drone.rs` (drone orders, control and automatic engagement; drones use the NPC effects worker), `space/combat_facts.rs` (the system's bounded in-memory aggregates of accepted combat effects, journalled by the system checkpoint), `space/snapshot.rs` (periodic pilot position saves, frozen combat facts and the shutdown flush) |
 | Scheduled jobs | `scheduler/` (job registration, the claim runner, retries and the shutdown drain), `dao/jobs.rs` (`game.jobs`); handlers register in `services/mod.rs` |
+| Progress events | `progress/` (event registration, durable consumers and their delivery, the Lua observer; `progress/codec.rs` encodes stored events), `dao/progress/` (`game.progress_events`, subscriptions and deliveries); `docs/progress-events.md` documents the guarantees |
 | Public gateway (gRPC) | `gateway/mod.rs` (`Gateway`, built once with its database, world and config), `gateway/transport.rs` (HTTP/2 streams), `gateway/protocol.rs` and `gateway/message.rs` (envelopes and messages), `gateway/requests.rs` (the one table of claimed requests), `gateway/context.rs` (`HandlerContext`: the authenticated caller and identity of one request), `gateway/error.rs` (typed failures), `gateway/events.rs`, `gateway/fallback.rs`; one module per feature (`skill_plans/`, `achievements/`, `characters.rs`, `plex.rs`, ...) |
 | Chat | `chat.rs` and `chat/` (XMPP transport, connected occupants and stanzas); `services/chat/` (`XmppChatMgr`, room admission and moderation authority, moderation expiry); `dao/chat_channels.rs` |
 | Image server and content CDN | `images.rs`, `cdn.rs` |
@@ -85,7 +89,7 @@ Any other tag starts nothing.
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
 | Static data (SDE) | `sde/mod.rs` (`Sde`: loaded once at startup, read-only, shared as `Arc<Sde>`; one module per dataset such as `types`, `dogma`, `map`, `industry`, `missions`), `dao/sde/` (the only static-data SQL, run once by the loader) |
 | Game data access (all `game.*` SQL) | `dao/`: one module per kind of data (`accounts`, `characters`, `items`, `wallets`, `skills`, `market`, `contracts`, ...); a feature's statements on shared data live in `dao/<data>/<feature>.rs` |
-| Player-visible text and client message names | `messages.rs` and `messages/<feature>.rs` |
+| Player-visible text and client message names | `crates/core/src/messages.rs` and `crates/core/src/messages/<feature>.rs` (`infinity_core::messages`) |
 | Wire format | `crates/marshal` |
 
 ## 4. Conventions
@@ -160,15 +164,16 @@ Any other tag starts nothing.
 ### Player-visible text
 
 - The Infinity client runs in Simplified Chinese. Any text a player sees, such as notify messages, mail, agent lines and default names, is written in Simplified Chinese, matching the existing strings.
-- Every such text is defined once in the `messages` module (`crates/server/src/messages.rs` and its children), and call sites refer to it by its module path.
-  - Text that predates the children stays in `messages.rs`, in the section for its feature (`messages::NAME`).
-  - GM slash-command text (help lines, replies and refusals) lives in `messages/gm.rs` (`messages::gm::NAME`).
-  - Any other new text goes in its feature's child, `messages/<feature>.rs` (`messages::<feature>::NAME`), declared with one `pub(crate) mod <feature>;` line in `messages.rs`. New text is not added to `messages.rs` itself, and nothing is re-exported.
+- Every such text is defined once in `infinity_core::messages` (`crates/core/src/messages.rs` and its children), and call sites refer to it by its module path.
+  - Text that predates the children stays in `crates/core/src/messages.rs`, in the section for its feature (`infinity_core::messages::NAME`).
+  - GM slash-command text (help lines, replies and refusals) lives in `crates/core/src/messages/gm.rs` (`infinity_core::messages::gm::NAME`).
+  - Any other new text goes in its feature's child, `crates/core/src/messages/<feature>.rs` (`infinity_core::messages::<feature>::NAME`), declared with one `pub mod <feature>;` line in `crates/core/src/messages.rs`. New text is not added to `messages.rs` itself, and nothing is re-exported. Only items used by production callers outside the crate are public; internal helpers and test-only access do not widen the API.
   - Plain text is a `const`.
   - Text that carries values is a function in the same file as its texts that returns `String`; no other file formats player-visible text.
-  - Client message names (the keys of the client's message catalogue passed to `user_error`, `CallError::User` or a notification, such as `CustomNotify`) are `MSG_` consts in their own section of `messages.rs`, one catalogue shared by every feature.
+  - Client message names (the keys of the client's message catalogue passed to `user_error`, `CallError::User` or a notification, such as `CustomNotify`) are `MSG_` consts in their own section of `crates/core/src/messages.rs`, one catalogue shared by every feature.
   - Reuse an existing entry when the meaning is the same; add a new one when it differs.
   - Not messages: names read from the SDE or written by players, and protocol identifiers such as service, method and notification names (`OnItemChange`).
+- The one exception is Lua-owned content (`crates/server/lua/content/<feature>/`): its player-visible text is defined once in that feature's `messages.lua`, and handlers and data refer to it by key. Client message names and text shared with Rust stay in `infinity_core::messages`; never write the same text in both, and never copy client localization into the repository.
 - Everything else (code, comments, logs, docs) stays in English.
 
 ### Shared state and concurrency
@@ -198,7 +203,8 @@ Helpers and constants used by more than one module, each defined once:
 - `services/mod.rs`: `CallError` builders (`db_err`, `user_error`, `notify_error`), random numbers (`rand01`, `rand_dir`), reading a field of a client `Value`, and other service-level queries shared by several services.
 - `space/mod.rs`: vector math on `V3` (`add`, `sub`, `scale`, `len`, `dist`), the wall clock (`now_ms`) and unit conversions (`ms_to_seconds`, `seconds_to_ms`). Destiny stamps are not conversions of the wall clock; they come from `System::current_time()`.
 - `client.rs`: FILETIME conversions (`filetime_now` and conversions from unix time).
-- `consts.rs` and its child `consts/dogma.rs`: game-data constants used by more than one module, grouped by source. Dogma attribute and effect IDs live in `consts/dogma.rs` and are imported as `crate::consts::dogma::...`; `consts.rs` holds the rest: FILETIME durations, distances, SDE type, group and category IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `macho::cmd` and the space ball modes and flags.
+- `hash.rs`: `sha256_hex`, the lowercase hexadecimal SHA-256 digest of a byte slice, used for shared settings and Lua content identities. The importer crate has its own `sde_import::encoding::hex` for raw bytes.
+- `crates/core/src/consts.rs` and its child `crates/core/src/consts/dogma.rs`: game-data constants used by more than one module, grouped by source. Dogma attribute and effect IDs live in `crates/core/src/consts/dogma.rs` and are imported as `infinity_core::consts::dogma::...`; `crates/core/src/consts.rs` holds the rest: FILETIME durations, distances, SDE type, group and category IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `macho::cmd` and the space ball modes and flags.
 - `dao/`: statements used by several features, in the module of their data (see Database).
 - `sde/mod.rs`: `Sde::celestial_radius`, the one collision radius of a celestial (its own radius, then its type's, then one documented fallback), as the `f32` destiny sends. Static balls and every placement next to a celestial widen that value; never apply a separate fallback or cast.
 - Game formulas used by several callers (such as lock time) are one function in the module that owns the mechanic, called by every user, players and NPCs alike.
@@ -221,6 +227,7 @@ Helpers and constants used by more than one module, each defined once:
   - Dao functions take an `Executor`; service helpers that queue effects also take the outbox. Both work inside a transaction and on their own, and never open a transaction themselves.
 - **Notify after commit.** Inside `operation`:
   - Never notify a client, call `World`, or change memory state directly. Queue the effect in the outbox; a rolled-back operation sends nothing.
+  - A game event is queued with `outbox.event(...)` inside `operation`. The runner journals it before COMMIT and hands it to consumers and Lua after; an event never reaches them outside a transaction.
   - Never `.await` on `World` or on a client. Read what the operation needs from `World` before the transaction starts.
 - **Guarded writes.** A write that depends on a value read earlier checks it in SQL, for example `UPDATE ... SET quantity = quantity - $2 WHERE item_id = $1 AND quantity >= $2`. The same applies to a status transition (`AND status = $old`) and a balance (`AND balance >= $2`).
   - The guarded write is the dao function that performs it. It returns the affected count, an `Option` or a `bool`; the service turns a miss into the player-visible refusal and rolls the transaction back.
@@ -232,6 +239,7 @@ Helpers and constants used by more than one module, each defined once:
   - `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
   - guarded backfill `UPDATE`s
 - Never edit or remove an existing statement in a way that breaks a database created by an earlier version. Add new statements to the relevant section, with a comment naming the owning module.
+- **Size fields for the future.** Give a new or changed count, quantity, amount or ID the widest type the game could ever need, not the type today's values fit: `bigint`/`i64` for counts, quantities and IDs, `numeric` for ISK and other money. Widening a column later means a schema migration and a pass over every caller; this rule avoids that rework. The client is still the spec for the wire: encode each value in the type the client accepts, and refuse a value that does not fit; never truncate it.
 - The `dao/sde/` loaders read the typed `sde.*` tables, and the raw `sde_native` / `sde_compat` `jsonb` tables only for data that has no typed table yet. Load only the tables and fields the server reads; a new static read adds a field to a dataset in `sde/`, never a runtime query.
 - Never edit the dumps under `db/` by hand. Regenerate them with `scripts/db-dump.ps1`, in a commit of their own.
 - Persist what players would expect to survive a restart. If state is kept in memory on purpose, say so in the module docs.

@@ -5,9 +5,9 @@
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::{range::range_multiplier, weapons::consume_charge, EffectKind};
-use crate::consts::{dogma::ATTR_CAPACITOR_BONUS, dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_POWER_TRANSFER_AMOUNT, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
-use crate::messages;
-use crate::services::combat::{Ctx, groups_health::{capacitor_snapshot, drain_exact_guarded, inject, NpcCapacitorGuard}, targeting_charges::{loaded, targets_of}};
+use infinity_core::consts::{dogma::ATTR_CAPACITOR_BONUS, dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_POWER_TRANSFER_AMOUNT, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
+use infinity_core::messages;
+use crate::services::combat::{Ctx, groups_health::{capacitor_snapshot, drain_exact_guarded, inject, inject_guarded, NpcCapacitorGuard}, targeting_charges::{loaded, targets_of}};
 use crate::services::fit::{Fit, Key};
 use crate::services::{user_error, CallError};
 use crate::space::{dist, MODE_WARP};
@@ -100,13 +100,13 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         }
         EffectKind::CapTransfer => {
             let amount = fit.value(key, ATTR_POWER_TRANSFER_AMOUNT).max(0.0) * scale;
-            inject(&cx.db, &cx.world, cx.system_id, target, amount).await?;
+            inject_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await?;
         }
         _ => unreachable!("not a capacitor effect"),
     }
     if target_drone && cycle.effect.has(EffectFlag::Offensive) {
-        if let (Some(victim), Some(ship_type)) = (victim_owner, fit.source_type(Key::Ship)) {
-            crate::services::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, ship_type, module.type_id, victim, target).await?;
+        if let (Some(victim), Some(_)) = (victim_owner, fit.source_type(Key::Ship)) {
+            crate::services::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, victim).await?;
         }
     }
     Ok(CycleOutcome::Continue)

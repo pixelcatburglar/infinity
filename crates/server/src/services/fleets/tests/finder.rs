@@ -2,7 +2,7 @@ use super::*;
 use super::super::fleet_proxy::{capacity, display, eligible, normalize, still_current};
 use crate::dao::characters::contacts::Contact;
 use crate::services::value_field;
-use crate::session::OnlineSession;
+use infinity_core::session::OnlineSession;
 
 fn session(id: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>) -> OnlineSession {
     OnlineSession { character_id: id, user_id: None, session_id: id, ship_id: None, station_id: None, system_id: Some(10), corporation_id: Some(corp), alliance_id: alliance, faction_id: faction, fleet_id: None, role: 0, corporation_role: 0 }

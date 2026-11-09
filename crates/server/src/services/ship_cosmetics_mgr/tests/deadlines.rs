@@ -38,7 +38,7 @@ async fn expiry_plus_one_overflow_is_rejected() {
         let skin = c.sde.ship_skins.skin(license.skin_id)?;
         (!skin.is_structure_skin && skin.visible(&c.cfg.server.boot_region)).then_some(skin.skin_id)
     }).expect("visible ordinary SKIN");
-    let now = i64::MAX - crate::consts::FILETIME_DAY;
+    let now = i64::MAX - infinity_core::consts::FILETIME_DAY;
     assert!(licenses::grant_tx(&db, &c.sde, &c.cfg.server.boot_region, fixture.character, skin, Some(1), now).await.is_err());
     assert!(ship_skins::get_stored_license(&db, fixture.character, skin).await.unwrap().is_none());
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
@@ -66,11 +66,11 @@ async fn query_and_authorized_selection_converge_overdue_licenses() {
             &[&character, &station_id, &system_id, &constellation_id, &region_id],
         ).await.unwrap();
         let ship_type = c.sde.types.iter().find(|t| {
-            t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_SHIP)
-                && t.type_id != crate::consts::TYPE_CAPSULE
+            t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
+                && t.type_id != infinity_core::consts::TYPE_CAPSULE
         }).expect("published SDE ship").type_id;
         let ship = crate::dao::items::creation::rookie_ship(
-            &test_db, ship_type, character, station_id, crate::consts::FLAG_HANGAR,
+            &test_db, ship_type, character, station_id, infinity_core::consts::FLAG_HANGAR,
         ).await.unwrap();
         crate::dao::characters::selection::set_ship(&test_db, character, ship).await.unwrap();
         let skin = c.sde.ship_skins.licenses().find_map(|license| {

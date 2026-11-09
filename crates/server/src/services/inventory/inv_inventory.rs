@@ -1,23 +1,50 @@
 //! Bound `invInventory` requests from `eve/client/script/environment/invCache.py`
 //! and `invCacheContainer`. Reads `game.items`, corporate roles and SDE types and
-//! delegates movement, reachability and stack mutations. Soul binding and service
+//! delegates movement, reachability and stack mutations. Shared ship-bay reads
+//! revalidate current physical reachability and access. Soul binding and service
 //! life damage are not modelled.
 
 use super::access::{container_of, custody_allowed, may_view_corp_hangar, Container};
 use super::movement;
 use super::stacks::{merge_operations, stack_all};
+use super::reachability::{Endpoint, Reachability};
 use crate::client::{short, Client};
-use crate::consts::{FLAG_CORP_DELIVERIES, FLAG_HANGAR, FLAG_PILOT, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
-use crate::consts::dogma::ATTR_CAPACITY;
+use infinity_core::consts::{CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_FLEET_HANGAR, FLAG_HANGAR, FLAG_PILOT, FLAG_SHIP_HANGAR, GROUP_WRECK, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
 use crate::dao::items::loading::{self, GameItem, Item, ItemQuery};
 use crate::db::executor::Executor;
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::services::{db_err, items::load_items, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use marshal::Value;
 use tracing::warn;
 fn kw_or_arg<'a>(call: &'a Call<'_>, name: &str, idx: usize) -> Option<&'a Value> {
     call.kwargs.get(name).or_else(|| call.args.get(idx)).filter(|v| !v.is_none())
+}
+
+fn physical_container(item: &Item) -> bool {
+    item.category_id == i64::from(CATEGORY_SHIP)
+        || i64::from(GROUP_WRECK) == item.group_id
+        || CARGO_CONTAINER_GROUPS.iter().any(|group| i64::from(*group) == item.group_id)
+}
+
+async fn admitted(c: &Client, endpoints: &[Endpoint]) -> Result<Vec<bool>, CallError> {
+    let identity = super::super::identity::Identity::of_client(c);
+    let reach = Reachability::capture(&identity, &c.db, &c.world, c.session.int("solarsystemid"), endpoints).await?;
+    reach.check_many(&c.db, &c.sde, endpoints).await
+}
+
+async fn metadata_access(c: &Client, item: &Item) -> Result<(), CallError> {
+    let endpoints = if !physical_container(item) || item.category_id == i64::from(CATEGORY_SHIP) && item.flag_id == FLAG_SHIP_HANGAR {
+        vec![Endpoint { location: item.location_id, flag: item.flag_id }]
+    } else {
+        [FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_SHIP_HANGAR].into_iter()
+            .map(|flag| Endpoint { location: item.item_id, flag }).collect()
+    };
+    if admitted(c, &endpoints).await?.into_iter().any(|allowed| allowed) {
+        Ok(())
+    } else {
+        Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))
+    }
 }
 
 async fn list(c: &Client, container: &Container, flags: Option<Vec<i64>>) -> Result<Vec<Item>, CallError> {
@@ -31,14 +58,38 @@ async fn list(c: &Client, container: &Container, flags: Option<Vec<i64>>) -> Res
         }
         Container::Deliveries { station_id, owner_id } => {
             if c.session.int("stationid") != Some(*station_id) || c.sde.map.station(*station_id).is_none()
-                || !may_view_corp_hangar(&c.db, me, *owner_id, FLAG_CORP_DELIVERIES).await?
+                || !may_view_corp_hangar(&c.db, me, *owner_id, *station_id, FLAG_CORP_DELIVERIES).await?
                 || flags.as_ref().is_some_and(|f| !f.contains(&FLAG_CORP_DELIVERIES)) { return Ok(vec![]); }
             load_items(&c.db, &c.sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &[FLAG_CORP_DELIVERIES])).await.map_err(db_err)?
         }
-        Container::Item(item_id) => match flags {
-            Some(flags) => load_items(&c.db, &c.sde, ItemQuery::LocationFlags(*item_id, &flags)).await.map_err(db_err)?,
-            None => load_items(&c.db, &c.sde, ItemQuery::Location(*item_id)).await.map_err(db_err)?,
-        },
+        Container::Item(item_id) => {
+            let mut items = match &flags {
+                Some(flags) => load_items(&c.db, &c.sde, ItemQuery::LocationFlags(*item_id, flags)).await.map_err(db_err)?,
+                None => load_items(&c.db, &c.sde, ItemQuery::Location(*item_id)).await.map_err(db_err)?,
+            };
+            let parent = load_items(&c.db, &c.sde, ItemQuery::Id(*item_id)).await.map_err(db_err)?.into_iter().next();
+            if parent.is_none() && c.sde.map.celestial(*item_id).is_none()
+                && Some(*item_id) != c.session.int("charid")
+                && super::super::offices::office_owner(&c.db, *item_id).await?.is_none() {
+                return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+            }
+            if parent.as_ref().is_some_and(physical_container) {
+                let mut requested: Vec<i32> = flags.unwrap_or_else(|| items.iter().map(|item| item.flag_id).collect());
+                if requested.is_empty() {
+                    requested.extend([FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_SHIP_HANGAR]);
+                }
+                requested.sort_unstable();
+                requested.dedup();
+                let endpoints: Vec<_> = requested.iter().map(|&flag| Endpoint { location: *item_id, flag }).collect();
+                let permissions = admitted(c, &endpoints).await?;
+                items.retain(|item| requested.binary_search(&item.flag_id).ok().is_some_and(|index| permissions[index]));
+                return Ok(items);
+            }
+            if let Some(item) = &parent {
+                metadata_access(c, item).await?;
+            }
+            items
+        }
     };
     let mut visible = Vec::new();
     for item in items {
@@ -59,6 +110,9 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
         Container::Item(id) => *id,
     };
     if let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next() {
+        if matches!(container, Container::Item(_)) {
+            metadata_access(c, &item).await?;
+        }
         return Ok(item.row());
     }
     if Some(id) == c.session.int("charid") {
@@ -90,7 +144,7 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
             custom_info: None,
         }.row())
     });
-    Ok(item.unwrap_or(Value::None))
+    item.ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))
 }
 
 pub(super) fn item_capacity(items: &[GameItem], id: i64, sde: &Sde) -> Result<(f64, f64), CallError> {
@@ -98,21 +152,80 @@ pub(super) fn item_capacity(items: &[GameItem], id: i64, sde: &Sde) -> Result<(f
     let used = items.iter().filter(|item| item.location_id == parent.item_id).try_fold(0.0_f64, |total, item| {
         Ok::<_, CallError>(total + super::super::item_volume::item_volume(sde, item.type_id, item.singleton, i64::from(item.quantity), None)?)
     })?;
-    let data = sde.types.get(parent.type_id).ok_or_else(|| anyhow::anyhow!("missing SDE type {}", parent.type_id))?;
-    let capacity = if parent.type_id == TYPE_PLASTIC_WRAP { used } else { data.attribute(ATTR_CAPACITY).or(data.capacity).unwrap_or(0.0) };
+    let capacity = if parent.type_id == TYPE_PLASTIC_WRAP { used } else { super::hold_storage::static_capacity(sde, parent.type_id)? };
     Ok((capacity, used))
 }
 
-pub(super) async fn item_capacity_reply(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64) -> Result<Value, CallError> {
-    let items = loading::load_items(ex, ItemQuery::IdOrLocation(id)).await.map_err(db_err)?;
-    let (cap, used) = item_capacity(&items, id, sde)?;
+pub(super) async fn item_capacity_reply(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64, expected: Option<&Item>) -> Result<Value, CallError> {
+    let (cap, used) = if expected.is_some_and(|item| super::hold_storage::is_ordinary_container(sde, item.type_id)) {
+        let snapshot = loading::capacity_snapshot(ex, id).await.map_err(db_err)?;
+        let parent = snapshot.parent.as_ref().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+        let item = expected.ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+        if parent.item_id != item.item_id || parent.type_id != item.type_id || parent.owner_id != item.owner_id
+            || parent.location_id != item.location_id || parent.flag_id != item.flag_id
+            || parent.quantity != item.quantity || parent.singleton != item.singleton {
+            return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+        }
+        let room = super::hold_storage::container_room(sde, parent, &snapshot.items, &snapshot.reloads)?
+            .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+        (room.capacity, room.used)
+    } else {
+        let items = loading::load_items(ex, ItemQuery::IdOrLocation(id)).await.map_err(db_err)?;
+        item_capacity(&items, id, sde)?
+    };
     Ok(keyval([("capacity", Value::Float(cap)), ("used", Value::Float(used))]))
 }
 
-async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError> {
+async fn capacity(c: &Client, container: &Container, flag: i32) -> Result<Value, CallError> {
     let (cap, used) = match container {
         Container::Hangar { .. } | Container::Deliveries { .. } => (1e12, 0.0),
-        Container::Item(id) => return item_capacity_reply(&c.db, &c.sde, *id).await,
+        Container::Item(id) => {
+            let item = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.into_iter().next();
+            if let Some(item) = item {
+                if item.category_id == i64::from(CATEGORY_SHIP) {
+                    let id = *id;
+                    let endpoint = Endpoint { location: id, flag };
+                    let identity = super::super::identity::Identity::of_client(c);
+                    let reach = Reachability::capture(&identity, &c.db, &c.world, c.session.int("solarsystemid"), &[endpoint]).await?;
+                    let sde = c.sde.clone();
+                    c.db.transaction(
+                        move |tx, _: &mut ()| {
+                            let reach = reach.clone();
+                            let sde = sde.clone();
+                            Box::pin(async move {
+                                let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
+                                if !crate::dao::items::ship::lock_reload_ship(tx, id).await.map_err(db_err)? {
+                                    return Err(refuse());
+                                }
+                                let hull = loading::load_items(tx, ItemQuery::Id(id)).await.map_err(db_err)?
+                                    .into_iter().next().ok_or_else(refuse)?;
+                                if !reach.check_many(tx, &sde, &[endpoint]).await?[0] {
+                                    return Err(refuse());
+                                }
+                                let (cap, used, _locks) = super::hold_storage::capacity(tx, &sde, hull.owner_id, id, flag).await?.ok_or_else(refuse)?;
+                                Ok((cap, used))
+                            })
+                        },
+                        |values, ()| async move { Ok(values) },
+                    ).await?
+                } else {
+                    if physical_container(&item) {
+                        let endpoint = Endpoint { location: *id, flag };
+                        if !admitted(c, &[endpoint]).await?[0] {
+                            return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                        }
+                    } else {
+                        metadata_access(c, &item).await?;
+                    }
+                    return item_capacity_reply(&c.db, &c.sde, *id, Some(&item)).await;
+                }
+            } else if c.sde.map.celestial(*id).is_some() || Some(*id) == c.session.int("charid")
+                || super::super::offices::office_owner(&c.db, *id).await?.is_some() {
+                return item_capacity_reply(&c.db, &c.sde, *id, None).await;
+            } else {
+                return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+            }
+        }
     };
     Ok(keyval([("capacity", Value::Float(cap)), ("used", Value::Float(used))]))
 }
@@ -121,10 +234,17 @@ pub(super) async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
     let Some(container) = container_of(call.bind_params) else {
         return Err(CallError::Internal(anyhow::anyhow!("bad inventory bind params {:?}", call.bind_params)));
     };
+    if let Container::Hangar { station_id, owner_id } = &container {
+        if matches!(call.method, "List" | "ListByFlags" | "GetSelfInvItem" | "GetItem" | "GetCapacity"
+            | "GetAvailableTurretSlots" | "ListSoulBound" | "ListServiceLifeDamage")
+            && (c.session.int("stationid") != Some(*station_id) || c.session.int("charid") != Some(*owner_id)) {
+            return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+        }
+    }
     if let Container::Deliveries { station_id, owner_id } = &container {
         let me = c.session.int("charid").unwrap_or(0);
         if c.session.int("stationid") != Some(*station_id) || c.sde.map.station(*station_id).is_none()
-            || !may_view_corp_hangar(&c.db, me, *owner_id, FLAG_CORP_DELIVERIES).await? {
+            || !may_view_corp_hangar(&c.db, me, *owner_id, *station_id, FLAG_CORP_DELIVERIES).await? {
             return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
         }
     }
@@ -153,8 +273,18 @@ pub(super) async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         "GetSelfInvItem" => self_item(c, &container).await,
         "GetItem" => self_item(c, &container).await,
-        "GetCapacity" => capacity(c, &container).await,
-        "GetAvailableTurretSlots" => Ok(Value::list([])),
+        "GetCapacity" => {
+            let flag = match kw_or_arg(call, "flag", 0) {
+                None => FLAG_CARGO,
+                Some(value) => value.as_int().and_then(|v| i32::try_from(v).ok())
+                    .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?,
+            };
+            capacity(c, &container, flag).await
+        }
+        "GetAvailableTurretSlots" => {
+            self_item(c, &container).await?;
+            Ok(Value::list([]))
+        }
         // Add(itemID, sourceID, flag=, qty=) -> itemID now in this container
         "Add" => {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -191,7 +321,10 @@ pub(super) async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
             stack_all(c, &container, flag).await.map(|_| Value::None)
         }
         // {itemID: ...} maps; nothing soul-bound or service-life damaged.
-        "ListSoulBound" | "ListServiceLifeDamage" => Ok(Value::Dict(vec![])),
+        "ListSoulBound" | "ListServiceLifeDamage" => {
+            self_item(c, &container).await?;
+            Ok(Value::Dict(vec![]))
+        }
         _ => {
             warn!(
                 user = c.login.user_id,
@@ -208,3 +341,5 @@ pub(super) async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
 #[cfg(test)]
 #[path = "tests/deliveries.rs"]
 mod deliveries;
+
+#[cfg(test)] mod tests;

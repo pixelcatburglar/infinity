@@ -79,10 +79,10 @@ async fn rollback_discards_domain_job_and_effects() {
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL and serial execution"]
+#[ignore = "requires a job-free dedicated INFINITY_TEST_DATABASE_URL and serial execution"]
 async fn real_runner_expires_trade_and_shuts_down() {
     let (db, world, ty) = setup().await;
-    assert!(crate::dao::jobs::next_due(&db, &[]).await.unwrap().is_none());
+    crate::dao::jobs::tests::require_job_free_database(&db).await;
     let old = client::filetime_now() - client::filetime_ticks_from_seconds(crate::config::game().trade.idle_timeout_secs + 1);
     let trade = trades::create(&db, 1, 2, 3, old).await.unwrap();
     let root = transfers::insert(&db, ty, 2, trade.id, 7, 1).await.unwrap();

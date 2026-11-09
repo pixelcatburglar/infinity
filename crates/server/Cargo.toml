@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 marshal = { path = "../marshal" }
+infinity-core = { path = "../core" }
 mlua = { version = "0.12", features = ["lua54", "vendored", "async", "send", "macros", "anyhow"] }
 anyhow.workspace = true
 deadpool-postgres.workspace = true
@@ -20,6 +21,7 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 flate2 = "1"
+flatbuffers = "=25.2.10"
 fancy-regex = "0.14.0"
 base64 = "0.22"
 bytes = "1"
@@ -27,12 +29,12 @@ h2 = "0.4"
 http = "1"
 prost = "0.13"
 prost-types = "0.13"
-prost-reflect = "0.14"
+prost-reflect = { version = "0.14", features = ["text-format"] }
 quick-xml = { version = "0.37", features = ["async-tokio"] }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
-sha2 = "0.11"
+sha2.workspace = true
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 

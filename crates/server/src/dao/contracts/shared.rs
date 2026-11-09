@@ -18,16 +18,39 @@ pub(crate) async fn set_status(ex: &(impl Executor + ?Sized), id: i64, old_statu
 }
 struct ItemId { item_id: i64 }
 impl ItemId { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }
-pub(crate) async fn insert_item(ex: &(impl Executor + ?Sized), contract: i64, item: i64, type_id: i32, quantity: i32) -> Result<u64, Error> {
+pub(crate) async fn insert_item(ex: &(impl Executor + ?Sized), contract: i64, item: i64, type_id: i32, quantity: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.contract_items (contract_id, item_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, $4, true)", &[&contract, &item, &type_id, &quantity]).await
 }
 pub(crate) async fn escrowed_ids(ex: &(impl Executor + ?Sized), id: i64) -> Result<Vec<i64>, Error> {
     Ok(ex.query("SELECT item_id FROM game.contract_items WHERE contract_id = $1 AND in_crate AND item_id IS NOT NULL", &[&id]).await?.iter().map(|r| ItemId::from_row(r).item_id).collect())
 }
-pub(crate) async fn destroy_escrow(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<(), Error> {
-    let tree = "WITH RECURSIVE tree(id) AS (SELECT unnest($1::bigint[]) UNION SELECT i.item_id FROM game.items i JOIN tree t ON i.location_id = t.id)";
-    ex.query(&format!("{tree} SELECT i.item_id FROM game.items i JOIN tree t ON t.id = i.item_id ORDER BY i.item_id FOR UPDATE OF i"), &[&ids]).await?;
-    ex.execute(&format!("{tree} DELETE FROM game.items WHERE item_id IN (SELECT id FROM tree)"), &[&ids]).await?;
+/// Capture actual escrow descendants, including clone rows, without acquiring locks.
+/// A missing root is still a traversal seed.
+pub(crate) async fn escrow_closure(ex: &(impl Executor + ?Sized), roots: &[i64]) -> Result<Vec<i64>, Error> {
+    Ok(ex.query(
+        "WITH RECURSIVE tree(id) AS (
+             SELECT unnest($1::bigint[])
+             UNION
+             SELECT i.item_id FROM game.items i JOIN tree t ON i.location_id = t.id
+         ) SELECT i.item_id FROM game.items i JOIN tree t ON t.id = i.item_id ORDER BY i.item_id",
+        &[&roots],
+    ).await?.iter().map(|row| ItemId::from_row(row).item_id).collect())
+}
+/// Delete the caller-revalidated existing closure without acquiring item locks.
+/// Missing roots remain traversal seeds and need not appear in the closure.
+pub(crate) async fn destroy_escrow(ex: &(impl Executor + ?Sized), roots: &[i64], closure: &[i64], locks: &crate::dao::items::parent_locks::LockedItems<'_>) -> Result<(), Error> {
+    if closure.iter().any(|id| !locks.is_write_locked(*id)) {
+        return Err(Error::InvalidItemLockRequest("escrow closure is not write locked"));
+    }
+    ex.execute(
+        "WITH RECURSIVE tree(id) AS (
+             SELECT unnest($1::bigint[])
+             UNION
+             SELECT i.item_id FROM game.items i JOIN tree t ON i.location_id = t.id
+             WHERE i.item_id = ANY($2)
+         ) DELETE FROM game.items WHERE item_id IN (SELECT id FROM tree) AND item_id = ANY($2)",
+        &[&roots, &closure],
+    ).await?;
     Ok(())
 }
 pub(crate) struct TopBid { pub bidder_id: i64, pub wallet_key: i32, pub amount: f64 }

@@ -11,6 +11,7 @@ pub(crate) struct DirectionalLocator {
     pub(crate) direction: V3,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct GraphicLocations(HashMap<i32, Vec<DirectionalLocator>>);
 
 impl GraphicLocations {

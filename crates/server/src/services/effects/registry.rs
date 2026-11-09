@@ -2,7 +2,8 @@
 //! Client counterparts are named in `dogma/const.py` and `dogma/pythonEffects`.
 //! Out-of-scope effects are rejected even if they contain modifier rows;
 //! classifying a later-wave kind does not implement its lifecycle behavior.
-use crate::{consts::{*, dogma::*}, sde::Sde};
+use infinity_core::{consts::{*, dogma::*}};
+use crate::sde::Sde;
 use super::{EffectKind, JammingType};
 
 /// Client inventorycommon/const.py: groupMissileLauncherFestival.
@@ -207,7 +208,7 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_NPC_WARP_SCRAMBLE => Projected { jamming: JammingType::Scramble },
         EFFECT_NPC_WARP_SCRAMBLE_MWD => Projected { jamming: JammingType::Scramble },
         EFFECT_WARP_DISRUPT_SPHERE => return None,
-        EFFECT_ENTOSIS_LINK => return None,
+        EFFECT_ENTOSIS_LINK => Entosis,
         EFFECT_SNOWBALL_LAUNCHING => return None,
         EFFECT_INDUSTRIAL_ITEM_COMPRESSION => Compression,
         EFFECT_CLONE_RESPAWN_BAY => return None,

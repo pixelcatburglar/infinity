@@ -40,7 +40,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetSkills") | (SKILL_HANDLER, "GetAllSkills") => skills_dict(c, me).await,
         // [(typeID, pointChange)] since the last login
         (SKILL_HANDLER, "GetSkillChangesForISIS") => Ok(Value::list([])),
-        (SKILL_HANDLER, "GetSkillBundleInfo") => Err(crate::services::notify_error(crate::messages::crates::METADATA_UNAVAILABLE)),
+        (SKILL_HANDLER, "GetSkillBundleInfo") => Err(crate::services::notify_error(infinity_core::messages::crates::METADATA_UNAVAILABLE)),
         (SKILL_HANDLER, "CheckAndSendNotifications") => Ok(Value::None),
         (SKILL_HANDLER, "GetSkillQueueAndFreePoints") => {
             let free: i64 = match crate::dao::characters::attributes::free_points(&c.db, me).await {
@@ -52,9 +52,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetSkillQueue") => queue_list(&crate::services::identity::Identity::of_client(c), &c.db).await.map(|q| queue_value(&q)),
         (SKILL_HANDLER, "SaveNewQueue") => {
             let activate = call.kwargs.get("activate").or_else(|| call.args.get(1)).map(|v| v.as_int() != Some(0)).unwrap_or(true);
-            save_queue(&crate::services::identity::Identity::of_client(c), &c.db, &c.sde, call.args.first().unwrap_or(&Value::None), activate, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.map(|()| Value::None)
+            save_queue(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, &c.sde, call.args.first().unwrap_or(&Value::None), activate, true, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.map(|()| Value::None)
         }
-        (SKILL_HANDLER, "AbortTraining") => match save_queue(&crate::services::identity::Identity::of_client(c), &c.db, &c.sde, &Value::Dict(vec![]), false, false, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await {
+        (SKILL_HANDLER, "AbortTraining") => match save_queue(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, &c.sde, &Value::Dict(vec![]), false, false, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await {
             Ok(()) => Ok(Value::None),
             Err(e) => Err(e),
         },

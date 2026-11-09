@@ -28,7 +28,7 @@ fn protocol_shapes_and_validation() {
     assert!(map::visits_request(&call("GetSolarSystemVisits", &[Value::Int(1)], &none)).is_err());
     assert!(map::visits_request(&call("GetSolarSystemVisits", &[], &kwargs)).is_err());
     for character in [None, Some(0), Some(-1)] {
-        assert!(matches!(map::selected(character), Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_CHARACTER_NOT_FOUND));
+        assert!(matches!(map::selected(character), Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_CHARACTER_NOT_FOUND));
     }
     assert_eq!(map::selected(Some(7)).unwrap(), 7);
     let rows = vec![History { solar_system_id: 42, value1: 5, value2: 2, value3: 1 }];
@@ -59,7 +59,11 @@ async fn map_dispatch_events_and_reconnect() {
     let character = 4_000_000_000_000_000 + id;
     let system = -id;
     let now = crate::client::filetime_now();
-    events::arrived(&db, character, system, now).await;
+    db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        assert!(dao::append(tx, dao::EventSource::JumpOccurrence, id, system, now, dao::EventKind::Jump).await?);
+        dao::record_visit(tx, character, system, now).await?;
+        Ok::<_, crate::db::Error>(())
+    }), |(), ()| async { Ok(()) }).await.unwrap();
     events::npc_lost(&db, system, now).await;
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         events::player_lost(tx, -id, system, false, now).await?;
@@ -80,10 +84,22 @@ async fn map_dispatch_events_and_reconnect() {
     let args = [Value::Int(5), Value::Int(24)];
     assert_eq!(wire(services::dispatch(&mut client, &call("GetHistory", &args, &none)).await.unwrap()), wire(map::history_value(vec![])));
     assert_eq!(wire(services::dispatch(&mut client, &call("GetSolarSystemVisits", &[], &none)).await.unwrap()), wire(map::visits_value(vec![Visit { last_date_time: now, solar_system_id: system, visits: 1 }])));
+    let system_id = client.sde.map.systems().next().expect("SDE system").solar_system_id;
+    let location = [Value::Int(system_id)];
+    let value = wire(services::dispatch(&mut client, &call("GetCurrentSovData", &location, &none)).await.unwrap());
+    assert_eq!(crate::services::value_field(&value, "header"), Some(&Value::list([Value::str("locationID"), Value::str("corporationID"), Value::str("allianceID"), Value::str("claimTime")])));
+    let expected = crate::services::sovereignty::queries::read(&client.db, &client.sde,
+        crate::services::sovereignty::queries::Query::CurrentSovData { location_id: system_id }).await.unwrap();
+    assert_eq!(value, wire(expected));
+    let history = services::dispatch(&mut client, &call("GetRecentSovActivity", &[], &none)).await.unwrap();
+    let expected = crate::services::sovereignty::queries::read(&client.db, &client.sde,
+        crate::services::sovereignty::queries::Query::RecentSovActivity).await.unwrap();
+    assert_eq!(wire(history), wire(expected));
+    assert!(map::dispatch(&mut client, &call("GetCurrentSovData", &[], &none)).await.unwrap().is_err());
     assert!(super::dispatch(&mut client, &call("GetBeaconCount", &[], &none)).await.is_none());
     assert_eq!(services::dispatch(&mut client, &call("GetBeaconCount", &[], &none)).await.unwrap(), Value::Dict(vec![]));
     client.session.apply(vec![("charid", Value::None)]);
-    assert!(matches!(services::dispatch(&mut client, &call("GetHistory", &args, &none)).await, Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_CHARACTER_NOT_FOUND));
+    assert!(matches!(services::dispatch(&mut client, &call("GetHistory", &args, &none)).await, Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_CHARACTER_NOT_FOUND));
     let reopened = Db::connect(&cfg).await.unwrap();
     assert_eq!(dao::visits(&reopened, character).await.unwrap()[0].visits, 1);
     db.execute("DELETE FROM game.map_events WHERE solar_system_id = $1", &[&system]).await.unwrap();
@@ -93,7 +109,8 @@ async fn map_dispatch_events_and_reconnect() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database and external flock"]
 async fn retention_handler_survives_reconnect_and_retry() {
-    use crate::{consts::FILETIME_HOUR, dao::{jobs, map_telemetry as dao}, db::Db, scheduler, services::{self, tests}};
+    use infinity_core::consts::FILETIME_HOUR;
+    use crate::{dao::{jobs, map_telemetry as dao}, db::Db, scheduler, services::{self, tests}};
 
     crate::tests::init_config();
     let cfg = crate::config::tests::test_database();

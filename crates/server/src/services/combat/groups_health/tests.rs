@@ -1,6 +1,5 @@
 //! Health and capacitor boundary tests without a database or running system actor.
 use super::*;
-use crate::dao::items::creation;
 
 mod db_smoke;
 mod fixture;
@@ -9,6 +8,21 @@ mod rewards;
 /// Drain up to the requested amount for capacitor integration tests.
 pub(in crate::services) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
     Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
+}
+
+pub(in crate::services) fn replace_capacitor_test_entry(ship: i64, entry: Option<(f64, i64)>) -> Option<(f64, i64)> {
+    let mut state = state();
+    match entry {
+        Some(entry) => state.capacitor.insert(ship, entry),
+        None => state.capacitor.remove(&ship),
+    }
+}
+
+pub(in crate::services) fn capacitor_snapshot_for_capture(ship: i64, capacity: f64, recharge_tau_ms: f64) -> (i64, f64) {
+    let mut st = state();
+    let now = filetime_now();
+    let result = mutate(&mut st.capacitor, ship, capacity, recharge_tau_ms, now, Operation::Snapshot);
+    (now, result.after)
 }
 
 #[test]
@@ -53,6 +67,56 @@ fn drain_is_partial_and_negative_input_cannot_add_energy() {
 }
 
 #[test]
+fn warp_debit_uses_shared_recharged_balance_and_partial_drain() {
+    let ship = -920_202;
+    state().capacitor.insert(ship, (25.0, FILETIME_SECOND));
+    let debit = drain_warp_capacitor(ship, 100.0, 1000.0, 40.0, FILETIME_SECOND);
+    assert_eq!(debit.before, 25.0);
+    assert_eq!(debit.after, 0.0);
+    assert_eq!(debit.drained, 25.0);
+    let empty = drain_warp_capacitor(ship, 100.0, 1000.0, 1.0, FILETIME_SECOND);
+    assert_eq!((empty.before, empty.after, empty.drained), (0.0, 0.0, 0.0));
+    state().capacitor.remove(&ship);
+}
+
+#[test]
+fn warp_debit_and_module_operations_share_one_balance() {
+    let ship = -920_203;
+    state().capacitor.insert(ship, (100.0, FILETIME_SECOND));
+    let first = drain_warp_capacitor(ship, 100.0, 1000.0, 40.0, FILETIME_SECOND);
+    assert_eq!((first.before, first.after, first.drained), (100.0, 60.0, 40.0));
+    let mut st = state();
+    let injected = mutate(&mut st.capacitor, ship, 100.0, 1000.0, FILETIME_SECOND, Operation::Inject(20.0));
+    assert!((injected.before - 60.0).abs() < 1e-12);
+    assert!((injected.after - 80.0).abs() < 1e-12);
+    let drained = mutate(&mut st.capacitor, ship, 100.0, 1000.0, FILETIME_SECOND, Operation::Drain(30.0));
+    assert!((drained.before - 80.0).abs() < 1e-12);
+    assert!((drained.after - 50.0).abs() < 1e-12);
+    st.capacitor.remove(&ship);
+}
+
+
+#[test]
+fn concurrent_warp_and_module_debits_cannot_double_spend() {
+    let ship = -920_204;
+    state().capacitor.insert(ship, (100.0, FILETIME_SECOND));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_barrier = barrier.clone();
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        drain_warp_capacitor(ship, 100.0, 1000.0, 80.0, FILETIME_SECOND).drained
+    });
+    barrier.wait();
+    let module = {
+        let mut st = state();
+        mutate(&mut st.capacitor, ship, 100.0, 1000.0, FILETIME_SECOND, Operation::Drain(80.0)).amount
+    };
+    let warp = worker.join().unwrap();
+    assert!((warp + module - 100.0).abs() < 1e-12);
+    assert!(warp >= 0.0 && module >= 0.0);
+    assert_eq!(state().capacitor.remove(&ship).unwrap().0, 0.0);
+}
+#[test]
 fn refused_cycle_drain_leaves_stored_state_untouched() {
     let mut entries = HashMap::new();
     entries.insert(1, (20.0, 0));
@@ -62,75 +126,56 @@ fn refused_cycle_drain_leaves_stored_state_untouched() {
 }
 
 #[test]
-fn npc_repairs_are_layer_isolated_bounded_and_never_resurrect() {
-    let mut hp = Hp { now: [20.0, 30.0, 40.0], max: [100.0; 3], resonance: [[1.0; 4]; 3] };
-    assert_eq!(repair_npc_hp(&mut hp, 1, 25.0), Some([0.2, 0.55, 0.4]));
-    assert_eq!(hp.now, [20.0, 55.0, 40.0]);
-    assert_eq!(repair_npc_hp(&mut hp, 1, f64::MAX), Some([0.2, 1.0, 0.4]));
-    for (layer, amount) in [(3, 1.0), (0, -1.0), (0, f64::NAN), (0, f64::INFINITY), (1, 1.0)] {
-        assert!(repair_npc_hp(&mut hp, layer, amount).is_none());
-    }
-    assert_eq!(hp.now, [20.0, 100.0, 40.0]);
-    hp.now[2] = 0.0;
-    assert!(repair_npc_hp(&mut hp, 2, 50.0).is_none());
-    assert_eq!(hp.now[2], 0.0);
+fn fitting_capacitor_rebases_old_curve_and_preserves_depletion() {
+    let mut entries = HashMap::new();
+    entries.insert(1, (25.0, 0));
+    let (old, new) = rebase_capacitor_at(&mut entries, 1, 100.0, 10_000.0, 200.0, FILETIME_SECOND);
+    let expected = recharge(25.0, 100.0, 10_000.0, 1.0);
+    assert_eq!((old, new), (expected, expected));
+    assert_eq!(entries[&1], (expected, FILETIME_SECOND));
+    let (old, new) = rebase_capacitor_at(&mut entries, 1, 200.0, 20_000.0, 10.0, FILETIME_SECOND);
+    assert!(old > 10.0);
+    assert_eq!(new, 10.0);
+    assert_eq!(rebase_capacitor_at(&mut entries, 2, 100.0, 1000.0, 200.0, 0), (100.0, 100.0));
+    entries.insert(3, (0.0, 0));
+    assert_eq!(rebase_capacitor_at(&mut entries, 3, 100.0, 1000.0, 200.0, 0), (0.0, 0.0));
 }
 
 #[test]
-fn npc_fraction_uses_cached_layer_and_defaults_to_full() {
-    let ball = Ball {
-        id: -8_736_421, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
-        char_id: None, signature_radius: None, mode: crate::space::MODE_STOP,
+fn actor_fitting_publication_keeps_intervening_capacitor_spend() {
+    use crate::services::fit::attributes::tests::ship_fit;
+    use crate::space::{Ball, System, MODE_STOP};
+    use std::sync::Arc;
+    crate::tests::init_config();
+    let ship = -920_201;
+    let before = ship_fit(&[]);
+    let patch = ship_fit(&[(ATTR_CAPACITOR_CAPACITY, 200.0), (ATTR_RECHARGE_RATE, 2000.0)])
+        .into_committed_fitting(&before);
+    let registry = Arc::new(crate::space::Pilots::default());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    registry.register_pilot(2, tx);
+    let mut system = System::new(1, registry, 0);
+    system.add_persistent_ship(Ball { id: ship, type_id: 1, owner_id: 2, corp_id: 1,
+        alliance_id: -1, char_id: Some(2), signature_radius: None, mode: MODE_STOP,
         radius: 1.0, mass: 1.0, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
-        free: true, global: false, massive: true, interactive: false,
-        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0,
-        interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0, cloak_until: 0,
-        health: [1.0; 3], launcher: 0, slim: Vec::new(),
-    };
-    assert_eq!(npc_health_fraction(&ball, 0), Some(1.0));
-    assert_eq!(npc_health_fraction(&ball, 3), None);
-    state().hp.insert(ball.id, Hp { now: [25.0, 150.0, 50.0], max: [100.0; 3], resonance: [[1.0; 4]; 3] });
-    assert_eq!(npc_health_fraction(&ball, 0), Some(0.25));
-    assert_eq!(npc_health_fraction(&ball, 1), Some(1.0));
-    state().hp.remove(&ball.id);
-}
-
-#[test]
-fn concurrent_npc_damage_does_not_overwrite_cached_updates() {
-    let target = i64::MIN + 205;
-    state().hp.remove(&target);
-    std::thread::scope(|scope| {
-        for _ in 0..2 {
-            scope.spawn(|| {
-                for _ in 0..100 {
-                    damage_npc_cached(target, || Hp {
-                        now: [1000.0; 3], max: [1000.0; 3], resonance: [[1.0; 4]; 3],
-                    }, [1.0, 0.0, 0.0, 0.0]);
-                }
-            });
-        }
-    });
-    assert_eq!(state().hp.remove(&target).unwrap().now[0], 800.0);
-}
-
-#[test]
-fn drone_hp_rollback_restores_absence_and_exact_previous_value() {
-    let target = i64::MIN + 206;
-    for damaged in [[80.0, 100.0, 100.0], [0.0; 3]] {
-        for existed in [false, true] {
-            let original = Hp { now: [90.0, 80.0, 70.0], max: [100.0; 3], resonance: [[0.5; 4]; 3] };
-            let previous = existed.then(|| original.clone());
-            state().hp.insert(target, Hp { now: damaged, max: [100.0; 3], resonance: [[1.0; 4]; 3] });
-            restore_drone_hp(target, previous);
-            let restored = state().hp.remove(&target);
-            if existed {
-                let restored = restored.unwrap();
-                assert_eq!((restored.now, restored.max, restored.resonance), (original.now, original.max, original.resonance));
-            } else {
-                assert!(restored.is_none());
-            }
-        }
-    }
+        free: true, global: false, massive: true, interactive: true, warp: Default::default(),
+        last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0, cloak_until: 0,
+        health: [1.0; 3], launcher: 0, slim: Vec::new() });
+    let generation = system.persistent_generation(ship).unwrap();
+    let stats = ShipStats::from_fit(&before, Key::Ship);
+    system.install_condition(ship, Condition { now: stats.max, stats, shield_at: filetime_now() }, before);
+    state().capacitor.insert(ship, (25.0, filetime_now() + FILETIME_SECOND));
+    assert!(system.publish_fitting(ship, 2, generation, patch, vec![]));
+    let (_, args) = rx.try_recv().unwrap();
+    let [Value::List(rows)] = args.as_slice() else { panic!("expected batch") };
+    let index = rows.iter().position(|row| {
+        let Value::Tuple(fields) = row else { return false };
+        fields[3].as_int() == Some(i64::from(ATTR_CAPACITOR_CAPACITY))
+    }).unwrap();
+    let Value::Tuple(fields) = &rows[index + 1] else { panic!("expected charge") };
+    assert_eq!(fields[3].as_int(), Some(i64::from(ATTR_CHARGE)));
+    assert_eq!(fields[5], Value::Float(25.0));
+    assert_eq!(state().capacitor.remove(&ship).unwrap().0, 25.0);
 }

@@ -4,7 +4,7 @@
 
 use super::*;
 use anyhow::{anyhow, ensure, Result};
-use crate::consts::{ACCOUNT_CASH, CATEGORY_ENTITY, dogma::ATTR_ENTITY_KILL_BOUNTY};
+use infinity_core::consts::{ACCOUNT_CASH, CATEGORY_ENTITY, ROLE_ACCOUNTANT, dogma::ATTR_ENTITY_KILL_BOUNTY};
 use crate::services::drones::tests::fixture::Fixture;
 use marshal::Value;
 use std::time::Duration;
@@ -17,12 +17,12 @@ enum Case { Split, Overflow, Postcommit }
 
 async fn run_case(case: Case) -> Result<()> {
     let f = Fixture::new().await;
-    let original = match f.db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&f.owner]).await {
-        Ok(row) => row.get::<_, i64>("corporation_id"),
+    let (original, original_roles) = match f.db.query_one("SELECT corporation_id,corp_roles FROM game.characters WHERE character_id=$1", &[&f.owner]).await {
+        Ok(row) => (row.get::<_, i64>("corporation_id"), row.get::<_, i64>("corp_roles")),
         Err(error) => { f.cleanup().await; return Err(error.into()); }
     };
     let corp = match f.db.query_one(
-        "WITH id AS (SELECT nextval('game.corporations_corporation_id_seq') AS n) INSERT INTO game.corporations (corporation_id,name,ticker,creator_id,station_id,created) SELECT n,'reward-test-' || n::text,'R' || n::text,$1,$2,0 FROM id RETURNING corporation_id",
+        "WITH id AS (SELECT nextval('game.corporations_corporation_id_seq') AS n) INSERT INTO game.corporations (corporation_id,name,ticker,creator_id,ceo_id,station_id,created) SELECT n,'reward-test-' || n::text,'R' || n::text,$1,$1,$2,0 FROM id RETURNING corporation_id",
         &[&f.owner, &f.system],
     ).await {
         Ok(row) => row.get::<_, i64>("corporation_id"),
@@ -32,7 +32,7 @@ async fn run_case(case: Case) -> Result<()> {
     f.world.register_pilot(f.owner, sender);
     let result = async {
         ensure!(corp >= 98_000_000, "corporation sequence is outside player range");
-        f.db.execute("UPDATE game.characters SET corporation_id=$2 WHERE character_id=$1", &[&f.owner, &corp]).await?;
+        f.db.execute("UPDATE game.characters SET corporation_id=$2,corp_roles=$3 WHERE character_id=$1", &[&f.owner, &corp, &(original_roles | ROLE_ACCOUNTANT)]).await?;
         f.db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,0)", &[&corp, &ACCOUNT_CASH]).await?;
         match case {
             Case::Split => split(&f, corp, &mut receiver).await,
@@ -40,9 +40,12 @@ async fn run_case(case: Case) -> Result<()> {
             Case::Postcommit => postcommit(&f, corp, &mut receiver).await,
         }
     }.await;
-    let restore = f.db.execute("UPDATE game.characters SET corporation_id=$2 WHERE character_id=$1", &[&f.owner, &original]).await;
+    let restore = f.db.execute("UPDATE game.characters SET corporation_id=$2,corp_roles=$3 WHERE character_id=$1", &[&f.owner, &original, &original_roles]).await;
     let wallet_cleanup = f.db.execute("DELETE FROM game.corp_wallets WHERE corporation_id=$1", &[&corp]).await;
-    let corp_cleanup = f.db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await;
+    let corp_cleanup: Result<u64, crate::db::Error> = f.db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        crate::services::tests::fixture::cleanup_progress(tx, &[corp], &[]).await?;
+        Ok(tx.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await?)
+    }), |value, ()| async move { Ok(value) }).await;
     f.cleanup().await;
     restore?;
     wallet_cleanup?;
@@ -50,16 +53,16 @@ async fn run_case(case: Case) -> Result<()> {
     result
 }
 
-async fn npc(f: &Fixture) -> Result<(crate::space::Ball, f64)> {
+async fn npc(f: &Fixture, taxable: bool) -> Result<(crate::space::Ball, f64)> {
     let multiplier = crate::config::game().combat.bounty_multiplier;
     let (kind, payout) = f.sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_ENTITY))
         .filter_map(|t| {
             let bounty = t.attribute(ATTR_ENTITY_KILL_BOUNTY)?;
             let payout = bounty_payout(bounty, multiplier)?;
-            (bounty > 0.0 && payout >= 1.0 && payout <= 100_000.0 && payout.is_finite()
+            (bounty > 0.0 && payout >= 1.0 && (payout > 100_000.0) == taxable && payout.is_finite()
                 && payout == crate::services::market::round2(payout)
                 && crate::services::market::round2(payout * 0.1) > 0.0).then_some((t.type_id, payout))
-        }).next().ok_or_else(|| anyhow!("real SDE needs a small positive NPC bounty and positive multiplier"))?;
+        }).next().ok_or_else(|| anyhow!("real SDE needs a positive NPC bounty in the requested tax range and positive multiplier"))?;
     let mut ball = f.world.ball(f.system, f.ship).await.ok_or_else(|| anyhow!("fixture ship missing"))?;
     ball.type_id = kind;
     ball.char_id = None;
@@ -88,13 +91,14 @@ fn expected_notices(owner: i64, corp: i64, personal: f64, corporate: f64, net: f
 }
 
 async fn split(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
-    let (ball, payout) = npc(f).await?;
+    for taxable in [false, true] {
+    let (ball, payout) = npc(f, taxable).await?;
     for rate in [0.0_f64, 0.1, 1.0] {
         f.db.execute("UPDATE game.corporations SET tax_rate=$2 WHERE corporation_id=$1", &[&corp, &rate]).await?;
         f.db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&f.owner]).await?;
         f.db.execute("UPDATE game.corp_wallets SET balance=0 WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?;
         reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
-        let tax = crate::services::market::round2(payout * rate);
+        let tax = if taxable { crate::services::market::round2(payout * rate) } else { 0.0 };
         let net = payout - tax;
         let expected_personal = crate::services::market::round2(net);
         let expected_corp = crate::services::market::round2(tax);
@@ -103,21 +107,24 @@ async fn split(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
         ensure!((expected_personal + expected_corp - crate::services::market::round2(payout)).abs() < 0.001, "split does not add to payout");
         ensure!(wallet_notices(receiver) == expected_notices(f.owner, corp, expected_personal, expected_corp, net, tax), "wrong wallet notices at rate {rate}");
     }
+    }
     Ok(())
 }
 
 async fn overflow(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
-    let (ball, _) = npc(f).await?;
+    let (ball, _) = npc(f, true).await?;
     f.db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await?;
     f.db.execute("UPDATE game.corp_wallets SET balance='9999999999999999999999999999999999.99'::numeric WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?;
     let before = balances(f, corp).await?;
     let items: i64 = f.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1", &[&f.owner]).await?.get("n");
     let error = reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.err().ok_or_else(|| anyhow!("corporate overflow unexpectedly succeeded"))?;
-    let code = match &error {
-        CallError::Internal(error) => error.downcast_ref::<crate::db::Error>().and_then(|e| match e { crate::db::Error::Postgres(e) => e.code(), _ => None }),
-        _ => None,
-    };
-    ensure!(code == Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE), "expected numeric overflow, got {error:?}");
+    match &error {
+        CallError::User { msg, dict } => {
+            assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+            assert_eq!(dict, &vec![("notify".into(), Value::unicode(infinity_core::messages::wallets::AMOUNT_TOO_LARGE))]);
+        }
+        CallError::Internal(error) => panic!("expected wallet overflow refusal, got {error:#}"),
+    }
     ensure!(balances(f, corp).await? == before, "overflow did not roll back both balances");
     ensure!(receiver.try_recv().is_err(), "failed reward emitted a notice");
     let after: i64 = f.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1", &[&f.owner]).await?.get("n");
@@ -126,7 +133,7 @@ async fn overflow(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> 
 }
 
 async fn postcommit(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
-    let (ball, payout) = npc(f).await?;
+    let (ball, payout) = npc(f, true).await?;
     f.db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await?;
     f.db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&f.owner]).await?;
     let config = crate::config::tests::test_database().to_pg_config()?;

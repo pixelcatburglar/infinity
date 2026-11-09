@@ -9,7 +9,8 @@ async fn deliveries(db: &crate::db::Db, id: i64) -> i64 {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn mining_default_effect_and_target_lifecycle() {
-    use crate::{consts::dogma::{ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}, dao::items::loading::ItemQuery, services::{combat, fit::{Fit, Key}, mining}};
+    use infinity_core::{consts::dogma::{ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}};
+    use crate::{dao::items::loading::ItemQuery, services::{combat, fit::{Fit, Key}, mining}};
     let r = fixture::resources().await;
     let (race, bloodline, school, station) = fixture::creation_inputs(&r).await;
     let fields = fixture::FieldSnapshot::capture(&r, station).await;
@@ -48,7 +49,7 @@ async fn mining_default_effect_and_target_lifecycle() {
         let module_id = module.item_id;
         globals.set("module", module_id).unwrap();
         let no_default_type = r.sde.types.iter().find(|ty| !r.sde.types.effects(ty.type_id).iter().any(|effect| effect.is_default)).expect("SDE type without a default effect").type_id;
-        let no_default: i64 = r.db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&no_default_type, &id, &ship, &crate::consts::FLAG_CARGO]).await.unwrap().get("item_id");
+        let no_default: i64 = r.db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&no_default_type, &id, &ship, &infinity_core::consts::FLAG_CARGO]).await.unwrap().get("item_id");
         globals.set("no_default", no_default).unwrap();
         for call in ["pilots.activate(id,no_default,nil,nil)", "pilots.deactivate(id,no_default)"] {
             assert!(lua.load(call).exec_async().await.is_err(), "{call}");
@@ -70,7 +71,16 @@ async fn mining_default_effect_and_target_lifecycle() {
             assert!(lua.load(call).exec_async().await.is_err(), "actor mismatch: {call}");
         }
         r.world.remove_ball(system, ship).await;
-        r.world.add_ship(system, original).await.unwrap();
+        let fit = Fit::load(&r.db, r.sde.clone(), id, ship).await.unwrap();
+        let condition = combat::prepare_condition_with_fit(&r.db, ship, &fit).await.unwrap();
+        r.world.with(system, move |s| {
+            s.add_ship(original);
+            s.install_condition(ship, condition.into_condition(), fit);
+            assert_eq!(s.pilot_ball(id).map(|ball| ball.id), Some(ship));
+            assert!(s.persistent_generation(ship).is_some());
+            assert_eq!(s.combat_membership_generation(ship), s.persistent_generation(ship));
+            assert!(s.ship_condition(ship).is_some());
+        }).await.unwrap();
         // The ore generator spreads centers up to 43 km and clamps rock radii
         // at 25 km. Clear every existing fixed massive sphere by that envelope,
         // plus room for the ship and its 100 m offset from the chosen rock.
@@ -83,7 +93,7 @@ async fn mining_default_effect_and_target_lifecycle() {
             Some(center)
         }).await.flatten().expect("undocked ship must remain in space");
         *test_field.lock().unwrap() = Some(ship);
-        let rocks = mining::grow_field(&r.db, &r.world, system, ship, center, mining::Field::Ore, 1.0, false).await.unwrap();
+        let rocks = mining::grow_field(&r.db, &r.world, system, ship, center, crate::space::asteroids::Field::Ore, 1.0, false).await.unwrap();
         let (rock, ship_radius) = r.world.with(system, move |s| {
             let rock = rocks.into_iter().map(|id| {
                 let ball = s.ball(id).expect("generated asteroid must remain in space");
@@ -166,11 +176,15 @@ async fn mining_default_effect_and_target_lifecycle() {
     let _ = lifecycle::offline(r.clone(), id).await;
     let saved_field = *field.lock().unwrap();
     if let Some(field) = saved_field {
-        let rows = r.db.query("SELECT asteroid_id FROM game.asteroids WHERE field_id=$1", &[&field]).await.unwrap();
+        let rows = r.db.query("SELECT asteroid_id, system_id FROM game.asteroids WHERE field_id=$1", &[&field]).await.unwrap();
         for row in rows {
             let rock: i64 = row.get("asteroid_id");
-            crate::services::mining::reconcile_depleted(&r.db, &r.world, rock).await.unwrap();
-            r.db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND field_id=$2", &[&rock, &field]).await.unwrap();
+            let system: i64 = row.get("system_id");
+            let actor = r.world.asteroid_actor(system).expect("fixture asteroid actor");
+            let owner = actor.rock_field(rock).await.expect("fixture rock metadata");
+            assert_eq!(owner, field);
+            r.db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2 AND field_id=$3", &[&rock, &system, &field]).await.unwrap();
+            assert!(crate::space::asteroids::publish_depletion(&r.world, system, &actor, rock, field, None, None).await);
         }
     }
     r.db.execute("UPDATE game.characters SET user_id=$2 WHERE character_id=$1", &[&peer, &r.pilots.account]).await.unwrap();

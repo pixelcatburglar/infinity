@@ -8,7 +8,7 @@ fn ball(id: i64, type_id: i32, character: Option<i64>) -> Ball {
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3],
         old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3],
         follow_id: 0, follow_range: 0.0, free: true, global: false, massive: true,
-        interactive: character.is_some(), warp: WarpState::default(), warp_factor: 0,
+        interactive: character.is_some(), warp: WarpState::default(), 
         last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0, cloak_until: 0,
         health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
@@ -29,7 +29,7 @@ async fn actor_visibility_and_npc_projection() {
     system.insert(ball(i64::MAX, entity, None));
     assert!(fact(&system, system.ball(i64::MAX).unwrap()).is_none());
     let config = NpcConfig { fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0, scan_resolution: 1.0, repairs: (0.0, 0.0, 0.0) };
-    system.add_npc(i64::MAX, NpcBrain::new(None, config, Arc::new(|_| Box::pin(async {}))));
+    system.add_npc(i64::MAX, NpcBrain::new(None, config, Arc::new(|_, _| Some(Box::pin(async {})))));
     assert!(fact(&system, system.ball(i64::MAX).unwrap()).is_some());
     assert!(fact(&system, system.ball(4).unwrap()).is_none());
     let npc = fact(&system, system.ball(i64::MAX).unwrap()).unwrap();
@@ -112,7 +112,7 @@ async fn frame(
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with imported SDE and external flock"]
 async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
     use crate::services::tests::fixture;
-    use crate::session::OnlineSession;
+    use infinity_core::session::OnlineSession;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
@@ -126,11 +126,11 @@ async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
         Some((skin.skin_id, hull))
     }).expect("permanent personal SKIN and ship hull in SDE");
     let entity = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)).unwrap().type_id;
-    let drone = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_DRONE)).unwrap().type_id;
+    let drone = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_DRONE)).unwrap().type_id;
     let system = sde.map.stations().find_map(|station| station.solar_system_id).unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
     world.system(system).await.unwrap();
-    let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &owner.character, &system, &crate::consts::FLAG_HANGAR]).await.unwrap().get("item_id");
+    let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &owner.character, &system, &infinity_core::consts::FLAG_HANGAR]).await.unwrap().get("item_id");
     assert!(crate::dao::ship_skins::insert_license(&db, owner.character, skin, None).await.unwrap());
     db.execute("INSERT INTO game.ship_skin_applications (ship_item_id,character_id,skin_id) VALUES ($1,$2,$3)", &[&ship, &owner.character, &skin]).await.unwrap();
     assert_eq!(crate::dao::ship_skins::states_for_ships(&db, &[ship], filetime_now()).await.unwrap()[0].skin_id, Some(skin));
@@ -180,7 +180,7 @@ async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
     world.add_ship(system, ball(unrelated, entity, None)).await.unwrap();
     world.add_ship(system, ball(drone_id, drone, None)).await.unwrap();
     let config = NpcConfig { fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0, scan_resolution: 1.0, repairs: (0.0, 0.0, 0.0) };
-    assert!(world.with(system, move |s| s.add_npc(npc, NpcBrain::new(None, config, Arc::new(|_| Box::pin(async {}))))).await.unwrap());
+    assert!(world.with(system, move |s| s.add_npc(npc, NpcBrain::new(None, config, Arc::new(|_, _| Some(Box::pin(async {})))))).await.unwrap());
     let npc_notice = frame(&mut observer_stream.rx, observer.character, SET, Some(npc), None).await;
     assert_state(&child(&npc_notice, "state"), npc, 0, None);
     let owner_npc = frame(&mut owner_stream.rx, owner.character, SET, Some(npc), None).await;
@@ -198,13 +198,13 @@ async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
     assert!(snapshot_state(&current, drone_id).is_none());
     assert_state(&snapshot_state(&current, npc).unwrap(), npc, 0, None);
     assert_eq!(crate::dao::ship_skins::states_for_ships(&db, &[ship], filetime_now()).await.unwrap()[0].skin_id, None);
-    let collision: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &owner.character, &system, &crate::consts::FLAG_HANGAR]).await.unwrap().get("item_id");
+    let collision: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &owner.character, &system, &infinity_core::consts::FLAG_HANGAR]).await.unwrap().get("item_id");
     db.execute("INSERT INTO game.ship_skin_applications (ship_item_id,character_id,skin_id) VALUES ($1,$2,$3)", &[&collision, &owner.character, &skin]).await.unwrap();
     let guard = crate::services::market::lock().await;
     let npc_fact = world.with(system, move |s| {
         s.add_ship(ball(collision, hull, None));
         let config = NpcConfig { fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0, scan_resolution: 1.0, repairs: (0.0, 0.0, 0.0) };
-        assert!(s.add_npc(collision, NpcBrain::new(None, config, Arc::new(|_| Box::pin(async {})))));
+        assert!(s.add_npc(collision, NpcBrain::new(None, config, Arc::new(|_, _| Some(Box::pin(async {}))))));
         fact(s, s.ball(collision).unwrap()).unwrap()
     }).await.unwrap();
     assert!(npc_fact.is_npc);
@@ -216,7 +216,7 @@ async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
     drop(guard);
     world.remove_ball(system, collision).await;
     for id in [ship, observer.character, late.character, npc, unrelated, drone_id] { world.remove_ball(system, id).await; }
-    for who in [owner, observer, late] { world.unobserve(who.character); world.unregister_pilot(who.character); }
+    for who in [owner, observer, late] { world.unobserve(who.character); world.unregister_pilot_generation(who.character, None); }
     drop((owner_stream, observer_stream, late_stream, notify_receivers, world));
     for who in [owner, observer, late] { fixture::cleanup(&db, who).await.unwrap(); }
 }

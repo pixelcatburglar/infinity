@@ -39,7 +39,7 @@ fn plastic_wrap_uses_stored_quantity_and_rejects_nonpositive_volume() {
 fn logical_stack_size_ignores_singleton_encoding() {
     assert_eq!(stack_size(false, 42), 42);
     assert_eq!(stack_size(true, 1), 1);
-    assert_eq!(stack_size(true, crate::consts::BLUEPRINT_COPY_QUANTITY), 1);
+    assert_eq!(stack_size(true, infinity_core::consts::BLUEPRINT_COPY_QUANTITY), 1);
     assert_eq!(stack_size(true, -500_000), 1);
 }
 
@@ -49,7 +49,7 @@ fn wrap_encoding_rounds_up_and_has_a_minimum() {
     assert_eq!(encode_wrap_quantity(1.001).unwrap(), -101);
     assert_eq!(encode_wrap_quantity(0.0).unwrap(), -1);
     assert_eq!(encode_wrap_quantity(f64::MIN_POSITIVE).unwrap(), -1);
-    assert_eq!(encode_wrap_quantity(21_474_836.47).unwrap(), -i32::MAX);
+    assert_eq!(encode_wrap_quantity(21_474_836.47).unwrap(), -i64::from(i32::MAX));
 }
 
 #[test]

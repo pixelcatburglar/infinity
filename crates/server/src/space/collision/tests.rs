@@ -164,8 +164,7 @@ fn warp_exit_resets_after_step_with_or_without_callback() {
     for collisions in [false, true] {
         for callback in [false, true] {
             let mut s = system::System::new(0, std::sync::Arc::default(), 0);
-            let mut ball = super::super::tests::destiny_reference::ship(1, [0.0; 3], [100.0, 0.0, 0.0]);
-            ball.warp_factor = 3000;
+            let ball = super::super::tests::destiny_reference::ship(1, [0.0; 3], [100.0, 0.0, 0.0]);
             s.insert(ball);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             s.observe(1, 1, tx);
@@ -268,8 +267,7 @@ fn default_off_collision_lifecycle() {
     let batch = owner.try_recv().unwrap();
     assert_eq!(batch[0], event(1, "UncloakBall", vec![Value::Int(3)]));
     assert_eq!(batch[1], reset_event(3, 1, false).unwrap());
-    let mut warper = ship(4, [0.0; 3], [100.0, 0.0, 0.0]);
-    warper.warp_factor = 3000;
+    let warper = ship(4, [0.0; 3], [100.0, 0.0, 0.0]);
     s.insert(warper);
     s.command(4, |b, _, _| { b.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000); Vec::new() });
     for tick in 3..=102 {

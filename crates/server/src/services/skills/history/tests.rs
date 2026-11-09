@@ -46,7 +46,7 @@ async fn requested_count_controls_persisted_history() {
     for invalid in [Value::Int(-1), Value::str("51"), Value::None, Value::Bool(true)] {
         match get(&client, f.character, Some(&invalid)).await {
             Err(CallError::User { msg, dict }) => {
-                assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
+                assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
                 assert_eq!(dict, vec![("notify".into(), Value::unicode(messages::skills::INVALID_HISTORY_REQUEST))]);
             }
             _ => panic!("invalid history request was not refused"),

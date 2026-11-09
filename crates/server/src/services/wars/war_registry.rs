@@ -2,7 +2,8 @@
 //! Mirrors `eve/client/script/ui/services/wars/war_cso.py`; reads `game.wars`.
 //! Ally, surrender, aggressive and GM war mutations are not supported.
 
-use crate::{client::Client, dao::wars, messages};
+use infinity_core::messages;
+use crate::{client::Client, dao::wars};
 use crate::services::{Call, CallResult, db_err, notify_error};
 use marshal::Value;
 use super::{lifecycle, wire};

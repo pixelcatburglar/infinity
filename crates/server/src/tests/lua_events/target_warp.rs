@@ -3,9 +3,13 @@
 mod fleet;
 
 use std::{future::Future, sync::Arc, time::Duration};
-use crate::{consts::{CATEGORY_SHIP, dogma::{ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS}},
+use infinity_core::{
+    consts::{CATEGORY_SHIP, dogma::{ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS}},
+};
+use crate::{
     services::{combat::{self, targeting_charges}, identity::Identity},
-    space::{Ball, System, WarpState, MODE_STOP, HOSTILE_TO_ALL, NpcBrain, NpcConfig}};
+    space::{Ball, System, WarpState, MODE_STOP, HOSTILE_TO_ALL, NpcBrain, NpcConfig},
+};
 use serde_json::json;
 
 const SYSTEM: i64 = 1;
@@ -17,7 +21,7 @@ fn ball(id: i64, type_id: i32, pilot: Option<i64>, x: f64) -> Ball {
         pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: true, global: false, massive: false, interactive: pilot.is_some(),
-        warp: WarpState::default(), warp_factor: 3000, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
 
@@ -32,6 +36,7 @@ async fn warp(ctx: &super::Context, cursor: &mut usize) {
     for collisions in [false, true] {
         for callback in [false, true] {
             let mut s = System::new(SYSTEM, Arc::default(), 0);
+            crate::space::system::tests::events::install_progress_registry(&mut s, &ctx.resources.db);
             let mut b = ball(1, 1, Some(10), 0.0);
             b.vel = [100.0, 0.0, 0.0];
             s.insert(b);
@@ -49,6 +54,7 @@ async fn warp(ctx: &super::Context, cursor: &mut usize) {
         }
     }
     let mut s = System::new(SYSTEM, Arc::default(), 0);
+    crate::space::system::tests::events::install_progress_registry(&mut s, &ctx.resources.db);
     s.insert(ball(1, 1, Some(10), 0.0));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     s.command(1, |b, _, _| { b.warp_to([1000.0, 0.0, 0.0], 0.0, 3000); Vec::new() });
@@ -70,14 +76,23 @@ async fn warp(ctx: &super::Context, cursor: &mut usize) {
     assert_new(ctx, cursor, &[]).await;
 }
 
+fn seed_npc(s: &mut System, sde: Arc<crate::sde::Sde>, id: i64, ty: i32) {
+    let fit = crate::services::fit::Fit::for_space_type(sde, ty, Vec::new());
+    let stats = combat::groups_health::ShipStats::from_fit(&fit, crate::services::fit::Key::Ship);
+    s.install_condition(id, combat::groups_health::Condition { now: stats.max, stats, shield_at: crate::client::filetime_now() }, fit);
+}
+
 async fn npc(ctx: &super::Context, cursor: &mut usize) {
+    let npc_type = ctx.resources.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_STRUCTURE_HP).is_some_and(|hp| hp > 0.0)).expect("damageable SDE type").type_id;
     let mut s = System::new(SYSTEM, Arc::default(), 0);
-    s.insert(ball(1000, 1, None, 0.0));
+    crate::space::system::tests::events::install_progress_registry(&mut s, &ctx.resources.db);
+    s.insert(ball(1000, npc_type, None, 0.0));
+    seed_npc(&mut s, ctx.resources.sde.clone(), 1000, npc_type);
     s.insert(ball(1, 1, Some(10), 50.0));
     let brain = NpcBrain::new(Some(HOSTILE_TO_ALL), NpcConfig {
         fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 5000.0),
-    }, Arc::new(|_| Box::pin(async {})));
+    }, Arc::new(|_, _| Some(Box::pin(async {}))));
     assert!(s.add_npc(1000, brain));
     s.tick(0);
     assert_new(ctx, cursor, &[]).await;
@@ -87,29 +102,34 @@ async fn npc(ctx: &super::Context, cursor: &mut usize) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.register_pilot(10, tx);
     let mut s = System::new(SYSTEM, registry, 0);
-    s.insert(ball(1000, 1, None, 0.0));
+    crate::space::system::tests::events::install_progress_registry(&mut s, &ctx.resources.db);
+    s.insert(ball(1000, npc_type, None, 0.0));
+    seed_npc(&mut s, ctx.resources.sde.clone(), 1000, npc_type);
     let mut drone = ball(2, 1, None, 50.0);
     drone.owner_id = 10;
     let spec = crate::space::drone::DroneSpec { type_id: 1, bandwidth: 1.0, scan_resolution: 1.0,
         control_range: 100.0, max_target_range: 100.0, optimal_range: 50.0, orbit_range: 20.0,
         duration_ms: 1000.0, effect_id: None };
-    s.restore_drone(drone, spec, Arc::new(|_| Box::pin(async {})));
+    s.insert(drone.clone());
+    s.register_drone(2, spec, Arc::new(|_, _| Some(Box::pin(async {}))), None, Some(10), false);
     let brain = NpcBrain::new(Some(10), NpcConfig {
         fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 5000.0),
-    }, Arc::new(|_| Box::pin(async {})));
+    }, Arc::new(|_, _| Some(Box::pin(async {}))));
     assert!(s.add_npc(1000, brain));
     for tick in 0..=60 { s.tick(tick * 1000); }
     assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|(name, args)|
         name == "OnTarget" && args[0].as_bytes() == Some(b"otheradd".as_slice())));
     assert_new(ctx, cursor, &[]).await;
     let mut s = System::new(SYSTEM, Arc::default(), 0);
-    s.insert(ball(1001, 1, None, 0.0));
+    crate::space::system::tests::events::install_progress_registry(&mut s, &ctx.resources.db);
+    s.insert(ball(1001, npc_type, None, 0.0));
+    seed_npc(&mut s, ctx.resources.sde.clone(), 1001, npc_type);
     s.insert(ball(1, 1, Some(10), 50.0));
     let brain = NpcBrain::new(Some(HOSTILE_TO_ALL), NpcConfig {
         fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 5000.0),
-    }, Arc::new(|_| Box::pin(async {})));
+    }, Arc::new(|_, _| Some(Box::pin(async {}))));
     assert!(s.add_npc(1001, brain));
     s.tick(1000);
     s.take(1);
@@ -128,32 +148,41 @@ pub(super) async fn run(ctx: &super::Context) {
 async fn player(ctx: &super::Context, cursor: &mut usize) {
     let db = &ctx.resources.db;
     let world = &ctx.resources.world;
+    world.system(SYSTEM).await.unwrap();
     let ty = ctx.resources.sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
         && t.attribute(ATTR_MAX_TARGET_RANGE).unwrap_or(0.0) > 0.0
         && t.attribute(ATTR_SIGNATURE_RADIUS).unwrap_or(0.0) > 0.0)
         .max_by(|a, b| a.attribute(ATTR_SCAN_RESOLUTION).unwrap_or(0.0).total_cmp(&b.attribute(ATTR_SCAN_RESOLUTION).unwrap_or(0.0)))
         .expect("ship type").type_id;
-    let (account, character, ship): (i64, i64, i64) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+    let (account, character, ship, pilot, target): (i64, i64, i64, i64, i64) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let account = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('event-lock-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
         let character = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'event-lock-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await?.get("character_id");
         let ship = tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z) VALUES ($1, $2, $3, 0, 1, true, 0, 0, 0) RETURNING item_id", &[&ty, &character, &SYSTEM]).await?.get("item_id");
-        Ok::<_, crate::db::Error>((account, character, ship))
+        let pilot: i64 = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'event-lock-target-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await?.get("character_id");
+        let target: i64 = tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z) VALUES ($1, $2, $3, 0, 1, true, 0, 0, 0) RETURNING item_id", &[&ty, &pilot, &SYSTEM]).await?.get("item_id");
+        Ok::<_, crate::db::Error>((account, character, ship, pilot, target))
     }), |f, ()| async move { Ok::<_, crate::db::Error>(f) }).await.unwrap();
-    let target = -ship;
-    let pilot = -character;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (target_tx, mut target_rx) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(pilot, target_tx);
     let identity = Identity { char_id: character, ship_id: Some(ship), corp_id: 1, station_id: None, system_id: Some(SYSTEM) };
     let cx = combat::Ctx::from_identity(&identity, db, world, Some(SYSTEM), tx).unwrap();
     let mut work = std::pin::pin!(async {
-        world.add_ship(SYSTEM, ball(ship, ty, Some(character), 0.0)).await.unwrap();
-        world.add_ship(SYSTEM, ball(target, ty, Some(pilot), 0.0)).await.unwrap();
+        world.system(SYSTEM).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: ship, type_id: ty, owner_id: character, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let mut prepared = crate::services::ship::balls::piloted(db, ctx.resources.sde.clone(), &row, character, 0.0).await.unwrap();
+        prepared.ball = ball(ship, ty, Some(character), 0.0);
+        world.with(SYSTEM, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: target, type_id: ty, owner_id: pilot, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let mut prepared = crate::services::ship::balls::piloted(db, ctx.resources.sde.clone(), &row, pilot, 0.0).await.unwrap();
+        prepared.ball = ball(target, ty, Some(pilot), 0.0);
+        world.with(SYSTEM, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
         let started = std::time::Instant::now();
         targeting_charges::add_target_ctx(&cx, target, true).await.ok().expect("lock starts");
         assert_new(ctx, cursor, &[]).await;
         let (_, args) = tokio::time::timeout(Duration::from_secs(120), rx.recv()).await.unwrap().unwrap();
         assert_eq!(args[0].as_bytes(), Some(b"add".as_slice()));
+        world.with(SYSTEM, |_| ()).await.unwrap();
         assert_new(ctx, cursor, &[json!({"kind":"Targeted", "char_id":pilot, "by_ball_id":ship, "system_id":SYSTEM})]).await;
         let wait_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64 + 1000;
         combat::reset_pilot(world, character, None);
@@ -162,6 +191,7 @@ async fn player(ctx: &super::Context, cursor: &mut usize) {
         assert_eq!(args[0].as_bytes(), Some(b"add".as_slice()));
         let (_, args) = tokio::time::timeout(Duration::from_secs(2), target_rx.recv()).await.unwrap().unwrap();
         assert_eq!(args[0].as_bytes(), Some(b"otheradd".as_slice()));
+        world.with(SYSTEM, |_| ()).await.unwrap();
         assert_new(ctx, cursor, &[json!({"kind":"Targeted", "char_id":pilot, "by_ball_id":ship, "system_id":SYSTEM})]).await;
         combat::reset_pilot(world, character, None);
         let (_, args) = tokio::time::timeout(Duration::from_secs(2), target_rx.recv()).await.unwrap().unwrap();
@@ -170,17 +200,24 @@ async fn player(ctx: &super::Context, cursor: &mut usize) {
         world.remove_ball(SYSTEM, target).await;
         let (_, args) = tokio::time::timeout(Duration::from_secs(120), rx.recv()).await.unwrap().unwrap();
         assert_eq!(args[0].as_bytes(), Some(b"lost".as_slice()));
+        world.with(SYSTEM, |_| ()).await.unwrap();
         assert_new(ctx, cursor, &[]).await;
-        let mut drone = ball(target, ty, None, 0.0);
-        drone.owner_id = pilot;
-        world.add_ship(SYSTEM, drone).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: target, type_id: ty, owner_id: pilot, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let mut prepared = crate::services::ship::balls::unpiloted(db, ctx.resources.sde.clone(), &row).await.unwrap();
+        prepared.ball = ball(target, ty, None, 0.0);
+        prepared.ball.owner_id = pilot;
+        world.with(SYSTEM, move |s| prepared.install(s, |s, ball| s.add_persistent_ship(ball))).await.unwrap();
         targeting_charges::add_target_ctx(&cx, target, true).await.ok().expect("unpiloted target lock starts");
         let (_, args) = tokio::time::timeout(Duration::from_secs(120), rx.recv()).await.unwrap().unwrap();
         assert_eq!(args[0].as_bytes(), Some(b"add".as_slice()));
+        world.with(SYSTEM, |_| ()).await.unwrap();
         assert_new(ctx, cursor, &[]).await;
         combat::reset_pilot(world, character, None);
         world.remove_ball(SYSTEM, target).await;
-        world.add_ship(SYSTEM, ball(target, ty, Some(pilot), 0.0)).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: target, type_id: ty, owner_id: pilot, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let mut prepared = crate::services::ship::balls::piloted(db, ctx.resources.sde.clone(), &row, pilot, 0.0).await.unwrap();
+        prepared.ball = ball(target, ty, Some(pilot), 0.0);
+        world.with(SYSTEM, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
         targeting_charges::add_target_ctx(&cx, target, true).await.ok().expect("cancelled lock starts");
         combat::reset_pilot(world, character, None);
         assert!(world.after(SYSTEM, wait_ms).await);
@@ -196,8 +233,11 @@ async fn player(ctx: &super::Context, cursor: &mut usize) {
     combat::reset_pilot(world, character, Some((SYSTEM, ship)));
     world.remove_ball(SYSTEM, ship).await;
     world.remove_ball(SYSTEM, target).await;
-    world.unregister_pilot(pilot);
+    world.unregister_pilot_generation(pilot, None);
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        crate::services::tests::fixture::cleanup_progress(tx, &[account, character, pilot], &[character, pilot]).await?;
+        tx.execute("DELETE FROM game.items WHERE item_id = $1", &[&target]).await?;
+        tx.execute("DELETE FROM game.characters WHERE character_id = $1", &[&pilot]).await?;
         tx.execute("DELETE FROM game.items WHERE item_id = $1", &[&ship]).await?;
         tx.execute("DELETE FROM game.characters WHERE character_id = $1", &[&character]).await?;
         tx.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await?;

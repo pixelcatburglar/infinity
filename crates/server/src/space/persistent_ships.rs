@@ -3,7 +3,7 @@
 //! come from game items and the SDE. Condition is installed only for a published
 //! hull, so duplicate restoration cannot replace live state. Boarding is separate.
 use super::{Ball, System, World, MILLISECONDS_PER_SECOND};
-use crate::consts::CATEGORY_SHIP;
+use infinity_core::consts::CATEGORY_SHIP;
 
 impl System {
     /// Add an unpiloted hull once, sharing the position snapshot identity map.
@@ -36,12 +36,16 @@ impl World {
         Ok(balls)
     }
 
-    pub(crate) async fn add_persistent_ship(&self, system: i64, ship: crate::services::ship::balls::PreparedShip) -> anyhow::Result<()> {
-        self.system(system).await?;
-        self.with(system, move |s| {
-            if !s.contains(ship.ball.id) { s.add_persistent_ship(ship.install()); }
-        }).await
-            .ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+    pub(crate) async fn add_persistent_ship_locked(&self, system: i64, ship: crate::services::ship::balls::PreparedShip,
+        market: &tokio::sync::MutexGuard<'static, ()>) -> anyhow::Result<()> {
+        self.system_locked(system, market).await?;
+        let installed = self.with(system, move |s| {
+            if s.contains(ship.ball.id) { return false; }
+            ship.install(s, |s, ball| s.add_persistent_ship(ball));
+            true
+        }).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))?;
+        if !installed { return Err(anyhow::anyhow!("ship already present in system")); }
+        Ok(())
     }
 }
 

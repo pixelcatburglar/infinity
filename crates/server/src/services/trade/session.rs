@@ -3,7 +3,8 @@
 //! cannot be silently discarded. Fitted items are outside direct-trade scope.
 use std::collections::BTreeSet;
 use marshal::{DbRowDescriptor, Value};
-use crate::{consts::CLIENT_MAX_ISK, dao::trades::{Trade, TradeItem}, services::{market::round2, value_field}};
+use infinity_core::consts::CLIENT_MAX_ISK;
+use crate::{dao::trades::{Trade, TradeItem}, services::{market::round2, value_field}};
 
 pub(super) fn money(value: &Value) -> Option<f64> {
     let amount = value.as_float()?;

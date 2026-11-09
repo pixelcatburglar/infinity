@@ -43,10 +43,10 @@ async fn permanent_activation_and_application() {
         if !license.is_permanent() || license.is_single_use || skin.is_structure_skin || !skin.visible(&c.cfg.server.boot_region) || c.sde.types.get(license.license_type_id).is_none() { return None; }
         let hull = *skin.type_ids.first()?;
         let second_hull = *skin.type_ids.get(1)?;
-        if hull == second_hull || ![hull, second_hull].iter().all(|id| c.sde.types.get(*id).is_some_and(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP))) { return None; }
+        if hull == second_hull || ![hull, second_hull].iter().all(|id| c.sde.types.get(*id).is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP))) { return None; }
         Some((license.license_type_id, skin.skin_id, hull, second_hull))
     }).expect("visible permanent multi-hull SKIN with two ship hulls and license type");
-    let flag = crate::consts::FLAG_HANGAR;
+    let flag = infinity_core::consts::FLAG_HANGAR;
     let first: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,2,false) RETURNING item_id", &[&license_type, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
     let second: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,false) RETURNING item_id", &[&license_type, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
     let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
@@ -108,7 +108,7 @@ async fn permanent_activation_and_application() {
     crate::services::tests::fixture::cleanup(&db, other).await.unwrap();
     assert!(activate(&mut c, vec![second]).await.is_err());
     assert_eq!(load_items(&db, &c.sde, ItemQuery::Id(second)).await.unwrap()[0].quantity, 1);
-    let incompatible = c.sde.types.iter().find(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP) && !c.sde.ship_skins.skin(skin).unwrap().supports(ty.type_id)).unwrap().type_id;
+    let incompatible = c.sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && !c.sde.ship_skins.skin(skin).unwrap().supports(ty.type_id)).unwrap().type_id;
     let wrong_ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&incompatible, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
     assert!(apply(&mut c, wrong_ship, Some(skin)).await.is_err());
     let identity = Arc::new(Identity::of_client(&c));
@@ -180,7 +180,7 @@ async fn permanent_activation_and_application() {
     assert!(registration.rx.try_recv().is_ok());
     assert_eq!(apply(&mut c, ship, None).await.unwrap(), Value::None);
     assert_eq!(apply(&mut c, ship, Some(skin)).await.unwrap(), Value::None);
-    assert!(matches!(apply(&mut c, ship, Some(skin)).await, Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_SKIN_ALREADY_APPLIED));
+    assert!(matches!(apply(&mut c, ship, Some(skin)).await, Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_SKIN_ALREADY_APPLIED));
     assert_eq!(apply(&mut c, ship, None).await.unwrap(), Value::None);
     assert_eq!(apply(&mut c, ship, None).await.unwrap(), Value::None);
     assert_eq!(apply(&mut c, ship, Some(skin)).await.unwrap(), Value::None);
@@ -204,7 +204,7 @@ async fn permanent_activation_and_application() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with imported SDE and external flock"]
 async fn corporation_take_controls_personal_license_and_ship() {
     use crate::services::tests::fixture;
-    use crate::consts::{FLAG_CORP_SAG1, FLAG_HANGAR, ROLE_HANGAR_CAN_TAKE_1};
+    use infinity_core::consts::{FLAG_CORP_SAG1, FLAG_HANGAR, ROLE_HANGAR_CAN_TAKE_1};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let actor = fixture::create(&db).await.unwrap();
@@ -214,7 +214,7 @@ async fn corporation_take_controls_personal_license_and_ship() {
     let (license_type, skin, hull) = c.sde.ship_skins.licenses().find_map(|license| {
         let skin = c.sde.ship_skins.skin(license.skin_id)?;
         if !license.is_permanent() || license.is_single_use || skin.is_structure_skin || !skin.visible(&c.cfg.server.boot_region) || c.sde.types.get(license.license_type_id).is_none() { return None; }
-        let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+        let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
         Some((license.license_type_id, skin.skin_id, hull))
     }).expect("visible permanent SKIN with ship hull");
     let corp = fixture::create_corporation(&db, ceo.character, station).await.unwrap();

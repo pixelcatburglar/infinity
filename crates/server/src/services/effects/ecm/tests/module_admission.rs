@@ -3,7 +3,8 @@ use super::*;
 use std::{future::Future, sync::atomic::AtomicBool, task::Poll};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{combat::{ActiveModule, targeting_charges}, drones::{settings, tests::{fixture::Fixture, resources::fleet::form_fleet}}, effects::{lifecycle::ActivationOwner, registry}}, space::drone::DroneOrder};
+use infinity_core::{consts::{*, dogma::*}};
+use crate::{services::{combat::{ActiveModule, targeting_charges}, drones::{settings, tests::{fixture::Fixture, resources::fleet::form_fleet}}, effects::{lifecycle::ActivationOwner, registry}}, space::drone::DroneOrder};
 
 async fn catch_scenario(future: impl Future<Output = Result<()>>) -> std::thread::Result<Result<()>> {
     let mut future = std::pin::pin!(future);
@@ -87,8 +88,10 @@ async fn module_ecm_final_admission_precedes_crimewatch() -> Result<()> {
             state.activation_generation.insert(module, generation.clone());
         }
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], effect,
-            target: Some(victim_ship), repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation: generation.clone(), armed: false },
-            started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+            target: Some(victim_ship), repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation: generation.clone(), armed: false,
+                combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id: module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
+                pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
+            started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
         ensure!(!crimewatch::retaliation_allowed(victim, attacker, crate::client::filetime_now()), "fixture starts with engagement");
         {
             let mut future = std::pin::pin!(start(&cx, &fit, &mut cycle));
@@ -115,7 +118,9 @@ async fn module_ecm_final_admission_precedes_crimewatch() -> Result<()> {
             state.activation_generation.insert(module, generation.clone());
         }
         cycle.stop = generation.clone();
-        cycle.owner = ActivationOwner { master: module, generation, armed: false };
+        cycle.owner = ActivationOwner { master: module, generation, armed: false,
+            combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id: module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
+            pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id };
         start(&cx, &fit, &mut cycle).await.map_err(|_| anyhow!("admitted cycle failed"))?;
         ensure!(!combat::jamming::is_jammed(victim_ship, crate::space::now_ms()), "zero-strength attempt jammed victim");
         ensure!(crimewatch::retaliation_allowed(victim, attacker, crate::client::filetime_now()), "admitted attempt did not create engagement");

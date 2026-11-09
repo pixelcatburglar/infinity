@@ -1,5 +1,6 @@
 [package]
 name = "sde-import"
+default-run = "sde-import"
 description = "Load Elysian SDE JSONL bundles into PostgreSQL"
 edition.workspace = true
 version.workspace = true
@@ -9,6 +10,9 @@ license.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
-serde_json.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

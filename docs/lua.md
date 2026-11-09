@@ -27,6 +27,72 @@ There is no host data cache: every `data.load` call reads the file afresh.
 If a module calls it at top level, `require` caches the module's result; reload
 recreates the modules and reads the data again.
 
+`content.data("shipadaptionnodes")` instead reads an operator-published content
+bundle captured once when the VM generation is built. It is not `data.load`:
+the latter remains for server-authored files. Registration, datasets, policy
+and messages are pinned together for that generation. Typed handles preserve
+this identity; scripts cannot choose another character or forge a plan.
+Change the authored content version when policy, messages or registration
+changes: retained versions are immutable and reject different bytes under the
+same version and hash. See [setup](setup.md) for publication.
+
+Every authored namespace has an append-only durable activation history. Startup
+and reload store each immutable package and, when its version or fingerprint
+differs from the namespace's latest activation, append its FILETIME publication
+stamp in the same transaction. Repeating the same package adds no row; returning
+to an earlier package adds a new ordered row. A failed transaction leaves the
+old generation live. The database decision commits before the brief in-memory
+generation swap; after a crash in that interval, rebuilding the same files
+reuses the latest activation rather than recording a second publication. Retain
+both package bytes and activation history when backing up or restoring.
+
+The shipped `ship_adaption_mgr.lua` uses the generic context operations:
+
+```lua
+local revision = ctx:content_snapshot('ship_adaption')
+return ctx:content_commit('ship_adaption', revision)
+```
+
+The snapshot is a coherent integer revision for the authenticated request;
+commit consumes its original method and typed arguments. Reads send their
+notification and return `None` without writing. Mutations plan outside locks,
+then perform one admitted atomic operation. The original absolute deadline
+limits planning and starting an owned operation. Once started, the owned
+operation completes even if the caller times out or disconnects; read back its result instead of
+automatically replaying it. A publication before admission causes a conflict;
+an already admitted operation finishes with its pinned generation.
+
+The script claims only `fetch_tree_data`, `fetch_missions`, `fetch_user_data`,
+`InjectChips` and `call_chip_exchange`. Injection checks physical custody and
+uses the injector's SDE dogma target and units per item to credit a distinct
+virtual currency with checked multiplication. Exchange accepts only quoted types
+and eligible issuers, using a corporation quote then the dataset default;
+nonpositive or overflowing totals are refused. There is no ISK grant. Unlock,
+assignment and QA finish remain no-effect refusals: nodes, tasks and effects
+are not implemented. No Lua work is added to tick, hit, module or NPC paths,
+and this package claims no progress observer.
+
+The shipped daily-goal package (`daily_goals.lua` and
+`content/daily_goals/`) registers `Assign`, `Match`, `Cascade` and `Project`
+against the original server-authored JSON. Its six exact gateway claims use
+`ctx:content_read("daily_goals")` for the three reads and
+`ctx:content_commit("daily_goals")` for redeem, paid completion and QA
+progress. Each call admits one fixed, typed native operation scoped to the
+authenticated request and returns an opaque invocation-bound token, not the
+native response. The handler must return that token unchanged after exactly one
+matching call; an error, second call, wrong mode or namespace, missing call,
+or foreign token rejects the request without starting the operation. The input
+is protobuf TEXT for inspection, while the public gateway remains binary.
+After successful admission Rust starts the operation and returns its native
+response; typed business failures remain unchanged. Once started, the owned
+operation completes even if the caller times out or disconnects; before
+admission no operation runs. Read back state rather than blindly retrying.
+This is not an arbitrary effects DSL. Natural progress resources are obtained
+by Rust through `World` outside locks, not exposed to Lua. Activation checks producer capabilities before accepting playable pools,
+and retained periods resolve their immutable original policies. See
+[daily goals](features.md) for assignment and reward rules and
+[remote services](remote-services.md#daily-goals) for the exact claims.
+
 Script names are file stems and must be unique across all roots. Duplicate names
 fail startup or reload, reporting both source paths. Settings and persistent
 store namespaces remain keyed by script name, not by root. Set `[lua] enabled =
@@ -105,8 +171,9 @@ use actual methods such as `PlaceBuyOrder` or `PlaceMultiSellOrder`.
 ## Events
 
 `register.event(kind, function(ev) ... end)` subscribes to a known kind;
-unknown kinds fail loading. The one argument is a plain scalar table, not a
-wire value, containing `kind` and the snake_case fields below. There is no
+unknown kinds fail loading. The one argument is a plain table, not a wire
+value, containing `kind` and the snake_case fields below. Resource facts include
+historical nested tables as described below. There is no
 invocation context: event handlers cannot use context-dependent mutators.
 Asynchronous `world` and `store` functions remain available.
 
@@ -122,6 +189,7 @@ Asynchronous `world` and `store` functions remain available.
 | `ItemsMoved` | `char_id`, `item_id`, `from_location_id`, `to_location_id`, `quantity` | An inventory move commits |
 | `WalletChanged` | `owner_id`, `account_key`, `balance`, `delta` | A wallet change commits |
 | `SkillTrained` | `char_id`, `type_id`, `level` | A completed skill level is persisted |
+| `SkillStateChanged` | `char_id` | Free skill points, extraction or GM changes persist a trained skill change |
 | `MarketOrderPlaced` | `char_id`, `order_id`, `type_id`, `quantity`, `price`, `is_buy` | A market order is placed |
 | `MarketOrderFilled` | `order_id`, `buyer_id`, `seller_id`, `type_id`, `quantity`, `price` | A market order is filled |
 | `MissionAccepted` | `char_id`, `agent_id`, `mission_id` | A mission is accepted |
@@ -131,10 +199,29 @@ Asynchronous `world` and `store` functions remain available.
 | `Damaged` | `char_id`, `ship_id`, `attacker_ball_id`, `system_id` | Damage removes shield, armor or structure from a pilot's ship |
 | `ModuleCycleEnded` | `char_id`, `module_item_id`, `effect_id`, `outcome` | A module cycle ends |
 | `WarpArrived` | `char_id`, `system_id` | A piloted ball changes from warp to stopped |
+| `OreMined` | `char_id`, `ore_type`, `context`, `slices` | Delivered ore or ice |
+| `GasHarvested` | `char_id`, `gas_type`, `context`, `slices` | Delivered gas |
+| `ManufacturingInstalled` | `char_id`, `job_id`, `owner_id`, `owner_is_corporation`, `product_type`, `runs`, `scheduled_quantity`, `facility_id`, `occurred_at`, `context` | A manufacturing job is installed |
+| `ManufacturingDelivered` | `char_id`, `installer_id`, `job_id`, `owner_id`, `owner_is_corporation`, `product_type`, `quantity`, `facility_id`, `output_location_id`, `occurred_at`, `context` | Manufacturing output is delivered |
+| `SignatureResolved` | `char_id`, `site_id`, `signature_id`, `signature_type`, `archetype`, `dungeon_type`, `occurred_at`, `context` | A signature is first resolved |
+| `WreckSalvaged` | `char_id`, `wreck_id`, `wreck_type`, `occurred_at`, `context` | A wreck is salvaged |
+| `ContainerHacked` | `char_id`, `container_id`, `container_type`, `site_id`, `archetype`, `hack_kind`, `occurred_at`, `context` | A container is first hacked |
+| `LoyaltyPointsEarned` | `char_id`, `issuer_id`, `amount`, `reason`, `occurred_at`, `context` | Ordinary loyalty points are earned |
 
-`type_id`, `mission_id`, `quantity`, `level` and `account_key` are i32;
-other IDs, including `effect_id`, are i64, money fields are f64, `is_buy` is
-boolean, and `outcome` is a string.
+Resource `context` contains optional `corporation_id`, `alliance_id`, `faction_id`,
+`ship_id`, `ship_type_id`, `system_id`, `station_id` and an `origin` string
+(`natural`, `gm`, `qa`). Missing values are nil. Mining `slices` is a 1-based
+array of tables containing `log_id`, `occurred_at`, `quantity`, and total
+`volume_m3`; filter each slice by its own FILETIME before summing.
+`hack_kind` is `data` or `relic`; ordinary loyalty earning `reason` is
+`mission_reward`. Only positive natural mission rewards from non-Heraldry
+issuers emit it; GM adjustments and store purchases do not. Salvage emits only
+after a successful wreck claim, not on failed or repeated cycles.
+
+`type_id`, `mission_id`, `level` and `account_key` are i32; quantities and
+other IDs, including `effect_id`, are i64. Monetary event fields use exact
+server-side amounts but are exposed to Lua as numbers and can lose precision
+at large magnitudes. `is_buy` is boolean, and `outcome` is a string.
 
 `ModuleCycleEnded.outcome` is `completed`, `target_lost`, `out_of_capacitor`
 or `cargo_full`. One repeated module interval emits one event. A weapon bank
@@ -145,16 +232,13 @@ Database-backed events are dispatched after COMMIT. Actor-only events are
 enqueued after the authoritative actor transition. Consumers should wait for
 the relevant event and read visible state rather than assume an accepted request
 has completed.
-Wallet values are client-facing f64 scalars, not an exact arbitrary-decimal
-ledger. For GM `setisk` and `addisk`, balance is clamped to the client-facing
-f64 projection and delta is projected-after minus projected-before; delta can
-be zero even when the exact balance changes. The before-read can race existing
-direct writers, so it is not an exact journal. Other wallet deltas are the signed
-requested amounts. Existing direct core bypasses have event additions, but
-arbitrary DAO writes are not globally captured.
-Some autocommit shared corporation wallet writes perform an announcement or
-membership lookup after changing the balance but before queuing `WalletChanged`.
-If that lookup fails, the balance may be committed without a wallet event.
+`WalletChanged` carries the exact committed balance and signed change internally,
+including the actual difference for GM `setisk` and `addisk`. Its Lua `balance`
+and `delta` fields remain numbers, projected without the client wallet display
+cap. Large values can lose cents or other low digits to IEEE floating-point
+precision; Lua arithmetic is not an exact wallet ledger. Durable schema 2
+stores these two fields as exact decimal strings, independently of the Lua
+projection. Arbitrary direct DAO writes are not globally captured as events.
 
 `NpcKilled` confirms destruction and identifies the known killer; it is omitted
 when the killer is unknown. It is emitted before reward processing and does not
@@ -163,6 +247,9 @@ guarantee a successful reward or wreck. NPC kill rewards are not atomic; a faile
 `ItemsMoved` covers inventory moves, not every economic stack delta.
 `SkillTrained` is emitted lazily when completed levels are persisted, not by a
 wall-clock timer.
+`SkillStateChanged` invalidates the current trained skill state; it is not a
+`SkillTrained` completion. Adding unallocated skill points or changing expert
+system grants does not emit it.
 
 Transaction dispatch remains synchronous: after successful COMMIT, events are
 handed off in outbox order to one ordered channel runner started by `lua::start`.
@@ -174,6 +261,11 @@ order, with independent instruction and time budgets for each handler. Failures
 are logged and later handlers continue; a subscriber cannot change the committed
 operation's reply. When Lua is disabled, there is no runner and events are dropped.
 The event queue is best-effort and process-local, not durable across a restart.
+The source transaction also journals durable outbox events for server progress
+consumers; replaying those receipts does not enqueue Lua events again. Targeting,
+damage, module-cycle completion and warp arrival remain live-only. Some older
+standalone event producers still use the process-local channel and are not
+journaled.
 Each event snapshots the registry when processing starts, retaining that generation
 for all its handlers even if a reload occurs.
 
@@ -219,8 +311,20 @@ Incoming wire values support `:int()`, `:float()`, `:text()`, `:bool()`,
 value. `ctx:notify(event, ...)` takes wire arguments; `ctx:change_session(table)`
 takes string keys and wire values. `ctx:bind(service, params)` returns a wire
 callback. `ctx:user_error(name, dict)` raises a client error; its dictionary
-values must be wire values. Context and session objects expire when the handler
-finishes or is cancelled and must never be stored for later use.
+values must be wire values. Uncaught typed host refusals also reach the client as
+user errors with their message and full dictionary intact; other Lua errors are
+internal errors. Context and session objects expire when the handler finishes or
+is cancelled and must never be stored for later use.
+
+### Sovereignty content
+
+The shipped sovereignty RPC script claims four exact `sovMgr` reads and the bound alliance structure and capital reads; `ctx:content_snapshot('sovereignty')` returns the host's typed, already encoded result for the current request. It is not a generic selector or a grant of authority. For the two bound alliance reads, the request must be bound with exactly `Tuple(Int(allianceID), Int(1))` and no arguments or keyword arguments. The host checks the character's current database corporation-to-alliance membership for that request against the selector. OID provenance, session fallback and the second tuple value do not grant authority. Context expiry applies to this host function too; the existing call ABI is unchanged.
+
+The authored sovereignty policy package defines capital initialization, capital loss and self-destruct rules. Policy evaluation uses restricted immutable inputs; deployment and capture obligations retain their required frozen parameters and content identity. Package versions are immutable: reusing a namespace and version for different bytes is refused. Reload prepares and persists the replacement before publication, and a failed reload keeps the old generation; only the current generation admits new writes. Referenced older packages are retained and reopened for existing obligations. Missing, corrupt or incompatible packages fail closed rather than substituting the latest policy.
+
+Startup recovery validates referenced packages before opening Hub admission, cancels unfinished self-destruct requests and reanchors capture without offline progress. Shutdown closes admission before the existing market fence drains. For rollback, preserve a mutually compatible server binary, database and every referenced authored policy package; an older binary or database alone is not a safe rollback.
+
+Capture business inputs are frozen for transaction retries. Organization invalidation timestamps are sampled after mutation under the canonical organization ordering lock on each attempt, and roll back with that attempt. Checkpoints validate the complete historical contributor proof; bounded retained history freezes unresolved progress rather than discarding proof. Dirty targets are coalesced per system into a guarded transaction per interval, not a global batch. General module fuel consumption uses effective dogma attributes 713 and 714 and retains the existing single in-space fit load per cycle.
 
 ## Persistence and configuration
 
@@ -294,6 +398,10 @@ operation has completed. Supported operations are:
 
 `pilots` creates and controls persistent characters for the server's simulated
 pilot account. It cannot control a character from a player account.
+The server initializes this account with the same unlimited Omega authority as
+normal registration. On startup, a missing authority for an existing service
+account is restored without changing any existing grade. A conflicting player
+account is rejected and left unchanged.
 
 ### Lifecycle, identity and list
 
@@ -355,12 +463,12 @@ default effect is refused. Deactivation normally completes the current cycle.
 quantity_or_nil)` uses normal inventory movement and returns no value. The
 pilot must be online. Its current station ID selects its personal hangar; another
 container ID selects an item container. IDs must be positive, `flag` non-negative
-and a supplied quantity positive and representable as a signed 32-bit integer.
+and a supplied quantity positive and representable as a signed 64-bit integer.
 
 `pilots.sell(character_id, item_id, station_id, price, quantity, duration)`
 places or fills a normal sell order and returns whether anything was sold or
 listed. The pilot must be online. Price must be finite and positive, and quantity
-must be positive and representable as a signed 32-bit integer. `duration = 0`
+must be positive and representable as a signed 64-bit integer. `duration = 0`
 requests immediate matching. A missing item is refused. Normal station,
 duration, ownership, skill, price and matching rules apply.
 
@@ -409,8 +517,10 @@ hangar items in that station. Character `get` returns nil when absent or a table
 with `name`, `corporation_id`, `race_id`, `bloodline_id`, `ancestry_id`,
 `school_id`, `gender_id` and `created`; `name`, `ship`, `corps.of` and
 `standings.get` return nil when absent. `skills.levels` returns a
-type-ID-to-level table. Wallet balance is a number. Item-move quantities must
-also fit a signed 32-bit inventory quantity.
+type-ID-to-level table. Wallet balance is an uncapped number and can lose
+precision at large magnitudes. Wallet credit and debit accept numeric ISK and
+convert it to checked, rounded cents at the wallet boundary. Item-move
+quantities must also fit a signed 64-bit inventory quantity.
 
 Mutators require the live invocation context as their first argument:
 

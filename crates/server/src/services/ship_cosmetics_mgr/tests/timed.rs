@@ -54,12 +54,12 @@ async fn give_skin_rpc_roles_validation_and_renewal() {
     }).expect("visible ordinary SKIN");
     let args = [Value::Int(i64::from(skin))];
     let kwargs = Value::dict([("duration", Value::Int(1))]);
-    for role in [0, crate::consts::ROLE_DIRECTOR, crate::consts::ROLE_QA, crate::consts::GM_ROLES & !crate::consts::ROLE_GML] {
+    for role in [0, infinity_core::consts::ROLE_DIRECTOR, infinity_core::consts::ROLE_QA, infinity_core::consts::GM_ROLES & !infinity_core::consts::ROLE_GML] {
         c.login.role = role;
         assert!(dispatch(&mut c, &call("GiveSkin", &args, &kwargs)).await.unwrap().is_err());
         assert!(ship_skins::get_stored_license(&db, fixture.character, skin).await.unwrap().is_none());
     }
-    c.login.role = crate::consts::ROLE_GML;
+    c.login.role = infinity_core::consts::ROLE_GML;
     for bad in [
         Value::dict([("duration", Value::Bool(true))]),
         Value::dict([("duration", Value::Float(1.0))]),
@@ -79,7 +79,7 @@ async fn give_skin_rpc_roles_validation_and_renewal() {
     let first = ship_skins::get_stored_license(&db, fixture.character, skin).await.unwrap().unwrap().expires_at.unwrap();
     assert_eq!(dispatch(&mut c, &call("GiveSkin", &args, &kwargs)).await.unwrap().unwrap(), Value::None);
     let second = ship_skins::get_stored_license(&db, fixture.character, skin).await.unwrap().unwrap().expires_at.unwrap();
-    assert_eq!(second, first + crate::consts::FILETIME_DAY);
+    assert_eq!(second, first + infinity_core::consts::FILETIME_DAY);
     assert_eq!(dispatch(&mut c, &call("GiveSkin", &args, &Value::dict([("isSingleUse", Value::Bool(false))]))).await.unwrap().unwrap(), Value::None);
     assert_eq!(ship_skins::get_stored_license(&db, fixture.character, skin).await.unwrap().unwrap().expires_at, None);
     assert!(dispatch(&mut c, &call("GiveSkin", &args, &kwargs)).await.unwrap().is_err());
@@ -109,7 +109,7 @@ async fn timed_item_batch_consumes_each_and_extends_once() {
             && skin.visible(&c.cfg.server.boot_region) && c.sde.types.get(license.license_type_id).is_some())
             .then_some((license.license_type_id, skin.skin_id, i64::from(license.duration_days)))
     }).expect("visible timed ordinary SKIN item");
-    let flag = crate::consts::FLAG_HANGAR;
+    let flag = infinity_core::consts::FLAG_HANGAR;
     let mut ids = Vec::new();
     for _ in 0..2 {
         let item: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,2,false) RETURNING item_id", &[&item_type, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
@@ -126,7 +126,7 @@ async fn timed_item_batch_consumes_each_and_extends_once() {
     assert!(rx.try_recv().is_err());
     let after = filetime_now();
     let expiry = ship_skins::get_stored_license(&db, fixture.character, skin).await.unwrap().unwrap().expires_at.unwrap();
-    let duration = 2 * days * crate::consts::FILETIME_DAY;
+    let duration = 2 * days * infinity_core::consts::FILETIME_DAY;
     assert!(expiry >= before + duration && expiry <= after + duration);
     for id in ids { assert_eq!(load_items(&db, &c.sde, ItemQuery::Id(id)).await.unwrap()[0].quantity, 1); }
     }).await;
@@ -147,14 +147,14 @@ async fn expired_application_is_not_resurrected_by_give() {
     let (mut c, _peer) = crate::services::tests::client(db.clone(), fixture.character).await;
     let station = c.sde.map.stations().next().unwrap().station_id;
     c.session.apply(vec![("stationid", Value::Int(station))]);
-    c.login.role = crate::consts::ROLE_GML;
+    c.login.role = infinity_core::consts::ROLE_GML;
     let (skin, hull) = c.sde.ship_skins.licenses().find_map(|license| {
         let skin = c.sde.ship_skins.skin(license.skin_id)?;
         if skin.is_structure_skin || !skin.visible(&c.cfg.server.boot_region) { return None; }
-        let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+        let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
         Some((skin.skin_id, hull))
     }).expect("visible ordinary ship SKIN");
-    let flag = crate::consts::FLAG_HANGAR;
+    let flag = infinity_core::consts::FLAG_HANGAR;
     let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
     let args = [Value::Int(i64::from(skin))];
     let one_day = Value::dict([("duration", Value::Int(1))]);
@@ -191,11 +191,11 @@ async fn expired_application_batch_rollback_and_no_resurrection() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.world.register_pilot(fixture.character, tx);
         c.session.apply(vec![("userid", Value::Int(fixture.account))]);
-        c.world.set_online_session(fixture.character, crate::session::OnlineSession::from_session(&c.session));
+        c.world.set_online_session(fixture.character, infinity_core::session::OnlineSession::from_session(&c.session));
         let mut stream = crate::gateway::tests::notice_stream(&c.world, [2; 16], fixture.character, 16);
         let station = c.sde.map.stations().next().unwrap().station_id;
         c.session.apply(vec![("stationid", Value::Int(station))]);
-        let flag = crate::consts::FLAG_HANGAR;
+        let flag = infinity_core::consts::FLAG_HANGAR;
         for permanent in [false, true] {
             let (item_type, skin, hull) = c.sde.ship_skins.licenses().find_map(|license| {
                 let skin = c.sde.ship_skins.skin(license.skin_id)?;
@@ -203,13 +203,13 @@ async fn expired_application_batch_rollback_and_no_resurrection() {
                     || !skin.visible(&c.cfg.server.boot_region) || c.sde.types.get(license.license_type_id).is_none() {
                     return None;
                 }
-                let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+                let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
                 Some((license.license_type_id, skin.skin_id, hull))
             }).expect("visible SKIN item with ship hull");
             let ship: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
             let good: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,2,false) RETURNING item_id", &[&item_type, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
             let bad: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
-            assert!(ship_skins::insert_license(&test_db, fixture.character, skin, Some(filetime_now() + crate::consts::FILETIME_DAY)).await.unwrap());
+            assert!(ship_skins::insert_license(&test_db, fixture.character, skin, Some(filetime_now() + infinity_core::consts::FILETIME_DAY)).await.unwrap());
             assert_eq!(apply(&mut c, ship, Some(skin)).await.unwrap(), Value::None);
             while stream.rx.try_recv().is_ok() {}
             let expiry = ship_skins::get_stored_license(&test_db, fixture.character, skin).await.unwrap().unwrap().expires_at;

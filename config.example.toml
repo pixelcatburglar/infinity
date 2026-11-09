@@ -1,5 +1,5 @@
 # Infinity server. Every key is optional; shown values are the defaults.
-# Precedence: environment variable (deployment keys only) > this file > default.
+# Precedence: documented environment variables > this file > default.
 
 [server]
 bind = "0.0.0.0:26000"              # env: BIND; existing server listener
@@ -72,6 +72,7 @@ drain_secs = 10                     # bounded shutdown drain
 enabled = true                      # Load Lua scripts; false disables the VM.
 scripts_dir = "crates/server/lua"   # Directory containing the Lua scripts.
 mod_dirs = []                       # Additional independent Lua script roots.
+# content_data_dir = "content/adaption" # Published adaptation bundle root; LUA_CONTENT_DATA_DIR overrides it.
 memory_limit_mb = 64                # Maximum memory for the Lua VM, in MiB.
 call_budget_ms = 1000               # Maximum wall-clock time per call.
 call_budget_instructions = 5000000  # Maximum Lua instructions per call.
@@ -80,9 +81,14 @@ store_value_limit_bytes = 65536     # Maximum encoded value size in the script s
 data_file_limit_bytes = 4194304     # Maximum bytes in one data.load JSON file; must be nonzero.
 # [lua.scripts.motd]                # Arbitrary per-script TOML settings.
 
-# Game parameters have no environment overrides.
+[game.daily_goals]
+history_page_maximum = 100          # env: DAILY_GOALS_HISTORY_PAGE_MAXIMUM; minimum client batch is 25
+rollover_batch_size = 64            # env: DAILY_GOALS_ROLLOVER_BATCH_SIZE; positive job batch limit
+qa_account_ids = []                 # env: DAILY_GOALS_QA_ACCOUNT_IDS; comma-separated positive unique IDs, empty disables QA
+
+# Game parameters have no environment overrides except documented operational settings.
 [expert_systems]
-enabled = false                      # advertise expert-system feature support to clients
+enabled = true                       # advertise expert-system feature support to clients
 [map]
 history_retention_hours = 48        # server event history retention; minimum 24 hours
 maintenance_secs = 3600             # server event history cleanup interval
@@ -110,6 +116,7 @@ broker_fee = 0.03                   # existing market default broker fee
 broker_fee_min_isk = 100            # market minimum broker fee
 sales_tax = 0.08                    # existing market default transaction tax
 max_order_days = 90                 # longest order duration offered by the market windows
+modification_delay_seconds = 300    # server order modification cooldown, appConst.mktModificationDelay default; 0 disables it
 npc_buy_ratio = 0.8                 # server market policy: fraction of the NPC sell price
 maintenance_secs = 60               # server market order maintenance cadence
 order_history_days = 90             # server closed-order history retention
@@ -153,6 +160,10 @@ lock_time_min_secs = 0.5            # existing player targeting minimum
 lock_time_max_secs = 60             # existing player targeting maximum
 npc_think_ms = 1000                 # existing once-per-second NPC thinking cadence
 npc_target_loss_range_factor = 2.0  # existing server target-loss policy
+# Server combat checkpoint policy: distinct aggregate keys across active and sealed batches, not events.
+progress_key_capacity = 4096        # env: COMBAT_PROGRESS_KEY_CAPACITY
+# In-flight batch handles share that key capacity; they do not each add another 4096 keys.
+progress_pending_batches = 4        # env: COMBAT_PROGRESS_PENDING_BATCHES
 
 [npc]
 belt_rats = true                    # existing behavior: region pirates spawn when a pilot warps to a belt
@@ -181,6 +192,8 @@ killmail_attacker_window_secs = 300 # existing window before older damage stops 
 belt_regrowth_secs = 7200           # existing delay before an emptied belt grows back
 ledger_retention_days = 90          # client ledger horizon; server retention deletion policy
 ledger_maintenance_secs = 3600      # server ledger cleanup interval
+progress_aggregation_secs = 1       # env: MINING_PROGRESS_AGGREGATION_SECS; bounded worker interval
+progress_batch_rows = 256           # env: MINING_PROGRESS_BATCH_ROWS; maximum ledger rows per job
 ore_rocks = [15, 25]                # existing ore rocks per belt field range
 ore_rock_m3 = [4000, 25000]         # existing ore rock volume range
 ice_rocks = [6, 11]                 # existing ice rocks per field range
@@ -229,6 +242,7 @@ office_rent_base_isk = 100000       # server minimum office rent
 office_rent_per_security_isk = 900000 # server additional rent at security 1
 bills_maintenance_secs = 600        # server billing maintenance cadence
 advance_billing_days = 7            # server advance-billing policy
+role_removal_cooldown_secs = 86400     # server delay after all corporation rights are removed
 
 [contracts]
 maintenance_secs = 60               # existing auction settlement cadence

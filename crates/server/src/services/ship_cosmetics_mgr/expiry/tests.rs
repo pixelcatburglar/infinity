@@ -10,7 +10,7 @@ async fn stale_claim_after_service_renewal_preserves_nearest_job() {
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut c, _peer) = crate::services::tests::client(test_db.clone(), character).await;
-        c.login.role = crate::consts::ROLE_GML;
+        c.login.role = infinity_core::consts::ROLE_GML;
         let mut skins = c.sde.ship_skins.licenses().filter_map(|license| {
             let skin = c.sde.ship_skins.skin(license.skin_id)?;
             (!skin.is_structure_skin && skin.visible(&c.cfg.server.boot_region)).then_some(skin.skin_id)
@@ -18,7 +18,7 @@ async fn stale_claim_after_service_renewal_preserves_nearest_job() {
         skins.sort_unstable(); skins.dedup();
         let first = skins[0]; let second = skins[1];
         let now = crate::client::filetime_now();
-        let future = now + crate::consts::FILETIME_DAY;
+        let future = now + infinity_core::consts::FILETIME_DAY;
         assert!(ship_skins::insert_license(&test_db, character, first, Some(now - 1)).await.unwrap());
         assert!(ship_skins::insert_license(&test_db, character, second, Some(future)).await.unwrap());
         schedule(&test_db, character).await.unwrap();
@@ -61,18 +61,18 @@ async fn equality_boundary_removes_application_only_on_first_later_tick() {
         let (skin, hull) = c.sde.ship_skins.licenses().find_map(|license| {
             let skin = c.sde.ship_skins.skin(license.skin_id)?;
             if skin.is_structure_skin || !skin.visible(&c.cfg.server.boot_region) { return None; }
-            let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+            let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
             Some((skin.skin_id, hull))
         }).unwrap();
-        let flag = crate::consts::FLAG_HANGAR;
+        let flag = infinity_core::consts::FLAG_HANGAR;
         let ship: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &character, &station, &flag]).await.unwrap().get("item_id");
-        let deadline = crate::client::filetime_now() + crate::consts::FILETIME_DAY;
+        let deadline = crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY;
         assert!(ship_skins::insert_license(&test_db, character, skin, Some(deadline)).await.unwrap());
         let later_skin = c.sde.ship_skins.licenses().find_map(|license| {
             let candidate = c.sde.ship_skins.skin(license.skin_id)?;
             (candidate.skin_id != skin && !candidate.is_structure_skin && candidate.visible(&c.cfg.server.boot_region)).then_some(candidate.skin_id)
         }).unwrap();
-        let later = deadline + crate::consts::FILETIME_DAY;
+        let later = deadline + infinity_core::consts::FILETIME_DAY;
         assert!(ship_skins::insert_license(&test_db, character, later_skin, Some(later)).await.unwrap());
         assert_eq!(super::super::apply(&mut c, ship, Some(skin)).await.unwrap(), Value::None);
         let targets = prepare(&test_db, &c.world, character).await.unwrap();
@@ -111,12 +111,12 @@ async fn reopened_runner_and_startup_recovery_remove_overdue_applications() {
         let (skin, hull) = c.sde.ship_skins.licenses().find_map(|license| {
             let skin = c.sde.ship_skins.skin(license.skin_id)?;
             if skin.is_structure_skin || !skin.visible(&c.cfg.server.boot_region) { return None; }
-            let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+            let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
             Some((skin.skin_id, hull))
         }).unwrap();
-        let flag = crate::consts::FLAG_HANGAR;
+        let flag = infinity_core::consts::FLAG_HANGAR;
         let ship: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &character, &station, &flag]).await.unwrap().get("item_id");
-        let future = crate::client::filetime_now() + crate::consts::FILETIME_DAY;
+        let future = crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY;
         assert!(ship_skins::insert_license(&test_db, character, skin, Some(future)).await.unwrap());
         super::super::apply(&mut c, ship, Some(skin)).await.unwrap();
         assert!(ship_skins::update_expiry(&test_db, character, skin, Some(future), Some(crate::client::filetime_now() - 1)).await.unwrap());
@@ -147,7 +147,7 @@ async fn reopened_runner_and_startup_recovery_remove_overdue_applications() {
         assert!(crate::dao::jobs::lock_job(&reopened, &id(character)).await.unwrap().is_none());
         let (mut client, _peer) = crate::services::tests::client(reopened.clone(), character).await;
         client.session.apply(vec![("stationid", Value::Int(station))]);
-        let next = crate::client::filetime_now() + crate::consts::FILETIME_DAY;
+        let next = crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY;
         assert!(ship_skins::insert_license(&reopened, character, skin, Some(next)).await.unwrap());
         super::super::apply(&mut client, ship, Some(skin)).await.unwrap();
         assert!(ship_skins::update_expiry(&reopened, character, skin, Some(next), Some(crate::client::filetime_now() - 1)).await.unwrap());
@@ -172,18 +172,18 @@ async fn queued_renewal_and_application_precede_stale_expiry() {
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut c, _peer) = crate::services::tests::client(test_db.clone(), character).await;
-        c.login.role = crate::consts::ROLE_GML;
+        c.login.role = infinity_core::consts::ROLE_GML;
         let station = c.sde.map.stations().next().unwrap().station_id;
         c.session.apply(vec![("stationid", Value::Int(station))]);
         let (skin, hull) = c.sde.ship_skins.licenses().find_map(|license| {
             let skin = c.sde.ship_skins.skin(license.skin_id)?;
             if skin.is_structure_skin || !skin.visible(&c.cfg.server.boot_region) { return None; }
-            let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+            let hull = skin.type_ids.iter().copied().find(|id| c.sde.types.get(*id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
             Some((skin.skin_id, hull))
         }).unwrap();
-        let flag = crate::consts::FLAG_HANGAR;
+        let flag = infinity_core::consts::FLAG_HANGAR;
         let ship: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &character, &station, &flag]).await.unwrap().get("item_id");
-        let expiry = crate::client::filetime_now() + crate::consts::FILETIME_DAY;
+        let expiry = crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY;
         assert!(ship_skins::insert_license(&test_db, character, skin, Some(expiry)).await.unwrap());
         schedule(&test_db, character).await.unwrap();
         let stale = crate::dao::jobs::lock_job(&test_db, &id(character)).await.unwrap().unwrap();
@@ -213,7 +213,7 @@ async fn queued_renewal_and_application_precede_stale_expiry() {
         drop(guard);
         let mut c = renewal.await.unwrap();
         handler.await.unwrap();
-        assert_eq!(ship_skins::get_stored_license(&test_db, character, skin).await.unwrap().unwrap().expires_at, Some(expiry + crate::consts::FILETIME_DAY));
+        assert_eq!(ship_skins::get_stored_license(&test_db, character, skin).await.unwrap().unwrap().expires_at, Some(expiry + infinity_core::consts::FILETIME_DAY));
         let stale = crate::dao::jobs::lock_job(&test_db, &id(character)).await.unwrap().unwrap();
         let guard = market::lock().await;
         let (ready, queued) = tokio::sync::oneshot::channel();
@@ -239,7 +239,7 @@ async fn queued_renewal_and_application_precede_stale_expiry() {
         handler.await.unwrap();
         assert_eq!(ship_skins::applications_for_character(&test_db, character).await.unwrap().len(), 1);
         assert_eq!(ship_skins::states_for_ships(&test_db, &[ship], crate::client::filetime_now()).await.unwrap()[0].skin_id, Some(skin));
-        assert_eq!(crate::dao::jobs::lock_job(&test_db, &id(character)).await.unwrap().unwrap().due_at, expiry + crate::consts::FILETIME_DAY + 1);
+        assert_eq!(crate::dao::jobs::lock_job(&test_db, &id(character)).await.unwrap().unwrap().due_at, expiry + infinity_core::consts::FILETIME_DAY + 1);
     }).await;
     crate::scheduler::cancel(&db, &id(character)).await.unwrap();
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();

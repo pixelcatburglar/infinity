@@ -3,7 +3,8 @@
 //! destination location and destination flag. Claiming acknowledges a durable
 //! server receipt only; it never moves or creates an item and emits no notice.
 
-use crate::{dao::items::crates, messages::crates as messages, services::{db_err, notify_error, CallError, CallResult}, client::Client};
+use infinity_core::messages::crates as messages;
+use crate::{dao::items::crates, services::{db_err, notify_error, CallError, CallResult}, client::Client};
 use crate::services::identity::Identity;
 use marshal::Value;
 

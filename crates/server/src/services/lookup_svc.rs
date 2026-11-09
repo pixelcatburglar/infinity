@@ -3,7 +3,8 @@
 //! Searches active game owners and startup SDE NPC owners; structures and aggressive
 //! war permits are not supported.
 
-use crate::{client::Client, consts::{TYPE_ALLIANCE, TYPE_CHARACTER, TYPE_CORPORATION, TYPE_FACTION}, dao, messages};
+use infinity_core::{consts::{TYPE_ALLIANCE, TYPE_CHARACTER, TYPE_CORPORATION, TYPE_FACTION}, messages};
+use crate::{client::Client, dao};
 use crate::services::{Call, CallResult, db_err, keyval, notify_error};
 use marshal::Value;
 use std::collections::HashSet;

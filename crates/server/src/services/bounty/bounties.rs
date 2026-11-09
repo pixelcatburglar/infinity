@@ -1,7 +1,8 @@
 //! Bounty placement and leaderboard mechanics backed by the bounty DAO.
 //! The client contract is described by eve/client/script/ui/shared/bountySvc.py.
 use super::*;
-use crate::{client::filetime_now, dao::bounties as dao, db::outbox::{dispatch_world, Outbox}, messages};
+use infinity_core::messages;
+use crate::{client::filetime_now, dao::bounties as dao, db::outbox::{dispatch_world, Outbox}};
 use crate::services::{db_err, keyval, notify_error, wallets, market};
 use marshal::Value;
 
@@ -48,7 +49,7 @@ pub(super) async fn add(c: &Client, target: i64, amount: f64) -> CallResult {
         let owner = crate::dao::characters::social::owners(db, &[target], CHARACTER as i64, CORPORATION as i64, ALLIANCE as i64).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::bounty::UNKNOWN_OWNER))?;
         let kind = owner.type_id as i16;
         if !valid_amount(kind, amount) { return Err(notify_error(messages::bounty::INVALID_BOUNTY_AMOUNT)); }
-        wallets::debit(db, outbox, me, amount).await?;
+        wallets::debit(db, outbox, me, crate::isk::IskAmount::from_isk(amount)?).await?;
         if !dao::add(db, target, kind, amount, MAX_BOUNTY).await.map_err(db_err)? { return Err(notify_error(messages::bounty::INVALID_BOUNTY_AMOUNT)); }
         dao::contribute(db, target, me, amount, now).await.map_err(db_err)?;
         let type_id = match kind { CHARACTER => PLACED_CHARACTER, CORPORATION => PLACED_CORPORATION, _ => PLACED_ALLIANCE };

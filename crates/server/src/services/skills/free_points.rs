@@ -1,7 +1,8 @@
 //! Applying unallocated skill points for skillsvc.py.
 //! Uses game.characters, skills, history, queue and jobs; changes dispatch after commit.
 use super::{db_err, training, CallError};
-use crate::{client::{filetime_now, Client}, consts::dogma::MAX_SKILL_LEVEL, dao::{characters::attributes, skills::{history, queue, trading, training as skill_dao}}, db::{executor::Executor, outbox::Outbox}, messages, services::{effects::online::{self, OnlineChanged}, notify_error}};
+use infinity_core::{consts::dogma::MAX_SKILL_LEVEL, messages};
+use crate::{client::{filetime_now, Client}, dao::{characters::attributes, skills::{history, queue, trading, training as skill_dao}}, db::{executor::Executor, outbox::Outbox}, services::{effects::online::{self, OnlineChanged}, notify_error}};
 use marshal::Value;
 
 fn refusal() -> CallError { notify_error(messages::skills::INVALID_ECONOMY_REQUEST) }
@@ -34,7 +35,7 @@ fn distribute(rows: &[(i32, i32)], skills: &[skill_dao::Skill], free: i64, sde: 
     Ok(allocations)
 }
 
-async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, targets: &[Target], caps: Option<&[(i32, i64)]>, now: i64) -> Result<i64, CallError> {
+async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &std::sync::Arc<crate::sde::Sde>, fences: &online::OnlineFences, char_id: i64, targets: &[Target], caps: Option<&[(i32, i64)]>, now: i64) -> Result<i64, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let progress = super::completion::advance_tx(tx, outbox, sde, char_id, now).await?;
     let accrued = training::in_training_sp(tx, char_id, now).await?;
@@ -58,11 +59,14 @@ async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChang
         history::append(tx, char_id, type_id, super::history::FREE_POINTS_USED, new_sp, now).await.map_err(db_err)?;
         changed.push(type_id);
     }
+    if !changed.is_empty() {
+        outbox.event(crate::lua::events::GameEvent::SkillStateChanged { char_id });
+    }
     let queue_rows = queue::list(tx, char_id).await.map_err(db_err)?;
     let levels = allocations.iter().map(|(type_id, _, level)| (*type_id, *level)).collect::<std::collections::HashMap<_, _>>();
     let activate = queue_rows.first().is_some_and(|row| row.start_time.is_some());
     let entries = queue_rows.into_iter().filter(|row| levels.get(&row.type_id).is_none_or(|level| row.to_level > *level)).enumerate().map(|(pos, row)| (pos as i64, i64::from(row.type_id), i64::from(row.to_level))).collect();
-    training::save_queue_tx(tx, outbox, sde, char_id, entries, activate, true, now, progress, &changed).await?;
+    training::save_queue_tx(tx, outbox, sde, fences, char_id, entries, activate, true, now, progress, &changed).await?;
     outbox.notify_client("OnFreeSkillPointsChanged", vec![Value::Int(free - used)]);
     Ok(free - used)
 }
@@ -86,7 +90,8 @@ pub(super) async fn preview(c: &mut Client, char_id: i64, targets: Vec<Target>) 
 
 pub(super) async fn apply_targets(c: &mut Client, char_id: i64, targets: Vec<Target>, caps: Option<Vec<(i32, i64)>>) -> Result<Value, CallError> {
     let now = filetime_now(); let _lock = crate::services::market::lock().await; let db = c.db.clone(); let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let targets = targets.clone(); let caps = caps.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, char_id, &targets, caps.as_deref(), now).await }) }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await.map(Value::Int)
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let targets = targets.clone(); let caps = caps.clone(); let fences = fences.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, char_id, &targets, caps.as_deref(), now).await }) }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await.map(Value::Int)
 }
 
 pub(super) async fn preview_queue(c: &mut Client, char_id: i64) -> Result<Value, CallError> {

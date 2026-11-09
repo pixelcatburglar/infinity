@@ -18,11 +18,12 @@
 //! native cadence. The clamped interpolation anchor is actual execution time;
 //! the logical counter is not reset to wall time.
 //!
-//! DB effects run on workers; timers, warp-exit callbacks and non-position
-//! dynamic state, including projected effects, do not survive restart. Legacy
-//! sphere collisions do not emit bumps. Taking, replacing or destroying an NPC
-//! releases its in-memory combat health and capacitor state; temporary player
-//! removal preserves that state.
+//! Persistent positions and ship conditions checkpoint through the same worker;
+//! projections, capacitor, timers and other ephemeral state do not survive restart.
+//! In-process membership transfers carry captured condition; ordinary native cleanup
+//! follows actor membership generations. Legacy sphere collisions do not emit bumps.
+//! Ordinary warp charges the shared in-memory capacitor at activation; partial routes
+//! publish their completed state and do not complete the original arrival callback.
 //! Live compressor ranges use actor-owned module generations and static type lists.
 //! Taking a ball also ends its in-memory ECM lockout before its pilot leaves.
 //! Rack heat and overload membership are transient and are cleared when a ship leaves.
@@ -32,6 +33,11 @@ use std::future::Future;
 #[path = "effects.rs"] mod effects;
 #[path = "boarding.rs"] pub(crate) mod boarding;
 mod affiliation;
+mod sovereignty_placement;
+mod tick;
+pub(crate) mod warp;
+pub(crate) mod warp_arrival;
+mod warp_capacitor;
 use effects::Tractor;
 
 /// carbonengine destiny Ballpark.cpp tick catchup policy.
@@ -64,20 +70,27 @@ struct ModuleCloak {
 #[derive(Default)]
 pub struct System {
     pub(super) id: i64,
+    pub(super) sovereignty: sovereignty::State,
     balls: HashMap<i64, Ball>,
+    pub(super) rocks: HashMap<i64, super::asteroids::Rock>,
+    pub(super) asteroid_timers: HashMap<i64, (i64, u64)>,
+    pub(super) asteroid_timer_sequence: u64,
     pilots: HashMap<i64, i64>,
     observers: HashMap<i64, (i64, DestinyTx)>,
-    registry: Arc<Pilots>,
+    pub(super) registry: Arc<Pilots>,
+    pub(super) progress_registry: Arc<crate::progress::Registry>,
     pub(super) world: std::sync::Weak<World>,
     target_states: HashMap<i64, TargetState>,
     free_ids: Vec<i64>,
     collision_scratch: Vec<collision::Snapshot>,
     exited_ids: Vec<i64>,
+    warp_corrections: Vec<i64>,
     /// Celestial warp-in points (warpin.rs), by celestial ID.
     warp_ins: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
     timers: BTreeMap<(i64, u64), Timer>,
-    warp_exits: HashMap<i64, Timer>,
+    warp_exits: HashMap<i64, warp::WarpIntent>,
+    warp_arrivals: HashMap<warp_arrival::WarpArrivalId, warp_arrival::ArrivalEntry>,
     timer_sequence: u64,
     pub(super) ms: i64,
     current_time: i64,
@@ -93,7 +106,11 @@ pub struct System {
     pub(super) brains: HashMap<i64, NpcBrain>,
     pub(super) drones: HashMap<i64, drone::DroneBrain>,
     pub(super) drone_reservations: HashMap<u64, drone::Reservation>,
-    pub(super) effect_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
+    pub(super) actor_combat: HashMap<i64, combat::ActorCombatRecord>,
+    pub(super) combat_facts: Option<combat_facts::CombatFacts>,
+    pub(super) nativefact_clock: i64,
+    pub(super) effect_jobs: Option<mpsc::UnboundedSender<npc::NpcFuture>>,
+    pub(super) effect_staging: Vec<npc::EffectJob>,
     pub(super) deferred_jobs: Option<mpsc::UnboundedSender<npc::NpcFuture>>,
     pub(super) groups: HashMap<u64, npc::SpawnGroup>,
     pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
@@ -116,6 +133,7 @@ pub struct System {
 }
 impl System {
     pub(crate) fn sde(&self) -> Option<&crate::sde::Sde> { self.projection_sde.as_deref() }
+    pub(crate) fn progress_registry(&self) -> &crate::progress::Registry { &self.progress_registry }
     pub fn new(id: i64, registry: Arc<Pilots>, unix_ms: i64) -> Self {
         let current_time = unix_ms.div_euclid(MILLISECONDS_PER_SECOND);
         Self { id, registry, ms: unix_ms, current_time,
@@ -138,28 +156,13 @@ impl System {
     pub fn now_ms(&self) -> i64 { self.ms }
     /// Submit owned async work to the concurrent worker outside the actor.
     pub fn defer(&self, job: impl Future<Output = ()> + Send + 'static) {
-        if self.deferred_jobs.as_ref().is_none_or(|tx| tx.send(Box::pin(job)).is_err()) {
+        if !self.try_defer(job) {
             tracing::warn!(system = self.id, "space effects worker unavailable");
         }
     }
     pub fn warp_in(&self, id: i64) -> Option<V3> { self.warp_ins.get(&id).copied() }
-    /// Queue cancellation of any previous landing intent before a new warp request.
-    pub fn clear_warp_exit(&mut self, id: i64) {
-        self.actions.push_back((self.current_time, Box::new(move |s, _| { s.warp_exits.remove(&id); })));
-    }
-
-    /// Register the latest landing intent after its warp command in the FIFO.
-    /// The registration must follow a valid warp request in the same FIFO.
-    /// The production service validates before uncloak, clearing, and registration.
-    /// A valid duplicate native request may replace the latest consumer's intent.
-    pub fn on_warp_exit(&mut self, id: i64, f: impl FnOnce(&mut System) + Send + 'static) {
-        self.actions.push_back((self.current_time, Box::new(move |s, _| {
-            match s.balls.get(&id).map(|b| b.mode) {
-                Some(MODE_WARP) => { s.warp_exits.insert(id, Box::new(f)); }
-                Some(MODE_GOTO) => f(s),
-                _ => {}
-            }
-        })));
+    pub(super) fn asteroid_action(&mut self, f: impl FnOnce(&mut System) + Send + 'static) {
+        self.actions.push_back((self.current_time, Box::new(move |system, _| f(system))));
     }
     pub(super) fn set_warp_in(&mut self, id: i64, point: V3) { self.warp_ins.insert(id, point); }
     pub fn ball(&self, id: i64) -> Option<&Ball> {
@@ -248,21 +251,31 @@ impl System {
                 self.snapshot_due = self.ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND));
             }
         }
+        let id = ball.id;
         self.balls.insert(ball.id, ball);
+        if self.actor_combat.get(&id).is_some_and(|record| matches!(record.phase, combat::CombatPhase::Dying { .. } | combat::CombatPhase::Transition { .. })) {
+            self.actor_combat.remove(&id);
+        }
     }
-
     pub fn take(&mut self, id: i64) -> Option<Ball> {
+        if (self.is_npc(id) || self.drone(id).is_some()) && self.contains(id) {
+            if let Some(generation) = self.combat_membership_generation(id) {
+                let _ = self.retire_combat_source(generation);
+            }
+        }
         self.drone_controller_lost(id);
         self.drone_removed(id);
         self.cleanup_tractors(id);
-        self.warp_exits.remove(&id);
+        self.cancel_warp_intent(id);
         if self.balls.contains_key(&id) {
             crate::services::combat::jamming::clear(self, id);
         }
         if let Some(ball) = self.balls.get(&id) {
             crate::services::fleets::space_state::ball_removed(self, self.id, id, ball.char_id);
         }
-        let ball = self.balls.remove(&id)?;
+        self.remove_combat_state(id);
+        if !self.balls.contains_key(&id) { return None; }
+        sovereignty::links::removed(self, id);
         crate::services::effects::heat::remove_ship(self, id);
         self.compressors.remove(&id);
         self.module_cloaks.remove(&id);
@@ -271,9 +284,11 @@ impl System {
         self.remove_projections_on_departure(id);
         self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
+        let ball = self.balls.remove(&id)?;
         if let Some(char_id) = ball.char_id {
             if self.pilots.get(&char_id) == Some(&id) {
                 self.pilots.remove(&char_id);
+                if let Some(facts) = self.combat_facts.as_mut() { facts.mark_character_scopes_dirty(); }
             }
         }
         if self.brains.contains_key(&id) {
@@ -304,128 +319,13 @@ impl System {
     }
     pub(super) fn is_cold(&self, collisions: bool) -> bool {
         self.actions.is_empty()
+            && !self.combat_facts.as_ref().is_some_and(|facts| facts.is_dirty() || facts.batch_count() != 0)
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
             && self.module_cloaks.is_empty() && self.brains.is_empty() && self.drones.is_empty() && self.observers.is_empty()
             && !crate::services::effects::heat::active(&self.heat) && !self.balls.values().any(|b|
             (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
             && !collision::stationary_contact(&self.balls, collisions)
-    }
-    pub fn tick(&mut self, ms: i64) {
-        self.tick_with_collisions(ms, collision::enabled());
-    }
-    pub(super) fn tick_with_collisions(&mut self, ms: i64, collisions: bool) {
-        self.observers.retain(|_, (_, tx)| !tx.is_closed());
-        self.ms = ms;
-        self.expire_projections();
-        let next_tick_ms = *self.next_tick_ms.get_or_insert(MILLISECONDS_PER_SECOND);
-        let due = if ms >= next_tick_ms {
-            (ms - next_tick_ms) / MILLISECONDS_PER_SECOND + 1
-        } else { 0 };
-        let steps = if due > MAX_CATCHUP_STEPS {
-            tracing::warn!(system = self.id, due, "destiny tick catchup clamped");
-            self.next_tick_ms = Some(next_aligned_ms(ms, MILLISECONDS_PER_SECOND));
-            1
-        } else {
-            self.next_tick_ms = Some(next_tick_ms + due * MILLISECONDS_PER_SECOND);
-            due
-        };
-        if !self.is_cold(collisions) { self.pending = Some(HashMap::new()); }
-        for step in 0..steps {
-            let count = self.actions.len();
-            for _ in 0..count {
-                let (stamp, action) = self.actions.pop_front().unwrap();
-                action(self, stamp);
-            }
-            if self.balls.values().any(|b| b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
-                || collision::stationary_contact(&self.balls, collisions) {
-                self.target_states.clear();
-                self.target_states.extend(self.balls.iter().map(|(&id, b)| (id, TargetState {
-                    pos: b.pos, vel: b.vel, radius: b.radius,
-                })));
-                self.free_ids.clear();
-                self.free_ids.extend(self.balls.iter().filter_map(|(&id, b)| b.free.then_some(id)));
-                self.free_ids.sort_unstable();
-                let logical_ms = (self.current_time + 1) * MILLISECONDS_PER_SECOND;
-                let anchor_ms = if due > MAX_CATCHUP_STEPS { ms }
-                    else { next_tick_ms + step * MILLISECONDS_PER_SECOND };
-                for index in 0..self.free_ids.len() {
-                    let id = self.free_ids[index];
-                    let b = self.balls.get_mut(&id).unwrap();
-                    let aligning = b.mode == MODE_WARP && !b.is_warping();
-                    b.evolve_behavior_for_ball(logical_ms, anchor_ms, &self.target_states, self.current_time);
-                    let activated = aligning && b.is_warping();
-                    self.target_states.get_mut(&id).unwrap().vel = b.vel;
-                    if activated { self.stop_all_followers(id); self.drone_controller_lost(id); }
-                }
-                collision::freeze(&mut self.collision_scratch, &self.balls, collisions);
-                collision::apply(&self.collision_scratch, &mut self.balls);
-                self.exited_ids.clear();
-                for snapshot in self.collision_scratch.iter().filter(|snapshot| snapshot.free) {
-                    let id = &snapshot.id;
-                    let b = self.balls.get_mut(id).unwrap();
-                    let was_warping = b.is_warping();
-                    b.evolve_position(logical_ms, snapshot.time_factor);
-                    if was_warping && b.mode == MODE_STOP {
-                        if let Some(char_id) = b.char_id {
-                            crate::lua::on_event(crate::lua::events::GameEvent::WarpArrived {
-                                char_id, system_id: self.id,
-                            });
-                        }
-                        if !collisions || self.warp_exits.contains_key(id) {
-                            self.exited_ids.push(*id);
-                        }
-                    }
-                }
-                for index in 0..self.exited_ids.len() {
-                    let id = self.exited_ids[index];
-                    // Native WarpDistance restores massiveness during the completed step
-                    // (Ballpark.cpp:4330,4355); correct it at the next pre-tick.
-                    if let Some(update) = collision::reset_event(id, self.current_time + 1, collisions) {
-                        self.broadcast(id, vec![update]);
-                    }
-                    if let Some(callback) = self.warp_exits.remove(&id) { callback(self); }
-                }
-            }
-            self.current_time += 1;
-        }
-        if self.snapshot_positions.is_empty() {
-            self.snapshot_due = 0;
-        } else if self.snapshot_due != 0 && ms >= self.snapshot_due {
-            self.snapshot_due = ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND));
-            snapshot::schedule(self);
-        }
-        if self.is_cold(collisions) {
-            self.pending = None;
-            return;
-        }
-        let filetime = crate::client::filetime_from_unix_ms(ms);
-        let expired: Vec<_> = self.balls.values().filter(|b|
-            b.cloak != 0 && b.cloak_until > 0 && b.cloak_until <= filetime).map(|b| b.id).collect();
-        for id in expired { self.uncloak(id); }
-        let obstructed: Vec<_> = self.module_cloaks.keys().copied().filter(|&ship| self.cloak_obstructed(ship)).collect();
-        for ship in obstructed { self.uncloak(ship); }
-        while self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= ms) {
-            let (_, timer) = self.timers.pop_first().unwrap();
-            timer(self);
-        }
-        crate::services::effects::heat::tick(self);
-        self.think_npcs();
-        self.think_drones();
-        if let Some(pending) = self.pending.take() {
-            for (client, events) in pending {
-                if let Some((_, tx)) = self.observers.get(&client) {
-                    if tx.send(events).is_err() { self.observers.remove(&client); }
-                }
-            }
-        }
-        let mut announcements = std::mem::take(&mut self.drone_announcements);
-        for id in announcements.iter().copied() { self.announce_drone(id); }
-        announcements.clear();
-        self.drone_announcements = announcements;
-        let mut acks = std::mem::take(&mut self.drone_launch_acks);
-        for ack in acks.drain(..) { let _ = ack.send(()); }
-        self.drone_launch_acks = acks;
     }
     fn deliver(&mut self, about: Option<(i64, u8)>, events: Vec<Value>) {
         self.observers.retain(|&client, (ego, tx)| {
@@ -590,6 +490,7 @@ impl System {
                     s.module_cloaks.remove(&ship);
                     generation.store(true, std::sync::atomic::Ordering::Relaxed);
                     if crate::services::effects::lifecycle::force_inactive(module, &generation) {
+                        s.fitted_module_active(ship, module, false);
                         s.refresh_projection_target(ship);
                     }
                 }
@@ -601,6 +502,7 @@ impl System {
                 ball.cloak = 1;
                 ball.cloak_until = 0;
             }
+            s.detach_warp_arrival(ship);
             if let Some(on_success) = on_success { on_success(s); }
         })));
         true
@@ -635,6 +537,7 @@ impl System {
         if let Some(cloak) = self.module_cloaks.remove(&ship) {
             cloak.generation.store(true, std::sync::atomic::Ordering::Relaxed);
             if crate::services::effects::lifecycle::force_inactive(cloak.module, &cloak.generation) {
+                self.fitted_module_active(ship, cloak.module, false);
                 self.refresh_projection_target(ship);
             }
             if self.balls[&ship].cloak != 0 {
@@ -706,7 +609,7 @@ impl System {
         }
         let sol = Value::instance(
             "eve.common.script.util.slimItem.SlimItem",
-            [("itemID", Value::Int(system_id)), ("typeID", Value::Int(crate::consts::TYPE_SOLAR_SYSTEM.into())), ("ownerID", Value::Int(1))],
+            [("itemID", Value::Int(system_id)), ("typeID", Value::Int(infinity_core::consts::TYPE_SOLAR_SYSTEM.into())), ("ownerID", Value::Int(1))],
         );
         let bag = Value::instance(
             "utillib.KeyVal",
@@ -757,23 +660,27 @@ impl System {
     /// Queue a command for the next destiny boundary, retaining its enqueue stamp.
     pub fn command(&mut self, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
-            let Some(mut ball) = s.balls.remove(&ship) else { return };
-            ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
-            let old_warp = (ball.mode == MODE_WARP).then_some(
-                (ball.effect_stamp, ball.goto, ball.warp.min_range.to_bits(), ball.warp.factor));
-            let events = f(&mut ball, stamp, s);
-            if old_warp.is_some_and(|old| ball.mode != MODE_WARP
-                || old != (ball.effect_stamp, ball.goto, ball.warp.min_range.to_bits(), ball.warp.factor)) {
-                s.warp_exits.remove(&ship);
-            }
-            ball.interpolation_anchor_ms = s.ms;
-            ball.old_pos = ball.pos;
-            ball.old_vel = ball.vel;
-            ball.segment_acceleration = None;
-            let visibility = (ball.id, ball.cloak);
-            s.balls.insert(ship, ball);
-            if !events.is_empty() { s.deliver(Some(visibility), events); }
+            s.apply_command(ship, stamp, f);
         })));
+    }
+
+    fn apply_command(&mut self, ship: i64, stamp: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value>) {
+        let Some(mut ball) = self.balls.remove(&ship) else { return };
+        ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
+        let old_warp = (ball.mode == MODE_WARP).then_some(
+            (ball.effect_stamp, ball.goto, ball.warp.min_range.to_bits(), ball.warp.factor));
+        let events = f(&mut ball, stamp, self);
+        if old_warp.is_some_and(|old| ball.mode != MODE_WARP
+            || old != (ball.effect_stamp, ball.goto, ball.warp.min_range.to_bits(), ball.warp.factor)) {
+            self.cancel_warp_intent(ship);
+        }
+        ball.interpolation_anchor_ms = self.ms;
+        ball.old_pos = ball.pos;
+        ball.old_vel = ball.vel;
+        ball.segment_acceleration = None;
+        let visibility = (ball.id, ball.cloak);
+        self.balls.insert(ship, ball);
+        if !events.is_empty() { self.deliver(Some(visibility), events); }
     }
 }
 #[cfg(test)] pub(crate) mod tests;

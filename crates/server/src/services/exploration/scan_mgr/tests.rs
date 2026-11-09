@@ -35,11 +35,11 @@ async fn qa_dispatch_validates_role_session_arguments_and_binding() {
         let empty = Value::Dict(vec![]);
         let args = [Value::tuple([])];
         c.session.apply(vec![("solarsystemid", Value::Int(system))]);
-        for role in [0, crate::consts::GM_ROLES] {
+        for role in [0, infinity_core::consts::GM_ROLES] {
             c.login.role = role;
             denied(rpc(&mut c, "QAScanSites", &args, &empty).await);
         }
-        c.login.role = crate::consts::ROLE_QA;
+        c.login.role = infinity_core::consts::ROLE_QA;
         for (ch, space, docked) in [(0, system, 0), (character, 0, system), (character, -1, 0)] {
             c.session.apply(vec![("charid", Value::Int(ch)), ("solarsystemid", Value::Int(space)), ("solarsystemid2", Value::Int(docked))]);
             denied(rpc(&mut c, "QAScanSites", &args, &empty).await);
@@ -82,7 +82,7 @@ async fn qa_selection_wire_persistence_and_character_isolation() {
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut c, _peer) = crate::services::tests::client(test_db.clone(), character).await;
-        c.login.role = crate::consts::ROLE_QA;
+        c.login.role = infinity_core::consts::ROLE_QA;
         c.session.apply(vec![("solarsystemid", Value::Int(system))]);
         let mut sites = Vec::new();
         for (i, (sys, kind, target)) in [(system, Kind::Signature, "SELECTED"), (system, Kind::Signature, "UNSELECTED"), (system, Kind::Anomaly, "ANOMALY"), (other_system, Kind::Signature, "CROSS"), (system, Kind::Signature, "EXPIRED")].into_iter().enumerate() {
@@ -117,6 +117,12 @@ async fn qa_selection_wire_persistence_and_character_isolation() {
             assert_eq!(crate::dao::exploration::is_scanned(&test_db, character, test_ids[i]).await.unwrap(), expected);
             assert!(!crate::dao::exploration::is_scanned(&test_db, other.character, test_ids[i]).await.unwrap());
         }
+        rpc(&mut c, "QAScanSites", &args, &Value::Dict(vec![])).await.unwrap();
+        let events = test_db.query("SELECT payload::text AS payload, origin FROM game.progress_events WHERE kind='SignatureResolved' AND subject_character_id=$1", &[&character]).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].get::<_, String>("origin"), "qa");
+        let event = crate::progress::codec::decode(crate::progress::codec::SCHEMA_VERSION, "SignatureResolved", &events[0].get::<_, String>("payload")).unwrap();
+        assert!(matches!(event, crate::lua::events::GameEvent::SignatureResolved { site_id, signature_type, .. } if site_id == test_ids[0] && signature_type == STRENGTH_RADAR));
         state().scanned.retain(|(ch, _)| *ch != character);
         assert_eq!(scan_result_position(&test_db, system, character, "SELECTED").await.unwrap(), Some(sites[0].pos));
         assert_eq!(scan_result_position(&test_db, system, character, "UNSELECTED").await.unwrap(), None);
@@ -143,7 +149,7 @@ async fn qa_batch_failure_rolls_back_and_retry_commits() {
     let test_trigger = trigger.clone(); let test_function = function.clone();
     let result = tokio::spawn(async move {
         let (mut c, _peer) = crate::services::tests::client(test_db.clone(), character).await;
-        c.login.role = crate::consts::ROLE_QA;
+        c.login.role = infinity_core::consts::ROLE_QA;
         c.session.apply(vec![("solarsystemid", Value::Int(system))]);
         for (id, target) in test_ids.iter().zip(["FIRST", "SECOND"]) {
             let mut site = new_site(system, [1.0, 2.0, 3.0], Kind::Signature, STRENGTH_RADAR, 1.0, &mut HashSet::new());
@@ -157,6 +163,8 @@ async fn qa_batch_failure_rolls_back_and_retry_commits() {
         let args = [Value::tuple([Value::str("SECOND"), Value::str("FIRST")])];
         let kwargs = Value::Dict(vec![]);
         assert!(rpc(&mut c, "QAScanSites", &args, &kwargs).await.is_err());
+        let events = test_db.query("SELECT event_id FROM game.progress_events WHERE kind='SignatureResolved' AND subject_character_id=$1", &[&character]).await.unwrap();
+        assert!(events.is_empty());
         for id in &test_ids {
             assert!(!crate::dao::exploration::is_scanned(&test_db, character, *id).await.unwrap());
             assert!(!state().scanned.contains(&(character, *id)));

@@ -40,7 +40,10 @@ async fn partial_claim_commit_and_rollback() {
         let id: i64 = tx.query_one("INSERT INTO game.redeem_tokens (user_id,type_id,quantity,label,created) VALUES ($1,$2,1,'fixture',0) RETURNING token_id", &[&user, &ty]).await.unwrap().get("token_id");
         ids.push(id);
     }
+    let wide_quantity = i64::MAX;
+    tx.execute("UPDATE game.redeem_tokens SET quantity=$2 WHERE token_id=$1", &[&ids[0], &wide_quantity]).await.unwrap();
     tx.commit().await.unwrap();
+    assert_eq!(crate::dao::store::purchases::tokens(&db, user).await.unwrap().iter().find(|t| t.token_id == ids[0]).unwrap().quantity, wide_quantity);
 
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
@@ -58,6 +61,20 @@ async fn partial_claim_commit_and_rollback() {
     assert!(rolled_back.is_err());
     assert!(!dispatched.load(Ordering::SeqCst));
     assert_eq!(crate::dao::store::purchases::tokens(&db, user).await.unwrap().len(), 5);
+    client.execute("UPDATE game.redeem_tokens SET quantity=$2 WHERE token_id=$1", &[&ids[2], &i64::MAX]).await.unwrap();
+    let overflow: CallResult = db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let ids = ids.clone();
+            let sde = sde.clone();
+            Box::pin(async move { claim_in_transaction(tx, outbox, &sde, user, character, &ids[..3], false, true, Some(station)).await })
+        },
+        |value, _outbox| async move { Ok(value) },
+    ).await;
+    assert!(overflow.is_err());
+    assert_eq!(crate::dao::store::purchases::tokens(&db, user).await.unwrap().len(), 5);
+    let count: i64 = client.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1", &[&character]).await.unwrap().get("n");
+    assert_eq!(count, 0);
+    client.execute("UPDATE game.redeem_tokens SET quantity=1 WHERE token_id=$1", &[&ids[2]]).await.unwrap();
 
     let initial_points: i64 = client.query_one("SELECT free_skill_points FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap().get("free_skill_points");
     let unauthorized: CallResult = db.transaction(
@@ -86,6 +103,9 @@ async fn partial_claim_commit_and_rollback() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].get("stationID"), Some(&Value::Int(station)));
     let item_id = items[0].get("itemID").unwrap().as_int().unwrap();
+    assert_eq!(items[0].get("quantity"), Some(&Value::Int(infinity_core::consts::CLIENT_MAX_SHORT_AMOUNT)));
+    let stored: i64 = client.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&item_id]).await.unwrap().get("quantity");
+    assert_eq!(stored, wide_quantity);
     let errors = value.get("errors").unwrap().items().unwrap();
     assert_eq!(errors, &[redeem_error(ids[1])]);
     assert_eq!(marshal::loads(&marshal::dumps(&errors[0])).unwrap(), errors[0]);

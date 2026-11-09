@@ -1,6 +1,7 @@
 //! Durable scheduler persistence in `game.jobs`, independent of client services.
 //! Deadlines use FILETIME; lease renewal and cross-process ownership are unsupported.
-use crate::{client::filetime_ticks_from_seconds, consts::FILETIME_SECOND, db::{executor::Executor, Error}};
+use infinity_core::consts::FILETIME_SECOND;
+use crate::{client::filetime_ticks_from_seconds, db::{executor::Executor, Error}};
 use crate::scheduler::Job;
 use tokio_postgres::Row;
 

@@ -1,11 +1,14 @@
 //! Turret accuracy and missile launches using fitted dogma and charge data.
 //! Mirrors clientDogmaLocation and michelle, with accuracy from native GetAccuracy
 //! and SDE attributes; missile flight remains an approximation of native physics.
+//! Admitted combat source identities remain frozen until their damage is resolved.
 use super::lifecycle::Module;
-use crate::services::combat::{groups_health::damage, quantity_change, Ctx, ATTR_DAMAGE};
+use super::space_source::PreparedCombatAttempt;
+use crate::services::combat::{quantity_change, Ctx, ATTR_DAMAGE};
+use crate::services::combat::damage::{apply_damage_guarded, DamageSource};
 use crate::services::fit::{Fit, Key};
 use crate::services::{db_err, rand01, CallError};
-use crate::consts::{dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED};
+use infinity_core::consts::{dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED};
 use crate::db::Db;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::sde::Sde;
@@ -202,42 +205,59 @@ pub(crate) fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot
 
 /// Resolve and apply one source-neutral turret shot.
 pub(crate) async fn turret_shot(db: &Db, world: &Arc<World>, system: i64, source: &Ball, target: &Ball,
-    attacker: Option<i64>, weapon: i32, parameters: (f64, f64, f64, f64), raw: [f64; 4],
-    guard: Option<super::space_source::SourceGuard>) -> Result<(), CallError> {
+    attacker: Option<i64>, weapon: i32, illegal: bool, parameters: (f64, f64, f64, f64), raw: [f64; 4],
+    guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
     let (optimal, falloff, tracking, signature) = parameters;
     let source_id = source.id;
     let target_id = target.id;
-    let Some(Some((sampled_source, sampled_target, shooter_pilot, victim_pilot))) = world.with(system, move |s| {
+    let facts = attempt.facts();
+    let shooter_pilot = facts.actual_actor_character;
+    let Some(Some((sampled_source, sampled_target, victim_pilot, target_generation))) = world.with(system, move |s| {
         if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
         let source = s.sampled_ball(source_id)?;
         let target = s.sampled_ball(target_id)?;
-        let owners = (s.combat_owner(source_id), s.combat_owner(target_id));
+        let generation = s.combat_membership_generation(target_id)?;
+        let victim = s.combat_owner(target_id);
         s.drone_attack(source_id, target_id);
-        Some((source, target, owners.0, owners.1))
+        Some((source, target, victim, generation))
     }).await else { return Ok(()) };
     let chance = turret_chance(&sampled_source, &sampled_target, optimal, falloff, tracking, signature, target_signature(world.sde(), &sampled_target));
     let multiplier = turret_roll(chance);
-    let shooter_pilot = shooter_pilot.or(attacker).or(source.char_id);
+    let _ = attacker;
+    let mut illegal = illegal;
     if matches!(guard, Some(super::space_source::SourceGuard::Drone { .. })) {
         if let (Some(shooter), Some(victim)) = (shooter_pilot, victim_pilot) {
-            crate::services::crimewatch::aggress(db, world, system, shooter, source.type_id, source.type_id, victim, target_id).await?;
+            illegal = crate::services::crimewatch::aggress(db, world, system, shooter, victim).await?;
         }
     }
     let dealt = if multiplier > 0.0 {
-        damage(db, world, system, target_id, raw.map(|d| d * multiplier), shooter_pilot, Some(source_id)).await?
+        let outcome = apply_damage_guarded(db, world, system, target_id, raw.map(|d| d * multiplier), DamageSource {
+            attacker_id: shooter_pilot, attacker_ball_id: Some(facts.entity.item_id),
+            source_ship_id: Some(facts.entity.item_id), source_ship_type: Some(facts.entity.type_id),
+            weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
+        }, false, move |s| s.combat_membership_generation(target_id) == Some(target_generation)
+            && guard.is_none_or(|guard| guard.valid(s))).await?;
+        if outcome.is_some() { attempt.disarm(); }
+        outcome.map_or(0.0, |outcome| outcome.dealt)
     } else { 0.0 };
     report_hit(world, source_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, hit_quality(multiplier));
     Ok(())
 }
 
-/// One turret shot at `target`, with the fitted module's and its charge's effective attributes.
-pub(super) async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64) -> Result<(), CallError> {
-    let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
+/// Calculate a fitted turret's parameters and unscaled typed damage.
+pub(super) fn turret_parameters(fit: &Fit, module: &Module) -> ((f64, f64, f64, f64), [f64; 4]) {
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
     let raw = ATTR_DAMAGE.map(|id| fit.value(ch, id) * fit.value(m, ATTR_DAMAGE_MULTIPLIER).max(0.0));
-    turret_shot(&cx.db, &cx.world, cx.system_id, &ship, &t, Some(cx.char_id), module.type_id,
-        (fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF), fit.value(m, ATTR_TRACKING_SPEED), fit.value(m, ATTR_OPTIMAL_SIG_RADIUS)), raw, None).await
+    ((fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF),
+        fit.value(m, ATTR_TRACKING_SPEED), fit.value(m, ATTR_OPTIMAL_SIG_RADIUS)), raw)
+}
+
+pub(super) async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64, illegal: bool, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
+    let ship_id = cx.ship_id;
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
+    let (parameters, raw) = turret_parameters(fit, module);
+    turret_shot(&cx.db, &cx.world, cx.system_id, &ship, &t, Some(cx.char_id), module.type_id, illegal,
+        parameters, raw, None, attempt).await
 }
 
 /// What a missile does when it arrives.
@@ -250,14 +270,13 @@ pub(crate) struct Missile {
     pub(crate) velocity: f64,
     pub(crate) flight_range: f64,
     pub(crate) weapon: i32,
-    /// The pilot who fired it.
-    pub(crate) attacker: Option<i64>,
+    pub(crate) illegal: bool,
 }
 
 
 /// Launch a native-steered missile actor; the separate gameplay impact timer
 /// applies explosion radius and velocity against the impact-time target state.
-pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile, guard: Option<super::space_source::SourceGuard>) -> Result<(), CallError> {
+pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile, guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
@@ -288,7 +307,6 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         massive: false,
         interactive: false,
         warp: crate::space::WarpState::default(),
-        warp_factor: 0,
         last_ms: launch_ms,
         interpolation_anchor_ms: launch_ms,
         effect_stamp: 0,
@@ -303,47 +321,78 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
     let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
     let shooter_id = from.id;
     let target_id = target.id;
-    let source_type = from.type_id;
-    let fallback_shooter = m.attacker.or(from.char_id);
+    let facts = attempt.facts();
+    let shooter_pilot = facts.actual_actor_character;
     let (flight_range, aoe_cloud, aoe_velocity, drf, raw, weapon) =
         (m.flight_range, m.aoe_cloud, m.aoe_velocity, m.drf, m.raw, m.weapon);
     let sde = world.sde().clone();
     let world_ref = Arc::downgrade(&world);
     let impact_db = db.clone();
     world.system(system).await.map_err(CallError::Internal)?;
-    let Some(admission) = world.with(system, move |s| {
+    let Some((victim_pilot, target_generation)) = world.with(system, move |s| {
         if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
-        let shooter_pilot = s.combat_owner(shooter_id).or(fallback_shooter);
-        let victim_pilot = s.combat_owner(target_id);
+        Some((s.combat_owner(target_id), s.combat_membership_generation(target_id)?))
+    }).await.flatten() else { return Ok(()) };
+    let drone_admission = matches!(guard, Some(super::space_source::SourceGuard::Drone { .. }))
+        .then_some((shooter_pilot, victim_pilot));
+    let illegal = if let Some((Some(shooter), Some(victim))) = drone_admission {
+        crate::services::crimewatch::classify(&db, &world, system, shooter, victim).await?
+    } else { m.illegal };
+    let Some(()) = world.with(system, move |s| {
+        if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
+        if s.combat_membership_generation(target_id) != Some(target_generation) { return None; }
+        if drone_admission.is_some() && s.combat_owner(target_id) != victim_pilot { return None; }
         s.drone_attack(shooter_id, target_id);
         s.launch_missile(missile, target_id, shooter_id, delay_ms, move |s| {
+            if !s.contains(missile_id) { return; }
             s.destroy_ball(missile_id);
-            let application = s.sampled_ball(target_id).map(|target| {
-                (missile_applied(target_signature(&sde, &target), dist(target.vel, [0.0; 3]), aoe_cloud, aoe_velocity, drf),
-                    s.combat_owner(target_id))
-            });
+            let application = (s.combat_membership_generation(target_id) == Some(target_generation))
+                .then(|| s.sampled_ball(target_id)).flatten()
+                .filter(|target| target.cloak == 0 && target.mode != crate::space::MODE_WARP)
+                .map(|target| {
+                    (missile_applied(target_signature(&sde, &target), dist(target.vel, [0.0; 3]), aoe_cloud, aoe_velocity, drf),
+                        s.combat_owner(target_id))
+                });
             let reached = distance <= flight_range + MISSILE_REACH_ALLOWANCE_METRES;
             s.defer(async move {
                 let Some(world) = world_ref.upgrade() else { return };
                 let (dealt, quality, victim_pilot) = if let Some((application, victim_pilot)) = application.filter(|_| reached) {
-                    (damage(&impact_db, &world, system, target_id, raw.map(|d| d * application), shooter_pilot, Some(shooter_id)).await.unwrap_or(0.0), HIT_NORMAL, victim_pilot)
+                    let outcome = apply_damage_guarded(&impact_db, &world, system, target_id, raw.map(|d| d * application), DamageSource {
+                        attacker_id: shooter_pilot, attacker_ball_id: Some(facts.entity.item_id),
+                        source_ship_id: Some(facts.entity.item_id), source_ship_type: Some(facts.entity.type_id),
+                        weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
+                    }, false, move |s| s.combat_membership_generation(target_id) == Some(target_generation)
+                        && s.ball(target_id).is_some_and(|target| target.cloak == 0 && target.mode != crate::space::MODE_WARP)).await;
+                    let dealt = match outcome {
+                        Ok(Some(outcome)) => { attempt.disarm(); outcome.dealt }
+                        Ok(None) => 0.0,
+                        Err(error) if crate::services::combat::capacity::is_refusal(&error) => {
+                            attempt.report_capacity_refusal();
+                            0.0
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, missile = missile_id, "missile impact damage failed");
+                            0.0
+                        }
+                    };
+                    (dealt, HIT_NORMAL, victim_pilot)
                 } else {
                     (0.0, HIT_MISS, application.and_then(|(_, owner)| owner))
                 };
                 report_hit(&world, shooter_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, quality);
             });
         });
-        Some((shooter_pilot, victim_pilot))
+        Some(())
     }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))? else { return Ok(()) };
-    if matches!(guard, Some(super::space_source::SourceGuard::Drone { .. })) {
-        if let (Some(shooter), Some(victim)) = admission {
-            crate::services::crimewatch::aggress(&db, &world, system, shooter, source_type, source_type, victim, target_id).await?;
+    if let Some((Some(shooter), Some(victim))) = drone_admission {
+        if let Err(error) = crate::services::crimewatch::apply(&db, &world, system, shooter, victim, illegal).await {
+            tracing::warn!(?error, missile = missile_id, "missile aggression application failed");
         }
     }
     Ok(())
 }
 
-pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64) -> Result<(), CallError> {
+pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64, illegal: bool, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
     let ch = Key::Charge(module.id);
@@ -357,15 +406,16 @@ pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i
         velocity,
         flight_range: velocity * ms_to_seconds(fit.value(ch, ATTR_EXPLOSION_DELAY)),
         weapon: module.type_id,
-        attacker: Some(cx.char_id),
+        illegal,
     };
-    launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile, None).await
+    launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile, None, attempt).await
 }
 
 /// Execute an actor-owned weapon using the sampled source and effective fit.
-pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>) -> Result<(), CallError> {
+pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>, attempt: Option<PreparedCombatAttempt>) -> Result<(), CallError> {
     use crate::space::drone::DronePhase;
     if !matches!(cx.phase, DronePhase::Begin) { return Ok(()); }
+    let attempt = attempt.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing admitted combat attempt")))?;
     let source = cx.source.id;
     let target = cx.target.id;
     let guard = cx.guard;
@@ -377,7 +427,7 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>) -> 
     };
     let Some((from, victim)) = sample().await else { return Ok(()) };
     if matches!(cx.effect.kind, super::EffectKind::Missile) {
-        let charge = cx.fit.value(cx.key, crate::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
+        let charge = cx.fit.value(cx.key, infinity_core::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
         if charge <= 0 || cx.world.sde().types.get(charge).is_none() {
             let id = cx.effect.id as i32;
             let name = cx.world.sde().dogma.effect(id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
@@ -389,27 +439,27 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>) -> 
     match cx.effect.kind {
         super::EffectKind::Turret => {
             let raw = ATTR_DAMAGE.map(|id| fit.value(key, id) * fit.value(key, ATTR_DAMAGE_MULTIPLIER).max(0.0));
-            turret_shot(cx.db, cx.world, cx.system, &from, &victim, cx.attacker, from.type_id,
-                (fit.value(key, ATTR_MAX_RANGE), fit.value(key, ATTR_FALLOFF), fit.value(key, ATTR_TRACKING_SPEED), fit.value(key, ATTR_OPTIMAL_SIG_RADIUS)), raw, Some(cx.guard)).await
+            turret_shot(cx.db, cx.world, cx.system, &from, &victim, cx.attacker, from.type_id, false,
+                (fit.value(key, ATTR_MAX_RANGE), fit.value(key, ATTR_FALLOFF), fit.value(key, ATTR_TRACKING_SPEED), fit.value(key, ATTR_OPTIMAL_SIG_RADIUS)), raw, Some(cx.guard), attempt).await
         }
         super::EffectKind::Missile => {
-            let charge = fit.value(key, crate::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
+            let charge = fit.value(key, infinity_core::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
             let sde = cx.world.sde();
             let attr = |id| sde.types.attribute(charge, id).or_else(|| sde.dogma.attribute(id).and_then(|a| a.default_value)).unwrap_or(0.0);
-            let velocity = (attr(ATTR_MAX_VELOCITY) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER)).max(1.0);
+            let velocity = (attr(ATTR_MAX_VELOCITY) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER)).max(1.0);
             let missile = Missile {
                 charge,
                 raw: ATTR_DAMAGE.map(|id| attr(id) * fit.value(key, ATTR_MISSILE_DAMAGE_MULTIPLIER)),
-                aoe_cloud: attr(ATTR_AOE_CLOUD_SIZE) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
-                aoe_velocity: attr(ATTR_AOE_VELOCITY) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
+                aoe_cloud: attr(ATTR_AOE_CLOUD_SIZE) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
+                aoe_velocity: attr(ATTR_AOE_VELOCITY) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
                 drf: attr(ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
                 velocity,
-                flight_range: velocity * ms_to_seconds(attr(ATTR_EXPLOSION_DELAY) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER)),
+                flight_range: velocity * ms_to_seconds(attr(ATTR_EXPLOSION_DELAY) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER)),
                 weapon: from.type_id,
-                attacker: cx.attacker,
+                illegal: false,
             };
             let owner = cx.attacker.unwrap_or(from.owner_id);
-            launch_missile(cx.db.clone(), cx.world.clone(), cx.system, from, victim, owner, None, missile, Some(cx.guard)).await
+            launch_missile(cx.db.clone(), cx.world.clone(), cx.system, from, victim, owner, None, missile, Some(cx.guard), attempt).await
         }
         _ => unreachable!(),
     }

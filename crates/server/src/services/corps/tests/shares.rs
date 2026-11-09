@@ -106,7 +106,7 @@ async fn retry_after_claim_commits_once_and_failure_never_dispatches() {
     let ceo = fixture::create(&db).await.unwrap();
     let target = fixture::create(&db).await.unwrap();
     let issuer: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('governance-retry-' || nextval('game.corporations_corporation_id_seq')::text,'GR' || currval('game.corporations_corporation_id_seq')::text,$1,$1,1,1) RETURNING corporation_id", &[&ceo.character]).await.unwrap().get("corporation_id");
-    db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&issuer, &ceo.character]).await.unwrap();
+    fixture::assign_corporation(&db, ceo.character, issuer, infinity_core::consts::ROLE_DIRECTOR).await.unwrap();
     assert!(ledger::initialize(&db, issuer, 1000).await.unwrap());
     let test_db = db.clone();
     let result = tokio::spawn(async move {

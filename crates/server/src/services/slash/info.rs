@@ -1,7 +1,8 @@
 //! Read-only session information and GM security-status controls.
 //! Security is stored by Crimewatch and follows its normal notification path.
 use super::{slash_error, Client, CallError};
-use crate::{db::outbox::dispatch_world, messages, services::crimewatch};
+use infinity_core::messages;
+use crate::{db::outbox::dispatch_world, services::crimewatch};
 
 fn valid_security(value: f64) -> bool {
     value.is_finite() && (-10.0..=10.0).contains(&value)

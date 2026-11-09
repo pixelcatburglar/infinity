@@ -102,6 +102,10 @@ pub struct CombatConfig {
     pub npc_think_ms: i64,
     /// Existing server target-loss policy in space/npc.rs.
     pub npc_target_loss_range_factor: f64,
+    /// Server combat checkpoint policy: distinct aggregate keys across active and sealed batches, not events.
+    pub progress_key_capacity: usize,
+    /// Server combat checkpoint policy: in-flight batch handles sharing the key capacity.
+    pub progress_pending_batches: usize,
 }
 
 impl Default for CombatConfig {
@@ -113,6 +117,8 @@ impl Default for CombatConfig {
             lock_time_max_secs: 60.0,
             npc_think_ms: 1000,
             npc_target_loss_range_factor: 2.0,
+            progress_key_capacity: 4096,
+            progress_pending_batches: 4,
         }
     }
 }
@@ -126,6 +132,8 @@ impl CombatConfig {
         anyhow::ensure!(self.npc_think_ms > 0, "combat.npc_think_ms={} is outside its valid domain", self.npc_think_ms);
         anyhow::ensure!(crate::space::now_ms().checked_add(self.npc_think_ms).is_some(), "combat.npc_think_ms={} exceeds the millisecond deadline", self.npc_think_ms);
         anyhow::ensure!(self.npc_target_loss_range_factor.is_finite() && self.npc_target_loss_range_factor > 0.0, "combat.npc_target_loss_range_factor={} is outside its valid domain", self.npc_target_loss_range_factor);
+        anyhow::ensure!(self.progress_key_capacity > 0, "combat.progress_key_capacity={} is outside its valid domain", self.progress_key_capacity);
+        anyhow::ensure!(self.progress_pending_batches > 0, "combat.progress_pending_batches={} is outside its valid domain", self.progress_pending_batches);
         anyhow::ensure!(self.lock_time_min_secs <= self.lock_time_max_secs, "combat.lock_time_min_secs={} exceeds combat.lock_time_max_secs={}", self.lock_time_min_secs, self.lock_time_max_secs);
         Ok(())
     }
@@ -250,9 +258,9 @@ impl CrimewatchConfig {
         anyhow::ensure!(self.security_loss_kill.is_finite() && (0.0..=1.0).contains(&self.security_loss_kill), "crimewatch.security_loss_kill={} is outside its valid domain", self.security_loss_kill);
         anyhow::ensure!(self.killmail_attacker_window_secs > 0, "crimewatch.killmail_attacker_window_secs={} is outside its valid domain", self.killmail_attacker_window_secs);
         for (key, value) in [("crimewatch.weapons_timer_secs", self.weapons_timer_secs), ("crimewatch.pvp_timer_secs", self.pvp_timer_secs), ("crimewatch.criminal_timer_secs", self.criminal_timer_secs), ("crimewatch.engagement_secs", self.engagement_secs)] {
-            super::duration(key, value, crate::consts::FILETIME_SECOND, true)?;
+            super::duration(key, value, infinity_core::consts::FILETIME_SECOND, true)?;
         }
-        super::duration("crimewatch.killmail_attacker_window_secs", self.killmail_attacker_window_secs, crate::consts::FILETIME_SECOND, false)?;
+        super::duration("crimewatch.killmail_attacker_window_secs", self.killmail_attacker_window_secs, infinity_core::consts::FILETIME_SECOND, false)?;
         Ok(())
     }
 }
@@ -268,6 +276,10 @@ pub struct MiningConfig {
     pub ledger_retention_days: i64,
     /// Server policy default cleanup interval in seconds.
     pub ledger_maintenance_secs: i64,
+    /// Server policy interval for bounded progress aggregation.
+    pub progress_aggregation_secs: i64,
+    /// Server policy maximum source rows per aggregation transaction.
+    pub progress_batch_rows: i64,
     /// Server design default ore rock counts in services/mining.rs.
     pub ore_rocks: [i64; 2],
     /// Server design default ore rock volumes in services/mining.rs.
@@ -294,6 +306,8 @@ impl Default for MiningConfig {
             belt_regrowth_secs: 7200,
             ledger_retention_days: 90,
             ledger_maintenance_secs: 3600,
+            progress_aggregation_secs: 1,
+            progress_batch_rows: 256,
             ore_rocks: [15, 25],
             ore_rock_m3: [4000.0, 25000.0],
             ice_rocks: [6, 11],
@@ -310,11 +324,14 @@ impl Default for MiningConfig {
 impl MiningConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.belt_regrowth_secs > 0, "mining.belt_regrowth_secs={} is outside its valid domain", self.belt_regrowth_secs);
-        super::duration("mining.belt_regrowth_secs", self.belt_regrowth_secs, crate::consts::FILETIME_SECOND, true)?;
+        super::duration("mining.belt_regrowth_secs", self.belt_regrowth_secs, infinity_core::consts::FILETIME_SECOND, true)?;
         anyhow::ensure!(self.ledger_retention_days > 0, "mining.ledger_retention_days={} is outside its valid domain", self.ledger_retention_days);
-        super::duration("mining.ledger_retention_days", self.ledger_retention_days, crate::consts::FILETIME_DAY, false)?;
+        super::duration("mining.ledger_retention_days", self.ledger_retention_days, infinity_core::consts::FILETIME_DAY, false)?;
         anyhow::ensure!(self.ledger_maintenance_secs > 0, "mining.ledger_maintenance_secs={} is outside its valid domain", self.ledger_maintenance_secs);
-        super::duration("mining.ledger_maintenance_secs", self.ledger_maintenance_secs, crate::consts::FILETIME_SECOND, true)?;
+        super::duration("mining.ledger_maintenance_secs", self.ledger_maintenance_secs, infinity_core::consts::FILETIME_SECOND, true)?;
+        anyhow::ensure!(self.progress_aggregation_secs > 0, "mining.progress_aggregation_secs must be positive");
+        super::duration("mining.progress_aggregation_secs", self.progress_aggregation_secs, infinity_core::consts::FILETIME_SECOND, true)?;
+        anyhow::ensure!(self.progress_batch_rows > 0 && usize::try_from(self.progress_batch_rows).ok().and_then(|rows| rows.checked_mul(std::mem::size_of::<crate::dao::mining_ledger::progress::ProgressLog>())).is_some_and(|bytes| bytes <= isize::MAX as usize), "mining.progress_batch_rows must be positive and representable");
         anyhow::ensure!(self.ore_rocks.iter().all(|v| *v > 0) && self.ore_rocks[0] <= self.ore_rocks[1], "mining.ore_rocks={:?} must be a positive ordered range", self.ore_rocks);
         anyhow::ensure!(self.ore_rock_m3.iter().all(|v| v.is_finite() && *v > 0.0) && self.ore_rock_m3[0] <= self.ore_rock_m3[1], "mining.ore_rock_m3={:?} must be a positive ordered range", self.ore_rock_m3);
         anyhow::ensure!(self.ice_rocks.iter().all(|v| *v > 0) && self.ice_rocks[0] <= self.ice_rocks[1], "mining.ice_rocks={:?} must be a positive ordered range", self.ice_rocks);

@@ -1,7 +1,8 @@
 //! GM inspection and control of durable jobs in `game.jobs` via the slash service.
 //! The client forwards remote slash commands; payloads and job editing are unsupported.
 use super::{db_err, slash_error, CallError};
-use crate::{client::filetime_now, dao::jobs, db::{Db, Error}, messages, scheduler};
+use infinity_core::messages;
+use crate::{client::filetime_now, dao::jobs, db::{Db, Error}, scheduler};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command<'a> { List, Retry(&'a str), Cancel(&'a str) }

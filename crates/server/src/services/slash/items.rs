@@ -4,9 +4,9 @@
 //! in the caller's hangar or nearby in space, without boarding it.
 //! Ammunition uses the ordinary reload path.
 use super::{args::{self, Args}, slash_error, CallError, Client};
-use crate::consts::{FLAG_CARGO, FLAG_HANGAR};
+use infinity_core::consts::{FLAG_CARGO, FLAG_HANGAR};
 use crate::dao::items::loading::ItemQuery;
-use crate::messages;
+use infinity_core::messages;
 use crate::services::{combat::targeting_charges, dogma, fitting::ship, inventory, items::load_items, db_err};
 
 /// dogma/const.py: chargeGroup1 through chargeGroup5.
@@ -108,13 +108,13 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             let modules: Vec<_> = items.into_iter().filter(|item| inventory::is_fitting_flag(item.flag_id) && accepts(c, item.type_id, type_id)).map(|item| item.item_id).collect();
             if modules.is_empty() { return Err(slash_error(messages::gm::GM_ITEM_NOT_FOUND.into())); }
             let location = c.session.int("stationid").unwrap_or(ship);
-            let count = targeting_charges::gm_load_ammo(c, ship, modules, location, type_id, quantity).await?;
+            let count = targeting_charges::gm_load_ammo(c, ship, modules, location, type_id, i64::from(quantity)).await?;
             Ok(messages::gm::gm_item_loaded(count))
         }
         "online" => {
             let text = args.first().ok_or_else(invalid)?;
             let ship = if text.eq_ignore_ascii_case("me") { c.session.int("shipid").ok_or_else(invalid)? } else { parsed.i64(0).map_err(|_| slash_error(messages::gm::GM_ITEM_ONLINE_USAGE.into()))? };
-            let count = dogma::gm_online(c, ship).await?;
+            let count = dogma::online::gm_online(c, ship).await?;
             Ok(messages::gm::gm_item_online(count))
         }
         "iteminfo" => {

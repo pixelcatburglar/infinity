@@ -194,7 +194,7 @@ fn parse_contents(data: &Value, exists: &impl Fn(i32) -> bool) -> ContentsParse 
         for item in array_field(data, "fixedCustomLootItems")? {
             let type_id = positive_id(item.get("loottypeid")?)?;
             let quantity = item.get("lootcount")?.as_i64()?;
-            if !exists(type_id) || quantity <= 0 || quantity > i64::from(i32::MAX) { return None; }
+            if !exists(type_id) || quantity <= 0 { return None; }
             let soulbound = match item.get("lootsoulbound")? {
                 Value::Bool(value) => *value,
                 value if value.as_i64() == Some(0) => false,

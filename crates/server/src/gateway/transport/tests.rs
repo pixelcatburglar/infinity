@@ -329,7 +329,7 @@ async fn authenticated_request_and_consume_open_in_either_order() {
     let character: i64 = gateway.db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'gateway-test-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     gateway.world.register_pilot(character, tx);
-    gateway.world.set_online_session(character, Some(crate::session::OnlineSession {
+    gateway.world.set_online_session(character, Some(infinity_core::session::OnlineSession {
         character_id: character, user_id: Some(account), session_id: 1, ship_id: None, station_id: None,
         system_id: Some(40), corporation_id: Some(1), alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     }));
@@ -391,7 +391,7 @@ async fn authenticated_request_and_consume_open_in_either_order() {
         assert!(decoded.payload.is_some());
         request_send.send_data(Bytes::new(), true).unwrap();
     }
-    gateway.world.unregister_pilot(character);
+    gateway.world.unregister_pilot_generation(character, None);
     gateway.db.execute("DELETE FROM game.characters WHERE character_id = $1", &[&character]).await.unwrap();
     gateway.db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
 }

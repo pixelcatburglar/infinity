@@ -3,7 +3,7 @@ use crate::{conn::Conn, handshake::Login};
 
 mod integration;
 
-fn fixture_module(id: i64, flag: i32, kind: i32, group: i64, charge: Option<(i32, i64)>) -> Module {
+fn fixture_module(id: i64, flag: i32, kind: i32, group: i64, charge: Option<(i32, i128)>) -> Module {
     Module { item: Item { item_id: id, type_id: kind, owner_id: 1, location_id: 1, flag_id: flag,
         quantity: 1, singleton: true, group_id: group, category_id: i64::from(CATEGORY_MODULE), custom_info: None }, online: true, charge }
 }
@@ -33,7 +33,7 @@ fn pair_rules_and_effective_reload() {
     assert_eq!(effective_charge(Some((3, 0)), None), None);
     assert_eq!(effective_charge(Some((3, 5)), Some((3, 5))), Some((3, 10)));
     assert_eq!(effective_charge(None, Some((4, 2))), Some((4, 2)));
-    assert_eq!(effective_charge(Some((3, i32::MAX)), Some((3, i32::MAX))), Some((3, i64::from(i32::MAX) * 2)));
+    assert_eq!(effective_charge(Some((3, i64::MAX)), Some((3, i64::MAX))), Some((3, i128::from(i64::MAX) * 2)));
 }
 
 #[test]
@@ -64,14 +64,14 @@ fn ship_authorization_requires_active_ship() {
 async fn rpc(client: &mut Client, method: &str, ship: i64, first: i64, second: i64) -> CallResult {
     let args = [Value::Int(ship), Value::Int(first), Value::Int(second)];
     let kwargs = Value::Dict(vec![]);
-    weapon_groups(client, &Call { service: "dogmaIM", method, args: &args, kwargs: &kwargs, bound: true, bind_params: None }).await
+    crate::services::dogma::dispatch(client, &Call { service: "dogmaIM", method, args: &args, kwargs: &kwargs, bound: true, bind_params: None }).await
 }
 
 async fn rows(db: &Db, ship: i64) -> Vec<(i64, i64)> {
     charges::banks(db, ship).await.unwrap().into_iter().map(|r| (r.master_id, r.slave_id)).collect()
 }
 
-async fn set_charge(db: &Db, ship: i64, flag: i32, kind: i32, quantity: i32) {
+async fn set_charge(db: &Db, ship: i64, flag: i32, kind: i32, quantity: i64) {
     db.execute("INSERT INTO game.module_charges (ship_id,flag_id,type_id,quantity) VALUES ($1,$2,$3,$4) ON CONFLICT (ship_id,flag_id) DO UPDATE SET type_id=$3,quantity=$4", &[&ship, &flag, &kind, &quantity]).await.unwrap();
 }
 
@@ -82,7 +82,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let station = sde.map.stations().next().expect("station in SDE").station_id;
-    use crate::consts::dogma::{ATTR_CPU, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_HI_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, EFFECT_TURRET_FITTED, EFFECT_LAUNCHER_FITTED, ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT};
+    use infinity_core::consts::dogma::{ATTR_CPU, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_HI_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, EFFECT_TURRET_FITTED, EFFECT_LAUNCHER_FITTED, ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT};
     /// SDE dogma effect hiPower, the client high-slot rack effect.
     const EFFECT_HI_POWER: i32 = 12;
     /// Client dogma.const.attributeMaxGroupFitted.
@@ -97,7 +97,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     let base = |ty: i32, attr: i32| crate::services::fit::base_attribute(sde.types.get(ty), sde.dogma.attribute(attr), attr);
     let (gun, hull) = sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
         && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g)))
-        && [crate::consts::dogma::EFFECT_ONLINE as i32, EFFECT_HI_POWER].iter().all(|id| t.effects().iter().any(|e| e.effect_id == *id))
+        && [infinity_core::consts::dogma::EFFECT_ONLINE as i32, EFFECT_HI_POWER].iter().all(|id| t.effects().iter().any(|e| e.effect_id == *id))
         && HULL_RESTRICTIONS.iter().all(|&a| base(t.type_id, a) <= 0.0)
         && [MAX_GROUP_FITTED, MAX_TYPE_FITTED].iter().all(|&a| { let v = base(t.type_id, a); v <= 0.0 || v >= 8.0 })
         && t.attribute(MAX_GROUP_ONLINE).is_none_or(|v| v >= 8.0))
@@ -120,14 +120,15 @@ async fn real_bank_rpcs_and_transactional_rules() {
     let ammo: Vec<i32> = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_CHARGE)).take(2).map(|t| t.type_id).collect();
     assert_eq!(ammo.len(), 2);
     let now = filetime_now();
-    let account = -now;
-    let owner = account + 1;
     let name = format!("weapon-banks-{now}");
     let password: Vec<u8> = Vec::new();
-    db.execute("INSERT INTO game.accounts (user_id,user_name,password_hash,role) VALUES ($1,$2,$3,0)", &[&account, &name, &password]).await.unwrap();
-    db.execute("INSERT INTO game.characters (character_id,user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,$3,1,1,1,$2,0)", &[&owner, &account, &name]).await.unwrap();
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ($1,$2,0) RETURNING user_id", &[&name, &password]).await.unwrap().get("user_id");
+    let owner: i64 = db.query_one("SELECT nextval('game.characters_character_id_seq') AS character_id", &[]).await.unwrap().get("character_id");
+    let corporation: i64 = db.query_one("WITH id AS (SELECT nextval('game.corporations_corporation_id_seq') AS n) INSERT INTO game.corporations (corporation_id,name,ticker,ceo_id,creator_id,station_id,created) SELECT n,'weapon-banks-' || n::text,'WB' || n::text,$1,$1,$2,$3 FROM id RETURNING corporation_id", &[&owner, &station, &now]).await.unwrap().get("corporation_id");
+    db.execute("INSERT INTO game.characters (character_id,user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,$3,1,1,1,$4,0)", &[&owner, &account, &name, &corporation]).await.unwrap();
     let insert = "INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,$5) RETURNING item_id";
     let ship: i64 = db.query_one(insert, &[&hull, &owner, &station, &FLAG_HANGAR, &false]).await.unwrap().get("item_id");
+    db.execute("UPDATE game.characters SET ship_id=$2,station_id=$3 WHERE character_id=$1", &[&owner, &ship, &station]).await.unwrap();
     // Insert in reverse slot order so item-ID order cannot accidentally choose the first slave.
     let mut guns = Vec::new();
     for flag in (27_i32..=34).rev() {
@@ -193,14 +194,14 @@ async fn real_bank_rpcs_and_transactional_rules() {
     assert!(rpc(&mut client, "LinkWeapons", ship, guns[0], guns[1]).await.is_err());
     assert!(rows(&db, ship).await.is_empty());
     db.execute("DELETE FROM game.module_charges WHERE ship_id=$1 AND flag_id=$2", &[&ship, &28_i32]).await.unwrap();
-    pending_reloads::insert(&db, owner, ship, guns[1], 28, ammo[0], 1).await.unwrap();
+    pending_reloads::insert(&db, owner, ship, guns[1], 28, ammo[0], 1, infinity_core::consts::FLAG_CARGO, ship).await.unwrap();
     assert!(rpc(&mut client, "LinkWeapons", ship, guns[0], guns[1]).await.is_ok());
     db.execute("DELETE FROM game.pending_reloads WHERE ship_id=$1", &[&ship]).await.unwrap();
     assert!(rpc(&mut client, "UnlinkAllModules", ship, 0, 0).await.is_ok());
     set_charge(&db, ship, 27, ammo[0], 10).await;
     set_charge(&db, ship, 28, ammo[0], 5).await;
     set_charge(&db, ship, 29, ammo[0], 5).await;
-    pending_reloads::insert(&db, owner, ship, guns[1], 28, ammo[0], 5).await.unwrap();
+    pending_reloads::insert(&db, owner, ship, guns[1], 28, ammo[0], 5, infinity_core::consts::FLAG_CARGO, ship).await.unwrap();
     assert!(rpc(&mut client, "LinkWeapons", ship, guns[0], guns[1]).await.is_ok());
     let before_topup_refusal = rows(&db, ship).await;
     assert!(rpc(&mut client, "LinkWeapons", ship, guns[0], guns[2]).await.is_err());
@@ -234,6 +235,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     db.execute("DELETE FROM game.items WHERE location_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap();
+    db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corporation]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
     scenario.unwrap();
 }

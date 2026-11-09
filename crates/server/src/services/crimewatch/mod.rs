@@ -7,6 +7,8 @@
 //! CONCORD destroys their ship after a response time that grows as security falls, unless
 //! CONCORD responses are disabled. Aggression starts weapons and PvP timers and a mutual
 //! engagement regardless; their durations are operator policies.
+//! Entosis Link activation also starts the weapons timer without player aggression
+//! (CCP Help Center, article 203729281).
 //!
 //! A lost player ship writes a killmail (game.killmails) naming attackers within the configured
 //! window; an illegal kill costs those aggressors more security status. Killing NPCs that carry
@@ -27,11 +29,11 @@ mod war_statistic_mgr;
 use super::{db_err, keyval, Call, CallError, CallResult};
 use killmails::killmails;
 use crate::client::{filetime_now, ms_from_filetime_ticks, Client};
-use crate::consts::FILETIME_SECOND;
+use infinity_core::consts::FILETIME_SECOND;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
-use crate::messages;
+use infinity_core::messages;
 use crate::space::{seconds_to_ms, World};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -73,7 +75,6 @@ struct Contribution {
     damage: f64,
     ship_type: i32,
     weapon_type: i32,
-    last: i64,
     illegal: bool,
 }
 
@@ -82,8 +83,6 @@ struct State {
     pilots: HashMap<i64, Pilot>,
     /// (a, b) -> until when a may shoot b without consequence.
     engagements: HashMap<(i64, i64), i64>,
-    /// Victim ship -> attacker -> damage done.
-    damage: HashMap<i64, HashMap<i64, Contribution>>,
     /// Criminals CONCORD is on its way to.
     concord: HashSet<i64>,
 }
@@ -171,24 +170,48 @@ fn announce(world: &Arc<World>, char_id: i64, event: &'static str, running: i64,
     });
 }
 
+fn weapons_deadline(now: i64) -> i64 {
+    now.saturating_add(crate::config::game().crimewatch.weapons_timer_secs.saturating_mul(FILETIME_SECOND))
+}
+
+/// Start or refresh only the weapons timer after an Entosis Link activation.
+pub(crate) fn weapons_activate(world: &Arc<World>, character: i64) {
+    let until = weapons_deadline(filetime_now());
+    state().pilots.entry(character).or_default().weapons_until = until;
+    announce(world, character, "OnWeaponsTimerUpdate", WEAPONS_TIMER, WEAPONS_IDLE, until);
+}
+
 /// `attacker` activated a weapon on `victim`'s ship in `system`.
-#[allow(clippy::too_many_arguments)]
-pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, attacker_ship_type: i32, weapon_type: i32, victim: i64, victim_ship: i64) -> Result<(), CallError> {
-    if attacker == victim {
-        return Ok(());
-    }
+/// Returns whether this aggression was illegal before engagement state changed.
+pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, victim: i64) -> Result<bool, CallError> {
+    let illegal = classify(db, world, system, attacker, victim).await?;
+    apply(db, world, system, attacker, victim, illegal).await?;
+    Ok(illegal)
+}
+
+/// Classify an admission without changing timers or engagements.
+pub(crate) async fn classify(db: &Db, world: &Arc<World>, system: i64, attacker: i64, victim: i64) -> Result<bool, CallError> {
+    if attacker == victim { return Ok(false); }
     let now = filetime_now();
     let policy = &crate::config::game().crimewatch;
     let system_sec = system_security(world, system);
     let victim_sec = security_status(db, victim).await?;
     let engaged = state().engagements.get(&(attacker, victim)).is_some_and(|until| *until > now);
-    let legal = system_sec <= 0.0
+    Ok(!(system_sec <= 0.0
         || is_criminal(victim, now)
         || victim_sec <= policy.outlaw_threshold
         || engaged
-        || super::wars::classification::legal(db, attacker, victim, now).await?;
+        || super::wars::classification::legal(db, attacker, victim, now).await?))
+}
+
+/// Apply an already classified admission without reclassifying it.
+pub(crate) async fn apply(db: &Db, world: &Arc<World>, system: i64, attacker: i64, victim: i64, illegal: bool) -> Result<(), CallError> {
+    if attacker == victim { return Ok(()); }
+    let now = filetime_now();
+    let policy = &crate::config::game().crimewatch;
+    let system_sec = system_security(world, system);
     let (weapons, pvp) = (
-        now.saturating_add(policy.weapons_timer_secs.saturating_mul(FILETIME_SECOND)),
+        weapons_deadline(now),
         now.saturating_add(policy.pvp_timer_secs.saturating_mul(FILETIME_SECOND)),
     );
     let until = now.saturating_add(policy.criminal_timer_secs.saturating_mul(FILETIME_SECOND));
@@ -198,18 +221,13 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         let a = st.pilots.entry(attacker).or_default();
         a.weapons_until = weapons;
         a.pvp_until = pvp;
-        let became = !legal && a.criminal_until <= now;
-        if !legal {
+        let became = illegal && a.criminal_until <= now;
+        if illegal {
             a.criminal_until = until;
         }
         st.pilots.entry(victim).or_default().pvp_until = pvp;
         st.engagements.insert((victim, attacker), engagement);
         st.engagements.insert((attacker, victim), engagement);
-        let c = st.damage.entry(victim_ship).or_default().entry(attacker).or_default();
-        c.ship_type = attacker_ship_type;
-        c.weapon_type = weapon_type;
-        c.last = now;
-        c.illegal |= !legal;
         became
     };
     announce(world, attacker, "OnWeaponsTimerUpdate", WEAPONS_TIMER, WEAPONS_IDLE, weapons);
@@ -217,7 +235,7 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
     announce(world, victim, "OnPvpTimerUpdate", PVP_TIMER, PVP_IDLE, pvp);
     world.notify_pilot(attacker, "OnCrimewatchEngagementCreated", vec![Value::Int(victim), Value::Int(engagement)]);
     world.notify_pilot(victim, "OnCrimewatchEngagementCreated", vec![Value::Int(attacker), Value::Int(engagement)]);
-    if legal {
+    if !illegal {
         return Ok(());
     }
     if let Err(error) = super::bounty::kill_rights::earn(db, world, victim, attacker).await {
@@ -332,75 +350,49 @@ fn concord_response(pending: PendingConcord, system: i64, weak_world: Weak<World
     move |s| {
         let criminal = pending.0;
         drop(pending);
-        if let Some(ship) = s.pilot_ball(criminal).map(|b| b.id) {
-            info!("crimewatch: CONCORD destroyed ship {ship} of {criminal} in {system}");
-            s.notify_pilot(
-                criminal,
-                "OnRemoteMessage",
-                vec![Value::str(messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(messages::CONCORD_DESTROYED_SHIP_FOR_CRIME))])],
-            );
+        if let Some((ship, generation)) = s.pilot_ball(criminal).and_then(|b|
+            s.combat_membership_generation(b.id).map(|generation| (b.id, generation))) {
             s.defer(async move {
                 if let Some(world) = weak_world.upgrade() {
-                    super::combat::destroy_player_ship(&world, system, ship, criminal).await;
+                    match super::combat::damage::apply_damage_guarded(world.db(), &world, system, ship, [0.0; 4], super::combat::damage::DamageSource { force_origin: Some(crate::lua::events::resources::FactOrigin::Natural), ..Default::default() }, true,
+                        move |s| s.pilot_ball(criminal).is_some_and(|ball| ball.id == ship)
+                            && s.combat_membership_generation(ship) == Some(generation)).await {
+                        Ok(Some(outcome)) if outcome.lethal => world.notify_pilot(criminal, "OnRemoteMessage", vec![Value::str(messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(messages::CONCORD_DESTROYED_SHIP_FOR_CRIME))])]),
+                        Ok(_) => {},
+                        Err(error) => warn!("crimewatch: CONCORD ship loss failed: {error:?}"),
+                    }
                 }
             });
         }
     }
 }
 
-/// `attacker`'s weapon did `amount` damage to a player's `ship`.
-pub fn note_damage(ship: i64, attacker: i64, amount: f64) {
-    let mut st = state();
-    let c = st.damage.entry(ship).or_default().entry(attacker).or_default();
-    c.damage += amount;
-    c.last = filetime_now();
-}
-
 /// What was on a lost ship, for its killmail: (typeID, flagID, singleton, quantity).
 pub type Lost = Vec<(i32, i32, bool, i64)>;
 
-/// A player's ship was destroyed: write its killmail and make illegal killers pay for it.
+/// Write the killmail and penalties in the same transaction as the loss.
 #[allow(clippy::too_many_arguments)]
-pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_corp: i64, ship: i64, ship_type: i32, items: &Lost) -> Result<(), CallError> {
-    let now = filetime_now();
-    let snapshot = state().damage.get(&ship).cloned().unwrap_or_default();
-    let attackers: Vec<(i64, Contribution)> = snapshot.iter()
-        .filter(|(_, c)| c.last >= now.saturating_sub(crate::config::game().crimewatch.killmail_attacker_window_secs.saturating_mul(FILETIME_SECOND)))
-        .map(|(id, c)| (*id, c.clone()))
-        .collect();
-    let attacker_count = attackers.len();
-    let items = items.clone();
-    db.transaction(
-        |tx, outbox: &mut Outbox| {
-            let mut attackers = attackers.clone();
-            let items = items.clone();
-            Box::pin(async move {
-                write_killmail(tx, outbox, system, victim, victim_corp, ship_type, &items, &mut attackers, now).await
-            })
-        },
-        |(kill_id, isk_lost), outbox| async move {
-            {
-                let mut st = state();
-                if let Some(current) = st.damage.get_mut(&ship) {
-                    current.retain(|id, contribution| snapshot.get(id) != Some(contribution));
-                    if current.is_empty() {
-                        st.damage.remove(&ship);
-                    }
-                }
-            }
-            info!("crimewatch: killmail {kill_id} for {victim}'s ship type {ship_type} in {system} ({attacker_count} attackers, {isk_lost:.0} ISK)");
-            crate::scheduler::wake();
-            dispatch_world((), outbox, world)
-        },
-    ).await
+pub(crate) async fn ship_lost_in<X: Send>(
+    ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, system: i64, victim: i64,
+    victim_corp: i64, ship: i64, ship_type: i32, items: &Lost, source: &super::combat::damage::DamageSource,
+    now: i64, contributions: &[crate::space::combat::ContributionEntry],
+) -> Result<(i64, f64, HashMap<i32, f64>, i64), CallError> {
+    let window = crate::config::game().crimewatch.killmail_attacker_window_secs.saturating_mul(FILETIME_SECOND);
+    let cutoff = now.saturating_sub(window);
+    let mut attackers: Vec<_> = contributions.iter().filter(|r| r.last_damage_at >= cutoff).map(|r| (r.attacker_id, Contribution {
+        damage: r.damage, ship_type: r.source_ship_type.unwrap_or(0),
+        weapon_type: r.weapon_type_id.unwrap_or(0), illegal: r.illegal,
+    })).collect();
+    write_killmail(ex, outbox, system, victim, victim_corp, ship_type, items, &mut attackers, now, Some(ship), source).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn write_killmail<X: Send>(
     db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, system: i64, victim: i64,
     victim_corp: i64, ship_type: i32, items: &Lost, attackers: &mut [(i64, Contribution)], now: i64,
-) -> Result<(i64, f64), CallError> {
-    let final_blow = attackers.iter().max_by_key(|(_, c)| c.last).cloned();
+    victim_item_id: Option<i64>, source: &super::combat::damage::DamageSource,
+) -> Result<(i64, f64, HashMap<i32, f64>, i64), CallError> {
+    let final_blow = source.attacker_id.and_then(|id| attackers.iter().find(|(ch, _)| *ch == id).cloned());
     let mut blob = String::from("<doc><attackers>");
     let mut affiliations = Vec::with_capacity(attackers.len());
     for (char_id, c) in attackers.iter() {
@@ -422,13 +414,12 @@ async fn write_killmail<X: Send>(
     let mut types: Vec<i32> = items.iter().map(|i| i.0).collect();
     types.push(ship_type);
     let prices = crate::dao::killmails::prices(db, &types).await.map_err(db_err)?;
+    let observed_at = crate::client::filetime_now();
     let price: HashMap<i32, f64> = prices.iter().map(|r| (r.type_id, r.average)).collect();
     let isk_lost = price.get(&ship_type).copied().unwrap_or(0.0) + items.iter().map(|(t, _, _, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum::<f64>();
     let damage_taken: f64 = attackers.iter().map(|(_, c)| c.damage).sum();
-    let (final_char, final_c) = match &final_blow {
-        Some((ch, c)) => (Some(*ch), c.clone()),
-        None => (None, Contribution::default()),
-    };
+    let final_char = source.attacker_id;
+    let final_damage = final_blow.as_ref().map_or(0.0, |(_, c)| c.damage);
     let final_corp = affiliations.iter().find(|a| Some(a.character) == final_char).map(|a| a.corporation);
     let final_alliance = affiliations.iter().find(|a| Some(a.character) == final_char).and_then(|a| a.alliance);
     let victim_alliance = crate::dao::alliances::corporation_membership(db, victim_corp).await.map_err(db_err)?.map(|membership| membership.alliance);
@@ -438,11 +429,11 @@ async fn write_killmail<X: Send>(
     };
     let involved: Vec<i64> = attackers.iter().map(|(ch, _)| *ch).collect();
     let kill_id = crate::dao::killmails::insert(db, &crate::dao::killmails::NewKillmail {
-        now, system, victim, victim_corp, victim_alliance, ship_type, damage_taken, final_char, final_corp, final_alliance,
-        final_ship_type: final_c.ship_type, final_weapon_type: final_c.weapon_type, final_damage: final_c.damage,
+        now, system, victim, victim_item_id, victim_corp, victim_alliance, ship_type, damage_taken, final_char, final_corp, final_alliance,
+        final_ship_type: source.source_ship_type.unwrap_or(0), final_weapon_type: source.weapon_type_id.unwrap_or(0), final_damage,
         final_sec, isk_lost, involved: &involved, blob: &blob,
     }).await.map_err(db_err)?;
-    super::map::events::player_lost(db, kill_id, system, ship_type == crate::consts::TYPE_CAPSULE, now).await?;
+    super::map::events::player_lost(db, kill_id, system, ship_type == infinity_core::consts::TYPE_CAPSULE, now).await?;
     super::wars::classification::index(db, kill_id, victim_corp, victim_alliance, &affiliations, now).await?;
     super::bounty::kill_rights::consume(db, outbox, victim, now).await?;
     if let Some(final_char) = final_char {
@@ -464,7 +455,7 @@ async fn write_killmail<X: Send>(
             shift_security(db, outbox, *char_id, crate::config::game().crimewatch.security_loss_kill, -10.0).await?;
         }
     }
-    Ok((kill_id, isk_lost))
+    Ok((kill_id, isk_lost, price, observed_at))
 }
 
 /// A pilot killed an NPC with a bounty.

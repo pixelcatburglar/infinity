@@ -59,8 +59,10 @@ pub(crate) struct Celestial {
     pub y: Option<f64>,
     pub z: Option<f64>,
     pub radius: Option<f64>,
+    pub celestial_index: Option<i64>,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Map {
     systems: Vec<SolarSystem>,
     regions: Vec<Region>,

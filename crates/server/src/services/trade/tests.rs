@@ -76,6 +76,7 @@ async fn reservation_lineage_batch_and_closed_trade() {
 #[ignore]
 async fn settlement_abort_and_rollback_preserve_item_trees() {
     use crate::{config::deployment::DatabaseConfig, dao::{items::transfers, trades, wallets::characters}, db::{outbox::{Effect, Notification, Outbox}, Db}, sde::Sde};
+    use crate::progress::{prepare_batch, AfterCommit, Registry};
     let cfg = DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() };
     let db = Db::connect(&cfg).await.unwrap();
     let sde = Sde::load(&db).await.unwrap();
@@ -103,8 +104,8 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     let job_id = format!("trade-timeout:{}", trade.id);
     let due: i64 = tx.query_one("SELECT due_at FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap().get("due_at");
     assert_eq!(due, stored.updated_at + crate::client::filetime_ticks_from_seconds(crate::config::game().trade.idle_timeout_secs));
-    assert_eq!(characters::balance(&tx, a).await.unwrap(), 100.0);
-    assert_eq!(characters::balance(&tx, b).await.unwrap(), 100.0);
+    assert_eq!(characters::balance(&tx, a).await.unwrap(), crate::isk::IskAmount::from_cents(10_000).unwrap());
+    assert_eq!(characters::balance(&tx, b).await.unwrap(), crate::isk::IskAmount::from_cents(10_000).unwrap());
     let before = tx.query("SELECT owner_id, location_id FROM game.items WHERE item_id = ANY($1) ORDER BY item_id", &[&vec![root, child, leaf]]).await.unwrap();
     assert_eq!(before.len(), 3);
     assert!(before.iter().all(|row| row.get::<_, i64>("owner_id") == a));
@@ -123,8 +124,12 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     let mut outbox: Outbox<super::TradeEffect> = Outbox::default();
     assert!(matches!(super::settle::complete(&tx, &sde, &mut outbox, &mut trade).await, Ok(super::settle::Settled::Done)));
     assert!(tx.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap().is_none());
-    assert_eq!(characters::balance(&tx, a).await.unwrap(), 90.0);
-    assert_eq!(characters::balance(&tx, b).await.unwrap(), 110.0);
+    assert_eq!(characters::balance(&tx, a).await.unwrap(), crate::isk::IskAmount::from_cents(9_000).unwrap());
+    assert_eq!(characters::balance(&tx, b).await.unwrap(), crate::isk::IskAmount::from_cents(11_000).unwrap());
+    let invocation = (u128::from(crate::handshake::random_u64()) << u64::BITS) | u128::from(crate::handshake::random_u64());
+    let inserted = prepare_batch(&mut outbox, &tx, invocation).await.unwrap();
+    assert!(!inserted.is_empty());
+    let _publication = outbox.after_commit(&Registry::default(), &inserted);
     let events: Vec<_> = outbox.into_entries().into_iter().filter_map(|entry| match entry {
         Effect::Notification(Notification::Pilot { char_id, event, args }) => Some((char_id, event, args)),
         _ => None,

@@ -1,9 +1,10 @@
 //! Map history and personal arrival visits RPCs for
 //! `eve/client/script/ui/shared/mapView/mapViewColorHandler.py` and
 //! `eve/client/script/ui/shared/mapView/filters/mapFilterVisited.py`.
-//! Reads `game.map_events` and `game.map_visits` through the map telemetry DAO.
+//! Reads `game.map_events`, `game.map_visits`, and committed sovereignty through DAOs.
 //! Topology, cynos and faction warfare history are not supported here.
-use crate::{client::{Client, filetime_now}, consts::FILETIME_HOUR, dao::map_telemetry::{self as dao, History, HistoryStat, Visit}, messages};
+use infinity_core::{consts::FILETIME_HOUR, messages};
+use crate::{client::{Client, filetime_now}, dao::map_telemetry::{self as dao, History, HistoryStat, Visit}};
 use crate::services::{Call, CallError, CallResult, notify_error, user_error, rowset, keyval};
 use marshal::Value;
 
@@ -53,13 +54,26 @@ pub(super) fn selected(character: Option<i64>) -> Result<i64, CallError> {
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    if call.service != "map" || !matches!(call.method, "GetHistory" | "GetSolarSystemVisits") { return None; }
+    if call.service != "map" || !matches!(call.method, "GetHistory" | "GetSolarSystemVisits" | "GetCurrentSovData" | "GetRecentSovActivity") { return None; }
     Some(handle(c, call).await)
 }
 
 async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
-    let character = selected(c.session.int("charid"))?;
+    use crate::services::sovereignty::queries::{self, Query};
+    if matches!(call.method, "GetHistory" | "GetSolarSystemVisits") {
+        selected(c.session.int("charid"))?;
+    }
     match call.method {
+        "GetCurrentSovData" => {
+            if !empty_kwargs(call.kwargs) { return Err(invalid()); }
+            let [Value::Int(location_id)] = call.args else { return Err(invalid()); };
+            if *location_id <= 0 { return Err(invalid()); }
+            queries::read(&c.db, &c.sde, Query::CurrentSovData { location_id: *location_id }).await
+        }
+        "GetRecentSovActivity" => {
+            visits_request(call)?;
+            queries::read(&c.db, &c.sde, Query::RecentSovActivity).await
+        }
         "GetHistory" => {
             let (stat, hours) = history_request(call)?;
             let Some(stat) = stat else { return Ok(history_value(vec![])); };
@@ -69,7 +83,7 @@ async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
         }
         "GetSolarSystemVisits" => {
             visits_request(call)?;
-            Ok(visits_value(dao::visits(&c.db, character).await?))
+            Ok(visits_value(dao::visits(&c.db, selected(c.session.int("charid"))?).await?))
         }
         _ => unreachable!(),
     }

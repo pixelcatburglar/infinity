@@ -12,11 +12,11 @@ use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, C
 use crate::dao::characters::members;
 use crate::dao::{offices, items::{creation, inventory}};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
+use infinity_core::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::dispatch_world;
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::space::World;
 use marshal::Value;
@@ -53,23 +53,18 @@ pub(super) async fn office_at(db: &(impl Executor + ?Sized), corp: i64, station:
 pub(super) async fn office_owner(db: &(impl Executor + ?Sized), item: i64) -> Result<Option<i64>, CallError> {
     offices::owner(db, item).await.map_err(db_err)
 }
-/// Tell the corporation's online members its offices changed.
-async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), CallError> {
-    for id in members::active_ids(db, corp).await.map_err(db_err)? {
-        world.notify_pilot(id, "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
-    }
-    Ok(())
-}
 
 
 /// Rent (or extend) `corp`'s office at `station` for a period, paid from its master wallet.
-pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Result<i64, CallError> {
+pub(super) async fn rent(db: &Db, world: &World, me: i64, corp: i64, station: i64) -> Result<i64, CallError> {
     let price = rent_price(world.sde(), station);
     let _trading = super::market::lock().await;
     let now = filetime_now();
     db.transaction(
         |tx, outbox| Box::pin(async move {
-            super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, price).await?;
+            if !crate::dao::corporations::registry::lock_admission(tx, &[], &[corp], &[me]).await.map_err(db_err)?
+                || !may_rent(tx, me, corp).await? { return Err(notify_error(messages::NO_OFFICE_RENTAL_ROLE)); }
+            super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, crate::isk::IskAmount::from_isk(price)?).await?;
             if let Some(office) = office_at(tx, corp, station).await? {
                 offices::extend(tx, office, now, RENTAL_DAYS * FILETIME_DAY).await.map_err(db_err)?;
                 return Ok((office, false));
@@ -92,7 +87,7 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
 }
 
 /// A director, the CEO, or a member allowed to rent offices.
-async fn may_rent(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
+async fn may_rent(db: &(impl Executor + ?Sized), me: i64, corp: i64) -> Result<bool, CallError> {
     has_role_or_is_ceo(db, me, corp, ROLE_DIRECTOR | ROLE_CAN_RENT_OFFICE).await
 }
 
@@ -145,44 +140,31 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if !is_player_corp(corp) {
                 return Some(Err(notify_error(messages::NPC_CORPORATION_CANNOT_RENT_OFFICE)));
             }
-            match may_rent(db, me, corp).await {
-                Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error(messages::NO_OFFICE_RENTAL_ROLE))),
-                Err(e) => return Some(Err(e)),
-            }
             let quoted = call.args.first().and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
             let price = rent_price(world.sde(), station);
             if quoted.is_some_and(|q| q + QUOTE_TOLERANCE < price) {
                 return Some(Err(notify_error(messages::OFFICE_RENT_CHANGED)));
             }
-            rent(db, world, corp, station).await.map(|_| Value::None)
+            rent(db, world, me, corp, station).await.map(|_| Value::None)
         }
         // Give the office up; its hangars must be empty first.
         "UnrentOffice" => {
-            match may_rent(db, me, corp).await {
-                Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error(messages::NO_OFFICE_RELEASE_ROLE))),
-                Err(e) => return Some(Err(e)),
-            }
-            let office = match office_at(db, corp, station).await {
-                Ok(Some(o)) => o,
-                Ok(None) => return Some(Ok(Value::None)),
-                Err(e) => return Some(Err(e)),
-            };
-            match offices::has_items(db, office).await {
-                Ok(true) => return Some(Err(notify_error(messages::EMPTY_CORPORATION_HANGAR_BEFORE_RELEASE))),
-                Err(e) => return Some(Err(db_err(e))),
-                Ok(false) => {}
-            }
-            let removed = async {
-                offices::delete(db, office).await.map_err(db_err)?;
-                inventory::delete(db, office).await.map_err(db_err)?;
-                announce(db, world, corp, office).await?;
-                info!("offices: {corp} gave up office {office} at {station}");
-                Ok::<_, CallError>(Value::None)
-            }
-            .await;
-            removed
+            let _trading = super::market::lock().await;
+            db.transaction(
+                |tx, outbox: &mut crate::db::outbox::Outbox| Box::pin(async move {
+                    if !crate::dao::corporations::registry::lock_admission(tx, &[], &[corp], &[me]).await.map_err(db_err)?
+                        || !may_rent(tx, me, corp).await? { return Err(notify_error(messages::NO_OFFICE_RELEASE_ROLE)); }
+                    let Some(office) = office_at(tx, corp, station).await? else { return Ok(Value::None) };
+                    if offices::has_items(tx, office).await.map_err(db_err)? { return Err(notify_error(messages::EMPTY_CORPORATION_HANGAR_BEFORE_RELEASE)); }
+                    offices::delete(tx, office).await.map_err(db_err)?;
+                    inventory::delete(tx, office).await.map_err(db_err)?;
+                    for id in members::active_ids(tx, corp).await.map_err(db_err)? {
+                        outbox.notify_pilot(id, "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
+                    }
+                    Ok(Value::None)
+                }),
+                |value, outbox| async move { dispatch_world(value, outbox, world) },
+            ).await
         }
         // Nothing is impounded: an office is only given up empty.
         "PrimeOfficeItem" => Ok(Value::None),

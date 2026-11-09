@@ -46,10 +46,10 @@ fn config_value(lua: &Lua, value: &toml::Value) -> Result<Value> {
 
 pub fn register(lua: &Lua, env: &Table, script: &str, config: &toml::Table, resources: &Resources) -> Result<()> {
     let messages = lua.create_table()?;
-    messages.set("motd_help", crate::messages::lua::LUA_MOTD_HELP)?;
-    messages.set("motd_saved", crate::messages::lua::LUA_MOTD_SAVED)?;
-    messages.set("motd_empty", crate::messages::lua::LUA_MOTD_EMPTY)?;
-    messages.set("custom_notify", crate::messages::MSG_CUSTOM_NOTIFY)?;
+    messages.set("motd_help", infinity_core::messages::lua::LUA_MOTD_HELP)?;
+    messages.set("motd_saved", infinity_core::messages::lua::LUA_MOTD_SAVED)?;
+    messages.set("motd_empty", infinity_core::messages::lua::LUA_MOTD_EMPTY)?;
+    messages.set("custom_notify", infinity_core::messages::MSG_CUSTOM_NOTIFY)?;
     env.set("messages", messages)?;
     env.set("config", config_value(lua, &toml::Value::Table(config.clone()))?)?;
     dao::register(lua, env, &resources.db, &resources.sde)?;

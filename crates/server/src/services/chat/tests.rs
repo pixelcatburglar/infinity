@@ -1,6 +1,7 @@
 //! Durable chat authorization and manager RPC behavior.
 use super::authority::{self, RoomConfig};
-use crate::{dao::chat_channels as dao, db::Db, services::{Call, CallError}, session::OnlineSession};
+use infinity_core::session::OnlineSession;
+use crate::{dao::chat_channels as dao, db::Db, services::{Call, CallError}};
 use marshal::Value;
 
 fn session(id: i64) -> OnlineSession {

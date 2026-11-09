@@ -17,6 +17,7 @@ fn state() -> &'static Mutex<HashMap<i64, Trade>> { STATE.get_or_init(|| Mutex::
 pub(crate) fn is_trade_container(id: i64) -> bool { state().lock().unwrap().contains_key(&id) }
 
 pub(crate) enum TradeEffect { Put(Trade), Remove(i64), WakeScheduler }
+crate::progress::leaf_effect!(TradeEffect);
 
 pub(crate) fn dispatch<T>(value: T, outbox: Outbox<TradeEffect>, world: &World) -> Result<T, CallError> {
     for effect in outbox.into_entries() {
@@ -25,7 +26,6 @@ pub(crate) fn dispatch<T>(value: T, outbox: Outbox<TradeEffect>, world: &World) 
             Effect::Operation(TradeEffect::Put(trade)) => { state().lock().unwrap().insert(trade.id, trade); }
             Effect::Operation(TradeEffect::Remove(id)) => { state().lock().unwrap().remove(&id); }
             Effect::Operation(TradeEffect::WakeScheduler) => crate::scheduler::wake(),
-            Effect::Event(event) => crate::lua::on_event(event),
         }
     }
     Ok(value)

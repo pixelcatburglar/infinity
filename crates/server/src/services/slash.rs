@@ -5,12 +5,14 @@
 //!
 //! `SlashCmd('/')` answers with the command list in a UserError's `reason`
 //! (svc_slash.FetchRemoteCommandList evals what follows ': ').
+//! Command results also reach the selected online character in a private system
+//! conversation; offline replies are dropped. Autocomplete is silent, while
+//! commands issued by menus echo their results like typed commands.
 //! Wallet commands write exact values through the character and account DAOs to
 //! `game.characters` and `game.accounts`; client wallet displays are clamped to
 //! their protocol limits. Corporation wallets and target writes are unsupported.
-//! ISK wallet events report the difference between client-projected balances.
-//! f64 precision and the client cap can mask exact changes; a typed
-//! event payload would be needed to expose exact decimal deltas.
+//! ISK wallet events retain exact balances and deltas; only client displays are capped.
+//! `/addisk` accepts signed deltas; the other wallet commands remain nonnegative.
 //!
 //! Type and celestial data come from the startup SDE snapshot; item positions,
 //! per-item dogma base overrides and wallet balances come from game data.
@@ -19,6 +21,8 @@
 //! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
 //! Quoted arguments are grouped by the shared parser. Skill, item, NPC, social
 //! and exploration commands delegate to their owning services and game data.
+//! Item creation accepts case-insensitive k/m/b/t quantity suffixes and exact
+//! decimal fractions when the resulting total is a positive integer.
 //! Durable job inspection and control use `game.jobs`; job payloads are not displayed.
 //! Listings are limited to 50 rows; full help remains available. Teleport
 //! extensions are not supported here. Hit-chance diagnostics use live space snapshots.
@@ -26,11 +30,12 @@
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
 use crate::client::Client;
-use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM_ROLES, GROUP_PLANET};
-use crate::messages;
+use infinity_core::consts::{CLIENT_MAX_ISK, CLIENT_MAX_SHORT_AMOUNT, FLAG_CARGO, FLAG_HANGAR, GM_ROLES, GROUP_PLANET};
+use infinity_core::messages;
 use marshal::Value;
 use tracing::info;
 mod args;
+mod feedback;
 mod dogma;
 mod jobs;
 mod effects;
@@ -57,6 +62,17 @@ const PLEX_DIGITS: usize = 36;
 
 /// Server design: maximum rows returned by a GM listing.
 const LIST_ROW_LIMIT: usize = 50;
+
+/// Server design: decimal radix for item quantity shorthand.
+const QUANTITY_RADIX: i64 = 10;
+/// Server design: item quantity shorthand multiplier for k.
+const QUANTITY_KILO: i64 = 1_000;
+/// Server design: item quantity shorthand multiplier for m.
+const QUANTITY_MEGA: i64 = 1_000_000;
+/// Server design: item quantity shorthand multiplier for b.
+const QUANTITY_BILLION: i64 = 1_000_000_000;
+/// Server design: item quantity shorthand multiplier for t.
+const QUANTITY_TRILLION: i64 = 1_000_000_000_000;
 
 const COMMANDS: &[(&str, &str)] = &[
     ("tr", messages::gm::GM_HELP_TELEPORT),
@@ -203,9 +219,46 @@ async fn tr(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     Err(slash_error(messages::gm::gm_target_not_found(id)))
 }
 
+fn create_quantity(arg: Option<&str>) -> Result<i64, CallError> {
+    let Some(arg) = arg else { return Ok(1) };
+    let quantity = (|| {
+        let multiplier = match arg.as_bytes().last() {
+            Some(b'k' | b'K') => Some(QUANTITY_KILO),
+            Some(b'm' | b'M') => Some(QUANTITY_MEGA),
+            Some(b'b' | b'B') => Some(QUANTITY_BILLION),
+            Some(b't' | b'T') => Some(QUANTITY_TRILLION),
+            _ => None,
+        };
+        let number = if multiplier.is_some() { &arg[..arg.len() - 1] } else { arg };
+        let (whole, fraction) = match (multiplier, number.split_once('.')) {
+            (Some(_), Some((whole, fraction))) if !fraction.is_empty() => (whole, Some(fraction)),
+            (_, None) => (number, None),
+            _ => return None,
+        };
+        if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let mut quantity = whole.parse::<i64>().ok()?.checked_mul(multiplier.unwrap_or(1))?;
+        if let Some(fraction) = fraction {
+            let mut place = multiplier?;
+            for digit in fraction.bytes() {
+                if !digit.is_ascii_digit() { return None; }
+                if place > 1 {
+                    place /= QUANTITY_RADIX;
+                    quantity = quantity.checked_add(i64::from(digit - b'0').checked_mul(place)?)?;
+                } else if digit != b'0' {
+                    return None;
+                }
+            }
+        }
+        (1..=infinity_core::consts::MAX_STACK_QUANTITY).contains(&quantity).then_some(quantity)
+    })();
+    quantity.ok_or_else(|| slash_error(messages::gm::gm_create_quantity_invalid()))
+}
+
 async fn create(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let Some(what) = args.first() else { return Err(slash_error(messages::gm::GM_CREATE_USAGE.into())) };
-    let qty: i32 = args.get(1).and_then(|q| q.parse().ok()).unwrap_or(1).clamp(1, 1_000_000_000);
+    let qty = create_quantity(args.get(1).map(String::as_str))?;
     let (type_id, name) = resolve_type(c, what).await?;
     let char_id = c.session.int("charid").unwrap_or(0);
     let (location, flag) = match (c.session.int("stationid"), c.session.int("shipid")) {
@@ -214,19 +267,28 @@ async fn create(c: &mut Client, args: &[String]) -> Result<String, CallError> {
         _ => return Err(slash_error(messages::gm::GM_NOWHERE_TO_PUT_ITEM.into())),
     };
     let _lock = crate::services::market::lock().await;
-    let mut outbox = crate::db::outbox::Outbox::default();
-    super::items::deposit(&c.db, &c.sde, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
-    crate::db::outbox::dispatch_client((), outbox, c)?;
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    db.transaction(
+        |tx, outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                super::items::deposit(tx, &sde, outbox, &super::inventory::destination::Destination::owned(char_id, location, flag), type_id, qty, 0).await.map(|_| ())
+            })
+        },
+        |value, outbox| async move { crate::db::outbox::dispatch_client(value, outbox, c) },
+    ).await?;
     Ok(messages::gm::gm_created_item(qty, &name, type_id))
 }
 
-fn parse_amount(args: &[String], integer_digits: usize, decimals: usize) -> Option<String> {
+fn parse_amount(args: &[String], integer_digits: usize, decimals: usize, signed: bool) -> Option<String> {
     let [arg] = args else { return None };
     let amount = arg.replace(',', "");
-    let (integer, fraction) = match amount.split_once('.') {
+    let digits = if signed { amount.strip_prefix('-').or_else(|| amount.strip_prefix('+')).unwrap_or(&amount) } else { &amount };
+    let (integer, fraction) = match digits.split_once('.') {
         Some((integer, fraction)) if decimals > 0 => (integer, Some(fraction)),
         Some(_) => return None,
-        None => (amount.as_str(), None),
+        None => (digits, None),
     };
     if integer.is_empty() || integer.len() > integer_digits || !integer.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -248,15 +310,6 @@ fn exceeds_cap(exact: &str, cap: &str) -> bool {
             || (integer == cap && fraction.bytes().any(|b| b != b'0'))))
 }
 
-fn wallet_error(error: crate::db::Error) -> CallError {
-    if matches!(&error, crate::db::Error::Postgres(e)
-        if e.code() == Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE))
-    {
-        slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into())
-    } else {
-        db_err(error)
-    }
-}
 
 async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String, CallError> {
     let (usage, digits, decimals) = match command {
@@ -266,33 +319,75 @@ async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String
         "addplex" => (messages::gm::GM_ADD_PLEX_USAGE, PLEX_DIGITS, 0),
         _ => unreachable!(),
     };
-    let amount = parse_amount(args, digits, decimals).ok_or_else(|| slash_error(usage.into()))?;
+    let amount = parse_amount(args, digits, decimals, command == "addisk").ok_or_else(|| slash_error(usage.into()))?;
     let _guard = super::market::lock().await;
     match command {
         "setisk" | "addisk" => {
             let char_id = c.session.int("charid").unwrap_or(0);
-            let before = crate::dao::wallets::characters::balance(&c.db, char_id).await.map_err(wallet_error)?;
-            let (exact, balance) = if command == "setisk" {
-                crate::dao::wallets::characters::set_exact(&c.db, char_id, &amount).await
-            } else {
-                crate::dao::wallets::characters::credit_exact(&c.db, char_id, &amount).await
-            }.map_err(wallet_error)?;
-            c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-            let delta = balance - before;
-            let mut outbox = crate::db::outbox::Outbox::default();
-            outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: crate::consts::ACCOUNT_CASH, balance, delta });
-            crate::db::outbox::dispatch_client((), outbox, c)?;
-            let shown = exceeds_cap(&exact, &format!("{CLIENT_MAX_ISK:.0}")).then_some(balance);
+            let world = c.world.clone();
+            let set = command == "setisk";
+            let amount = crate::isk::IskAmount::parse_decimal(&amount).map_err(|_| slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into()))?;
+            let (balance, delta) = c.db.transaction(
+                |tx, outbox: &mut crate::db::outbox::Outbox| {
+                    Box::pin(async move {
+                    use crate::dao::wallets::{characters, WalletMutation};
+                    let before = characters::balance(tx, char_id).await.map_err(db_err)?;
+                    if !set && amount.is_zero() {
+                        return Ok::<_, CallError>((before, crate::isk::IskAmount::ZERO));
+                    }
+                    let magnitude = if amount.is_negative() {
+                        amount.checked_neg().ok_or_else(|| slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into()))?
+                    } else {
+                        amount
+                    };
+                    let result = if set {
+                        characters::set(tx, char_id, amount).await
+                    } else if amount.is_negative() {
+                        characters::debit(tx, char_id, magnitude).await
+                    } else {
+                        characters::credit(tx, char_id, amount).await
+                    }.map_err(db_err)?;
+                    let balance = match result {
+                        WalletMutation::Applied(balance) => balance,
+                        WalletMutation::Overflow => return Err(slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into())),
+                        WalletMutation::Missing => return Err(db_err(anyhow::anyhow!("wallet owner missing"))),
+                        WalletMutation::Insufficient(have) => return Err(super::wallets::not_enough_money(have, magnitude)),
+                    };
+                    let delta = balance.checked_sub(before).ok_or_else(|| slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into()))?;
+                    if !delta.is_zero() {
+                        outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: infinity_core::consts::ACCOUNT_CASH, balance, delta });
+                    }
+                    Ok::<_, CallError>((balance, delta))
+                    })
+                },
+                |value, outbox| async move { crate::db::outbox::dispatch_world(value, outbox, &world) },
+            ).await?;
+            let projected = balance.client_isk(crate::isk::personal_client_cap());
+            if !delta.is_zero() { c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(projected)]); }
+            let exact = balance.decimal();
+            let shown = exceeds_cap(&exact, &format!("{CLIENT_MAX_ISK:.0}")).then_some(projected);
             Ok(messages::gm::gm_balance(&exact, shown))
         }
         "setplex" | "addplex" => {
-            let (exact, balance) = if command == "setplex" {
-                crate::dao::accounts::balances::set_plex(&c.db, c.login.user_id, &amount).await
-            } else {
-                crate::dao::accounts::balances::add_plex(&c.db, c.login.user_id, &amount).await
-            }.map_err(wallet_error)?;
-            super::store::notify_plex_balance(c, balance);
-            let shown = exceeds_cap(&exact, &CLIENT_MAX_PLEX.to_string()).then_some(balance);
+            use super::plex_vault::{self, VaultAudience, VaultChange, VaultContext, VaultKind};
+            let value: i128 = amount.parse().map_err(|_| slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into()))?;
+            let (change, kind) = if command == "setplex" { (VaultChange::Set(value), VaultKind::GmSet) } else { (VaultChange::Add(value), VaultKind::GmAdd) };
+            let user = c.login.user_id;
+            let actor = c.session.int("charid");
+            let audience = match actor {
+                Some(character_id) if c.world.is_online(character_id) => VaultAudience::Account,
+                character_id => VaultAudience::UnpublishedCaller { character_id },
+            };
+            let db = c.db.clone();
+            let entry = db.transaction(
+                move |tx, outbox| Box::pin(async move {
+                    plex_vault::change_in(tx, outbox, user, actor, change, VaultContext { kind, item_id: None, reference: None }, audience).await?
+                        .ok_or_else(|| slash_error(messages::gm::GM_AMOUNT_TOO_LARGE.into()))
+                }),
+                |entry, outbox| async move { crate::db::outbox::dispatch_client(entry, outbox, c) },
+            ).await?;
+            let exact = entry.balance.to_string();
+            let shown = (entry.balance > i128::from(CLIENT_MAX_SHORT_AMOUNT)).then_some(entry.projected);
             Ok(messages::gm::gm_plex_balance(&exact, shown))
         }
         _ => unreachable!(),
@@ -300,9 +395,12 @@ async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String
 }
 
 async fn heal(c: &mut Client) -> Result<String, CallError> {
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(messages::gm::GM_DOCKED_SHIP_REPAIRS.into()) };
-    super::combat::gm_repair(&c.db, &c.world, system, c.session.int("charid").unwrap_or(0), ship).await?;
-    c.world.set_health(system, ship, [1.0; 3]);
+    if c.session.int("stationid").is_some_and(|station| station > 0) {
+        super::repair::heal_docked(&super::identity::Identity::of_client(c), &c.db, &c.world, &c.sde).await?;
+        return Ok(messages::gm::GM_HEALED_DOCKED.into());
+    }
+    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Err(slash_error(messages::gm::GM_DOGMA_NO_SHIP.into())) };
+    super::combat::gm_repair(&c.world, system, c.session.int("charid").unwrap_or(0), ship).await?;
     super::ship::send_state(c).await?;
     Ok(messages::gm::GM_REPAIRED.into())
 }
@@ -312,6 +410,16 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         return None;
     }
 
+    let bare = call.args.first().and_then(|v| v.as_text())
+        .is_none_or(|line| line.trim().trim_start_matches('/').trim().is_empty());
+    let result = execute(c, call).await?;
+    if !bare {
+        feedback::publish(c, &result);
+    }
+    Some(result)
+}
+
+async fn execute(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let line = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let line = line.trim().trim_start_matches('/');
     let words = match args::tokenize(line) {

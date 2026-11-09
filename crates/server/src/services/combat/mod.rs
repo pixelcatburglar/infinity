@@ -25,19 +25,18 @@
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
 //! Targeting and weapon range decisions use positions sampled together by the system actor;
 //! wrecks and ejected pilots use the position sampled when their ball is destroyed.
-//! Reload reservations survive interruptions and return to cargo during startup; reload
-//! timers remain memory-only and are not resumed.
+//! Reload reservations survive interruptions and return to their original source on startup;
+//! reload timers remain memory-only and are not resumed.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Explicit lock removal also removes the matching outgoing projected effects.
 //! The shared incoming-targeter query combines player locks and NPC hostiles as ball IDs.
-//! Ship condition is persisted in game.item_attributes, with shield recharge time on
-//! the shield override; capacitor and in-flight effects remain runtime-only.
-//! Space damage, repair and GM condition changes serialize with final condition saves;
-//! removed balls reject queued effects from their former system.
-//! Persistent unpiloted hulls use the same condition cache and durable overrides;
-//! their condition is prepared before publication and installed by the winning loader.
-//! Their destruction removes inventory without wrecks, payouts or pilot consequences.
+//! Space condition, fitted defenses and contributions live in their owning system actor.
+//! Dirty persistent conditions are checkpointed to game.item_attributes; the shield
+//! override carries its recharge anchor. Capacitor and in-flight effects remain runtime-only.
+//! Removed or transitioning balls reject ordinary mutation, and loss publication follows
+//! durable settlement. Persistent unpiloted hulls use the same actor condition; their
+//! destruction removes inventory without wrecks, payouts or pilot consequences.
 //! Missiles in flight use a temporary, nonpersistent ID namespace.
 //! LoadAmmo accepts an owned active or assembled docked fitting ship and owned charge
 //! stacks in its holds, the current hangar, or a directly held singleton container.
@@ -48,6 +47,10 @@
 //! through `LoadChargesToModule` as well as stacked charges.
 //! eve/common/script/util/inventoryFlagsCommon.py:9-15,53-60,217-226 describes cargo,
 //! fleet and ammo holds. Remote, foreign and recursively nested containers are unsupported.
+//! Wire charge stack quantities in notifications and the charge cache are
+//! projected to the client display limit; stored module_charges stay exact.
+
+pub(crate) mod capacity;
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -57,15 +60,17 @@ use super::fit::{Fit, Key};
 use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use super::identity::Identity;
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
-use crate::consts::{ACCOUNT_CASH, dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_QUANTITY, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_FALLOFF, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
-use crate::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_EM_DAMAGE, dogma::ATTR_THERMAL_DAMAGE, dogma::ATTR_KINETIC_DAMAGE, dogma::ATTR_EXPLOSIVE_DAMAGE};
-use crate::consts::{dogma::ATTR_ARMOR_HP, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_SCAN_RESOLUTION, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SHIELD_RECHARGE_RATE, dogma::ATTR_RELOAD_TIME, dogma::ATTR_NEXT_ACTIVATION_TIME, dogma::ATTR_ENTITY_FLY_RANGE, dogma::ATTR_ENTITY_ATTACK_RANGE, dogma::ATTR_ENTITY_MISSILE_TYPE, dogma::ATTR_ENTITY_KILL_BOUNTY, dogma::ATTR_ENTITY_SHIELD_BOOST_AMOUNT, dogma::ATTR_ENTITY_SHIELD_BOOST_DURATION, dogma::ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, dogma::ATTR_ENTITY_ARMOR_REPAIR_DURATION};
+use infinity_core::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_QUANTITY, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_FALLOFF, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
+use infinity_core::consts::{FLAG_FLEET_HANGAR, FLAG_SPECIALIZED_AMMO_HOLD};
+use infinity_core::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_EM_DAMAGE, dogma::ATTR_THERMAL_DAMAGE, dogma::ATTR_KINETIC_DAMAGE, dogma::ATTR_EXPLOSIVE_DAMAGE};
+use infinity_core::consts::{dogma::ATTR_ARMOR_HP, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_SCAN_RESOLUTION, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SHIELD_RECHARGE_RATE, dogma::ATTR_RELOAD_TIME, dogma::ATTR_NEXT_ACTIVATION_TIME, dogma::ATTR_ENTITY_FLY_RANGE, dogma::ATTR_ENTITY_ATTACK_RANGE, dogma::ATTR_ENTITY_MISSILE_TYPE, dogma::ATTR_ENTITY_KILL_BOUNTY, dogma::ATTR_ENTITY_SHIELD_BOOST_AMOUNT, dogma::ATTR_ENTITY_SHIELD_BOOST_DURATION, dogma::ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, dogma::ATTR_ENTITY_ARMOR_REPAIR_DURATION};
 use crate::db::Db;
 use crate::db::executor::Executor;
-use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
-use crate::messages;
+use crate::db::outbox::{Outbox, dispatch_world};
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
+use crate::space::combat::ActorConditionSnapshot;
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,10 +78,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{debug, info, warn};
 
 const HI_SLOTS: std::ops::RangeInclusive<i32> = 27..=34;
-/// inventorycommon/const.py:177, flagSpecializedAmmoHold.
-const FLAG_AMMO_HOLD: i32 = 143;
-/// inventorycommon/const.py:189, flagFleetHangar.
-const FLAG_FLEET_HANGAR: i32 = 155;
 pub(super) const ATTR_DAMAGE: [i32; 4] = [ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE];
 const ATTR_HP: [i32; 3] = [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP];
 const ATTR_RESONANCE: [[i32; 4]; 3] = [
@@ -99,12 +100,6 @@ static NEXT_LOCK: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------- state
 
-#[derive(Clone)]
-struct Hp {
-    now: [f64; 3],
-    max: [f64; 3],
-    resonance: [[f64; 4]; 3],
-}
 
 pub(super) struct ActiveModule {
     pub(super) char_id: i64,
@@ -126,12 +121,8 @@ pub(super) struct State {
     pub(super) active: HashMap<i64, ActiveModule>,
     /// Most recent activation, retained to invalidate deferred propulsion updates.
     pub(super) activation_generation: HashMap<i64, Arc<AtomicBool>>,
-    /// ballID -> hit points left (NPCs)
-    hp: HashMap<i64, Hp>,
     /// shipID -> (capacitor level, FILETIME it was measured)
     capacitor: HashMap<i64, (f64, i64)>,
-    /// shipID -> a player ship's damage
-    condition: HashMap<i64, Condition>,
     /// moduleID -> FILETIME its reload finishes
     pub(super) reloading: HashMap<i64, i64>,
 }
@@ -212,22 +203,25 @@ pub(crate) fn reset_pilot(world: &crate::space::World, char_id: i64, space_ship:
 
 pub(in crate::services) mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
+mod charge_reservations;
 pub(crate) mod targeting_charges;
 pub(crate) mod jamming;
 use targeting_charges::*;
 pub(in crate::services) mod banks;
-use banks::weapon_groups;
 pub(crate) mod groups_health;
 pub(crate) mod unpiloted;
-pub(crate) mod drone_health;
+#[cfg(test)] #[path = "drone_health/tests.rs"] mod drone_health_tests;
+pub(crate) mod damage;
 use groups_health::*;
 use super::effects::notify::attribute_change;
-use super::effects::lifecycle;
 pub(crate) mod npc;
 use npc::*;
 
+/// `OnModuleAttributeChanges` for a charge sublocation's stack quantity;
+/// wire new/old values are projected to the client display limit.
 pub(super) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, new: i64, old: i64) -> Value {
-    Value::list([attribute_change(owner, charge_key(ship, flag, type_id), ATTR_QUANTITY, Value::Int(new), Value::Int(old))])
+    let cap = super::dogma::info::cap_client_quantity;
+    Value::list([attribute_change(owner, charge_key(ship, flag, type_id), ATTR_QUANTITY, Value::Int(cap(new)), Value::Int(cap(old)))])
 }
 
 pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>), CallError> {
@@ -236,7 +230,7 @@ pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>
         ("locationID", marshal::DbType::I8),
         ("flagID", marshal::DbType::I2),
         ("typeID", marshal::DbType::I4),
-        ("quantity", marshal::DbType::I4),
+        ("quantity", marshal::DbType::I8),
     ]);
     let mut by_flag = Vec::new();
     let mut keys = Vec::new();
@@ -244,7 +238,7 @@ pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>
         let (flag, type_id, qty) = (r.flag_id, r.type_id, r.quantity);
         by_flag.push((
             Value::Int(flag as i64),
-            header.row(&[Value::Int(ship), Value::Int(flag as i64), Value::Int(type_id as i64), Value::Int(qty as i64)]),
+            header.row(&[Value::Int(ship), Value::Int(flag as i64), Value::Int(type_id as i64), Value::Int(super::dogma::info::cap_client_quantity(qty))]),
         ));
         keys.push(charge_key(ship, flag, type_id));
     }
@@ -277,29 +271,37 @@ pub(crate) async fn targeters(world: &World, system: i64, ship: i64) -> Vec<i64>
     candidates
 }
 
-pub fn ship_condition(ship: i64) -> Option<(f64, f64, f64)> {
-    let st = state();
-    let c = st.condition.get(&ship)?;
-    let shield = recharge(c.now[0], c.stats.max[0], c.stats.shield_tau_ms, (filetime_now() - c.shield_at) as f64 / FILETIME_SECOND as f64);
-    Some((shield, c.stats.max[1] - c.now[1], c.stats.max[2] - c.now[2]))
-}
 
-/// Persist the current runtime condition; serialize capture with paid repair.
-pub(crate) async fn save_condition(db: &Db, ship: i64) -> Result<(), CallError> {
-    let _lock = super::market::lock().await;
-    save_condition_in(db, ship).await
-}
-
-/// Capture and persist cached condition using an existing executor and lifecycle lock.
-pub(crate) async fn save_condition_in(ex: &(impl Executor + ?Sized), ship: i64) -> Result<(), CallError> {
-    let Some(cond) = state().condition.get(&ship).cloned() else { return Ok(()) };
-    persist_condition_in(ex, ship, &cond).await
-}
-
-async fn persist_condition_in(ex: &(impl Executor + ?Sized), ship: i64, cond: &Condition) -> Result<(), CallError> {
-    let now = filetime_now();
-    let shield = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, now.saturating_sub(cond.shield_at) as f64 / FILETIME_SECOND as f64);
-    crate::dao::items::dogma::save_condition(ex, ship, &[ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE], &[shield, cond.stats.max[1] - cond.now[1], cond.stats.max[2] - cond.now[2]], ATTR_SHIELD_CHARGE, now).await.map_err(db_err)
+/// Persist dirty actor conditions in one batch and return only IDs written by the DAO.
+pub(crate) async fn checkpoint_conditions_in<E: Send>(
+    ex: &(impl Executor + ?Sized),
+    outbox: &mut crate::db::outbox::Outbox<E>,
+    system: i64,
+    snapshots: &[ActorConditionSnapshot],
+    facts: Option<&crate::space::snapshot::FactCheckpoint>,
+) -> Result<Vec<i64>, CallError> {
+    let mut rows: Vec<_> = snapshots.iter()
+        .filter(|snapshot| snapshot.revision != snapshot.saved_revision)
+        .map(|snapshot| {
+            let condition = &snapshot.condition;
+            (snapshot.item_id, [
+                condition.now[0],
+                condition.stats.max[1] - condition.now[1],
+                condition.stats.max[2] - condition.now[2],
+            ], condition.shield_at)
+        })
+        .collect();
+    if let Some(facts) = facts {
+        let own: std::collections::HashSet<_> = rows.iter().map(|row| row.0).collect();
+        rows.extend(facts.condition_rows().filter(|row| !own.contains(&row.0)));
+        facts.append(outbox);
+    }
+    if rows.is_empty() { return Ok(Vec::new()); }
+    crate::dao::items::dogma::save_conditions(
+        ex, system,
+        &[ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE],
+        &rows,
+    ).await.map_err(db_err)
 }
 
 /// Reload a docked ship's durable condition and advance shield recharge while offline.
@@ -314,59 +316,96 @@ pub(crate) struct ConditionSeed(Condition);
 
 impl ConditionSeed {
     pub(crate) fn fractions(&self) -> [f64; 3] {
-        [0, 1, 2].map(|i| if self.0.stats.max[i] > 0.0 { self.0.now[i] / self.0.stats.max[i] } else { 0.0 })
+        [0, 1, 2].map(|i| if self.0.stats.max[i] > 0.0 {
+            (self.0.now[i] / self.0.stats.max[i]).clamp(0.0, 1.0)
+        } else { 0.0 })
     }
 
-    pub(crate) fn install(self, ship: i64) {
-        state().condition.insert(ship, self.0);
+    /// Rebase a cold seed before native publication; the caller must mark a changed seed dirty after installation.
+    pub(crate) fn rebase_with_fit(&mut self, fit: &Fit, key: Key) -> Result<([f64; 3], bool), CallError> {
+        let stats = ShipStats::from_fit(fit, key);
+        if !crate::space::combat::valid_condition(&Condition { stats: stats.clone(), now: [0.0; 3], shield_at: 0 }) {
+            return Err(CallError::Internal(anyhow::anyhow!("invalid fitted condition")));
+        }
+        let changed = crate::space::combat::rebase_condition(&mut self.0, stats);
+        Ok((self.fractions(), changed))
     }
+
+    pub(crate) fn scalars(&self) -> (f64, f64, f64) {
+        (self.0.now[0], self.0.stats.max[1] - self.0.now[1], self.0.stats.max[2] - self.0.now[2])
+    }
+
+    /// Consume a validated cold seed for installation in the owning system actor.
+    pub(crate) fn into_condition(self) -> Condition { self.0 }
 }
 
-pub(crate) async fn prepare_condition_with_fit(ex: &(impl Executor + ?Sized), ship: i64, fit: &Fit) -> Result<ConditionSeed, CallError> {
-    let stats = ShipStats::from_fit(fit, Key::Ship);
+async fn prepare_condition(ex: &(impl Executor + ?Sized), ship: i64, stats: ShipStats) -> Result<ConditionSeed, CallError> {
     let rows = crate::dao::items::dogma::overrides(ex, ship).await.map_err(db_err)?;
     let at = rows.iter().find(|r| r.attribute_id == ATTR_SHIELD_CHARGE).map(|r| r.updated_at).unwrap_or(0);
     let value = |id| rows.iter().find(|r| r.attribute_id == id).map(|r| r.value);
     let now = filetime_now();
-    let (levels, _) = restored_condition(&stats, [value(ATTR_SHIELD_CHARGE), value(ATTR_ARMOR_DAMAGE), value(ATTR_HULL_DAMAGE)], at, now);
+    let values = [value(ATTR_SHIELD_CHARGE), value(ATTR_ARMOR_DAMAGE), value(ATTR_HULL_DAMAGE)];
+    if !stats.max.iter().all(|v| v.is_finite() && *v >= 0.0)
+        || !stats.resonance.iter().flatten().all(|v| v.is_finite() && *v >= 0.0)
+        || !stats.shield_tau_ms.is_finite() || stats.shield_tau_ms < 0.0
+        || !values.iter().flatten().all(|v| v.is_finite() && *v >= 0.0) {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid ship condition seed")));
+    }
+    let (levels, health) = restored_condition(&stats, values, at, now);
+    if !levels.iter().all(|v| v.is_finite())
+        || !health.iter().all(|v| v.is_finite() && *v >= 0.0)
+        || levels[0] < 0.0
+        || levels.iter().zip(stats.max).any(|(level, max)| *level > max) {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid restored ship condition")));
+    }
     Ok(ConditionSeed(Condition { stats, now: levels, shield_at: now }))
 }
 
+pub(crate) async fn prepare_condition_with_fit(ex: &(impl Executor + ?Sized), ship: i64, fit: &Fit) -> Result<ConditionSeed, CallError> {
+    prepare_condition(ex, ship, ShipStats::from_fit(fit, Key::Ship)).await
+}
+
+/// Prepare durable condition using the receiving ship or drone key in a fitted snapshot.
+pub(crate) async fn prepare_condition_with_fit_key(
+    ex: &(impl Executor + ?Sized),
+    item: i64,
+    fit: &Fit,
+    key: Key,
+) -> Result<ConditionSeed, CallError> {
+    prepare_condition(ex, item, ShipStats::from_fit(fit, key)).await
+}
+
 pub(super) async fn load_condition_with_fit(db: &Db, ship: i64, fit: &Fit) -> Result<[f64; 3], CallError> {
-    let seed = prepare_condition_with_fit(db, ship, fit).await?;
-    let health = seed.fractions();
-    seed.install(ship);
-    Ok(health)
+    Ok(prepare_condition_with_fit(db, ship, fit).await?.fractions())
 }
 
 fn restored_condition(stats: &ShipStats, values: [Option<f64>; 3], at: i64, now: i64) -> ([f64; 3], [f64; 3]) {
     let shield = values[0].unwrap_or(stats.max[0]).clamp(0.0, stats.max[0].max(0.0));
     let shield = if at > 0 { recharge(shield, stats.max[0], stats.shield_tau_ms, now.saturating_sub(at).max(0) as f64 / FILETIME_SECOND as f64) } else { shield };
-    let levels = [shield, (stats.max[1] - values[1].unwrap_or(0.0)).clamp(0.0, stats.max[1].max(0.0)), (stats.max[2] - values[2].unwrap_or(0.0)).clamp(0.0, stats.max[2].max(0.0))];
-    let health = [0, 1, 2].map(|i| if stats.max[i] > 0.0 { levels[i] / stats.max[i] } else { 0.0 });
+    let levels = [shield, stats.max[1] - values[1].unwrap_or(0.0), stats.max[2] - values[2].unwrap_or(0.0)];
+    let health = [0, 1, 2].map(|i| if stats.max[i] > 0.0 {
+        (levels[i] / stats.max[i]).clamp(0.0, 1.0)
+    } else { 0.0 });
     (levels, health)
 }
 
-/// Drop only runtime condition after a committed repair.
-pub(crate) fn invalidate_condition(ship: i64) {
-    state().condition.remove(&ship);
-}
 
-/// Persist a GM's full ship repair before exposing it to the client.
-pub(crate) async fn gm_repair(db: &Db, world: &World, system: i64, char_id: i64, ship: i64) -> Result<(), CallError> {
-    let _lock = super::market::lock().await;
-    let stats = ship_stats(db, world, system, char_id, ship).await?;
-    let cond = Condition { now: stats.max, stats, shield_at: filetime_now() };
-    persist_condition_in(db, ship, &cond).await?;
-    invalidate_condition(ship);
+/// Repair the selected in-space ship through its owning actor.
+pub(crate) async fn gm_repair(world: &World, system: i64, char_id: i64, ship: i64) -> Result<(), CallError> {
+    let repaired = world.with(system, move |s| {
+        if !s.ball(ship).is_some_and(|ball| ball.char_id == Some(char_id))
+            || s.combat_phase(ship) != Some(crate::space::combat::CombatPhase::Live) {
+            return false;
+        }
+        if s.set_condition_fraction(ship, 1.0) { s.set_health(ship, [1.0; 3]); }
+        true
+    }).await.unwrap_or(false);
+    if !repaired { return Err(CallError::Internal(anyhow::anyhow!("ship condition unavailable"))); }
     Ok(())
 }
 
 pub fn forget_ship(ship: i64) {
-    let mut st = state();
-    st.condition.remove(&ship);
-    st.capacitor.remove(&ship);
-    st.hp.remove(&ship);
+    state().capacitor.remove(&ship);
 }
 /// Clear targeting and cached health after a GM removes a spawned ball.
 pub(crate) fn forget_gm_spawn(world: &World, id: i64) {
@@ -374,16 +413,6 @@ pub(crate) fn forget_gm_spawn(world: &World, id: i64) {
 }
 
 
-pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id: i64) -> bool {
-    forget_ship(ship);
-    if let Some(b) = world.destroy_ball(system, ship).await {
-        forget_target(world, ship);
-        world.notify_pilot(char_id, "__ship_destroyed", vec![Value::Int(ship), Value::Float(b.pos[0]), Value::Float(b.pos[1]), Value::Float(b.pos[2])]);
-        true
-    } else {
-        false
-    }
-}
 
 
 pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) -> Result<(), CallError> {
@@ -403,19 +432,59 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
     };
     let mut brain = NpcBrain::new(owner, config, {
         let weak_world = Arc::downgrade(&world);
-        let effects: NpcEffects = Arc::new(move |action| -> NpcFuture {
+        let sde = world.sde().clone();
+        let effects: NpcEffects = Arc::new(move |s, action| -> Option<NpcFuture> {
+            use super::effects::space_source::{PreparedCombatAttempt, SourceGuard};
+            let mut prepare = |source, target, generation, module, effect, weapon| {
+                let guard = SourceGuard::Npc { source, target, generation };
+                match s.prepare_body_combat_source(source, module, effect, weapon,
+                    crate::lua::events::resources::FactOrigin::Natural, move |s| guard.valid(s)) {
+                    Ok(facts) => Some(PreparedCombatAttempt::new(facts, weak_world.clone(), system)),
+                    Err(crate::space::combat_facts::Refusal::Full) => { capacity::refusal(system); None }
+                    Err(crate::space::combat_facts::Refusal::Invalid | crate::space::combat_facts::Refusal::Replay | crate::space::combat_facts::Refusal::Busy) => None,
+                    Err(error) => { warn!("npc {id} source admission: {error:?}"); None }
+                }
+            };
+            let (mut missile_attempt, mut turret_attempt, mut effect_attempt) = (None, None, None);
+            match &action {
+                NpcAction::Shot { me, victim, generation } => {
+                    if let Some((charge, _)) = stats.missile {
+                        missile_attempt = Some(prepare(me.id, victim.id, *generation, None, None, Some(charge))?);
+                    }
+                    if stats.damage.iter().any(|damage| *damage > 0.0) {
+                        turret_attempt = Some(prepare(me.id, victim.id, *generation, None, None, None)?);
+                    }
+                }
+                NpcAction::Effect { me, victim, effect_id, source_module, generation, .. } => {
+                    let effect = super::effects::registry::resolve(&sde, *effect_id)?;
+                    let tracked = matches!(effect.kind, super::effects::EffectKind::Turret | super::effects::EffectKind::Missile
+                        | super::effects::EffectKind::Smartbomb | super::effects::EffectKind::RemoteRepair { .. }
+                        | super::effects::EffectKind::Projected { jamming: super::effects::JammingType::Scramble });
+                    if tracked {
+                        let weapon = if matches!(effect.kind, super::effects::EffectKind::Missile) {
+                            sde.types.attribute(me.type_id, infinity_core::consts::dogma::ATTR_ENTITY_MISSILE_TYPE)
+                                .map(|value| value as i32).filter(|id| *id > 0 && sde.types.get(*id).is_some())
+                        } else { None };
+                        effect_attempt = Some(prepare(me.id, victim.id, *generation,
+                            (*source_module > 0).then_some(*source_module), (*effect_id > 0).then_some(i64::from(*effect_id)), weapon)?);
+                    }
+                }
+                NpcAction::Repair => {}
+            }
             let db = db.clone();
             let weak_world = weak_world.clone();
             let stats = stats.clone();
-            Box::pin(async move {
+            Some(Box::pin(async move {
                 let Some(world) = weak_world.upgrade() else { return };
                 match action {
                     NpcAction::Shot { me, victim, generation } => {
-                        if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim, generation).await {
-                            warn!("npc {id}: {}", match e {
-                                CallError::Internal(e) => format!("{e:#}"),
-                                CallError::User { msg, .. } => msg,
-                            });
+                        if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim, generation, missile_attempt, turret_attempt).await {
+                            if !capacity::is_refusal(&e) {
+                                warn!("npc {id}: {}", match e {
+                                    CallError::Internal(e) => format!("{e:#}"),
+                                    CallError::User { msg, .. } => msg,
+                                });
+                            }
                         }
                     }
                     NpcAction::Effect { me, victim, effect_id, source_module, duration_ms, generation } => {
@@ -431,9 +500,10 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                                 guard: super::effects::space_source::SourceGuard::Npc { source, target, generation },
                                 attacker: None, drone: None, phase: crate::space::drone::DronePhase::Begin,
                             };
-                            let result = super::effects::space_source::apply(&cx).await;
-                            match result {
+                            let result = super::effects::space_source::apply(&cx, effect_attempt).await;
+                            match &result {
                                 Err(CallError::Internal(error)) => warn!("npc {id} effect {effect_id}: {error:#}"),
+                                Err(error) if capacity::is_refusal(error) => {}
                                 Err(CallError::User { msg, .. }) if !matches!(effect.kind, super::effects::EffectKind::Projected { .. }) =>
                                     warn!("npc {id} effect {effect_id}: {msg}"),
                                 _ => {}
@@ -442,7 +512,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                     }
                     NpcAction::Repair => npc_repair(&world, system, id, &stats),
                 }
-            })
+            }))
         });
         effects
     });
@@ -476,70 +546,6 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
     Ok(())
 }
 
-pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    Some(match call.method {
-        "AddTarget" => add_target(c, call.args.first().and_then(|v| v.as_int()).unwrap_or(0)).await,
-        "CancelAddTarget" => {
-            if let (Some(ch), Some(t)) = (c.session.int("charid"), call.args.first().and_then(|v| v.as_int())) {
-                state().locking.remove(&(ch, t));
-            }
-            Ok(Value::None)
-        }
-        "RemoveTarget" => {
-            let t = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let identity = Identity::of_client(c);
-            let world = c.world.clone();
-            let system = c.session.int("solarsystemid");
-            drop_targets(&identity, &world, system, &[t], |event, args| c.notify(event, args));
-            Ok(Value::None)
-        }
-        "RemoveTargets" => {
-            let identity = Identity::of_client(c);
-            let world = c.world.clone();
-            let system = c.session.int("solarsystemid");
-            drop_targets(&identity, &world, system, &value_id_list(call.args.first()), |event, args| c.notify(event, args));
-            Ok(Value::None)
-        }
-        "ClearTargets" => {
-            if let Some(ch) = c.session.int("charid") {
-                let targets = clear_character_locks(&c.world, ch);
-                remove_target_projections(&Identity::of_client(c), &c.world, c.session.int("solarsystemid"), targets);
-            }
-            c.notify("OnTarget", vec![Value::str("clear")]);
-            Ok(Value::None)
-        }
-        "GetTargets" => Ok(Value::list(c.session.int("charid").map(targets_of).unwrap_or_default().into_iter().map(Value::Int))),
-        "GetTargeters" => Ok(Value::list([])),
-        "LoadAmmo" => load_ammo(c, call).await,
-        "UnloadAmmo" => unload_ammo(c, call).await,
-        "LinkWeapons" | "LinkAllWeapons" | "UnlinkModule" | "UnlinkAllModules" | "MergeModuleGroups" | "PeelAndLink" | "DestroyWeaponBank" | "GetWeaponBankInfoForShip" => {
-            weapon_groups(c, call).await
-        }
-        "Activate" | "Deactivate" => {
-            let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let effect_name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
-            let target = call.args.get(2).and_then(|v| v.as_int());
-            let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-            let identity = Identity::of_client(c);
-            let db = c.db.clone();
-            let world = c.world.clone();
-            let sde = c.sde.clone();
-            let space_system = c.session.int("solarsystemid");
-            let sender = c.notify_tx.clone();
-            let login_user = c.login.user_id;
-            let notify = |notification| match notification {
-                notification @ crate::db::outbox::Notification::DirectClient { .. } => notification.dispatch(&world, Some(&mut *c)),
-                notification => super::effects::online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid")),
-            };
-            if call.method == "Activate" {
-                lifecycle::activate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, target, repeat, notify).await
-            } else {
-                lifecycle::deactivate(&identity, &db, &world, &sde, space_system, sender, login_user, item_id, &effect_name, notify).await
-            }
-        }
-        _ => return None,
-    })
-}
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;
 

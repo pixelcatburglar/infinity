@@ -1,7 +1,8 @@
 //! Access-group authority and live affiliation resolution for ownerGroupManager.
 //! Uses game access groups and current corporation/alliance membership; structure policies
 //! and immediate eviction on affiliation changes are not supported.
-use crate::{dao, db::executor::Executor, services::{notify_error, CallError}, messages};
+use infinity_core::messages;
+use crate::{dao, db::executor::Executor, services::{notify_error, CallError}};
 use super::{ADMIN, EXCLUDED, MEMBER, NONE, PUBLIC};
 
 pub(crate) async fn membership(ex: &(impl Executor + ?Sized), character: i64, group: i64) -> Result<i32, CallError> {

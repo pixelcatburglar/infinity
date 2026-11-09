@@ -3,14 +3,19 @@ use super::fixture;
 mod cleanup;
 mod banks;
 mod skills;
-use crate::{
-    client::Client, config::Config, conn::Conn,
+use infinity_core::{
     consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CPU, dogma::ATTR_CPU_OUTPUT,
         dogma::ATTR_HI_SLOTS, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MED_SLOTS,
         dogma::ATTR_POWER, dogma::ATTR_POWER_OUTPUT, dogma::ATTR_REQUIRED_SKILL_LEVELS, dogma::ATTR_RIG_SLOTS,
         dogma::ATTR_STRUCTURE_HP, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE,
         FLAG_HANGAR, FLAG_MED_SLOT_FIRST},
-    dao::items::dogma, handshake::Login,
+};
+use crate::{
+    client::Client,
+    config::Config,
+    conn::Conn,
+    dao::items::dogma,
+    handshake::Login,
     services::{self, combat, effects::{heat, online, registry::{self, EffectAttribute}}, fit::{Fit, Key}, wallets, Call, CallResult},
     space::World,
 };
@@ -30,6 +35,24 @@ async fn call(c: &mut Client, service: &str, method: &str, args: &[Value], bind:
     let kwargs = Value::Dict(vec![]);
     services::dispatch(c, &Call { service, method, args, kwargs: &kwargs, bound: true, bind_params: bind }).await
 }
+
+async fn assert_cached_defenses(db: &crate::db::Db, world: &World, owner: i64, ship: i64) -> [f64; 2] {
+    let fit = Fit::load_in_space(db, world, SYSTEM, owner, ship).await.ok().expect("load expected fit");
+    let expected = combat::groups_health::ShipStats::from_fit(&fit, Key::Ship);
+    let snapshot = world.with(SYSTEM, move |s| s.combat_condition_snapshot(ship)).await.flatten().expect("actor condition");
+    assert_eq!(snapshot.condition.stats.max, expected.max);
+    assert_eq!(snapshot.condition.stats.resonance, expected.resonance);
+    assert_eq!(snapshot.condition.stats.shield_tau_ms, expected.shield_tau_ms);
+    [1, 2].map(|i| snapshot.condition.stats.max[i] - snapshot.condition.now[i])
+}
+async fn seed_module_prerequisites(db: &crate::db::Db, sde: &crate::sde::Sde, character: i64, module: i32) {
+    for (skill, level) in services::skills::requirements::requirements(sde, module) {
+        let rank = sde.types.get(skill).and_then(|t| t.fit_attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT)).expect("module prerequisite rank");
+        let points = services::skills::formulas::sp_for_level(rank, i64::from(level));
+        crate::dao::skills::training::set_level(db, character, skill, level, points).await.unwrap();
+    }
+}
+
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
@@ -74,22 +97,35 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = tx.clone();
         w.register_pilot(f.character, tx);
-        w.add_ship(SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await.unwrap();
+        w.system(SYSTEM).await.unwrap();
+        let market = services::market::lock().await;
+        let hull_row = crate::dao::items::space_ships::FreeShip { item_id: f.ship, type_id: hull, owner_id: f.character, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let prepared = services::ship::balls::piloted(&d, sde.clone(), &hull_row, f.character, 0.0).await.ok().expect("prepare ship");
+        w.with(SYSTEM, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
+        drop(market);
+        assert_cached_defenses(&d, &w, f.character, f.ship).await;
+        combat::groups_health::set_damage(&c, SYSTEM, f.ship, f.character, [false, true, true], 0.25).await.ok().expect("damage armor and hull");
+        let raw_damage = assert_cached_defenses(&d, &w, f.character, f.ship).await;
         let baseline = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap();
         let bad = [Value::Int(f.module), Value::Int(i64::from(OVERLOAD_SPEED + 1))];
         assert!(call(&mut c, "dogmaIM", "Overload", &bad, None).await.is_err());
         assert!(!heat::overloaded_modules().contains(&f.module));
         let overload = [Value::Int(f.module), Value::Int(i64::from(OVERLOAD_SPEED))];
         dogma::set_override(&d, f.module, REQUIRED_THERMODYNAMICS, 1.0).await.unwrap();
+        fixture::publish_fit(&d, &w, SYSTEM, f.character, f.ship).await;
         assert!(call(&mut c, "dogmaIM", "Overload", &overload, None).await.is_err());
         assert!(!heat::overloaded_modules().contains(&f.module));
+        // Reconciliation checks SDE prerequisites, not fitted level overrides.
+        seed_module_prerequisites(&d, &sde, f.character, module).await;
         dogma::set_override(&d, f.module, REQUIRED_THERMODYNAMICS, 0.0).await.unwrap();
         dogma::set_override(&d, f.module, HEAT_DAMAGE, 0.0).await.unwrap();
+        fixture::publish_fit(&d, &w, SYSTEM, f.character, f.ship).await;
         let running = [Value::Int(f.module), Value::str(&effect_name), Value::None, Value::Int(5)];
         let kwargs = Value::Dict(vec![]);
         let running_call = Call { service: "dogmaIM", method: "Activate", args: &running, kwargs: &kwargs, bound: true, bind_params: None };
-        combat::dispatch(&mut c, &running_call).await.expect("combat method").ok().expect("activate unheated propulsion");
+        crate::services::dogma::dispatch(&mut c, &running_call).await.ok().expect("activate unheated propulsion");
         let normal_speed = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap().value(Key::Ship, ATTR_MAX_VELOCITY);
+        assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw_damage);
         assert!(call(&mut c, "dogmaIM", "Overload", &overload, None).await.is_ok());
         assert!(!heat::overloaded_modules().contains(&f.module));
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -97,27 +133,31 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         }).await.expect("pending start boundary");
         let hot_speed = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap().value(Key::Ship, ATTR_MAX_VELOCITY);
         assert!(hot_speed > normal_speed);
+        assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw_damage);
         assert!(call(&mut c, "dogmaIM", "StopOverload", &overload, None).await.is_ok());
         assert!(heat::overloaded_modules().contains(&f.module));
         tokio::time::timeout(Duration::from_secs(10), async {
             while heat::overloaded_modules().contains(&f.module) { assert!(w.after(SYSTEM, 100).await); }
         }).await.expect("pending stop boundary");
+        assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw_damage);
         let stop_args = [Value::Int(f.module), Value::str(&effect_name)];
         let stop = Call { service: "dogmaIM", method: "Deactivate", args: &stop_args, kwargs: &kwargs, bound: true, bind_params: None };
-        combat::dispatch(&mut c, &stop).await.expect("combat method").ok().expect("stop propulsion");
+        crate::services::dogma::dispatch(&mut c, &stop).await.ok().expect("stop propulsion");
         tokio::time::timeout(Duration::from_secs(10), async {
             while combat::state().active.contains_key(&f.module) { assert!(w.after(SYSTEM, 100).await); }
         }).await.expect("propulsion retired");
+        assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw_damage);
         while rx.try_recv().is_ok() {}
-        dogma::set_override(&d, f.module, HEAT_DAMAGE, 1_000_000.0).await.unwrap();
+        dogma::set_override(&d, f.module, HEAT_DAMAGE, 0.0).await.unwrap();
+        fixture::publish_fit(&d, &w, SYSTEM, f.character, f.ship).await;
         assert!(call(&mut c, "dogmaIM", "Overload", &overload, None).await.is_ok());
         assert!(heat::overloaded_modules().contains(&f.module));
         let prime = heat::ship_state(&w, SYSTEM, f.ship).await;
         assert!(prime.as_ref().is_none_or(|racks| racks.iter().all(|r| r.incoming == 0.0)));
-        let activate = [Value::Int(f.module), Value::str(&effect_name), Value::None, Value::Int(1)];
+        let activate = [Value::Int(f.module), Value::str(&effect_name), Value::None, Value::Int(100)];
         let kwargs = Value::Dict(vec![]);
         let activation = Call { service: "dogmaIM", method: "Activate", args: &activate, kwargs: &kwargs, bound: true, bind_params: None };
-        combat::dispatch(&mut c, &activation).await.expect("combat method").ok().expect("activate propulsion");
+        crate::services::dogma::dispatch(&mut c, &activation).await.ok().expect("activate propulsion");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if heat::ship_state(&w, SYSTEM, f.ship).await.is_some_and(|r| r.iter().any(|r| r.incoming > 0.0)) { break; }
@@ -129,11 +169,22 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         let prime_args = [Value::Bool(false), Value::Bool(true), Value::None];
         for _ in 0..2 {
             let info = call(&mut c, "dogmaIM", "GetAllInfo", &prime_args, None).await.ok().expect("reprime");
+            assert!(dogma::online(&d, f.ship).await.unwrap().iter().any(|m| m.item_id == f.module), "reprime must keep the propulsion module online");
             let state = services::value_field(&info, "shipState").unwrap().items().unwrap();
             let Value::Dict(racks) = &state[3] else { panic!("heat bootstrap mapping") };
-            let (_, medium) = racks.iter().find(|(id, _)| id.as_int() == Some(i64::from(crate::consts::dogma::ATTR_HEAT_MED))).unwrap();
-            assert!(medium.items().unwrap()[2].as_float().unwrap() > 0.0);
+            let (_, medium) = racks.iter().find(|(id, _)| id.as_int() == Some(i64::from(infinity_core::consts::dogma::ATTR_HEAT_MED))).unwrap();
+            assert!(medium.items().unwrap()[2].as_float().unwrap() > 0.0, "medium heat row={medium:?}, actor={:?}", heat::ship_state(&w, SYSTEM, f.ship).await.map(|r| r.into_iter().map(|rack| (rack.heat, rack.incoming, rack.capacity)).collect::<Vec<_>>()));
         }
+        crate::services::dogma::dispatch(&mut c, &stop).await.ok().expect("stop priming propulsion");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while combat::state().active.contains_key(&f.module) { assert!(w.after(SYSTEM, 100).await); }
+        }).await.expect("priming propulsion retired");
+        while rx.try_recv().is_ok() {}
+        dogma::set_override(&d, f.module, HEAT_DAMAGE, 1_000_000.0).await.unwrap();
+        fixture::publish_fit(&d, &w, SYSTEM, f.character, f.ship).await;
+        let burn = [Value::Int(f.module), Value::str(&effect_name), Value::None, Value::Int(1)];
+        let burn_call = Call { service: "dogmaIM", method: "Activate", args: &burn, kwargs: &kwargs, bound: true, bind_params: None };
+        crate::services::dogma::dispatch(&mut c, &burn_call).await.ok().expect("activate forced burnout");
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if dogma::overrides(&d, f.module).await.unwrap().iter().any(|v| v.attribute_id == ATTR_HULL_DAMAGE && v.value > 0.0)
@@ -152,7 +203,7 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         let Value::Dict(instances) = &state[0] else { panic!("instance bootstrap mapping") };
         let (_, module_row) = instances.iter().find(|(id, _)| id.as_int() == Some(f.module)).unwrap();
         assert_eq!(module_row.items().unwrap()[2].as_float(), Some(hp));
-        assert!(online::set_online(&services::identity::Identity::of_client(&c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, f.ship, f.module, true, |notification| online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid"))).await.is_err());
+        assert!(online::set_online(&services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.notify_tx.clone(), c.login.user_id, f.ship, f.module, true, |notification| online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid"))).await.is_err());
         assert!(w.after(SYSTEM, 300).await);
         let mut adds = 0;
         let mut removes = 0;
@@ -161,7 +212,7 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         w.remove_ball(SYSTEM, f.ship).await;
         assert!(!heat::overloaded_modules().contains(&f.module));
         let fresh_world = World::new(d.clone(), sde.clone(), 1);
-        fresh_world.add_ship(SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await.unwrap();
+        fixture::admit(&d, &fresh_world, SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await;
         let fresh_fit = Fit::load_in_space(&d, &fresh_world, SYSTEM, f.character, f.ship).await.ok().unwrap();
         assert_eq!(fresh_fit.value(Key::Module(f.module), ATTR_HULL_DAMAGE), hp);
         assert!(heat::ship_state(&fresh_world, SYSTEM, f.ship).await.is_none_or(|r| r.iter().all(|r| r.heat == 0.0 && r.incoming == 0.0)));
@@ -187,13 +238,13 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
         assert_eq!(wallets::balance(&d, f.character).await.ok().unwrap(), balance);
         assert_eq!(Fit::load(&d, sde.clone(), f.character, f.ship).await.ok().unwrap().value(Key::Module(f.module), ATTR_HULL_DAMAGE), hp);
         call(&mut c, "repairSvc", "RepairItemsInStation", &[ids.clone(), Value::Float(cost)], Some(&bind)).await.ok().expect("full repair");
-        assert!((wallets::balance(&d, f.character).await.ok().unwrap() - (balance - services::market::round2(cost))).abs() < 0.001);
+        assert_eq!(wallets::balance(&d, f.character).await.ok().unwrap(), balance.checked_sub(crate::isk::IskAmount::from_isk(services::market::round2(cost)).unwrap()).unwrap());
         assert_eq!(Fit::load(&d, sde.clone(), f.character, f.ship).await.ok().unwrap().value(Key::Module(f.module), ATTR_HULL_DAMAGE), 0.0);
         let repaired_balance = wallets::balance(&d, f.character).await.ok().unwrap();
         assert!(call(&mut c, "repairSvc", "RepairItemsInStation", &[ids, Value::Float(cost)], Some(&bind)).await.is_err());
         assert_eq!(wallets::balance(&d, f.character).await.ok().unwrap(), repaired_balance);
         assert_eq!(Fit::load(&d, sde.clone(), f.character, f.ship).await.ok().unwrap().value(Key::Module(f.module), ATTR_HULL_DAMAGE), 0.0);
-        online::set_online(&services::identity::Identity::of_client(&c), &c.db, &c.sde, c.notify_tx.clone(), c.login.user_id, f.ship, f.module, true, |notification| online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid"))).await.ok().expect("online after repair");
+        online::set_online(&services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.notify_tx.clone(), c.login.user_id, f.ship, f.module, true, |notification| online::dispatch_notification(notification, &c.world, &c.notify_tx, c.session.int("charid"))).await.ok().expect("online after repair");
         assert!(dogma::online(&d, f.ship).await.unwrap().iter().any(|m| m.item_id == f.module));
     }).await;
     {
@@ -203,7 +254,7 @@ async fn overloaded_cycle_burns_persists_and_station_repairs() {
     }
     heat::clear_character(f.character);
     world.remove_ball(SYSTEM, f.ship).await;
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);

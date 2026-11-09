@@ -23,7 +23,7 @@ impl MapConfig {
     pub(super) fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.history_retention_hours >= 24, "map.history_retention_hours={} must be at least 24", self.history_retention_hours);
         anyhow::ensure!(self.maintenance_secs > 0, "map.maintenance_secs={} must be positive", self.maintenance_secs);
-        super::game::duration("map.history_retention_hours", self.history_retention_hours, crate::consts::FILETIME_HOUR, false)?;
-        super::game::duration("map.maintenance_secs", self.maintenance_secs, crate::consts::FILETIME_SECOND, true)
+        super::game::duration("map.history_retention_hours", self.history_retention_hours, infinity_core::consts::FILETIME_HOUR, false)?;
+        super::game::duration("map.maintenance_secs", self.maintenance_secs, infinity_core::consts::FILETIME_SECOND, true)
     }
 }

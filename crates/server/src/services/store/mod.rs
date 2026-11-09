@@ -4,8 +4,10 @@
 //!   dicts vgs/common/utils.py parses. The live catalogue was server-side only, so
 //!   it is rebuilt from this build's data: Serenity-visible SKINs, apparel and
 //!   crates that traded on the retail market, priced in PLEX at the retail
-//!   ISK/PLEX ratio (crate::retail), plus skill services and a free daily gift.
-//!   Category ids are the ones the store UI has icons for (nes_constants.py).
+//!   ISK/PLEX ratio (crate::retail), plus skill services, a free daily gift and
+//!   server-authored expert consumables priced from historical retail observations.
+//!   Expert purchases use the ordinary token claim flow to deliver physical items.
+//!   Root category IDs have client icons (nes_constants.py); 202 is a server-selected child.
 //! * `vaultManager`: the account's PLEX.
 //! * `userSvc` redeem tokens (eve/client/script/ui/services/redeemsvc.py): what
 //!   purchases and rewards deliver; claiming turns them into items, or free skill
@@ -21,10 +23,15 @@
 
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
-use crate::consts::FLAG_HANGAR;
-use crate::messages;
+use infinity_core::consts::FLAG_HANGAR;
+use infinity_core::messages;
 use marshal::Value;
 use tracing::info;
+/// Client currency code from `vgs/common/const.py`: `PLX_CURRENCY`.
+pub(super) const PLX: &str = "PLX";
+
+/// Server redeem-label policy: the vgs store localization label identifies purchases.
+pub(super) const TOKEN_LABEL: &str = "UI/VirtualGoodsStore/StoreName";
 
 
 fn s(v: &str) -> Value {
@@ -39,8 +46,8 @@ fn period_start() -> String {
 
 fn period_start_at(now: i64, turnover: &str) -> String {
     let mut parts = turnover.split(':').map(|part| part.parse::<i64>().expect("validated UTC turnover"));
-    let offset = parts.next().unwrap() * crate::consts::SECONDS_PER_HOUR
-        + parts.next().unwrap() * crate::consts::SECONDS_PER_MINUTE + parts.next().unwrap();
+    let offset = parts.next().unwrap() * infinity_core::consts::SECONDS_PER_HOUR
+        + parts.next().unwrap() * infinity_core::consts::SECONDS_PER_MINUTE + parts.next().unwrap();
     let day = (now - offset).div_euclid(86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = day + 719_468;
@@ -58,16 +65,9 @@ fn period_start_at(now: i64, turnover: &str) -> String {
 
 // ---------------------------------------------------------------- PLEX and redeeming
 
-pub(super) fn notify_plex_balance(c: &mut Client, balance: i64) {
-    c.notify("OnAurumChangeFromVgs", vec![Value::dict([
-        ("userid", Value::Int(c.login.user_id)),
-        ("balance", Value::Int(balance)),
-    ])]);
-}
 
 /// Queue `quantity` x `type_id` on `user_id`'s redeeming queue.
 async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, label: &str) -> Result<(), CallError> {
-    let quantity = i32::try_from(quantity).map_err(|e| db_err(anyhow::anyhow!("redeem quantity out of range: {e}")))?;
     crate::dao::store::purchases::grant(&c.db, user_id, type_id, quantity, label, filetime_now()).await.map_err(db_err)?;
     Ok(())
 }
@@ -75,6 +75,7 @@ async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, labe
 
 
 
+mod purchasing;
 mod store_manager;
 mod vault_manager;
 mod user_svc;

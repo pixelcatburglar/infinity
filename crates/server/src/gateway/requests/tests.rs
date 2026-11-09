@@ -120,7 +120,7 @@ async fn forged_character_ownership_never_binds_notice_stream() {
     let character: i64 = gateway.db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'gateway-test-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     gateway.world.register_pilot(character, tx);
-    gateway.world.set_online_session(character, Some(crate::session::OnlineSession {
+    gateway.world.set_online_session(character, Some(infinity_core::session::OnlineSession {
         character_id: character, user_id: Some(account), session_id: 1, ship_id: None, station_id: None,
         system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     }));
@@ -136,8 +136,32 @@ async fn forged_character_ownership_never_binds_notice_stream() {
     let payload = DynamicMessage::new(message("eve_public.Event").unwrap());
     gateway.notice_hub.dispatch(GatewayNotice::new(Target::Character(u32::try_from(character).unwrap()), &payload).unwrap(), |id| gateway.world.online_session(id));
     assert!(stream.rx.try_recv().is_err());
-    gateway.world.unregister_pilot(character);
+    gateway.world.unregister_pilot_generation(character, None);
     gateway.db.execute("DELETE FROM game.characters WHERE character_id = $1", &[&character]).await.unwrap();
     gateway.db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
     gateway.db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&other]).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn daily_reservation_prevents_default_success_and_requires_original_uuid() {
+    let gateway = super::super::tests::gateway().await;
+    for (name, uuid, status) in [
+        ("eve_public.dailygoal.api.GetAllCurrentRequest", vec![], 401),
+        ("eve_public.dailygoal.api.admin.ProgressRequest", vec![], 400),
+        ("eve_public.dailygoal.api.admin.ProgressRequest", vec![1; 15], 400),
+        ("eve_public.dailygoal.api.admin.ProgressRequest", vec![2; 16], 401),
+        ("eve_public.dailygoal.api.RedeemAllRequest", vec![], 501),
+        ("eve_public.dailygoal.api.FutureRequest", vec![], 501),
+    ] {
+        let req = Request {
+            issued: None, correlation_uuid: uuid.clone(), external_origin: String::new(),
+            application_instance_uuid: vec![], authoritative_context: None,
+            payload: Some(prost_types::Any { type_url: format!("type.googleapis.com/{name}"), value: vec![] }),
+        };
+        let response = handle_request(gateway.as_ref(), req, None).await;
+        assert_eq!(response.status_code, status, "{name}");
+        assert_eq!(response.correlation_uuid, uuid);
+        assert!(response.payload.is_none());
+    }
 }

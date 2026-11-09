@@ -1,0 +1,30 @@
+{
+  "version": "1",
+  "source": "server daily goals policy",
+  "ordinary": [
+    {"key":"npc","target":25,"career":"enforcer","method":{"kind":"kill_npc","entries":[{"system":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"damage","target":10000,"career":"soldier_of_fortune","method":{"kind":"damage_ship","entries":[{"system":{"kind":"any"},"ship":{"kind":"any"},"identity":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"mining","target":1000,"career":"industrialist","method":{"kind":"mine_ore","entries":[{"system":{"kind":"any"},"ore":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"scan","target":3,"career":"explorer","method":{"kind":"scan_signature","entries":[{"system":{"kind":"any"},"signature":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"manufacture","target":100,"career":"industrialist","method":{"kind":"manufacture_item","entries":[{"owner":"character","facility":{"kind":"any"},"item":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"salvage","target":3,"career":"industrialist","method":{"kind":"salvage_wreck","entries":[{"system":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"loyalty","target":1000,"career":"enforcer","method":{"kind":"earn_loyalty_points","entries":[{"corporation":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"jump","target":5,"career":"none","method":{"kind":"space_jump"},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"shield","target":500,"career":"soldier_of_fortune","method":{"kind":"remote_repair_shields","entries":[{"system":{"kind":"any"},"ship":{"kind":"any"},"identity":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]},
+    {"key":"armor","target":500,"career":"soldier_of_fortune","method":{"kind":"remote_repair_armor","entries":[{"system":{"kind":"any"},"ship":{"kind":"any"},"identity":{"kind":"any"}}]},"rewards":[{"kind":"evermark","amount":500}]}
+  ],
+  "slot_pools": [["npc","damage","loyalty"],["mining","manufacture","salvage"],["scan","jump"]],
+  "bonus": {"key":"bonus","target":2,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"ordinary"},"period":"day"}]},"rewards":[{"kind":"skill_points","amount":10000}]},
+  "monthly_base": [
+    {"key":"base_3","target":3,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"skill_points","amount":25000}]},
+    {"key":"base_6","target":6,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"skill_points","amount":50000}]},
+    {"key":"base_9","target":9,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"skill_points","amount":75000}]},
+    {"key":"base_12","target":12,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"skill_points","amount":100000}]}
+  ],
+  "monthly_omega": [
+    {"key":"omega_3","target":3,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"isk","amount":"1000000"}]},
+    {"key":"omega_6","target":6,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"skill_points","amount":25000}]},
+    {"key":"omega_9","target":9,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"isk","amount":"2000000"}]},
+    {"key":"omega_12","target":12,"career":"none","method":{"kind":"complete_goal","entries":[{"goal":{"kind":"any"},"category":{"kind":"bonus"},"period":"month"}]},"rewards":[{"kind":"skill_points","amount":100000}]}
+  ]
+}

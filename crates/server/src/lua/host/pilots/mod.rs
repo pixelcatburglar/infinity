@@ -126,7 +126,7 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> mlua::R
         let r = r.clone();
         async move {
             let characters = crate::dao::characters::selection::characters(
-                &r.db, r.pilots.account, crate::consts::FILETIME_SECOND, crate::consts::FILETIME_UNIX_EPOCH,
+                &r.db, r.pilots.account, infinity_core::consts::FILETIME_SECOND, infinity_core::consts::FILETIME_UNIX_EPOCH,
             ).await.map_err(services::db_err).map_err(lua_error)?;
             let list = lua.create_table()?;
             for (index, character) in characters.into_iter().enumerate() {

@@ -16,6 +16,7 @@ enum Route {
     CharacterNamesByUser,
     PlexBalance,
     PersonalSkillPlan,
+    PersonalMilestone,
     ShipCosmetics,
 }
 
@@ -41,7 +42,15 @@ const CLAIMS: &[(&str, Route)] = &[
     ("eve_public.character.skill.plan.SetNameRequest", Route::PersonalSkillPlan),
     ("eve_public.character.skill.plan.SetDescriptionRequest", Route::PersonalSkillPlan),
     ("eve_public.character.skill.plan.SetSkillRequirementsRequest", Route::PersonalSkillPlan),
+    ("eve_public.character.skill.plan.milestone.GetAllRequest", Route::PersonalMilestone),
+    ("eve_public.character.skill.plan.milestone.CreateRequest", Route::PersonalMilestone),
+    ("eve_public.character.skill.plan.milestone.DeleteRequest", Route::PersonalMilestone),
+    ("eve_public.character.skill.plan.milestone.SetDescriptionRequest", Route::PersonalMilestone),
 ];
+
+pub(crate) fn is_implemented(name: &str) -> bool {
+    CLAIMS.iter().any(|(claim, _)| *claim == name)
+}
 
 pub(super) fn validate() -> anyhow::Result<()> {
     for &(name, _) in CLAIMS {
@@ -50,6 +59,7 @@ pub(super) fn validate() -> anyhow::Result<()> {
         anyhow::ensure!(message(&response).is_some(), "missing response descriptor {response}");
     }
     ship_cosmetics::validate()?;
+    crate::services::daily_goals::wire::validate()?;
     Ok(())
 }
 
@@ -68,6 +78,7 @@ pub(super) async fn handle(ctx: &HandlerContext<'_>, name: &str, req: &DynamicMe
         Route::CharacterNamesByUser => characters::names_by_user(ctx).await,
         Route::PlexBalance => plex::plex_balance(ctx).await,
         Route::PersonalSkillPlan => skill_plans::personal::skill_plan(ctx, name, req).await,
+        Route::PersonalMilestone => skill_plans::personal_milestones::handle(ctx, name, req).await,
         Route::ShipCosmetics => ship_cosmetics::handle(ctx, name, req).await,
     };
     Dispatch::Claimed(result)

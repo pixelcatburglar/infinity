@@ -58,7 +58,7 @@ async fn mutual_authority_transactions_and_durable_deadlines() {
     let (a,b) = (corps[0],corps[1]);
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=ANY($2)", &[&a,&chars[0..3].to_vec()]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=ANY($2)", &[&b,&chars[3..5].to_vec()]).await.unwrap();
-    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&crate::consts::ROLE_DIRECTOR,&chars[1]]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&infinity_core::consts::ROLE_DIRECTOR,&chars[1]]).await.unwrap();
     let alliance: i64 = db.query_one("INSERT INTO game.alliances (name,short_name,executor_corp_id,creator_corp_id,creator_char_id,created) VALUES ('war-test-' || nextval('game.alliances_alliance_id_seq')::text,'W' || currval('game.alliances_alliance_id_seq')::text,$1,$1,$2,1) RETURNING alliance_id", &[&a,&chars[0]]).await.unwrap().get("alliance_id");
     let test_db = db.clone(); let actors = chars.clone();
     let result = tokio::spawn(async move {
@@ -200,13 +200,13 @@ async fn mutual_authority_transactions_and_durable_deadlines() {
         for _ in 0..2 { super::super::deadlines::handle(test_db.clone(),world.clone(),job(&test_db,&start_id).await).await.unwrap(); }
         assert_eq!(wars::get(&test_db,war.war_id).await.unwrap().unwrap().state,State::Active);
         let system = world.sde().map.systems().find(|s| s.security.is_some_and(|v| v >= crate::config::game().crimewatch.highsec_threshold && v > 0.0)).expect("high-security SDE system").solar_system_id;
-        let ship_type = world.sde().types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)).expect("SDE ship type").type_id;
+        let ship_type = world.sde().types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)).expect("SDE ship type").type_id;
         let _attacker_ship = crate::dao::items::transfers::insert(&test_db,ship_type,ceo,system,0,1).await.unwrap();
-        let victim_ship = crate::dao::items::transfers::insert(&test_db,ship_type,other,system,0,1).await.unwrap();
+        crate::dao::items::transfers::insert(&test_db,ship_type,other,system,0,1).await.unwrap();
         let security = crate::services::crimewatch::security_status(&test_db,ceo).await.unwrap();
         let rights: Vec<i64> = crate::dao::kill_rights::mine(&test_db,other,crate::client::filetime_now()).await.unwrap().iter().filter(|r| r.from_id == other && r.to_id == ceo).map(|r| r.kill_right_id).collect();
         for rx in &mut receivers { drain(rx); }
-        crate::services::crimewatch::aggress(&test_db,&world,system,ceo,ship_type,ship_type,other,victim_ship).await.unwrap();
+        crate::services::crimewatch::aggress(&test_db,&world,system,ceo,other).await.unwrap();
         assert!(crate::services::crimewatch::weapons_timer(ceo).is_some());
         assert!(crate::services::crimewatch::retaliation_allowed(other,ceo,crate::client::filetime_now()));
         assert!(crate::services::crimewatch::retaliation_allowed(ceo,other,crate::client::filetime_now()));
@@ -223,7 +223,7 @@ async fn mutual_authority_transactions_and_durable_deadlines() {
         assert!(victim_events.iter().any(|(event,_)| event == "OnCrimewatchEngagementCreated"));
         test_db.execute("UPDATE game.corporations SET alliance_id=$2 WHERE corporation_id=$1", &[&a,&alliance]).await.unwrap();
         test_db.execute("UPDATE game.corporations SET alliance_id=$2 WHERE corporation_id=$1", &[&b,&alliance]).await.unwrap();
-        test_db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&crate::consts::ROLE_DIRECTOR,&other]).await.unwrap();
+        test_db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&infinity_core::consts::ROLE_DIRECTOR,&other]).await.unwrap();
         assert_eq!(super::super::authority::owner(&test_db,ceo).await.unwrap(),alliance);
         assert!(super::super::authority::require_owner(&test_db,director,alliance).await.is_ok());
         assert!(super::super::authority::require_owner(&test_db,member,alliance).await.is_err());

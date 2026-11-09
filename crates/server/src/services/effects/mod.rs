@@ -18,6 +18,8 @@ pub(crate) mod propulsion;
 pub(crate) mod weapons;
 pub(crate) mod hacking;
 pub(crate) mod lifecycle;
+mod fuel;
+mod entosis;
 mod behaviors;
 pub(crate) mod online;
 pub(crate) mod fitting;
@@ -31,7 +33,7 @@ mod tractor;
 mod scan;
 mod salvage;
 mod targeting;
-mod repair;
+pub(crate) mod repair;
 mod mining;
 mod capacitor;
 pub(crate) mod npc_capacitor;
@@ -52,7 +54,7 @@ pub(crate) enum EffectKind {
     CapTransfer, Neutralizer, Nosferatu, CapBooster, Propulsion, Mining,
     Projected { jamming: JammingType }, Ecm, BurstJammer, Cloak,
     MicroJumpDrive, Salvage, Tractor, CargoScan, ShipScan, SurveyScan,
-    AutoTarget, PassiveTarget, Bomb, Compression, ProbeLaunch, Hacking, Online,
+    AutoTarget, PassiveTarget, Bomb, Compression, Entosis, ProbeLaunch, Hacking, Online,
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(in crate::services) mod tests;

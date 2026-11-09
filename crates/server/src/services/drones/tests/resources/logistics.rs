@@ -1,7 +1,12 @@
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{Call, CallError, combat::{self, groups_health}, drones::worker,
-    effects::{registry::{self, EffectAttribute}, EffectKind}, fit::{Fit, Key}}};
+use infinity_core::{
+    consts::{*, dogma::*},
+};
+use crate::{
+    services::{Call, CallError, combat::{self, damage}, drones::worker,
+    effects::{registry::{self, EffectAttribute}, EffectKind}, fit::{Fit, Key}},
+};
 use super::{fleet::form_fleet, super::fixture::Fixture};
 
 fn error(e: CallError) -> anyhow::Error {
@@ -10,6 +15,11 @@ fn error(e: CallError) -> anyhow::Error {
 
 async fn health(f: &Fixture, ship: i64) -> Result<[f64; 3]> {
     Ok(f.world.ball(f.system, ship).await.ok_or_else(|| anyhow!("target absent"))?.health)
+}
+
+async fn persisted_health(f: &Fixture, item: i64) -> Result<String> {
+    let attrs = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
+    Ok(f.db.query_one("SELECT COALESCE(string_agg(row_to_json(t)::text, ',' ORDER BY attribute_id), '') AS state FROM (SELECT * FROM game.item_attributes WHERE item_id=$1 AND attribute_id=ANY($2)) t", &[&item, &attrs.as_slice()]).await?.get("state"))
 }
 
 async fn state(f: &Fixture, target: i64, drone: Option<i64>) -> String {
@@ -35,7 +45,9 @@ async fn state(f: &Fixture, target: i64, drone: Option<i64>) -> String {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
 async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
     let mut f = Fixture::new().await;
-    let result: Result<()> = async {
+    let mut result: Result<()> = Ok(());
+    let panic = crate::tests::catch_scenario(async {
+        result = async {
         let (other, target) = f.add_pilot().await;
         form_fleet(&mut f, other, target).await?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -55,6 +67,14 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
         for attr in [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP] {
             ensure!((target_fit.value(Key::Ship, attr) - 1000.0).abs() < 1e-6, "unexpected fitted target HP");
         }
+        let (generation, revision, projection) = f.world.with(f.system, move |s| Some((s.combat_membership_generation(target)?, s.combat_fit_revision(target)?, s.projection_revision(target)))).await.flatten().ok_or_else(|| anyhow!("missing target fit cache"))?;
+        ensure!(f.world.with(f.system, move |s| s.replace_fitted_cache(target, generation, revision, target_fit, Key::Ship, Some(projection))).await == Some(true), "target fit publication failed");
+        // Resizing preserves absolute HP, so the fixture explicitly starts full.
+        let condition = f.world.with(f.system, move |s| {
+            s.set_condition_fraction(target, 1.0);
+            s.combat_condition_snapshot(target).map(|snapshot| snapshot.condition)
+        }).await.flatten().ok_or_else(|| anyhow!("missing target condition"))?;
+        ensure!(condition.now == condition.stats.max, "target condition is not full: current={:?}, max={:?}", condition.now, condition.stats.max);
         let source_fit = Fit::load_in_space(&f.db, &f.world, f.system, f.owner, f.ship).await.map_err(error)?;
         let scan = source_fit.value(Key::Ship, ATTR_SCAN_RESOLUTION);
         let bay_capacity = source_fit.value(Key::Ship, ATTR_DRONE_CAPACITY);
@@ -64,7 +84,23 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
         let signature = f.sde.types.attribute(target_ball.type_id, ATTR_SIGNATURE_RADIUS).unwrap_or(f64::from(target_ball.radius));
         let lock_ms = crate::space::lock_time_ms(scan, signature);
         ensure!(scan > 0.0 && lock_ms <= 1000, "unexpected fitted lock time: scan={scan}, signature={signature}, delay={lock_ms}ms");
-        groups_health::damage(&f.db, &f.world, f.system, target, [2500.0, 0.0, 0.0, 0.0], None, None).await.map_err(error)?;
+        let persisted = persisted_health(&f, target).await?;
+        let source = f.ship;
+        let owner = f.owner;
+        let system = f.system;
+        let weak = std::sync::Arc::downgrade(&f.world);
+        let generation = crate::space::targeting::next_generation();
+        let mut attempt = f.world.with(system, move |s| {
+            let facts = s.prepare_combat_source(source, None, None, None,
+                crate::lua::events::resources::FactOrigin::Natural, generation, 1, 1,
+                move |s| s.pilot_ball(owner).is_some_and(|ball| ball.id == source))?;
+            Ok::<_, crate::space::combat_facts::Refusal>(crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system))
+        }).await.ok_or_else(|| anyhow!("source actor unavailable"))?.map_err(|e| anyhow!("source admission: {e:?}"))?;
+        let outcome = damage::apply_damage_guarded(&f.db, &f.world, system, target, [2500.0, 0.0, 0.0, 0.0],
+            damage::DamageSource { facts: Some(attempt.facts()), ..Default::default() }, false, |_| true).await.map_err(error)?;
+        ensure!(outcome.is_some(), "damage was not applied");
+        attempt.disarm();
+        ensure!(persisted_health(&f, target).await? == persisted, "damage checkpointed before periodic save");
         ensure!(f.world.after(f.system, 100).await, "system stopped after damage");
         let initial = health(&f, target).await?;
         ensure!(initial[0].abs() < 1e-6 && initial[1].abs() < 1e-6 && (initial[2] - 0.5).abs() < 1e-6, "damage did not reach all layers: {initial:?}");
@@ -72,7 +108,7 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
         let kwargs = Value::None;
         let args = [Value::Int(target)];
         let lock = Call { service: "dogmaIM", method: "AddTarget", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
-        combat::dispatch(&mut f.client, &lock).await.ok_or_else(|| anyhow!("targeting service unavailable"))?.map_err(error)?;
+        crate::services::dogma::dispatch(&mut f.client, &lock).await.map_err(error)?;
         let locked = tokio::time::timeout(std::time::Duration::from_secs(20), async {
             while !combat::targeting_charges::targets_of(f.owner).contains(&target) {
                 ensure!(f.world.after(f.system, 100).await, "system stopped locking target");
@@ -115,6 +151,7 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
             let launched = f.call("ship", "LaunchDrones", &launch).await.map_err(error)?;
             ensure!(launched == Value::Dict(vec![(Value::Int(drone), Value::list([Value::Int(drone)]))]), "launch failed: {launched:?}");
             ensure!(f.world.ball(f.system, drone).await.is_some_and(|b| b.char_id.is_none() && b.owner_id == f.owner), "source is not a physical unpiloted drone");
+            let persisted = persisted_health(&f, target).await?;
             let before = health(&f, target).await?;
             let args = [Value::list([Value::Int(drone)]), Value::Int(target)];
             ensure!(f.call("entity", "CmdEngage", &args).await.map_err(error)? == Value::Dict(vec![]), "engage refused");
@@ -149,6 +186,7 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
             let expected = (before[layer] + amount / 1000.0).min(1.0);
             ensure!((after[layer] - expected).abs() < 1e-6, "wrong layer repair: {before:?} -> {after:?}, expected {expected}");
             for i in 0..3 { if i != layer { ensure!((after[i] - before[i]).abs() < 1e-6, "unrelated layer changed"); } }
+            if layer == 0 { ensure!(persisted_health(&f, target).await? == persisted, "repair checkpointed before periodic save"); }
             let mut hud = false;
             while let Ok((event, payload)) = rx.try_recv() {
                 if event != "OnModuleAttributeChanges" { continue; }
@@ -176,7 +214,9 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
             while rx.try_recv().is_ok() {}
         }
         Ok(())
-    }.await;
+        }.await;
+    }).await;
     f.cleanup().await;
+    if let Err(panic) = panic { std::panic::resume_unwind(panic); }
     result
 }

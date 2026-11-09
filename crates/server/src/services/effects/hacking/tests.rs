@@ -1,5 +1,5 @@
 use super::*;
-use crate::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST};
+use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST};
 use crate::dao::items::loading::Item;
 use crate::sde::types::TypeEffect;
 

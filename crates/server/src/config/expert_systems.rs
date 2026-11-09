@@ -13,5 +13,5 @@ pub struct ExpertSystemsConfig {
 }
 
 impl Default for ExpertSystemsConfig {
-    fn default() -> Self { Self { enabled: false } }
+    fn default() -> Self { Self { enabled: true } }
 }

@@ -3,9 +3,9 @@
 //! Sanctioned votes and actions are unsupported; results do not execute actions.
 
 use super::*;
-use crate::consts::FILETIME_DAY;
+use infinity_core::consts::FILETIME_DAY;
 use crate::dao::corporations::{shares, votes as dao};
-use crate::messages::corporations as text;
+use infinity_core::messages::corporations as text;
 use crate::scheduler::{self, Job};
 use crate::services::{crowset, has_role_or_is_ceo, market};
 
@@ -94,7 +94,7 @@ pub(super) async fn cast_inner<X: Send>(ex: &(impl Executor + ?Sized), outbox: &
     if case.closed_at.is_some() || case.ends <= now { return Err(notify_error(text::VOTE_CLOSED)); }
     if !dao::options(ex, id).await.map_err(db_err)?.iter().any(|row| row.option_id == option) { return Err(invalid()); }
     let holders = dao::eligible_holders(ex, id, actor).await.map_err(db_err)?;
-    if holders.is_empty() && ceo_of(ex, issuer).await? != Some(actor) { return Err(notify_error(text::VOTE_NOT_ELIGIBLE)); }
+    if holders.is_empty() && !permissions::is_active_ceo(ex, actor, issuer).await? { return Err(notify_error(text::VOTE_NOT_ELIGIBLE)); }
     if !dao::insert_ballot(ex, id, actor, option, now).await.map_err(db_err)? { return Err(invalid()); }
     for holder in holders {
         if !dao::claim_holder(ex, id, holder.holder_id, actor).await.map_err(db_err)? {

@@ -1,6 +1,7 @@
 //! Database-backed scanner and tractor cycles through the system actor.
 use super::fixture;
-use crate::{consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, CARGO_CONTAINER_GROUPS, dogma::EFFECT_CARGO_SCAN, dogma::EFFECT_SHIP_SCAN, dogma::EFFECT_SURVEY_SCAN, dogma::EFFECT_TRACTOR_BEAM, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_WRECK}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, groups_health, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, scan, tractor}, fit::Fit}, space::{World, MODE_FOLLOW, MODE_STOP}};
+use infinity_core::{consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, CARGO_CONTAINER_GROUPS, dogma::EFFECT_CARGO_SCAN, dogma::EFFECT_SHIP_SCAN, dogma::EFFECT_SURVEY_SCAN, dogma::EFFECT_TRACTOR_BEAM, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_WRECK}};
+use crate::{dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, groups_health, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, scan, tractor}, fit::Fit}, space::{World, MODE_FOLLOW, MODE_STOP}};
 use marshal::Value;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
 
@@ -16,8 +17,8 @@ fn cycle(cx: &Ctx, f: fixture::Fixture, module_type: i32, effect: registry::Effe
         state.activation_generation.insert(f.module, generation.clone());
     }
     Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], effect, target, repeat: 1,
-        stop: generation.clone(), owner: ActivationOwner { master: f.module, generation, armed: true }, started: 0, charge_type: None,
-        cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0 }
+        stop: generation.clone(), owner: ActivationOwner { master: f.module, generation, armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 }, started: 0, charge_type: None,
+        cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false }
 }
 
 async fn lock(cx: &Ctx, target: i64) {
@@ -33,7 +34,7 @@ async fn scanner(effect_id: i32) {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > 0.0) && t.attribute(crate::consts::dogma::ATTR_RECHARGE_RATE).is_some_and(|v| v > 10000.0)).expect("capacitor hull").type_id;
+    let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > 0.0) && t.attribute(infinity_core::consts::dogma::ATTR_RECHARGE_RATE).is_some_and(|v| v > 10000.0)).expect("capacitor hull").type_id;
     let module = module_type(&sde, effect_id);
     let effect = registry::resolve(&sde, effect_id).expect("scanner effect");
     let before = fixture::fingerprint(&db).await.unwrap();
@@ -106,7 +107,7 @@ async fn scanner(effect_id: i32) {
     }
     targeting_charges::clear_locks_on(&world, 1, f.ship, f.character);
     for id in [f.ship, foreign.ship] { world.remove_ball(1, id).await; combat::forget_ship(id); }
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     let flush = world.flush_positions().await;
     drop(world);
     let cleanup_foreign = fixture::cleanup(&db, foreign).await;
@@ -186,7 +187,7 @@ async fn tractor_owns_and_moves_container_then_restores_motion() {
     let target = target_id.load(Ordering::Relaxed);
     if target != 0 { world.remove_ball(1, target).await; combat::forget_ship(target); }
     world.remove_ball(1, f.ship).await; combat::forget_ship(f.ship);
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     let flush = world.flush_positions().await; drop(world);
     fixture::cleanup(&db, f).await.unwrap();
     assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);

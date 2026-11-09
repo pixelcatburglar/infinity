@@ -1,5 +1,8 @@
 use super::*;
 
+mod purchasing;
+mod acquisition;
+
 #[test]
 fn service_prices_use_only_positive_retail_prices() {
     assert_eq!(service_price(None, 100.0, 50), 50);
@@ -30,7 +33,7 @@ async fn unavailable_crates_are_not_listed_or_purchasable() {
     let actor = fixture::create(&db).await.unwrap();
     let (mut client, _peer) = crate::services::tests::client(db.clone(), actor.character).await;
     client.login.user_id = actor.account;
-    crate::dao::accounts::balances::set_plex(&db, actor.account, "1000000").await.unwrap();
+    purchasing::set_balance(&db, actor, 1_000_000).await;
     let type_id = client.sde.crates.iter().find(|d| !d.sale_supported()).expect("catalogue requires an unavailable crate").type_id;
     let balance = crate::dao::accounts::balances::plex_balance(&db, actor.account).await.unwrap();
     let tokens = crate::dao::store::purchases::tokens(&db, actor.account).await.unwrap();
@@ -102,5 +105,38 @@ async fn unavailable_crates_are_not_listed_or_purchasable() {
     }
     let token_ids: Vec<_> = crate::dao::store::purchases::tokens(&db, actor.account).await.unwrap().iter().map(|t| t.token_id).collect();
     crate::dao::store::purchases::trash(&db, actor.account, &token_ids).await.unwrap();
+    crate::dao::accounts::plex::tests::cleanup(&db, actor.account).await;
+    fixture::cleanup(&db, actor).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn external_period_marking_is_refused_without_side_effects() {
+    use crate::services::tests::fixture;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let actor = fixture::create(&db).await.unwrap();
+    let (mut client, _peer) = crate::services::tests::client(db.clone(), actor.character).await;
+    client.login.user_id = actor.account;
+    purchasing::set_balance(&db, actor, 1_000_000).await;
+    let balance = crate::dao::accounts::balances::plex_balance(&db, actor.account).await.unwrap();
+    let purchases = fixture::store_purchase_count(&db, actor.account, DAILY_GIFT_OFFER as i32).await.unwrap();
+    let token_ids: Vec<_> = crate::dao::store::purchases::tokens(&db, actor.account).await.unwrap().iter().map(|t| t.token_id).collect();
+    assert!(client.outbox.is_empty());
+    let args = [Value::Int(DAILY_GIFT_OFFER), Value::str("2026-01-01T00:00:00Z")];
+    let kwargs = Value::Dict(vec![]);
+    let call = Call { service: "storeManager", method: "set_offer_purchased", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+    match crate::services::dispatch(&mut client, &call).await {
+        Err(CallError::User { msg, dict }) => {
+            assert_eq!(msg, messages::MSG_CUSTOM_NOTIFY);
+            assert_eq!(dict, vec![("notify".into(), Value::unicode(messages::store::EXTERNAL_PAYMENT_UNSUPPORTED))]);
+        }
+        other => panic!("expected external period marking refusal: {other:?}"),
+    }
+    assert_eq!(crate::dao::accounts::balances::plex_balance(&db, actor.account).await.unwrap(), balance);
+    assert_eq!(fixture::store_purchase_count(&db, actor.account, DAILY_GIFT_OFFER as i32).await.unwrap(), purchases);
+    assert_eq!(crate::dao::store::purchases::tokens(&db, actor.account).await.unwrap().iter().map(|t| t.token_id).collect::<Vec<_>>(), token_ids);
+    assert!(client.outbox.is_empty());
+    crate::dao::accounts::plex::tests::cleanup(&db, actor.account).await;
     fixture::cleanup(&db, actor).await.unwrap();
 }

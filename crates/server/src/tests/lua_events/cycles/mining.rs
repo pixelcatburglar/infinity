@@ -3,7 +3,8 @@
 //! it does not replace the server's extraction or observer paths.
 
 use std::{sync::{Arc, Mutex}, time::Duration};
-use crate::{consts::{dogma::{ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}, FLAG_CARGO}, dao::items::loading::ItemQuery, services::{fit::{Fit, Key}, mining}};
+use infinity_core::{consts::{dogma::{ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}, FLAG_CARGO}};
+use crate::{dao::items::loading::ItemQuery, services::{fit::{Fit, Key}, mining}};
 
 #[derive(Default)]
 struct Keys {
@@ -65,7 +66,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
             Some(center)
         }).await.flatten().unwrap();
         saved.lock().unwrap().field = Some(ship);
-        let rocks = mining::grow_field(&r.db, &r.world, system, ship, center, mining::Field::Ore, 1.0, false).await.unwrap();
+        let rocks = mining::grow_field(&r.db, &r.world, system, ship, center, crate::space::asteroids::Field::Ore, 1.0, false).await.unwrap();
         let (rock, ship_radius) = r.world.with(system, move |s| {
             let rock = rocks.into_iter().map(|id| { let b = s.ball(id).unwrap(); (b.id, b.pos, b.radius, b.type_id) })
                 .max_by(|a, b| (a.1[0] + f64::from(a.2)).total_cmp(&(b.1[0] + f64::from(b.2))))?;
@@ -96,14 +97,14 @@ pub(super) async fn run(ctx: &super::super::Context) {
         let before: i64 = r.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1", &[&rock.0]).await.unwrap().get("quantity");
         let cargo_before: i64 = r.db.query_one("SELECT COALESCE(sum(quantity),0)::bigint AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3 AND flag_id=$4", &[&id, &ship, &rock.3, &FLAG_CARGO]).await.unwrap().get("n");
         let ledger_before = crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap().len();
-        let stacks_before: Vec<(i64, i32)> = r.db.query("SELECT item_id, quantity FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 ORDER BY item_id", &[&id, &ship, &FLAG_CARGO]).await.unwrap().iter().map(|row| (row.get("item_id"), row.get("quantity"))).collect();
+        let stacks_before: Vec<(i64, i64)> = r.db.query("SELECT item_id, quantity FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 ORDER BY item_id", &[&id, &ship, &FLAG_CARGO]).await.unwrap().iter().map(|row| (row.get("item_id"), row.get("quantity"))).collect();
         let ledger_rows_before = crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap();
         lua.load("pilots.activate(mining_accept_id,mining_accept_module,mining_accept_rock,nil)").exec_async().await.unwrap();
         super::idle(&r.world, system, module, duration + 15_000).await;
         assert_eq!(r.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1", &[&rock.0]).await.unwrap().get::<_, i64>("quantity"), before);
         assert_eq!(r.db.query_one("SELECT COALESCE(sum(quantity),0)::bigint AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3 AND flag_id=$4", &[&id, &ship, &rock.3, &FLAG_CARGO]).await.unwrap().get::<_, i64>("n"), cargo_before);
         assert_eq!(crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap().len(), ledger_before);
-        let stacks_after: Vec<(i64, i32)> = r.db.query("SELECT item_id, quantity FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 ORDER BY item_id", &[&id, &ship, &FLAG_CARGO]).await.unwrap().iter().map(|row| (row.get("item_id"), row.get("quantity"))).collect();
+        let stacks_after: Vec<(i64, i64)> = r.db.query("SELECT item_id, quantity FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 ORDER BY item_id", &[&id, &ship, &FLAG_CARGO]).await.unwrap().iter().map(|row| (row.get("item_id"), row.get("quantity"))).collect();
         assert_eq!(stacks_after, stacks_before);
         assert_eq!(crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap(), ledger_rows_before);
         r.db.execute(&format!("DROP TRIGGER {trigger} ON game.character_mining_ledger"), &[]).await.unwrap();
@@ -152,14 +153,13 @@ pub(super) async fn run(ctx: &super::super::Context) {
         ctx.lua.globals().set("mining_accept_cleanup", id).unwrap();
         let _ = ctx.lua.load("pilots.offline(mining_accept_cleanup)").exec_async().await;
         if let Some(field) = field {
-            match ctx.resources.db.query("SELECT asteroid_id FROM game.asteroids WHERE field_id=$1", &[&field]).await {
+            match ctx.resources.db.query("SELECT asteroid_id, system_id FROM game.asteroids WHERE field_id=$1", &[&field]).await {
                 Ok(rows) => for row in rows {
-                    let rock: i64 = row.get("asteroid_id");
-                    if let Err(e) = mining::reconcile_depleted(&ctx.resources.db, &ctx.resources.world, rock).await { cleanup_errors.push(format!("{e:?}")); }
-                    if let Err(e) = ctx.resources.db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND field_id=$2", &[&rock, &field]).await { cleanup_errors.push(e.to_string()); }
+                    if let Err(e) = super::remove_fixture_rock(&ctx.resources.db, &ctx.resources.world, row.get("system_id"), field, row.get("asteroid_id")).await { cleanup_errors.push(format!("{e:?}")); }
                 },
                 Err(e) => cleanup_errors.push(e.to_string()),
             }
+            if let Err(e) = ctx.resources.db.execute("DELETE FROM game.asteroid_fields WHERE field_id=$1", &[&field]).await { cleanup_errors.push(e.to_string()); }
         }
         for sql in ["DELETE FROM game.character_mining_ledger WHERE character_id=$1", "DELETE FROM game.skills WHERE character_id=$1", "DELETE FROM game.items WHERE owner_id=$1", "DELETE FROM game.characters WHERE character_id=$1"] {
             if let Err(e) = ctx.resources.db.execute(sql, &[&id]).await { cleanup_errors.push(e.to_string()); }

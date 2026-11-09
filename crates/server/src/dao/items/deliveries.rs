@@ -4,7 +4,7 @@
 //! access or include structure delivery locations.
 
 use crate::db::{executor::Executor, Error};
-use crate::consts::FLAG_CORP_DELIVERIES;
+use infinity_core::consts::FLAG_CORP_DELIVERIES;
 
 pub(crate) struct DeliveryLocation {
     pub location_id: i64,
@@ -29,15 +29,48 @@ pub(crate) struct Ancestor {
     pub owner_id: i64,
     pub location_id: i64,
     pub flag_id: i32,
+    pub quantity: i64,
     pub singleton: bool,
 }
 
 impl Ancestor {
     fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { item_id: row.get("item_id"), type_id: row.get("type_id"), owner_id: row.get("owner_id"), location_id: row.get("location_id"), flag_id: row.get("flag_id"), singleton: row.get("singleton") }
+        Self { item_id: row.get("item_id"), type_id: row.get("type_id"), owner_id: row.get("owner_id"), location_id: row.get("location_id"), flag_id: row.get("flag_id"), quantity: row.get("quantity"), singleton: row.get("singleton") }
     }
 }
 
-pub(crate) async fn ancestry(ex: &(impl Executor + ?Sized), id: i64) -> Result<Vec<Ancestor>, Error> {
-    Ok(ex.query("WITH RECURSIVE ancestors AS (SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM game.items WHERE item_id = $1 AND jump_clone_id IS NULL UNION SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.singleton FROM game.items i JOIN ancestors a ON i.item_id = a.location_id WHERE i.jump_clone_id IS NULL) SELECT item_id, type_id, owner_id, location_id, flag_id, singleton FROM ancestors ORDER BY item_id", &[&id]).await?.iter().map(Ancestor::from_row).collect())
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OfficeMetadata {
+    pub corporation_id: i64,
+    pub station_id: i64,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LineageRow {
+    pub origin: i64,
+    pub ancestor: Ancestor,
+    pub office: Option<OfficeMetadata>,
+}
+
+impl LineageRow {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self {
+            origin: row.get("origin"),
+            ancestor: Ancestor::from_row(row),
+            office: row.get::<_, Option<i64>>("office_corporation_id").map(|corporation_id| OfficeMetadata {
+                corporation_id,
+                station_id: row.get("office_station_id"),
+            }),
+        }
+    }
+}
+
+pub(crate) async fn ancestry_many(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<LineageRow>, Error> {
+    Ok(ex.query("WITH RECURSIVE ancestors AS (SELECT seed.origin, i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton FROM unnest($1::bigint[]) AS seed(origin) JOIN game.items i ON i.item_id = seed.origin WHERE i.jump_clone_id IS NULL UNION SELECT a.origin, i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton FROM game.items i JOIN ancestors a ON i.item_id = a.location_id WHERE i.jump_clone_id IS NULL) SELECT a.origin, a.item_id, a.type_id, a.owner_id, a.location_id, a.flag_id, a.quantity, a.singleton, o.corporation_id AS office_corporation_id, o.station_id AS office_station_id FROM ancestors a LEFT JOIN game.offices o ON o.office_id = a.item_id ORDER BY a.origin, a.item_id", &[&ids]).await?.iter().map(LineageRow::from_row).collect())
+}
+
+pub(crate) async fn ancestry(ex: &(impl Executor + ?Sized), id: i64) -> Result<Vec<Ancestor>, Error> {
+    Ok(ancestry_many(ex, &[id]).await?.into_iter().map(|row| row.ancestor).collect())
+}
+
+#[cfg(test)] mod tests;

@@ -5,9 +5,11 @@
 //! the special skill relationship is derived by Fit, not emitted. Structure effects
 //! and implant/booster injection or expiry are not supported. Versions are in-memory;
 //! training-completion updates follow scheduled and mutation-time completions.
+//! In-space brain changes replace the actor's cached fit behind membership and fitting revisions.
 
 use super::super::{fit::{Fit, Key, OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_PERCENT_UNNERFED, OP_POST_ASSIGN, PERCENT_SCALE}, keyval, CallError};
-use crate::{client::Client, consts::dogma::ATTR_SKILL_LEVEL};
+use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
+use crate::client::Client;
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -110,27 +112,58 @@ pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, V
     (Value::List(char_effects), Value::List(ship_effects), Value::list([]))
 }
 
-async fn effects(c: &Client) -> Result<(i64, Value, Value, Value), CallError> {
+async fn effects(c: &Client, publish: bool) -> Result<(i64, Value, Value, Value), CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let fit = if let Some(system) = c.session.int("solarsystemid") {
+    let system = c.session.int("solarsystemid");
+    let token = if publish {
+        if let Some(system) = system {
+            c.world.with(system, move |s| {
+                Some((s.combat_membership_generation(ship_id)?, s.combat_fit_revision(ship_id)?))
+            }).await.flatten()
+        } else { None }
+    } else { None };
+    let fit = if let Some(system) = system {
         Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
     } else {
         Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
     };
     let (character, ship, structure) = compile(&fit, char_id, ship_id);
+    if let (Some(system), Some((generation, fit_revision)), Some(revision)) = (system, token, fit.projection_revision()) {
+        c.world.post(system, move |s| {
+            if !s.replace_fitted_cache(ship_id, generation, fit_revision, fit, Key::Ship, Some(revision))
+                && s.combat_membership_generation(ship_id) == Some(generation) && s.combat_phase(ship_id) == Some(crate::space::combat::CombatPhase::Live) {
+                s.refresh_projection_target(ship_id);
+            }
+            if s.combat_membership_generation(ship_id) == Some(generation) {
+                let drones: Vec<_> = s.drones().filter(|drone| drone.owner == char_id).map(|drone| drone.id).collect();
+                for drone in drones { s.refresh_projection_target(drone); }
+            }
+        });
+    }
     Ok((char_id, character, ship, structure))
 }
 
 pub(crate) async fn bootstrap(c: &Client) -> Result<Value, CallError> {
-    let (char_id, character, ship, structure) = effects(c).await?;
+    let (char_id, character, ship, structure) = effects(c, false).await?;
     let version = *versions().lock().unwrap().entry(char_id).or_insert(0);
     Ok(Value::tuple([Value::Int(version), character, ship, structure]))
 }
 
 /// Call after a committed skill change; sends one brainData tuple to the client.
 pub(crate) async fn update(c: &mut Client) -> Result<(), CallError> {
-    let (char_id, character, ship, structure) = effects(c).await?;
+    let (char_id, character, ship, structure) = effects(c, true).await?;
+    notify_update(c, char_id, character, ship, structure);
+    Ok(())
+}
+
+/// Publish the brain from a fitting already evaluated by the caller.
+pub(crate) fn update_from_fit(c: &mut Client, fit: &Fit, char_id: i64, ship_id: i64) {
+    let (character, ship, structure) = compile(fit, char_id, ship_id);
+    notify_update(c, char_id, character, ship, structure);
+}
+
+fn notify_update(c: &mut Client, char_id: i64, character: Value, ship: Value, structure: Value) {
     let version = {
         let mut versions = versions().lock().unwrap();
         let version = versions.entry(char_id).or_insert(0);
@@ -139,7 +172,6 @@ pub(crate) async fn update(c: &mut Client) -> Result<(), CallError> {
     };
     let bytes = marshal::dumps(&Value::tuple([character, ship, structure]));
     c.notify("OnServerBrainUpdated", vec![Value::tuple([Value::Int(version), Value::Bytes(bytes)])]);
-    Ok(())
 }
 
 #[cfg(test)] mod tests;

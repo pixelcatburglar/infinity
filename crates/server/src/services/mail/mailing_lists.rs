@@ -7,7 +7,8 @@
 //! Unicode implementation; normalization is performed only by the DAO.
 
 use super::{delivery::{self, Delivery}, ACCESS_ALLOWED, ACCESS_BLOCKED, MAX_LIST_NAME, MAX_MEMBER_BATCH, MAX_MEMBERS, ROLE_MEMBER, ROLE_MUTED, ROLE_OPERATOR};
-use crate::{client::{Client, filetime_now}, consts::FILETIME_MINUTE, dao::{self, mailing_lists as lists}, db::{self, executor::Executor, outbox::{dispatch_world, Outbox}}, messages::mail as msg, services::{db_err, notify_error, CallError}};
+use infinity_core::{consts::FILETIME_MINUTE, messages::mail as msg};
+use crate::{client::{Client, filetime_now}, dao::{self, mailing_lists as lists}, db::{self, executor::Executor, outbox::{dispatch_world, Outbox}}, services::{db_err, notify_error, CallError}};
 use marshal::Value;
 use std::sync::Arc;
 

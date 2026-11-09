@@ -24,7 +24,7 @@ async fn authorization_cutoff_and_corporate_reclaim() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let corp = f::setup(&db, station_id, station_type).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -36,11 +36,11 @@ async fn authorization_cutoff_and_corporate_reclaim() {
         let root = transfers::insert(&db, kind, corp.id, corp.office, f::SAG, 1).await.unwrap();
         let id = f::id(create(&client, &f::payload(TYPE_ITEM_EXCHANGE, station_id, 0, f::SAG, root, 0.0, 0.0, 0.0)).await);
         while rx.try_recv().is_ok() {}
-        for role in [0, 9007199254740992, 262144, 4096, crate::consts::GM_ROLES & !crate::consts::ROLE_GML, crate::consts::ROLE_DIRECTOR] {
+        for role in [0, 9007199254740992, 262144, 4096, infinity_core::consts::GM_ROLES & !infinity_core::consts::ROLE_GML, infinity_core::consts::ROLE_DIRECTOR] {
             client.login.role = role;
             assert!(rpc(&mut client, &[Value::Int(id)]).await.is_err());
         }
-        client.login.role = crate::consts::ROLE_GML;
+        client.login.role = infinity_core::consts::ROLE_GML;
         for args in [vec![], vec![Value::Bool(true)], vec![Value::str("1")], vec![Value::None], vec![Value::Int(0)], vec![Value::Int(-1)], vec![Value::Float(1.0)], vec![Value::Int(id), Value::Int(id)]] {
             assert!(rpc(&mut client, &args).await.is_err());
         }
@@ -75,7 +75,7 @@ async fn authorization_cutoff_and_corporate_reclaim() {
             let after: String = db.query_one("SELECT row_to_json(k)::text AS state FROM game.contracts k WHERE contract_id=$1", &[&id]).await.unwrap().get("state");
             assert_eq!(after, before);
         }
-        client.world.unregister_pilot(corp.actor.character);
+        client.world.unregister_pilot_generation(corp.actor.character, None);
     }).await;
     f::cleanup(&db, corp).await;
     result.unwrap();
@@ -89,7 +89,7 @@ async fn bid_auction_settles_once_and_scheduler_does_not_pay_again() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, station_id, station_type).await;
     let bidder = f::setup(&db, station_id, station_type).await;
     let test_db = db.clone();
@@ -99,7 +99,7 @@ async fn bid_auction_settles_once_and_scheduler_does_not_pay_again() {
         let (mut buyer, _peer2) = crate::services::tests::client(db.clone(), bidder.actor.character).await;
         f::session(&mut seller, issuer, station_id, system, ACCOUNT_CASH + 1);
         f::session(&mut buyer, bidder, station_id, system, ACCOUNT_CASH + 2);
-        seller.login.role = crate::consts::ROLE_GML;
+        seller.login.role = infinity_core::consts::ROLE_GML;
         let root = transfers::insert(&db, kind, issuer.id, station_id, f::DELIVERIES, 1).await.unwrap();
         let id = f::id(create(&seller, &f::payload(TYPE_AUCTION, station_id, 0, f::DELIVERIES, root, 10.0, 0.0, 0.0)).await);
         assert!(place_bid(&buyer, id, 10.0, true).await.is_ok());
@@ -149,8 +149,8 @@ async fn bid_auction_settles_once_and_scheduler_does_not_pay_again() {
         assert_eq!(db.query_one("SELECT balance::float8 AS balance FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$2", &[&issuer.id, &(ACCOUNT_CASH + 1)]).await.unwrap().get::<_, f64>("balance"), balance);
         assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|(event, _)| event == "OnContractCompleted").count(), 0);
         assert_eq!(std::iter::from_fn(|| winner_rx.try_recv().ok()).filter(|(event, _)| event == "OnContractCompleted").count(), 0);
-        seller.world.unregister_pilot(issuer.actor.character);
-        seller.world.unregister_pilot(bidder.actor.character);
+        seller.world.unregister_pilot_generation(issuer.actor.character, None);
+        seller.world.unregister_pilot_generation(bidder.actor.character, None);
     }).await;
     f::cleanup(&db, issuer).await;
     f::cleanup(&db, bidder).await;
@@ -165,7 +165,7 @@ async fn courier_and_unbid_auction_cutoff_and_concurrent_actions() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, station_id, station_type).await;
     let bidder = f::setup(&db, station_id, station_type).await;
     let test_db = db.clone();
@@ -175,7 +175,7 @@ async fn courier_and_unbid_auction_cutoff_and_concurrent_actions() {
         let (mut buyer, _peer2) = crate::services::tests::client(db.clone(), bidder.actor.character).await;
         f::session(&mut seller, issuer, station_id, system, ACCOUNT_CASH + 1);
         f::session(&mut buyer, bidder, station_id, system, ACCOUNT_CASH + 1);
-        seller.login.role = crate::consts::ROLE_GML;
+        seller.login.role = infinity_core::consts::ROLE_GML;
         let (issuer_tx, mut issuer_rx) = tokio::sync::mpsc::unbounded_channel();
         let (bidder_tx, mut bidder_rx) = tokio::sync::mpsc::unbounded_channel();
         seller.world.register_pilot(issuer.actor.character, issuer_tx);
@@ -295,8 +295,8 @@ async fn courier_and_unbid_auction_cutoff_and_concurrent_actions() {
         assert_eq!(wallet(&db, bidder.id, ACCOUNT_CASH + 1).await, buyer_before);
         assert_eq!(std::iter::from_fn(|| issuer_rx.try_recv().ok()).filter(|(event, _)| event == "OnContractCompleted").count(), 1);
         assert_eq!(std::iter::from_fn(|| bidder_rx.try_recv().ok()).filter(|(event, _)| event == "OnContractCompleted").count(), 1);
-        seller.world.unregister_pilot(issuer.actor.character);
-        seller.world.unregister_pilot(bidder.actor.character);
+        seller.world.unregister_pilot_generation(issuer.actor.character, None);
+        seller.world.unregister_pilot_generation(bidder.actor.character, None);
     }).await;
     f::cleanup(&db, issuer).await;
     f::cleanup(&db, bidder).await;

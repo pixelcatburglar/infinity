@@ -5,6 +5,7 @@
 //! are evaluated from Fit and SDE data.
 //! Runtime heat and priming are discarded on ship departure and restart.
 //! Module damage, burnout, RPC validation and repair are handled elsewhere.
+//! Effective overload transitions also update the actor's cached fitted defenses.
 
 pub(crate) mod rack;
 pub(crate) mod damage;
@@ -16,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, atomic::AtomicBool};
 use tokio::sync::oneshot;
 use crate::client::{filetime_from_unix_ms, filetime_now};
-use crate::consts::{dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, FLAG_FITTING_FIRST, FLAG_MED_SLOT_FIRST, FLAG_HI_SLOT_FIRST, FLAG_FITTING_LAST};
+use infinity_core::consts::{dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, FLAG_FITTING_FIRST, FLAG_MED_SLOT_FIRST, FLAG_HI_SLOT_FIRST, FLAG_FITTING_LAST};
 use crate::services::combat::{self, Ctx};
 use crate::services::combat::targeting_charges::bank;
 use crate::services::effects::lifecycle::{cycle_valid, Cycle, Module};
@@ -291,7 +292,10 @@ pub(super) async fn request(cx: &Ctx, modules: Vec<(Module, i32)>, start: bool) 
             }
             st.modules.retain(|_, entry| entry.effective || entry.desired);
         }
-        for (id, effect_id, enabled) in changes { effect(&cx2, id, effect_id, enabled); }
+        for (id, effect_id, enabled) in changes {
+            s.fitted_module_overloaded(cx2.ship_id, id, enabled);
+            effect(&cx2, id, effect_id, enabled);
+        }
         Ok(())
     }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system unavailable during overload request")))?
 }
@@ -318,7 +322,10 @@ pub(super) fn begin_cycle(s: &mut System, cycle: &Cycle) {
             }
         }
     }
-    for (id, effect_id) in changes { effect(&cycle.cx, id, effect_id, true); }
+    for (id, effect_id) in changes {
+        s.fitted_module_overloaded(cycle.cx.ship_id, id, true);
+        effect(&cycle.cx, id, effect_id, true);
+    }
     if starts.is_empty() { return; }
     let ship = cycle.cx.ship_id;
     let state = s.heat.ships.entry(ship).or_insert_with(|| Ship { owner: cycle.cx.char_id, racks: std::array::from_fn(|_| Rack::default()) });
@@ -479,7 +486,10 @@ pub(super) fn complete_cycle(s: &mut System, cycle: &Cycle, final_cycle: bool) {
         }
     }
     if !remove.is_empty() { disconnect(s, ship, owner, &remove, Some(&cycle.stop)); }
-    for (id, effect_id) in stopped { effect(&cycle.cx, id, effect_id, false); }
+    for (id, effect_id) in stopped {
+        s.fitted_module_overloaded(ship, id, false);
+        effect(&cycle.cx, id, effect_id, false);
+    }
 }
 
 /// Retire sources and reconcile pending requests when activation exits early.
@@ -497,19 +507,49 @@ pub(super) fn stop_cycle(s: &mut System, cycle: &Cycle) {
         }
         st.modules.retain(|_, entry| entry.effective || entry.desired);
     }
-    for (id, effect_id, start) in changes { effect(&cycle.cx, id, effect_id, start); }
+    for (id, effect_id, start) in changes {
+        s.fitted_module_overloaded(cycle.cx.ship_id, id, start);
+        effect(&cycle.cx, id, effect_id, start);
+    }
+}
+
+/// Detached overload entries awaiting the fenced fitting publication.
+pub(crate) struct FittingHeatCleanup { entries: Vec<(i64, i64, Entry)> }
+
+fn detach_modules(ship: i64, modules: &[i64]) -> Vec<(i64, Entry)> {
+    let mut st = state();
+    modules.iter().filter_map(|id| {
+        if st.modules.get(id).is_some_and(|entry| entry.ship == ship) {
+            st.modules.remove(id).map(|entry| (*id, entry))
+        } else { None }
+    }).collect()
+}
+
+/// Detach committed membership, leaving same-system actor cleanup to publication.
+pub(crate) fn detach_for_fitting(ship: i64, system: i64, modules: &[i64]) -> FittingHeatCleanup {
+    let entries = detach_modules(ship, modules);
+    let mut cleanup = FittingHeatCleanup { entries: Vec::new() };
+    for (id, entry) in entries {
+        if entry.cx.system_id == system {
+            cleanup.entries.push((ship, id, entry));
+        } else {
+            let world = entry.cx.world.clone();
+            world.post(entry.cx.system_id, move |s| clear_committed(s, ship, id, entry));
+        }
+    }
+    cleanup
+}
+
+/// Consume detached entries after the actor's membership fence and old-value snapshot.
+pub(crate) fn apply_fitting_cleanup(s: &mut System, cleanup: FittingHeatCleanup) {
+    for (ship, id, entry) in cleanup.entries {
+        clear_committed_inner(s, ship, id, entry, true);
+    }
 }
 
 /// Invalidate overload synchronously after commit, then remove matching actor sources.
 pub(crate) fn clear_modules(ship: i64, modules: &[i64]) {
-    let entries: Vec<_> = {
-        let mut st = state();
-        modules.iter().filter_map(|id| {
-            if st.modules.get(id).is_some_and(|entry| entry.ship == ship) {
-                st.modules.remove(id).map(|entry| (*id, entry))
-            } else { None }
-        }).collect()
-    };
+    let entries = detach_modules(ship, modules);
     for (id, entry) in entries {
         let world = entry.cx.world.clone();
         world.post(entry.cx.system_id, move |s| clear_committed(s, ship, id, entry));
@@ -517,10 +557,21 @@ pub(crate) fn clear_modules(ship: i64, modules: &[i64]) {
 }
 
 fn clear_committed(s: &mut System, ship: i64, id: i64, entry: Entry) {
+    clear_committed_inner(s, ship, id, entry, false);
+}
+
+fn clear_committed_inner(s: &mut System, ship: i64, id: i64, entry: Entry, fitting: bool) {
     if let Some(generation) = &entry.source_generation {
         disconnect(s, ship, entry.owner, &[id], Some(generation));
     }
     if entry.effective {
+        if !state().modules.get(&id).is_some_and(|current| current.ship == ship && current.effective) {
+            if fitting {
+                s.clear_fitting_overload(ship, id);
+            } else {
+                s.fitted_module_overloaded(ship, id, false);
+            }
+        }
         let (name, args) = notify::overload_effect(entry.owner, ship, id, entry.effect, false);
         s.notify_pilot(entry.owner, name, args);
     }

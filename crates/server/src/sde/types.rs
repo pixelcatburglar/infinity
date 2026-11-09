@@ -3,7 +3,8 @@
 //! `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`.
 //! Presentation fields and other inventory tables are outside this dataset.
 use std::collections::{HashMap, HashSet};
-use crate::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, dogma::EFFECT_SKILL}, dao::sde::types as dao, db::Db};
+use infinity_core::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, dogma::EFFECT_SKILL}};
+use crate::{dao::sde::types as dao, db::Db};
 
 pub(crate) struct TypeData {
     pub(crate) type_id: i32,
@@ -47,6 +48,7 @@ impl TypeData {
 }
 #[derive(Default)]
 struct Children { attributes: Vec<(i32, f64)>, effects: Vec<TypeEffect>, materials: Vec<TypeMaterial> }
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Types {
     types: Vec<TypeData>, by_id: HashMap<i32, usize>, groups: HashMap<i32, Group>,
     categories: HashMap<i32, Category>,
@@ -97,3 +99,6 @@ impl Types {
     pub(crate) fn effects(&self, id: i32) -> &[TypeEffect] { self.get(id).map(|t| t.effects()).or_else(|| self.orphans.get(&id).map(|c| c.effects.as_slice())).unwrap_or(&[]) }
     pub(crate) fn materials(&self, id: i32) -> &[TypeMaterial] { self.get(id).map(|t| t.materials()).or_else(|| self.orphans.get(&id).map(|c| c.materials.as_slice())).unwrap_or(&[]) }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

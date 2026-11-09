@@ -86,7 +86,7 @@ fn ball(id: i64, type_id: i32) -> crate::space::Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: false, interactive: false,
-        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
@@ -98,7 +98,7 @@ async fn scheduled_removal_refuses_persistent_ships_at_schedule_and_execution_bu
     let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).expect("SDE ship").type_id;
-    let drone_type = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_DRONE)).expect("SDE drone").type_id;
+    let drone_type = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_DRONE)).expect("SDE drone").type_id;
     let world = World::new(db.clone(), sde.clone(), 1);
     let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
     let pilots = crate::lua::host::pilots::Pilots::new(&db, hub).await.unwrap();

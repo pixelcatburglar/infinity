@@ -8,7 +8,7 @@ use super::*;
 // tuple of those strings. probescanning/scanHandler.py:InjectResults consumes
 // result objects with id, certainty, data/pos tuples and optional metadata.
 async fn qa_scan_sites(c: &Client, call: &Call<'_>) -> CallResult {
-    if c.login.role & crate::consts::ROLE_QA == 0 {
+    if c.login.role & infinity_core::consts::ROLE_QA == 0 {
         return Err(notify_error(messages::exploration::QA_REQUIRED));
     }
     let char_id = c.session.int("charid").filter(|id| *id > 0)
@@ -40,8 +40,8 @@ async fn qa_scan_sites(c: &Client, call: &Call<'_>) -> CallResult {
             && !site.wormhole.as_ref().is_some_and(|w| now - w.born > filetime_ticks_from_seconds(minutes_to_seconds(w.life_minutes) as i64)))
         .cloned().collect();
     sites.sort_by_key(|site| site.id);
-    let ids: Vec<i64> = sites.iter().filter(|site| site.kind == Kind::Signature).map(|site| site.id).collect();
-    complete_scans(&c.db, char_id, &ids).await?;
+    let signatures: Vec<ResolvedSignature> = sites.iter().filter(|site| site.kind == Kind::Signature).map(ResolvedSignature::from).collect();
+    complete_scans(&c.db, char_id, &signatures, &fact_context(c, FactOrigin::Qa)).await?;
     state().reported.entry((char_id, system)).or_default().extend(sites.iter().map(|site| site.target.clone()));
     Ok(Value::list(sites.iter().map(|site| result_value(site, 1.0, 0.0))))
 }
@@ -52,8 +52,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("scanMgr", "QAScanSites") => Some(qa_scan_sites(c, call).await),
         ("scanMgr", "SignalTrackerRegister") => {
             let system = c.session.int("solarsystemid")?;
-            if let Err(e) = crate::services::mining::ensure_fields(&c.db, &c.world, system).await {
-                return Some(Err(e));
+            if let Err(e) = c.world.system(system).await {
+                return Some(Err(CallError::Internal(e)));
             }
             if let Err(e) = expire_wormholes(&c.db, &c.world).await {
                 return Some(Err(e));

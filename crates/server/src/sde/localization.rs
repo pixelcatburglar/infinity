@@ -1,6 +1,6 @@
-//! Immutable English and Chinese text used by dungeon and store data.
+//! Immutable English and Chinese text used by dungeon, store and goal metadata.
 //! This server-startup dataset has no direct client mirror.
-//! Sources: native localization, dungeons, types and market groups. Other languages and unreferenced text are unsupported.
+//! Sources: native localization, dungeons, types, market groups and contribution methods. Other languages and unreferenced text are unsupported.
 
 use crate::{dao, db::Db};
 
@@ -9,6 +9,7 @@ pub(crate) struct LocalizedText {
     pub text: Option<String>,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Localization {
     english: Vec<LocalizedText>,
     chinese: Vec<LocalizedText>,

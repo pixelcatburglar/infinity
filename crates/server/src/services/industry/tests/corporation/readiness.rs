@@ -19,10 +19,10 @@ pub(super) async fn science_readiness(db: &Db, client: &mut Client, f: Fixture, 
             db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0) ON CONFLICT (character_id,type_id) DO UPDATE SET level=GREATEST(game.skills.level,EXCLUDED.level)", &[&f.actor, &skill, &level]).await.unwrap();
         }
         for &(material, quantity) in &act.materials {
-            item(db, material, f.actor, f.station, FLAG_HANGAR, i32::try_from(quantity.max(1)).unwrap() + 10, false).await;
+            item(db, material, f.actor, f.station, FLAG_HANGAR, quantity.max(1) + 10, false).await;
         }
         let copy = activity == INVENTION;
-        let blueprint = item(db, kind, f.actor, f.station, FLAG_HANGAR, if copy { i32::try_from(BLUEPRINT_COPY_QUANTITY).unwrap() } else { 1 }, true).await;
+        let blueprint = item(db, kind, f.actor, f.station, FLAG_HANGAR, if copy { BLUEPRINT_COPY_QUANTITY } else { 1 }, true).await;
         if copy { industry_dao::set_blueprint(db, blueprint, 0, 0, 1).await.unwrap(); }
         let product = if copy { act.products[0].0 } else { kind };
         let id = mechanics::install(client, &request(f, blueprint, activity, personal, personal, f.actor, ACCOUNT_CASH)).await.ok().unwrap().as_int().unwrap();

@@ -3,8 +3,8 @@
 //! data and the SDE, while the system actor supplies both sampled balls.
 //! Missing balls are refused; this command does not fire or modify weapons.
 use super::{db_err, slash_error, CallError, Client};
-use crate::consts::{dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_TRACKING_SPEED};
-use crate::messages;
+use infinity_core::consts::{dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_TRACKING_SPEED};
+use infinity_core::messages;
 use crate::services::effects::{registry, weapons::{target_signature, turret_chance, turret_geometry}, EffectKind};
 use crate::services::fit::{Fit, Key};
 

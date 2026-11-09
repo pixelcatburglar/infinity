@@ -1,11 +1,11 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{Call, effects::{registry, EffectKind, registry::EffectAttribute}, fit::{Fit, Key}, mining::{self, Field}}, space::{dist, drone::{DroneOrder, PendingMining}}};
+use infinity_core::{consts::{*, dogma::*}};
+use crate::{services::{Call, effects::{registry, EffectKind, registry::EffectAttribute}, fit::{Fit, Key}, mining}, space::{asteroids::Field, dist, drone::{DroneOrder, PendingMining}}};
 use super::super::fixture::Fixture;
 
 // SDE dgmAttributeTypes used by the shared mining calculation.
 const MINING_AMOUNT: i32 = 77;
-const MINING_HOLD: i32 = 1556;
 const WASTE_PROBABILITY: i32 = 3154;
 const CRIT_CHANCE: i32 = 5967;
 
@@ -81,7 +81,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         // The field is randomly placed; isolate the real target so unrelated rocks
         // cannot obstruct the fixture's outbound and return journeys.
         for &other in rocks.iter().skip(1) {
-            mining::reconcile_depleted(&f.db, &f.world, other).await.map_err(|e| anyhow!("isolating target rock {rock}: removing {other}: {e:?}"))?;
+            super::remove_fixture_rock(&f.db, &f.world, f.system, f.ship, other).await.context("isolating target rock")?;
         }
         let ball = f.world.ball(f.system, rock).await.context("rock has no ball")?;
         let ore = ball.type_id;
@@ -96,7 +96,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         let id = f.drone(ty, 1, true).await;
         for (item, attr, value) in [(f.ship, ATTR_DRONE_BANDWIDTH, 1_000_000.0), (f.ship, ATTR_DRONE_CAPACITY, 1_000_000.0),
             (f.ship, ATTR_MAX_TARGET_RANGE, 1_000_000.0), (f.ship, ATTR_SCAN_RESOLUTION, 1_000_000.0),
-            (f.ship, MINING_HOLD, 0.0), (f.ship, ATTR_CAPACITY, volume * 100.0),
+            (f.ship, ATTR_GENERAL_MINING_HOLD_CAPACITY, 0.0), (f.ship, ATTR_CAPACITY, volume * 100.0),
             (id, ATTR_MAX_VELOCITY, 2_000.0), (id, ATTR_MAX_TARGET_RANGE, 1_000_000.0),
             (id, ATTR_SCAN_RESOLUTION, 1_000_000.0), (id, ATTR_MAX_RANGE, 500.0), (id, range_attr, 500.0),
             (id, duration_attr, 1_000.0), (id, MINING_AMOUNT, volume * 2.0), (id, WASTE_PROBABILITY, 0.0), (id, CRIT_CHANCE, 0.0)] { f.set(item, attr, value).await; }
@@ -128,7 +128,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
             "launched drone inertia differs from fitted policy: type={ty} mass={} agility={} free={} last_ms={}", motion.mass, motion.agility, motion.free, motion.last_ms);
         let args = [Value::Int(rock)]; let kwargs = Value::None;
         let lock = Call { service: "dogmaIM", method: "AddTarget", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
-        crate::services::combat::dispatch(&mut f.client, &lock).await.context("target service unavailable")?.map_err(|e| anyhow!("target lock: {e:?}"))?;
+        crate::services::dogma::dispatch(&mut f.client, &lock).await.map_err(|e| anyhow!("target lock: {e:?}"))?;
         let mut locked = false;
         for _ in 0..300 { if crate::services::combat::targeting_charges::targets_of(f.owner).contains(&rock) { locked = true; break; } tick(&f).await?; }
         ensure!(locked, "rock did not lock: {}", state(&f, id, rock).await);
@@ -205,6 +205,11 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         f.set(f.ship, ATTR_DRONE_CAPACITY, 1_000_000.0).await;
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let third = pending(&f, id, rock, "bay-delivery intent").await?;
+        let before_return = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
+        ensure!(before_return == first_logs, "cached bay intent appended a source before return");
+        f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| Box::pin(mining::progress::aggregate_tx(tx, outbox, 100)), |value, _| async move { Ok(value) }).await.map_err(|e| anyhow!("aggregate before return: {e:?}"))?;
+        let before_events = crate::db::outbox::tests::events(&f.db, "OreMined", f.owner).await;
+        ensure!(before_events.len() == 1, "cached intent created a journal event");
         let third_units = expected(&third, after.0)?;
         command(&mut f, id, "CmdReturnBay", None).await?;
         let mut bay = false;
@@ -219,6 +224,17 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         let returned_logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
         ensure!(returned_logs.len() == first_logs.len() + 1, "bay return did not record exactly one fact");
         ensure!((returned_logs[0].type_id, returned_logs[0].solar_system_id, returned_logs[0].quantity, returned_logs[0].quantity_wasted) == (ore, f.system, third_units, 0), "bay fact differs from delivery");
+        let source = f.db.query_one("SELECT log_id, event_time, progress_aggregated FROM game.character_mining_ledger WHERE character_id=$1 ORDER BY log_id DESC LIMIT 1", &[&f.owner]).await?;
+        let source_id: i64 = source.get("log_id");
+        let source_time: i64 = source.get("event_time");
+        ensure!(!source.get::<_, bool>("progress_aggregated"), "return source was already aggregated");
+        f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| Box::pin(mining::progress::aggregate_tx(tx, outbox, 100)), |value, _| async move { Ok(value) }).await.map_err(|e| anyhow!("aggregate return: {e:?}"))?;
+        let events = crate::db::outbox::tests::events(&f.db, "OreMined", f.owner).await;
+        let slices = events.iter().filter_map(|event| match event {
+            crate::lua::events::GameEvent::OreMined { ore_type, slices, .. } if *ore_type == ore => Some(slices),
+            _ => None,
+        }).flatten().filter(|slice| slice.log_id == source_id).collect::<Vec<_>>();
+        ensure!(events.len() == 2 && slices.len() == 1 && slices[0].occurred_at == source_time && slices[0].quantity == third_units && slices[0].volume_m3 == third.unit_volume * third_units as f64, "return journal does not contain exactly the delivered source slice");
         let mut return_notices = 0;
         for _ in 0..100 {
             while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { return_notices += 1; } }
@@ -228,6 +244,9 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         ensure!(return_notices == 1, "return delivery did not emit exactly one post-commit ore notice");
         for _ in 0..100 { if f.world.ball(f.system, id).await.is_none() { break; } tick(&f).await?; }
         ensure!(f.world.ball(f.system, id).await.is_none(), "returned drone still in space");
+        ensure!(command(&mut f, id, "CmdReturnBay", None).await.is_err(), "already returned drone accepted another return");
+        f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| Box::pin(mining::progress::aggregate_tx(tx, outbox, 100)), |value, _| async move { Ok(value) }).await.map_err(|e| anyhow!("aggregate repeated return: {e:?}"))?;
+        ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == returned_logs && crate::db::outbox::tests::events(&f.db, "OreMined", f.owner).await.len() == 2, "repeated return created another source or event");
         launch(&mut f, id).await?;
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let _lost = pending(&f, id, rock, "control-loss intent").await?;
@@ -243,7 +262,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
     let cleanup: Result<()> = async {
         let rows = f.db.query("SELECT asteroid_id FROM game.asteroids WHERE system_id=$1 AND field_id=$2", &[&f.system, &f.ship]).await?;
         let mut errors = Vec::new();
-        for row in rows { if let Err(e) = mining::reconcile_depleted(&f.db, &f.world, row.get("asteroid_id")).await { errors.push(format!("{e:?}")); } }
+        for row in rows { if let Err(e) = super::remove_fixture_rock(&f.db, &f.world, f.system, f.ship, row.get("asteroid_id")).await { errors.push(format!("{e:?}")); } }
         if let Err(e) = f.db.execute("DELETE FROM game.asteroid_fields WHERE system_id=$1 AND field_id=$2", &[&f.system, &f.ship]).await { errors.push(e.to_string()); }
         ensure!(errors.is_empty(), "field cleanup: {}", errors.join(", "));
         Ok(())

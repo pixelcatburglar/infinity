@@ -36,9 +36,9 @@ fn jam_notifications_preserve_identity_filetime_and_milliseconds() {
 
 #[test]
 fn npc_scram_slots_distinguish_mwd_blocking() {
-    assert_eq!(ewar_slot_by_id(crate::consts::dogma::EFFECT_NPC_WARP_SCRAMBLE), Some("warpScrambler"));
-    assert_eq!(ewar_slot_by_id(crate::consts::dogma::EFFECT_NPC_WARP_SCRAMBLE_MWD), Some("warpScramblerMWD"));
-    assert_eq!(ewar_slot_by_id(crate::consts::dogma::EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE), Some("warpScramblerMWD"));
+    assert_eq!(ewar_slot_by_id(infinity_core::consts::dogma::EFFECT_NPC_WARP_SCRAMBLE), Some("warpScrambler"));
+    assert_eq!(ewar_slot_by_id(infinity_core::consts::dogma::EFFECT_NPC_WARP_SCRAMBLE_MWD), Some("warpScramblerMWD"));
+    assert_eq!(ewar_slot_by_id(infinity_core::consts::dogma::EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE), Some("warpScramblerMWD"));
 }
 
 #[test]
@@ -73,10 +73,10 @@ fn special_fx_has_all_client_arguments() {
 
 #[test]
 fn scans_encode_client_rows_and_argument_order() {
-    let rows = vec![(34, 7), (35, 12345678901)];
+    let rows = vec![(34, 7), (35, i64::MAX)];
     let encoded = Value::list([
         Value::tuple([Value::Int(34), Value::Int(7)]),
-        Value::tuple([Value::Int(35), Value::Int(12345678901)]),
+        Value::tuple([Value::Int(35), Value::Int(infinity_core::consts::CLIENT_MAX_SHORT_AMOUNT)]),
     ]);
     assert_eq!(cargo_scan_args(42, rows.clone()), vec![Value::Int(42), encoded.clone()]);
     assert_eq!(ship_scan_args(42, 1.5, 3.0, rows), vec![Value::Int(42), Value::Float(1.5), Value::Float(3.0), encoded]);

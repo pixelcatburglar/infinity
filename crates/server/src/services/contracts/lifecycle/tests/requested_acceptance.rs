@@ -12,13 +12,13 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
     let (client, _peer) = crate::services::tests::client(db.clone(), buyer.character).await;
     let station = client.sde.map.stations().next().unwrap().station_id;
     let blueprint = client.sde.types.iter().find(|t| t.category_id == Some(9)).unwrap().type_id;
-    let stack_type = client.sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).expect("published charge type").type_id;
+    let stack_type = client.sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).expect("published charge type").type_id;
     let root = transfers::insert(&db, blueprint, buyer.character, station, FLAG_HANGAR, 1).await.unwrap();
     db.execute("UPDATE game.items SET singleton = true, quantity = -2 WHERE item_id = $1", &[&root]).await.unwrap();
     db.execute("INSERT INTO game.blueprints (item_id, material_efficiency, time_efficiency, runs) VALUES ($1, 7, 9, 3)", &[&root]).await.unwrap();
     assert!(crate::dao::items::dogma::set_override(&db, root, 1, 42.0).await.unwrap());
     let child = transfers::insert(&db, stack_type, buyer.character, root, FLAG_HANGAR, 1).await.unwrap();
-    let stack = transfers::insert(&db, stack_type, buyer.character, station, FLAG_HANGAR, 10).await.unwrap();
+    let stack = transfers::insert(&db, stack_type, buyer.character, station, FLAG_HANGAR, 4_294_967_300).await.unwrap();
     db.execute("UPDATE game.items SET custom_info = 'metadata', name = 'named' WHERE item_id = $1", &[&stack]).await.unwrap();
     // The issuer starts at the exact maximum for the upgraded numeric(36,2) balance.
     db.execute("UPDATE game.characters SET balance = CASE WHEN character_id = $1 THEN 9999999999999999999999999999999999.99 ELSE 100 END WHERE character_id = ANY($2)", &[&issuer.character, &vec![issuer.character, buyer.character]]).await.unwrap();
@@ -30,7 +30,7 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
         for_corp: false, issuer_wallet_key: ACCOUNT_CASH, issuer_hangar_flag: FLAG_HANGAR, issuer_source_location: station,
     }).await.unwrap();
     contract_dao::insert_requested_item(&db, id, blueprint, 1).await.unwrap();
-    contract_dao::insert_requested_item(&db, id, stack_type, 3).await.unwrap();
+    contract_dao::insert_requested_item(&db, id, stack_type, 4_294_967_296).await.unwrap();
     let duplicate_payload = Value::Dict(vec![
         (Value::str("contractType"), Value::Int(i64::from(TYPE_ITEM_EXCHANGE))),
         (Value::str("startStationID"), Value::Int(station)),
@@ -40,12 +40,20 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
         ])),
     ]);
     let duplicate_create = create(&client, &duplicate_payload).await;
+    for bad in [Value::None, Value::Int(0), Value::Int(-1)] {
+        let payload = Value::dict([
+            ("contractType", Value::Int(i64::from(TYPE_ITEM_EXCHANGE))),
+            ("startStationID", Value::Int(station)),
+            ("itemList", Value::list([Value::tuple([Value::Int(stack), bad])])),
+        ]);
+        assert!(create(&client, &payload).await.is_err());
+    }
     contract_dao::insert_requested_item(&db, id, blueprint, 1).await.unwrap();
     let duplicate_accept = accept(&client, id, false).await;
     db.execute("DELETE FROM game.contract_items WHERE ctid IN (SELECT ctid FROM game.contract_items WHERE contract_id = $1 AND type_id = $2 LIMIT 1)", &[&id, &blueprint]).await.unwrap();
-    db.execute("UPDATE game.contract_items SET quantity = 11 WHERE contract_id = $1 AND type_id = $2", &[&id, &stack_type]).await.unwrap();
+    db.execute("UPDATE game.contract_items SET quantity = 4294967301 WHERE contract_id = $1 AND type_id = $2", &[&id, &stack_type]).await.unwrap();
     let insufficient = accept(&client, id, false).await;
-    db.execute("UPDATE game.contract_items SET quantity = 3 WHERE contract_id = $1 AND type_id = $2", &[&id, &stack_type]).await.unwrap();
+    db.execute("UPDATE game.contract_items SET quantity = 4294967296 WHERE contract_id = $1 AND type_id = $2", &[&id, &stack_type]).await.unwrap();
     let mut reserved = Vec::new();
     for trade_id in [root, child] {
         db.execute("INSERT INTO game.trades (trade_id, station_id, char_a, char_b, state, created_at, updated_at) VALUES ($1, $2, $3, $4, 'open', 0, 0)", &[&trade_id, &station, &buyer.character, &issuer.character]).await.unwrap();
@@ -65,7 +73,7 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
     let split = db.query_one("SELECT quantity, custom_info, name FROM game.items WHERE owner_id = $1 AND type_id = $2 AND location_id = $3", &[&issuer.character, &stack_type, &station]).await;
     let remaining = db.query_one("SELECT quantity FROM game.items WHERE item_id = $1", &[&stack]).await;
     let status = db.query_one("SELECT status FROM game.contracts WHERE contract_id = $1", &[&id]).await;
-    client.world.unregister_pilot(buyer.character);
+    client.world.unregister_pilot_generation(buyer.character, None);
     db.execute("DELETE FROM game.contract_items WHERE contract_id = $1", &[&id]).await.unwrap();
     db.execute("DELETE FROM game.contracts WHERE contract_id = $1", &[&id]).await.unwrap();
     db.execute("DELETE FROM game.blueprints WHERE item_id = $1", &[&root]).await.unwrap();
@@ -79,25 +87,25 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
         panic!("requested-item acceptance failed: {detail}");
     }
     match &failure {
-        Err(CallError::Internal(error)) => match error.downcast_ref::<crate::db::Error>() {
-            Some(crate::db::Error::Postgres(error)) if error.code() == Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE) => {}
-            _ => panic!("expected PostgreSQL numeric overflow after transfers, got {error:#}"),
-        },
-        Err(CallError::User { msg, dict }) => panic!("expected PostgreSQL numeric overflow after transfers, got {msg} {dict:?}"),
-        Ok(_) => panic!("expected PostgreSQL numeric overflow after transfers, acceptance succeeded"),
+        Err(CallError::User { msg, dict }) => {
+            assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+            assert_eq!(dict, &vec![("notify".into(), Value::unicode(infinity_core::messages::wallets::AMOUNT_TOO_LARGE))]);
+        }
+        Err(CallError::Internal(error)) => panic!("expected wallet overflow refusal after transfers, got {error:#}"),
+        Ok(_) => panic!("expected wallet overflow refusal after transfers, acceptance succeeded"),
     }
     let unchanged = unchanged.unwrap();
     let row = row.unwrap();
     let descendant = descendant.unwrap();
     let split = split.unwrap();
-    let remaining: i32 = remaining.unwrap().get("quantity");
+    let remaining: i64 = remaining.unwrap().get("quantity");
     let status: i32 = status.unwrap().get("status");
     assert_eq!(unchanged.get::<_, i64>("owner"), buyer.character);
-    assert_eq!(unchanged.get::<_, i32>("quantity"), 10);
+    assert_eq!(unchanged.get::<_, i64>("quantity"), 4_294_967_300);
     assert_eq!(unchanged.get::<_, i32>("status"), STATUS_OUTSTANDING);
     assert_eq!(unchanged.get::<_, f64>("balance"), 100.0);
     assert!(quiet);
-    assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i32>("quantity"), row.get::<_, bool>("singleton")), (issuer.character, -2, true));
+    assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("quantity"), row.get::<_, bool>("singleton")), (issuer.character, -2, true));
     assert_eq!((row.get::<_, i32>("material_efficiency"), row.get::<_, i32>("time_efficiency"), row.get::<_, i32>("runs")), (7, 9, 3));
     assert_eq!(row.get::<_, f64>("value"), 42.0);
     assert!(duplicate_create.is_err());
@@ -105,7 +113,7 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
     assert!(insufficient.is_err());
     assert_eq!(reserved, vec![true, true]);
     assert_eq!((descendant.get::<_, i64>("owner_id"), descendant.get::<_, i64>("location_id")), (issuer.character, root));
-    assert_eq!((split.get::<_, i32>("quantity"), split.get::<_, Option<String>>("custom_info").as_deref(), split.get::<_, Option<String>>("name").as_deref()), (3, Some("metadata"), Some("named")));
-    assert_eq!(remaining, 7);
+    assert_eq!((split.get::<_, i64>("quantity"), split.get::<_, Option<String>>("custom_info").as_deref(), split.get::<_, Option<String>>("name").as_deref()), (4_294_967_296, Some("metadata"), Some("named")));
+    assert_eq!(remaining, 4);
     assert_eq!(status, STATUS_FINISHED);
 }

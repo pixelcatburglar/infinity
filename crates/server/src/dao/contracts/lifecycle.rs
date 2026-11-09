@@ -47,7 +47,7 @@ pub(crate) async fn insert(ex: &(impl Executor + ?Sized), c: &NewContract<'_>) -
     Ok(ContractId::from_row(&row).contract_id)
 }
 
-pub(crate) async fn insert_requested_item(ex: &(impl Executor + ?Sized), id: i64, type_id: i32, quantity: i32) -> Result<u64, Error> {
+pub(crate) async fn insert_requested_item(ex: &(impl Executor + ?Sized), id: i64, type_id: i32, quantity: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.contract_items (contract_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, false)", &[&id, &type_id, &quantity]).await
 }
 
@@ -55,7 +55,7 @@ pub(crate) async fn update_volume(ex: &(impl Executor + ?Sized), id: i64, volume
     ex.execute("UPDATE game.contracts SET volume = $2 WHERE contract_id = $1", &[&id, &volume]).await
 }
 
-pub(crate) struct RequestedItem { pub type_id: i32, pub quantity: i32 }
+pub(crate) struct RequestedItem { pub type_id: i32, pub quantity: i64 }
 impl RequestedItem {
     fn from_row(row: &Row) -> Self { Self { type_id: row.get("type_id"), quantity: row.get("quantity") } }
 }
@@ -70,7 +70,7 @@ impl ItemId {
     fn from_row(row: &Row) -> Self { Self { item_id: row.get("item_id") } }
 }
 
-pub(crate) async fn insert_package(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, location: i64, flag: i32, quantity: i32, custom_info: &str) -> Result<i64, Error> {
+pub(crate) async fn insert_package(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, location: i64, flag: i32, quantity: i64, custom_info: &str) -> Result<i64, Error> {
     let row = ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, custom_info)
                              VALUES ($1, $2, $3, $4, $5, true, $6) RETURNING item_id", &[&type_id, &owner, &location, &flag, &quantity, &custom_info]).await?;
     Ok(ItemId::from_row(&row).item_id)

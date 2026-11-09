@@ -9,9 +9,9 @@ fn usurp_exception_roundtrips_with_close_arguments() {
     assert_eq!(decoded, Value::Reduce {
         data: Box::new(Value::tuple([
             Value::global("exceptions.GPSTransportClosed"),
-            Value::tuple([Value::str(crate::messages::SESSION_USURPED)]),
+            Value::tuple([Value::str(infinity_core::messages::SESSION_USURPED)]),
             Value::dict([
-                ("reason", Value::str(crate::messages::SESSION_USURPED)),
+                ("reason", Value::str(infinity_core::messages::SESSION_USURPED)),
                 ("reasonCode", Value::None),
                 ("reasonArgs", Value::Dict(vec![])),
             ]),
@@ -30,7 +30,7 @@ fn refusal_exception_roundtrips_with_reason_code() {
             Value::tuple([Value::None]),
             Value::dict([
                 ("reason", Value::None),
-                ("reasonCode", Value::str(crate::messages::ACL_NOTACCEPTING)),
+                ("reasonCode", Value::str(infinity_core::messages::ACL_NOTACCEPTING)),
                 ("reasonArgs", Value::Dict(vec![])),
             ]),
         ])),

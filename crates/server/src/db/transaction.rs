@@ -28,7 +28,7 @@ impl TransactionError for Error {
     fn is_retryable_transaction(&self) -> bool {
         match self {
             Error::Postgres(error) => retryable_postgres(error),
-            Error::Pool(_) => false,
+            Error::Pool(_) | Error::Progress(_) | Error::InvalidItemLockRequest(_) => false,
         }
     }
 }
@@ -39,13 +39,14 @@ impl Db {
         T: Send,
         R: Send,
         E: TransactionError + Send,
-        O: Default + Send,
+        O: Default + crate::progress::Prepare + crate::progress::AfterCommit,
         F: for<'call, 'tx> FnMut(&'call tokio_postgres::Transaction<'tx>, &'call mut O) -> TxFuture<'call, T, E> + Send,
         D: FnOnce(T, O) -> DFut + Send,
         DFut: Future<Output = Result<R, E>> + Send,
     {
+        let invocation = (u128::from(crate::handshake::random_u64()) << u64::BITS) | u128::from(crate::handshake::random_u64());
         let mut retries = 0;
-        let (value, outbox) = loop {
+        let (value, mut outbox, inserted) = loop {
             let mut connection = self.pool.get().await.map_err(Error::from).map_err(E::from)?;
             let tx = connection.transaction().await.map_err(Error::from).map_err(E::from)?;
             let mut outbox = O::default();
@@ -63,10 +64,25 @@ impl Db {
                     return Err(error);
                 }
             };
+            let inserted = match crate::progress::prepare_batch(&mut outbox, &tx, invocation).await {
+                Ok(inserted) => inserted,
+                Err(error) => {
+                    let error = E::from(error);
+                    if let Err(rollback_error) = tx.rollback().await {
+                        tracing::warn!("transaction rollback failed: {rollback_error}");
+                        return Err(error);
+                    }
+                    if retries < MAX_TRANSACTION_RETRIES && error.is_retryable_transaction() {
+                        retries += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             match tx.commit().await {
                 Ok(()) => {
                     drop(connection);
-                    break (value, outbox);
+                    break (value, outbox, inserted);
                 }
                 Err(error) => {
                     let error = E::from(Error::from(error));
@@ -78,7 +94,10 @@ impl Db {
                 }
             }
         };
-        dispatch(value, outbox).await
+        let publication = outbox.after_commit(self.progress_registry(), &inserted);
+        let result = dispatch(value, outbox).await;
+        publication.publish();
+        result
     }
 }
 #[cfg(test)] mod tests;

@@ -1,6 +1,6 @@
 //! Operator configuration and immutable game-policy snapshot, including client telemetry.
-//! Deployment settings may be overridden by environment variables; game policy
-//! comes only from the TOML file and compiled defaults. No runtime reload is supported.
+//! Documented operational settings may be overridden by environment variables.
+//! No runtime reload is supported.
 
 pub mod deployment;
 pub mod bounty;
@@ -15,6 +15,13 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::OnceLock;
 use game::GameConfig;
+
+/// Nested game settings; legacy game sections remain at the root.
+#[derive(Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NestedGameConfig {
+    pub daily_goals: game::daily_goals::DailyGoalsConfig,
+}
 
 /// Strict root schema. Game fields are explicit because serde flatten cannot
 /// reliably enforce deny_unknown_fields at both the root and nested levels.
@@ -35,6 +42,7 @@ pub struct Config {
     pub bounty: bounty::BountyConfig,
     pub map: map::MapConfig,
     pub shared_settings: shared_settings::SharedSettingsConfig,
+    pub game: NestedGameConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
@@ -80,6 +88,7 @@ impl PartialEq for Config {
             && self.bounty == other.bounty
             && self.map == other.map
             && self.shared_settings == other.shared_settings
+            && self.game == other.game
             && self.accounts == other.accounts
             && self.characters == other.characters
             && self.market == other.market
@@ -115,7 +124,7 @@ impl Config {
         })
     }
 
-    /// Resolve one file and deployment-only environment overrides without mutating
+    /// Resolve one file and documented environment overrides without mutating
     /// process environment, so callers can exercise the same loader deterministically.
     pub(super) fn load_with(path: &Path, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let (mut config, source) = match std::fs::read_to_string(path) {
@@ -199,6 +208,22 @@ impl Config {
         override_env!("GATEWAY_BIND", config.gateway.bind);
         override_env!("GATEWAY_NOTICE_QUEUE_CAPACITY", config.gateway.notice_queue_capacity);
         override_env!("CDN_BIND", config.cdn.bind);
+        if let Some(value) = env("LUA_CONTENT_DATA_DIR") { config.lua.content_data_dir = Some(value); }
+        override_env!("MINING_PROGRESS_AGGREGATION_SECS", config.mining.progress_aggregation_secs);
+        override_env!("MINING_PROGRESS_BATCH_ROWS", config.mining.progress_batch_rows);
+        override_env!("COMBAT_PROGRESS_KEY_CAPACITY", config.combat.progress_key_capacity);
+        override_env!("COMBAT_PROGRESS_PENDING_BATCHES", config.combat.progress_pending_batches);
+        override_env!("DAILY_GOALS_HISTORY_PAGE_MAXIMUM", config.game.daily_goals.history_page_maximum);
+        override_env!("DAILY_GOALS_ROLLOVER_BATCH_SIZE", config.game.daily_goals.rollover_batch_size);
+        if let Some(value) = env("DAILY_GOALS_QA_ACCOUNT_IDS") {
+            config.game.daily_goals.qa_account_ids = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value.split(',').map(|part| part.trim().parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("invalid DAILY_GOALS_QA_ACCOUNT_IDS: {:?}", value)))
+                    .collect::<Result<Vec<_>>>()?
+            };
+        }
         secret_env!("DATABASE_URL", config.database.url);
         secret_env!("DATABASE_PASSWORD", config.database.password);
         config.validate()?;
@@ -228,6 +253,7 @@ impl Config {
             bounty: self.bounty.clone(),
             map: self.map.clone(),
             shared_settings: self.shared_settings.clone(),
+            daily_goals: self.game.daily_goals.clone(),
             accounts: self.accounts.clone(),
             characters: self.characters.clone(),
             market: self.market.clone(),
@@ -263,6 +289,8 @@ impl Config {
             ("imageserverurl", marshal::Value::str(format!("http://{}:{}/", self.server.public_host, self.images.port))),
             ("banned_words_enabled", marshal::Value::str(if self.chat.banned_words { "1" } else { "0" })),
             ("expert_system_feature_enabled", marshal::Value::str(if self.expert_systems.enabled { "1" } else { "0" })),
+            ("ld-global_plex_market_experiment_enabled", marshal::Value::str("1")),
+            ("world_task_enabled", marshal::Value::str("0")),
         ])
     }
 }

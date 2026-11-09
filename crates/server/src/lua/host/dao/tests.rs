@@ -6,7 +6,7 @@ fn boundary_rejects_invalid_ids_amounts_and_recipient_shapes() {
     assert!(positive(-1).is_err());
     assert_eq!(positive(7).unwrap(), 7);
     for value in [0.0, -1.0, f64::NAN, f64::INFINITY] { assert!(amount(value).is_err()); }
-    assert_eq!(amount(1.5).unwrap(), 1.5);
+    assert_eq!(amount(1.5).unwrap(), crate::isk::IskAmount::from_cents(150).unwrap());
     let lua = Lua::new();
     for source in ["{[2]=1}", "{[1]=1, x=2}", "{0}"] {
         let table = lua.load(format!("return {source}")).eval::<Table>().unwrap();
@@ -61,7 +61,7 @@ async fn registered_market_and_hangar_observers_filter_and_validate() {
     let owner = station + 2;
     let mut order_ids = Vec::new();
     for (at, ty, bid, volume, price, minimum, range) in [
-        (station, type_id, true, 7, 10.0, 2, 3),
+        (station, type_id, true, 7_i64, 10.0, 2_i64, 3),
         (station, type_id, true, 8, 20.0, 4, 5),
         (station, type_id, false, 9, 30.0, 6, 7),
         (station, type_id, false, 10, 40.0, 8, 9),
@@ -72,16 +72,16 @@ async fn registered_market_and_hangar_observers_filter_and_validate() {
         (station, type_id, true, 0, 1.0, 1, 1),
         (station, type_id, false, 0, 1.0, 1, 1),
     ] {
-        let id: i64 = db.query_one("INSERT INTO game.market_orders (type_id, station_id, solar_system_id, constellation_id, region_id, price, vol_entered, vol_remaining, min_volume, bid, range, duration) VALUES ($1,$2,$2,$2,$2,$3,10,$4,$5,$6,$7,1) RETURNING order_id", &[&ty, &at, &price, &volume, &minimum, &bid, &range]).await.unwrap().get("order_id");
+        let id: i64 = db.query_one("INSERT INTO game.market_orders (type_id, station_id, solar_system_id, constellation_id, region_id, price, vol_entered, vol_remaining, min_volume, bid, range, duration) VALUES ($1,$2,$2,$2,$2,$3::float8::numeric,10,$4,$5,$6,$7,1) RETURNING order_id", &[&ty, &at, &price, &volume, &minimum, &bid, &range]).await.unwrap().get("order_id");
         order_ids.push(id);
     }
     let mut item_ids = Vec::new();
     for (who, at, flag) in [
-        (owner, station, crate::consts::FLAG_HANGAR),
-        (owner + 1, station, crate::consts::FLAG_HANGAR),
-        (owner, station + 1, crate::consts::FLAG_HANGAR),
-        (owner, station, crate::consts::FLAG_CARGO),
-        (owner, station, crate::consts::FLAG_CORP_DELIVERIES),
+        (owner, station, infinity_core::consts::FLAG_HANGAR),
+        (owner + 1, station, infinity_core::consts::FLAG_HANGAR),
+        (owner, station + 1, infinity_core::consts::FLAG_HANGAR),
+        (owner, station, infinity_core::consts::FLAG_CARGO),
+        (owner, station, infinity_core::consts::FLAG_CORP_DELIVERIES),
     ] {
         let id: i64 = db.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1,$2,$3,$4,5,false) RETURNING item_id", &[&type_id, &who, &at, &flag]).await.unwrap().get("item_id");
         item_ids.push(id);

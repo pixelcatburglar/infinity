@@ -1,6 +1,31 @@
 use super::*;
 use crate::space::System;
 
+#[tokio::test]
+#[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn entosis_activation_refreshes_only_the_weapons_timer() {
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let world = World::new(db.clone(), Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
+    let character = -filetime_now();
+    let before = filetime_now();
+    weapons_activate(&world, character);
+    let first = state().pilots.get(&character).unwrap().weapons_until;
+    assert!(first >= weapons_deadline(before));
+    {
+        let mut st = state();
+        st.pilots.get_mut(&character).unwrap().weapons_until = 1;
+    }
+    let before_refresh = filetime_now();
+    weapons_activate(&world, character);
+    let mut st = state();
+    let pilot = st.pilots.get(&character).unwrap();
+    assert!(pilot.weapons_until >= weapons_deadline(before_refresh));
+    assert_eq!((pilot.pvp_until, pilot.criminal_until, pilot.suspect_until), (0, 0, 0));
+    assert!(!st.engagements.keys().any(|&(a, b)| a == character || b == character));
+    assert!(!st.concord.contains(&character));
+    st.pilots.remove(&character);
+}
+
 #[test]
 fn concord_reservation_respects_policy_without_clearing_criminal_flag() {
     let criminal = -104;
@@ -102,8 +127,8 @@ async fn startup_restores_active_kill_rights_without_economy_changes() {
         let name = format!("{name}-{suffix}");
         db.execute("INSERT INTO game.characters (character_id,user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,$3,1,1,1,$4,123)", &[&id, &account, &name, &corp]).await.unwrap();
     }
-    let until = now + 600 * crate::consts::FILETIME_SECOND;
-    let expiry = now + 1200 * crate::consts::FILETIME_SECOND;
+    let until = now + 600 * infinity_core::consts::FILETIME_SECOND;
+    let expiry = now + 1200 * infinity_core::consts::FILETIME_SECOND;
     let mut ids = Vec::new();
     for to in [target, expired_target, used_target] {
         let right = db.transaction(|tx, _: &mut ()| Box::pin(async move {
@@ -136,7 +161,7 @@ async fn startup_restores_active_kill_rights_without_economy_changes() {
         assert!(!st.pilots.contains_key(&expired_target));
         assert!(!st.pilots.contains_key(&used_target));
     }
-    let criminal_until = until + crate::consts::FILETIME_SECOND;
+    let criminal_until = until + infinity_core::consts::FILETIME_SECOND;
     state().pilots.get_mut(&target).unwrap().criminal_until = criminal_until;
     let repeated = match crate::services::bounty::restore_activations(&db, &world).await {
         Ok(count) => count,
@@ -198,10 +223,11 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     let save = tx.savepoint("killmail_writer").await.unwrap();
     let mut outbox: Outbox = Outbox::default();
     let mut attackers = [
-        (characters[1], Contribution { damage: 20.0, ship_type: 1, weapon_type: 1, last: 2, illegal: false }),
-        (characters[2], Contribution { damage: 10.0, ship_type: 1, weapon_type: 1, last: 3, illegal: false }),
+        (characters[1], Contribution { damage: 20.0, ship_type: 1, weapon_type: 1, illegal: false }),
+        (characters[2], Contribution { damage: 10.0, ship_type: 1, weapon_type: 1, illegal: false }),
     ];
-    let (kill_id, _) = match write_killmail(&save, &mut outbox, 1, characters[0], corps[0], 1, &Lost::new(), &mut attackers, 4).await {
+    let source = crate::services::combat::damage::DamageSource { attacker_id: Some(characters[1]), source_ship_type: Some(7), weapon_type_id: Some(42), ..Default::default() };
+    let (kill_id, _, _, _) = match write_killmail(&save, &mut outbox, 1, characters[0], corps[0], 1, &Lost::new(), &mut attackers, 4, None, &source).await {
         Ok(result) => result,
         Err(_) => panic!("killmail writer failed"),
     };
@@ -214,9 +240,9 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     assert_eq!(projections.len(), 1);
     let projection = &projections[0];
     assert_eq!((projection.kill_id, projection.war_id, projection.attacker_side, projection.defender_side), (kill_id, war.war_id, corps[1], alliance));
-    let notes = save.query("SELECT receiver_id,type_id,group_id,sender_id,data FROM game.notifications WHERE receiver_id=ANY($1) ORDER BY type_id", &[&[characters[0], characters[2]].as_slice()]).await.unwrap();
+    let notes = save.query("SELECT receiver_id,type_id,group_id,sender_id,data FROM game.notifications WHERE receiver_id=ANY($1) ORDER BY type_id", &[&[characters[0], characters[1]].as_slice()]).await.unwrap();
     assert_eq!(notes.len(), 2);
-    for (note, receiver, kind) in [(&notes[0], characters[0], NOTIFICATION_KILL_REPORT_VICTIM), (&notes[1], characters[2], NOTIFICATION_KILL_REPORT_FINAL_BLOW)] {
+    for (note, receiver, kind) in [(&notes[0], characters[0], NOTIFICATION_KILL_REPORT_VICTIM), (&notes[1], characters[1], NOTIFICATION_KILL_REPORT_FINAL_BLOW)] {
         assert_eq!(note.get::<_, i64>("receiver_id"), receiver);
         assert_eq!(note.get::<_, i32>("type_id"), kind);
         assert_eq!(note.get::<_, i32>("group_id"), NOTIFICATION_GROUP_WAR);
@@ -229,22 +255,42 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     let row = history.pop().unwrap();
     assert_eq!((row.projection.attacker_side, row.projection.defender_side), (corps[1], alliance));
     assert_eq!(row.killmail.victim_alliance_id, Some(alliance));
-    assert_eq!(row.killmail.final_char_id, Some(characters[2]));
-    assert_eq!(row.killmail.final_corp_id, Some(corps[2]));
+    assert_eq!(row.killmail.final_char_id, Some(characters[1]));
+    assert_eq!(row.killmail.final_corp_id, Some(corps[1]));
+    assert_eq!((row.killmail.final_ship_type, row.killmail.final_weapon_type, row.killmail.final_damage), (7, 42, 20.0));
     assert_eq!(row.killmail.final_alliance_id, None);
     let value = killmails::killmail_value(row.killmail, Some(row.projection.war_id));
     let value = marshal::loads(&marshal::dumps(&value)).unwrap();
     let Value::Instance(_, fields) = value else { panic!("expected KeyVal") };
     assert_eq!(fields.get("killID"), Some(&Value::Int(kill_id)));
     assert_eq!(fields.get("victimAllianceID"), Some(&Value::Int(alliance)));
-    assert_eq!(fields.get("finalCharacterID"), Some(&Value::Int(characters[2])));
-    assert_eq!(fields.get("finalCorporationID"), Some(&Value::Int(corps[2])));
+    assert_eq!(fields.get("finalCharacterID"), Some(&Value::Int(characters[1])));
+    assert_eq!(fields.get("finalCorporationID"), Some(&Value::Int(corps[1])));
     assert_eq!(fields.get("finalAllianceID"), Some(&Value::None));
     assert_eq!(fields.get("warID"), Some(&Value::Int(war.war_id)));
-    let (pod_id, _) = write_killmail(&save, &mut outbox, 1, characters[0], corps[0], crate::consts::TYPE_CAPSULE, &Lost::new(), &mut [], 5).await.unwrap();
+    let (pod_id, _, _, _) = write_killmail(&save, &mut outbox, 1, characters[0], corps[0], infinity_core::consts::TYPE_CAPSULE, &Lost::new(), &mut [], 5, None, &Default::default()).await.unwrap();
     let pod = save.query_one("SELECT solar_system_id, event_time, kind FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &pod_id]).await.unwrap();
     assert_eq!((pod.get::<_, i64>("solar_system_id"), pod.get::<_, i64>("event_time"), pod.get::<_, i16>("kind")), (1, 5, crate::dao::map_telemetry::EventKind::Pod as i16));
     assert_eq!(save.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=ANY($2)", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &&[kill_id, pod_id][..]]).await.unwrap().len(), 2);
+    // Equal timestamps do not choose the final blow; the explicit impact source does.
+    let ship = crate::dao::items::creation::positioned(&save, 1, characters[0], 1, [0.0; 3]).await.unwrap();
+    let now = crate::client::filetime_now();
+    let window = crate::config::game().crimewatch.killmail_attacker_window_secs.saturating_mul(FILETIME_SECOND);
+    let entity = |id| crate::lua::events::combat::CombatEntity { item_id: id, type_id: 1, incarnation: [0; 16], character_id: Some(id), corporation_id: None, alliance_id: None, faction_id: None };
+    let context = crate::lua::events::resources::FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: None, ship_type_id: None, system_id: Some(1), station_id: None, origin: crate::lua::events::resources::FactOrigin::Natural };
+    let contributions = [
+        crate::space::combat::ContributionEntry { attacker_id: characters[0], source_ship_id: None, source_ship_type: Some(1), weapon_type_id: Some(1), damage: 99.0, last_damage_at: now.saturating_sub(window).saturating_sub(1), illegal: false, entity: entity(characters[0]), context, exact_damage: Default::default() },
+        crate::space::combat::ContributionEntry { attacker_id: characters[1], source_ship_id: None, source_ship_type: Some(1), weapon_type_id: Some(1), damage: 20.0, last_damage_at: now, illegal: false, entity: entity(characters[1]), context, exact_damage: Default::default() },
+        crate::space::combat::ContributionEntry { attacker_id: characters[2], source_ship_id: None, source_ship_type: Some(1), weapon_type_id: Some(1), damage: 10.0, last_damage_at: now, illegal: false, entity: entity(characters[2]), context, exact_damage: Default::default() },
+    ];
+    let impact = crate::services::combat::damage::DamageSource {
+        attacker_id: Some(characters[2]), source_ship_type: Some(7), weapon_type_id: Some(42), ..Default::default()
+    };
+    ship_lost_in(&save, &mut outbox, 1, characters[0], corps[0], ship, 1, &Lost::new(), &impact, now, &contributions).await.unwrap();
+    let mail = save.query_one("SELECT final_char_id, final_ship_type, final_weapon_type, final_damage, attacker_ids FROM game.killmails WHERE victim_item_id=$1", &[&ship]).await.unwrap();
+    assert_eq!(mail.get::<_, Option<i64>>("final_char_id"), Some(characters[2]));
+    assert_eq!((mail.get::<_, i32>("final_ship_type"), mail.get::<_, i32>("final_weapon_type"), mail.get::<_, f64>("final_damage")), (7, 42, 10.0));
+    assert_eq!(mail.get::<_, Vec<i64>>("attacker_ids"), vec![characters[1], characters[2]]);
     save.rollback().await.unwrap();
     assert!(tx.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=ANY($2)", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &&[kill_id, pod_id][..]]).await.unwrap().is_empty());
     assert!(tx.query("SELECT kill_id FROM game.killmails WHERE victim_id=$1", &[&characters[0]]).await.unwrap().is_empty());

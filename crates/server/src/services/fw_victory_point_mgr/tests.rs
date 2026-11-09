@@ -17,7 +17,7 @@ async fn faction_warfare_dispatch_contract() {
     let result = tokio::spawn(async move {
     let (mut client, _peer) = services::tests::client(test_db, fixture.character).await;
     let kwargs = Value::Dict(vec![]);
-    let home = client.sde.factions.get(crate::consts::FACTION_CALDARI).unwrap().solar_system_id.unwrap();
+    let home = client.sde.factions.get(infinity_core::consts::FACTION_CALDARI).unwrap().solar_system_id.unwrap();
     let station = client.sde.map.stations().find(|station| station.solar_system_id.is_some_and(|id| client.sde.map.system(id).is_some())).expect("SDE station with system");
     let docked_system = station.solar_system_id.unwrap();
     let station_id = station.station_id;
@@ -30,12 +30,12 @@ async fn faction_warfare_dispatch_contract() {
     let hq = services::dispatch(&mut client, &call("fwWarzoneSolarsystem", "GetHQSystemIDs", &[], &kwargs)).await.unwrap();
     let Value::Dict(entries) = wire(hq) else { panic!("expected HQ mapping") };
     assert_eq!(entries.len(), 6);
-    for faction in crate::consts::WARFARE_FACTIONS {
+    for faction in infinity_core::consts::WARFARE_FACTIONS {
         let home = client.sde.factions.get(faction).unwrap().solar_system_id.unwrap();
         assert!(client.sde.map.system(home).is_some());
         assert!(entries.contains(&(Value::Int(faction), Value::Int(home))));
     }
-    let arg = [Value::Int(crate::consts::FACTION_CALDARI)];
+    let arg = [Value::Int(infinity_core::consts::FACTION_CALDARI)];
     for (service, method, args, expected) in [
         ("fwVictoryPointMgr", "GetAllVictoryPointStates", &[][..], Value::Dict(vec![])),
         ("facWarMgr", "GetStats_Character", &[][..], Value::Dict(vec![])),
@@ -57,7 +57,7 @@ async fn faction_warfare_dispatch_contract() {
     for side in sides {
         let Value::Dict(groups) = side else { panic!("expected groups") };
         assert_eq!(groups.len(), 3);
-        for group in [crate::consts::GROUP_CHARACTER, crate::consts::GROUP_CORPORATION, crate::consts::GROUP_ALLIANCE] {
+        for group in [infinity_core::consts::GROUP_CHARACTER, infinity_core::consts::GROUP_CORPORATION, infinity_core::consts::GROUP_ALLIANCE] {
             let counters = &groups.iter().find(|(k, _)| *k == Value::Int(group)).unwrap().1;
             let Value::Dict(fields) = counters else { panic!("expected counters") };
             assert_eq!(fields.len(), 6);

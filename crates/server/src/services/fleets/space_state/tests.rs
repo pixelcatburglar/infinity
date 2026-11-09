@@ -7,7 +7,7 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> space::Ball {
         mode: space::MODE_STOP, radius: 1.0, signature_radius: None, mass: 1.0, max_vel: 100.0,
         agility: 1.0, speed_fraction: 0.0, pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: false, interactive: pilot.is_some(), warp: space::WarpState::default(), warp_factor: 0,
+        massive: false, interactive: pilot.is_some(), warp: space::WarpState::default(), 
         last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: vec![] }
 }
 
@@ -21,7 +21,7 @@ async fn fleet_space_dispatch_and_explicit_clears() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let target_type = sde.types.iter().find(|t| t.group_id.is_some_and(|g| !matches!(g, crate::consts::GROUP_PLANET | crate::consts::GROUP_ASTEROID_BELT | crate::consts::GROUP_MOON))).unwrap().type_id;
+    let target_type = sde.types.iter().find(|t| t.group_id.is_some_and(|g| !matches!(g, infinity_core::consts::GROUP_PLANET | infinity_core::consts::GROUP_ASTEROID_BELT | infinity_core::consts::GROUP_MOON))).unwrap().type_id;
     let world = space::World::new(db.clone(), sde.clone(), 1);
     let system = -123;
     let leader = 90_111_001;
@@ -136,7 +136,7 @@ async fn fleet_space_dispatch_and_explicit_clears() {
     assert_eq!(notices.try_recv().unwrap(), ("OnFleetStateChange".to_string(), vec![empty.clone()]));
     rpc(&mut client, "beyonce", "CmdFleetTagTarget", &[Value::Int(15), Value::str("A")]).await.unwrap();
     notices.try_recv().unwrap();
-    world.set_online_session(leader, Some(crate::session::OnlineSession {
+    world.set_online_session(leader, Some(infinity_core::session::OnlineSession {
         character_id: leader, user_id: None, session_id: 1, ship_id: Some(11), station_id: None,
         system_id: Some(system), corporation_id: None, alliance_id: None, faction_id: None,
         fleet_id: Some(fleet_id), role: 0, corporation_role: 0,
@@ -152,7 +152,7 @@ async fn fleet_space_dispatch_and_explicit_clears() {
     }
     assert!(clear);
     { let mut st = state(); st.fleets.remove(&fleet_id); st.of.remove(&leader); st.of.remove(&member); }
-    world.unregister_pilot(leader);
-    world.unregister_pilot(member);
-    world.unregister_pilot(outsider);
+    world.unregister_pilot_generation(leader, None);
+    world.unregister_pilot_generation(member, None);
+    world.unregister_pilot_generation(outsider, None);
 }

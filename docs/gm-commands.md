@@ -5,6 +5,12 @@ Slash commands need GM roles on the account. Grant them in the database, then lo
 ```sql
 UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) = lower('<name>');
 ```
+Replies, including `/help`, appear in a private conversation with EVE System,
+the fixed retail system owner; the client resolves its caption through `cfg.eveowners`.
+They are delivered only while chat is online, and otherwise dropped silently
+without a backlog. Bare `/` requests autocomplete without a chat reply.
+Commands invoked from menus also echo their results in the conversation.
+
 
 | Command | Effect |
 |---|---|
@@ -13,13 +19,13 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/wh status\|ensure\|random [count]\|clear` (alias `/wormhole`) | Show, make sure there is one, create random, or remove the wormholes of the current system. Destinations never repeat, and each batch is saved in one transaction. |
 | `/scanall` | Scan every signature in the current system to 100% |
 | `/sites` | List the current system's anomalies and signatures, with their signature strength |
-| `/create <typeID\|name> [qty]` (alias `/createitem`) | Create items in the hangar (docked) or cargo |
+| `/create <typeID\|name> [qty]` (alias `/createitem`) | Create items in the hangar (docked) or cargo. Quantity defaults to 1; plain quantities use ASCII digits only. Case-insensitive suffixes `k`, `m`, `b`, `t` multiply by 1,000, 1,000,000, 1,000,000,000 and 1,000,000,000,000 respectively; suffixed decimals must yield an exact integer. The result must be positive and at most 9,223,372,036,854,775,807 (signed 64-bit maximum). It is the total requested, even if delivery uses more than one stack. Example: `/create Tritanium 1.5m`. |
 | `/setisk <amount>` | Set your character's ISK wallet balance |
-| `/addisk <amount>` | Add ISK to your character's wallet |
+| `/addisk <signed amount>` | Adjust your character's ISK wallet by an exact signed amount; a negative amount subtracts ISK and cannot take the balance below zero. |
 | `/setplex <count>` | Set your account's PLEX vault balance |
 | `/addplex <count>` | Add PLEX to your account's vault |
 | `/clonegrade <userID> alpha\|omega [seconds [grace_seconds]]` | Set an account's clone grade. Omega without a duration has no end date; with one, the account turns Alpha when the duration and then the grace period (0 by default) have passed. Alpha takes no duration. The account's client is told at once, and every change is audited. |
-| `/heal` | Repair the ship in space |
+| `/heal` | Docked at a station: repair your active ship's shield, armor and hull and every fitted module, including offline, burnt-out, rig and subsystem slots. In space: repair the ship's shield, armor and hull |
 | `/dogma <ship\|itemID\|flag:N> <attribute> [value\|reset]` | Show, set or clear a per-item base value of a dogma attribute (by ID or exact name). Skills and modules still apply on top. Targets are single items only: the active ship, a module fitted at flag `N`, or any singleton item by ID. Runtime state (shield, armor and hull damage, online, charge, quantity, skills) is refused; use `/heal` or the module controls. |
 | `/dogma <target> list` | List the overrides of an item; for `ship`, of the ship and every fitted module |
 | `/effects unsupported` | List the module effects pilots tried to activate that the server refused, by effect and item type, since the server started |
@@ -58,6 +64,15 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/help` | List the commands |
 
 Arguments may be quoted to include spaces. Lists longer than 50 rows show the first 50 and the number left out.
+
+`/heal` works on your own active ship only. While docked at a station it persists
+the ship's shield, armor and hull condition and clears the damage of every fitted
+module — high, medium and low slots, rigs and subsystems — whether the module is
+online or burnt out. Unrelated attribute overrides, cargo, charges, weapon groups
+and wallets are not touched; a burnt-out module stays offline. A docked ship's
+full capacitor and zero rack heat come from the existing dogma projection, not
+from stored fields. In space the command restores shield, armor and hull only;
+module damage, capacitor and heat are not yet repaired there.
 
 For `/dogma` writes, mass must be finite and positive; agility must be finite
 and remain finite and positive when converted to a 32-bit float; maximum velocity

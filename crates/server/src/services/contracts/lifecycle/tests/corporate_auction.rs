@@ -10,7 +10,7 @@ async fn corporate_auction_refunds_and_settles_captured_divisions() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let station = sde.map.stations().find(|s| s.type_id.is_some() && s.solar_system_id.is_some()).unwrap();
     let (station_id, system, station_type) = (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap());
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, station_id, station_type).await;
     let bidder = f::setup(&db, station_id, station_type).await;
     let test_db = db.clone();

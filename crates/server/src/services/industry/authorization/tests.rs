@@ -47,6 +47,7 @@ async fn current_membership_roles_divisions_and_payer() {
     let ceo: i64 = db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'industry-auth-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
     let corp: i64 = db.query_one("INSERT INTO game.corporations (name, ticker, ceo_id, creator_id, station_id, created) VALUES ('industry-auth-' || nextval('game.corporations_corporation_id_seq')::text, 'IA' || nextval('game.corporations_corporation_id_seq')::text, $1, $1, $2, 0) RETURNING corporation_id", &[&ceo, &station]).await.unwrap().get("corporation_id");
     db.execute("UPDATE game.characters SET corporation_id = $1 WHERE character_id = ANY($2)", &[&corp, &vec![actor, ceo]]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&ceo, &ROLE_DIRECTOR]).await.unwrap();
     let office = crate::dao::items::transfers::insert(&db, office_type, corp, station, FLAG_HANGAR, 1).await.unwrap();
     crate::dao::offices::insert(&db, office, corp, station, 1).await.unwrap();
     let test_db = db.clone();
@@ -59,7 +60,7 @@ async fn current_membership_roles_divisions_and_payer() {
             assert_eq!(owner(&db, actor, corp, Some(MANUFACTURING)).await.is_ok(), allowed);
         }
         for (roles, allowed) in [(ROLE_HANGAR_CAN_TAKE_1, false), (ROLE_FACTORY_MANAGER, false), (ROLE_FACTORY_MANAGER | ROLE_HANGAR_CAN_TAKE_1, true)] {
-            db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor, &roles]).await.unwrap();
+            db.execute("UPDATE game.characters SET corp_roles=$2::bigint & ~$3::bigint,corp_roles_hq=$2::bigint & $3::bigint WHERE character_id=$1", &[&actor, &roles, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
             match locations(&db, &sde, actor, corp, &facility).await {
                 Ok(found) => {
                     assert_eq!(found.len(), 7);
@@ -70,7 +71,7 @@ async fn current_membership_roles_divisions_and_payer() {
                 Err(_) => assert_eq!(roles, ROLE_HANGAR_CAN_TAKE_1),
             }
         }
-        db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor, &ROLE_DIRECTOR]).await.unwrap();
+        db.execute("UPDATE game.characters SET corp_roles = $2, corp_roles_hq = 0 WHERE character_id = $1", &[&actor, &ROLE_DIRECTOR]).await.unwrap();
         assert!(owner(&db, actor, corp, Some(COPYING)).await.is_ok());
         assert!(locations(&db, &sde, actor, corp, &facility).await.ok().unwrap().iter().all(|l| l.can_take));
         assert!(owner(&db, ceo, corp, Some(MANUFACTURING)).await.is_ok());

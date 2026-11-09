@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use crate::{dao::sde::wrecks as dao, db::Db};
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Wrecks { mappings: HashMap<i32, HashMap<i32, i32>> }
 impl Wrecks {
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {

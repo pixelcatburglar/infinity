@@ -1,6 +1,7 @@
 use super::*;
 use crate::dao::items;
-use crate::consts::{FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
+use infinity_core::consts::{FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST};
+mod market_orders;
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
@@ -119,7 +120,7 @@ async fn rookie_grants_are_persistent_and_atomic() {
         assert_eq!(second.ok().unwrap(), ship);
         assert_eq!(db.query_one("SELECT count(*) AS count FROM game.items WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3", &[&owner, &station, &FLAG_HANGAR]).await.unwrap().get::<_, i64>("count"), 1);
         let row = db.query_one("SELECT type_id, owner_id, location_id, flag_id, quantity, singleton FROM game.items WHERE item_id = $1", &[&ship]).await.unwrap();
-        assert_eq!((row.get::<_, i32>("type_id"), row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id"), row.get::<_, i32>("quantity"), row.get::<_, bool>("singleton")), (hull, owner, station, FLAG_HANGAR, 1, true));
+        assert_eq!((row.get::<_, i32>("type_id"), row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id"), row.get::<_, i64>("quantity"), row.get::<_, bool>("singleton")), (hull, owner, station, FLAG_HANGAR, 1, true));
         let rows = db.query("SELECT type_id, owner_id, location_id, flag_id, quantity, singleton, online FROM game.items WHERE location_id = $1", &[&ship]).await.unwrap();
         assert_eq!(rows.len(), expected.len());
         let mut slots = HashSet::new();
@@ -127,11 +128,11 @@ async fn rookie_grants_are_persistent_and_atomic() {
         for row in &rows {
             let ty: i32 = row.get("type_id");
             let flag: i32 = row.get("flag_id");
-            let quantity: i32 = row.get("quantity");
-            assert!(expected.contains(&(ty, flag, quantity)));
+            let quantity: i64 = row.get("quantity");
+            assert!(expected.iter().any(|&(type_id, slot, count)| (type_id, slot, i64::from(count)) == (ty, flag, quantity)));
             assert_eq!(row.get::<_, i64>("owner_id"), owner);
             assert_eq!(row.get::<_, i64>("location_id"), ship);
-            let module = flag != crate::consts::FLAG_DRONE_BAY;
+            let module = flag != infinity_core::consts::FLAG_DRONE_BAY;
             assert_eq!(row.get::<_, bool>("singleton"), module);
             assert_eq!(row.get::<_, bool>("online"), module);
             if module {
@@ -161,6 +162,9 @@ async fn rookie_grants_are_persistent_and_atomic() {
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
 }
 
+/// Test fixture clearance beyond all celestial and capsule collision radii, in metres.
+const SPACE_SELECTION_FIXTURE_CLEARANCE: f64 = 1_000.0;
+
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn space_selection_restores_cloak_before_session_and_without_map_telemetry() {
@@ -171,10 +175,21 @@ async fn space_selection_restores_cloak_before_session_and_without_map_telemetry
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let row = sde.map.systems().find(|s| s.constellation_id.is_some() && s.region_id.is_some()).unwrap();
     let (system, constellation, region) = (row.solar_system_id, row.constellation_id.unwrap(), row.region_id.unwrap());
+    let capsule_radius = f64::from(crate::services::ship::balls::radius(&sde, infinity_core::consts::TYPE_CAPSULE).unwrap());
+    let max_surface_x = sde.map.celestials(system)
+        .filter(|r| r.type_id.and_then(|id| i32::try_from(id).ok()).is_some_and(|id| sde.types.get(id).is_some()))
+        .map(|r| {
+            let surface = r.x.expect("NULL celestial x") + f64::from(sde.celestial_radius(r));
+            assert!(surface.is_finite(), "celestial surface must be finite");
+            surface
+        })
+        .max_by(f64::total_cmp)
+        .expect("fixture system must contain a celestial");
+    let pos = [max_surface_x + capsule_radius + SPACE_SELECTION_FIXTURE_CLEARANCE, 0.0, 0.0];
+    assert!(pos[0].is_finite(), "fixture position must be finite");
     let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
     let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id,constellation_id,region_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,NULL,$2,$3,$4) RETURNING character_id", &[&account, &system, &constellation, &region]).await.unwrap().get("character_id");
-    let pos = [1234.0, 5678.0, 9012.0];
-    let ship = items::creation::positioned(&db, crate::consts::TYPE_CAPSULE, character, system, pos).await.unwrap();
+    let ship = items::creation::positioned(&db, infinity_core::consts::TYPE_CAPSULE, character, system, pos).await.unwrap();
     characters::selection::set_ship(&db, character, ship).await.unwrap();
     let selected = characters::selection::selected(&db, character, account).await.unwrap().unwrap();
     let (corp, alliance) = (selected.corporation_id, selected.alliance_id);
@@ -187,6 +202,7 @@ async fn space_selection_restores_cloak_before_session_and_without_map_telemetry
     let cfg = Arc::new(Config::default());
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let mut c = Client::new(Conn::new(stream, addr), cfg, db.clone(), sde, chat, world.clone(), login);
+    c.session.apply(vec![("userid", Value::Int(account))]);
     let w = world.clone();
     let result = tokio::spawn(async move {
         assert_eq!(c.session.int("charid"), None);
@@ -197,10 +213,10 @@ async fn space_selection_restores_cloak_before_session_and_without_map_telemetry
             select_character(&mut c, character).await.unwrap();
             let ball = w.with(system, move |s| s.pilot_ball(character).cloned()).await.unwrap().unwrap();
             assert_eq!((ball.id, ball.type_id, ball.char_id, ball.owner_id, ball.corp_id, ball.alliance_id),
-                (ship, crate::consts::TYPE_CAPSULE, Some(character), character, corp, alliance.unwrap_or(-1)));
+                (ship, infinity_core::consts::TYPE_CAPSULE, Some(character), character, corp, alliance.unwrap_or(-1)));
             assert_eq!(ball.pos, pos);
             let fit = crate::services::fit::Fit::load(&c.db, c.sde.clone(), character, ship).await.unwrap();
-            let fitted_speed = fit.value(crate::services::fit::Key::Ship, crate::consts::dogma::ATTR_MAX_VELOCITY);
+            let fitted_speed = fit.value(crate::services::fit::Key::Ship, infinity_core::consts::dogma::ATTR_MAX_VELOCITY);
             if fitted_speed > 0.0 { assert_eq!(ball.max_vel, fitted_speed as f32); }
             assert_eq!(ball.cloak, CLOAK_RESTORE);
             assert!(ball.cloak_until >= start + 60 * FILETIME_SECOND);
@@ -225,13 +241,23 @@ async fn space_selection_restores_cloak_before_session_and_without_map_telemetry
             let envelope = c.outbox[timer].body[0].items().unwrap();
             let payload = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();
             assert_eq!(payload, Value::tuple([Value::Int(1), Value::tuple([Value::Int(ship), Value::Int(ball.cloak_until), Value::Int(60 * FILETIME_SECOND)])]));
+            let before = crate::db::outbox::tests::events(&c.db, "CharacterLoggedOff", character).await.len();
             log_off(&mut c).await.unwrap();
+            let logoffs = crate::db::outbox::tests::events(&c.db, "CharacterLoggedOff", character).await;
+            assert_eq!(logoffs.len(), before + 1);
+            assert!(matches!(logoffs.last(), Some(crate::lua::events::GameEvent::CharacterLoggedOff { user_id, char_id }) if (*user_id, *char_id) == (account, character)));
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            assert!(!w.is_online(character));
+            assert!(w.online_session(character).is_none());
+            assert!(!w.online_pilots().contains(&character));
+            assert!(w.with(system, move |s| s.ball(ship).is_none()).await.unwrap());
         }
     }).await;
     assert_eq!(db.query_one("SELECT count(*) AS count FROM game.map_events", &[]).await.unwrap().get::<_, i64>("count"), events);
     assert!(db.query("SELECT 1 FROM game.map_visits WHERE character_id=$1", &[&character]).await.unwrap().is_empty());
     world.remove_ball(system, ship).await;
+    db.execute("DELETE FROM game.progress_deliveries WHERE event_id IN (SELECT event_id FROM game.progress_events WHERE subject_character_id=$1)", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.progress_events WHERE subject_character_id=$1", &[&character]).await.unwrap();
     db.execute("DELETE FROM game.skills WHERE character_id=$1", &[&character]).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&ship]).await.unwrap();
     db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&character]).await.unwrap();

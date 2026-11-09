@@ -3,16 +3,12 @@
 //! nested dictionaries and sequences retain order. Input is supplied by the service,
 //! not read from a database. Non-UTF-8, non-finite and unsupported marshal values
 //! cannot be encoded. Depth counts logical values, not JSON pair-list wrappers.
-use std::{cell::Cell, fmt::Write as _, io::{self, Write}};
+use std::{cell::Cell, io::{self, Write}};
 use marshal::Value;
 use serde::{Serialize, Serializer, ser::{Error, SerializeMap, SerializeSeq}};
-use sha2::{Digest, Sha256};
 
 /// A JSON dictionary entry needs at least `"":0` bytes, excluding separators.
 const MIN_ENTRY_BYTES: usize = 4;
-
-/// Two hexadecimal digits encode each byte.
-const HEX_DIGITS_PER_BYTE: usize = 2;
 
 /// YAML 1.1 requires a decimal point to recognize floats; JSON exponent forms
 /// emitted by the default formatter can otherwise load as strings.
@@ -92,11 +88,7 @@ pub(super) fn encode(value: &Value, limit: usize, depth: usize) -> Result<(Strin
     Adapter { value, depth: 1, max_depth: depth, entries_left: &entries_left, top: true }
         .serialize(&mut serde_json::Serializer::with_formatter(&mut writer, YamlFloatFormatter))
         .map_err(|_| ())?;
-    let digest = Sha256::digest(&writer.bytes);
-    let mut hash = String::with_capacity(digest.len() * HEX_DIGITS_PER_BYTE);
-    for byte in digest {
-        write!(&mut hash, "{byte:02x}").expect("writing to a String cannot fail");
-    }
+    let hash = crate::hash::sha256_hex(&writer.bytes);
     Ok((String::from_utf8(writer.bytes).map_err(|_| ())?, hash))
 }
 

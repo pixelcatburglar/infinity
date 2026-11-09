@@ -2,9 +2,10 @@
 //! Skills and queues are persisted and notified by the skills service.
 //! Quoted skill and character names are parsed by the shared argument parser.
 use super::{args::{self, Args}, slash_error, CallError, Client};
-use crate::{messages, services::skills::gm::{self, Change}};
+use infinity_core::messages;
+use crate::{services::skills::gm::{self, Change}};
 
-use crate::consts::dogma::MAX_SKILL_LEVEL as MAX_LEVEL;
+use infinity_core::consts::dogma::MAX_SKILL_LEVEL as MAX_LEVEL;
 
 fn level(text: Option<&str>) -> Result<i32, CallError> {
     match text {

@@ -47,7 +47,7 @@ async fn projected_sensor_boost_reduces_fitted_ecm_chance() {
                 }
                 let projection = Projection { source_ship: -1, source_module: -2, source_type: booster.type_id,
                     effect_id: row.effect_id, kind: effect.kind, until_ms: i64::MAX,
-                    values, charge_values: Vec::new(), charge_type: None };
+                    values, charge_values: Vec::new(), charge_type: None, scramble: None };
                 let boosted = Fit::for_space_type(sde.clone(), hull.type_id, vec![projection]);
                 let Some((boosted_index, boosted_defense)) = primary(SENSORS.map(|a| boosted.value(Key::Ship, a))) else { continue };
                 if boosted_index != index || !boosted_defense.is_finite() || boosted_defense <= defense { continue; }

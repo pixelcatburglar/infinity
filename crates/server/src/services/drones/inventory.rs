@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, CATEGORY_DRONE, OWNER_UNOWNED};
+use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, CATEGORY_DRONE, OWNER_UNOWNED};
 use crate::dao::items::drones;
 use crate::db::Db;
 use crate::sde::Sde;
 use crate::services::{db_err, CallError, fit::{Fit, Key}};
-use crate::space::{Ball, MODE_STOP, WarpState, drone::DroneSpec};
+use crate::space::{Ball, MODE_STOP, WarpState, drone::PreparedDrone};
 pub(crate) mod launch;
 pub(crate) mod returning;
 
@@ -26,7 +26,7 @@ fn drone_ball(fit: &Fit, key: Key, id: i64, type_id: i32, owner: i64, affiliatio
         pos, vel: [0.0; 3], old_pos: pos, old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: true, global: false, massive: true, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: now,
+        warp: WarpState::default(), last_ms: now,
         interpolation_anchor_ms: now, effect_stamp: 0, cloak: 0, cloak_until: 0,
         health, launcher: 0, slim: Vec::new(),
     })
@@ -39,13 +39,13 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
     use crate::services::{items::load_items, notify_error};
     use marshal::Value;
 
-    let refuse = || notify_error(crate::messages::drones::NOT_AVAILABLE);
+    let refuse = || notify_error(infinity_core::messages::drones::NOT_AVAILABLE);
     let owner = c.session.int("charid").ok_or_else(refuse)?;
     let system = c.session.int("solarsystemid").ok_or_else(refuse)?;
     let valid = c.world.with(system, move |s| s.drone(id).is_some_and(|d|
         d.owner == owner && s.ball(id).is_some())).await.unwrap_or(false);
     if !valid { return Err(refuse()); }
-    let _lock = crate::services::market::lock().await;
+    let market = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
     let world = c.world.clone();
@@ -61,16 +61,17 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
                     return Err(refuse());
                 }
                 crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, id,
-                    vec![(crate::consts::IX_OWNER_ID, Value::Int(owner))]).await?;
+                    vec![(infinity_core::consts::IX_OWNER_ID, Value::Int(owner))]).await?;
                 Ok(())
             })
         },
         |(), outbox| async move {
+            let market = market;
             let task = tokio::spawn(async move {
                 if world.with(system, move |s| {
                     if s.drone(id).is_some_and(|d| d.owner == owner) { s.drone_abandoned(id); }
                 }).await.is_none() {
-                    match world.system(system).await {
+                    match world.system_locked(system, &market).await {
                         Ok(()) => {
                             if world.with(system, move |s| {
                                 if s.drone(id).is_some_and(|d| d.owner == owner) { s.drone_abandoned(id); }
@@ -93,7 +94,7 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
 }
 
 /// Load positioned singleton identities without entering or constructing a world.
-pub(crate) async fn restore_specs(db: &Db, sde: Arc<Sde>, system: i64) -> Result<Vec<(Ball, DroneSpec)>, CallError> {
+pub(crate) async fn restore_specs(db: &Db, sde: Arc<Sde>, system: i64) -> Result<Vec<PreparedDrone>, CallError> {
     let types: Vec<_> = sde.types.iter().filter(|data| data.category_id == Some(CATEGORY_DRONE)).map(|data| data.type_id).collect();
     let rows = drones::positioned(db, system, &types).await.map_err(db_err)?;
     let mut restored = Vec::with_capacity(rows.len());
@@ -104,13 +105,13 @@ pub(crate) async fn restore_specs(db: &Db, sde: Arc<Sde>, system: i64) -> Result
             (Fit::drone(db, sde.clone(), row.owner_id, row.item_id).await?, Key::Drone(row.item_id))
         };
         let spec = super::worker::spec(&fit, key, row.type_id)?;
-        let health = crate::services::combat::drone_health::initialize(db, sde.clone(), row.owner_id, row.item_id, row.type_id).await?;
+        let condition = crate::services::combat::prepare_condition_with_fit_key(db, row.item_id, &fit, key).await?;
         let corp = if row.owner_id == OWNER_UNOWNED { OWNER_UNOWNED } else {
             crate::dao::characters::crimewatch::corporation(db, row.owner_id).await.map_err(db_err)?
                 .ok_or_else(|| CallError::Internal(anyhow::anyhow!("drone owner corporation missing")))?
         };
-        let ball = drone_ball(&fit, key, row.item_id, row.type_id, row.owner_id, (corp, -1), row.pos, health)?;
-        restored.push((ball, spec));
+        let ball = drone_ball(&fit, key, row.item_id, row.type_id, row.owner_id, (corp, -1), row.pos, condition.fractions().map(|v| v.clamp(0.0, 1.0)))?;
+        restored.push(PreparedDrone { ball, spec, condition, fit, key });
     }
     Ok(restored)
 }

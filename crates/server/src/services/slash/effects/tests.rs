@@ -10,7 +10,7 @@ fn unsupported_arguments_are_exact() {
 
 #[test]
 fn unsupported_output_includes_each_pair_in_snapshot_order() {
-    assert_eq!(messages::gm::gm_effects_unsupported(&[]), messages::gm::GM_EFFECTS_EMPTY);
+    assert_eq!(messages::gm::gm_effects_unsupported(&[]), "尚未记录未支持的效果。");
     let effects = vec![("alpha".to_string(), 42), ("beta".to_string(), 7)];
     assert_eq!(messages::gm::gm_effects_unsupported(&effects), "alpha（类型 ID：42）\nbeta（类型 ID：7）");
 }

@@ -5,7 +5,8 @@
 
 mod overrides;
 
-use crate::{consts::TYPE_PLASTIC_WRAP, sde::Sde};
+use infinity_core::consts::TYPE_PLASTIC_WRAP;
+use crate::sde::Sde;
 use super::CallError;
 
 /// Client `GetItemVolume`: hundredths of a cubic metre encoded in wrap quantity.
@@ -20,9 +21,10 @@ pub(super) fn stack_size(singleton: bool, quantity: i64) -> i64 {
 
 /// Encode a plastic wrap volume for the client `inventorycommon/util.py:45-48`
 /// decoder. Rounding up and the minimum magnitude are server representation choices;
-/// the i32 representation supports at most 21,474,836.47 m³. Courier creation
-/// separately enforces the client's 1,200,000 m³ limit.
-pub(super) fn encode_wrap_quantity(volume: f64) -> Result<i32, super::CallError> {
+/// the encoded magnitude remains limited to 21,474,836.47 m³ even though
+/// the stored quantity is i64. Courier creation separately enforces the client's
+/// 1,200,000 m³ limit.
+pub(super) fn encode_wrap_quantity(volume: f64) -> Result<i64, super::CallError> {
     if !volume.is_finite() || volume < 0.0 {
         return Err(anyhow::anyhow!("invalid plastic wrap volume {volume}").into());
     }
@@ -30,7 +32,7 @@ pub(super) fn encode_wrap_quantity(volume: f64) -> Result<i32, super::CallError>
     if magnitude > i32::MAX as f64 {
         return Err(anyhow::anyhow!("plastic wrap volume exceeds encoded range").into());
     }
-    Ok(-(magnitude as i32))
+    Ok(-(magnitude as i64))
 }
 
 pub(super) fn item_volume(sde: &Sde, type_id: i32, singleton: bool, quantity: i64, qty: Option<i64>) -> Result<f64, CallError> {

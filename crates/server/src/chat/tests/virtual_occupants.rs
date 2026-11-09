@@ -1,6 +1,7 @@
 //! Virtual system-room occupants share the real XMPP presence stream.
 use super::{fixture, socket::{open, presence, read_until, Tasks}};
-use crate::{chat::Hub, db::Db, sde::Sde, services::chat::authority, session::OnlineSession, space::World};
+use infinity_core::session::OnlineSession;
+use crate::{chat::Hub, db::Db, sde::Sde, services::chat::authority, space::World};
 use marshal::Value;
 use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::mpsc};
@@ -107,7 +108,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
             assert!(occupant.tx.is_none());
             assert_eq!(occupant.role, "participant");
         }
-        world.unregister_pilot(virtual_char.id);
+        world.unregister_pilot_generation(virtual_char.id, None);
         hub.disconnect_character(virtual_char.id);
         let unavailable = read_until(&mut socket, "</presence>").await;
         assert!(unavailable.contains("type='unavailable'") && unavailable.contains(&format!("{room}/{}", virtual_char.id)));
@@ -142,7 +143,7 @@ async fn virtual_presence_replay_broadcast_relocation_and_isolation() {
                 assert!(hub.rooms.lock().unwrap().entries[&format!("{channel}@conference.chat.test")].contains_key(&virtual_char.id.to_string()));
             }
         }
-        world.unregister_pilot(virtual_char.id);
+        world.unregister_pilot_generation(virtual_char.id, None);
         hub.disconnect_character(virtual_char.id);
     }).await;
     fixture::cleanup(&db, &[real, virtual_char]).await;

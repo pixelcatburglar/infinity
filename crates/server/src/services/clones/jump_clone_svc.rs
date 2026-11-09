@@ -4,9 +4,16 @@
 
 use super::{lifecycle, policy, transition, CloneEffect, MAX_CLONE_NAME_LENGTH};
 use super::super::{crowset, db_err, notify_error, Call, CallError, CallResult};
-use crate::{client::{filetime_now, Client}, consts::{GM_ROLES, ROLE_QA, TYPE_CAPSULE},
+use infinity_core::{
+    consts::{GM_ROLES, ROLE_QA, TYPE_CAPSULE},
+    messages,
+};
+use crate::{
+    client::{filetime_now, Client},
     dao::{characters::clones as clone_dao, items::clones as item_dao},
-    db::outbox::{Effect, Outbox}, messages, services::{effects::online, identity::Identity, market, trade}};
+    db::outbox::Outbox,
+    services::{effects::online, identity::Identity, market, trade},
+};
 use marshal::{DbRowDescriptor, DbType, Value};
 
 fn positive_id(value: &Value) -> Option<i64> {
@@ -69,15 +76,10 @@ async fn clone_state(c: &Client, me: i64, station_only: bool) -> CallResult {
 
 fn dispatch_effects(c: &mut Client, outbox: Outbox<CloneEffect>) -> Result<(), CallError> {
     let world = c.world.clone();
-    for entry in outbox.into_entries() {
-        match entry {
-            Effect::Notification(notification) => online::dispatch_notification(notification, &world, &c.notify_tx, c.session.int("charid"))?,
-            Effect::Operation(CloneEffect::Online(change)) => online::apply_online_changed(change),
-            Effect::Operation(CloneEffect::Trade(effects)) => trade::dispatch((), effects, &world)?,
-            Effect::Event(event) => crate::lua::on_event(event),
-        }
-    }
-    Ok(())
+    online::dispatch_mixed_entries((), outbox, &world,
+        |effect| match effect { CloneEffect::Online(change) => Ok(change), other => Err(other) },
+        |effect| match effect { CloneEffect::Trade(effects) => trade::dispatch((), effects, &world), CloneEffect::Online(_) => unreachable!() },
+        |notification| online::dispatch_notification(notification, &world, &c.notify_tx, c.session.int("charid")))
 }
 
 #[derive(Clone)]
@@ -95,6 +97,7 @@ async fn mutate(c: &mut Client, mutation: Mutation) -> CallResult {
     let now = filetime_now();
     let _guard = market::lock().await;
     let char_id = id.char_id;
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
@@ -102,13 +105,14 @@ async fn mutate(c: &mut Client, mutation: Mutation) -> CallResult {
             let sde = sde.clone();
             let id = Identity { char_id: id.char_id, ship_id: id.ship_id, corp_id: id.corp_id, station_id: id.station_id, system_id: id.system_id };
             let mutation = mutation.clone();
+            let fences = fences.clone();
             Box::pin(async move {
                 match mutation {
                     Mutation::Install => { lifecycle::install_tx(tx, outbox, &sde, &id, now).await?; Ok(None) }
                     Mutation::Destroy(clone) => { lifecycle::destroy_tx(tx, outbox, &id, clone).await?; Ok(None) }
                     Mutation::Rename(clone, name) => { lifecycle::rename_tx(tx, outbox, &id, clone, &name).await?; Ok(None) }
                     Mutation::Reset => { lifecycle::reset_tx(tx, outbox, &id).await?; Ok(None) }
-                    Mutation::Jump(dest, clone, quote, confirmed) => transition::jump_tx(tx, outbox, &sde, &id, dest, clone, quote, confirmed, now).await.map(Some),
+                    Mutation::Jump(dest, clone, quote, confirmed) => transition::jump_tx(tx, outbox, &sde, &fences, &id, dest, clone, quote, confirmed, now).await.map(Some),
                 }
             })
         },

@@ -2,7 +2,8 @@
 //! Only events recorded by implemented skill mutations are returned.
 //! Missing result counts use the client default; explicit nonnegative counts are passed to the database.
 use super::{db_err, keyval, CallError};
-use crate::{client::Client, dao::skills::history, messages, services::notify_error};
+use infinity_core::messages;
+use crate::{client::Client, dao::skills::history, services::notify_error};
 use marshal::Value;
 
 /// Client appConst.py:1543-1560, training completed.

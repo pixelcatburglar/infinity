@@ -1,6 +1,7 @@
 //! `mutualWarInviteMgr`, mirroring the client mutualWarInvites service. Invitations
 //! and blocks are persisted; aggressive war fees and allies are not implemented.
-use crate::{client::{Client, filetime_now}, consts::FILETIME_DAY, dao::wars::{self, Invite}, db::outbox::{Outbox, dispatch_world}, scheduler, services::{Call, CallResult, keyval}};
+use infinity_core::consts::FILETIME_DAY;
+use crate::{client::{Client, filetime_now}, dao::wars::{self, Invite}, db::outbox::{Outbox, dispatch_world}, scheduler, services::{Call, CallResult, keyval}};
 use marshal::Value;
 use super::{authority, deadlines, lifecycle::{self, invalid, WAR_MUTUAL_WAR_EXPIRY_DAYS, WAR_SPOOLUP}};
 
@@ -32,6 +33,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let owner = authority::owner(&c.db, actor).await?;
             let world = &c.world;
             c.db.transaction(|tx, outbox: &mut Outbox| Box::pin(async move {
+                authority::lock_actor(tx, actor).await?;
                 wars::lock_owners(tx, &[owner]).await?;
                 if authority::owner(tx, actor).await? != owner { return Err(invalid()); }
                 authority::require_owner(tx, actor, owner).await?;
@@ -50,6 +52,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let now = filetime_now();
             let world = &c.world;
             c.db.transaction(|tx, outbox: &mut Outbox| Box::pin(async move {
+                authority::lock_actor(tx, actor).await?;
                 wars::lock_owners(tx, &[owner,other]).await?;
                 if authority::owner(tx, actor).await? != owner || owner == other { return Err(invalid()); }
                 authority::require_owner(tx, actor, owner).await?;

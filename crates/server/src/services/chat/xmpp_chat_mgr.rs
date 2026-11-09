@@ -4,7 +4,8 @@
 //! Occupants and messages remain runtime transport state. Passwords, expiring
 //! restrictions, corporation/alliance ACL grants and proxy-room ownership are unsupported.
 use super::{authority, super::{Call, CallResult, notify_error}};
-use crate::{client::Client, messages::chat as text, session::OnlineSession};
+use infinity_core::{messages::chat as text, session::OnlineSession};
+use crate::client::Client;
 use marshal::Value;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

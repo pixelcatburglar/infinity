@@ -36,7 +36,7 @@ async fn tier_matrix_and_bulk_refusals() {
         assert_eq!(dao::bookmarks(&test_db, &[dest], i64::MIN).await.unwrap().len(), 1);
         let no_expiry = mutations::add(&a, owner.character, f, None, None, None, 1, [0.0; 3], "none", "", Some(0)).await.unwrap();
         assert_eq!(no_expiry.items().unwrap()[7], Value::None);
-        for (option, duration) in [(1, 4 * crate::consts::FILETIME_HOUR), (2, 2 * crate::consts::FILETIME_DAY), (3, 24 * crate::consts::FILETIME_HOUR)] {
+        for (option, duration) in [(1, 4 * infinity_core::consts::FILETIME_HOUR), (2, 2 * infinity_core::consts::FILETIME_DAY), (3, 24 * infinity_core::consts::FILETIME_HOUR)] {
             let before = crate::client::filetime_now();
             let row = mutations::add(&a, owner.character, f, None, None, None, 1, [0.0; 3], "expiry", "", Some(option)).await.unwrap();
             let after = crate::client::filetime_now();

@@ -2,6 +2,8 @@
 //! Payloads use runtime effect and item data; EWAR slots follow client
 //! dogma/effects/GetEwarTypeByEffectID and buffBarConst. Jam start times are
 //! FILETIME and durations are milliseconds. Scheduling and delivery are elsewhere.
+//! Scan result stack quantities are projected to the client display limit;
+//! scanned inventory stays exact.
 
 use crate::client::filetime_now;
 use crate::services::combat::Ctx;
@@ -34,7 +36,7 @@ pub(crate) fn ewar_slot(effect: &super::registry::Effect) -> Option<&'static str
 
 /// Client dogma/effects/BUFF_SLOTS_BY_EFFECT_ID for the supported effects.
 fn ewar_slot_by_id(id: i32) -> Option<&'static str> {
-    use crate::consts::dogma::*;
+    use infinity_core::consts::dogma::*;
     Some(match id {
         EFFECT_REMOTE_ECM_FALLOFF | EFFECT_ENTITY_ECM_FALLOFF | EFFECT_NPC_BEHAVIOR_ECM => "electronic",
         EFFECT_REMOTE_WEBIFIER_FALLOFF | EFFECT_REMOTE_WEBIFIER_ENTITY | EFFECT_NPC_BEHAVIOR_WEB => "webify",
@@ -91,7 +93,7 @@ pub(in crate::services) fn ship_effect_args(module: i64, effect_id: i64, environ
 }
 
 fn scan_rows(rows: Vec<(i32, i64)>) -> Value {
-    Value::list(rows.into_iter().map(|(type_id, quantity)| Value::tuple([Value::Int(i64::from(type_id)), Value::Int(quantity)])))
+    Value::list(rows.into_iter().map(|(type_id, quantity)| Value::tuple([Value::Int(i64::from(type_id)), Value::Int(crate::services::dogma::info::cap_client_quantity(quantity))])))
 }
 
 fn cargo_scan_args(target: i64, rows: Vec<(i32, i64)>) -> Vec<Value> {

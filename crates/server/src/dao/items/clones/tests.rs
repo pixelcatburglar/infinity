@@ -25,10 +25,13 @@ async fn custody_preserves_identity_and_isolates_generic_readers() {
     assert!(dogma::overrides(&tx, item).await.unwrap().is_empty());
     assert!(!dogma::set_override(&tx, item, 1, 7.0).await.unwrap());
     assert_eq!(overrides(&tx, owner, clone.clone_id, &[item]).await.unwrap()[0].value, 3.5);
-    assert!(crate::dao::items::repair::lock_items(&tx, &[item], owner).await.unwrap().is_empty());
+    assert!(crate::dao::items::repair::candidates(&tx, &[item], owner).await.unwrap().is_empty());
+    let locks = crate::dao::items::parent_locks::lock(&tx, &[], &[crate::dao::items::parent_locks::LockRequest {
+        item_id: item, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }]).await.unwrap();
     crate::dao::items::transfers::hand_over(&tx, &[crate::dao::items::transfers::Transfer {
         item_id: item, owner: owner + 1, location: 2, flag: 1,
-    }]).await.unwrap();
+    }], &[item], &locks, &[]).await.unwrap();
     assert_eq!(list(&tx, owner, clone.clone_id).await.unwrap()[0].item_id, item);
     assert!(list(&tx, owner + 1, clone.clone_id).await.unwrap().is_empty());
     assert!(!activate(&tx, owner + 1, clone.clone_id, item).await.unwrap());

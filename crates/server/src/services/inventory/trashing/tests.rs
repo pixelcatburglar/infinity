@@ -1,14 +1,16 @@
-use crate::consts::{FLAG_HANGAR, IX_LOCATION_ID};
+use infinity_core::consts::{FLAG_HANGAR, IX_LOCATION_ID};
 use crate::dao::items::loading::Item;
 use crate::db::outbox::{Effect, Notification, Outbox};
 use super::MoveEffect;
 use super::super::notifications::notify_item_removed;
 
+mod container_capacity;
+
 #[test]
 fn broker_maps_only_typed_trash_refusal() {
-    let refusal = crate::services::user_error(crate::messages::MSG_CANNOT_TRASH_ITEM, vec![]);
-    assert_eq!(super::broker_refusal_key(&refusal), Some(crate::messages::MSG_CANNOT_TRASH_ITEM));
-    let unrelated = crate::services::user_error(crate::messages::MSG_CUSTOM_NOTIFY, vec![]);
+    let refusal = crate::services::user_error(infinity_core::messages::MSG_CANNOT_TRASH_ITEM, vec![]);
+    assert_eq!(super::broker_refusal_key(&refusal), Some(infinity_core::messages::MSG_CANNOT_TRASH_ITEM));
+    let unrelated = crate::services::user_error(infinity_core::messages::MSG_CUSTOM_NOTIFY, vec![]);
     assert_eq!(super::broker_refusal_key(&unrelated), None);
 }
 
@@ -24,7 +26,7 @@ async fn missing_root_refuses_without_deleting_existing_items() {
         (station.station_id, station.solar_system_id.expect("test SDE station has a solar system"))
     };
     client.session.apply(vec![("stationid", marshal::Value::Int(station_id)), ("solarsystemid", marshal::Value::Int(system)), ("shipid", marshal::Value::Int(0))]);
-    let ty = client.sde.types.iter().find(|ty| ty.category_id != Some(crate::consts::CATEGORY_SHIP) && !client.sde.typelists.is_untrashable(ty.type_id, ty.group_id.unwrap_or_default(), ty.category_id.unwrap_or_default())).expect("test SDE has a trashable non-ship type");
+    let ty = client.sde.types.iter().find(|ty| ty.category_id != Some(infinity_core::consts::CATEGORY_SHIP) && !client.sde.typelists.is_untrashable(ty.type_id, ty.group_id.unwrap_or_default(), ty.category_id.unwrap_or_default())).expect("test SDE has a trashable non-ship type");
     let item = crate::dao::items::transfers::insert(&db, ty.type_id, fixture.character, station_id, FLAG_HANGAR, 1).await.unwrap();
     let missing = item + 9_000_000_000;
     let result = super::trash_items(&mut client, &[missing], station_id).await;
@@ -59,7 +61,7 @@ async fn broker_returns_catalogue_key_for_trash_business_refusal() {
         .expect("business refusal must be returned as a successful error-list result");
     assert!(matches!(result, marshal::Value::List(values)
         if values.len() == 1
-            && values[0].as_text().is_some_and(|key| key == crate::messages::MSG_CANNOT_TRASH_ITEM)));
+            && values[0].as_text().is_some_and(|key| key == infinity_core::messages::MSG_CANNOT_TRASH_ITEM)));
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
 }
 
@@ -76,7 +78,7 @@ async fn committed_trash_removes_descendants_and_notifies_for_each_item() {
         ("shipid", marshal::Value::Int(0)),
     ]);
     let ty = client.sde.types.iter().find(|ty| {
-        ty.category_id != Some(crate::consts::CATEGORY_SHIP)
+        ty.category_id != Some(infinity_core::consts::CATEGORY_SHIP)
             && !client.sde.typelists.is_untrashable(
                 ty.type_id,
                 ty.group_id.unwrap_or_default(),
@@ -90,16 +92,18 @@ async fn committed_trash_removes_descendants_and_notifies_for_each_item() {
         "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
         &[&ty.type_id, &fixture.character, &parent, &FLAG_HANGAR],
     ).await.unwrap().get("item_id");
+    let (notify_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    client.notify_tx = notify_tx;
+    let expected = crate::services::items::load_items(&db, &client.sde, crate::dao::items::loading::ItemQuery::Ids(&[parent, child])).await.unwrap();
+    let expected_rows: Vec<_> = expected.into_iter().map(|item| {
+        let gone = Item { location_id: infinity_core::consts::LOCATION_JUNKYARD, ..item };
+        gone.row()
+    }).collect();
     assert_eq!(super::trash_items(&mut client, &[parent], station_id).await.unwrap(), marshal::Value::list([]));
-    assert_eq!(client.outbox.len(), 2, "one OnItemChange packet per removed item");
-    for packet in &client.outbox {
-        let packet = crate::macho::Packet::from_value(&packet.to_value()).unwrap();
-        assert_eq!(packet.command, crate::macho::cmd::NOTIFICATION);
-        assert!(matches!(
-            packet.destination,
-            crate::macho::Address::Broadcast { ref broadcast_id, .. }
-                if broadcast_id.as_text().as_deref() == Some("OnItemChange")
-        ));
+    let received: Vec<_> = std::iter::from_fn(|| notifications.try_recv().ok()).collect();
+    assert_eq!(received.len(), 2, "one OnItemChange per removed item");
+    for row in expected_rows {
+        assert!(received.iter().any(|(event, args)| event == "OnItemChange" && args.first() == Some(&row)));
     }
     assert_eq!(
         db.query_one("SELECT count(*) AS n FROM game.items WHERE item_id=ANY($1)", &[&vec![parent, child]]).await.unwrap().get::<_, i64>("n"),
@@ -121,7 +125,7 @@ async fn refused_trash_rolls_back_parent_and_descendants_without_notifications()
         ("shipid", marshal::Value::Int(0)),
     ]);
     let ty = client.sde.types.iter().find(|ty| {
-        ty.category_id != Some(crate::consts::CATEGORY_SHIP)
+        ty.category_id != Some(infinity_core::consts::CATEGORY_SHIP)
             && !client.sde.typelists.is_untrashable(
                 ty.type_id,
                 ty.group_id.unwrap_or_default(),

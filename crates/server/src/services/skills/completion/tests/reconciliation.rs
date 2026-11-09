@@ -1,8 +1,10 @@
 //! Scheduler expiry reconciles fitting resources in the committing transaction.
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::{
+use infinity_core::{
     consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTERNESS, dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_IMPLANT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, GROUP_BOOSTER},
+};
+use crate::{
     dao::items::dogma,
     db::outbox::Outbox,
     services::{effects::online::{self, OnlineChanged, OnlinePolicy}, fit::{Fit, Key}, skills::{brain_items, requirements::requirements}},
@@ -37,7 +39,7 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
             && t.effects().iter().any(|e| e.effect_id == 12)
             && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)
             && t.attribute(ATTR_CPU).is_some_and(|v| v > 0.0)
-            && !t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_TURRET_FITTED || e.effect_id == crate::consts::dogma::EFFECT_LAUNCHER_FITTED)).expect("high-slot module").type_id;
+            && !t.effects().iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_TURRET_FITTED || e.effect_id == infinity_core::consts::dogma::EFFECT_LAUNCHER_FITTED)).expect("high-slot module").type_id;
         for (skill, level) in requirements(&sde, booster).chain(requirements(&sde, module_type)) {
             let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, i64::from(level));
             training::set_level(&db, f.character, skill, level, points).await.unwrap();
@@ -60,11 +62,12 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         draws.sort_unstable_by_key(|v| v.0);
         draws.dedup_by_key(|v| v.0);
         let now = filetime_now();
+        let fences = online::capture_online_fences(&test_world, &[f.character]).await;
         {
             let _market = crate::services::market::lock().await;
             db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-                let sde = sde.clone(); let draws = draws.clone();
-                Box::pin(async move { brain_items::activate_tx(tx, outbox, &sde, f.character, None, item, Some(station), now, &draws, true).await })
+                let sde = sde.clone(); let draws = draws.clone(); let fences = fences.clone();
+                Box::pin(async move { brain_items::activate_tx(tx, outbox, &sde, &fences, f.character, None, item, Some(station), now, &draws, true).await })
             }, |value, outbox| { let client = &c; async move { online::dispatch_changed(value, outbox, client) } }).await.unwrap_or_else(|error| match error {
                 CallError::Internal(error) => panic!("booster activation: {error:#}"),
                 CallError::User { msg, .. } => panic!("booster activation refused: {msg}"),
@@ -78,12 +81,18 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let receiver = Arc::new(std::sync::Mutex::new(receiver));
         test_world.register_pilot(f.character, sender.clone());
+        let fences = online::capture_online_fences(&test_world, &[f.character]).await;
         let policy = OnlinePolicy { owner: f.character, active_ship: None, station: Some(station), notify: sender };
         {
             let _market = crate::services::market::lock().await;
             let changed = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-                let sde = sde.clone(); let policy = policy.clone();
-                Box::pin(async move { online::set_online_core(tx, &sde, &policy, outbox, ship, module, true).await })
+                let sde = sde.clone(); let policy = policy.clone(); let fences = fences.clone();
+                Box::pin(async move {
+                    let before = online::fitting::capture(tx, &sde, &fences, policy.owner, ship).await?;
+                    let (changed, fit) = online::set_online_core(tx, &sde, &policy, outbox, &fences, ship, module, true).await?;
+                    online::fitting::finish(tx, before, fit, outbox).await?;
+                    Ok(changed)
+                })
             }, |value, outbox| { let world = &test_world; async move { online::dispatch_changed_world(value, outbox, world) } }).await.ok().expect("online module");
             assert!(changed);
         }
@@ -103,11 +112,11 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         let failed: Result<(), CallError> = {
             let _market = crate::services::market::lock().await;
             db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
-                let sde = sde.clone(); let receiver = receiver.clone();
+                let sde = sde.clone(); let receiver = receiver.clone(); let fences = fences.clone();
                 Box::pin(async move {
                     crate::dao::characters::selection::lock_character(tx, f.character).await.map_err(db_err)?;
                     let progress = advance_tx(tx, outbox, &sde, f.character, filetime_now()).await?;
-                    finish_tx(tx, outbox, &sde, f.character, filetime_now(), &progress, &[]).await?;
+                    finish_tx(tx, outbox, &sde, &fences, f.character, filetime_now(), &progress, &[]).await?;
                     assert!(brain::get(tx, f.character, item).await.map_err(db_err)?.is_none());
                     assert!(dogma::online(tx, ship).await.map_err(db_err)?.is_empty());
                     assert!(receiver.lock().unwrap().try_recv().is_err(), "notification before commit");
@@ -138,7 +147,7 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         assert!(dogma::online(&db, ship).await.unwrap().is_empty());
         assert!(receiver.lock().unwrap().try_recv().is_err(), "retry emitted another notification");
     }).await;
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     scheduler::cancel(&db, &format!("{KIND}:{}", f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();

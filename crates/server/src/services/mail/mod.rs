@@ -24,8 +24,8 @@ use marshal::Value;
 pub(super) fn text_argument(v: &Value) -> Result<String, CallError> {
     match v {
         Value::Unicode(s) => Ok(s.clone()),
-        Value::Bytes(s) => String::from_utf8(s.clone()).map_err(|_| notify_error(crate::messages::mail::INVALID_ARGUMENT)),
-        _ => Err(notify_error(crate::messages::mail::INVALID_ARGUMENT)),
+        Value::Bytes(s) => String::from_utf8(s.clone()).map_err(|_| notify_error(infinity_core::messages::mail::INVALID_ARGUMENT)),
+        _ => Err(notify_error(infinity_core::messages::mail::INVALID_ARGUMENT)),
     }
 }
 

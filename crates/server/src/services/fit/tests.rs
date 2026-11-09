@@ -135,7 +135,7 @@ fn drone_node_overrides_are_independent_of_owner_bonus() {
 #[ignore = "requires a dedicated database with the retail SDE"]
 async fn real_sde_prospective_drone_and_projection_receivers() {
     use super::{Fit, Key};
-    use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::EFFECT_REMOTE_WEBIFIER_FALLOFF};
+    use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::EFFECT_REMOTE_WEBIFIER_FALLOFF};
     use crate::services::effects::{projection::Projection, EffectKind};
     use std::sync::Arc;
 
@@ -191,7 +191,7 @@ async fn real_sde_prospective_drone_and_projection_receivers() {
         .expect("web velocity modifier in SDE");
     let projection = Projection { source_ship: 1, kind: EffectKind::Modifiers, until_ms: i64::MAX,
         source_module: 42, source_type: 587, effect_id: EFFECT_REMOTE_WEBIFIER_FALLOFF,
-        values: vec![(modifier.modifying, -60.0)], charge_values: vec![], charge_type: None };
+        values: vec![(modifier.modifying, -60.0)], charge_values: vec![], charge_type: None, scramble: None };
     let ship_before = fit.value(Key::Ship, ATTR_MAX_VELOCITY);
     Fit::insert_projections(&sde, &mut fit.nodes, Key::Drone(7), vec![projection.clone()]);
     fit.memo.get_mut().unwrap().clear();
@@ -207,7 +207,7 @@ async fn real_sde_prospective_drone_and_projection_receivers() {
 
 #[test]
 fn projected_category_gate_uses_receiving_hull() {
-    use crate::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
+    use infinity_core::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
     for actual in [Some(CATEGORY_SHIP), Some(CATEGORY_ENTITY), Some(CATEGORY_DRONE), None] {
         assert!(super::category_matches(None, actual));
         assert_eq!(super::category_matches(Some(CATEGORY_SHIP), actual), actual == Some(CATEGORY_SHIP));
@@ -219,7 +219,7 @@ fn projected_category_gate_uses_receiving_hull() {
 #[test]
 fn drone_and_ship_projections_keep_receivers_and_owner_bonus_separate() {
     use super::{category_matches, modifier_applies, Key, Location};
-    use crate::consts::{CATEGORY_DRONE, CATEGORY_SHIP};
+    use infinity_core::consts::{CATEGORY_DRONE, CATEGORY_SHIP};
     let ship = fixture_node(Location::Space);
     let drone = fixture_node(Location::Space);
     let owner = fixture_modifier("OwnerRequiredSkillModifier", "charID");
@@ -418,7 +418,7 @@ fn unknown_type_uses_attribute_default() {
 
 #[test]
 fn drone_physical_base_corrects_only_missing_or_nonpositive_inputs() {
-    use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS};
+    use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS};
     let drone = Some(CATEGORY_DRONE);
     for value in [None, Some(0.0), Some(-1.0)] {
         assert_eq!(super::physical_base(drone, ATTR_MASS, value), Some(DRONE_FALLBACK_MASS));
@@ -462,7 +462,7 @@ fn node_override_precedence_and_modifier() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn brain_snapshot_respects_activation_and_expiry() {
-    use crate::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
+    use infinity_core::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
     use crate::dao::items::fit::brain_items;
     use crate::services::tests::fixture;
     crate::tests::init_config();
@@ -485,7 +485,7 @@ async fn brain_snapshot_respects_activation_and_expiry() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn selected_booster_effect_changes_fit_and_wire_brain() {
-    use crate::consts::FLAG_BOOSTER;
+    use infinity_core::consts::FLAG_BOOSTER;
     use crate::services::tests::{client, fixture};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -493,7 +493,7 @@ async fn selected_booster_effect_changes_fit_and_wire_brain() {
     let (c, _peer) = client(db.clone(), f.character).await;
     let mut exercised = false;
     'types: for data in c.sde.types.iter() {
-        if data.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_none() { continue; }
+        if data.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_none() { continue; }
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
             if effect.effect_category.unwrap_or(0) != 0 || !effect.fitting_usage_chance_attribute_id.is_some_and(|id| data.attribute(id).is_some()) { continue; }
@@ -533,7 +533,7 @@ async fn selected_booster_effect_changes_fit_and_wire_brain() {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn expert_fit_projects_virtual_level_and_dogma_sp_without_mutating_training() {
     use std::sync::Arc;
-    use crate::consts::dogma::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS};
+    use infinity_core::consts::dogma::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS};
     use crate::services::tests::fixture;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -542,7 +542,7 @@ async fn expert_fit_projects_virtual_level_and_dogma_sp_without_mutating_trainin
     let definition = sde.expert_systems.iter().find(|definition| definition.skills.first().is_some()).expect("expert definition with skills");
     let (skill_type, virtual_level) = definition.skills[0];
     let expert_type = definition.type_id;
-    let rank = sde.types.get(skill_type).and_then(|skill| skill.fit_attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT)).expect("skill rank in SDE");
+    let rank = sde.types.get(skill_type).and_then(|skill| skill.fit_attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT)).expect("skill rank in SDE");
     let trained_points = crate::services::skills::formulas::sp_for_level(rank, 1);
     db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&f.character, &skill_type, &trained_points]).await.unwrap();
     db.execute("INSERT INTO game.character_expert_systems (character_id,type_id,installed_at,expires_at) VALUES ($1,$2,100,300)", &[&f.character, &expert_type]).await.unwrap();

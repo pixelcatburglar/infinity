@@ -13,7 +13,7 @@ use super::*;
 use super::attributes::character_attributes_at;
 use super::formulas::sp_for_level;
 use crate::client::filetime_now;
-use crate::consts::{CATEGORY_SKILL, FILETIME_MINUTE, dogma::{CHAR_ATTRIBUTES, MAX_SKILL_LEVEL}};
+use infinity_core::consts::{CATEGORY_SKILL, FILETIME_MINUTE, dogma::{CHAR_ATTRIBUTES, MAX_SKILL_LEVEL}};
 use crate::db::executor::Executor;
 use crate::db::outbox::{Notification, Outbox};
 use crate::services::identity::Identity;
@@ -46,27 +46,27 @@ fn refusal(msg: &'static str) -> CallError {
 }
 
 fn parse_queue(queue: &Value) -> Result<Vec<(i64, i64, i64)>, CallError> {
-    let Value::Dict(pairs) = queue else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
+    let Value::Dict(pairs) = queue else { return Err(refusal(infinity_core::messages::MSG_QUEUE_INVALID_POSITION)) };
     if pairs.len() > MAX_QUEUE_ENTRIES {
-        return Err(CallError::User { msg: crate::messages::MSG_QUEUE_TOO_MANY.into(), dict: vec![("num".into(), Value::Int(MAX_QUEUE_ENTRIES as i64))] });
+        return Err(CallError::User { msg: infinity_core::messages::MSG_QUEUE_TOO_MANY.into(), dict: vec![("num".into(), Value::Int(MAX_QUEUE_ENTRIES as i64))] });
     }
     let mut entries = Vec::with_capacity(pairs.len());
     for (key, value) in pairs {
-        let Value::Int(position) = key else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
-        let (Value::Tuple(values) | Value::List(values)) = value else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
-        let [Value::Int(type_id), Value::Int(level)] = values.as_slice() else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
-        if *position < 0 { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)); }
+        let Value::Int(position) = key else { return Err(refusal(infinity_core::messages::MSG_QUEUE_INVALID_POSITION)) };
+        let (Value::Tuple(values) | Value::List(values)) = value else { return Err(refusal(infinity_core::messages::MSG_QUEUE_INVALID_POSITION)) };
+        let [Value::Int(type_id), Value::Int(level)] = values.as_slice() else { return Err(refusal(infinity_core::messages::MSG_QUEUE_INVALID_POSITION)) };
+        if *position < 0 { return Err(refusal(infinity_core::messages::MSG_QUEUE_INVALID_POSITION)); }
         entries.push((*position, *type_id, *level));
     }
     entries.sort_unstable_by_key(|entry| entry.0);
     if entries.iter().enumerate().any(|(index, entry)| entry.0 != index as i64) {
-        return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION));
+        return Err(refusal(infinity_core::messages::MSG_QUEUE_INVALID_POSITION));
     }
     Ok(entries)
 }
 
 fn validate_queue(sde: &crate::sde::Sde, entries: &[(i64, i64, i64)], current: &HashMap<i32, (i32, i64)>) -> Result<(), CallError> {
-    use crate::messages as m;
+    use infinity_core::messages as m;
     if entries.len() > MAX_QUEUE_ENTRIES {
         return Err(CallError::User { msg: m::MSG_QUEUE_TOO_MANY.into(), dict: vec![("num".into(), Value::Int(MAX_QUEUE_ENTRIES as i64))] });
     }
@@ -88,7 +88,11 @@ fn validate_queue(sde: &crate::sde::Sde, entries: &[(i64, i64, i64)], current: &
         if level != previous + 1 { return Err(refusal(m::MSG_QUEUE_LEVELS_OUT_OF_ORDER)); }
         if points == 0 {
             for (required, required_level) in super::requirements::requirements(sde, type_id) {
-                let Some(&(trained_required, _)) = current.get(&required) else { return Err(refusal(m::MSG_QUEUE_BEFORE_REQUIREMENTS)) };
+                let trained_required = match current.get(&required) {
+                    Some(&(level, _)) => level,
+                    None if required_level == 0 => 0,
+                    None => return Err(refusal(m::MSG_QUEUE_BEFORE_REQUIREMENTS)),
+                };
                 if trained_required.max(levels.get(&required).copied().unwrap_or(0)) < required_level {
                     let later = entries[index + 1..].iter().any(|&(_, t, l)| t == i64::from(required) && l == i64::from(required_level));
                     return Err(refusal(if later { m::MSG_QUEUE_AFTER_DEPENDENTS } else { m::MSG_QUEUE_BEFORE_REQUIREMENTS }));
@@ -100,13 +104,13 @@ fn validate_queue(sde: &crate::sde::Sde, entries: &[(i64, i64, i64)], current: &
     Ok(())
 }
 
-pub(super) struct SkillType {
-    pub(super) rank: f64,
+pub(in crate::services) struct SkillType {
+    pub(in crate::services) rank: f64,
     primary: i64,
     secondary: i64,
 }
 
-pub(super) fn skill_type(sde: &crate::sde::Sde, type_id: i32) -> SkillType {
+pub(in crate::services) fn skill_type(sde: &crate::sde::Sde, type_id: i32) -> SkillType {
     let attribute = |id| sde.types.attribute(type_id, id);
     SkillType {
         rank: attribute(ATTR_RANK).unwrap_or(FALLBACK_SKILL_RANK),
@@ -133,14 +137,9 @@ pub(super) fn plan_skills(done: &[(i32, i32, i64)], training: Option<(i32, i64)>
     plan
 }
 
-pub(super) fn queue_training_events<X>(outbox: &mut Outbox<X>, char_id: i64, finished: &[(i32, i32)]) {
-    for &(type_id, level) in finished {
-        outbox.event(crate::lua::events::GameEvent::SkillTrained { char_id, type_id, level });
-    }
-}
 
 /// Interpolate a queue interval, clamped to its stored bounds.
-pub(super) fn points_at(start_sp: i64, dest_sp: i64, start: i64, end: i64, at: i64) -> i64 {
+pub(in crate::services) fn points_at(start_sp: i64, dest_sp: i64, start: i64, end: i64, at: i64) -> i64 {
     let elapsed = (at as i128 - start as i128).max(0);
     let duration = (end as i128 - start as i128).max(1);
     let fraction = (elapsed as f64 / duration as f64).clamp(0.0, 1.0);
@@ -195,7 +194,7 @@ pub(crate) async fn queue_list(identity: &Identity, db: &(impl Executor + ?Sized
     queue_dao::list(db, identity.char_id).await.map_err(db_err)
 }
 
-pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut progress: super::completion::AdvanceResult, additional: &[i32]) -> Result<super::completion::AdvanceResult, CallError> {
+pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<crate::sde::Sde>, fences: &online::OnlineFences, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut progress: super::completion::AdvanceResult, additional: &[i32]) -> Result<super::completion::AdvanceResult, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     progress.merge(super::completion::advance_tx(tx, outbox, sde, char_id, now).await?);
     let training = in_training_sp(tx, char_id, now).await?;
@@ -219,7 +218,7 @@ pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Exec
     let previous_queue_changed = progress.queue_changed;
     progress.queue_changed |= changed;
     if !notify { progress.queue_changed = previous_queue_changed; }
-    super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, additional).await?;
+    super::completion::finish_tx(tx, outbox, sde, fences, char_id, now, &progress, additional).await?;
     if notify && !progress.queue_changed {
         outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![super::skill_handler::queue_value(&queue_dao::list(tx, char_id).await.map_err(db_err)?)]);
     }
@@ -227,17 +226,19 @@ pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Exec
     Ok(progress)
 }
 /// `SaveNewQueue({idx: (typeID, toLevel)}, activate=bool)`: rebuild the queue with timings.
-pub(crate) async fn save_queue(identity: &Identity, db: &crate::db::Db, sde: &Arc<crate::sde::Sde>, queue: &Value, activate: bool, notify: bool, dispatch: impl FnMut(Notification) -> Result<(), CallError> + Send) -> Result<(), CallError> {
+pub(crate) async fn save_queue(identity: &Identity, db: &crate::db::Db, world: &crate::space::World, sde: &Arc<crate::sde::Sde>, queue: &Value, activate: bool, notify: bool, dispatch: impl FnMut(Notification) -> Result<(), CallError> + Send) -> Result<(), CallError> {
     let now = filetime_now();
     let entries = parse_queue(queue)?;
     let char_id = identity.char_id;
     let _market = crate::services::market::lock().await;
+    let fences = online::capture_online_fences(world, &[char_id]).await;
     db.transaction(
         |tx, outbox: &mut Outbox<OnlineChanged>| {
             let entries = entries.clone();
             let sde = sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, char_id, entries, activate, notify, now, Default::default(), &[]).await
+                save_queue_tx(tx, outbox, &sde, &fences, char_id, entries, activate, notify, now, Default::default(), &[]).await
             })
         },
         |progress, outbox| async move {
@@ -245,7 +246,7 @@ pub(crate) async fn save_queue(identity: &Identity, db: &crate::db::Db, sde: &Ar
                 info!("character {char_id} finished training skill {type_id} to level {level}");
             }
             crate::scheduler::wake();
-            online::dispatch_entries((), outbox, dispatch)?;
+            online::dispatch_entries((), outbox, world, dispatch)?;
             Ok(())
         },
     ).await

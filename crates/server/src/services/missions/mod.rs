@@ -40,8 +40,8 @@ use super::{combat, inventory, items, off_surface, ship, site_position, standing
 
 use super::{db_err, keyval, rand01, rand_dir, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{FLAG_CARGO, FLAG_HANGAR, IX_STACK_SIZE, TYPE_SOLAR_SYSTEM};
-use crate::messages;
+use infinity_core::consts::{FLAG_CARGO, FLAG_HANGAR, IX_STACK_SIZE, TYPE_SOLAR_SYSTEM};
+use infinity_core::messages;
 use crate::space::{dist, now_ms, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};

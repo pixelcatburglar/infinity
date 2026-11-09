@@ -66,6 +66,14 @@ impl Default for WarpState {
 pub enum WarpOutcome { Ignored, Approach, Align }
 
 impl Ball {
+    /// Convert AU/s to the integer milli-AU/s carried by destiny.
+    pub(crate) fn warp_factor_from_speed(speed_au_per_second: f64) -> Option<i64> {
+        if !speed_au_per_second.is_finite() || speed_au_per_second <= 0.0 { return None; }
+        let factor = (speed_au_per_second / FACTOR_TO_AU_PER_SECOND).round();
+        if !factor.is_finite() || factor >= i64::MAX as f64 { return None; }
+        Some(factor as i64)
+    }
+
     /// Initialize a native WarpTo request without changing throttle.
     pub fn warp_to(&mut self, point: V3, min_range: f64, factor: i64) -> WarpOutcome {
         if !point.iter().all(|v| v.is_finite()) { return WarpOutcome::Ignored; }
@@ -89,7 +97,7 @@ impl Ball {
 
     pub fn is_warping(&self) -> bool { self.mode == MODE_WARP && self.effect_stamp >= 0 }
 
-    fn is_aligned_for_warp(&self) -> bool {
+    pub(super) fn is_aligned_for_warp(&self) -> bool {
         if self.mode != MODE_WARP || self.effect_stamp >= 0 { return false; }
         let direction = norm(sub(self.goto, self.pos));
         let velocity = norm(self.vel);
@@ -113,8 +121,15 @@ impl Ball {
 
     /// Ballpark::RealWarp activates an aligned warp.
     fn real_warp(&mut self, current_time: i64) {
-        let delta = norm(sub(self.pos, self.goto));
-        self.goto = add(self.goto, scale(delta, self.warp.min_range));
+        self.activate_warp_to(current_time, self.resolved_warp_endpoint());
+    }
+
+    pub(super) fn resolved_warp_endpoint(&self) -> V3 {
+        add(self.goto, scale(norm(sub(self.pos, self.goto)), self.warp.min_range))
+    }
+
+    pub(super) fn activate_warp_to(&mut self, current_time: i64, endpoint: V3) {
+        self.goto = endpoint;
         self.effect_stamp = current_time;
         self.warp.length = len(sub(self.goto, self.pos));
         self.warp.profile = Some(WarpProfile::setup_warp_constants(self.warp.factor, self.warp.length));

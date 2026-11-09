@@ -14,7 +14,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
     let db = &ctx.resources.db;
     let world = &ctx.resources.world;
     let system = super::SYSTEM;
-    let ty = crate::consts::TYPE_CAPSULE;
+    let ty = infinity_core::consts::TYPE_CAPSULE;
     let fixtures: Vec<(i64, i64, i64)> = db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let mut rows = Vec::new();
         for _ in 0..2 {
@@ -43,9 +43,12 @@ pub(super) async fn run(ctx: &super::super::Context) {
             clients.push(client);
             peers.push(peer);
             // Start separated and aligned to exercise a sustained physical warp.
-            let mut ball = super::ball(ship, ty, Some(character), -(index as f64) * 10_000.0);
-            ball.vel = [100.0, 0.0, 0.0];
-            world.add_ship(system, ball).await.unwrap();
+            let row = crate::dao::items::space_ships::FreeShip { item_id: ship, type_id: ty, owner_id: character, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+            let mut prepared = crate::services::ship::balls::piloted(db, ctx.resources.sde.clone(), &row, character, 0.0).await.unwrap();
+            prepared.ball = super::ball(ship, ty, Some(character), -(index as f64) * 10_000.0);
+            prepared.ball.vel = [100.0, 0.0, 0.0];
+            world.system(system).await.unwrap();
+            world.with(system, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
             world.observe(system, ship, ship, clients.last().unwrap().destiny_tx.clone()).await.unwrap();
         }
         world.add_ship(system, super::ball(target, ty, None, 1_000_000_000.0)).await.unwrap();
@@ -105,6 +108,9 @@ pub(super) async fn run(ctx: &super::super::Context) {
     world.remove_ball(system, target).await;
     let fixtures = [fixtures[0], fixtures[1]];
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        for &(account, character, _) in &fixtures {
+            crate::services::tests::fixture::cleanup_progress(tx, &[account, character], &[character]).await?;
+        }
         for (account, character, ship) in fixtures {
             tx.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&ship]).await?;
             tx.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship]).await?;

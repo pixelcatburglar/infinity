@@ -20,7 +20,7 @@ const DECODE_ERROR_PREVIEW_BYTES: usize = 64;
 
 /// Raw GPS close exception, not a MachoNet packet.
 pub fn usurped_close() -> Value {
-    let reason = Value::str(crate::messages::SESSION_USURPED);
+    let reason = Value::str(infinity_core::messages::SESSION_USURPED);
     Value::Reduce {
         data: Box::new(Value::tuple([
             Value::global("exceptions.GPSTransportClosed"),
@@ -44,7 +44,7 @@ pub fn not_accepting_close() -> Value {
             Value::tuple([Value::None]),
             Value::dict([
                 ("reason", Value::None),
-                ("reasonCode", Value::str(crate::messages::ACL_NOTACCEPTING)),
+                ("reasonCode", Value::str(infinity_core::messages::ACL_NOTACCEPTING)),
                 ("reasonArgs", Value::Dict(vec![])),
             ]),
         ])),

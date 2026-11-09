@@ -1,11 +1,11 @@
 //! crateService RPCs used by eve/client/script/ui/crate/controller.py and
 //! recruitment_crate_controller.py. The SDE catalogue supplies preview data;
-//! instance previews consult authenticated inventory. Round-one opening supports
-//! only ordinary direct-list definitions; custom and special claims remain refused.
+//! instance previews consult authenticated inventory. Destination queries and
+//! opening support ordinary direct-list definitions; custom and special claims remain refused.
 
 use super::catalogue;
 use crate::client::Client;
-use crate::messages::crates as messages;
+use infinity_core::messages::crates as messages;
 use crate::services::{notify_error, Call, CallResult};
 use crate::services::identity::Identity;
 use marshal::Value;
@@ -29,6 +29,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             Some(item_id) => catalogue::instance(c, item_id, call.method == "CustomGetLootFromFixedCrate").await,
             None => Err(notify_error(messages::INVALID_SOURCE)),
         },
+        "GetCrateLocation" => match id() {
+            Some(source) => super::opening::location(c, source).await,
+            None => Err(notify_error(messages::INVALID_SOURCE)),
+        },
         "OpenCrate" => match id() {
             Some(source) => super::opening::open(c, source, 1, false).await,
             None => Err(notify_error(messages::INVALID_SOURCE)),
@@ -44,7 +48,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             Some((item, destination, flag)) => super::claims::claim_loot(c, item, destination, flag).await,
             None => Err(notify_error(messages::INVALID_SOURCE)),
         },
-        "GetCrateLocation" | "CustomOpenCrate" | "ClaimSkillBundle" | "ClaimFitting" => Err(notify_error(messages::OPENING_UNAVAILABLE)),
+        "CustomOpenCrate" | "ClaimSkillBundle" | "ClaimFitting" => Err(notify_error(messages::OPENING_UNAVAILABLE)),
         _ => return None,
     })
 }

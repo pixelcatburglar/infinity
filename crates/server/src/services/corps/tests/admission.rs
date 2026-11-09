@@ -1,5 +1,6 @@
 //! Player-facing corporation application state transitions.
-use crate::{client::Client, consts::ROLE_DIRECTOR, db::Db, services::{Call, CallResult, tests::{self, fixture}}};
+use infinity_core::consts::ROLE_DIRECTOR;
+use crate::{client::Client, db::Db, services::{Call, CallResult, tests::{self, fixture}}};
 mod admission_events;
 mod effects;
 mod creation_capacity;

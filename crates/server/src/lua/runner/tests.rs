@@ -8,7 +8,7 @@ fn registry(source: &str) -> Arc<Registry> {
     let function = lua.load(source).eval().unwrap();
     let mut claims = Claims::default();
     claims.ticks.push(Tick { handler: Handler { script: "test".into(), function }, name: "pulse".into(), interval: Duration::from_millis(100), skipped: AtomicU64::new(0) });
-    Arc::new(Registry { lua, claims, overrides: Mutex::new(Default::default()) })
+    Arc::new(Registry { lua, claims, content: Default::default(), overrides: Mutex::new(Default::default()) })
 }
 
 fn config() -> LuaConfig {

@@ -1,9 +1,9 @@
 //! Share ownership and transfers for `eve/client/script/ui/services/corporation/bco_shares.py`.
 //! Uses the corporation share ledger and transfer receipts; share issuance votes are unsupported.
 use super::*;
-use crate::consts::{ROLE_ACCOUNTANT, ROLE_JUNIOR_ACCOUNTANT};
+use infinity_core::consts::{ROLE_ACCOUNTANT, ROLE_JUNIOR_ACCOUNTANT};
 use crate::dao::corporations::shares as dao;
-use crate::messages::corporations as text;
+use infinity_core::messages::corporations as text;
 use crate::services::{crowset, has_role_or_is_ceo};
 
 const COLUMNS: [&str; 4] = ["corporationID", "shareholderID", "shareholderCorporationID", "shares"];

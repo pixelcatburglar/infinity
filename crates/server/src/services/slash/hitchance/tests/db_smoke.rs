@@ -1,8 +1,15 @@
 //! Database-backed slash oracle against sampled actor state and real SDE types.
 use std::sync::Arc;
+use infinity_core::{
+    consts::{dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_TRACKING_SPEED, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST, GM_ROLES},
+};
 use crate::{
-    config::Config, conn::Conn, consts::{dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_TRACKING_SPEED, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST, GM_ROLES},
-    db::Db, handshake::Login, sde::Sde, services::effects::{registry, EffectKind},
+    config::Config,
+    conn::Conn,
+    db::Db,
+    handshake::Login,
+    sde::Sde,
+    services::effects::{registry, EffectKind},
     space::{Ball, WarpState, World, MODE_STOP},
 };
 use marshal::Value;
@@ -26,7 +33,7 @@ fn ball(id: i64, type_id: i32, owner: i64, pos: [f64; 3], vel: [f64; 3], radius:
         mode: MODE_STOP, radius, mass: 1e6, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos, vel, old_pos: pos, old_vel: vel, segment_acceleration: None,
         goto: pos, follow_id: 0, follow_range: 0.0, free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
 

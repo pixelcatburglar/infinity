@@ -2,7 +2,8 @@
 //! reads the server capacity rather than computing a local formula. Capacity uses the effective
 //! CEO skill snapshot from `game.skills` and expert systems together with SDE dogma attributes
 //! and effects. Racial membership restrictions are not modeled.
-use crate::{consts::dogma::ATTR_SKILL_LEVEL, db::executor::Executor, sde::Sde, services::{CallError, skills::effective}};
+use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
+use crate::{db::executor::Executor, sde::Sde, services::{CallError, skills::effective}};
 use crate::services::fit::{OP_MOD_ADD, OP_PRE_MUL};
 
 pub(super) async fn capacity(ex: &(impl Executor + ?Sized), sde: &Sde, ceo: i64, now: i64) -> Result<i64, CallError> {

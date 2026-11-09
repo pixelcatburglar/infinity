@@ -101,7 +101,7 @@ async fn authenticated_socket_rejects_forged_rooms_without_occupants() {
         assert!(read_until(&mut outsider_socket, "</message>").await.contains("type='error'"));
         outsider_socket.write_all(format!("<presence id='password' to='corp_{}@conference.chat.test/{}'><x xmlns='http://jabber.org/protocol/muc'><password>secret</password></x></presence>", outsider.id, outsider.id).as_bytes()).await.unwrap();
         let password = read_until(&mut outsider_socket, "</presence>").await;
-        assert!(password.contains("type='error'") && password.contains(crate::messages::chat::UNSUPPORTED_PASSWORD));
+        assert!(password.contains("type='error'") && password.contains(infinity_core::messages::chat::UNSUPPORTED_PASSWORD));
         let response = presence(&mut outsider_socket, &format!("{}@conference.chat.test", private.name), owner.id, "impersonate").await;
         assert!(response.contains("type='error'"));
         assert!(!hub.rooms.lock().unwrap().entries.contains_key(&format!("{}@conference.chat.test", private.name)));
@@ -139,7 +139,7 @@ async fn socket_expiry_role_display_and_destroy() {
         guest_client.change_session(vec![("charid", Value::Int(guest.id))]);
         let channel = dao::create_player(&test_db, owner.id, &format!("SocketDisplay{}", owner.id)).await.unwrap();
         let room = format!("{}@conference.chat.test", channel.name);
-        let session = crate::session::OnlineSession { character_id: owner.id, user_id: None, session_id: owner.id, ship_id: None, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+        let session = infinity_core::session::OnlineSession { character_id: owner.id, user_id: None, session_id: owner.id, ship_id: None, station_id: None, system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
         crate::services::chat::authority::configure(&test_db, &hub, &session, &channel.name, crate::services::chat::authority::RoomConfig { display_name: channel.display_name.clone(), public: true, moderated: true, members_by_default: false }).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut tasks = Tasks(Vec::new());

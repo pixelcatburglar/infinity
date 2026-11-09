@@ -5,7 +5,8 @@
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, Ordering}};
 use mlua::{Lua, MultiValue, Thread, UserData, UserDataFields, UserDataMethods};
 use tokio::sync::{mpsc, oneshot};
-use crate::{client::Client, consts::GM_ROLES, lua::value::{from_lua, WireValue}, services::CallError};
+use infinity_core::consts::GM_ROLES;
+use crate::{client::Client, lua::value::{from_lua, WireValue}, services::CallError};
 use marshal::Value;
 
 struct Context {
@@ -18,17 +19,40 @@ struct Context {
 
 struct Session { live: Arc<AtomicBool>, tx: mpsc::UnboundedSender<Request> }
 
+pub(crate) struct AdaptionInvocation<'a> {
+    pub host: &'a Arc<crate::lua::reload::Host>,
+    pub pin: crate::lua::content::PinnedPolicy,
+    pub request: crate::services::ship_adaption::model::Request,
+    pub identity: crate::services::identity::Identity,
+    pub user: i64,
+}
+
 enum Request {
     Get(String, oneshot::Sender<Value>),
     Notify(String, Vec<Value>, oneshot::Sender<()>),
     Change(Vec<(String, Value)>, oneshot::Sender<()>),
     Bind(String, Value, oneshot::Sender<Value>),
     Mutation(Mutation, oneshot::Sender<Result<Option<i64>, CallError>>),
+    ContentSnapshot(ContentKind, oneshot::Sender<Result<ContentSnapshot, CallError>>),
+    ContentCommit(ContentKind, Option<i64>, oneshot::Sender<Result<Value, CallError>>),
+}
+
+#[derive(Clone, Copy)]
+enum ContentKind { Sovereignty, ShipAdaption }
+enum ContentSnapshot { Wire(Value), Revision(i64) }
+impl ContentKind {
+    fn parse(namespace: &str) -> mlua::Result<Self> {
+        match namespace {
+            "sovereignty" => Ok(Self::Sovereignty),
+            "ship_adaption" => Ok(Self::ShipAdaption),
+            _ => Err(mlua::Error::runtime("unknown content namespace")),
+        }
+    }
 }
 
 pub(super) enum Mutation {
-    Wallet { character: i64, amount: f64, credit: bool },
-    Create { owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32 },
+    Wallet { character: i64, amount: crate::isk::IskAmount, credit: bool },
+    Create { owner: i64, location: i64, flag: i32, type_id: i32, quantity: i64 },
     Move { container: crate::services::inventory::access::Container, item: i64, flag: Option<i32>, quantity: Option<i64> },
     Delete { item: i64 },
     Mail(crate::services::mail::delivery::SendMail),
@@ -61,15 +85,10 @@ impl std::fmt::Display for UserError {
 impl std::error::Error for UserError {}
 
 fn call_error(error: mlua::Error) -> CallError {
-    let mut cause: &(dyn std::error::Error + 'static) = &error;
-    loop {
-        if let Some(user) = cause.downcast_ref::<UserError>() {
-            return CallError::User { msg: user.msg.clone(), dict: user.dict.clone() };
-        }
-        match cause.source() {
-            Some(next) => cause = next,
-            None => return CallError::Internal(error.into()),
-        }
+    if let Some(user) = error.downcast_ref::<UserError>() {
+        CallError::User { msg: user.msg.clone(), dict: user.dict.clone() }
+    } else {
+        CallError::Internal(error.into())
     }
 }
 
@@ -100,6 +119,26 @@ impl UserData for Context {
     }
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("is_gm", |_, this, ()| { valid(&this.live)?; Ok(this.role & GM_ROLES != 0) });
+        methods.add_async_method("content_snapshot", |lua, this, namespace: String| async move {
+            valid(&this.live)?;
+            let kind = ContentKind::parse(&namespace)?;
+            let (tx, rx) = oneshot::channel();
+            this.tx.send(Request::ContentSnapshot(kind, tx)).map_err(|_| mlua::Error::runtime("client context has expired"))?;
+            match rx.await.map_err(|_| mlua::Error::runtime("client context has expired"))?.map_err(lua_error)? {
+                ContentSnapshot::Wire(value) => Ok(mlua::Value::UserData(lua.create_userdata(WireValue(value))?)),
+                ContentSnapshot::Revision(value) => Ok(mlua::Value::Integer(value)),
+            }
+        });
+        // A read-only namespace may use commit to deliver its original request's
+        // response; the bound invocation, never the script, determines the operation.
+        methods.add_async_method("content_commit", |_, this, (namespace, revision): (String, mlua::Value)| async move {
+            valid(&this.live)?;
+            let kind = ContentKind::parse(&namespace)?;
+            let revision = match revision { mlua::Value::Integer(value) if value >= 0 => Some(value), _ => None };
+            let (tx, rx) = oneshot::channel();
+            this.tx.send(Request::ContentCommit(kind, revision, tx)).map_err(|_| mlua::Error::runtime("client context has expired"))?;
+            Ok(WireValue(rx.await.map_err(|_| mlua::Error::runtime("client context has expired"))?.map_err(lua_error)?))
+        });
         methods.add_async_method("notify", |_, this, (event, args): (String, mlua::Variadic<mlua::Value>)| async move {
             valid(&this.live)?;
             let args = args.into_iter().map(from_lua).collect::<mlua::Result<Vec<_>>>()?;
@@ -168,7 +207,7 @@ async fn apply_mutation(c: &mut Client, operation: Mutation) -> Result<Option<i6
             db.transaction(
                 |tx, outbox: &mut Outbox| {
                     let sde = sde.clone();
-                    Box::pin(async move { items::deposit(tx, &sde, outbox, owner, location, flag, type_id, quantity, 0).await })
+                    Box::pin(async move { items::deposit(tx, &sde, outbox, &crate::services::inventory::destination::Destination::owned(owner, location, flag), type_id, quantity, 0).await.map(|_| ()) })
                 },
                 |value, outbox| async move { dispatch_client(value, outbox, c) },
             ).await?;
@@ -189,6 +228,75 @@ async fn apply_mutation(c: &mut Client, operation: Mutation) -> Result<Option<i6
     }
 }
 
+async fn run_adaption(c: &mut Client, invocation: AdaptionInvocation<'_>, snapshot: crate::dao::ship_adaption::Snapshot, live: &AtomicBool, deadline: tokio::time::Instant) -> Result<Value, CallError> {
+    use crate::{lua::content::{adaption, protocol::{self, Identity, Response}}, services::{db_err, ship_adaption::{model::Request, operations, policy::{self, Input}, wire}}};
+    let AdaptionInvocation { host, pin, request, identity, user } = invocation;
+    let definitions = pin.adaption().ok_or_else(|| db_err(anyhow::anyhow!("missing adaptation catalogue")))?.clone();
+    let character = identity.char_id;
+    if c.login.user_id != user || c.session.int("charid") != Some(character) {
+        return Err(operations::refusal(&definitions, adaption::INVALID));
+    }
+    let wire_identity = || Identity { user, character };
+    match request {
+        Request::Tree(tree) => {
+            if !definitions.published_tree(tree) { return Err(operations::refusal(&definitions, adaption::INVALID)); }
+            let text = protocol::encode_content_text(Response::Tree { identity: wire_identity(), tree }).map_err(db_err)?;
+            c.notify("OnTreeResponsed", vec![Value::str(text)]);
+            return Ok(Value::None);
+        }
+        Request::Missions => {
+            let text = protocol::encode_content_text(Response::Mission { identity: wire_identity() }).map_err(db_err)?;
+            c.notify("OnMissionResponsed", vec![Value::str(text)]);
+            return Ok(Value::None);
+        }
+        Request::User => {
+            let text = wire::user(&definitions, &snapshot, user, character)?;
+            c.notify("OnUserResponsed", vec![Value::str(text)]);
+            return Ok(Value::None);
+        }
+        Request::Inject { item, quantity } => {
+            let row = crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::Id(item)).await.map_err(db_err)?.pop()
+                .ok_or_else(|| operations::refusal(&definitions, adaption::ITEM))?;
+            let credit = policy::conversion(&c.sde, &definitions, row.type_id, quantity);
+            let input = Input { definitions: definitions.clone(), item_type: Some(row.type_id), quantity, credit, issuer: 0, chips: Arc::new(Vec::new()) };
+            let plan = policy::plan(&pin, input, deadline.into_std())?.ok_or_else(|| operations::refusal(&definitions, adaption::ITEM))?;
+            return submit_adaption(c, host.clone(), pin, identity, user, snapshot.revision(), plan, Some(item), live, deadline).await;
+        }
+        Request::Exchange { issuer, chips } => {
+            let input = Input { definitions: definitions.clone(), item_type: None, quantity: 0, credit: None, issuer, chips: Arc::new(chips) };
+            let plan = policy::plan(&pin, input, deadline.into_std())?.ok_or_else(|| operations::refusal(&definitions, adaption::CHIPS))?;
+            return submit_adaption(c, host.clone(), pin, identity, user, snapshot.revision(), plan, None, live, deadline).await;
+        }
+    }
+}
+
+async fn submit_adaption(c: &Client, host: Arc<crate::lua::reload::Host>, pin: crate::lua::content::PinnedPolicy, identity: crate::services::identity::Identity, user: i64, expected: i64, plan: crate::services::ship_adaption::policy::PreparedPlan, item: Option<i64>, live: &AtomicBool, deadline: tokio::time::Instant) -> Result<Value, CallError> {
+    use crate::{lua::content::{adaption, AdmissionError}, services::{market, ship_adaption::operations}};
+    let db = c.db.clone();
+    let world = c.world.clone();
+    let sender = c.notify_tx.clone();
+    let sde = c.sde.clone();
+    let (tx, rx) = oneshot::channel();
+    if !live.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
+        return Err(CallError::Internal(super::super::vm::budget_exceeded().into()));
+    }
+    tokio::spawn(async move {
+        let _market = market::lock().await;
+        let result = match host.admit(&pin) {
+            Ok(admitted) => match plan.admit(Arc::new(admitted)) {
+                Ok(Some(plan)) => operations::commit(&db, &world, &sender, sde, identity, user, expected, Arc::new(plan), item).await,
+                Ok(None) => Err(operations::refusal(pin.adaption().expect("validated adaptation package"), adaption::CHIPS)),
+                Err(error) => Err(error),
+            },
+            Err(AdmissionError::Stale) => Err(operations::refusal(pin.adaption().expect("validated adaptation package"), adaption::CONFLICT)),
+            Err(AdmissionError::Infrastructure(error)) => Err(error),
+        };
+        if let Err(Err(error)) = tx.send(result) { tracing::warn!("adaptation owned operation failed after caller departed: {error:?}"); }
+    });
+    rx.await.map_err(|_| CallError::Internal(anyhow::anyhow!("adaptation owned operation terminated")))??;
+    Ok(Value::None)
+}
+
 struct InvocationGuard { live: Arc<AtomicBool>, hook_thread: Arc<Mutex<Option<Thread>>> }
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
@@ -199,7 +307,7 @@ impl Drop for InvocationGuard {
     }
 }
 
-pub async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::vm::Invocation, args: Vec<mlua::Value>, deadline: tokio::time::Instant) -> Result<MultiValue, CallError> {
+pub(crate) async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::vm::Invocation, args: Vec<mlua::Value>, deadline: tokio::time::Instant, query: Option<(i64, crate::services::sovereignty::queries::Query)>, mut adaption: Option<AdaptionInvocation<'_>>) -> Result<MultiValue, CallError> {
     let live = Arc::new(AtomicBool::new(true));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let char_id = Arc::new(AtomicI64::new(c.session.int("charid").unwrap_or(0)));
@@ -210,7 +318,8 @@ pub async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::vm::Inv
     let call = invocation.function.call_async::<MultiValue>(values);
     tokio::pin!(call);
     // Expire the context and remove the hook before mlua terminates and recycles the coroutine.
-    let _guard = InvocationGuard { live, hook_thread: invocation.hook_thread };
+    let _guard = InvocationGuard { live: live.clone(), hook_thread: invocation.hook_thread };
+    let mut prepared = None;
     loop {
         tokio::select! {
             biased;
@@ -225,6 +334,61 @@ pub async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::vm::Inv
                     let _ = tx.send(());
                 }
                 Some(Request::Bind(service, params, tx)) => { let _ = tx.send(c.bind(&service, params)); }
+                Some(Request::ContentSnapshot(ContentKind::Sovereignty, tx)) => {
+                    let result = match query {
+                        Some((character, query)) => {
+                            use crate::services::sovereignty::queries::Query;
+                            let alliance = match query {
+                                Query::AllianceStructures { alliance_id } | Query::CapitalSystemInfo { alliance_id } => Some(alliance_id),
+                                _ => None,
+                            };
+                            if let Some(alliance) = alliance {
+                                match crate::dao::characters::members::organization(&c.db, character).await.map_err(crate::services::db_err) {
+                                    Ok(Some(org)) if org.alliance_id == Some(alliance) => crate::services::sovereignty::queries::read(&c.db, &c.sde, query).await,
+                                    Ok(_) => Err(CallError::Internal(anyhow::anyhow!("sovereignty alliance membership required"))),
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                crate::services::sovereignty::queries::read(&c.db, &c.sde, query).await
+                            }
+                        }
+                        None => Err(CallError::Internal(anyhow::anyhow!("sovereignty snapshot unavailable for this invocation"))),
+                    };
+                    let _ = tx.send(result.map(ContentSnapshot::Wire));
+                }
+                Some(Request::ContentSnapshot(ContentKind::ShipAdaption, tx)) => {
+                    let result = if let Some(invocation) = adaption.take() {
+                        let definitions = invocation.pin.adaption().expect("validated adaptation package");
+                        let character = invocation.identity.char_id;
+                        if c.login.user_id != invocation.user || c.session.int("charid") != Some(character) {
+                            Err(crate::services::ship_adaption::operations::refusal(definitions, crate::lua::content::adaption::INVALID))
+                        } else {
+                            match crate::dao::characters::selection::owns(&c.db, character, invocation.user).await.map_err(crate::services::db_err) {
+                                Ok(true) => match crate::dao::ship_adaption::snapshot(&c.db, character).await.map_err(crate::services::db_err) {
+                                    Ok(snapshot) => { let revision = snapshot.revision(); prepared = Some((invocation, snapshot)); Ok(revision) }
+                                    Err(error) => Err(error),
+                                },
+                                Ok(false) => Err(crate::services::ship_adaption::operations::refusal(definitions, crate::lua::content::adaption::INVALID)),
+                                Err(error) => Err(error),
+                            }
+                        }
+                    } else { Err(CallError::Internal(anyhow::anyhow!("adaptation snapshot unavailable for this invocation"))) };
+                    let _ = tx.send(result.map(ContentSnapshot::Revision));
+                }
+                Some(Request::ContentCommit(ContentKind::ShipAdaption, revision, tx)) => {
+                    let result = match prepared.take() {
+                        Some((invocation, snapshot)) if revision == Some(snapshot.revision()) => tokio::select! {
+                            result = run_adaption(c, invocation, snapshot, &live, deadline) => result,
+                            _ = tokio::time::sleep_until(deadline) => return Err(CallError::Internal(super::super::vm::budget_exceeded().into())),
+                        },
+                        Some((invocation, _)) => Err(crate::services::ship_adaption::operations::refusal(invocation.pin.adaption().expect("validated adaptation package"), crate::lua::content::adaption::CONFLICT)),
+                        None => Err(CallError::Internal(anyhow::anyhow!("adaptation request unavailable for this invocation"))),
+                    };
+                    let _ = tx.send(result);
+                }
+                Some(Request::ContentCommit(ContentKind::Sovereignty, _, tx)) => {
+                    let _ = tx.send(Err(CallError::Internal(anyhow::anyhow!("sovereignty content has no commit operation"))));
+                }
                 Some(Request::Mutation(operation, tx)) => {
                     let result = apply_mutation(c, operation).await;
                     if tokio::time::Instant::now() >= deadline {

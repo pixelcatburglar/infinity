@@ -11,11 +11,9 @@
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::dao::insurance;
 use crate::client::{filetime_now, Client};
-use crate::consts::{CATEGORY_SHIP, FILETIME_DAY};
-use crate::db::Db;
+use infinity_core::consts::{CATEGORY_SHIP, FILETIME_DAY};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
-use crate::messages;
-use crate::space::World;
+use infinity_core::messages;
 use marshal::Value;
 use tracing::info;
 
@@ -84,7 +82,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let type_id = item.type_id;
     db.transaction(
         |tx, outbox: &mut Outbox| Box::pin(async move {
-            super::wallets::debit(tx, outbox, me, amount).await?;
+            super::wallets::debit(tx, outbox, me, crate::isk::IskAmount::from_isk(amount)?).await?;
             insurance::insure(tx, ship, me, type_id, fraction, now, now + CONTRACT_DAYS * FILETIME_DAY).await.map_err(db_err)?;
             super::mail::notify(tx, outbox, me, NOTIFICATION_ISSUED, NOTIFICATION_GROUP_INSURANCE, INSURER, &format!("{{itemID: {ship}, typeID: {type_id}}}")).await?;
             outbox.notify_pilot(me, "OnShipInsured", vec![]);
@@ -96,33 +94,19 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     Ok(Value::None)
 }
 
-/// A ship was destroyed: pay out its insurance, if it has any that is still running.
-pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), CallError> {
-    let now = filetime_now();
-    let sde = world.sde().clone();
-    db.transaction(
-        |tx, outbox: &mut Outbox| {
-            let sde = sde.clone();
-            Box::pin(async move {
-                let Some(r) = insurance::take_payout(tx, ship).await.map_err(db_err)?
-                else { return Ok(None); };
-                let (owner, type_id, fraction, end) = (r.owner_id, r.type_id, r.fraction, r.end_date);
-                if end < now { return Ok(None); }
-                let payout = super::market::round2(value(tx, &sde, type_id).await? * fraction);
-                super::wallets::credit(tx, outbox, owner, payout).await?;
-                let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
-                super::mail::notify(tx, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
-                Ok(Some((owner, payout)))
-            })
-        },
-        |paid, outbox| async move {
-            dispatch_world((), outbox, world)?;
-            if let Some((owner, payout)) = paid {
-                info!("insurance: ship {ship} of {owner} paid out {payout:.0} ISK");
-            }
-            Ok(())
-        },
-    ).await
+/// Consume an insurance contract and queue its payout in the ship loss transaction.
+pub(crate) async fn ship_destroyed_in<X: Send>(
+    ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, sde: &crate::sde::Sde, ship: i64, now: i64,
+) -> Result<crate::isk::IskAmount, CallError> {
+    let Some(r) = insurance::take_payout(ex, ship).await.map_err(db_err)? else { return Ok(crate::isk::IskAmount::ZERO) };
+    let (owner, type_id, fraction, end) = (r.owner_id, r.type_id, r.fraction, r.end_date);
+    if end < now { return Ok(crate::isk::IskAmount::ZERO); }
+    let payout = super::market::round2(value(ex, sde, type_id).await? * fraction);
+    let posted = crate::isk::IskAmount::from_isk(payout)?;
+    super::wallets::credit(ex, outbox, owner, posted).await?;
+    let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
+    super::mail::notify(ex, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
+    Ok(posted)
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

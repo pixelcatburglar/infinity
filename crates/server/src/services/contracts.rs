@@ -32,6 +32,8 @@
 //! Auction settlement scans run as durable periodic jobs registered through the services
 //! scheduler and persisted in game.jobs, not detached maintenance sleeps. Scan errors
 //! propagate to the scheduler for retry.
+//! Escrowed item quantities project to the client display limit; requested quantities
+//! keep the issuer's exact long-format numbers.
 
 mod custody;
 mod fees;
@@ -45,15 +47,16 @@ use lists::{bidding_on, escrow, in_progress, items_in, list_for_owner, login_inf
 use crate::dao::contracts::{Contract, query::{self, Filter}, shared};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
+use super::dogma::info::cap_client_quantity;
 use super::market::{lock, round2, station};
 use crate::dao::items::transfers;
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_PLASTIC_WRAP};
+use infinity_core::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_PLASTIC_WRAP};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -207,7 +210,7 @@ async fn items_of(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<Value>>, Call
             ("contractID", Value::Int(contract_id)),
             ("itemID", Value::Int(r.item_id.unwrap_or(0))),
             ("itemTypeID", Value::Int(r.type_id)),
-            ("quantity", Value::Int(r.quantity)),
+            ("quantity", Value::Int(if r.in_crate { cap_client_quantity(r.quantity) } else { r.quantity })),
             ("inCrate", Value::Bool(r.in_crate)),
             ("parentID", Value::Int(0)),
             ("productivityLevel", Value::None),
@@ -273,9 +276,22 @@ async fn escrowed_ids(db: &(impl Executor + ?Sized), contract_id: i64) -> Result
 
 
 /// Lose the escrowed items (a courier package that no longer exists).
-async fn destroy_escrow(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<(), CallError> {
+async fn destroy_escrow(db: &(impl Executor + ?Sized), sde: &Sde, contract_id: i64) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
-    shared::destroy_escrow(db, &ids).await.map_err(db_err)?;
+    let closure = shared::escrow_closure(db, &ids).await.map_err(db_err)?;
+    let captured = crate::dao::items::parent_locks::capture(db, &closure).await.map_err(db_err)?;
+    let requests: Vec<_> = closure.iter().map(|&item_id| crate::dao::items::parent_locks::LockRequest {
+        item_id, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }).collect();
+    let locks = super::inventory::destination::lock_items(db, sde, &requests, &[]).await?;
+    if captured.len() != closure.len() || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row|
+        row.type_id == old.type_id && row.owner_id == old.owner_id && row.location_id == old.location_id
+        && row.flag_id == old.flag_id && row.quantity == old.quantity && row.singleton == old.singleton
+        && row.jump_clone_id == old.jump_clone_id))
+        || shared::escrow_closure(db, &ids).await.map_err(db_err)? != closure {
+        return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
+    }
+    shared::destroy_escrow(db, &ids, &closure, &locks).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -310,7 +326,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // eve/client/script/ui/shared/neocom/contracts/contractentry.py:_ExpireContract
         // sends one contractID and ignores the result (None).
         "GM_ExpireContract" => {
-            if c.login.role & crate::consts::ROLE_GML == 0 {
+            if c.login.role & infinity_core::consts::ROLE_GML == 0 {
                 Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION))
             } else if c.session.int("charid").unwrap_or(0) <= 0 {
                 Err(notify_error(messages::gm::GM_ARGS_NO_CHARACTER))

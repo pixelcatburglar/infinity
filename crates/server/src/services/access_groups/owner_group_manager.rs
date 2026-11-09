@@ -3,7 +3,8 @@
 //! lifecycle and structure-specific policy are not supported.
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use marshal::{DbRowDescriptor, DbType, Value};
-use crate::{client::{Client, filetime_now}, consts::{TYPE_ALLIANCE, TYPE_CHARACTER, TYPE_CORPORATION}, dao::access_groups as dao, db::{executor::Executor, outbox::{dispatch_world, Outbox}}, messages::access_groups as msg, services::{Call, CallError, CallResult, crowset, keyval, notify_error}};
+use infinity_core::{consts::{TYPE_ALLIANCE, TYPE_CHARACTER, TYPE_CORPORATION}, messages::access_groups as msg};
+use crate::{client::{Client, filetime_now}, dao::access_groups as dao, db::{executor::Executor, outbox::{dispatch_world, Outbox}}, services::{Call, CallError, CallResult, crowset, keyval, notify_error}};
 use super::{membership, lock, ADMIN, EXCLUDED, MANAGER, MEMBER, NONE, PUBLIC};
 use crate::services::bookmarks::notifications;
 

@@ -63,3 +63,12 @@ fn guaranteed_groups_are_exact_and_mutually_exclusive_candidates_are_not_summed(
     assert!(parse(r#"{"type_id":10,"mode":"random_multi","draws":1,"groups":[{"chance":1,"entries":[{"type_id":11,"quantity":1,"probability":1}]},{"chance":1,"entries":[{"type_id":12,"quantity":1,"probability":1}]}]}"#).is_err());
     assert!(parse(r#"{"type_id":10,"mode":"random_weighted","draws":1,"entries":[{"type_id":11,"quantity":2147483647,"probability":0.5},{"type_id":12,"quantity":2147483647,"probability":0.5}]}"#).is_ok());
 }
+
+#[test]
+fn policy_accepts_wide_quantities_and_rejects_aggregate_overflow() {
+    for quantity in [2147483648_i64, 4294967296, 9007199254740993, i64::MAX] {
+        let text = format!(r#"{{"type_id":10,"mode":"fixed_all","entries":[{{"type_id":11,"quantity":{quantity}}}]}}"#);
+        assert_eq!(parse(&text).unwrap()[&10].preview(None), vec![(11, quantity)]);
+    }
+    assert!(parse(r#"{"type_id":10,"mode":"fixed_all","entries":[{"type_id":11,"quantity":9223372036854775807},{"type_id":11,"quantity":1}]}"#).is_err());
+}

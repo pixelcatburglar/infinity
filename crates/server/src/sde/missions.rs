@@ -37,6 +37,7 @@ pub(crate) struct JournalMessage {
     pub mission_id: i32,
     pub message_id: Option<i64>,
 }
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Missions {
     rows: Vec<Mission>,
     steps: Vec<ArcStep>,

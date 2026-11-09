@@ -6,7 +6,8 @@
 //! CharSettingBool with SDE attribute defaults and sends individual changes.
 use std::{collections::HashMap, sync::{Mutex, MutexGuard, OnceLock}};
 use marshal::Value;
-use crate::{consts::{dogma::ATTR_DRONE_FOCUS_FIRE, dogma::ATTR_DRONE_IS_AGGRESSIVE}, sde::Sde, services::{CallError, notify_error}};
+use infinity_core::{consts::{dogma::ATTR_DRONE_FOCUS_FIRE, dogma::ATTR_DRONE_IS_AGGRESSIVE}};
+use crate::{sde::Sde, services::{CallError, notify_error}};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DroneSettings {
@@ -29,7 +30,7 @@ fn state() -> MutexGuard<'static, State> {
 }
 
 pub(crate) fn parse(args: &[Value]) -> Result<Patch, CallError> {
-    let invalid = || notify_error(crate::messages::drones::INVALID_COMMAND);
+    let invalid = || notify_error(infinity_core::messages::drones::INVALID_COMMAND);
     let [Value::Dict(entries)] = args else { return Err(invalid()); };
     let mut patch = Patch::default();
     for (key, value) in entries {

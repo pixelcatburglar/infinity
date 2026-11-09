@@ -2,9 +2,6 @@
 //! Uses `game.calendar_events` and `game.calendar_responses`; alliance events are unsupported.
 use super::*;
 
-async fn invitees(c: &Client, event: i64) -> Result<Vec<i64>, CallError> {
-    dao::invitees(&c.db, event, RESPONSE_DELETED).await.map_err(db_err)
-}
 async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let when = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -21,6 +18,10 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
             let description = description.clone();
             let guests = guests.clone();
             Box::pin(async move {
+                if owner != me && !crate::dao::corporations::registry::lock_admission(tx, &[], &[owner], &[me]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::PLAYER_CORP_DIRECTOR_REQUIRED_FOR_CORP_EVENT));
+                }
+                if !may_manage(tx, me, owner).await? { return Err(notify_error(messages::PLAYER_CORP_DIRECTOR_REQUIRED_FOR_CORP_EVENT)); }
                 let id = dao::create(tx, &dao::NewEvent { owner, creator: me, when, duration, title: &title, description: &description, importance: important, modified: now }).await.map_err(db_err)?;
                 if owner == me {
                     dao::initial_responses(tx, id, me, &guests, RESPONSE_UNDECIDED, RESPONSE_ACCEPTED).await.map_err(db_err)?;
@@ -34,25 +35,67 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
         |value, outbox| async move { dispatch_world(value, outbox, &world) },
     ).await
 }
-fn may_manage(c: &Client, owner: i64) -> bool {
-    let me = c.session.int("charid").unwrap_or(0);
-    owner == me || (c.session.int("corpid") == Some(owner) && c.session.int("corprole").unwrap_or(0) & ROLE_DIRECTOR != 0)
+async fn may_manage(ex: &(impl crate::db::executor::Executor + ?Sized), me: i64, owner: i64) -> Result<bool, CallError> {
+    if owner == me { return Ok(true); }
+    super::super::corps::permissions::has(ex, me, owner, ROLE_DIRECTOR).await
 }
 async fn edit(c: &Client, call: &Call<'_>) -> CallResult {
     let event = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+    let me = c.session.int("charid").unwrap_or(0);
     let Some(owner) = dao::owner(&c.db, event).await.map_err(db_err)? else { return Err(notify_error(messages::CALENDAR_EVENT_NOT_FOUND)); };
-    if !may_manage(c, owner) { return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED)); }
+    if !may_manage(&c.db, me, owner).await? { return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED)); }
     let old = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     let when = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(old);
     let duration = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     let policy = &crate::config::game().calendar;
     let title = value_text(call.args.get(4), usize::try_from(policy.title_max_len).unwrap_or(usize::MAX));
     let important = call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    dao::edit(&c.db, &dao::EditEvent { event, when, duration, title: &title, description: &value_text(call.args.get(5), usize::try_from(policy.description_max_len).unwrap_or(usize::MAX)), importance: important, modified: filetime_now() }).await.map_err(db_err)?;
-    for g in invitees(c, event).await? {
-        c.world.notify_pilot(g, "OnEditCalendarEvent", vec![Value::Int(event), Value::Int(owner), Value::Int(old), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
-    }
-    Ok(Value::None)
+    let description = value_text(call.args.get(5), usize::try_from(policy.description_max_len).unwrap_or(usize::MAX));
+    let modified = filetime_now();
+    c.db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let title = title.clone();
+            let description = description.clone();
+            Box::pin(async move {
+                if owner != me && !crate::dao::corporations::registry::lock_admission(tx, &[], &[owner], &[me]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED));
+                }
+                if dao::owner(tx, event).await.map_err(db_err)? != Some(owner) || !may_manage(tx, me, owner).await? {
+                    return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED));
+                }
+                dao::edit(tx, &dao::EditEvent { event, when, duration, title: &title, description: &description, importance: important, modified }).await.map_err(db_err)?;
+                for g in dao::invitees(tx, event, RESPONSE_DELETED).await.map_err(db_err)? {
+                    outbox.notify_pilot(g, "OnEditCalendarEvent", vec![Value::Int(event), Value::Int(owner), Value::Int(old), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
+                }
+                Ok(Value::None)
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &c.world) },
+    ).await
+}
+
+async fn delete(c: &Client, event: i64, me: i64) -> CallResult {
+    let Some(found) = dao::owner_date(&c.db, event).await.map_err(db_err)? else { return Ok(Value::None) };
+    let owner = found.owner_id;
+    let now = filetime_now();
+    c.db.transaction(
+        |tx, outbox: &mut Outbox| Box::pin(async move {
+            if owner != me && !crate::dao::corporations::registry::lock_admission(tx, &[], &[owner], &[me]).await.map_err(db_err)? {
+                return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED));
+            }
+            let Some(current) = dao::owner_date(tx, event).await.map_err(db_err)? else { return Ok(Value::None) };
+            if current.owner_id != owner { return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED)); }
+            if may_manage(tx, me, owner).await? {
+                let guests = dao::invitees(tx, event, RESPONSE_DELETED).await.map_err(db_err)?;
+                dao::delete_event(tx, event, now).await.map_err(db_err)?;
+                for guest in guests { outbox.notify_pilot(guest, "OnRemoveCalendarEvent", vec![Value::Int(event), Value::Int(current.event_date), Value::Bool(true)]); }
+            } else {
+                dao::delete_response(tx, event, me, RESPONSE_DELETED).await.map_err(db_err)?;
+            }
+            Ok(Value::None)
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, &c.world) },
+    ).await
 }
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = c.session.int("charid").unwrap_or(0);
@@ -61,21 +104,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "CreatePersonalEvent" => create(c, call, me).await,
         "CreateCorporationEvent" => {
             let corp = c.session.int("corpid").unwrap_or(0);
-            if !super::super::corps::is_player_corp(corp) || !may_manage(c, corp) { return Some(Err(notify_error(messages::PLAYER_CORP_DIRECTOR_REQUIRED_FOR_CORP_EVENT))); }
+            if !super::super::corps::is_player_corp(corp) { return Some(Err(notify_error(messages::PLAYER_CORP_DIRECTOR_REQUIRED_FOR_CORP_EVENT))); }
             create(c, call, corp).await
         }
         "EditPersonalEvent" | "EditCorporationEvent" => edit(c, call).await,
-        "DeleteEvent" => {
-            let event = int(0);
-            let found = match dao::owner_date(&c.db, event).await { Ok(r) => r, Err(e) => return Some(Err(db_err(e))) };
-            let Some(found) = found else { return Some(Ok(Value::None)) };
-            if may_manage(c, found.owner_id) {
-                let guests = match invitees(c, event).await { Ok(g) => g, Err(e) => return Some(Err(e)) };
-                if let Err(e) = dao::delete_event(&c.db, event, filetime_now()).await { return Some(Err(db_err(e))); }
-                for g in guests { c.world.notify_pilot(g, "OnRemoveCalendarEvent", vec![Value::Int(event), Value::Int(found.event_date), Value::Bool(true)]); }
-                Ok(Value::None)
-            } else { dao::delete_response(&c.db, event, me, RESPONSE_DELETED).await.map(|_| Value::None).map_err(db_err) }
-        }
+        "DeleteEvent" => delete(c, int(0), me).await,
         "SendEventResponse" => dao::set_response(&c.db, int(0), me, int(2) as i32).await.map(|_| Value::None).map_err(db_err),
         "GetResponsesForCharacter" => match dao::character_responses(&c.db, me).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| keyval([("eventID", Value::Int(r.event_id)), ("status", Value::Int(r.status))])))), Err(e) => Err(db_err(e)),

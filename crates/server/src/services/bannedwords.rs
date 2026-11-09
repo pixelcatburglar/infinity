@@ -9,7 +9,7 @@ use marshal::Value;
 use tracing::warn;
 
 use super::{user_error, Call, CallResult};
-use crate::messages::{MSG_BANNED_WORDS_DOWN, MSG_LOCATION_NAME_INVALID_BANNED_WORD};
+use infinity_core::messages::{MSG_BANNED_WORDS_DOWN, MSG_LOCATION_NAME_INVALID_BANNED_WORD};
 
 /// Client `bannedwords_regexes.MAX_CHECK_LENGTH`, in Unicode characters.
 const MAX_CHECK_LENGTH: usize = 200;

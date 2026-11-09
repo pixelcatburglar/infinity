@@ -13,6 +13,7 @@ async fn projection_is_unique_and_preserves_sides() {
     let b = -a;
     let war = crate::dao::wars::create(&save, a, b, 1, 2).await.unwrap().unwrap();
     let mut new = crate::dao::killmails::NewKillmail {
+        victim_item_id: None,
         now: 3, system: 1, victim: 1, victim_corp: 1, victim_alliance: Some(10),
         ship_type: 1, damage_taken: 0.0, final_char: None, final_corp: None,
         final_alliance: Some(20), final_ship_type: 1, final_weapon_type: 1,

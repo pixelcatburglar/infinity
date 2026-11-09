@@ -1,7 +1,7 @@
 use super::*;
 
 fn row(item: i64, attribute: i32, damage: f64, max: f64, unit: f64, module: bool) -> Quote {
-    Quote { item, type_id: 1, group: 1, category: 1, attribute, damage, max, unit, module, ship: !module }
+    Quote { item, type_id: 1, group: 1, category: 1, attribute, damage, max, unit, module }
 }
 
 #[test]
@@ -114,14 +114,14 @@ async fn station_settlement_is_atomic_and_checks_context() {
     db.execute("UPDATE game.items SET owner_id = $2 WHERE item_id = $1", &[&ship, &owner]).await.unwrap();
     db.execute("UPDATE game.characters SET balance = 0 WHERE character_id = $1", &[&owner]).await.unwrap();
     assert!(handle(&c, &call).await.is_err());
-    assert_eq!(wallets::balance(&db, owner).await.ok().unwrap(), 0.0);
+    assert_eq!(wallets::balance(&db, owner).await.ok().unwrap(), crate::isk::IskAmount::ZERO);
     let unchanged = dogma::overrides(&db, ship).await.unwrap();
     assert_eq!(unchanged.iter().find(|r| r.attribute_id == ATTR_HULL_DAMAGE).unwrap().value, 2.0);
     assert_eq!(unchanged.iter().find(|r| r.attribute_id == ATTR_ARMOR_DAMAGE).unwrap().value, 3.0);
-    db.execute("UPDATE game.characters SET balance = $2::float8::numeric WHERE character_id = $1", &[&owner, &before]).await.unwrap();
+    db.execute("UPDATE game.characters SET balance = $2::text::numeric WHERE character_id = $1", &[&owner, &before.decimal()]).await.unwrap();
     assert_eq!(wallets::balance(&db, owner).await.ok().unwrap(), before);
     assert!(handle(&c, &call).await.is_ok());
-    assert!((wallets::balance(&db, owner).await.ok().unwrap() - (before - paid)).abs() < 0.01);
+    assert_eq!(wallets::balance(&db, owner).await.ok().unwrap(), before.checked_sub(crate::isk::IskAmount::from_isk(paid).unwrap()).unwrap());
     let damage = dogma::overrides(&db, ship).await.unwrap();
     assert!((damage.iter().find(|r| r.attribute_id == ATTR_HULL_DAMAGE).unwrap().value - 2.0 * (1.0 - portion)).abs() < 1e-9);
     assert!((damage.iter().find(|r| r.attribute_id == ATTR_ARMOR_DAMAGE).unwrap().value - 3.0 * (1.0 - portion)).abs() < 1e-9);
@@ -134,7 +134,7 @@ async fn station_settlement_is_atomic_and_checks_context() {
     let full_call = Call { args: &full_args, ..call };
     assert!(handle(&c, &full_call).await.is_ok());
     let balance = wallets::balance(&db, owner).await.ok().unwrap();
-    assert!((balance - (before - paid - market::round2(remaining))).abs() < 0.01);
+    assert_eq!(balance, before.checked_sub(crate::isk::IskAmount::from_isk(paid).unwrap()).unwrap().checked_sub(crate::isk::IskAmount::from_isk(market::round2(remaining)).unwrap()).unwrap());
     assert_eq!(handle(&c, &quote_call).await.ok().unwrap(), Value::Dict(vec![(Value::Int(ship), Value::list([]))]));
     let invalid = [requested, Value::Float(f64::NAN)];
     let invalid_call = Call { args: &invalid, ..full_call };
@@ -153,7 +153,7 @@ async fn station_settlement_is_atomic_and_checks_context() {
     let full_module = [Value::list([Value::Int(module)]), Value::Float(module_cost)];
     let full_module_call = Call { args: &full_module, ..module_call };
     assert!(handle(&c, &full_module_call).await.is_ok());
-    assert!((wallets::balance(&db, owner).await.ok().unwrap() - (balance - market::round2(module_cost))).abs() < 0.01);
+    assert_eq!(wallets::balance(&db, owner).await.ok().unwrap(), balance.checked_sub(crate::isk::IskAmount::from_isk(market::round2(module_cost)).unwrap()).unwrap());
     assert_eq!(dogma::overrides(&db, module).await.unwrap().iter().find(|r| r.attribute_id == ATTR_HULL_DAMAGE).unwrap().value, 0.0);
     db.execute("DELETE FROM game.item_attributes WHERE item_id = $1", &[&module]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id = $1", &[&module]).await.unwrap();
