@@ -1,11 +1,16 @@
 use super::*;
-use crate::consts::{ACCOUNT_CASH, CARGO_CONTAINER_GROUPS, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, INDUSTRY_JOB_STATUS_READY, ROLE_FACTORY_MANAGER, ROLE_FACTORY_MANUFACTURING, ROLE_FACTORY_SCIENCE, ROLE_HANGAR_CAN_TAKE_1};
+use infinity_core::consts::{ACCOUNT_CASH, CARGO_CONTAINER_GROUPS, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, INDUSTRY_JOB_STATUS_READY, ROLE_FACTORY_MANAGER, ROLE_FACTORY_MANUFACTURING, ROLE_FACTORY_SCIENCE, ROLE_HANGAR_CAN_TAKE_1};
 use crate::db::Db;
 
 mod readiness;
 
 #[derive(Clone, Copy)]
 struct Fixture { account: i64, actor: i64, ceo: i64, corp: i64, office: i64, station: i64, system: i64, bp: i32 }
+
+async fn require_no_installed_industry_jobs(db: &Db) {
+    let installed: Vec<_> = industry_dao::installed_deadlines(db).await.unwrap().into_iter().map(|job| job.id).collect();
+    assert!(installed.is_empty(), "installed industry jobs would be seeded: {installed:?}; point INFINITY_TEST_DATABASE_URL at a separately initialized database without installed industry jobs");
+}
 
 async fn fingerprint(db: &Db, f: Fixture) -> String {
     db.query_one(
@@ -31,14 +36,14 @@ async fn fingerprint(db: &Db, f: Fixture) -> String {
 fn assert_active<T>(result: Result<T, CallError>) {
     match result {
         Err(CallError::User { msg, dict }) => {
-            assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-            assert_eq!(dict, vec![("notify".into(), Value::unicode(crate::messages::industry::BLUEPRINT_ACTIVE))]);
+            assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+            assert_eq!(dict, vec![("notify".into(), Value::unicode(infinity_core::messages::industry::BLUEPRINT_ACTIVE))]);
         }
         _ => panic!("expected active blueprint CustomNotify"),
     }
 }
 
-async fn item(db: &Db, kind: i32, owner: i64, location: i64, flag: i32, quantity: i32, singleton: bool) -> i64 {
+async fn item(db: &Db, kind: i32, owner: i64, location: i64, flag: i32, quantity: i64, singleton: bool) -> i64 {
     db.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1,$2,$3,$4,$5,$6) RETURNING item_id", &[&kind, &owner, &location, &flag, &quantity, &singleton]).await.unwrap().get("item_id")
 }
 
@@ -60,7 +65,6 @@ async fn corporate_runner(db: &Db, client: &Client, f: Fixture, id: i64, deadlin
     let (ceo_tx, mut ceo_rx) = tokio::sync::mpsc::unbounded_channel();
     client.world.register_pilot(f.actor, actor_tx);
     client.world.register_pilot(f.ceo, ceo_tx);
-    db.execute("DELETE FROM game.jobs WHERE job_id<>$1", &[&deadline]).await.unwrap();
     let due = filetime_now() + crate::client::filetime_ticks_from_seconds(5);
     db.execute("UPDATE game.industry_jobs SET end_date=$2 WHERE job_id=$1", &[&id, &due]).await.unwrap();
     db.execute("UPDATE game.jobs SET due_at=$2 WHERE job_id=$1", &[&deadline, &due]).await.unwrap();
@@ -94,10 +98,12 @@ async fn corporate_runner(db: &Db, client: &Client, f: Fixture, id: i64, deadlin
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated database with SDE"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated, quiet, job-free database with SDE and no installed industry jobs"]
 async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    crate::dao::jobs::tests::require_job_free_database(&db).await;
+    require_no_installed_industry_jobs(&db).await;
     let baseline = super::database_fingerprint(&db).await;
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let facility = sde.map.stations().filter(|s| s.type_id.is_some() && s.solar_system_id.is_some()).filter_map(|s| Facility::from_station(&sde, s)).find(|f| f.factory && f.laboratory).expect("factory and laboratory station");
@@ -110,21 +116,19 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             if research.time <= 0.0 || research.time >= 1_000_000.0 || research.materials.iter().any(|(_, q)| *q <= 0 || *q >= 1_000_000) { return None; }
         }
         let price = m.materials.iter().map(|(t, q)| prices.get(t).copied().unwrap_or(0.0) * *q as f64).sum::<f64>();
-        (sde.is_tradable(t.type_id) && m.time > 0.0 && m.time < 1_000_000.0 && c.time > 0.0 && c.time < 1_000_000.0 && !m.materials.is_empty() && m.products.len() == 1 && m.products[0].1 > 0 && c.max_production_limit >= 1 && m.materials.iter().chain(&c.materials).all(|(_, q)| *q > 0 && *q < 1_000_000) && (10_000.0..100_000_000.0).contains(&price)).then_some(t.type_id)
+        (t.published == Some(true) && t.market_group_id.is_some() && sde.is_tradable(t.type_id) && m.time > 0.0 && m.time < 1_000_000.0 && c.time > 0.0 && c.time < 1_000_000.0 && !m.materials.is_empty() && m.products.len() == 1 && m.products[0].1 > 0 && c.max_production_limit >= 1 && m.materials.iter().chain(&c.materials).all(|(_, q)| *q > 0 && *q < 1_000_000) && (10_000.0..100_000_000.0).contains(&price)).then_some(t.type_id)
     }).expect("manufacturing and copying blueprint in SDE");
     let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('industry-corp-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
     let actor: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,balance) VALUES ($1,'industry-corp-' || nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,1000000000) RETURNING character_id", &[&account, &facility.id]).await.unwrap().get("character_id");
     let ceo: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,'industry-corp-' || nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
     let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('industry-corp-' || nextval('game.corporations_corporation_id_seq')::text,'IC' || nextval('game.corporations_corporation_id_seq')::text,$1,$1,$2,0) RETURNING corporation_id", &[&ceo, &facility.id]).await.unwrap().get("corporation_id");
     let roles = ROLE_FACTORY_MANAGER | ROLE_FACTORY_MANUFACTURING | ROLE_FACTORY_SCIENCE | ROLE_HANGAR_CAN_TAKE_1 | (134_217_728_i64 << 1);
-    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2 WHERE character_id=$3", &[&corp, &roles, &actor]).await.unwrap();
-    db.execute("UPDATE game.characters SET corporation_id=$1,station_id=$3 WHERE character_id=$2", &[&corp, &ceo, &facility.id]).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2::bigint & ~$4::bigint,corp_roles_hq=$2::bigint & $4::bigint WHERE character_id=$3", &[&corp, &roles, &actor, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=$1,station_id=$3,corp_roles=$4 WHERE character_id=$2", &[&corp, &ceo, &facility.id, &infinity_core::consts::ROLE_DIRECTOR]).await.unwrap();
     db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,1000000000)", &[&corp, &(ACCOUNT_CASH + 1)]).await.unwrap();
     let office = item(&db, i32::try_from(facility.type_id).unwrap(), corp, facility.id, FLAG_HANGAR, 1, true).await;
     crate::dao::offices::insert(&db, office, corp, facility.id, 1).await.unwrap();
     let f = Fixture { account, actor, ceo, corp, office, station: facility.id, system: facility.system, bp };
-    let saved_jobs: String = db.query_one("SELECT COALESCE(json_agg(row_to_json(j) ORDER BY job_id), '[]'::json)::text AS rows FROM game.jobs j", &[]).await.unwrap().get("rows");
-    db.execute("DELETE FROM game.jobs", &[]).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let db = test_db;
@@ -179,7 +183,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             let act = sde.industry.activity(f.bp, activity).unwrap();
             let blueprint = item(&db, f.bp, owner, input.item_id, input.flag_id, 1, true).await;
             for &(kind, quantity) in &act.materials {
-                let quantity = i32::try_from(quantity.max(1)).unwrap();
+                let quantity = quantity.max(1);
                 item(&db, kind, owner, input.item_id, input.flag_id, quantity + 10, false).await;
                 if owner == f.corp { item(&db, kind, owner, f.office, FLAG_CORP_SAG1 + 2, 7, false).await; }
             }
@@ -188,17 +192,32 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             for &(kind, _) in &before { material_before.push(quantities(&db, owner, input.item_id, input.flag_id, kind).await); }
             let mut other_before = Vec::new();
             for &(kind, _) in &before { other_before.push(quantities(&db, owner, f.office, FLAG_CORP_SAG1 + 2, kind).await); }
-            let personal_balance: f64 = crate::services::wallets::balance(&db, f.actor).await.ok().unwrap();
-            let corp_balance: f64 = crate::services::wallets::corp_balance(&db, f.corp, ACCOUNT_CASH + 1).await.ok().unwrap();
+            let personal_balance = crate::services::wallets::balance(&db, f.actor).await.ok().unwrap();
+            let corp_balance = crate::services::wallets::corp_balance(&db, f.corp, ACCOUNT_CASH + 1).await.ok().unwrap();
             let req = request(f, blueprint, activity, input, output, wallet, key);
             let id = mechanics::install(&mut client, &req).await.ok().unwrap().as_int().unwrap();
             let job = industry_dao::job(&db, id).await.unwrap().unwrap();
+            let installed = crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await;
+            let matching: Vec<_> = installed.iter().filter(|event| matches!(event, crate::lua::events::GameEvent::ManufacturingInstalled { job_id, .. } if *job_id == id)).collect();
+            if activity == MANUFACTURING {
+                assert!(matches!(matching.as_slice(), [crate::lua::events::GameEvent::ManufacturingInstalled {
+                    char_id, owner_id, owner_is_corporation, product_type, runs, scheduled_quantity, facility_id, context, ..
+                }] if *char_id == f.actor && *owner_id == owner && *owner_is_corporation == (owner == f.corp)
+                    && *product_type == act.products[0].0 && *runs == 1 && *scheduled_quantity == act.products[0].1
+                    && *facility_id == f.station && context.corporation_id == Some(f.corp)));
+                let journal = db.query_one("SELECT source_namespace, source_key FROM game.progress_events WHERE kind=$1 AND subject_character_id=$2 AND source_key=$3", &[&"ManufacturingInstalled", &f.actor, &format!("ManufacturingInstalled:{id}")]).await.unwrap();
+                assert_eq!(journal.get::<_, String>("source_namespace"), "business");
+                assert_eq!(journal.get::<_, String>("source_key"), format!("ManufacturingInstalled:{id}"));
+            } else {
+                assert!(matching.is_empty());
+            }
+            assert!(!crate::db::outbox::tests::events(&db, "ManufacturingDelivered", f.actor).await.iter().any(|event| matches!(event, crate::lua::events::GameEvent::ManufacturingDelivered { job_id, .. } if *job_id == id)));
             let deadline = format!("industry.ready:{id}");
             let scheduled = db.query_one("SELECT kind,due_at,payload::text AS payload FROM game.jobs WHERE job_id=$1", &[&deadline]).await.unwrap();
             assert_eq!(scheduled.get::<_, String>("kind"), completion::KIND);
             assert_eq!(scheduled.get::<_, i64>("due_at"), job.end);
             assert_eq!(scheduled.get::<_, String>("payload"), id.to_string());
-            let future = filetime_now() + crate::consts::FILETIME_MINUTE;
+            let future = filetime_now() + infinity_core::consts::FILETIME_MINUTE;
             db.execute("UPDATE game.industry_jobs SET end_date=$2 WHERE job_id=$1", &[&id, &future]).await.unwrap();
             db.execute("UPDATE game.jobs SET due_at=$2 WHERE job_id=$1", &[&deadline, &future]).await.unwrap();
             client.outbox.clear();
@@ -223,8 +242,9 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             }
             let new_personal = crate::services::wallets::balance(&db, f.actor).await.ok().unwrap();
             let new_corp = crate::services::wallets::corp_balance(&db, f.corp, ACCOUNT_CASH + 1).await.ok().unwrap();
-            if wallet == f.actor { assert!((personal_balance - new_personal - job.cost).abs() < 0.001); assert_eq!(corp_balance, new_corp); }
-            else { assert_eq!(personal_balance, new_personal); assert!((corp_balance - new_corp - job.cost).abs() < 0.001); }
+            let cost = crate::isk::IskAmount::from_isk(job.cost).unwrap();
+            if wallet == f.actor { assert_eq!(personal_balance.checked_sub(new_personal), Some(cost)); assert_eq!(corp_balance, new_corp); }
+            else { assert_eq!(personal_balance, new_personal); assert_eq!(corp_balance.checked_sub(new_corp), Some(cost)); }
             if owner == f.actor && wallet == f.actor {
                 let container_type = sde.types.iter().find(|t| t.group_id.is_some_and(|g| CARGO_CONTAINER_GROUPS.contains(&g)) && sde.is_tradable(t.type_id)).expect("tradable cargo container in SDE").type_id;
                 let container = item(&db, container_type, f.actor, f.station, FLAG_HANGAR, 1, true).await;
@@ -238,10 +258,9 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                         let (ceo_tx, mut ceo_rx) = tokio::sync::mpsc::unbounded_channel();
                         client.world.register_pilot(f.actor, actor_tx);
                         client.world.register_pilot(f.ceo, ceo_tx);
-                        let due = filetime_now() + crate::consts::FILETIME_MINUTE;
+                        let due = filetime_now() + infinity_core::consts::FILETIME_MINUTE;
                         db.execute("UPDATE game.industry_jobs SET end_date=$2 WHERE job_id=$1", &[&id, &due]).await.unwrap();
                         db.execute("UPDATE game.jobs SET due_at=$2 WHERE job_id=$1", &[&deadline, &due]).await.unwrap();
-                        db.execute("DELETE FROM game.jobs WHERE job_id<>$1", &[&deadline]).await.unwrap();
                         let (stop, watch) = tokio::sync::watch::channel(false);
                         let mut first_runner = crate::scheduler::runner::start(db.clone(), client.world.clone(), vec![crate::scheduler::register(completion::KIND, completion::handle)], crate::config::scheduler::SchedulerConfig::default(), watch).unwrap();
                         let _ = stop.send(true);
@@ -264,7 +283,6 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                         completion::seed(&db).await.ok().unwrap();
                         completion::seed(&db).await.ok().unwrap();
                         assert_eq!(db.query_one("SELECT count(*) AS n FROM game.jobs WHERE job_id=$1", &[&deadline]).await.unwrap().get::<_, i64>("n"), 1);
-                        db.execute("DELETE FROM game.jobs WHERE job_id<>$1", &[&deadline]).await.unwrap();
                         let due = filetime_now() + crate::client::filetime_ticks_from_seconds(5);
                         db.execute("UPDATE game.industry_jobs SET end_date=$2 WHERE job_id=$1", &[&id, &due]).await.unwrap();
                         db.execute("UPDATE game.jobs SET due_at=$2 WHERE job_id=$1", &[&deadline, &due]).await.unwrap();
@@ -315,7 +333,9 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                     assert!(client.outbox.is_empty());
 
                     let location = crate::services::inventory::trashing::resolve_location(&client, blueprint).await.unwrap();
-                    assert_active(crate::services::inventory::trashing::trash_items(&mut client, &[blueprint], location).await);
+                    let Err(CallError::User { msg, dict }) = crate::services::inventory::trashing::trash_items(&mut client, &[blueprint], location).await else { panic!("expected trash refusal for active blueprint job"); };
+                    assert_eq!(msg, infinity_core::messages::MSG_CANNOT_TRASH_ITEM);
+                    assert!(dict.is_empty());
                     assert_eq!(fingerprint(&db, f).await, state);
                     assert!(client.outbox.is_empty());
 
@@ -385,6 +405,12 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             db.execute("UPDATE game.industry_jobs SET end_date=0 WHERE job_id=$1", &[&id]).await.unwrap();
             db.execute("UPDATE game.jobs SET due_at=0 WHERE job_id=$1", &[&deadline]).await.unwrap();
             let output_before = quantities(&db, owner, output.item_id, output.flag_id, product).await;
+            let stack_before = if recipients.is_some() {
+                crate::services::items::load_items(&db, &sde, crate::dao::items::loading::ItemQuery::OwnerLocationFlagTypeStackAscending(owner, output.item_id, output.flag_id, product)).await.unwrap().into_iter().next()
+            } else { None };
+            assert_eq!(crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await.len(), installed.len());
+            let deliverer = if owner == f.corp && wallet == f.actor && activity == MANUFACTURING { f.ceo } else { f.actor };
+            if deliverer != f.actor { client.session.apply(vec![("charid", Value::Int(deliverer))]); }
             if direct_channels.is_some() && activity == MANUFACTURING {
                 let replay = crate::scheduler::Job { id: deadline.clone(), kind: completion::KIND.into(), due_at: 0, payload: id.to_string() };
                 let handler = completion::handle(db.clone(), client.world.clone(), replay);
@@ -394,6 +420,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             } else {
                 mechanics::complete(&mut client, id).await.ok().unwrap();
             }
+            if deliverer != f.actor { client.session.apply(vec![("charid", Value::Int(f.actor))]); }
             if let Some((actor_rx, ceo_rx)) = direct_channels.as_mut() {
                 for receiver in [actor_rx, ceo_rx] {
                     let mut statuses = Vec::new();
@@ -416,12 +443,36 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                 }
             }
             if let Some((actor_rx, ceo_rx)) = recipients.as_mut() {
-                for receiver in [actor_rx, ceo_rx] {
+                let item = crate::services::items::load_items(&db, &sde, crate::dao::items::loading::ItemQuery::OwnerLocationFlagTypeStackAscending(owner, output.item_id, output.flag_id, product)).await.unwrap().into_iter().next().unwrap();
+                assert!(item.item_id > 0);
+                assert_eq!(item.type_id, product);
+                assert_eq!(item.owner_id, owner);
+                assert_eq!(item.location_id, output.item_id);
+                assert_eq!(item.flag_id, output.flag_id);
+                assert!(!item.singleton);
+                assert_eq!(item.quantity, stack_before.as_ref().map_or(0, |old| old.quantity) + act.products[0].1);
+                let change = if let Some(old) = &stack_before {
+                    assert_eq!(item.item_id, old.item_id);
+                    vec![(Value::Int(infinity_core::consts::IX_STACK_SIZE), Value::Int(old.quantity))]
+                } else {
+                    vec![(Value::Int(infinity_core::consts::IX_LOCATION_ID), Value::Int(infinity_core::consts::LOCATION_JUNKYARD)), (Value::Int(infinity_core::consts::IX_FLAG), Value::Int(i64::from(output.flag_id)))]
+                };
+                let receipt = vec![item.row(), Value::Dict(change), Value::None];
+                let job_notice = vec![Value::Int(id), Value::Int(owner), Value::Int(blueprint), Value::Int(f.actor), Value::Int(i64::from(STATUS_DELIVERED)), Value::Int(1)];
+                let blueprint_notice = vec![Value::Int(owner)];
+                // Wallet access does not grant visibility into the output division.
+                for (receiver, sees_receipt) in [(actor_rx, false), (ceo_rx, true)] {
+                    if sees_receipt {
+                        let (event, args) = receiver.try_recv().unwrap();
+                        assert_eq!(event, "OnItemChange");
+                        assert_eq!(&args, &receipt);
+                    }
                     let (event, args) = receiver.try_recv().unwrap();
                     assert_eq!(event, "OnIndustryJob");
-                    assert_eq!(args.get(0).and_then(Value::as_int), Some(id));
-                    assert_eq!(args.get(4).and_then(Value::as_int), Some(i64::from(STATUS_DELIVERED)));
-                    assert_eq!(receiver.try_recv().unwrap().0, "OnBlueprintsUpdated");
+                    assert_eq!(&args, &job_notice);
+                    let (event, args) = receiver.try_recv().unwrap();
+                    assert_eq!(event, "OnBlueprintsUpdated");
+                    assert_eq!(&args, &blueprint_notice);
                     assert!(receiver.try_recv().is_err());
                 }
             }
@@ -437,30 +488,71 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
                 assert_eq!(crate::services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, blueprint, Some(f.station), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().unwrap(), Some(blueprint));
             }
             let output_after = quantities(&db, owner, output.item_id, output.flag_id, product).await;
+            let delivered = crate::db::outbox::tests::events(&db, "ManufacturingDelivered", deliverer).await;
+            let matching: Vec<_> = delivered.iter().filter(|event| matches!(event, crate::lua::events::GameEvent::ManufacturingDelivered { job_id, .. } if *job_id == id)).collect();
+            if activity == MANUFACTURING {
+                assert!(matches!(matching.as_slice(), [crate::lua::events::GameEvent::ManufacturingDelivered {
+                    char_id, installer_id, owner_id, owner_is_corporation, product_type, quantity, facility_id, output_location_id, context, ..
+                }] if *char_id == deliverer && *installer_id == f.actor && *owner_id == owner
+                    && *owner_is_corporation == (owner == f.corp) && *product_type == product
+                    && *quantity == output_after - output_before && *facility_id == f.station
+                    && *output_location_id == output.item_id && context.corporation_id == Some(f.corp)));
+                let journal = db.query_one("SELECT source_namespace, source_key FROM game.progress_events WHERE kind=$1 AND subject_character_id=$2 AND source_key=$3", &[&"ManufacturingDelivered", &deliverer, &format!("ManufacturingDelivered:{id}")]).await.unwrap();
+                assert_eq!(journal.get::<_, String>("source_namespace"), "business");
+                assert_eq!(journal.get::<_, String>("source_key"), format!("ManufacturingDelivered:{id}"));
+            } else {
+                assert!(matching.is_empty());
+            }
+            assert_eq!(crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await.len(), installed.len());
             if activity == MANUFACTURING { assert_eq!(output_after - output_before, act.products[0].1); }
             else {
                 assert_eq!(output_after - output_before, BLUEPRINT_COPY_QUANTITY);
                 let row = db.query_one("SELECT b.runs, i.quantity, i.singleton FROM game.blueprints b JOIN game.items i ON i.item_id=b.item_id WHERE i.owner_id=$1 AND i.location_id=$2 AND i.flag_id=$3 AND i.type_id=$4 ORDER BY i.item_id DESC LIMIT 1", &[&owner, &output.item_id, &output.flag_id, &f.bp]).await.unwrap();
                 assert_eq!(row.get::<_, i32>("runs"), 1);
-                assert_eq!(i64::from(row.get::<_, i32>("quantity")), BLUEPRINT_COPY_QUANTITY);
+                assert_eq!(row.get::<_, i64>("quantity"), BLUEPRINT_COPY_QUANTITY);
                 assert!(row.get::<_, bool>("singleton"));
             }
             let state = fingerprint(&db, f).await;
             assert!(mechanics::complete(&mut client, id).await.is_err());
             assert_eq!(fingerprint(&db, f).await, state);
+            assert_eq!(crate::db::outbox::tests::events(&db, "ManufacturingDelivered", deliverer).await.len(), delivered.len());
         }
+        let act = sde.industry.activity(f.bp, MANUFACTURING).unwrap();
+        let product = act.products[0].0;
+        let quantity = act.products[0].1.checked_mul(2).unwrap();
+        let output = &divisions[2];
+        db.execute("DELETE FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 AND type_id=$4", &[&f.corp, &output.item_id, &output.flag_id, &product]).await.unwrap();
+        let existing = item(&db, product, f.corp, output.item_id, output.flag_id, i64::MAX - 1, false).await;
+        let bp = item(&db, f.bp, f.corp, f.office, FLAG_CORP_SAG1, 1, true).await;
+        for &(kind, amount) in &act.materials {
+            item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, amount * 2 + 10, false).await;
+        }
+        let mut req = request(f, bp, MANUFACTURING, &divisions[0], output, f.corp, ACCOUNT_CASH + 1);
+        if let Value::Dict(fields) = &mut req {
+            fields.iter_mut().find(|(key, _)| *key == Value::str("runs")).unwrap().1 = Value::Int(2);
+        }
+        let id = mechanics::install(&mut client, &req).await.ok().unwrap().as_int().unwrap();
+        db.execute("UPDATE game.industry_jobs SET end_date=0 WHERE job_id=$1", &[&id]).await.unwrap();
+        mechanics::complete(&mut client, id).await.ok().unwrap();
+        let stacks = crate::services::items::load_items(&db, &sde, crate::dao::items::loading::ItemQuery::OwnerLocationFlagTypeStackAscending(f.corp, output.item_id, output.flag_id, product)).await.unwrap();
+        assert_eq!(stacks.len(), 2);
+        assert!(stacks.iter().any(|row| row.item_id == existing && row.quantity == i64::MAX));
+        assert!(stacks.iter().any(|row| row.item_id != existing && row.quantity == quantity - 1));
         let missing = i64::MAX;
         assert!(industry_dao::job(&db, missing).await.unwrap().is_none());
         let before = fingerprint(&db, f).await;
         completion::handle(db.clone(), client.world.clone(), crate::scheduler::Job { id: format!("industry.ready:{missing}"), kind: completion::KIND.into(), due_at: 0, payload: missing.to_string() }).await.unwrap();
         assert_eq!(fingerprint(&db, f).await, before);
+        let before_science = crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await.len();
         readiness::science_readiness(&db, &mut client, f, &personal, &sde, &prices).await;
+        assert_eq!(crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await.len(), before_science);
         let act = sde.industry.activity(f.bp, MANUFACTURING).unwrap();
         let blueprint = item(&db, f.bp, f.corp, f.office, FLAG_CORP_SAG1, 1, true).await;
         for &(kind, quantity) in &act.materials {
-            item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, i32::try_from(quantity + 10).unwrap(), false).await;
+            item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, quantity + 10, false).await;
         }
         let valid = request(f, blueprint, MANUFACTURING, &divisions[0], &divisions[1], f.corp, ACCOUNT_CASH + 1);
+        let installed_before_refusals = crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await.len();
         for field in ["cost", "tax"] {
             let mut stale = valid.clone();
             let Value::Dict(pairs) = &mut stale else { unreachable!() };
@@ -484,13 +576,13 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             assert_eq!(fingerprint(&db, f).await, state);
             assert!(client.outbox.is_empty());
         }
-        db.execute("UPDATE game.characters SET corp_roles=0 WHERE character_id=$1", &[&f.actor]).await.unwrap();
+        db.execute("UPDATE game.characters SET corp_roles=0,corp_roles_hq=0 WHERE character_id=$1", &[&f.actor]).await.unwrap();
         client.outbox.clear();
         let state = fingerprint(&db, f).await;
         assert!(mechanics::install(&mut client, &valid).await.is_err());
         assert_eq!(fingerprint(&db, f).await, state);
         assert!(client.outbox.is_empty());
-        db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&f.actor, &roles]).await.unwrap();
+        db.execute("UPDATE game.characters SET corp_roles=$2::bigint & ~$3::bigint,corp_roles_hq=$2::bigint & $3::bigint WHERE character_id=$1", &[&f.actor, &roles, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
         let first_material = act.materials[0].0;
         db.execute("DELETE FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 AND type_id=$4", &[&f.corp, &f.office, &FLAG_CORP_SAG1, &first_material]).await.unwrap();
         client.outbox.clear();
@@ -499,18 +591,19 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
         assert_eq!(fingerprint(&db, f).await, state);
         assert!(client.outbox.is_empty());
         let first_quantity = act.materials[0].1;
-        item(&db, first_material, f.corp, f.office, FLAG_CORP_SAG1, i32::try_from(first_quantity + 10).unwrap(), false).await;
+        item(&db, first_material, f.corp, f.office, FLAG_CORP_SAG1, first_quantity + 10, false).await;
         db.execute("UPDATE game.corp_wallets SET balance=0 WHERE corporation_id=$1 AND account_key=$2", &[&f.corp, &(ACCOUNT_CASH + 1)]).await.unwrap();
         client.outbox.clear();
         let state = fingerprint(&db, f).await;
         assert!(mechanics::install(&mut client, &valid).await.is_err());
         assert_eq!(fingerprint(&db, f).await, state);
         assert!(client.outbox.is_empty());
+        assert_eq!(crate::db::outbox::tests::events(&db, "ManufacturingInstalled", f.actor).await.len(), installed_before_refusals);
         db.execute("UPDATE game.corp_wallets SET balance=1000000000 WHERE corporation_id=$1 AND account_key=$2", &[&f.corp, &(ACCOUNT_CASH + 1)]).await.unwrap();
         for mutation in 0..3 {
             let bp = item(&db, f.bp, f.corp, f.office, FLAG_CORP_SAG1, 1, true).await;
             for &(kind, quantity) in &act.materials {
-                item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, i32::try_from(quantity + 10).unwrap(), false).await;
+                item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, quantity + 10, false).await;
             }
             let req = request(f, bp, MANUFACTURING, &divisions[0], &divisions[1], f.corp, ACCOUNT_CASH + 1);
             let id = mechanics::install(&mut client, &req).await.ok().unwrap().as_int().unwrap();
@@ -525,6 +618,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             client.outbox.clear();
             let state = fingerprint(&db, f).await;
             assert!(mechanics::complete(&mut client, id).await.is_err());
+            assert!(!crate::db::outbox::tests::events(&db, "ManufacturingDelivered", f.actor).await.iter().any(|event| matches!(event, crate::lua::events::GameEvent::ManufacturingDelivered { job_id, .. } if *job_id == id)));
             assert_eq!(fingerprint(&db, f).await, state);
             assert!(client.outbox.is_empty());
             assert_eq!(industry_dao::job(&db, id).await.unwrap().unwrap().status, INDUSTRY_JOB_STATUS_INSTALLED);
@@ -543,7 +637,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             }
         }
         for &(kind, quantity) in &act.materials {
-            item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, i32::try_from(quantity + 10).unwrap(), false).await;
+            item(&db, kind, f.corp, f.office, FLAG_CORP_SAG1, quantity + 10, false).await;
         }
         let id = mechanics::install(&mut client, &valid).await.ok().unwrap().as_int().unwrap();
         db.execute("UPDATE game.industry_jobs SET end_date=0 WHERE job_id=$1", &[&id]).await.unwrap();
@@ -553,6 +647,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
         client.outbox.clear();
         let state = fingerprint(&db, f).await;
         assert!(mechanics::complete(&mut client, id).await.is_err());
+        assert!(!crate::db::outbox::tests::events(&db, "ManufacturingDelivered", f.actor).await.iter().any(|event| matches!(event, crate::lua::events::GameEvent::ManufacturingDelivered { job_id, .. } if *job_id == id)));
         let args = [Value::Int(id), Value::Int(f.system)];
         let kwargs = Value::None;
         let call = Call { service: "industryManager", method: "CancelJob", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
@@ -560,8 +655,10 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
         assert_eq!(fingerprint(&db, f).await, state);
         assert!(client.outbox.is_empty());
     }).await;
-    db.execute("DELETE FROM game.jobs", &[]).await.unwrap();
-    db.execute("INSERT INTO game.jobs SELECT (json_populate_record(NULL::game.jobs, value)).* FROM json_array_elements($1::text::json)", &[&saved_jobs]).await.unwrap();
+    db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        crate::services::tests::fixture::cleanup_progress(tx, &[f.actor, f.ceo, f.corp], &[f.actor, f.ceo]).await
+    }), |(), ()| async { Ok(()) }).await.unwrap();
+    db.execute("DELETE FROM game.jobs WHERE job_id IN (SELECT 'industry.ready:' || job_id::text FROM game.industry_jobs WHERE installer_id=$1)", &[&f.actor]).await.unwrap();
     db.execute("DELETE FROM game.jobs WHERE job_id IN (SELECT 'trade-timeout:' || trade_id::text FROM game.trades WHERE char_a=$1 OR char_b=$1)", &[&f.actor]).await.unwrap();
     db.execute("DELETE FROM game.trade_items WHERE trade_id IN (SELECT trade_id FROM game.trades WHERE char_a=$1 OR char_b=$1)", &[&f.actor]).await.unwrap();
     db.execute("DELETE FROM game.trades WHERE char_a=$1 OR char_b=$1", &[&f.actor]).await.unwrap();

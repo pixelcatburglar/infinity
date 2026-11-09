@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "offers": [
+    {
+      "type_id": 57207,
+      "quantity": 1,
+      "plex_price": 15,
+      "source_url": "https://forums.eveonline.com/t/hard-miners-life/464830/13",
+      "observed_on": "2024-10-17",
+      "price_basis": "observed historical retail price"
+    },
+    {
+      "type_id": 86227,
+      "quantity": 1,
+      "plex_price": 50,
+      "source_url": "https://forums.eveonline.com/t/version-22-02-revenant-general-feedback/467659/45",
+      "observed_on": "2024-11-12",
+      "price_basis": "observed historical retail price"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 //! Augmentation read wire shape and active membership regressions.
 use super::*;
-use crate::consts::{FILETIME_MINUTE, FILETIME_SECOND};
+use infinity_core::consts::{FILETIME_MINUTE, FILETIME_SECOND};
 use crate::services::tests::{client, fixture};
 
 async fn insert(db: &crate::db::Db, character: i64, type_id: i32, flag: i32, start: Option<i64>, end: Option<i64>, effects: Option<Vec<i32>>) -> i64 {

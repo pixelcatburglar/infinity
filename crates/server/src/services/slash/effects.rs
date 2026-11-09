@@ -2,7 +2,8 @@
 //! The data is process-local; this command does not modify effect state.
 
 use super::{slash_error, CallError};
-use crate::{messages, services::effects::unsupported};
+use infinity_core::messages;
+use crate::services::effects::unsupported;
 
 fn valid_args(args: &[String]) -> bool {
     matches!(args, [action] if action.as_str() == "unsupported")

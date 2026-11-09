@@ -15,8 +15,8 @@ async fn singleton_encoded_quantity_stages_as_one() {
     let a: i64 = db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id, station_id, balance) VALUES ($1, nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1, $2, 100) RETURNING character_id", &[&account, &station]).await.unwrap().get("character_id");
     let b: i64 = db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id, station_id, balance) VALUES ($1, nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1, $2, 100) RETURNING character_id", &[&account, &station]).await.unwrap().get("character_id");
     let trade = trades::create(&db, station, a, b, 1).await.unwrap();
-    let item = transfers::insert(&db, ty, a, station, crate::consts::FLAG_HANGAR, -12345).await.unwrap();
-    let control = transfers::insert(&db, ty, a, station, crate::consts::FLAG_HANGAR, 1).await.unwrap();
+    let item = transfers::insert(&db, ty, a, station, infinity_core::consts::FLAG_HANGAR, -12345).await.unwrap();
+    let control = transfers::insert(&db, ty, a, station, infinity_core::consts::FLAG_HANGAR, 1).await.unwrap();
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&control]).await.unwrap();
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&item]).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -39,7 +39,7 @@ async fn singleton_encoded_quantity_stages_as_one() {
     assert!(result.is_ok(), "singleton staging failed: {result:?}");
     let row = db.query_one("SELECT location_id, quantity FROM game.items WHERE item_id = $1", &[&item]).await.unwrap();
     assert_eq!(row.get::<_, i64>("location_id"), trade.id);
-    assert_eq!(row.get::<_, i32>("quantity"), -12345);
+    assert_eq!(row.get::<_, i64>("quantity"), -12345);
     db.execute("DELETE FROM game.trade_items WHERE trade_id = $1", &[&trade.id]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&vec![item, control]]).await.unwrap();
     db.execute("DELETE FROM game.jobs WHERE job_id = $1", &[&format!("trade-timeout:{}", trade.id)]).await.unwrap();

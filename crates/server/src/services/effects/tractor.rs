@@ -4,9 +4,9 @@
 //! modelled, matching the inventory service's existing access policy.
 //! Tractor beams follow to surface contact; the client supplies no stand-off distance.
 use super::{lifecycle::{Cycle, CycleOutcome, Module, subject_valid}, registry::{Effect, EffectAttribute, EffectFlag}, notify::fire_fx};
-use crate::consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, CARGO_CONTAINER_GROUPS, GROUP_WRECK};
+use infinity_core::consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, CARGO_CONTAINER_GROUPS, GROUP_WRECK};
 use crate::dao::items::loading::ItemQuery;
-use crate::messages;
+use infinity_core::messages;
 use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, fit::{Fit, Key}, items::load_items, user_error, db_err, CallError};
 use crate::space::{dist, System, MODE_WARP};
 use std::sync::Arc;

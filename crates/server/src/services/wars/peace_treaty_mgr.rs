@@ -4,7 +4,7 @@
 
 use crate::client::Client;
 use crate::services::{Call, CallResult, notify_error};
-use crate::messages;
+use infinity_core::messages;
 use marshal::Value;
 
 pub(super) async fn dispatch(_c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

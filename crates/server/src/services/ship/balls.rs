@@ -5,7 +5,7 @@
 //! Unpiloted hulls have no pilot or security status.
 
 use std::sync::Arc;
-use crate::consts::dogma::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS};
+use infinity_core::consts::dogma::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS};
 use crate::dao::items::space_ships::FreeShip;
 use crate::db::executor::Executor;
 use crate::db::Db;
@@ -14,8 +14,6 @@ use crate::services::{combat, crimewatch, db_err, fit::{Fit, Key}, identity::Ide
 use crate::space::{self, now_ms, Ball, MODE_STOP};
 use marshal::Value;
 
-const ATTR_WARP_SPEED_MULTIPLIER: i32 = 600;
-const ATTR_BASE_WARP_SPEED: i32 = 1281;
 /// Server policy: ship radius in metres when the SDE has no radius.
 const DEFAULT_SHIP_RADIUS: f64 = 50.0;
 
@@ -27,17 +25,33 @@ pub(crate) fn radius(sde: &Sde, type_id: i32) -> Result<f32, CallError> {
 pub(crate) struct PreparedShip {
     pub ball: Ball,
     condition: combat::ConditionSeed,
+    fit: Fit,
 }
 
 impl PreparedShip {
-    pub(crate) fn install(self) -> Ball {
-        self.condition.install(self.ball.id);
-        self.ball
+    pub(crate) fn install(self, actor: &mut space::System, add: impl FnOnce(&mut space::System, Ball)) {
+        let id = self.ball.id;
+        add(actor, self.ball);
+        actor.install_condition(id, self.condition.into_condition(), self.fit);
+    }
+
+    pub(crate) fn valid_transfer(&self, snapshot: &space::combat::ActorConditionSnapshot) -> bool {
+        self.ball.id == snapshot.item_id && snapshot.valid_with_fit(&self.fit, Key::Ship)
+    }
+
+    pub(crate) fn install_transfer(mut self, actor: &mut space::System,
+        add: impl FnOnce(&mut space::System, Ball), snapshot: space::combat::ActorConditionSnapshot) -> bool {
+        let id = self.ball.id;
+        if actor.contains(id) || !self.valid_transfer(&snapshot) { return false; }
+        self.ball.health = snapshot.fractions_with_fit(&self.fit, Key::Ship);
+        add(actor, self.ball);
+        actor.persistent_generation(id).is_some_and(|generation|
+            actor.transfer_combat_state(id, generation, snapshot, self.fit, Key::Ship))
     }
 }
 
 pub(super) async fn selected(identity: &Identity, db: &Db, world: &space::World, sde: &Arc<Sde>,
-    space_system: Option<i64>, alliance_id: Option<i64>, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
+    space_system: Option<i64>, alliance_id: Option<i64>, ship_id: i64, pos: [f64; 3]) -> Result<PreparedShip, CallError> {
     let type_id = super::required(crate::dao::items::inventory::type_id(db, ship_id).await.map_err(db_err)?, "ship item")?;
     let char_id = identity.char_id;
     let fit = if let Some(system) = space_system {
@@ -46,9 +60,10 @@ pub(super) async fn selected(identity: &Identity, db: &Db, world: &space::World,
         Fit::load(db, sde.clone(), char_id, ship_id).await?
     };
     let security = crimewatch::security_status(db, char_id).await?;
-    let health = combat::load_condition_with_fit(db, ship_id, &fit).await?;
-    build(sde, ship_id, type_id, char_id, identity.corp_id,
-        alliance_id.unwrap_or(-1), Some(char_id), pos, &fit, health, Some(security))
+    let condition = combat::prepare_condition_with_fit(db, ship_id, &fit).await?;
+    let ball = build(sde, ship_id, type_id, char_id, identity.corp_id,
+        alliance_id.unwrap_or(-1), Some(char_id), pos, &fit, condition.fractions(), Some(security))?;
+    Ok(PreparedShip { ball, condition, fit })
 }
 
 /// Prepare an unpiloted persistent ship without publishing its condition.
@@ -57,7 +72,7 @@ pub(crate) async fn unpiloted(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ship
     let condition = combat::prepare_condition_with_fit(ex, ship.item_id, &fit).await?;
     let ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
         ship.alliance_id, None, ship.pos, &fit, condition.fractions(), None)?;
-    Ok(PreparedShip { ball, condition })
+    Ok(PreparedShip { ball, condition, fit })
 }
 
 /// Prepare a piloted persistent ship without publishing its condition.
@@ -66,19 +81,20 @@ pub(crate) async fn piloted(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ship: 
     let condition = combat::prepare_condition_with_fit(ex, ship.item_id, &fit).await?;
     let ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
         ship.alliance_id, Some(character), ship.pos, &fit, condition.fractions(), Some(security))?;
-    Ok(PreparedShip { ball, condition })
+    Ok(PreparedShip { ball, condition, fit })
 }
 
 fn build(sde: &Sde, id: i64, type_id: i32, owner_id: i64, corp_id: i64, alliance_id: i64,
     char_id: Option<i64>, pos: [f64; 3], fit: &Fit, health: [f64; 3], security: Option<f64>) -> Result<Ball, CallError> {
+    if !pos.iter().all(|v| v.is_finite()) {
+        return Err(CallError::Internal(anyhow::anyhow!("non-finite ship position")));
+    }
     let r = super::required(sde.types.get(type_id), "ship type")?;
     let fitted = |attr: i32, base: f64| match fit.value(Key::Ship, attr) {
         v if v > 0.0 => v,
         _ => base,
     };
     let mass = fitted(ATTR_MASS, r.attribute(ATTR_MASS).or(r.mass).unwrap_or(1_000_000.0));
-    let warp_mult = r.attribute(ATTR_WARP_SPEED_MULTIPLIER).unwrap_or(1.0);
-    let base_warp = r.attribute(ATTR_BASE_WARP_SPEED).unwrap_or(3.0);
     let radius = radius(sde, type_id)?;
     Ok(Ball {
         id, type_id, owner_id, corp_id, alliance_id, char_id,
@@ -100,7 +116,6 @@ fn build(sde: &Sde, id: i64, type_id: i32, owner_id: i64, corp_id: i64, alliance
         massive: true,
         interactive: char_id.is_some(),
         warp: space::WarpState::default(),
-        warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
         effect_stamp: 0,

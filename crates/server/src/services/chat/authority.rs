@@ -7,7 +7,8 @@
 //! and use the durable scheduler. Passwords, corporation/alliance ACL grants,
 //! proxy-room ownership and client-preference nullsec blackout are unsupported.
 use std::sync::Arc;
-use crate::{chat::Hub, client::filetime_now, consts::{ROLE_DIRECTOR, WORMHOLE_SYSTEM_START}, dao::{alliances, chat_channels as dao, characters::lookup}, db::{self, Db, executor::Executor, outbox::{Effect, Outbox}}, messages::chat as text, sde::Sde, session::OnlineSession};
+use infinity_core::{consts::{ROLE_DIRECTOR, WORMHOLE_SYSTEM_START}, messages::chat as text, session::OnlineSession};
+use crate::{chat::{console, Hub}, client::filetime_now, dao::{alliances, chat_channels as dao, characters::lookup}, db::{self, Db, executor::Executor, outbox::{Effect, Outbox}}, sde::Sde};
 use super::super::{CallError, notify_error, has_role_or_is_ceo};
 
 /// `inventorycommon/const.py:48-59`: suppressed solar-system ranges.
@@ -118,6 +119,9 @@ fn voice(c: &dao::Channel, m: Option<&dao::Member>, aff: &str, now: i64) -> &'st
 pub(crate) async fn admit(db: &Db, sde: &Sde, session: &OnlineSession, channel: &str) -> Result<Option<Admission>, CallError> {
     let id = session.character_id;
     if id <= 0 { return Ok(None); }
+    if let Some(recipient) = console::recipient(channel) {
+        return Ok((recipient == id).then(|| Admission { affiliation: "member".into(), role: "visitor".into(), motd: String::new() }));
+    }
     let system_match = if channel.starts_with("corp_") || channel.starts_with("alliance_") {
         let Some(org) = crate::dao::characters::members::organization(db, id).await? else { return Ok(None); };
         let mut actual = session.clone();
@@ -155,6 +159,7 @@ async fn active(ex: &(impl Executor + ?Sized), id: i64) -> Result<(), CallError>
 }
 
 pub(super) enum ChatEffect { Invite(i64, String), EvictRoom(String), EvictMember(String, i64), Subject(String, String), Refresh(String) }
+crate::progress::leaf_effect!(ChatEffect);
 pub(super) async fn dispatch<T>(value: T, outbox: Outbox<ChatEffect>, hub: &Hub) -> Result<T, CallError> {
     for e in outbox.into_entries() {
         match e {
@@ -163,7 +168,7 @@ pub(super) async fn dispatch<T>(value: T, outbox: Outbox<ChatEffect>, hub: &Hub)
             Effect::Operation(ChatEffect::EvictMember(room, id)) => hub.evict_member(&room, id),
             Effect::Operation(ChatEffect::Subject(room, motd)) => hub.broadcast_subject(&room, &motd),
             Effect::Operation(ChatEffect::Refresh(room)) => hub.refresh_permissions(&room).await?,
-            Effect::Notification(_) | Effect::Event(_) => return Err(invalid()),
+            Effect::Notification(_) => tracing::warn!("chat dispatcher received an unsupported notification"),
         }
     }
     Ok(value)
@@ -344,6 +349,8 @@ pub(super) async fn system_motd(db: &Db, hub: &Hub, session: &OnlineSession, cha
     db.transaction(|tx, outbox: &mut Outbox<ChatEffect>| { let channel = Arc::clone(&channel); let motd = Arc::clone(&motd); Box::pin(async move {
         let channel = &*channel;
         let motd = &*motd;
+        let alliances: Vec<i64> = if allowed_alliance { alliance.into_iter().collect() } else { Vec::new() };
+        if !crate::dao::corporations::registry::lock_admission(tx, &alliances, &[corp], &[id]).await? { return Err(forbidden()); }
         if !has_role_or_is_ceo(tx, id, corp, ROLE_DIRECTOR).await? || (allowed_alliance && alliances::executor_corp(tx, alliance.unwrap()).await? != Some(corp)) { return Err(forbidden()); }
         dao::set_system_motd(tx, channel, motd).await?;
         outbox.operation(ChatEffect::Subject(channel.to_owned(), motd.to_owned())); Ok(())

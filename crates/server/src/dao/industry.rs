@@ -5,7 +5,7 @@
 //! Installed jobs transition to ready only when due; cancellation is installed-only.
 
 use std::collections::HashMap;
-use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY};
+use infinity_core::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY, MAX_STACK_QUANTITY};
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 
@@ -24,7 +24,7 @@ const JOB_SELECT: &str = "SELECT job_id, installer_id, owner_id, activity_id, bl
     FROM game.industry_jobs";
 const COUNTS_SQL: &str = "SELECT activity_id, count(*) AS count FROM game.industry_jobs WHERE installer_id = $1 AND status = $2 GROUP BY 1";
 const PRICES_SQL: &str = "SELECT type_id, adjusted FROM game.retail_prices WHERE type_id = ANY($1)";
-const AVAILABLE_SQL: &str = "SELECT type_id, sum(quantity)::bigint AS quantity FROM game.items
+const AVAILABLE_SQL: &str = "SELECT type_id, LEAST(sum(quantity), $4::bigint)::bigint AS quantity FROM game.items
              WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3 AND NOT singleton GROUP BY type_id";
 const BUSY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = ANY($1) AND status = ANY($2)) AS exists";
 const INSERT_JOB_SQL: &str = "INSERT INTO game.industry_jobs (installer_id, owner_id, activity_id, blueprint_id, blueprint_type_id, blueprint_copy, facility_id,
@@ -33,7 +33,7 @@ const INSERT_JOB_SQL: &str = "INSERT INTO game.industry_jobs (installer_id, owne
                                                          wallet_owner_id, wallet_account_key, blueprint_location_id, blueprint_flag_id)
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) RETURNING job_id";
 const DELETE_BLUEPRINT_SQL: &str = "DELETE FROM game.blueprints WHERE item_id = $1";
-const INSERT_COPY_SQL: &str = "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5::bigint::integer, true) RETURNING item_id";
+const INSERT_COPY_SQL: &str = "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, true) RETURNING item_id";
 const DELIVER_SQL: &str = "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1 AND status = $6";
 const CANCEL_SQL: &str = "UPDATE game.industry_jobs SET status = $2, completed_date = $3, completed_by = $4 WHERE job_id = $1 AND status = $5";
 
@@ -46,10 +46,10 @@ pub(crate) struct Blueprint {
 impl Blueprint {
     fn from_row(r: &Row) -> Self {
         let singleton = r.get("singleton");
-        let quantity: i32 = r.get("quantity");
+        let quantity: i64 = r.get("quantity");
         Self { item_id: r.get("item_id"), type_id: r.get("type_id"), owner: r.get("owner_id"), station: r.get("station_id"),
             location: r.get("location_id"), flag: r.get("flag_id"),
-            singleton, copy: singleton && quantity == BLUEPRINT_COPY_QUANTITY as i32,
+            singleton, copy: singleton && quantity == BLUEPRINT_COPY_QUANTITY,
             me: r.get("material_efficiency"), te: r.get("time_efficiency"), runs: r.get("runs") }
     }
 }
@@ -125,7 +125,7 @@ pub(crate) async fn prices(ex: &(impl Executor + ?Sized), ids: &[i32]) -> Result
     Ok(ex.query(PRICES_SQL, &[&ids]).await?.iter().map(|r| { let r = PriceRow::from_row(r); (r.type_id, r.adjusted) }).collect())
 }
 pub(crate) async fn available(ex: &(impl Executor + ?Sized), owner: i64, station: i64, flag: i32) -> Result<HashMap<i32, i64>, db::Error> {
-    Ok(ex.query(AVAILABLE_SQL, &[&owner, &station, &flag]).await?.iter().map(|r| { let r = AvailableRow::from_row(r); (r.type_id, r.quantity) }).collect())
+    Ok(ex.query(AVAILABLE_SQL, &[&owner, &station, &flag, &MAX_STACK_QUANTITY]).await?.iter().map(|r| { let r = AvailableRow::from_row(r); (r.type_id, r.quantity) }).collect())
 }
 pub(crate) async fn has_active_blueprint_job(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<bool, db::Error> {
     let statuses = [INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY];

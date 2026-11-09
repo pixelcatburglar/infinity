@@ -4,8 +4,8 @@
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::{Effect, EffectFlag};
 use super::{notify, weapons};
-use crate::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
-use crate::messages;
+use infinity_core::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
+use infinity_core::messages;
 use crate::services::combat::{self, Ctx, targeting_charges::{loaded, targets_of}};
 use crate::services::fit::{Fit, Key};
 use crate::services::{user_error, CallError};
@@ -63,7 +63,11 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
     let master = cycle.modules[0].id;
     let generation = cycle.stop.clone();
     let mut fired = false;
-    for module in &cycle.modules {
+    for index in 0..cycle.modules.len() {
+        let module = cycle.modules[index].clone();
+        let Some(attempt) = super::lifecycle::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
+            return Ok(CycleOutcome::Stop("source lost or activation replaced"));
+        };
         if !generation_valid(master, &generation) { return Ok(CycleOutcome::Stop("activation replaced")); }
         let key = Key::Module(module.id);
         let range = fit.value(key, ATTR_VORTON_ARC_RANGE);
@@ -71,24 +75,22 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         let source = cx.ship_id;
         let sde = cx.world.sde().clone();
         let check = generation.clone();
-        let Some((ship_type, primary_pilot, targets)) = cx.world.with(cx.system_id, move |s| {
+        let Some((targets, victims)) = cx.world.with(cx.system_id, move |s| {
             if !generation_valid(master, &check) { return None; }
             let ship = s.sampled_ball(source)?;
             if ship.mode == MODE_WARP { return None; }
             let target = s.sampled_ball(primary)?;
-            Some((ship.type_id, target.char_id, select_targets(s, &sde, source, primary, range, count)?))
+            let targets = select_targets(s, &sde, source, primary, range, count)?;
+            let victims = std::iter::once((primary, target.char_id)).chain(targets.iter().copied())
+                .map(|(id, pilot)| (id, pilot, s.combat_membership_generation(id), false, None)).collect();
+            Some((targets, victims))
         }).await.flatten() else { return Ok(CycleOutcome::Stop("source or target lost")); };
-        let Some(charge) = weapons::consume_charge(cx, module, fit.source_type(Key::Charge(module.id))).await? else { continue; };
+        let Some(charge) = weapons::consume_charge(cx, &module, fit.source_type(Key::Charge(module.id))).await? else { continue; };
         cycle.charge_type = Some(charge);
         fired = true;
-        for (target, pilot) in std::iter::once((primary, primary_pilot)).chain(targets.iter().copied()) {
-            if !generation_valid(master, &generation) { return Ok(CycleOutcome::Stop("activation replaced")); }
-            if let Some(pilot) = pilot {
-                crate::services::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, ship_type, module.type_id, pilot, target).await?;
-            }
-            if !generation_valid(master, &generation) { return Ok(CycleOutcome::Stop("activation replaced")); }
-            weapons::fire_turret(cx, fit, module, target).await?;
-        }
+        let (parameters, raw) = weapons::turret_parameters(fit, &module);
+        super::aoe::apply_damage_guarded(&cx.db, &cx.world, cx.system_id, module.type_id, victims, raw,
+            Some(super::aoe::DamageGuard::Player(master, generation.clone())), attempt, Some(parameters)).await?;
         if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) {
             let info = Value::dict([("targets", Value::list(targets.iter().map(|(id, _)| Value::Int(*id))))]);
             let (id, type_id, duration, repeat, offensive) = (module.id, module.type_id, cycle.duration_ms, cycle.repeat, cycle.effect.has(EffectFlag::Offensive));

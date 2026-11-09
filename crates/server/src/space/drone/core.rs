@@ -4,7 +4,7 @@
 //! Orders and controller state are not restored after restart.
 
 use super::*;
-use crate::consts::{*, dogma::*};
+use infinity_core::consts::{*, dogma::*};
 use crate::space::targeting::next_generation as generation;
 
 /// Server movement policy: converge inside the action/contact boundary, not at it.
@@ -18,6 +18,7 @@ pub(in crate::space) struct DroneBrain {
     locked: bool,
     cycle_at: i64,
     end_at: Option<i64>,
+    combat_attempt: Option<crate::services::effects::space_source::PreparedCombatAttempt>,
     contact_queued: bool,
     contact_claimed: Option<u64>,
     kinematics: Option<crate::services::effects::propulsion::Kinematics>,
@@ -26,6 +27,14 @@ pub(in crate::space) struct DroneBrain {
 
 impl System {
     pub(crate) fn drone(&self, id: i64) -> Option<DroneRecord> { self.drones.get(&id).map(|b| b.record.clone()) }
+    pub(crate) fn drone_store_combat_attempt(&mut self, id: i64, generation: u64, attempt: crate::services::effects::space_source::PreparedCombatAttempt) {
+        if let Some(brain) = self.drones.get_mut(&id).filter(|b| b.record.generation == generation) {
+            brain.combat_attempt = Some(attempt);
+        }
+    }
+    pub(crate) fn drone_take_combat_attempt(&mut self, id: i64, generation: u64) -> Option<crate::services::effects::space_source::PreparedCombatAttempt> {
+        self.drones.get_mut(&id).filter(|b| b.record.generation == generation)?.combat_attempt.take()
+    }
     pub(crate) fn combat_owner(&self, id: i64) -> Option<i64> {
         let ball = self.ball(id)?;
         ball.char_id.or_else(|| self.drones.get(&id).and_then(|b| (b.record.owner != OWNER_UNOWNED).then_some(b.record.owner)))
@@ -49,34 +58,55 @@ impl System {
         self.drone_reservations.insert(token, Reservation { owner, controller, bandwidths: bandwidths.to_vec() });
         Some(token)
     }
+    pub(in crate::space) fn complete_drone_launch_reservation(&mut self, token: u64, owner: i64, controller: i64) -> bool {
+        self.drone_reservations.remove(&token).is_some_and(|r| r.owner == owner && r.controller == controller)
+            && self.drone_ship_live(owner, controller)
+    }
     pub(crate) fn cancel_drone_launch(&mut self, token: u64) { self.drone_reservations.remove(&token); }
-    pub(crate) fn complete_drone_launch(&mut self, token: u64, owner: i64, controller: i64, entries: Vec<(Ball, DroneSpec)>, effects: DroneEffects) -> tokio::sync::oneshot::Receiver<()> {
-        let valid = self.drone_reservations.remove(&token).is_some_and(|r| r.owner == owner && r.controller == controller)
-            && self.drone_ship_live(owner, controller);
-        for (ball, spec) in entries {
+    pub(crate) fn complete_drone_launch(&mut self, token: u64, owner: i64, controller: i64, mut entries: Vec<PreparedDrone>, effects: DroneEffects) -> Result<tokio::sync::oneshot::Receiver<()>, crate::services::CallError> {
+        let mut dirty = Vec::with_capacity(entries.len());
+        for prepared in &mut entries {
+            let id = prepared.ball.id;
+            prepared.fit.replace_projections_for(crate::services::fit::Key::Ship, self.projections_on(controller), Some(self.projection_revision(controller)));
+            prepared.fit.replace_projections_for(prepared.key, self.projections_on(id), Some(self.projection_revision(id)));
+            let (health, changed) = prepared.condition.rebase_with_fit(&prepared.fit, prepared.key)?;
+            prepared.ball.health = health;
+            dirty.push(changed);
+        }
+        let valid = self.complete_drone_launch_reservation(token, owner, controller);
+        for (prepared, changed) in entries.into_iter().zip(dirty) {
+            let PreparedDrone { ball, spec, condition, fit, key } = prepared;
             if self.drones.contains_key(&ball.id) { continue; }
             let id = ball.id;
             self.add_ship(ball);
             self.register_drone(id, spec, effects.clone(), valid.then_some(controller), valid.then_some(owner), false);
+            self.install_condition_with_key(id, condition.into_condition(), fit, key);
+            if changed {
+                if let Some(generation) = self.combat_membership_generation(id) {
+                    self.mark_condition_dirty(id, generation);
+                }
+            }
             self.queue_drone_announcement(id);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.queue_drone_launch_ack(tx);
-        rx
+        Ok(rx)
     }
-    pub(crate) fn restore_drone(&mut self, ball: Ball, spec: DroneSpec, effects: DroneEffects) {
+    pub(crate) fn restore_drone(&mut self, prepared: PreparedDrone, effects: DroneEffects) {
+        let PreparedDrone { ball, spec, condition, fit, key } = prepared;
         let id = ball.id;
         if self.drones.contains_key(&id) { return; }
         self.insert(ball);
         self.register_drone(id, spec, effects, None, None, true);
+        self.install_condition_with_key(id, condition.into_condition(), fit, key);
     }
-    fn register_drone(&mut self, id: i64, spec: DroneSpec, effects: DroneEffects, controller: Option<i64>, controller_owner: Option<i64>, announced: bool) {
+    pub(crate) fn register_drone(&mut self, id: i64, spec: DroneSpec, effects: DroneEffects, controller: Option<i64>, controller_owner: Option<i64>, announced: bool) {
         let Some((owner, pos)) = self.ball(id).map(|b| (b.owner_id, b.pos)) else { return };
         let record = DroneRecord { id, owner, controller, controller_owner, generation: generation(), order: DroneOrder::Idle, target: None, state: DRONE_STATE_IDLE, spec, pending: None };
         self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
         self.snapshot_positions.insert(id, (self.snapshot_generation, pos));
         if self.snapshot_due == 0 { self.snapshot_due = self.ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND)); }
-        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, contact_queued: false, contact_claimed: None, kinematics: None, announced });
+        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, combat_attempt: None, contact_queued: false, contact_claimed: None, kinematics: None, announced });
     }
     fn notify_drone(&self, d: &DroneRecord) {
         if self.drones.get(&d.id).is_none_or(|b| !b.announced) { return; }
@@ -130,6 +160,7 @@ impl System {
         if order != DroneOrder::ReturnBay { b.record.pending = None; }
         b.record.state = match order { DroneOrder::ReturnBay | DroneOrder::ReturnHome => DRONE_STATE_DEPARTING, DroneOrder::Engage(_) | DroneOrder::Mine(_) => DRONE_STATE_APPROACHING, _ => DRONE_STATE_IDLE };
         b.locked = false; b.lock_at = 0; b.cycle_at = 0; b.end_at = None; b.contact_queued = false;
+        b.combat_attempt = None;
         let record = b.record.clone();
         if matches!(old_order, DroneOrder::Assist(_) | DroneOrder::Guard(_)) {
             self.notify_pilot(owner, "OnDroneActivityChange", crate::services::effects::notify::drone_activity(id, None, None));
@@ -185,6 +216,7 @@ impl System {
         let b = self.drones.get_mut(&id).unwrap();
         b.record.generation = self::generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.state = DRONE_STATE_IDLE; b.record.pending = None;
         b.locked = false; b.end_at = None; b.contact_queued = false;
+        b.combat_attempt = None;
         let d = b.record.clone(); self.notify_drone(&d); self.drone_stop(id);
     }
     pub(crate) fn drone_pending(&mut self, id: i64, generation: u64, pending: PendingMining) -> bool {
@@ -194,7 +226,7 @@ impl System {
         let b = self.drones.get_mut(&id).unwrap(); b.record.pending = Some(pending); b.contact_queued = false; b.end_at = None; b.locked = false; b.lock_at = 0;
         self.drone_follow(id, controller, DRONE_SCOOP_RANGE); true
     }
-    pub(crate) fn drone_claim_contact(&mut self, id: i64, generation: u64) -> Option<DroneRecord> {
+    fn drone_contact_current(&self, id: i64, generation: u64) -> Option<DroneRecord> {
         let d = self.drone(id)?;
         let b = self.drones.get(&id)?;
         if !self.drone_current(id, generation) || b.contact_claimed.is_some() || !b.contact_queued
@@ -203,6 +235,13 @@ impl System {
         if !self.drone_ship_live(d.owner, destination) { return None; }
         let (source, ship) = self.sampled_ball(id).zip(self.sampled_ball(destination))?;
         if dist(source.pos, ship.pos) - f64::from(source.radius) - f64::from(ship.radius) > DRONE_SCOOP_RANGE { return None; }
+        Some(d)
+    }
+    pub(crate) fn drone_owns_contact(&self, id: i64, generation: u64) -> bool {
+        self.drones.get(&id).is_some_and(|b| b.contact_claimed == Some(generation)) && self.contains(id)
+    }
+    pub(crate) fn drone_claim_contact(&mut self, id: i64, generation: u64) -> Option<DroneRecord> {
+        let d = self.drone_contact_current(id, generation)?;
         self.drones.get_mut(&id)?.contact_claimed = Some(generation);
         Some(d)
     }
@@ -233,6 +272,7 @@ impl System {
         self.set_ball_owner(id, OWNER_UNOWNED);
         let b = self.drones.get_mut(&id).unwrap();
         b.record.owner = OWNER_UNOWNED; b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.pending = None; b.record.state = DRONE_STATE_IDLE; b.locked = false;
+        b.combat_attempt = None;
         self.notify_pilot(d.owner, "OnDroneStateChange", crate::services::effects::notify::drone_state(id, None, None, DRONE_STATE_IDLE, d.spec.type_id, None, None));
         self.notify_pilot(d.owner, "OnDroneActivityChange", crate::services::effects::notify::drone_activity(id, None, None));
         self.drone_stop(id);
@@ -245,6 +285,7 @@ impl System {
             let was_controlled = self.drones[&id].record.controller == Some(controller) && self.drones[&id].announced;
             let b = self.drones.get_mut(&id).unwrap();
             b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.state = DRONE_STATE_IDLE; b.locked = false; b.end_at = None; b.contact_queued = false;
+            b.combat_attempt = None;
             if b.contact_claimed.is_none() {
                 b.record.pending = None;
             }
@@ -264,6 +305,7 @@ impl System {
                 b.locked = false;
                 b.lock_at = 0;
                 b.end_at = None;
+                b.combat_attempt = None;
             }
         }
     }
@@ -290,6 +332,7 @@ impl System {
             if !targeting::target_visible(target_ball) || dist(owner_ball.position_at(self.ms), target_ball.position_at(self.ms)) > d.spec.control_range { continue; }
             self.remove_projections_from(id);
             let b = self.drones.get_mut(&id).unwrap(); b.record.generation = generation(); b.record.target = Some(victim); b.record.state = DRONE_STATE_APPROACHING; b.locked = false; b.lock_at = 0; b.end_at = None;
+            b.combat_attempt = None;
             let record = b.record.clone(); self.notify_drone(&record); self.drone_follow(id, victim, record.spec.optimal_range.max(0.0));
         }
     }
@@ -328,7 +371,7 @@ impl System {
             let brain = self.drones.get_mut(&id).unwrap();
             if !brain.contact_queued {
                 brain.contact_queued = true;
-                if let Some(tx) = &self.effect_jobs { let _ = tx.send(npc::EffectJob::Drone { effects: brain.effects.clone(), action: DroneAction::Contact { drone: d, return_to_bay: brain.record.order == DroneOrder::ReturnBay } }); }
+                if self.effect_jobs.is_some() { self.effect_staging.push(npc::EffectJob::Drone { effects: brain.effects.clone(), action: DroneAction::Contact { drone: d, return_to_bay: brain.record.order == DroneOrder::ReturnBay } }); }
             }
             return;
         }
@@ -339,9 +382,13 @@ impl System {
             self.remove_projections_from(id);
             let b = self.drones.get_mut(&id).unwrap();
             if b.locked || b.lock_at != 0 { b.record.generation = generation(); }
+            b.combat_attempt = None;
             b.locked = false; b.lock_at = 0; b.end_at = None; return;
         }
-        if dist(me.pos, victim.pos) - f64::from(me.radius) - f64::from(victim.radius) > d.spec.optimal_range.max(0.0) { return; }
+        if dist(me.pos, victim.pos) - f64::from(me.radius) - f64::from(victim.radius) > d.spec.optimal_range.max(0.0) {
+            self.drones.get_mut(&id).unwrap().combat_attempt = None;
+            return;
+        }
         let signature = victim.signature_radius.or_else(|| self.projection_sde.as_ref()
             .and_then(|sde| sde.types.get(victim.type_id))
             .and_then(|data| data.attribute(ATTR_SIGNATURE_RADIUS))).unwrap_or(f64::from(victim.radius));
@@ -355,7 +402,7 @@ impl System {
         if let Some(end) = b.end_at {
             if self.ms >= end {
                 b.end_at = None;
-                if let Some(tx) = &self.effect_jobs { let _ = tx.send(npc::EffectJob::Drone { effects: b.effects.clone(), action: DroneAction::Cycle { drone: d.clone(), target, phase: DronePhase::End } }); }
+                if self.effect_jobs.is_some() { self.effect_staging.push(npc::EffectJob::Drone { effects: b.effects.clone(), action: DroneAction::Cycle { drone: d.clone(), target, phase: DronePhase::End } }); }
             }
         }
         let mut notice = None;
@@ -364,7 +411,7 @@ impl System {
             if b.record.state != state { b.record.state = state; notice = Some(b.record.clone()); }
             let deadline = self.ms.saturating_add(d.spec.duration_ms.min(i64::MAX as f64) as i64);
             b.cycle_at = deadline; b.end_at = Some(deadline);
-            if let Some(tx) = &self.effect_jobs { let _ = tx.send(npc::EffectJob::Drone { effects: b.effects.clone(), action: DroneAction::Cycle { drone: b.record.clone(), target, phase: DronePhase::Begin } }); }
+            if self.effect_jobs.is_some() { self.effect_staging.push(npc::EffectJob::Drone { effects: b.effects.clone(), action: DroneAction::Cycle { drone: b.record.clone(), target, phase: DronePhase::Begin } }); }
         }
         if let Some(record) = notice { self.notify_drone(&record); }
     }

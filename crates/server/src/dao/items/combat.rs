@@ -23,7 +23,7 @@ pub(crate) async fn set_online(ex: &(impl Executor + ?Sized), item: i64, ship: i
 pub(crate) async fn loot(ex: &(impl Executor + ?Sized), bounty: f64) -> Result<Vec<Loot>, Error> {
     Ok(ex.query("SELECT type_id FROM game.retail_prices WHERE average BETWEEN 1000 AND GREATEST($1::float8, 50000)", &[&bounty]).await?.iter().map(Loot::from_row).collect())
 }
-pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), kind: i32, owner: i64, wreck: i64, quantity: i32) -> Result<u64, Error> {
+pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), kind: i32, owner: i64, wreck: i64, quantity: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, 0, $4)", &[&kind, &owner, &wreck, &quantity]).await
 }
 
@@ -44,20 +44,20 @@ pub(crate) async fn destroy(ex: &(impl Executor + ?Sized), ship: i64, master: i6
 pub(crate) async fn remove_slave(ex: &(impl Executor + ?Sized), ship: i64, slave: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = $2", &[&ship, &slave]).await
 }
-pub(crate) async fn delete_reserved(ex: &(impl Executor + ?Sized), ship: i64, rows: &std::collections::BTreeMap<i32, (i32, i32, i64)>) -> Result<bool, Error> {
+pub(crate) async fn delete_reserved(ex: &(impl Executor + ?Sized), ship: i64, rows: &std::collections::BTreeMap<i32, (i32, i64, i64)>) -> Result<bool, Error> {
     for (&flag, &(kind, quantity, _)) in rows {
         if ex.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity = $4", &[&ship, &flag, &kind, &quantity]).await? == 0 { return Ok(false); }
     }
     Ok(true)
 }
-pub(crate) async fn insert_cargo(ex: &(impl Executor + ?Sized), ship: i64, flag: i32, rows: &std::collections::BTreeMap<(i64, i32), i32>) -> Result<Vec<i64>, Error> {
+pub(crate) async fn insert_cargo(ex: &(impl Executor + ?Sized), ship: i64, flag: i32, rows: &std::collections::BTreeMap<(i64, i32), i64>) -> Result<Vec<i64>, Error> {
     let mut ids = Vec::with_capacity(rows.len());
     for (&(owner, kind), &quantity) in rows {
         ids.push(transfers::insert(ex, kind, owner, ship, flag, quantity).await?);
     }
     Ok(ids)
 }
-pub(crate) async fn apply_loads(ex: &(impl Executor + ?Sized), ship: i64, loads: &[(i64, i32, i32, i32, i32)]) -> Result<(), Error> {
+pub(crate) async fn apply_loads(ex: &(impl Executor + ?Sized), ship: i64, loads: &[(i64, i32, i32, i64, i64)]) -> Result<(), Error> {
     for &(_, flag, kind, quantity, _) in loads {
         ex.execute("INSERT INTO game.module_charges (ship_id, flag_id, type_id, quantity) VALUES ($1, $2, $3, $4)
                          ON CONFLICT (ship_id, flag_id) DO UPDATE SET type_id = EXCLUDED.type_id, quantity = EXCLUDED.quantity", &[&ship, &flag, &kind, &quantity]).await?;

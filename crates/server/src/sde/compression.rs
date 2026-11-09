@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::{dao::sde::compression as dao, db::Db};
 use super::types::Types;
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Compression(HashMap<i32, i32>);
 
 impl Compression {

@@ -3,7 +3,8 @@
 //! cached admission roles are runtime state. Password rooms, corporate/alliance
 //! ACLs and proxy ownership are unsupported.
 use super::*;
-use crate::{dao::chat_channels::Restriction, messages::chat as text, services::{chat::{authority, expiry}, CallError}};
+use infinity_core::messages::chat as text;
+use crate::{dao::chat_channels::Restriction, services::{chat::{authority, expiry}, CallError}};
 
 const OWNER: &str = "http://jabber.org/protocol/muc#owner";
 const ADMIN: &str = "http://jabber.org/protocol/muc#admin";
@@ -41,7 +42,7 @@ fn channel<'a>(hub: &Hub, jid: &'a str) -> Option<&'a str> {
     if domain != hub.conference() || name.is_empty() || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') { return None; }
     Some(name)
 }
-fn session(c: &Conn) -> Option<crate::session::OnlineSession> {
+fn session(c: &Conn) -> Option<infinity_core::session::OnlineSession> {
     let id = c.user.as_deref()?.parse::<i64>().ok()?;
     c.full_jid.as_ref()?;
     if !c.hub.check(c.user.as_deref()?, c.password.as_deref()?) { return None; }
@@ -237,8 +238,7 @@ async fn presence(c: &mut Conn, el: &Element) -> Result<()> {
     let (room, nick) = to.split_once('/').unwrap_or((to, ""));
     if nick != s.character_id.to_string() { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
     if el.attr("type") == Some("unavailable") {
-        let mut rooms = c.hub.rooms.lock().unwrap();
-        if let Some(occ) = rooms.entries.get_mut(room) { if occ.get(nick).is_some_and(|o| o.matches_socket(&full, &c.tx)) { occ.remove(nick); let p = format!("<presence from='{}' type='unavailable'><x xmlns='{USER}'><item affiliation='none' role='none'/></x></presence>", esc(to)); let _ = c.tx.send(p.clone()); for o in occ.values() { o.send(p.clone()); } } }
+        c.hub.leave_room(room, &full, &c.tx);
         return Ok(());
     }
     if el.attr("type").is_some() { error(c, el, "feature-not-implemented", ""); return Ok(()) }

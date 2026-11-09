@@ -5,7 +5,7 @@
 //! state. Virtual occupants join system rooms only, not durable custom rooms.
 //! Password rooms, corporation/alliance ACLs and proxy ownership are unsupported.
 
-use crate::consts::TYPE_CHARACTER;
+use infinity_core::consts::TYPE_CHARACTER;
 use anyhow::Result;
 use base64::Engine;
 use quick_xml::events::Event;
@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 mod rooms;
+pub(crate) mod console;
 mod stanzas;
 #[cfg(test)]
 mod tests;
@@ -74,8 +75,28 @@ impl Element {
     }
 }
 
+/// XML 1.0 predefined entities, shared by escaping and rendered-size accounting.
+fn xml_entity(ch: char) -> Option<&'static str> {
+    match ch {
+        '&' => Some("&amp;"),
+        '<' => Some("&lt;"),
+        '>' => Some("&gt;"),
+        '\'' => Some("&apos;"),
+        '"' => Some("&quot;"),
+        _ => None,
+    }
+}
+
 pub fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\'', "&apos;").replace('"', "&quot;")
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if let Some(entity) = xml_entity(ch) {
+            escaped.push_str(entity);
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 type Tx = mpsc::UnboundedSender<String>;

@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 use marshal::Value;
-use crate::{client::filetime_ticks_from_hours, consts::{dogma::{ATTR_CLONE_JUMP_COOLDOWN, ATTR_MAX_JUMP_CLONES}, UE_LOCID}, dao::characters::clones as clone_dao, db::executor::Executor, messages, sde::Sde, services::{db_err, notify_error, user_error, CallError, fit::{Fit, Key}, identity::Identity, standings, wallets}};
+use infinity_core::{consts::{dogma::{ATTR_CLONE_JUMP_COOLDOWN, ATTR_MAX_JUMP_CLONES}, UE_LOCID}, messages};
+use crate::{client::filetime_ticks_from_hours, dao::characters::clones as clone_dao, db::executor::Executor, sde::Sde, services::{db_err, notify_error, user_error, CallError, fit::{Fit, Key}, identity::Identity, standings, wallets}};
 
 /// appConst.py stationServiceCloning and stationServiceJumpCloneFacility.
 /// Server NPC installation accepts either service; access checks still use the jump-clone service.
@@ -79,7 +80,7 @@ pub(super) async fn check_cooldown_tx(ex: &(impl Executor + ?Sized), sde: &Arc<S
     if cooldown_ready(now, last, fit.value(Key::Char, ATTR_CLONE_JUMP_COOLDOWN))? { Ok(()) } else { Err(notify_error(messages::clones::COOLDOWN_ACTIVE)) }
 }
 
-enum Issue { Docked, Bay, Capacity, Skill, Funds(f64, f64), Duplicate, Access(CallError, bool) }
+enum Issue { Docked, Bay, Capacity, Skill, Funds(crate::isk::IskAmount, crate::isk::IskAmount), Duplicate, Access(CallError, bool) }
 impl Issue {
     fn label(&self) -> Value {
         let label = match self {
@@ -92,7 +93,7 @@ impl Issue {
             Self::Access(_, true) => messages::clones::VALIDATION_OPPONENT,
             Self::Access(_, false) => messages::clones::VALIDATION_STANDINGS,
         };
-        match self { Self::Funds(fee, _) => Value::tuple([Value::str(label), Value::dict([("cloneCost", Value::Float(*fee))])]), _ => Value::str(label) }
+        match self { Self::Funds(fee, _) => Value::tuple([Value::str(label), Value::dict([("cloneCost", Value::Float(fee.wire_isk()))])]), _ => Value::str(label) }
     }
     fn error(self) -> CallError {
         match self {
@@ -129,7 +130,7 @@ async fn issues(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, id: &Identity, no
     let capacity = capacity.trunc() as usize;
     if capacity == 0 { issues.push(Issue::Skill); }
     else if clones.len() >= capacity { issues.push(Issue::Capacity); }
-    let fee = service_fee();
+    let fee = crate::isk::IskAmount::from_isk(service_fee())?;
     let balance = wallets::balance(ex, id.char_id).await?;
     if balance < fee { issues.push(Issue::Funds(fee, balance)); }
     Ok(issues)

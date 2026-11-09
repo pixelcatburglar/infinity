@@ -1,7 +1,8 @@
 //! Opt-in database regression for the ShipGetInfo capacitor priming path.
 use super::*;
 use std::sync::Arc;
-use crate::{client::filetime_now, consts::{dogma::ATTR_RECHARGE_RATE, CATEGORY_SHIP, FILETIME_SECOND}, space::{Ball, WarpState, MODE_STOP, World}};
+use infinity_core::{consts::{dogma::ATTR_RECHARGE_RATE, CATEGORY_SHIP, FILETIME_SECOND}};
+use crate::{client::filetime_now, space::{Ball, WarpState, MODE_STOP, World}};
 
 fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
     Ball {
@@ -11,7 +12,7 @@ fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
@@ -52,11 +53,17 @@ async fn ship_get_info_priming_does_not_refill_capacitor() {
         let capacity = fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY);
         let tau = fit.value(fit::Key::Ship, ATTR_RECHARGE_RATE);
         assert!(capacity.is_finite() && capacity > 0.0 && tau.is_finite() && tau > 0.0);
+        let condition = combat::prepare_condition_with_fit(&test_db, fixture.ship, &fit).await.expect("prepare ship condition");
+        test_world.with(system, move |s| {
+            s.install_condition(fixture.ship, condition.into_condition(), fit);
+            assert_eq!(s.pilot_ball(fixture.character).map(|ball| ball.id), Some(fixture.ship));
+            assert!(s.ship_condition(fixture.ship).is_some());
+        }).await.expect("ship system");
         let start = filetime_now();
         let drained = combat::groups_health::tests::drain_exact(&test_db, &test_world, system, fixture.ship, capacity * 2.0).await.ok().expect("drain");
         assert_eq!(drained, capacity);
         for _ in 0..2 {
-            let primed = ship_info(&client).await.ok().expect("ShipGetInfo priming");
+            let primed = ship_info(&client).await.expect("ShipGetInfo priming");
             let reported = charge(&primed, fixture.ship);
             let snapshot = combat::groups_health::capacitor_snapshot(&test_db, &test_world, system, fixture.ship).await.ok().expect("snapshot").expect("ship present");
             let elapsed = filetime_now().saturating_sub(start).max(0) as f64 / FILETIME_SECOND as f64;
@@ -68,7 +75,7 @@ async fn ship_get_info_priming_does_not_refill_capacitor() {
         }
     }).await;
     world.remove_ball(system, fixture.ship).await;
-    world.unregister_pilot(fixture.character);
+    world.unregister_pilot_generation(fixture.character, None);
     let flush = world.flush_positions().await;
     combat::forget_ship(fixture.ship);
     drop(world);

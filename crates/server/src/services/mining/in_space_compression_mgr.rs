@@ -1,25 +1,22 @@
 //! In-space compression for `itemcompression/client/itemCompression.py` and
 //! `itemcompression/client/inSpaceCompression.py`. The one-to-one preview in
 //! `itemcompression/client/ui/compression_window.py:150-157` uses the native SDE
-//! mapping; inventory is persisted in game.items. Only live own or fleet ship
-//! compressors are supported, not automatic compression or structures.
+//! mapping; inventory is persisted in game.items. Explicit compression uses fresh
+//! inventory access checks, preserving shared-bay stack ownership. Wire stack
+//! quantities project to the client display limit; stored amounts stay exact.
+//! Only live own or fleet ship compressors are supported, not automatic
+//! compression or structures.
 use std::collections::BTreeMap;
-use crate::{client::Client, consts::{CATEGORY_SHIP, FLAG_CARGO, IX_LOCATION_ID, IX_STACK_SIZE}, dao::{self, items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, messages::mining as msg, sde::Sde, services::{db_err, fleets, inventory, items::load_items, market, notify_error, Call, CallError, CallResult}, space::dist};
+use infinity_core::{consts::{CATEGORY_SHIP, FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_GENERAL_MINING_HOLD, FLAG_SPECIAL_ASTEROID_HOLD, FLAG_SPECIALIZED_ICE_HOLD, FLAG_SPECIALIZED_GAS_HOLD, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, messages::mining as msg};
+use crate::{client::Client, dao::{self, items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, sde::Sde, services::{db_err, fleets, inventory, items::load_items, market, notify_error, Call, CallError, CallResult}, space::dist};
 use marshal::Value;
-use super::FLAG_MINING_HOLD;
-
-/// Client inventorycommon/const.py: flagSpecializedAsteroidHold.
-const FLAG_ASTEROID_HOLD: i32 = 182;
-/// Client inventorycommon/const.py: flagSpecializedIceHold.
-const FLAG_ICE_HOLD: i32 = 181;
-/// Client inventorycommon/const.py: flagSpecializedGasHold.
-const FLAG_GAS_HOLD: i32 = 135;
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct Context { character: i64, ship: i64, system: i64 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SourceGuard { item_id: i64, type_id: i32, owner_id: i64, location_id: i64, flag_id: i32, quantity: i32, singleton: bool }
+struct SourceGuard { item_id: i64, type_id: i32, owner_id: i64, location_id: i64, flag_id: i32, quantity: i64, singleton: bool }
 
 impl From<&Item> for SourceGuard {
     fn from(item: &Item) -> Self {
@@ -38,8 +35,8 @@ fn arguments(call: &Call<'_>) -> Result<(i64, i64), CallError> {
 }
 
 fn eligible(context: &Context, item: &Item) -> bool {
-    item.owner_id == context.character && item.location_id == context.ship && item.quantity > 0 && !item.singleton
-        && [FLAG_CARGO, FLAG_MINING_HOLD, FLAG_ASTEROID_HOLD, FLAG_ICE_HOLD, FLAG_GAS_HOLD].contains(&item.flag_id)
+    (item.owner_id == context.character || item.flag_id == FLAG_FLEET_HANGAR) && item.location_id == context.ship && item.quantity > 0 && !item.singleton
+        && [FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_GENERAL_MINING_HOLD, FLAG_SPECIAL_ASTEROID_HOLD, FLAG_SPECIALIZED_ICE_HOLD, FLAG_SPECIALIZED_GAS_HOLD].contains(&item.flag_id)
 }
 
 fn output_type(sde: &Sde, source: i32) -> Result<i32, CallError> {
@@ -51,42 +48,40 @@ async fn item(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64) -> Result<Optio
     Ok(load_items(ex, sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next())
 }
 
-async fn compress_tx(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox, context: &Context, expected_source: SourceGuard) -> CallResult {
+async fn compress_tx(
+    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox,
+    context: &Context, expected_source: SourceGuard,
+    locks: &crate::dao::items::parent_locks::LockedItems<'_>,
+) -> Result<(Value, Item, crate::services::items::DepositReceipt), CallError> {
     if context.character <= 0 || context.ship <= 0 || context.system <= 0 { return Err(notify_error(msg::COMPRESSION_CONTEXT)); }
+    let output_type = output_type(sde, expected_source.type_id)?;
     let source = item(ex, sde, expected_source.item_id).await?.ok_or_else(|| notify_error(msg::COMPRESSION_CHANGED))?;
-    if SourceGuard::from(&source) != expected_source {
-        return Err(notify_error(msg::COMPRESSION_CHANGED));
-    }
-    if !eligible(context, &source) { return Err(notify_error(msg::COMPRESSION_ITEM)); }
+    if SourceGuard::from(&source) != expected_source || !eligible(context, &source) { return Err(notify_error(msg::COMPRESSION_CHANGED)); }
     let ship = item(ex, sde, context.ship).await?.ok_or_else(|| notify_error(msg::COMPRESSION_CONTEXT))?;
     if ship.owner_id != context.character || ship.location_id != context.system || !ship.singleton || ship.quantity != 1 || ship.category_id != i64::from(CATEGORY_SHIP) {
         return Err(notify_error(msg::COMPRESSION_CONTEXT));
     }
-    if !dao::trades::reserved(ex, &[source.item_id]).await.map_err(db_err)?.is_empty() { return Err(notify_error(msg::COMPRESSION_RESERVED)); }
-    let output_type = output_type(sde, source.type_id)?;
-    let candidate = transfers::stack(ex, context.ship, source.flag_id, output_type, context.character).await.map_err(db_err)?;
-    let output = if let Some(candidate) = candidate {
-        let output = item(ex, sde, candidate.item_id).await?.ok_or_else(|| notify_error(msg::COMPRESSION_CHANGED))?;
-        if !eligible(context, &output) || output.flag_id != source.flag_id || output.type_id != output_type || output.quantity != candidate.quantity {
-            return Err(notify_error(msg::COMPRESSION_CHANGED));
-        }
-        Some(output)
-    } else { None };
-    let mut changes = BTreeMap::from([(source.item_id, QuantityChange::new(&source, None))]);
-    if let Some(output) = &output {
-        let quantity = output.quantity.checked_add(source.quantity).ok_or_else(|| notify_error(msg::COMPRESSION_OVERFLOW))?;
-        changes.insert(output.item_id, QuantityChange::new(output, Some(quantity)));
-    }
+    if !dao::trades::reserved(ex, &[source.item_id, context.ship]).await.map_err(db_err)?.is_empty() { return Err(notify_error(msg::COMPRESSION_RESERVED)); }
+    let mut changes = BTreeMap::new();
+    changes.insert(source.item_id, QuantityChange::new(&source, None));
     if !quantities::apply(ex, &changes).await.map_err(db_err)? { return Err(notify_error(msg::COMPRESSION_CHANGED)); }
-    let output_id = match &output {
-        Some(output) => output.item_id,
-        None => transfers::insert(ex, output_type, context.character, context.ship, source.flag_id, source.quantity).await.map_err(db_err)?,
-    };
-    let result = Value::tuple([Value::Int(source.item_id), Value::Int(i64::from(source.type_id)), Value::Int(i64::from(source.quantity)), Value::Int(output_id), Value::Int(i64::from(output_type)), Value::Int(i64::from(source.quantity))]);
-    inventory::notifications::notify_item_removed(outbox, source);
-    let change = match output { Some(output) => (IX_STACK_SIZE, Value::Int(i64::from(output.quantity))), None => (IX_LOCATION_ID, Value::Int(0)) };
-    inventory::notifications::notify_item_change(ex, sde, outbox, output_id, vec![change]).await?;
-    Ok(result)
+    let deposited = transfers::deposit_stack(
+        ex, context.ship, source.flag_id, output_type, source.owner_id, source.quantity,
+        transfers::DepositCandidate::InStatement, Some(locks),
+    ).await.map_err(db_err)?;
+    let receipt = crate::services::items::enrich_deposit(sde, deposited, source.quantity)?;
+    let output_id = receipt.last().item_id;
+    let display_quantity = crate::services::dogma::info::cap_client_quantity(source.quantity);
+    let result = Value::tuple([
+        Value::Int(source.item_id), Value::Int(i64::from(source.type_id)), Value::Int(display_quantity),
+        Value::Int(output_id), Value::Int(i64::from(output_type)), Value::Int(display_quantity),
+    ]);
+    inventory::notifications::notify_item_removed(outbox, source.clone());
+    for row in receipt.rows() {
+        let change = row.old_quantity.map_or((IX_LOCATION_ID, Value::Int(0)), |old| (IX_STACK_SIZE, Value::Int(old)));
+        outbox.notify_client("OnItemChange", vec![row.item.row(), inventory::notifications::item_change_dict([change]), Value::None]);
+    }
+    Ok((result, source, receipt))
 }
 
 async fn compress(c: &mut Client, source_id: i64, facility: i64) -> CallResult {
@@ -112,11 +107,43 @@ async fn compress(c: &mut Client, source_id: i64, facility: i64) -> CallResult {
     if !admitted { return Err(notify_error(msg::COMPRESSION_FACILITY)); }
     let db = c.db.clone();
     let sde = c.sde.clone();
+    let identity = crate::services::identity::Identity { system_id: Some(context.system), ..crate::services::identity::Identity::of_client(c) };
+    let endpoint = inventory::reachability::Endpoint { location: source.location_id, flag: source.flag_id };
+    let reach = inventory::reachability::Reachability::capture(&identity, &db, &c.world, Some(context.system), &[endpoint]).await?;
+    let audience = inventory::notifications::Audience::capture(&identity, &db, &c.world, Some(context.system), &[endpoint]).await?;
     let expected_source = SourceGuard::from(&source);
     db.transaction(move |tx, outbox: &mut Outbox| {
         let sde = sde.clone();
         let context = context.clone();
-        Box::pin(async move { compress_tx(tx, &sde, outbox, &context, expected_source).await })
+        let reach = reach.clone();
+        let audience = audience.clone();
+        let identity = identity.clone();
+        let source = source.clone();
+        Box::pin(async move {
+            let locks = inventory::hold_storage::check_destination(tx, &sde, context.character, context.ship, expected_source.flag_id,
+                &[inventory::hold_storage::Addition { type_id: output_type(&sde, expected_source.type_id)?, singleton: false, quantity: expected_source.quantity }],
+                inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, None).await?
+                .ok_or_else(|| notify_error(msg::COMPRESSION_ITEM))?;
+            let container = inventory::access::Container::Item(context.ship);
+            let (destination, _) = inventory::movement::authorize_move(tx, &sde, &identity, &reach, &source, Some(source.location_id), &container, Some(source.flag_id)).await?
+                .ok_or_else(|| notify_error(msg::COMPRESSION_ITEM))?;
+            if destination.item_owner != source.owner_id || destination.capacity_owner != context.character {
+                return Err(notify_error(msg::COMPRESSION_ITEM));
+            }
+            let viewers = audience.resolve(tx, &sde).await?;
+            let (result, source, receipt) = compress_tx(tx, &sde, outbox, &context, expected_source, &locks).await?;
+            let gone = Item { location_id: LOCATION_JUNKYARD, ..source.clone() };
+            viewers.item_change(outbox, &source, &gone, vec![(IX_LOCATION_ID, Value::Int(source.location_id))], context.character);
+            for row in receipt.rows() {
+                let previous = row.old_quantity.map_or_else(
+                    || Item { location_id: LOCATION_JUNKYARD, ..row.item.clone() },
+                    |old| Item { quantity: old, ..row.item.clone() },
+                );
+                let change = row.old_quantity.map_or((IX_LOCATION_ID, Value::Int(0)), |old| (IX_STACK_SIZE, Value::Int(old)));
+                viewers.item_change(outbox, &previous, &row.item, vec![change], context.character);
+            }
+            Ok(result)
+        })
     }, |value, outbox| async move { dispatch_client(value, outbox, c) }).await
 }
 

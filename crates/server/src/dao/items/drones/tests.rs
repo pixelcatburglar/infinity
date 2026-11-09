@@ -1,7 +1,7 @@
 //! Transaction-rolled-back database tests for persistent drone identities.
 use super::*;
 
-async fn source(tx: &(impl Executor + ?Sized), quantity: i32, singleton: bool) -> Item {
+async fn source(tx: &(impl Executor + ?Sized), quantity: i64, singleton: bool) -> Item {
     let row = tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES (1, 101, 102, $1, $2, $3) RETURNING item_id", &[&FLAG_DRONE_BAY, &quantity, &singleton]).await.unwrap();
     Item { item_id: row.get("item_id"), type_id: 1, owner_id: 101, location_id: 102, flag_id: FLAG_DRONE_BAY, quantity, singleton, group_id: 0, category_id: 0, custom_info: None }
 }
@@ -36,6 +36,10 @@ async fn launch_guards_and_preserves_stack_identities() {
     assert_eq!(attrs.len(), 1); assert_eq!(attrs[0].get::<_, i64>("item_id"), item.item_id);
     let single = source(&tx, 1, true).await;
     assert_eq!(launch(&tx, &single, 1, 101, 102, 103, p).await.unwrap().unwrap(), vec![single.item_id]);
+    let large = source(&tx, i64::from(i32::MAX) + 2, false).await;
+    assert_eq!(launch(&tx, &large, 1, 101, 102, 103, p).await.unwrap().unwrap().len(), 1);
+    let quantity: i64 = tx.query_one("SELECT quantity FROM game.items WHERE item_id = $1", &[&large.item_id]).await.unwrap().get("quantity");
+    assert_eq!(quantity, i64::from(i32::MAX) + 1);
     tx.rollback().await.unwrap();
 }
 

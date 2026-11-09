@@ -1,11 +1,12 @@
 //! Focused real-SDE behavioral coverage for the daily Alpha injector.
 use super::*;
-use crate::{client::filetime_now, config::tests::test_database, db::Db, messages, services::{skills::alpha_injections, tests::{client, fixture}}, consts::FLAG_HANGAR};
+use infinity_core::{messages, consts::FLAG_HANGAR};
+use crate::{client::filetime_now, config::tests::test_database, db::Db, services::{skills::alpha_injections, tests::{client, fixture}}};
 use marshal::Value;
 use std::sync::Arc;
 
 const CONTAINED_POINTS_ATTRIBUTE: i32 = 2461;
-const DAY: i64 = crate::consts::FILETIME_DAY;
+const DAY: i64 = infinity_core::consts::FILETIME_DAY;
 
 async fn alpha_fixture() -> (Db, fixture::Fixture, crate::client::Client, i64, i64) {
     crate::tests::init_config();

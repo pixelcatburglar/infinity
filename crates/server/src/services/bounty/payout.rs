@@ -6,7 +6,7 @@ use marshal::Value;
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin, sync::Arc};
 
-/// Server policy: cap player-bounty payouts at 20% of destroyed value to limit self-funded farming.
+/// Server policy: cap player-bounty payouts at 20% of the victim's destroyed value; this anti-farming cap limits self-funded bounty loops while keeping payouts tied to the loss.
 const PAYOUT_FRACTION: f64 = 0.2;
 /// Wallet and bounty storage use two decimal places.
 const CENTS_PER_ISK: i64 = 100;
@@ -76,7 +76,7 @@ pub(in crate::services) fn handle(db: Db, world: Arc<World>, job: Job) -> Pin<Bo
                     debited.push(pool.target_id);
                 }
                 let amount = cents as f64 / CENTS_PER_ISK as f64;
-                wallets::credit(tx, outbox, payload.final_char, amount).await?;
+                wallets::credit(tx, outbox, payload.final_char, crate::isk::IskAmount::from_cents(i128::from(cents)).ok_or(crate::isk::AmountError)?).await?;
                 outbox.notify_pilot(payload.final_char, "OnBountyAddedToPayout", vec![Value::dict([
                     ("amount", Value::Float(amount)), ("payoutTime", Value::Int(now)),
                     ("enemyTypeID", Value::Int(payload.ship_type as i64)), ("isModified", Value::Bool(false)),

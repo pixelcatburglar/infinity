@@ -16,10 +16,10 @@
 use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::db::{Db, outbox::Notification};
-use crate::sde::Sde;
+use crate::sde::{types::TypeData, Sde};
 use crate::services::{combat, effects::online::OnlinePolicy, identity::Identity};
-use crate::consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
-use crate::messages;
+use infinity_core::consts::{dogma::{ATTR_MAX_RANGE, ATTR_REQUIRED_SKILLS}, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use infinity_core::messages;
 use crate::space::{dist, metres_to_km, NotifyTx, World};
 use marshal::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -84,13 +84,26 @@ const UE_TURNS: i64 = 3;
 const SUPPRESSION: i64 = 10;
 const RESTORATION_HEAL: i64 = 10;
 
-/// Match PostgreSQL's float-to-integer conversion for requiredSkill1.
+/// Match PostgreSQL's float-to-integer conversion for a required skill.
 fn analyzer_skill(value: f64) -> Result<i32, CallError> {
     let rounded = value.round_ties_even();
     if !rounded.is_finite() || rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
         return Err(CallError::Internal(anyhow::anyhow!("analyzer required skill is out of integer range: {value}")));
     }
     Ok(rounded as i32)
+}
+
+/// Resolve the first hacking or archaeology prerequisite in dogma slot order.
+pub(super) fn required_analyzer_skill(ty: &TypeData) -> Result<Option<i32>, CallError> {
+    let mut found = None;
+    for skill_attr in ATTR_REQUIRED_SKILLS {
+        let Some(value) = ty.attribute(skill_attr) else { continue };
+        let skill = analyzer_skill(value)?;
+        if found.is_none() && matches!(skill, SKILL_HACKING | SKILL_ARCHAEOLOGY) {
+            found = Some(skill);
+        }
+    }
+    Ok(found)
 }
 
 type Coord = (i64, i64);
@@ -460,11 +473,14 @@ pub async fn start(
     }
     let Some(module_type) = crate::dao::items::hacking::analyzer(db, module, ship).await.map_err(db_err)? else { return Ok(Value::None) };
     let attr = |id, default| sde.types.attribute(module_type, id).unwrap_or(default);
-    let skill = analyzer_skill(attr(ATTR_REQUIRED_SKILL_1, 0.0))?;
+    let skill = match sde.types.get(module_type) {
+        Some(ty) => required_analyzer_skill(ty)?,
+        None => None,
+    };
     let range = attr(ATTR_MAX_RANGE, 6000.0);
     let duration = attr(ATTR_DURATION, 5000.0);
     let needed = if site.relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
-    if skill != needed {
+    if skill != Some(needed) {
         return Err(notify_error(if site.relic { messages::RELIC_CONTAINER_REQUIRES_RELIC_ANALYZER } else { messages::DATA_CONTAINER_REQUIRES_DATA_ANALYZER }));
     }
     let Some(gap) = world.with(system, move |s| {
@@ -693,7 +709,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         Outcome::Won => {
             games().remove(&char_id);
             info!(user = c.login.user_id, "hacked {container}");
-            if let Err(e) = super::exploration::container_hacked(&c.db, &c.world, container, char_id).await {
+            let context = super::exploration::fact_context(c, crate::lua::events::resources::FactOrigin::Natural);
+            if let Err(e) = super::exploration::container_hacked(&c.db, &c.world, container, char_id, context).await {
                 return Some(Err(e));
             }
         }

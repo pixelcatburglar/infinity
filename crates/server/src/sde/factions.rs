@@ -13,6 +13,7 @@ pub(crate) struct Faction {
     pub solar_system_id: Option<i64>,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Factions {
     rows: Vec<Faction>,
 }

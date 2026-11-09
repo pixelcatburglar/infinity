@@ -5,10 +5,10 @@ use super::super::inv_broker::broker;
 use super::super::notifications::notify_corp_item_change;
 use super::super::stacks::plan_merges;
 use super::super::tests::item;
-use crate::consts::{CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
+use infinity_core::consts::{CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::db::outbox::Outbox;
-use crate::messages;
+use infinity_core::messages;
 use crate::services::{items::load_items, notify_error, Call, CallError};
 use marshal::Value;
 
@@ -37,7 +37,7 @@ fn merge_cannot_move_quantities_between_custodians() {
 #[tokio::test]
 #[ignore = "requires a dedicated test database with SDE"]
 async fn deliveries_roles_listing_and_take() {
-    use crate::consts::{ROLE_ACCOUNTANT, ROLE_JUNIOR_ACCOUNTANT, ROLE_TRADER};
+    use infinity_core::consts::{ROLE_ACCOUNTANT, ROLE_JUNIOR_ACCOUNTANT, ROLE_TRADER};
     use crate::services::tests::fixture;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -46,9 +46,10 @@ async fn deliveries_roles_listing_and_take() {
     let outsider = fixture::create(&db).await.unwrap();
     let (mut client, _peer) = crate::services::tests::client(db.clone(), actor.character).await;
     let station = client.sde.map.stations().next().unwrap().station_id;
-    let type_id = client.sde.types.iter().find(|t| t.category_id != Some(crate::consts::CATEGORY_MODULE) && t.category_id != Some(crate::consts::CATEGORY_SUBSYSTEM)).unwrap().type_id;
+    let type_id = client.sde.types.iter().find(|t| t.published == Some(true) && t.group_id.is_some_and(|group| infinity_core::consts::CARGO_CONTAINER_GROUPS.contains(&group))).expect("published cargo container type").type_id;
     let corp: i64 = db.query_one("INSERT INTO game.corporations (name, ticker, ceo_id, creator_id, station_id, created) VALUES ('delivery-' || nextval('game.corporations_corporation_id_seq')::text, 'D' || nextval('game.corporations_corporation_id_seq')::text, $1, $1, $2, 0) RETURNING corporation_id", &[&ceo.character, &station]).await.unwrap().get("corporation_id");
     db.execute("UPDATE game.characters SET corporation_id = $1 WHERE character_id = ANY($2)", &[&corp, &vec![actor.character, ceo.character, outsider.character]]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&ceo.character, &ROLE_DIRECTOR]).await.unwrap();
     db.execute("UPDATE game.characters SET corp_roles = 0 WHERE character_id = $1", &[&outsider.character]).await.unwrap();
     client.session.apply(vec![("corpid", Value::Int(corp)), ("stationid", Value::Int(station))]);
     let id = crate::dao::items::transfers::insert(&db, type_id, corp, station, FLAG_CORP_DELIVERIES, 10).await.unwrap();
@@ -56,17 +57,17 @@ async fn deliveries_roles_listing_and_take() {
     let hangar = Container::Hangar { station_id: station, owner_id: actor.character };
     for (role, view, take) in [(0, false, false), (ROLE_JUNIOR_ACCOUNTANT, true, false), (ROLE_ACCOUNTANT, true, true), (ROLE_TRADER, true, true), (ROLE_DIRECTOR, true, true)] {
         db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &role]).await.unwrap();
-        assert_eq!(may_view_corp_hangar(&db, actor.character, corp, FLAG_CORP_DELIVERIES).await.ok().unwrap(), view);
-        assert_eq!(may_take_corp_hangar(&db, actor.character, corp, FLAG_CORP_DELIVERIES).await.ok().unwrap(), take);
+        assert_eq!(may_view_corp_hangar(&db, actor.character, corp, station, FLAG_CORP_DELIVERIES).await.ok().unwrap(), view);
+        assert_eq!(may_take_corp_hangar(&db, actor.character, corp, station, FLAG_CORP_DELIVERIES).await.ok().unwrap(), take);
         assert_eq!(list(&client, &deliveries, None).await.ok().unwrap().len(), usize::from(view));
         if !take { assert!(movement::move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, id, Some(station), None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err()); }
-        assert!(!may_view_corp_hangar(&db, actor.character, corp + 1, FLAG_CORP_DELIVERIES).await.ok().unwrap());
+        assert!(!may_view_corp_hangar(&db, actor.character, corp + 1, station, FLAG_CORP_DELIVERIES).await.ok().unwrap());
     }
-    assert!(may_take_corp_hangar(&db, ceo.character, corp, FLAG_CORP_DELIVERIES).await.ok().unwrap());
+    assert!(may_take_corp_hangar(&db, ceo.character, corp, station, FLAG_CORP_DELIVERIES).await.ok().unwrap());
     for (role, view, take) in [(ROLE_HANGAR_CAN_QUERY_1, true, false), (ROLE_HANGAR_CAN_TAKE_1, false, true)] {
-        db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &role]).await.unwrap();
-        assert_eq!(may_view_corp_hangar(&db, actor.character, corp, FLAG_CORP_SAG1).await.ok().unwrap(), view);
-        assert_eq!(may_take_corp_hangar(&db, actor.character, corp, FLAG_CORP_SAG1).await.ok().unwrap(), take);
+        db.execute("UPDATE game.characters SET corp_roles = 0, corp_roles_hq = $2 WHERE character_id = $1", &[&actor.character, &role]).await.unwrap();
+        assert_eq!(may_view_corp_hangar(&db, actor.character, corp, station, FLAG_CORP_SAG1).await.ok().unwrap(), view);
+        assert_eq!(may_take_corp_hangar(&db, actor.character, corp, station, FLAG_CORP_SAG1).await.ok().unwrap(), take);
     }
     db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&actor.character, &ROLE_DIRECTOR]).await.unwrap();
     let params = Value::tuple([Value::Int(station), Value::Int(CONTAINER_CORP_MARKET), Value::Int(corp)]);
@@ -128,7 +129,7 @@ async fn deliveries_roles_listing_and_take() {
                 let sde = sde.clone();
                 Box::pin(async move {
                     let mut effects: Outbox = Outbox::default();
-                    movement::move_core(tx, &sde, &mut effects, &row, actor.character, station, FLAG_HANGAR, None).await?;
+                    super::super::tests::prepared_move(tx, &sde, &mut effects, &row, &super::super::destination::Destination::owned(actor.character, station, FLAG_HANGAR), None, super::super::destination::Custody::TakeSubtree, actor.character).await?;
                     let mut pilots = Vec::new();
                     let mut actor_notice = false;
                     for effect in effects.into_entries() {
@@ -211,8 +212,8 @@ async fn deliveries_roles_listing_and_take() {
         let item = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
         assert_eq!((item.owner_id, item.location_id, item.flag_id), (actor.character, parent, FLAG_CARGO));
     }
-    client.world.unregister_pilot(ceo.character);
-    client.world.unregister_pilot(outsider.character);
+    client.world.unregister_pilot_generation(ceo.character, None);
+    client.world.unregister_pilot_generation(outsider.character, None);
     db.execute("UPDATE game.characters SET corporation_id = 1 WHERE character_id = ANY($1)", &[&vec![actor.character, ceo.character, outsider.character]]).await.unwrap();
     db.execute("DELETE FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.unwrap();
     fixture::cleanup(&db, actor).await.unwrap();

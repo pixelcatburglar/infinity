@@ -46,7 +46,7 @@ async fn fixture_fingerprint(db: &crate::db::Db) -> Vec<String> {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
-    use crate::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SPEED_FACTOR};
+    use infinity_core::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SPEED_FACTOR};
     use crate::space::{Ball, World, WarpState, MODE_STOP};
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
@@ -58,8 +58,8 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
     let module_type = sde.types.iter().find(|t| t.effects().iter().any(|e| e.effect_id == EFFECT_MICROWARPDRIVE)
         && positive(t.fit_attribute(ATTR_SPEED_FACTOR)) && positive(t.fit_attribute(speed_boost)))
         .expect("microwarpdrive with positive speed factor and thrust").type_id;
-    let scram_type = sde.types.iter().find(|t| sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_WARP_SCRAMBLE)).unwrap().type_id;
-    let modifying = sde.dogma.effect(crate::consts::dogma::EFFECT_WARP_SCRAMBLE).unwrap().modifiers().iter()
+    let scram_type = sde.types.iter().find(|t| sde.types.effects(t.type_id).iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_WARP_SCRAMBLE)).unwrap().type_id;
+    let modifying = sde.dogma.effect(infinity_core::consts::dogma::EFFECT_WARP_SCRAMBLE).unwrap().modifiers().iter()
         .find(|row| row.domain == "targetID" && row.modified == ATTR_ACTIVATION_BLOCKED).unwrap().modifying;
     let before = fixture_fingerprint(&db).await;
     let (account, character, ship, module) = db.transaction(
@@ -67,7 +67,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
             let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('retire-fixture-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
             let character: i64 = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'retire-fixture-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await?.get("character_id");
             let ship = crate::dao::items::creation::positioned(tx, ship_type, character, 1, [0.0; 3]).await?;
-            let module = crate::dao::items::creation::rookie_ship(tx, module_type, character, ship, crate::consts::FLAG_FITTING_FIRST).await?;
+            let module = crate::dao::items::creation::rookie_ship(tx, module_type, character, ship, infinity_core::consts::FLAG_FITTING_FIRST).await?;
             Ok::<_, crate::db::Error>((account, character, ship, module))
         }),
         |fixture, ()| async move { Ok(fixture) },
@@ -85,7 +85,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
             max_vel: 0.0, agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3],
             old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3],
             follow_id: 0, follow_range: 0.0, free: false, global: false, massive: false, interactive: false,
-            warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+            warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
             effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() };
         let mut source_ball = ball.clone();
         source_ball.id = source;
@@ -109,9 +109,9 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         test_world.with(1, move |s| {
             s.upsert_projection(ship, super::super::super::projection::Projection {
                 source_ship: source, source_module: -module, source_type: scram_type,
-                effect_id: crate::consts::dogma::EFFECT_WARP_SCRAMBLE,
+                effect_id: infinity_core::consts::dogma::EFFECT_WARP_SCRAMBLE,
                 kind: EffectKind::Projected { jamming: super::super::super::JammingType::Scramble },
-                until_ms: i64::MAX, values: vec![(modifying, 1.0)], charge_values: vec![], charge_type: None,
+                until_ms: i64::MAX, values: vec![(modifying, 1.0)], charge_values: vec![], charge_type: None, scramble: None,
             });
             assert_eq!(s.projections_on(ship).len(), 1);
         }).await.unwrap();
@@ -135,10 +135,10 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         }
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: character, ship_id: ship, system_id: 1 };
         let effect = registry::resolve(&sde, EFFECT_MICROWARPDRIVE).unwrap();
-        let make_cycle = || Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: crate::consts::FLAG_FITTING_FIRST }],
+        let make_cycle = || Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: infinity_core::consts::FLAG_FITTING_FIRST }],
             effect: effect.clone(), target: None, repeat: 3, stop: stop.clone(),
-            owner: ActivationOwner { master: module, generation: stop.clone(), armed: false },
-            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+            owner: ActivationOwner { master: module, generation: stop.clone(), armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
+            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
         let first = make_cycle();
         let duplicate = make_cycle();
         test_world.with(1, move |s| { cycle_stop(s, first); cycle_stop(s, duplicate); }).await.unwrap();
@@ -169,10 +169,10 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         let deactivating = Fit::load_in_space(&test_db, &test_world, 1, character, ship).await.ok().expect("loading deactivating fit")
             .value(Key::Ship, ATTR_MAX_VELOCITY);
         assert!((deactivating - boosted).abs() <= tolerance, "ordinary stop maxVelocity {deactivating} differs from boosted {boosted}");
-        let cycle = Cycle { cx, modules: vec![Module { id: module, type_id: module_type, flag: crate::consts::FLAG_FITTING_FIRST }],
+        let cycle = Cycle { cx, modules: vec![Module { id: module, type_id: module_type, flag: infinity_core::consts::FLAG_FITTING_FIRST }],
             effect, target: None, repeat: 3, stop: ordinary.clone(),
-            owner: ActivationOwner { master: module, generation: ordinary, armed: false },
-            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+            owner: ActivationOwner { master: module, generation: ordinary, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
+            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
         test_world.with(1, move |s| cycle_stop(s, cycle)).await.unwrap();
         assert!(!active_modules().contains(&module));
         let retired = Fit::load_in_space(&test_db, &test_world, 1, character, ship).await.ok().expect("loading retired fit")
@@ -186,7 +186,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
     }).await;
     world.remove_ball(1, source).await;
     world.remove_ball(1, ship).await;
-    world.unregister_pilot(character);
+    world.unregister_pilot_generation(character, None);
     let flush = world.flush_positions().await;
     {
         let mut st = state();

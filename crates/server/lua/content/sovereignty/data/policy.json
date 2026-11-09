@@ -1,0 +1,7 @@
+{
+  "version": "1",
+  "source": "Server-authored sovereignty policy",
+  "capital_cooldown_seconds": 2592000,
+  "self_destruct_seconds": 1200,
+  "capture_checkpoint_seconds": 5
+}

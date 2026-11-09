@@ -5,12 +5,14 @@
 //! The client requires one row per item; aggregating ship armor and hull health
 //! and applying the same repair fraction to both is a server inference.
 //! Payment and full-quote comparison use wallet-cent precision; zero-cent charges are refused.
+//! Damage persistence and attribute-change construction are shared with the GM
+//! docked repair through `services::repair`; quotes and settlement stay here.
 //! Structure facilities and in-space paste repair are not modelled.
 use super::*;
-use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_STARBASE, FLAG_HANGAR};
-use crate::dao::items::{dogma, repair};
+use infinity_core::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_STARBASE, FLAG_HANGAR};
+use crate::dao::items::{dogma, parent_locks::{LockRequest, LockStrength}, repair};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
-use crate::services::{combat, effects::notify::attribute_change, fit::{Fit, Key}, inventory::is_fitting_flag, market, notify_error, wallets};
+use crate::services::{fit::{Fit, Key}, inventory::is_fitting_flag, market, notify_error, repair as shared_repair, wallets};
 use crate::sde::Sde;
 use std::sync::Arc;
 /// Client inventorycommon.const.categoryStructureModule.
@@ -29,7 +31,7 @@ fn repairable(singleton: bool, category: Option<i32>, group: Option<i32>) -> boo
 #[derive(Clone)]
 struct Quote {
     item: i64, type_id: i32, group: i32, category: i32, attribute: i32,
-    damage: f64, max: f64, unit: f64, module: bool, ship: bool,
+    damage: f64, max: f64, unit: f64, module: bool,
 }
 impl Quote {
     fn wire(&self, damage: f64) -> Value {
@@ -65,7 +67,7 @@ fn total_cost(rows: &[Quote]) -> f64 {
     }
     total
 }
-fn refuse() -> CallError { notify_error(crate::messages::repair::INVALID) }
+fn refuse() -> CallError { notify_error(infinity_core::messages::repair::INVALID) }
 /// Client inventoryUtil.GetComputedBasePrice(typeID, 1), including its material portion rule.
 fn computed_base_price(sde: &Sde, id: i32) -> f64 {
     let Some(ty) = sde.types.get(id) else { return 0.0 };
@@ -91,7 +93,17 @@ fn fraction(payment: f64, total: f64, modules: bool) -> Option<f64> {
 }
 
 async fn quotes(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ids: &[i64], owner: i64, station: i64) -> Result<Vec<(i64, Vec<Quote>)>, CallError> {
-    let items = repair::lock_items(ex, ids, owner).await.map_err(db_err)?;
+    let items = repair::candidates(ex, ids, owner).await.map_err(db_err)?;
+    let candidate_ids: Vec<_> = items.iter().map(|item| item.item_id).collect();
+    let requests: Vec<_> = candidate_ids.iter().map(|&item_id| LockRequest { item_id, strength: LockStrength::Update }).collect();
+    let locks = crate::services::inventory::destination::lock_items(ex, &sde, &requests, &[]).await?;
+    if items.iter().any(|item| locks.row(item.item_id).is_none_or(|row| row.jump_clone_id.is_some()
+        || row.type_id != item.type_id || row.owner_id != item.owner_id || row.location_id != item.location_id
+        || row.flag_id != item.flag_id || row.singleton != item.singleton)) { return Err(refuse()); }
+    let fresh = repair::candidates(ex, ids, owner).await.map_err(db_err)?;
+    if fresh.len() != items.len() || fresh.iter().zip(&items).any(|(a, b)| a.item_id != b.item_id
+        || a.type_id != b.type_id || a.owner_id != b.owner_id || a.location_id != b.location_id
+        || a.flag_id != b.flag_id || a.singleton != b.singleton) { return Err(refuse()); }
     let mut result = Vec::with_capacity(ids.len());
     for &id in ids {
         let item = items.iter().find(|i| i.item_id == id).ok_or_else(refuse)?;
@@ -128,7 +140,7 @@ async fn quotes(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ids: &[i64], owner
                 if damage == 0.0 || max == 0.0 { continue; }
                 let unit = base / max_health * crate::config::game().repair.cost_multiplier;
                 if !unit.is_finite() || unit < 0.0 { return Err(refuse()); }
-                rows.push(Quote { item: selected_item.item_id, type_id: selected_item.type_id, group: data.group_id.unwrap_or(0), category: data.category_id.unwrap_or(0), attribute, damage, max: max_health, unit, module, ship: is_ship });
+                rows.push(Quote { item: selected_item.item_id, type_id: selected_item.type_id, group: data.group_id.unwrap_or(0), category: data.category_id.unwrap_or(0), attribute, damage, max: max_health, unit, module });
             }
         }
         result.push((id, rows));
@@ -137,7 +149,7 @@ async fn quotes(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ids: &[i64], owner
 }
 
 fn station(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
-    let station = c.session.int("stationid").filter(|v| *v > 0).ok_or_else(|| notify_error(crate::messages::repair::UNSUPPORTED))?;
+    let station = c.session.int("stationid").filter(|v| *v > 0).ok_or_else(|| notify_error(infinity_core::messages::repair::UNSUPPORTED))?;
     let bound = call.bind_params.and_then(|v| v.items()).and_then(|v| v.first()).and_then(Value::as_int);
     if bound != Some(station) { return Err(refuse()); }
     Ok(station)
@@ -154,7 +166,7 @@ fn ids(call: &Call<'_>) -> Result<Vec<i64>, CallError> {
 }
 
 async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
-    if call.method == "RepairItemsInStructure" { return Err(notify_error(crate::messages::repair::UNSUPPORTED)); }
+    if call.method == "RepairItemsInStructure" { return Err(notify_error(infinity_core::messages::repair::UNSUPPORTED)); }
     let station = station(c, call)?;
     let ids = ids(call)?;
     let owner = char_id(c);
@@ -162,8 +174,6 @@ async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
     let _lock = market::lock().await;
     let sde = c.sde.clone();
     let world = &*c.world;
-    let active_ship = c.session.int("shipid");
-    let db = &c.db;
     c.db.transaction(
         |tx, outbox: &mut Outbox| {
             let sde = sde.clone();
@@ -171,7 +181,7 @@ async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
             Box::pin(async move {
                 let grouped = quotes(tx, sde, &ids, owner, station).await?;
                 let Some(payment) = payment else {
-                    return Ok((Value::Dict(grouped.into_iter().map(|(id, rows)| (Value::Int(id), Value::list(wire_rows(&rows)))).collect()), Vec::new()));
+                    return Ok(Value::Dict(grouped.into_iter().map(|(id, rows)| (Value::Int(id), Value::list(wire_rows(&rows)))).collect()));
                 };
                 let mut rows: Vec<Quote> = grouped.into_iter().flat_map(|(_, rows)| rows).collect();
                 rows.sort_by_key(|r| (r.item, r.attribute));
@@ -181,9 +191,8 @@ async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
                 let portion = fraction(payment, total, rows.iter().any(|r| r.module)).ok_or_else(refuse)?;
                 let charge = market::round2(payment);
                 if !charge.is_finite() || charge <= 0.0 { return Err(refuse()); }
-                wallets::debit(tx, outbox, owner, charge).await?;
+                wallets::debit(tx, outbox, owner, crate::isk::IskAmount::from_isk(charge)?).await?;
                 let mut changed = Vec::new();
-                let mut ships = Vec::new();
                 let mut result: Vec<(i64, i32, i32, f64, f64, f64, f64)> = Vec::new();
                 for row in rows {
                     let new = row.damage * (1.0 - portion);
@@ -197,9 +206,7 @@ async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
                             if row.attribute == ATTR_ARMOR_DAMAGE { row.damage * portion } else { 0.0 },
                             row.damage, row.unit));
                     }
-                    if !dogma::set_override(tx, row.item, row.attribute, new).await.map_err(db_err)? { return Err(refuse()); }
-                    changed.push(attribute_change(owner, Value::Int(row.item), row.attribute, Value::Float(new), Value::Float(row.damage)));
-                    if row.ship && !ships.contains(&row.item) { ships.push(row.item); }
+                    changed.push(shared_repair::write_damage(tx, owner, row.item, row.attribute, row.damage, new).await?.ok_or_else(refuse)?);
                 }
                 outbox.notify_pilot(owner, "OnModuleAttributeChanges", vec![Value::list(changed)]);
                 let mut remaining = charge;
@@ -209,18 +216,10 @@ async fn handle(c: &Client, call: &Call<'_>) -> CallResult {
                     remaining = market::round2(remaining - actual);
                     vec![Value::Int(item), Value::Float(hull), Value::Float(armor), Value::Int(category as i64), Value::Int(type_id as i64), Value::Float(actual)]
                 }).collect();
-                Ok((rowset(&["itemID", "amountOfStructureToRepair", "amountOfArmorToRepair", "categoryID", "typeID", "actualCost"], lines), ships))
+                Ok(rowset(&["itemID", "amountOfStructureToRepair", "amountOfArmorToRepair", "categoryID", "typeID", "actualCost"], lines))
             })
         },
-        |(value, ships), outbox| async move {
-            for ship in ships {
-                combat::invalidate_condition(ship);
-                if active_ship == Some(ship) && combat::load_docked_condition(db, world, owner, ship).await.is_err() {
-                    tracing::warn!("repair committed but condition reload failed for ship {ship}");
-                }
-            }
-            dispatch_world(value, outbox, world)
-        },
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await
 }
 

@@ -2,10 +2,10 @@
 //! Module identities and online status come from game items; effects and attributes
 //! come from the SDE and Fit. Unsupported module behaviors cannot be overloaded.
 use crate::client::Client;
-use crate::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_SKILL_LEVEL, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, FLAG_HANGAR};
+use infinity_core::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_SKILL_LEVEL, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, FLAG_HANGAR};
 use crate::dao::items::loading::{Item, ItemQuery};
-use crate::messages;
-use crate::services::{combat, db_err, fit::{Fit, Key}, items::load_items, market, notify_error, Call, CallError, CallResult};
+use infinity_core::messages;
+use crate::services::{combat, db_err, fit::{Fit, Key}, items::load_items, market, notify_error, CallError, CallResult};
 use crate::services::effects::{lifecycle::{self, Module}, registry, unsupported};
 use crate::services::effects::online::OnlinePolicy;
 use crate::services::identity::Identity;
@@ -63,16 +63,8 @@ fn check_start(c: &Client, item: &Item, fit: &Fit, rack: usize) -> Result<(), Ca
     Ok(())
 }
 
-pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let (rack, start) = match call.method {
-        "Overload" => (false, true), "StopOverload" => (false, false),
-        "OverloadRack" => (true, true), "StopOverloadRack" => (true, false),
-        _ => return None,
-    };
-    Some(handle(c, call.args, rack, start).await)
-}
 
-async fn handle(c: &mut Client, args: &[Value], rack: bool, start: bool) -> CallResult {
+pub(in crate::services) async fn handle(c: &mut Client, args: &[Value], rack: bool, start: bool) -> CallResult {
     let (anchor, requested) = arguments(args, rack).ok_or_else(|| notify_error(messages::heat::INVALID_OVERLOAD))?;
     let cx = combat::ctx(c).ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     let _lock = market::lock().await;

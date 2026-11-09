@@ -5,7 +5,8 @@
 
 use std::{collections::HashSet, sync::Arc};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, dao::items::fit::{self as fit_dao, Module}, db::executor::Executor, messages, sde::Sde};
+use infinity_core::{consts::{*, dogma::*}, messages};
+use crate::{dao::items::fit::{self as fit_dao, Module}, db::executor::Executor, sde::Sde};
 use super::super::{db_err, notify_error, user_error, CallError, fit::{Fit, Key}};
 
 /// Client dogma effectSubSystem.
@@ -13,7 +14,7 @@ const EFFECT_SUBSYSTEM: i32 = 3772;
 /// Client dogma rack effects and slot-count attributes (rigSlots is not upgradeSlotsLeft).
 const RACKS: [(i32, i32, i32); 5] = [(11, ATTR_LOW_SLOTS, FLAG_FITTING_FIRST), (13, ATTR_MED_SLOTS, FLAG_MED_SLOT_FIRST), (12, ATTR_HI_SLOTS, FLAG_HI_SLOT_FIRST), (EFFECT_RIG_SLOT, ATTR_RIG_SLOTS, FLAG_RIG_FIRST), (EFFECT_SUBSYSTEM, 1367, FLAG_SUBSYSTEM_FIRST)];
 /// Client inventory rack width.
-const RACK_WIDTH: i32 = 8;
+pub(crate) const RACK_WIDTH: i32 = 8;
 /// Client visible subsystem slots.
 const VISIBLE_SUBSYSTEMS: i32 = 4;
 /// Client inventory service rack, used in cascade ordering.
@@ -54,7 +55,7 @@ fn int(value: i32) -> Value { Value::Int(i64::from(value)) }
 fn has_effect(sde: &Sde, ty: i32, effect: i32) -> bool { sde.types.effects(ty).iter().any(|e| e.effect_id == effect) }
 fn group(sde: &Sde, ty: i32) -> i32 { sde.types.get(ty).and_then(|t| t.group_id).unwrap_or(0) }
 fn refusal(msg: &'static str) -> CallError { notify_error(msg) }
-fn rack(sde: &Sde, ty: i32) -> Option<(i32, i32, i32)> { RACKS.iter().copied().find(|r| has_effect(sde, ty, r.0)) }
+pub(crate) fn rack(types: &crate::sde::types::Types, ty: i32) -> Option<(i32, i32, i32)> { RACKS.iter().copied().find(|r| types.effects(ty).iter().any(|e| e.effect_id == r.0)) }
 fn free_rack_slot(first: i32, count: i32, used: impl Fn(i32) -> bool) -> Option<i32> {
     (first..first + count.clamp(0, RACK_WIDTH)).find(|&flag| !used(flag))
 }
@@ -101,7 +102,7 @@ fn structural(fit: &Fit, sde: &Sde, modules: &[Module], item: i64, ty: i32, flag
     }
     if restricted && !allowed { return Err(refusal(messages::fitting::HULL)); }
     required_skills(fit, sde, Key::Module(item), ty, online)?;
-    let Some((effect, slots_attr, first)) = rack(sde, ty) else {
+    let Some((effect, slots_attr, first)) = rack(&sde.types, ty) else {
         return Err(user_error(messages::MSG_MODULE_NOT_POWERED, vec![("type".into(), int(ty))]));
     };
     let count = (fit.value(Key::Ship, slots_attr) as i32).clamp(0, RACK_WIDTH);
@@ -145,7 +146,7 @@ pub(crate) async fn free_slot(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, owne
     fit.include_module(ex, item, type_id).await?;
     let modules = fit_dao::modules(ex, ship).await.map_err(db_err)?;
     structural(&fit, &sde, &modules, item, type_id, None, false)?;
-    let Some((effect, attr, first)) = rack(&sde, type_id) else { return Ok(None) };
+    let Some((effect, attr, first)) = rack(&sde.types, type_id) else { return Ok(None) };
     let count = (fit.value(Key::Ship, attr) as i32).clamp(0, RACK_WIDTH);
     let desired = fit.value(Key::Module(item), SUBSYSTEM_SLOT) as i32;
     let start = if effect == EFFECT_SUBSYSTEM && desired >= first + VISIBLE_SUBSYSTEMS { first + VISIBLE_SUBSYSTEMS } else if effect == EFFECT_SUBSYSTEM { desired } else { first };
@@ -221,14 +222,15 @@ fn most_resource(candidates: impl Iterator<Item = (bool, f64, i64)>) -> Option<i
 }
 
 
-/// Pick one online item to offline; caller reloads the fit after each change.
-pub(crate) async fn overload_candidate(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, owner: i64, ship: i64) -> Result<Option<i64>, CallError> {
+/// Pick one online item to offline and retain the evaluated fit for reconciliation.
+pub(crate) async fn overload_candidate(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, owner: i64, ship: i64) -> Result<(Fit, Option<i64>), CallError> {
     let fit = Fit::load(ex, sde, owner, ship).await?;
-    let Some(attr) = worse_resource(fit.value(Key::Ship, ATTR_CPU_LOAD), fit.value(Key::Ship, ATTR_CPU_OUTPUT), fit.value(Key::Ship, ATTR_POWER_LOAD), fit.value(Key::Ship, ATTR_POWER_OUTPUT)) else { return Ok(None) };
+    let Some(attr) = worse_resource(fit.value(Key::Ship, ATTR_CPU_LOAD), fit.value(Key::Ship, ATTR_CPU_OUTPUT), fit.value(Key::Ship, ATTR_POWER_LOAD), fit.value(Key::Ship, ATTR_POWER_OUTPUT)) else { return Ok((fit, None)) };
     let modules = fit_dao::modules(ex, ship).await.map_err(db_err)?;
-    Ok(most_resource(modules.iter().filter(|m| m.online).map(|m| {
+    let candidate = most_resource(modules.iter().filter(|m| m.online).map(|m| {
         (!(SERVICE_FIRST..SERVICE_FIRST + RACK_WIDTH).contains(&m.flag_id), fit.value(Key::Module(m.item_id), attr), m.item_id)
-    })))
+    }));
+    Ok((fit, candidate))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(in crate::services) mod tests;

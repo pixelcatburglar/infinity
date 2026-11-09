@@ -1,6 +1,7 @@
 //! Database-backed cloak, micro jump and compression actor regressions.
 use super::fixture;
-use crate::{consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_WARP_SCRAMBLE_STATUS, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_CLOAKING, dogma::EFFECT_MICRO_JUMP_DRIVE, dogma::EFFECT_INDUSTRIAL_ITEM_COMPRESSION, FLAG_HI_SLOT_FIRST}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{cloak, compression, mjd, EffectKind, lifecycle::{ActivationOwner, Cycle, Module}, registry}, fit::Fit}, space::World};
+use infinity_core::{consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_WARP_SCRAMBLE_STATUS, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_CLOAKING, dogma::EFFECT_MICRO_JUMP_DRIVE, dogma::EFFECT_INDUSTRIAL_ITEM_COMPRESSION, FLAG_HI_SLOT_FIRST}};
+use crate::{dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{cloak, compression, mjd, EffectKind, lifecycle::{ActivationOwner, Cycle, Module}, registry}, fit::Fit}, space::World};
 use marshal::Value;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
@@ -25,7 +26,7 @@ async fn scenario(effect_id: i32, kind: u8) {
         } { dogma::set_override(&test_db, item, attr, value).await.unwrap(); }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         test_world.register_pilot(f.character, tx.clone());
-        test_world.add_ship(1, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await.unwrap();
+        fixture::admit(&test_db, &test_world, 1, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await;
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: f.character, ship_id: f.ship, system_id: 1 };
         let generation = Arc::new(AtomicBool::new(false));
         {
@@ -34,8 +35,8 @@ async fn scenario(effect_id: i32, kind: u8) {
             state.activation_generation.insert(f.module, generation.clone());
         }
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], effect,
-            target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: f.module, generation: generation.clone(), armed: true },
-            started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+            target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: f.module, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
+            started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
         let fit = Fit::load(&test_db, sde.clone(), f.character, f.ship).await.ok().expect("load fit");
         match kind {
             0 => {
@@ -43,7 +44,7 @@ async fn scenario(effect_id: i32, kind: u8) {
                 targeting_charges::add_target_ctx(&cx, -f.ship, true).await.ok().expect("lock target");
                 assert!(test_world.after(1, 1200).await);
                 assert!(targeting_charges::targets_of(f.character).contains(&-f.ship));
-                cloak::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, None).await.ok().expect("cloak valid");
+                cloak::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, None).await.expect("cloak valid");
                 let hp = combat::load_docked_condition(&test_db, &test_world, f.character, f.ship).await.ok().unwrap();
                 cloak::start(&cx, &fit, &mut cycle).await.ok().unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -99,8 +100,8 @@ async fn scenario(effect_id: i32, kind: u8) {
                 assert_eq!(marker(&test_world.ball(1, f.ship).await.unwrap()), Some(Value::Dict(vec![(Value::Int(7), Value::Float(20000.0)), (Value::Int(8), Value::Float(30000.0))])));
                 let stale = Arc::new(AtomicBool::new(false));
                 let stale_cycle = Cycle { cx: cx.clone(), modules: cycle.modules.clone(), effect: cycle.effect.clone(), target: None, repeat: 1,
-                    stop: stale.clone(), owner: ActivationOwner { master: f.module, generation: stale, armed: false }, started: 0,
-                    charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+                    stop: stale.clone(), owner: ActivationOwner { master: f.module, generation: stale, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 }, started: 0,
+                    charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
                 let stale_cx = cx.clone();
                 test_world.with(1, move |s| compression::stop(s, &stale_cx, &stale_cycle)).await.unwrap();
                 assert_eq!(marker(&test_world.ball(1, f.ship).await.unwrap()), Some(Value::Dict(vec![(Value::Int(7), Value::Float(20000.0)), (Value::Int(8), Value::Float(30000.0))])));
@@ -120,7 +121,7 @@ async fn scenario(effect_id: i32, kind: u8) {
     world.remove_ball(1, -f.ship).await;
     world.remove_ball(1, f.ship).await;
     combat::forget_ship(f.ship);
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     let flush = world.flush_positions().await;
     drop(world);
     fixture::cleanup(&db, f).await.unwrap();

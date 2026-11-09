@@ -14,9 +14,9 @@ fn selects_only_damaged_targets_with_nonzero_range_strength() {
 fn npc_repair_variants_exclude_unimplemented_families() {
     assert!(supported(i64::from(EFFECT_NPC_REMOTE_ARMOR_REPAIRER)));
     assert!(supported(i64::from(EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD)));
-    assert!(supported(i64::from(crate::consts::dogma::EFFECT_NPC_REMOTE_HULL_REPAIRER)));
-    assert!(!supported(i64::from(crate::consts::dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER)));
-    assert!(!supported(i64::from(crate::consts::dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER)));
+    assert!(supported(i64::from(infinity_core::consts::dogma::EFFECT_NPC_REMOTE_HULL_REPAIRER)));
+    assert!(!supported(i64::from(infinity_core::consts::dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER)));
+    assert!(!supported(i64::from(infinity_core::consts::dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER)));
 }
 
 #[test]

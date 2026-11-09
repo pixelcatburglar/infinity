@@ -5,6 +5,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[test]
+fn world_task_capability_is_a_closed_string_on_the_wire() {
+    let config = Config::default().global_config();
+    assert_eq!(config.get("world_task_enabled"), Some(&marshal::Value::str("0")));
+    let handshake = marshal::Value::dict([("config_vals", config)]);
+    let decoded = marshal::loads(&marshal::dumps(&handshake)).unwrap();
+    assert_eq!(decoded.get("config_vals").unwrap().get("world_task_enabled"), Some(&marshal::Value::str("0")));
+}
+
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture(PathBuf);
@@ -43,6 +52,46 @@ fn load_error(contents: &str) -> String {
 }
 
 #[test]
+fn market_modification_delay_defaults_loading_and_bounds() {
+    let fixture = Fixture::new();
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().market.modification_delay_seconds, 300);
+    fixture.write("[market]\nbroker_fee = 0.03");
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().market.modification_delay_seconds, 300);
+    let max = i64::MAX / infinity_core::consts::FILETIME_SECOND;
+    for value in [0, 42, max] {
+        fixture.write(&format!("[market]\nmodification_delay_seconds = {value}"));
+        let config = Config::load_with(&fixture.path(), |_| None).unwrap();
+        assert_eq!(config.market.modification_delay_seconds, value);
+        assert_eq!(config.game_config().market.modification_delay_seconds, value);
+    }
+    for value in [-1, max + 1, i64::MAX] {
+        assert!(load_error(&format!("[market]\nmodification_delay_seconds = {value}")).contains("market.modification_delay_seconds"));
+    }
+    assert!(load_error("[market]\nmodification_delay_seconds = '300'").contains("modification_delay_seconds"));
+}
+
+#[test]
+fn global_plex_market_capability_is_a_string_on_the_wire() {
+    let config = Config::default().global_config();
+    let key = "ld-global_plex_market_experiment_enabled";
+    assert_eq!(config.get(key), Some(&marshal::Value::str("1")));
+    let handshake = marshal::Value::dict([("config_vals", config)]);
+    let decoded = marshal::loads(&marshal::dumps(&handshake)).unwrap();
+    assert_eq!(decoded.get("config_vals").unwrap().get(key), Some(&marshal::Value::str("1")));
+}
+
+#[test]
+fn lua_content_root_file_environment_and_validation() {
+    let fixture = Fixture::new();
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().lua.content_data_dir, None);
+    fixture.write("[lua]\ncontent_data_dir = 'published'");
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().lua.content_data_dir.as_deref(), Some("published"));
+    let config = Config::load_with(&fixture.path(), |key| (key == "LUA_CONTENT_DATA_DIR").then(|| "override".into())).unwrap();
+    assert_eq!(config.lua.content_data_dir.as_deref(), Some("override"));
+    assert!(Config::load_with(&fixture.path(), |key| (key == "LUA_CONTENT_DATA_DIR").then(String::new)).is_err());
+}
+
+#[test]
 fn gateway_notice_capacity_file_environment_and_validation() {
     let fixture = Fixture::new();
     assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().gateway.notice_queue_capacity, 256);
@@ -52,6 +101,80 @@ fn gateway_notice_capacity_file_environment_and_validation() {
     assert_eq!(config.gateway.notice_queue_capacity, 3);
     assert!(load_error("[gateway]\nnotice_queue_capacity = 0").contains("gateway.notice_queue_capacity"));
     assert!(Config::load_with(&fixture.path(), |key| (key == "GATEWAY_NOTICE_QUEUE_CAPACITY").then(|| "0".into())).is_err());
+}
+
+#[test]
+fn mining_progress_defaults_file_environment_and_invalid_values() {
+    let fixture = Fixture::new();
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!((defaults.mining.progress_aggregation_secs, defaults.mining.progress_batch_rows), (1, 256));
+    fixture.write("[mining]\nprogress_aggregation_secs = 7\nprogress_batch_rows = 13");
+    let file = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!((file.game_config().mining.progress_aggregation_secs, file.mining.progress_batch_rows), (7, 13));
+    let env = Config::load_with(&fixture.path(), |key| match key {
+        "MINING_PROGRESS_AGGREGATION_SECS" => Some("2".into()),
+        "MINING_PROGRESS_BATCH_ROWS" => Some("3".into()),
+        _ => None,
+    }).unwrap();
+    assert_eq!((env.mining.progress_aggregation_secs, env.mining.progress_batch_rows), (2, 3));
+    for key in ["progress_aggregation_secs", "progress_batch_rows"] {
+        for value in ["0", "-1"] {
+            assert!(load_error(&format!("[mining]\n{key} = {value}")).contains(key), "missing diagnostic for {key} = {value}");
+        }
+        // Out-of-range integers are rejected by TOML parsing before field validation.
+        let value = "9223372036854775808";
+        let _ = load_error(&format!("[mining]\n{key} = {value}"));
+    }
+    assert!(load_error("[mining]\nprogress_aggregation_secs = 9223372036854775807").contains("mining.progress_aggregation_secs"));
+    assert!(load_error("[mining]\nprogress_batch_rows = 9223372036854775807").contains("mining.progress_batch_rows"));
+    for key in ["MINING_PROGRESS_AGGREGATION_SECS", "MINING_PROGRESS_BATCH_ROWS"] {
+        for value in ["0", "-1", "9223372036854775807", "9223372036854775808"] {
+            assert!(Config::load_with(&fixture.path(), |name| (name == key).then(|| value.into())).is_err(), "unexpectedly accepted {key} = {value}");
+        }
+    }
+}
+
+#[test]
+fn daily_goals_policy_defaults_overrides_and_validation() {
+    let fixture = Fixture::new();
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
+    let daily = &defaults.game.daily_goals;
+    assert_eq!((daily.history_page_maximum, daily.rollover_batch_size), (100, 64));
+    assert!(daily.qa_account_ids.is_empty());
+    fixture.write("[game.daily_goals]\nhistory_page_maximum = 25\nrollover_batch_size = 2\nqa_account_ids = [1, 2]");
+    let file = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert!(file.game.daily_goals == file.game_config().daily_goals);
+    assert_eq!(file.game.daily_goals.qa_account_ids, vec![1, 2]);
+    let overridden = Config::load_with(&fixture.path(), |key| match key {
+        "DAILY_GOALS_HISTORY_PAGE_MAXIMUM" => Some("30".into()),
+        "DAILY_GOALS_ROLLOVER_BATCH_SIZE" => Some("3".into()),
+        "DAILY_GOALS_QA_ACCOUNT_IDS" => Some(" 3, 4 ".into()),
+        _ => None,
+    }).unwrap();
+    let daily = &overridden.game.daily_goals;
+    assert_eq!((daily.history_page_maximum, daily.rollover_batch_size), (30, 3));
+    assert_eq!(daily.qa_account_ids, vec![3, 4]);
+    let cleared = Config::load_with(&fixture.path(), |key| (key == "DAILY_GOALS_QA_ACCOUNT_IDS").then(|| "  ".into())).unwrap();
+    assert!(cleared.game.daily_goals.qa_account_ids.is_empty());
+    for contents in [
+        "[game.daily_goals]\nhistory_page_maximum = 24",
+        "[game.daily_goals]\nrollover_batch_size = 0",
+        "[game.daily_goals]\nqa_account_ids = [0]",
+        "[game.daily_goals]\nqa_account_ids = [-1]",
+        "[game.daily_goals]\nqa_account_ids = [1, 1]",
+        "[game.daily_goals]\nunknown = 1",
+    ] {
+        let _ = load_error(contents);
+    }
+    for (key, values) in [
+        ("DAILY_GOALS_HISTORY_PAGE_MAXIMUM", &["24", "-1", "bad"][..]),
+        ("DAILY_GOALS_ROLLOVER_BATCH_SIZE", &["0", "-1", "bad"][..]),
+        ("DAILY_GOALS_QA_ACCOUNT_IDS", &["0", "-1", "1,1", "1,", ",1", "1,no", "9223372036854775808"][..]),
+    ] {
+        for value in values {
+            assert!(Config::load_with(&fixture.path(), |name| (name == key).then(|| (*value).into())).is_err(), "{key}={value}");
+        }
+    }
 }
 
 #[test]
@@ -114,14 +237,14 @@ fn shared_settings_policy_defaults_validation_and_snapshot() {
 fn expert_system_feature_policy_defaults_and_global_config() {
     let fixture = Fixture::new();
     let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
-    assert!(!defaults.expert_systems.enabled);
-    assert_eq!(defaults.global_config().get("expert_system_feature_enabled").and_then(|v| v.as_text()).map(|v| v.into_owned()), Some("0".to_owned()));
+    assert!(defaults.expert_systems.enabled);
+    assert_eq!(defaults.global_config().get("expert_system_feature_enabled").and_then(|v| v.as_text()).map(|v| v.into_owned()), Some("1".to_owned()));
     for value in [false, true] {
         fixture.write(&format!("[expert_systems]\nenabled = {value}"));
         let config = Config::load_with(&fixture.path(), |_| None).unwrap();
         assert_eq!(config.game_config().expert_systems.enabled, value);
         assert_eq!(config.global_config().get("expert_system_feature_enabled").and_then(|v| v.as_text()).map(|v| v.into_owned()), Some(if value { "1".to_owned() } else { "0".to_owned() }));
-        assert_eq!(config == defaults, !value);
+        assert_eq!(config == defaults, value);
     }
     assert!(load_error("[expert_systems]\nenabled = 1").contains("enabled"));
     assert!(load_error("[expert_systems]\nunknown = true").contains("unknown"));
@@ -229,7 +352,19 @@ fn salvage_policy_parses_and_rejects_invalid_bounds() {
     assert!(load_error("[salvage]\nsalvage_material_stacks = 0").contains("salvage.salvage_material_stacks"));
     assert!(load_error("[salvage]\nsalvage_quantity_min = 0").contains("salvage.salvage_quantity_min"));
     assert!(load_error("[salvage]\nsalvage_quantity_min = 4\nsalvage_quantity_max = 3").contains("salvage.salvage_quantity_max"));
-    assert!(load_error("[salvage]\nsalvage_quantity_max = 2147483648").contains("salvage.salvage_quantity_max"));
+    for value in [2147483648_u32, u32::MAX] {
+        fixture.write(&format!("[salvage]\nsalvage_quantity_max = {value}"));
+        assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().game_config().salvage.salvage_quantity_max, value);
+    }
+}
+
+#[test]
+fn daily_gift_accepts_wide_stock_quantities() {
+    let fixture = Fixture::new();
+    for value in [2147483648_i64, 4294967296, 9007199254740993, i64::MAX] {
+        fixture.write(&format!("[store]\ndaily_gift = {{ type_id = 1, quantity = {value} }}"));
+        assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().game_config().store.daily_gift.quantity, value);
+    }
 }
 
 #[test]
@@ -281,7 +416,6 @@ fn invalid_numeric_values_report_field_and_value() {
 fn representation_overflows_are_rejected_with_the_key_and_value() {
     for (contents, key, value) in [
         ("[store]\ndaily_gift = { type_id = 2147483648, quantity = 1 }", "store.daily_gift.type_id", "2147483648"),
-        ("[store]\ndaily_gift = { type_id = 1, quantity = 2147483648 }", "store.daily_gift.quantity", "2147483648"),
         ("[market]\nmax_order_days = 32768", "market.max_order_days", "32768"),
         ("[market]\norder_history_days = 9223372036854775807", "market.order_history_days", "9223372036854775807"),
         ("[characters]\ndelete_delay_secs = 922337203685", "characters.delete_delay_secs", "922337203685"),
@@ -294,6 +428,7 @@ fn representation_overflows_are_rejected_with_the_key_and_value() {
         ("[space]\nposition_snapshot_secs = 9223372036854775807", "space.position_snapshot_secs", "9223372036854775807"),
         ("[bounty]\nkill_right_lifetime_days = 9223372036854775807", "bounty.kill_right_lifetime_days", "9223372036854775807"),
         ("[bounty]\nkill_right_suspect_secs = 9223372036854775807", "bounty.kill_right_suspect_secs", "9223372036854775807"),
+        ("[store]\ndaily_gift = { type_id = 1, quantity = 0 }", "store.daily_gift.quantity", "0"),
     ] {
         let error = load_error(contents);
         assert!(error.contains(key) && error.contains(value), "{error}");
@@ -511,4 +646,26 @@ fn scheduler_validation_rejects_invalid_limits() {
     config.scheduler = scheduler::SchedulerConfig::default();
     config.contracts.maintenance_secs = 0;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn combat_progress_capacity_defaults_toml_and_zero_rejection() {
+    let fixture = Fixture::new();
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!((defaults.combat.progress_key_capacity, defaults.combat.progress_pending_batches), (4096, 4));
+    fixture.write("[combat]\nprogress_key_capacity = 17\nprogress_pending_batches = 2");
+    let config = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert_eq!((config.combat.progress_key_capacity, config.combat.progress_pending_batches), (17, 2));
+    let env = Config::load_with(&fixture.path(), |key| match key {
+        "COMBAT_PROGRESS_KEY_CAPACITY" => Some("23".into()),
+        "COMBAT_PROGRESS_PENDING_BATCHES" => Some("3".into()),
+        _ => None,
+    }).unwrap();
+    assert_eq!((env.combat.progress_key_capacity, env.combat.progress_pending_batches), (23, 3));
+    for key in ["COMBAT_PROGRESS_KEY_CAPACITY", "COMBAT_PROGRESS_PENDING_BATCHES"] {
+        assert!(Config::load_with(&fixture.path(), |name| (name == key).then(|| "0".into())).is_err());
+    }
+    for key in ["progress_key_capacity", "progress_pending_batches"] {
+        assert!(load_error(&format!("[combat]\n{key} = 0")).contains(&format!("combat.{key}")));
+    }
 }

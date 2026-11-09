@@ -161,7 +161,7 @@ async fn shared_rules_enforce_slots_and_persist_removal_and_expiry() {
         assert_eq!(expert::all(&test_db, fixture.character).await.unwrap().len(), 2);
         let row = expert::all(&test_db, fixture.character).await.unwrap().into_iter().find(|row| row.type_id == types[1]).unwrap();
         let mut expired_events = Vec::new();
-        super::super::advance_expired(&test_db, &sde, fixture.character, row.expires_at, |event| { expired_events.push(event); Ok(()) }).await.unwrap();
+        super::super::advance_expired(&test_db, &world, &sde, fixture.character, row.expires_at, |event| { expired_events.push(event); Ok(()) }).await.unwrap();
         assert!(!expert::all(&test_db, fixture.character).await.unwrap().iter().any(|item| item.type_id == row.type_id));
         assert!(expired_events.iter().any(|event| matches!(event, Notification::Pilot { event, .. } if event == "OnExpertSystemsUpdated")));
     }).await;
@@ -203,7 +203,8 @@ async fn rejected_shared_mutation_rolls_back_expiry_and_notifications() {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
 async fn failed_consume_restores_inventory_quantity_and_entitlement() {
     use std::sync::Arc;
-    use crate::{consts::FLAG_HANGAR, services::identity::Identity, space::World};
+    use infinity_core::consts::FLAG_HANGAR;
+    use crate::{services::identity::Identity, space::World};
 
     let db = connected().await;
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
@@ -222,7 +223,7 @@ async fn failed_consume_restores_inventory_quantity_and_entitlement() {
     let mut dispatched = Vec::new();
     let result = super::super::consume(&identity, &db, &world, &sde, item, |event| { dispatched.push(event); Ok(()) }).await;
     assert!(result.is_err());
-    let quantity: i32 = db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&item]).await.unwrap().get("quantity");
+    let quantity: i64 = db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&item]).await.unwrap().get("quantity");
     assert_eq!(quantity, 2);
     assert!(dispatched.is_empty());
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
@@ -243,7 +244,7 @@ async fn valid_service_renewal_extends_the_existing_row() {
     let world = World::new(db.clone(), sde.clone(), 1);
     let now = crate::client::filetime_now();
     let duration = definition.duration_filetime;
-    let expires = now + crate::consts::FILETIME_DAY * 29;
+    let expires = now + infinity_core::consts::FILETIME_DAY * 29;
     assert!(expert::insert(&db, fixture.character, type_id, now - 1, expires).await.unwrap());
     let before = expert::all(&db, fixture.character).await.unwrap();
     super::super::gm(&identity, &db, &world, &sde, true, type_id, |_| Ok(())).await.unwrap();
@@ -318,7 +319,7 @@ async fn manual_install_and_remove_preserve_training_deadline_and_banked_sp() {
     training::starting_skill(&db, fixture.character, skill, 0, 0).await.unwrap();
     queue::insert(&db, fixture.character, &queue::QueueEntry {
         position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 1_000,
-        start_time: Some(now), end_time: Some(now + crate::consts::FILETIME_DAY),
+        start_time: Some(now), end_time: Some(now + infinity_core::consts::FILETIME_DAY),
     }).await.unwrap();
     let identity = Identity { char_id: fixture.character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
     let world = World::new(db.clone(), sde.clone(), 1);
@@ -343,8 +344,8 @@ async fn manual_install_and_remove_preserve_training_deadline_and_banked_sp() {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
 async fn alpha_authority_installation_projects_virtual_skill_without_mutating_training() {
     use std::sync::Arc;
+    use infinity_core::consts::GM_ROLES;
     use crate::{
-        consts::GM_ROLES,
         dao::{accounts::subscriptions, skills::{history, training}},
         services::{identity::Identity, skills::effective, subscriptions::{management, rules}},
         space::World,
@@ -455,4 +456,31 @@ async fn lifecycle_install_timestamp_is_captured_after_character_lock() {
     assert!(matches!(times.first(), Some(marshal::Value::Int(installed_at)) if *installed_at >= t_release));
 
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
+async fn expert_install_and_expiry_do_not_emit_skill_state_changed() {
+    use std::sync::Arc;
+    use crate::{dao::skills::{queue, training}, lua::events::GameEvent, services::{identity::Identity, tests::fixture}, space::World};
+    let db = connected().await;
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let definition = sde.expert_systems.iter().find(|d| !d.hidden && !d.retired).expect("installable expert system");
+    let skill = definition.skills.first().expect("expert skill").0;
+    let owner = fixture::create(&db).await.unwrap();
+    training::starting_skill(&db, owner.character, skill, 0, 0).await.unwrap();
+    queue::insert(&db, owner.character, &queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(2) }).await.unwrap();
+    let identity = Identity { char_id: owner.character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
+    let world = World::new(db.clone(), sde.clone(), 1);
+    super::super::gm(&identity, &db, &world, &sde, true, definition.type_id, |_| Ok(())).await.unwrap();
+    let trained = crate::db::outbox::tests::events(&db, "SkillTrained", owner.character).await;
+    assert!(trained.iter().any(|event| matches!(event, GameEvent::SkillTrained { char_id, type_id, level: 1 } if *char_id == owner.character && *type_id == skill)));
+    assert!(crate::db::outbox::tests::events(&db, "SkillStateChanged", owner.character).await.is_empty());
+    let expiry = expert::all(&db, owner.character).await.unwrap()[0].expires_at;
+    super::super::advance_expired(&db, &world, &sde, owner.character, expiry, |_| Ok(())).await.unwrap();
+    assert!(expert::all(&db, owner.character).await.unwrap().is_empty());
+    assert!(crate::db::outbox::tests::events(&db, "SkillStateChanged", owner.character).await.is_empty());
+    assert_eq!(crate::db::outbox::tests::events(&db, "SkillTrained", owner.character).await.len(), trained.len());
+    db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", crate::services::skills::completion::KIND, owner.character)]).await.unwrap();
+    fixture::cleanup(&db, owner).await.unwrap();
 }

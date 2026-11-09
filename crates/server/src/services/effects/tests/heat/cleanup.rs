@@ -1,6 +1,7 @@
 //! Committed and rolled-back inventory departures of primed modules.
 use super::*;
-use crate::{consts::{FLAG_CARGO, FLAG_HI_SLOT_FIRST}, services::inventory::{self, access::Container}};
+use infinity_core::{consts::{FLAG_CARGO, FLAG_HI_SLOT_FIRST}};
+use crate::{services::inventory::{self, access::Container}};
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
@@ -49,7 +50,7 @@ async fn primed_unfit_clears_only_after_commit() {
     }).await;
     heat::clear_character(f.character);
     world.remove_ball(SYSTEM, f.ship).await;
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);
@@ -62,7 +63,7 @@ async fn primed_unfit_clears_only_after_commit() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn unsupported_overload_does_not_change_state() {
-    use crate::consts::dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER;
+    use infinity_core::consts::dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
@@ -100,7 +101,7 @@ async fn unsupported_overload_does_not_change_state() {
     }).await;
     heat::clear_character(f.character);
     world.remove_ball(SYSTEM, f.ship).await;
-    world.unregister_pilot(f.character);
+    world.unregister_pilot_generation(f.character, None);
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);

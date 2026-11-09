@@ -11,7 +11,8 @@
 //! Legacy untimed boosters have no known expiry; dormant implants belong to their clone.
 //! Static datetime follows dogma/attributes/datetime.py:6-12 (days since Unix epoch).
 use super::{attributes::character_attributes_at, completion, db_err, effective, requirements::requirements, trading::{available_credits, refusal, source}, training, CallError, CallResult};
-use crate::{client::{filetime_from_dogma_days, filetime_now, filetime_ticks_from_hours, filetime_ticks_from_ms, ms_from_filetime_ticks, Client}, consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTER_LAST_INJECTION_DATETIME, dogma::ATTR_BOOSTER_MAX_CHAR_AGE_HOURS, dogma::ATTR_BOOSTERNESS, dogma::ATTR_IMPLANTNESS, dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, CATEGORY_IMPLANT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_BOOSTER, FLAG_IMPLANT, GROUP_BOOSTER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE}, dao::{characters::social, items::{brain, dogma, inventory, loading::ItemQuery}}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{effects::online::{self, OnlineChanged}, fit::{Fit, Key}, inventory::{notifications::{notify_item_change, notify_item_removed}, stacks::split_stack}, items::load_items}};
+use infinity_core::{consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTER_LAST_INJECTION_DATETIME, dogma::ATTR_BOOSTER_MAX_CHAR_AGE_HOURS, dogma::ATTR_BOOSTERNESS, dogma::ATTR_IMPLANTNESS, dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, CATEGORY_IMPLANT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_BOOSTER, FLAG_IMPLANT, GROUP_BOOSTER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE}};
+use crate::{client::{filetime_from_dogma_days, filetime_now, filetime_ticks_from_hours, filetime_ticks_from_ms, ms_from_filetime_ticks, Client}, dao::{characters::social, items::{brain, dogma, inventory, loading::ItemQuery}}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{effects::online::{self, OnlineChanged}, fit::{Fit, Key}, inventory::{notifications::{notify_item_change, notify_item_removed}, stacks::split_stack}, items::load_items}};
 use marshal::Value;
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ fn slot(sde: &Sde, type_id: i32, attribute: i32) -> Result<i32, CallError> {
     Ok(value as i32)
 }
 
-pub(super) async fn activate_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, item_id: i64, location: Option<i64>, now: i64, draws: &[(i32, f64)], booster: bool) -> Result<Value, CallError> {
+pub(super) async fn activate_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, ship: Option<i64>, item_id: i64, location: Option<i64>, now: i64, draws: &[(i32, f64)], booster: bool) -> Result<Value, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let mut progress = completion::advance_tx(tx, outbox, sde, char_id, now).await?;
     let before = character_attributes_at(tx, sde, char_id, now).await?;
@@ -103,11 +104,11 @@ pub(super) async fn activate_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outb
     notify_item_change(tx, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(previous_location)), (IX_FLAG, Value::Int(i64::from(item.flag_id))), (IX_SINGLETON, Value::Bool(item.singleton))]).await?;
     training::retime_after_change_tx(tx, sde, char_id, now, &before, &mut progress).await?;
     progress.brain_changed = true;
-    completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
+    completion::finish_tx(tx, outbox, sde, fences, char_id, now, &progress, &[]).await?;
     Ok(Value::None)
 }
 
-pub(super) async fn destroy_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, item_id: i64, now: i64) -> Result<Value, CallError> {
+pub(super) async fn destroy_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, item_id: i64, now: i64) -> Result<Value, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let mut progress = completion::advance_tx(tx, outbox, sde, char_id, now).await?;
     let before = character_attributes_at(tx, sde, char_id, now).await?;
@@ -118,7 +119,7 @@ pub(super) async fn destroy_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbo
     training::retime_after_change_tx(tx, sde, char_id, now, &before, &mut progress).await?;
     progress.brain_changed = true;
     outbox.notify_pilot(char_id, "OnServerImplantsChanged", vec![]);
-    completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
+    completion::finish_tx(tx, outbox, sde, fences, char_id, now, &progress, &[]).await?;
     Ok(Value::None)
 }
 
@@ -136,7 +137,8 @@ async fn activate(c: &mut Client, args: &[Value], booster: bool) -> CallResult {
         let item = load_items(&db, &sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refusal)?;
         candidates(&sde, item.type_id).into_iter().map(|(effect, _)| (effect, crate::services::rand01())).collect::<Vec<_>>()
     } else { Vec::new() };
-    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let draws = draws.clone(); Box::pin(async move { activate_tx(tx, outbox, &sde, char_id, ship, item_id, location, now, &draws, booster).await }) }, |value, outbox| async move { let result = online::dispatch_changed(value, outbox, c); crate::scheduler::wake(); result }).await
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let draws = draws.clone(); let fences = fences.clone(); Box::pin(async move { activate_tx(tx, outbox, &sde, &fences, char_id, ship, item_id, location, now, &draws, booster).await }) }, |value, outbox| async move { let result = online::dispatch_changed(value, outbox, c); crate::scheduler::wake(); result }).await
 }
 pub(crate) async fn inject_implant(c: &mut Client, args: &[Value]) -> CallResult { activate(c, args, false).await }
 pub(crate) async fn use_booster(c: &mut Client, args: &[Value]) -> CallResult { activate(c, args, true).await }
@@ -147,7 +149,8 @@ pub(crate) async fn destroy_implant(c: &mut Client, args: &[Value]) -> CallResul
     let now = filetime_now();
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone(); let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); Box::pin(async move { destroy_tx(tx, outbox, &sde, char_id, item_id, now).await }) }, |value, outbox| async move { let result = online::dispatch_changed(value, outbox, c); crate::scheduler::wake(); result }).await
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { destroy_tx(tx, outbox, &sde, &fences, char_id, item_id, now).await }) }, |value, outbox| async move { let result = online::dispatch_changed(value, outbox, c); crate::scheduler::wake(); result }).await
 }
 
 #[cfg(test)] mod tests;

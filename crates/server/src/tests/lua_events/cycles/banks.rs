@@ -4,7 +4,8 @@
 
 use std::{sync::{Arc, Mutex}, time::Duration};
 use marshal::Value;
-use crate::{client::Client, consts::{CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS, dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION}}, dao::items::{charges, dogma}, services::{self, combat, effects::{registry::{self, EffectAttribute}, EffectKind}, Call}, space::{Ball, WarpState, MODE_STOP}};
+use infinity_core::{consts::{CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS, dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION}}};
+use crate::{client::Client, dao::items::{charges, dogma}, services::{self, combat, effects::{registry::{self, EffectAttribute}, EffectKind}, Call}, space::{Ball, WarpState, MODE_STOP}};
 
 /// SDE type Thermodynamics, used by dogmaIM overload admission.
 const THERMODYNAMICS: i32 = 28164;
@@ -18,7 +19,7 @@ fn ball(id: i64, type_id: i32, owner: i64, pilot: Option<i64>) -> Ball {
         agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3],
         old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3], follow_id: 0,
         follow_range: 0.0, free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
 
@@ -54,7 +55,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
                 let groups: Vec<_> = ["chargeGroup1", "chargeGroup2", "chargeGroup3", "chargeGroup4", "chargeGroup5"].iter()
                     .flat_map(|name| sde.dogma.attributes_by_name(name)).filter_map(|a| m.attribute(a.attribute_id)).collect();
                 let module_size = size.and_then(|id| m.attribute(id));
-                let capacity = m.capacity.or_else(|| m.attribute(crate::consts::dogma::ATTR_CAPACITY))?;
+                let capacity = m.capacity.or_else(|| m.attribute(infinity_core::consts::dogma::ATTR_CAPACITY))?;
                 let charge = sde.types.iter().find(|c| c.published == Some(true) && c.category_id == Some(CATEGORY_CHARGE)
                     && c.group_id.is_some_and(|g| groups.contains(&f64::from(g)))
                     && (module_size.is_none_or(|v| v <= 0.0) || size.and_then(|id| c.attribute(id)) == module_size)
@@ -71,7 +72,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
         let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,'event-bank-' || nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
         saved.lock().unwrap().character = Some(character);
         let rank = sde.types.get(THERMODYNAMICS)
-            .and_then(|t| t.fit_attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT))
+            .and_then(|t| t.fit_attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT))
             .expect("Thermodynamics rank");
         let (mut low, mut high) = (0_i64, 1_i64 << 40);
         while low < high {
@@ -102,8 +103,15 @@ pub(super) async fn run(ctx: &super::super::Context) {
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde.clone(), hub, r.world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(1))]);
         r.world.register_pilot(character, client.notify_tx.clone());
-        r.world.add_ship(1, ball(ship, ship_type, character, Some(character))).await.unwrap();
-        r.world.add_ship(1, ball(target, ship_type, character, None)).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: ship, type_id: ship_type, owner_id: character, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let mut prepared = crate::services::ship::balls::piloted(db, sde.clone(), &row, character, 0.0).await.unwrap();
+        prepared.ball = ball(ship, ship_type, character, Some(character));
+        r.world.system(1).await.unwrap();
+        r.world.with(1, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: target, type_id: ship_type, owner_id: character, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
+        let mut prepared = crate::services::ship::balls::unpiloted(db, sde.clone(), &row).await.unwrap();
+        prepared.ball = ball(target, ship_type, character, None);
+        r.world.with(1, move |s| prepared.install(s, |s, ball| s.add_persistent_ship(ball))).await.unwrap();
         call(&mut client, "LinkWeapons", &[Value::Int(ship), Value::Int(guns[0]), Value::Int(guns[1])]).await;
         call(&mut client, "LinkWeapons", &[Value::Int(ship), Value::Int(guns[0]), Value::Int(guns[2])]).await;
         call(&mut client, "AddTarget", &[Value::Int(target)]).await;
@@ -138,6 +146,13 @@ pub(super) async fn run(ctx: &super::super::Context) {
     }).await;
     let (account, character, ship, target, guns) = { let k = keys.lock().unwrap(); (k.account, k.character, k.ship, k.target, k.guns.clone()) };
     let db = &ctx.resources.db;
+    if let Some(character) = character {
+        let owners: Vec<i64> = account.into_iter().chain(std::iter::once(character)).collect();
+        db.transaction(|tx, _: &mut ()| {
+            let owners = owners.clone();
+            Box::pin(async move { crate::services::tests::fixture::cleanup_progress(tx, &owners, &[character]).await })
+        }, |(), ()| async move { Ok(()) }).await.unwrap();
+    }
     if let Some(ship) = ship {
         let name = format!("event_bank_fault_{ship}");
         db.execute(&format!("DROP TRIGGER IF EXISTS {name} ON game.module_charges"), &[]).await.unwrap();
@@ -146,7 +161,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
         if let Some(character) = character {
             combat::reset_pilot(&ctx.resources.world, character, Some((1, ship)));
             ctx.resources.world.unobserve(character);
-            ctx.resources.world.unregister_pilot(character);
+            ctx.resources.world.unregister_pilot_generation(character, None);
         }
         ctx.resources.world.remove_ball(1, ship).await;
         if let Some(target) = target { ctx.resources.world.remove_ball(1, target).await; combat::forget_ship(target); }

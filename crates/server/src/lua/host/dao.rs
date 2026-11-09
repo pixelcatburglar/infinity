@@ -11,8 +11,9 @@ fn positive(id: i64) -> Result<i64> {
     if id > 0 { Ok(id) } else { Err(mlua::Error::runtime("identifier must be positive")) }
 }
 
-fn amount(value: f64) -> Result<f64> {
-    if value.is_finite() && value > 0.0 { Ok(value) } else { Err(mlua::Error::runtime("amount must be finite and positive")) }
+fn amount(value: f64) -> Result<crate::isk::IskAmount> {
+    if value <= 0.0 { return Err(mlua::Error::runtime("amount must be finite and positive")); }
+    crate::isk::IskAmount::from_isk(value).map_err(|e| lua_error(e.into()))
 }
 
 fn item_rows(lua: &Lua, items: Vec<crate::dao::items::loading::Item>) -> Result<Table> {
@@ -56,7 +57,7 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
         let handle = handle.clone();
         async move {
             let character = positive(character)?;
-            crate::services::wallets::balance(&handle, character).await.map_err(lua_error)
+            crate::services::wallets::balance(&handle, character).await.map(|amount| amount.wire_isk()).map_err(lua_error)
         }
     })?)?;
     for (name, credit) in [("credit", true), ("debit", false)] {
@@ -87,22 +88,19 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
         let handle = handle.clone();
         let sde = sde.clone();
         async move {
-            let query = ItemQuery::OwnerLocationFlag(positive(character)?, positive(station)?, crate::consts::FLAG_HANGAR);
+            let query = ItemQuery::OwnerLocationFlag(positive(character)?, positive(station)?, infinity_core::consts::FLAG_HANGAR);
             let rows = crate::services::items::load_items(&handle, &sde, query).await.map_err(mlua::Error::external)?;
             item_rows(&lua, rows)
         }
     })?)?;
-    items.set("create", lua.create_async_function(|_, (ctx, owner, location, flag, type_id, quantity): (mlua::AnyUserData, i64, i64, i32, i32, i32)| async move {
-        positive(owner)?; positive(location)?; positive(i64::from(type_id))?; positive(i64::from(quantity))?;
+    items.set("create", lua.create_async_function(|_, (ctx, owner, location, flag, type_id, quantity): (mlua::AnyUserData, i64, i64, i32, i32, i64)| async move {
+        positive(owner)?; positive(location)?; positive(i64::from(type_id))?; positive(quantity)?;
         mutate(ctx, Mutation::Create { owner, location, flag, type_id, quantity }).await?;
         Ok(())
     })?)?;
     items.set("move", lua.create_async_function(|_, (ctx, item, container, flag, quantity): (mlua::AnyUserData, i64, i64, Option<i32>, Option<i64>)| async move {
         positive(item)?; positive(container)?;
-        if let Some(q) = quantity {
-            positive(q)?;
-            i32::try_from(q).map_err(|_| mlua::Error::runtime("quantity exceeds inventory limit"))?;
-        }
+        if let Some(q) = quantity { positive(q)?; }
         mutate(ctx, Mutation::Move { container: crate::services::inventory::access::Container::Item(container), item, flag, quantity }).await
     })?)?;
     items.set("delete", lua.create_async_function(|_, (ctx, item): (mlua::AnyUserData, i64)| async move {
@@ -118,7 +116,8 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
             async move {
                 let station = positive(station)?;
                 let type_id = i32::try_from(positive(type_id)?).map_err(|_| mlua::Error::runtime("type identifier exceeds limit"))?;
-                let orders = crate::dao::market::listings::orders(&handle, crate::client::filetime_now(), type_id, crate::dao::market::listings::Area::Station, station, Some(bid)).await.map_err(mlua::Error::external)?;
+                let now = crate::client::filetime_now();
+                let orders = crate::dao::market::listings::orders(&handle, now, infinity_core::consts::FILETIME_DAY, type_id, crate::dao::market::listings::Area::Station, station, Some(bid)).await.map_err(mlua::Error::external)?;
                 let rows = lua.create_table()?;
                 for (index, order) in orders.into_iter().enumerate() {
                     let row = lua.create_table()?;
@@ -147,7 +146,7 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
     characters.set("get", lua.create_async_function(move |lua, id: i64| {
         let handle = handle.clone();
         async move {
-            let row = social::public_info(&handle, id, crate::consts::FILETIME_SECOND, crate::consts::FILETIME_UNIX_EPOCH).await.map_err(mlua::Error::external)?;
+            let row = social::public_info(&handle, id, infinity_core::consts::FILETIME_SECOND, infinity_core::consts::FILETIME_UNIX_EPOCH).await.map_err(mlua::Error::external)?;
             row.map(|row| {
                 let result = lua.create_table()?;
                 result.set("name", row.name)?;

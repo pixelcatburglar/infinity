@@ -1,4 +1,4 @@
-use crate::space::{tests::destiny_reference::ship, Pilots, System, MODE_GOTO, MODE_STOP};
+use crate::space::{tests::destiny_reference::ship, Pilots, System, MODE_GOTO, MODE_ORBIT, MODE_STOP};
 use std::sync::Arc;
 
 #[test]
@@ -22,10 +22,16 @@ fn orbit_uses_target_position_before_integration() {
         -(radial + transverse * 0.52) * 200.0];
     system.insert(orbiter);
     system.insert(target);
+    let orbiter = system.ball(2).unwrap();
+    assert_eq!((orbiter.mode, orbiter.follow_id, orbiter.follow_range), (MODE_ORBIT, 1, 500.0));
     system.tick(1000);
     let actual = system.ball(2).unwrap();
-    for (actual, expected) in actual.segment_acceleration.unwrap().into_iter().zip(acceleration) {
-        assert!((actual - expected).abs() < 1e-10);
+    let actual_acceleration = actual.segment_acceleration.unwrap();
+    for (index, (actual, expected)) in actual_acceleration.into_iter().zip(acceleration).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-10,
+            "component {index}: actual={actual:?}, expected={expected:?}, actual acceleration={actual_acceleration:?}"
+        );
     }
     assert_ne!(system.ball(1).unwrap().pos, [1000.0, 0.0, 0.0]);
 }

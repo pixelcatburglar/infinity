@@ -1,6 +1,17 @@
+#[cfg(test)]
+mod governance;
 use super::*;
+use infinity_core::consts::{FLAG_HANGAR, TYPE_CAPSULE};
 use crate::space::{MODE_GOTO, MODE_STOP, MODE_WARP};
+mod navigation;
+mod configuration;
+mod cleaning;
 
+mod fitted_warp;
+mod warp_admission;
+mod warp_capacitor;
+mod warp_capacitor_transport;
+mod fitting_condition;
 fn ship() -> Ball {
     let mut b = Ball {
         id: 123, type_id: 456, owner_id: 789, corp_id: 12, alliance_id: 34,
@@ -12,13 +23,32 @@ fn ship() -> Ball {
         goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: true, global: false, massive: false, interactive: false,
         warp: crate::space::WarpState::default(),
-        warp_factor: 3000, last_ms: 1000, interpolation_anchor_ms: 500, effect_stamp: 42,
+        last_ms: 1000, interpolation_anchor_ms: 500, effect_stamp: 42,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: vec![],
     };
     b.warp.length = 20.0;
     b.warp.min_range = 10.0;
     b.warp.factor = 3;
     b
+}
+
+async fn admit_fixture_ship(db: &crate::db::Db, world: &std::sync::Arc<space::World>,
+    system: i64, character: i64, hull: i64, piloted: bool) {
+    world.system(system).await.unwrap();
+    let row = crate::dao::items::space_ships::FreeShip {
+        item_id: hull, type_id: TYPE_CAPSULE, owner_id: character, corporation_id: 1,
+        alliance_id: -1, pos: [0.0; 3],
+    };
+    let mut prepared = if piloted {
+        balls::piloted(db, world.sde().clone(), &row, character, 0.0).await.ok().unwrap()
+    } else {
+        balls::unpiloted(db, world.sde().clone(), &row).await.ok().unwrap()
+    };
+    prepared.ball.radius = 50.0;
+    world.remove_ball(system, hull).await;
+    world.with(system, move |s| prepared.install(s, |s, ball| {
+        if piloted { s.add_ship(ball); } else { s.add_persistent_ship(ball); }
+    })).await.unwrap();
 }
 
 #[test]
@@ -31,55 +61,10 @@ fn property_setters_preserve_retained_warp_metadata() {
     assert_eq!(b.mode, MODE_WARP);
     assert!(b.is_warping());
     assert_eq!((b.warp.length, b.warp.min_range, b.warp.factor), (20.0, 10.0, 3));
-    assert_eq!(b.warp_factor, 3000);
     assert_eq!(b.effect_stamp, 42);
     assert_eq!(b.segment_acceleration, Some([11.0, 12.0, 13.0]));
 }
 
-#[test]
-fn short_warp_uses_raw_point_and_preserves_motion_state() {
-    let point = [100_009.0, 20.0, 30.0];
-    for (object, min_range, throttle) in [
-        (None, -5000.0, 0.0),
-        (None, 5000.0, 0.4),
-        (Some((point, 10_000.0)), 5000.0, 0.4),
-    ] {
-        let mut b = ship();
-        b.speed_fraction = throttle;
-        let events = warp_command(&mut b, 77, object, point, min_range);
-        assert_eq!(b.mode, MODE_GOTO);
-        assert_eq!(b.goto, point);
-        assert!(!b.is_warping());
-        assert_eq!((b.warp.length, b.warp.min_range, b.warp.factor), (20.0, 10.0, 3));
-        assert_eq!(b.speed_fraction, if throttle == 0.0 { 1.0 } else { throttle });
-        assert_eq!(b.pos, [10.0, 20.0, 30.0]);
-        assert_eq!(b.vel, [4.0, 5.0, 6.0]);
-        assert_eq!(b.old_pos, [1.0, 2.0, 3.0]);
-        assert_eq!(b.old_vel, [7.0, 8.0, 9.0]);
-        assert_eq!(b.segment_acceleration, Some([11.0, 12.0, 13.0]));
-        assert_eq!(b.last_ms, 1000);
-        assert_eq!(b.interpolation_anchor_ms, 500);
-        assert_eq!(b.effect_stamp, 42);
-        assert_eq!(events, vec![event(77, "GotoPoint", vec![Value::Int(123), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])]);
-    }
-}
-
-#[test]
-fn warp_threshold_uses_unadjusted_distance_and_keeps_long_warp_events() {
-    for (distance, min_range) in [(100_000.0, 0.0), (100_001.0, 5000.0)] {
-        let mut b = ship();
-        let point = [b.pos[0] + distance, b.pos[1], b.pos[2]];
-        let events = warp_command(&mut b, 77, None, point, min_range);
-        assert_eq!(b.mode, MODE_WARP);
-        assert_eq!((b.warp.length, b.warp.min_range, b.warp.factor), (20.0, min_range, 3000));
-        assert_eq!(b.goto, point);
-        assert_eq!(events, vec![
-            event(77, "WarpTo", vec![Value::Int(123), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2]), Value::Float(min_range), Value::Int(3000)]),
-            event(77, "SetSpeedFraction", vec![Value::Int(123), Value::Float(1.0)]),
-            special_fx(77, 123, None, None, "effects.Warping", 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, None),
-        ]);
-    }
-}
 
 #[test]
 fn stale_warp_snapshot_has_no_side_effects_and_can_retry() {
@@ -91,20 +76,37 @@ fn stale_warp_snapshot_has_no_side_effects_and_can_retry() {
     let old = s.projection_revision(123);
     s.refresh_projection_target(123);
     let point = [200_000.0, 20.0, 30.0];
-    assert!(!commit_warp(&mut s, 123, old, false, None, point, 0.0, None).0);
+    assert_eq!(commit_warp(&mut s, 123, old, false, 4000, WarpDestination::Exact(point), None), WarpCommit::RetryProjection);
     assert_eq!(s.ball(123).unwrap().cloak, 1);
     s.tick(13_000);
     assert_ne!(s.ball(123).unwrap().mode, MODE_WARP);
     let current = s.projection_revision(123);
-    assert!(commit_warp(&mut s, 123, current, true, None, point, 0.0, None).0);
+    assert_eq!(commit_warp(&mut s, 123, current, true, 3000, WarpDestination::Exact(point), None), WarpCommit::Scrambled);
     assert_eq!(s.ball(123).unwrap().cloak, 1);
     s.refresh_projection_target(123);
-    assert!(!commit_warp(&mut s, 123, current, true, None, point, 0.0, None).0);
+    assert_eq!(commit_warp(&mut s, 123, current, true, 3000, WarpDestination::Exact(point), None), WarpCommit::RetryProjection);
     let current = s.projection_revision(123);
-    assert!(commit_warp(&mut s, 123, current, false, None, point, 0.0, None).0);
+    assert_eq!(commit_warp(&mut s, 123, current, false, 4320, WarpDestination::Exact(point), None), WarpCommit::Queued);
     s.tick(14_000);
     assert_eq!(s.ball(123).unwrap().mode, MODE_WARP);
+    assert_eq!(s.ball(123).unwrap().warp.factor, 4320);
 }
+#[test]
+fn queued_warp_keeps_its_factor_after_projection_refresh() {
+    crate::tests::init_config();
+    let mut s = space::System::new(0, std::sync::Arc::default(), 12_345);
+    s.insert(ship());
+    let revision = s.projection_revision(123);
+    let point = [1_000_000.0, 20.0, 30.0];
+    assert_eq!(commit_warp(&mut s, 123, revision, false, 4320, WarpDestination::Exact(point), None), WarpCommit::Queued);
+    s.refresh_projection_target(123);
+    s.tick(13_000);
+    assert_eq!(s.ball(123).unwrap().warp.factor, 4320);
+    s.refresh_projection_target(123);
+    s.tick(14_000);
+    assert_eq!(s.ball(123).unwrap().warp.factor, 4320);
+}
+
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -170,29 +172,42 @@ async fn completed_jumps_record_only_destination_arrivals() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let systems: Vec<i64> = sde.map.systems().filter(|s| s.constellation_id.is_some() && s.region_id.is_some()).take(2).map(|s| s.solar_system_id).collect();
     let (origin, destination) = (systems[0], systems[1]);
-    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
-    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
-    let hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, character, origin, [0.0; 3]).await.unwrap();
     let marker = map_telemetry::next_occurrence(&db).await.unwrap();
     let start = crate::client::filetime_now();
+    let (account, character, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
+        let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,solar_system_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2) RETURNING character_id", &[&account, &origin]).await?.get("character_id");
+        let hull = crate::dao::items::creation::positioned(tx, TYPE_CAPSULE, character, origin, [0.0; 3]).await?;
+        tx.execute("UPDATE game.characters SET ship_id=$2 WHERE character_id=$1", &[&character, &hull]).await?;
+        Ok::<_, crate::db::Error>((account, character, hull))
+    }), |value, ()| async move { Ok(value) }).await.unwrap();
     let world = space::World::new(db.clone(), sde.clone(), 1);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-    let (stream, address) = listener.accept().await.unwrap();
-    let cfg = Arc::new(crate::config::Config::default());
-    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
-    let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
-    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde, chat, world.clone(), login);
-    client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(origin))]);
-    let mut vessel = ship();
-    vessel.id = hull;
-    vessel.type_id = TYPE_CAPSULE;
-    vessel.owner_id = character;
-    vessel.char_id = Some(character);
-    world.add_ship(origin, vessel).await.unwrap();
     let w = world.clone();
     let d = db.clone();
     let result = tokio::spawn(async move {
+        admit_fixture_ship(&d, &w, origin, character, hull, true).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, address) = listener.accept().await.unwrap();
+        let cfg = Arc::new(crate::config::Config::default());
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
+        let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
+        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
+        client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(origin))]);
+        let market = crate::services::market::lock().await;
+        let cold_started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(10), w.system_locked(destination, &market))
+            .await.expect("market-held cold destination timed out").unwrap();
+        let cold_elapsed_ms = cold_started.elapsed().as_millis();
+        let restored_persistent_count = w.with(destination, |s| s.persistent_balls().count()).await.unwrap();
+        eprintln!("combat_cold_load_ms={cold_elapsed_ms} system_id={destination} restored_persistent_count={restored_persistent_count}");
+        drop(market);
+        let before = crate::dao::items::dogma::overrides(&d, hull).await.unwrap().len();
+        let old = w.with(origin, move |s| {
+            assert!(s.set_condition_fraction_mask(hull, 0b110, 0.5));
+            s.combat_health_scalars(hull).unwrap()
+        }).await.unwrap();
+        assert_eq!(crate::dao::items::dogma::overrides(&d, hull).await.unwrap().len(), before);
         let jump = |dest_system| Jump { through: 1, guid: "effects.JumpOut", other_type: None, dest_system, pos: [0.0; 3] };
         assert!(jump_out_and_arrive(&mut client, origin, hull, character, jump(-1)).await.is_err());
         w.system(destination).await.unwrap();
@@ -205,6 +220,16 @@ async fn completed_jumps_record_only_destination_arrivals() {
         assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap().is_empty());
         w.remove_ball(destination, -77).await;
         jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await.unwrap();
+        let arrived = w.with(destination, move |s| s.combat_health_scalars(hull).unwrap()).await.unwrap();
+        assert!((arrived.1[1] - old.1[1]).abs() < 1e-8);
+        assert!((arrived.1[2] - old.1[2]).abs() < 1e-8);
+        let rows = crate::dao::items::dogma::overrides(&d, hull).await.unwrap();
+        for (attribute, damage) in [
+            (infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE, old.1[1]),
+            (infinity_core::consts::dogma::ATTR_HULL_DAMAGE, old.1[2]),
+        ] {
+            assert!((rows.iter().find(|row| row.attribute_id == attribute).unwrap().value - damage).abs() < 1e-8);
+        }
         let visits = map_telemetry::visits(&d, character).await.unwrap();
         assert_eq!(visits.len(), 1);
         assert_eq!((visits[0].solar_system_id, visits[0].visits), (destination, 1));
@@ -232,10 +257,17 @@ async fn completed_jumps_record_only_destination_arrivals() {
     world.remove_ball(destination, hull).await;
     db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap();
     db.execute("DELETE FROM game.map_visits WHERE character_id=$1", &[&character]).await.unwrap();
+    let event_ids: Vec<String> = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let ids = tx.query("SELECT event_id::text AS event_id FROM game.progress_events WHERE subject_character_id=$1 OR (kind='WalletChanged' AND (payload->'WalletChanged'->>'owner_id')::bigint=ANY($2))", &[&character, &&[account, character][..]]).await?.iter().map(|row| row.get("event_id")).collect();
+        crate::services::tests::fixture::cleanup_progress(tx, &[account, character], &[character]).await?;
+        Ok::<_, crate::db::Error>(ids)
+    }), |ids, ()| async move { Ok(ids) }).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    assert!(db.query("SELECT event_id FROM game.progress_events WHERE event_id::text=ANY($1)", &[&event_ids]).await.unwrap().is_empty());
+    assert!(db.query("SELECT event_id FROM game.progress_deliveries WHERE event_id::text=ANY($1)", &[&event_ids]).await.unwrap().is_empty());
     result.unwrap();
 }
 
@@ -248,36 +280,39 @@ async fn headless_docking_returns_session_and_event() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let system = -1;
     let station_id = -2;
-    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
-    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
-    let hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, character, system, [0.0; 3]).await.unwrap();
+    let (account, character, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
+        let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,solar_system_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2) RETURNING character_id", &[&account, &system]).await?.get("character_id");
+        let hull = crate::dao::items::creation::positioned(tx, TYPE_CAPSULE, character, system, [0.0; 3]).await?;
+        tx.execute("UPDATE game.characters SET ship_id=$2 WHERE character_id=$1", &[&character, &hull]).await?;
+        Ok::<_, crate::db::Error>((account, character, hull))
+    }), |value, ()| async move { Ok(value) }).await.unwrap();
     let world = space::World::new(db.clone(), sde.clone(), 1);
-    world.system(system).await.unwrap();
     let w = world.clone();
     let d = db.clone();
     let result = tokio::spawn(async move {
-        let mut vessel = ship();
-        vessel.id = hull;
-        vessel.type_id = TYPE_CAPSULE;
-        vessel.owner_id = character;
-        vessel.char_id = Some(character);
-        vessel.mode = MODE_STOP;
-        vessel.pos = [0.0; 3];
-        vessel.old_pos = vessel.pos;
-        vessel.vel = [0.0; 3];
-        vessel.old_vel = vessel.vel;
-        vessel.segment_acceleration = None;
-        let mut station = vessel.clone();
+        macro_rules! phase {
+            ($name:literal, $future:expr) => {
+                tokio::time::timeout(std::time::Duration::from_secs(30), $future)
+                    .await.expect(concat!("docking phase timed out: ", $name))
+            };
+        }
+        phase!("initial admission", admit_fixture_ship(&d, &w, system, character, hull, true));
+        let mut station = ship();
         station.id = station_id;
         station.char_id = None;
+        station.mode = MODE_STOP;
+        station.vel = [0.0; 3];
+        station.old_vel = [0.0; 3];
+        station.segment_acceleration = None;
         station.radius = 1000.0;
         station.pos = [3551.0, 0.0, 0.0];
         station.old_pos = station.pos;
-        w.with(system, move |s| { s.insert(vessel); s.insert(station); }).await.unwrap();
+        w.with(system, move |s| s.insert(station)).await.unwrap();
         let identity = Identity { char_id: character, ship_id: Some(hull), corp_id: 0, station_id: None, system_id: None };
         let missing_ship = Identity { char_id: character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
         for (pilot, space_system) in [(&identity, None), (&missing_ship, Some(system)), (&identity, Some(system))] {
-            assert!(matches!(dock(pilot, &d, &w, space_system, station_id, None::<&mut Client>).await,
+            assert!(matches!(phase!("invalid request", dock(pilot, &d, &w, space_system, station_id, None::<&mut Client>)),
                 Err(CallError::User { msg, .. }) if msg == messages::MSG_DOCKING_REQUEST_DENIED));
         }
         let row = d.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
@@ -288,26 +323,36 @@ async fn headless_docking_returns_session_and_event() {
             station.old_pos = station.pos;
             s.insert(station);
         }).await.unwrap();
-        let change = dock(&identity, &d, &w, Some(system), station_id, None::<&mut Client>).await.ok().unwrap();
+        let damaged = w.with(system, move |s| {
+            assert!(s.set_condition_fraction_mask(hull, 0b110, 0.5));
+            s.combat_health_scalars(hull).unwrap().1
+        }).await.unwrap();
+        d.execute("ALTER TABLE game.characters ADD CONSTRAINT test_dock_rollback CHECK (station_id IS DISTINCT FROM -2) NOT VALID", &[]).await.unwrap();
+        let failure = phase!("failed durable dock", dock(&identity, &d, &w, Some(system), station_id, None::<&mut Client>));
+        d.execute("ALTER TABLE game.characters DROP CONSTRAINT test_dock_rollback", &[]).await.unwrap();
+        assert!(failure.is_err());
+        assert!(w.with(system, move |s| s.pilot_ball(character).is_some_and(|ball| ball.id == hull)).await.unwrap());
+        let row = d.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+        assert_eq!(row.get::<_, i64>("location_id"), system);
+        let change = phase!("headless dock", dock(&identity, &d, &w, Some(system), station_id, None::<&mut Client>)).ok().unwrap();
         assert_eq!(change.updates, vec![("solarsystemid", Value::None), ("stationid", Value::Int(station_id))]);
-        assert!(matches!(change.event, Some(GameEvent::Docked { char_id, ship_id, station_id: st, system_id }) if (char_id, ship_id, st, system_id) == (character, hull, station_id, system)));
+        let row = d.query_one("SELECT payload::text AS payload FROM game.progress_events WHERE kind='Docked' AND subject_character_id=$1 ORDER BY recorded_at DESC LIMIT 1", &[&character]).await.unwrap();
+        let event = crate::progress::codec::decode(crate::progress::codec::SCHEMA_VERSION, "Docked", &row.get::<_, String>("payload")).unwrap();
+        assert!(matches!(event, GameEvent::Docked { char_id, ship_id, station_id: st, system_id } if (char_id, ship_id, st, system_id) == (character, hull, station_id, system)));
         let row = d.query_one("SELECT location_id, flag_id FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
         assert_eq!((row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (station_id, FLAG_HANGAR));
+        let rows = crate::dao::items::dogma::overrides(&d, hull).await.unwrap();
+        for (attribute, damage) in [
+            (infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE, damaged[1]),
+            (infinity_core::consts::dogma::ATTR_HULL_DAMAGE, damaged[2]),
+        ] {
+            assert!((rows.iter().find(|row| row.attribute_id == attribute).unwrap().value - damage).abs() < 1e-8);
+        }
         let row = d.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
         assert_eq!((row.get::<_, Option<i64>>("station_id"), row.get::<_, i64>("solar_system_id")), (Some(station_id), system));
         item_dao::position(&d, hull, system, [0.0; 3]).await.unwrap();
-        let mut vessel = ship();
-        vessel.id = hull;
-        vessel.type_id = TYPE_CAPSULE;
-        vessel.owner_id = character;
-        vessel.char_id = Some(character);
-        vessel.mode = MODE_STOP;
-        vessel.pos = [0.0; 3];
-        vessel.old_pos = vessel.pos;
-        vessel.vel = [0.0; 3];
-        vessel.old_vel = vessel.vel;
-        vessel.segment_acceleration = None;
-        w.with(system, move |s| s.insert(vessel)).await.unwrap();
+        d.execute("UPDATE game.characters SET station_id=NULL, solar_system_id=$2 WHERE character_id=$1", &[&character, &system]).await.unwrap();
+        phase!("RPC admission", admit_fixture_ship(&d, &w, system, character, hull, true));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
@@ -327,31 +372,33 @@ async fn headless_docking_returns_session_and_event() {
             };
             let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
             assert!(matches!(packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
-            assert!(docking.await.is_ok());
+            assert!(phase!("RPC completion", &mut docking).is_ok());
         }
         assert_eq!(client.session.int("solarsystemid"), None);
         assert_eq!(client.session.int("stationid"), Some(station_id));
         assert!(client.outbox.iter().any(|packet| packet.command == crate::macho::cmd::SESSIONCHANGENOTIFICATION));
         item_dao::position(&d, hull, system, [0.0; 3]).await.unwrap();
-        let mut vessel = ship();
-        vessel.id = hull;
-        vessel.type_id = TYPE_CAPSULE;
-        vessel.mode = MODE_STOP;
-        vessel.pos = [0.0; 3];
-        vessel.old_pos = vessel.pos;
-        vessel.vel = [0.0; 3];
-        vessel.old_vel = vessel.vel;
-        vessel.segment_acceleration = None;
-        w.with(system, move |s| s.insert(vessel)).await.unwrap();
+        phase!("free hull admission", admit_fixture_ship(&d, &w, system, character, hull, false));
+        assert!(w.with(system, move |s| {
+            let persistent = s.persistent_generation(hull);
+            persistent.is_some() && persistent == s.combat_membership_generation(hull)
+        }).await.unwrap(), "unpiloted hull membership and combat generations must match");
         let no_character = Identity { char_id: 0, ship_id: Some(hull), corp_id: 0, station_id: None, system_id: None };
-        let change = dock(&no_character, &d, &w, Some(system), station_id, None::<&mut Client>).await.ok().unwrap();
-        assert!(change.event.is_none());
+        let change = phase!("free hull dock", dock(&no_character, &d, &w, Some(system), station_id, None::<&mut Client>)).ok().unwrap();
+        assert_eq!(change.updates, vec![("solarsystemid", Value::None), ("stationid", Value::Int(station_id))]);
     }).await;
     world.remove_ball(system, hull).await;
+    let event_ids: Vec<String> = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let ids = tx.query("SELECT event_id::text AS event_id FROM game.progress_events WHERE subject_character_id=$1 OR (kind='WalletChanged' AND (payload->'WalletChanged'->>'owner_id')::bigint=ANY($2))", &[&character, &&[account, character][..]]).await?.iter().map(|row| row.get("event_id")).collect();
+        crate::services::tests::fixture::cleanup_progress(tx, &[account, character], &[character]).await?;
+        Ok::<_, crate::db::Error>(ids)
+    }), |ids, ()| async move { Ok(ids) }).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    assert!(db.query("SELECT event_id FROM game.progress_events WHERE event_id::text=ANY($1)", &[&event_ids]).await.unwrap().is_empty());
+    assert!(db.query("SELECT event_id FROM game.progress_deliveries WHERE event_id::text=ANY($1)", &[&event_ids]).await.unwrap().is_empty());
     result.unwrap();
 }
 
@@ -365,9 +412,13 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
     let station = sde.map.stations().find(|s| s.solar_system_id.is_some() && sde.map.celestial(s.station_id)
         .is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some())).expect("station celestial");
     let (station_id, system) = (station.station_id, station.solar_system_id.unwrap());
-    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
-    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,$3) RETURNING character_id", &[&account, &station_id, &system]).await.unwrap().get("character_id");
-    let hull = crate::dao::items::creation::rookie_ship(&db, TYPE_CAPSULE, character, station_id, FLAG_HANGAR).await.unwrap();
+    let (account, character, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
+        let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,$3) RETURNING character_id", &[&account, &station_id, &system]).await?.get("character_id");
+        let hull = crate::dao::items::creation::rookie_ship(tx, TYPE_CAPSULE, character, station_id, FLAG_HANGAR).await?;
+        tx.execute("UPDATE game.characters SET ship_id=$2 WHERE character_id=$1", &[&character, &hull]).await?;
+        Ok::<_, crate::db::Error>((account, character, hull))
+    }), |value, ()| async move { Ok(value) }).await.unwrap();
     let world = space::World::new(db.clone(), sde.clone(), 1);
     let d = db.clone();
     let w = world.clone();
@@ -384,7 +435,9 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
         let expected = balls::selected(&identity, &d, &w, &sde, None, None, hull, [0.0; 3]).await.expect("load headless undock ball");
         let undocked = ship::undock(&identity, &d, &w, &sde, None, None).await.expect("headless undock");
         assert_eq!(undocked.change.updates, vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
-        assert!(matches!(undocked.change.event, Some(GameEvent::Undocked { char_id, ship_id, station_id: st, system_id }) if (char_id, ship_id, st, system_id) == (character, hull, station_id, system)));
+        let row = d.query_one("SELECT payload::text AS payload FROM game.progress_events WHERE kind='Undocked' AND subject_character_id=$1 ORDER BY recorded_at DESC LIMIT 1", &[&character]).await.unwrap();
+        let event = crate::progress::codec::decode(crate::progress::codec::SCHEMA_VERSION, "Undocked", &row.get::<_, String>("payload")).unwrap();
+        assert!(matches!(event, GameEvent::Undocked { char_id, ship_id, station_id: st, system_id } if (char_id, ship_id, st, system_id) == (character, hull, station_id, system)));
         let waiting = crate::services::market::lock();
         tokio::pin!(waiting);
         assert!(poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
@@ -395,12 +448,13 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
         assert_eq!((row.get::<_, Option<i64>>("station_id"), row.get::<_, i64>("solar_system_id")), (None, system));
         let ball = w.with(system, move |s| s.ball(hull).cloned()).await.unwrap().unwrap();
         assert_eq!(ball.pos, position);
-        assert_eq!((ball.mass, ball.max_vel, ball.agility, ball.signature_radius), (expected.mass, expected.max_vel, expected.agility, expected.signature_radius));
+        assert_eq!((ball.mass, ball.max_vel, ball.agility, ball.signature_radius), (expected.ball.mass, expected.ball.max_vel, expected.ball.agility, expected.ball.signature_radius));
         drop(undocked.economy);
         drop(waiting.await);
         w.remove_ball(system, hull).await;
         item_dao::dock(&d, hull, station_id, FLAG_HANGAR).await.unwrap();
         character_dao::dock(&d, character, station_id, system).await.unwrap();
+        d.execute("UPDATE game.characters SET corporation_id=2 WHERE character_id=$1", &[&character]).await.unwrap();
         let expected_space = balls::selected(&identity, &d, &w, &sde, Some(system), None, hull, [0.0; 3]).await.expect("load RPC undock ball");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -414,9 +468,11 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
         crate::services::dispatch(&mut client, &call).await.expect("dispatch undock RPC");
         assert_eq!(client.session.int("stationid"), None);
         assert_eq!(client.session.int("solarsystemid"), Some(system));
+        assert_eq!(client.session.int("corpid"), Some(2));
         assert!(client.outbox.iter().any(|packet| packet.command == crate::macho::cmd::SESSIONCHANGENOTIFICATION));
         let rpc_ball = w.with(system, move |s| s.ball(hull).cloned()).await.unwrap().unwrap();
-        assert_eq!((rpc_ball.mass, rpc_ball.max_vel, rpc_ball.agility, rpc_ball.signature_radius), (expected_space.mass, expected_space.max_vel, expected_space.agility, expected_space.signature_radius));
+        assert_eq!(rpc_ball.corp_id, 2);
+        assert_eq!((rpc_ball.mass, rpc_ball.max_vel, rpc_ball.agility, rpc_ball.signature_radius), (expected_space.ball.mass, expected_space.ball.max_vel, expected_space.ball.agility, expected_space.ball.signature_radius));
         w.remove_ball(system, hull).await;
         item_dao::dock(&d, hull, station_id, FLAG_HANGAR).await.unwrap();
         assert!(d.query_opt("SELECT character_id FROM game.characters WHERE character_id=$1", &[&0i64]).await.expect("check anonymous character").is_none());
@@ -438,10 +494,17 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
         assert!(w.with(system, move |s| s.ball(hull).is_none()).await.expect("inspect system after anonymous undock"));
     }).await;
     world.remove_ball(system, hull).await;
+    let event_ids: Vec<String> = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let ids = tx.query("SELECT event_id::text AS event_id FROM game.progress_events WHERE subject_character_id=$1 OR (kind='WalletChanged' AND (payload->'WalletChanged'->>'owner_id')::bigint=ANY($2))", &[&character, &&[account, character][..]]).await?.iter().map(|row| row.get("event_id")).collect();
+        crate::services::tests::fixture::cleanup_progress(tx, &[account, character], &[character]).await?;
+        Ok::<_, crate::db::Error>(ids)
+    }), |ids, ()| async move { Ok(ids) }).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    assert!(db.query("SELECT event_id FROM game.progress_events WHERE event_id::text=ANY($1)", &[&event_ids]).await.unwrap().is_empty());
+    assert!(db.query("SELECT event_id FROM game.progress_deliveries WHERE event_id::text=ANY($1)", &[&event_ids]).await.unwrap().is_empty());
     result.unwrap();
 }
 
@@ -514,31 +577,27 @@ async fn warp_dispatch_and_identity_guards() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let system = -1;
     let target_id = -2;
-    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
-    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
-    let hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, character, system, [0.0; 3]).await.unwrap();
+    let (account, character, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
+        let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await?.get("character_id");
+        let hull = crate::dao::items::creation::positioned(tx, TYPE_CAPSULE, character, system, [0.0; 3]).await?;
+        Ok::<_, crate::db::Error>((account, character, hull))
+    }), |value, ()| async move { Ok(value) }).await.unwrap();
     let world = space::World::new(db.clone(), sde.clone(), 1);
-    world.system(system).await.unwrap();
     let d = db.clone();
     let w = world.clone();
     let result = tokio::spawn(async move {
-        let mut vessel = ship();
-        vessel.id = hull;
-        vessel.type_id = TYPE_CAPSULE;
-        vessel.owner_id = character;
-        vessel.char_id = Some(character);
-        vessel.mode = MODE_STOP;
-        vessel.pos = [0.0; 3];
-        vessel.old_pos = vessel.pos;
-        vessel.vel = [0.0; 3];
-        vessel.old_vel = vessel.vel;
-        vessel.segment_acceleration = None;
-        let mut target = vessel.clone();
+        admit_fixture_ship(&d, &w, system, character, hull, true).await;
+        let mut target = ship();
+        target.mode = MODE_STOP;
+        target.vel = [0.0; 3];
+        target.old_vel = [0.0; 3];
+        target.segment_acceleration = None;
         target.id = target_id;
         target.char_id = None;
         target.pos = [1000.0, 0.0, 0.0];
         target.old_pos = target.pos;
-        w.with(system, move |s| { s.insert(vessel); s.insert(target); }).await.unwrap();
+        w.with(system, move |s| s.insert(target)).await.unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let connection = 1_000_000_000_001;
         w.observe(system, connection, hull, tx).await.unwrap();
@@ -549,7 +608,7 @@ async fn warp_dispatch_and_identity_guards() {
             (&missing_ship, Some(system), [1000.0, 0.0, 0.0]),
             (&identity, Some(system), [f64::NAN, 0.0, 0.0]),
         ] {
-            assert!(matches!(warp_to(pilot, &d, &w, space_system, None, point, 0.0, None).await, Ok(Value::None)));
+            assert!(matches!(warp_to(pilot, &d, &w, space_system, WarpDestination::Exact(point), None).await, Ok(Value::None)));
         }
         assert!(w.after(system, 1100).await);
         assert_eq!(w.ball(system, hull).await.unwrap().mode, MODE_STOP);
@@ -570,7 +629,7 @@ async fn warp_dispatch_and_identity_guards() {
         assert_eq!(ball.goto, [1000.0, 0.0, 0.0]);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let callback: Timer = Box::new(move |_| { let _ = tx.send(()); });
-        assert!(matches!(warp_to(&identity, &d, &w, Some(system), None, [2000.0, 0.0, 0.0], 0.0, Some(callback)).await, Ok(Value::None)));
+        assert!(matches!(warp_to(&identity, &d, &w, Some(system), WarpDestination::Exact([2000.0, 0.0, 0.0]), Some(callback)).await, Ok(Value::None)));
         tokio::time::timeout(std::time::Duration::from_secs(3), rx).await.unwrap().unwrap();
         assert_eq!(w.ball(system, hull).await.unwrap().goto, [2000.0, 0.0, 0.0]);
     }).await;
@@ -580,4 +639,48 @@ async fn warp_dispatch_and_identity_guards() {
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn fitting_change_precedes_cold_persistent_ship_publication() {
+    use std::sync::Arc;
+    use infinity_core::consts::{CATEGORY_SHIP, dogma::ATTR_ARMOR_HP};
+    use crate::services::fit::{Fit, Key};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let system = sde.map.systems().next().unwrap().solar_system_id;
+    let kind = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)
+        && t.attribute(ATTR_ARMOR_HP).is_some_and(|value| value > 0.0)).unwrap().type_id;
+    let (account, owner, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
+        let owner: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await?.get("character_id");
+        let hull = crate::dao::items::creation::positioned(tx, kind, owner, system, [0.0; 3]).await?;
+        Ok::<_, crate::db::Error>((account, owner, hull))
+    }), |value, ()| async move { Ok(value) }).await.unwrap();
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    let mut cold = None;
+    let result = crate::tests::catch_scenario(async {
+        let fit = Fit::load_unpiloted(&db, sde, hull).await.ok().unwrap();
+        let value = fit.value(Key::Ship, ATTR_ARMOR_HP) * 2.0;
+        assert!(value > 0.0);
+        let market = crate::services::market::lock().await;
+        let w = world.clone();
+        cold = Some(tokio::spawn(async move { w.system(system).await }));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), cold.as_mut().unwrap()).await.is_err());
+        assert!(crate::dao::items::dogma::set_override(&db, hull, ATTR_ARMOR_HP, value).await.unwrap());
+        drop(market);
+        tokio::time::timeout(std::time::Duration::from_secs(10), cold.as_mut().unwrap()).await.unwrap().as_ref().unwrap().as_ref().unwrap();
+        cold = None;
+        let stats = world.with(system, move |s| s.combat_health_scalars(hull)).await.unwrap().unwrap();
+        assert!((stats.0[1] - value).abs() < 1e-8);
+    }).await;
+    if let Some(task) = cold { task.abort(); let _ = task.await; }
+    world.remove_ball(system, hull).await;
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

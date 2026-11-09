@@ -2,7 +2,7 @@
 //! Mirrors `ballparkCommon/docking.py` using immutable graphic locators; NPC
 //! station positions have no `dunRotation`. If added, rotate both locator offset
 //! and channel here together. Upwell-specific behavior is not modeled.
-use crate::consts::*;
+use infinity_core::consts::*;
 use crate::sde::graphic_locations::DirectionalLocator;
 use crate::space::{add, dist, scale, sub, Ball, V3};
 

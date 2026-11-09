@@ -21,7 +21,7 @@ fn present_type_row_rejects_invalid_fitted_range() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn stale_generation_does_not_complete_jump_or_move_ship() {
-    use crate::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, dogma::{ATTR_WARP_SCRAMBLE_STATUS, EFFECT_MICRO_JUMP_DRIVE}};
+    use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, dogma::{ATTR_WARP_SCRAMBLE_STATUS, EFFECT_MICRO_JUMP_DRIVE}};
     use crate::services::combat::ActiveModule;
     use crate::services::effects::{lifecycle::{ActivationOwner, Module}, registry};
     use crate::space::{Ball, WarpState, World, MODE_STOP};
@@ -56,7 +56,7 @@ async fn stale_generation_does_not_complete_jump_or_move_ship() {
             agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3],
             old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
             free: false, global: false, massive: false, interactive: false, warp: WarpState::default(),
-            warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
+            last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
             cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }).await.unwrap();
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify, char_id: character, ship_id: ship, system_id: 1 };
         let generation = Arc::new(AtomicBool::new(false));
@@ -67,8 +67,8 @@ async fn stale_generation_does_not_complete_jump_or_move_ship() {
         }
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }],
             effect, target: None, repeat: 1, stop: generation.clone(),
-            owner: ActivationOwner { master: module, generation: generation.clone(), armed: true },
-            started: 0, charge_type: None, cycles: 0, duration_ms: 1.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+            owner: ActivationOwner { master: module, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
+            started: 0, charge_type: None, cycles: 0, duration_ms: 1.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
         let fit = Fit::load(&test_db, sde, character, ship).await.ok().unwrap();
         assert_eq!(start(&cx, &fit, &mut cycle).await.ok().unwrap(), CycleOutcome::Continue);
         combat::state().active.get_mut(&module).unwrap().stop = Arc::new(AtomicBool::new(false));
@@ -84,7 +84,7 @@ async fn stale_generation_does_not_complete_jump_or_move_ship() {
     }
     world.remove_ball(1, ship).await;
     combat::forget_ship(ship);
-    world.unregister_pilot(character);
+    world.unregister_pilot_generation(character, None);
     let flush = world.flush_positions().await;
     drop(world);
     db.execute("DELETE FROM game.item_attributes WHERE item_id = ANY($1)", &[&&[module, ship][..]]).await.unwrap();

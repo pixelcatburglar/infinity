@@ -2,7 +2,7 @@
 //! IDs are client inventory constants; values are cubic metres.
 //! No other item data or runtime overrides are represented here.
 
-use crate::consts::GROUP_STRATEGIC_CRUISER;
+use infinity_core::consts::GROUP_STRATEGIC_CRUISER;
 
 pub(super) const GROUP_OVERRIDES: &[(i32, f64)] = &[
     (25, 2500.0), // groupFrigate

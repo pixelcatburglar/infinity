@@ -1,5 +1,5 @@
 use super::*;
-use crate::consts::FLAG_HI_SLOT_FIRST;
+use infinity_core::consts::FLAG_HI_SLOT_FIRST;
 use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -18,16 +18,15 @@ impl MiningFixture {
         let f = Fixture::new().await;
         let ore = f.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ASTEROID) && t.volume.is_some_and(|v| v >= 0.01)).unwrap();
         let (ore, volume) = (ore.type_id, ore.volume.unwrap());
-        let module_type = f.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_MODULE)).unwrap().type_id;
+        let module_type = f.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_MODULE)).unwrap().type_id;
         let module = f.db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,true) RETURNING item_id", &[&module_type, &f.owner, &f.ship, &FLAG_HI_SLOT_FIRST]).await.unwrap().get("item_id");
         for (item, attr, value) in [(module, ATTR_MINING_AMOUNT, volume * fraction), (module, ATTR_MAX_RANGE, 10000.0),
             (module, ATTR_CRIT_CHANCE, 0.0), (module, ATTR_WASTE_PROBABILITY, 0.0),
-            (f.ship, ATTR_CAPACITY, volume * 10.0), (f.ship, ATTR_MINING_HOLD, 0.0)] {
+            (f.ship, ATTR_CAPACITY, volume * 10.0), (f.ship, ATTR_GENERAL_MINING_HOLD_CAPACITY, 0.0)] {
             f.set(item, attr, value).await;
         }
-        let rock = crate::dao::asteroids::insert(&f.db, f.system, f.system, ore, quantity, 1.0, [0.0; 3]).await.unwrap();
-        state().rocks.insert(rock, Rock { system: f.system, field: f.system, type_id: ore, quantity });
-        f.world.add_ship(f.system, rock_ball(rock, ore, [0.0; 3], 1.0)).await.unwrap();
+        let rock = crate::dao::asteroids::insert_batch(&f.db, f.system, &[NewAsteroid { field: f.system, type_id: ore, quantity, radius: 1.0, pos: [0.0; 3] }]).await.unwrap()[0].id;
+        publish_fixture(&f.db, &f.world, f.system, f.system).await;
         Self { f, module, module_type, ore, volume, rock }
     }
 
@@ -47,9 +46,14 @@ impl MiningFixture {
     }
 
     async fn cleanup(self) {
-        state().rocks.remove(&self.rock);
-        self.f.world.remove_ball(self.f.system, self.rock).await;
-        crate::dao::asteroids::delete(&self.f.db, self.rock).await.unwrap();
+        let actor = self.f.world.asteroid_actor(self.f.system);
+        self.f.db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2 AND field_id=$3", &[&self.rock, &self.f.system, &self.f.system]).await.unwrap();
+        if let Some(actor) = actor {
+            if actor.rock_field(self.rock).await == Some(self.f.system) {
+                assert!(crate::space::asteroids::publish_depletion(&self.f.world, self.f.system, &actor, self.rock, self.f.system, None, None).await);
+            }
+        }
+        self.f.db.execute("DELETE FROM game.asteroid_fields WHERE field_id=$1 AND system_id=$1", &[&self.f.system]).await.unwrap();
         self.f.cleanup().await;
     }
 }
@@ -69,7 +73,7 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
         let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
         m.f.world.register_pilot(m.f.owner, pilot);
         let before = m.snapshot().await?;
-        let other_type = m.f.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_MODULE) && t.type_id != m.module_type).unwrap().type_id;
+        let other_type = m.f.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_MODULE) && t.type_id != m.module_type).unwrap().type_id;
         let changes = [
             "UPDATE game.items SET online=false WHERE item_id=$1",
             "UPDATE game.items SET location_id=location_id+1 WHERE item_id=$1",
@@ -220,7 +224,8 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
     let world = m.f.world.clone();
     let (owner, ship, system, module, module_type, rock) = (m.f.owner, m.f.ship, m.f.system, m.module, m.module_type, m.rock);
     let mut handle = tokio::spawn(async move {
-        extract(&db, &world, &notify, owner, ship, system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await
+        let result = extract(&db, &world, &notify, owner, ship, system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await;
+        result
     });
     let barrier = wait_for_blocked(&observer, blocker).await;
     let update = if barrier.is_ok() && !cancel {
@@ -230,8 +235,9 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
     let commit = tx.commit().await;
     let completion = if cancel {
         let _ = handle.await;
-        tokio::time::timeout(WAIT, crate::services::market::lock()).await
-            .map(|guard| drop(guard)).map_err(|_| anyhow::anyhow!("owned extraction did not finish"))
+        let result = tokio::time::timeout(WAIT, crate::services::market::lock()).await
+            .map(|guard| drop(guard)).map_err(|_| anyhow::anyhow!("owned extraction did not finish"));
+        result
     } else {
         match tokio::time::timeout(WAIT, &mut handle).await {
             Ok(joined) => joined.map_err(|e| anyhow::anyhow!("extraction task: {e}"))
@@ -257,7 +263,8 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
         anyhow::ensure!(m.snapshot().await? == (None, 1, before.2 + 1), "cancelled caller did not deliver exactly once");
         let logs = crate::dao::mining_ledger::list(&m.f.db, m.f.owner, i64::MIN, i64::MAX).await?;
         anyhow::ensure!((logs[0].type_id, logs[0].solar_system_id, logs[0].quantity, logs[0].quantity_wasted) == (m.ore, m.f.system, 1, 0), "cancelled delivery ledger incorrect");
-        anyhow::ensure!(!state().rocks.contains_key(&m.rock), "depleted rock remains cached");
+        let rock = m.rock;
+        anyhow::ensure!(m.f.world.with(m.f.system, move |s| s.rock_field(rock)).await.flatten().is_none(), "depleted rock remains cached");
         anyhow::ensure!(m.f.world.ball(m.f.system, m.rock).await.is_none(), "depleted rock remains in actor");
         anyhow::ensure!(notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnItemChange") && notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnOreMined") && notices.try_recv().is_err(), "cancelled delivery notices incorrect");
     } else {

@@ -1,9 +1,12 @@
 //! Real-database coverage for station repackaging and confirmation.
+//! Requires a dedicated quiet test database: whole-database fingerprints intentionally prove no side effects anywhere.
 use std::sync::Arc;
-use crate::{client::Client, consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR, FLAG_RIG_FIRST, GROUP_STRATEGIC_CRUISER}, db::Db, sde::Sde, services::{Call, CallError}, space::World};
+use infinity_core::{consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR, FLAG_RIG_FIRST, GROUP_STRATEGIC_CRUISER}};
+use crate::{client::Client, db::Db, sde::Sde, services::{Call, CallError}, space::World};
 use marshal::Value;
 
 mod scenarios;
+mod container_capacity;
 
 async fn fingerprint(db: &Db) -> Vec<(String, String)> {
     let tables = [
@@ -75,8 +78,8 @@ async fn rig_confirmation_preserves_then_destroys() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let station = sde.map.stations().next().expect("SDE station").station_id;
-    let hull_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.group_id.map(i64::from) != Some(GROUP_STRATEGIC_CRUISER)).expect("ordinary hull").type_id;
-    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_RIG_SLOT)).expect("rig type").type_id;
+    let hull_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.group_id.map(i64::from) != Some(GROUP_STRATEGIC_CRUISER) && t.fit_attribute(infinity_core::consts::dogma::ATTR_CAPACITY).is_some()).expect("ordinary hull with cargo capacity").type_id;
+    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_RIG_SLOT) && crate::services::item_volume::item_volume(&sde, t.type_id, false, 7, None).is_ok_and(|v| v.is_finite() && v >= 0.0)).expect("rig type with valid volume").type_id;
     let before = fingerprint(&db).await;
     let f = create(&db, station, hull_type, rig_type).await;
     let world = World::new(db.clone(), sde.clone(), 1);
@@ -112,12 +115,12 @@ async fn rig_confirmation_preserves_then_destroys() {
         }, |(), ()| async move { Ok(()) }).await.unwrap();
         let unchanged = fingerprint(&test_db).await;
         for confirmation in [None, Some(Value::Bool(false)), Some(Value::str("true"))] {
-            assert!(matches!(request(&mut c, f, confirmation).await, Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_CONFIRM_REPACKAGE_SOMETHING_WITH_UPGRADES));
+            assert!(matches!(request(&mut c, f, confirmation).await, Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_CONFIRM_REPACKAGE_SOMETHING_WITH_UPGRADES));
             assert_eq!(fingerprint(&test_db).await, unchanged);
             assert!(events.try_recv().is_err());
         }
         let rig = crate::services::items::load_items(&test_db, &c.sde, crate::dao::items::loading::ItemQuery::Id(f.rig)).await.unwrap().pop().unwrap();
-        let gone = crate::dao::items::loading::Item { location_id: crate::consts::LOCATION_JUNKYARD, ..rig };
+        let gone = crate::dao::items::loading::Item { location_id: infinity_core::consts::LOCATION_JUNKYARD, ..rig };
         assert!(matches!(request(&mut c, f, Some(Value::Bool(true))).await, Ok(Value::None)));
         let row = test_db.query_one("SELECT singleton,online,name FROM game.items WHERE item_id=$1", &[&f.hull]).await.unwrap();
         assert!(!row.get::<_, bool>("singleton"));
@@ -131,8 +134,8 @@ async fn rig_confirmation_preserves_then_destroys() {
         let mut root_notice = false;
         while let Ok((name, payload)) = events.try_recv() {
             if name != "OnItemChange" { continue; }
-            if payload.first() == Some(&gone.row()) && payload.get(1) == Some(&Value::Dict(vec![(Value::Int(crate::consts::IX_LOCATION_ID), Value::Int(f.hull))])) { rig_notice = true; }
-            if payload.first() == Some(&root.row()) && payload.get(1) == Some(&Value::Dict(vec![(Value::Int(crate::consts::IX_SINGLETON), Value::Bool(true))])) { root_notice = true; }
+            if payload.first() == Some(&gone.row()) && payload.get(1) == Some(&Value::Dict(vec![(Value::Int(infinity_core::consts::IX_LOCATION_ID), Value::Int(f.hull))])) { rig_notice = true; }
+            if payload.first() == Some(&root.row()) && payload.get(1) == Some(&Value::Dict(vec![(Value::Int(infinity_core::consts::IX_SINGLETON), Value::Bool(true))])) { root_notice = true; }
         }
         assert!(rig_notice && root_notice);
         assert!(matches!(request(&mut c, f, None).await, Ok(Value::None)));
@@ -152,7 +155,7 @@ async fn sealed_wrap_repackaging_refused_without_changes() {
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let station = sde.map.stations().next().expect("SDE station").station_id;
     let hull_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.group_id.map(i64::from) != Some(GROUP_STRATEGIC_CRUISER)).expect("ordinary hull").type_id;
-    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_RIG_SLOT)).expect("rig type").type_id;
+    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_RIG_SLOT)).expect("rig type").type_id;
     let before = fingerprint(&db).await;
     let f = create(&db, station, hull_type, rig_type).await;
     let world = World::new(db.clone(), sde.clone(), 1);
@@ -180,7 +183,7 @@ async fn late_hull_update_failure_rolls_back_rig_and_notices() {
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let station = sde.map.stations().next().expect("SDE station").station_id;
     let hull_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.group_id.map(i64::from) != Some(GROUP_STRATEGIC_CRUISER)).expect("ordinary hull").type_id;
-    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_RIG_SLOT)).expect("rig type").type_id;
+    let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_RIG_SLOT)).expect("rig type").type_id;
     let before = fingerprint(&db).await;
     let f = create(&db, station, hull_type, rig_type).await;
     let world = World::new(db.clone(), sde.clone(), 1);
@@ -218,7 +221,7 @@ async fn late_hull_update_failure_rolls_back_rig_and_notices() {
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                     }).await.expect("service did not block on insurance")?;
-                    let child: i64 = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,false) RETURNING item_id", &[&rig_type,&f.owner,&second_rig,&crate::consts::FLAG_CARGO]).await?.get("item_id");
+                    let child: i64 = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,false) RETURNING item_id", &[&rig_type,&f.owner,&second_rig,&infinity_core::consts::FLAG_CARGO]).await?.get("item_id");
                     Ok::<_, crate::db::Error>(child)
                 })
             },
@@ -232,7 +235,7 @@ async fn late_hull_update_failure_rolls_back_rig_and_notices() {
             tokio::join!(blocker, service)
         }).await.expect("barrier or service timed out");
         let child = child.unwrap();
-        assert!(matches!(outcome, Err(CallError::User { msg, dict }) if msg == crate::messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert!(matches!(outcome, Err(CallError::User { msg, dict }) if msg == infinity_core::messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
         assert!(events.try_recv().is_err());
         assert_eq!(test_db.execute("DELETE FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&child,&f.owner]).await.unwrap(), 1);
         assert_eq!(fingerprint(&test_db).await, unchanged);

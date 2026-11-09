@@ -30,6 +30,9 @@ pub(super) async fn cleanup(db: &Db, fixture: Fixture, script: &str) -> Result<(
             let script = script.clone();
             Box::pin(async move {
             let id = fixture.char_id;
+            crate::services::tests::fixture::cleanup_progress(tx, &[fixture.account, id], &[id]).await?;
+            let kills: Vec<i64> = tx.query("SELECT kill_id FROM game.killmails WHERE victim_id = $1", &[&id]).await?.iter().map(|row| row.get("kill_id")).collect();
+            crate::services::tests::fixture::cleanup_killmail_rewards(tx, &kills).await?;
             tx.execute("DELETE FROM game.lua_store WHERE script = $1", &[&script]).await?;
             tx.execute("DELETE FROM game.market_transactions WHERE buyer_id = $1 OR seller_id = $1", &[&id]).await?;
             tx.execute("DELETE FROM game.market_order_history WHERE char_id = $1", &[&id]).await?;
@@ -51,26 +54,15 @@ pub(super) async fn cleanup(db: &Db, fixture: Fixture, script: &str) -> Result<(
     ).await
 }
 
-pub(super) async fn fingerprint(db: &Db) -> Result<Vec<String>, Error> {
+pub(super) async fn fingerprint(db: &Db) -> Result<Vec<Vec<String>>, Error> {
     let mut fingerprints = Vec::new();
-    for query in [
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY user_id), '')) AS fingerprint FROM game.accounts t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id), '')) AS fingerprint FROM game.characters t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.items t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id, attribute_id), '')) AS fingerprint FROM game.item_attributes t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY script, key), '')) AS fingerprint FROM game.lua_store t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY order_id), '')) AS fingerprint FROM game.market_orders t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY order_id), '')) AS fingerprint FROM game.market_order_history t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY transaction_id), '')) AS fingerprint FROM game.market_transactions t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY kill_id), '')) AS fingerprint FROM game.killmails t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY ship_id), '')) AS fingerprint FROM game.insurance t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY notification_id), '')) AS fingerprint FROM game.notifications t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY ship_id, flag_id, type_id), '')) AS fingerprint FROM game.module_charges t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY reload_id), '')) AS fingerprint FROM game.pending_reloads t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY slave_id), '')) AS fingerprint FROM game.weapon_banks t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.blueprints t",
+    for table in [
+        "accounts", "characters", "items", "item_attributes", "lua_store",
+        "market_orders", "market_order_history", "market_transactions", "killmails",
+        "insurance", "notifications", "module_charges", "pending_reloads",
+        "weapon_banks", "blueprints", "progress_events", "progress_deliveries", "bounty_payouts",
     ] {
-        fingerprints.push(db.query_one(query, &[]).await?.get("fingerprint"));
+        fingerprints.push(crate::services::drones::tests::fixture::table_fingerprint(db, table).await?);
     }
     Ok(fingerprints)
 }

@@ -4,7 +4,7 @@
 //! Mining yield is not stored as child inventory.
 
 use std::collections::BTreeMap;
-use crate::consts::{FLAG_DRONE_BAY, OWNER_UNOWNED};
+use infinity_core::consts::{FLAG_DRONE_BAY, OWNER_UNOWNED};
 use crate::db::{self, executor::Executor};
 use super::{creation, loading::Item, quantities::{self, QuantityChange}};
 use tokio_postgres::Row;
@@ -30,14 +30,14 @@ pub(crate) async fn positioned(ex: &(impl Executor + ?Sized), system: i64, drone
 }
 
 pub(crate) async fn launch(ex: &(impl Executor + ?Sized), item: &Item, count: i32, owner: i64, ship: i64, system: i64, pos: [f64; 3]) -> Result<Option<Vec<i64>>, db::Error> {
-    if count <= 0 || count > item.quantity || item.owner_id != owner || item.location_id != ship || item.flag_id != FLAG_DRONE_BAY || (item.singleton && (item.quantity != 1 || count != 1)) {
+    if count <= 0 || i64::from(count) > item.quantity || item.owner_id != owner || item.location_id != ship || item.flag_id != FLAG_DRONE_BAY || (item.singleton && (item.quantity != 1 || count != 1)) {
         return Ok(None);
     }
     let locked = ex.query_opt("SELECT item_id FROM game.items WHERE item_id = $1 AND type_id = $2 AND owner_id = $3 AND location_id = $4 AND flag_id = $5 AND quantity = $6 AND singleton = $7 FOR UPDATE", &[&item.item_id, &item.type_id, &owner, &ship, &FLAG_DRONE_BAY, &item.quantity, &item.singleton]).await?;
     if locked.is_none() { return Ok(None); }
 
-    let move_original = count == item.quantity;
-    let remaining = if move_original { 1 } else { item.quantity - count };
+    let move_original = i64::from(count) == item.quantity;
+    let remaining = if move_original { 1 } else { item.quantity - i64::from(count) };
     if remaining != item.quantity {
         let changes = BTreeMap::from([(item.item_id, QuantityChange::new(item, Some(remaining)))]);
         if !quantities::apply(ex, &changes).await? { return Ok(None); }

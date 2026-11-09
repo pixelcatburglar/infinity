@@ -11,7 +11,8 @@ mod licenses;
 
 use std::{collections::BTreeSet, sync::Arc};
 use marshal::Value;
-use crate::{client::{Client, filetime_now}, dao::{characters::selection::lock_character, items::loading::ItemQuery, ship_skins}, db::outbox::{dispatch_client, Outbox}, messages::ship_skins as text, services::{db_err, identity::Identity, inventory::reachability::{Endpoint, Reachability}, items::load_items, keyval, market, notify_error, Call, CallError, CallResult}};
+use infinity_core::messages::ship_skins as text;
+use crate::{client::{Client, filetime_now}, dao::{characters::selection::lock_character, items::loading::ItemQuery, ship_skins}, db::outbox::{dispatch_client, Outbox}, services::{db_err, identity::Identity, inventory::reachability::{Endpoint, Reachability}, items::load_items, keyval, market, notify_error, Call, CallError, CallResult}};
 
 fn positive(value: &Value) -> Result<i64, CallError> {
     match value { Value::Int(n) if *n > 0 => Ok(*n), _ => Err(notify_error(text::INVALID_ARGUMENT)) }
@@ -141,11 +142,11 @@ fn gm_args(call: &Call<'_>, me: i64) -> Result<(i32, GmAction), CallError> {
     }
 }
 fn notify_empty_removal<X>(outbox: &mut Outbox<X>, character: i64) {
-    outbox.notify_pilot(character, "OnRemoteMessage", vec![Value::str(crate::messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(text::REMOVED_NEXT_LOGIN))])]);
+    outbox.notify_pilot(character, "OnRemoteMessage", vec![Value::str(infinity_core::messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(text::REMOVED_NEXT_LOGIN))])]);
 }
 
 async fn gm(c: &mut Client, call: &Call<'_>) -> CallResult {
-    if c.login.role & crate::consts::ROLE_GML == 0 { return Err(notify_error(crate::messages::INSUFFICIENT_ROLE_FOR_OPERATION)); }
+    if c.login.role & infinity_core::consts::ROLE_GML == 0 { return Err(notify_error(infinity_core::messages::INSUFFICIENT_ROLE_FOR_OPERATION)); }
     let character = Identity::of_client(c).char_id;
     if character <= 0 { return Err(notify_error(text::INVALID_ARGUMENT)); }
     let (skin, action) = gm_args(call, character)?;

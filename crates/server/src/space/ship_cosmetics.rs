@@ -3,7 +3,8 @@
 //! tables. Deployment region changes across restart are not supported; region
 //! eligibility is checked only at write boundaries. NPC IDs are actor facts,
 //! not game item identities, even when their numeric IDs coincide.
-use crate::{client::filetime_now, consts::{CATEGORY_ENTITY, CATEGORY_SHIP}, db::outbox::{dispatch_world, Outbox}, gateway::ship_cosmetics as gateway, services::{identity::Identity, market, ship_cosmetics_mgr::state}, space::{Ball, System, World}};
+use infinity_core::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP}};
+use crate::{client::filetime_now, db::outbox::{dispatch_world, Outbox}, gateway::ship_cosmetics as gateway, services::{identity::Identity, market, ship_cosmetics_mgr::state}, space::{Ball, System, World}};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Ship { pub ship_id: i64, pub type_id: i32, pub character_id: Option<i64>, pub is_npc: bool }

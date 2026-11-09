@@ -1,12 +1,12 @@
 use super::*;
 use crate::db::outbox::{Effect as OutboxEffect, Outbox};
-use crate::services::effects::online::{apply_online_changed, OnlineChanged};
 use std::sync::Mutex;
 mod refund_db;
 mod forced_retire;
 mod banks_db;
 mod boundary;
 mod event_guards;
+mod remote_facts;
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -86,7 +86,7 @@ fn completed_cycle_retirement_preserves_committed_action_generation() {
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], old_pos: [0.0; 3],
         old_vel: [0.0; 3], segment_acceleration: None, follow_id: 0, follow_range: 0.0,
         free: true, global: false, interactive: false, massive: true,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     });
     let generation = Arc::new(AtomicBool::new(false));
@@ -121,7 +121,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
         st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         st.activation_generation.insert(master, generation.clone());
     }
-    let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
+    let owner = ActivationOwner { master, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 };
     let mut system = System::default();
     schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
     drop(system);
@@ -132,7 +132,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
         st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         st.activation_generation.insert(master, generation.clone());
     }
-    let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
+    let owner = ActivationOwner { master, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 };
     let system = System::default();
     system.defer(async move { drop(owner); });
     {
@@ -145,7 +145,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
         st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         st.activation_generation.insert(master, generation.clone());
     }
-    let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
+    let owner = ActivationOwner { master, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 };
     let rejected_post = move |_: &mut System| drop(owner);
     drop(rejected_post);
     {
@@ -160,7 +160,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
         st.active.insert(master, ActiveModule { char_id: 1, stop: replacement.clone(), forced_inactive: false });
         st.activation_generation.insert(master, replacement.clone());
     }
-    let owner = ActivationOwner { master, generation, armed: true };
+    let owner = ActivationOwner { master, generation, armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 };
     let mut system = System::default();
     schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
     drop(system);
@@ -219,7 +219,7 @@ fn cycle_deadlines_and_deactivation() {
 
 #[test]
 fn subject_requires_owned_fitted_module_on_permitted_ship() {
-    use crate::consts::{FLAG_CARGO, FLAG_FITTING_FIRST};
+    use infinity_core::consts::{FLAG_CARGO, FLAG_FITTING_FIRST};
     use crate::sde::types::TypeEffect;
     let mut hull = Item { item_id: 3, type_id: 1, owner_id: 2, location_id: 4, flag_id: FLAG_HANGAR, quantity: 1, singleton: true, group_id: 0, category_id: i64::from(CATEGORY_SHIP), custom_info: None };
     let mut module = Item { item_id: 5, type_id: 1, owner_id: 2, location_id: 3, flag_id: FLAG_FITTING_FIRST, quantity: 1, singleton: true, group_id: 0, category_id: i64::from(CATEGORY_MODULE), custom_info: None };
@@ -247,7 +247,7 @@ fn subject_requires_owned_fitted_module_on_permitted_ship() {
 }
 
 #[test]
-fn online_dispatch_stops_current_cycle_after_commit() {
+fn bank_stop_dispatch_stops_current_cycle_after_commit() {
     let module = -9021;
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -256,10 +256,10 @@ fn online_dispatch_stops_current_cycle_after_commit() {
         st.activation_generation.insert(module, stop.clone());
     }
     let mut outbox = Outbox::default();
-    outbox.operation(OnlineChanged { bank_stops: crate::services::combat::banks::capture_stop(module).into_iter().collect(), ship: 0, clear_heat: vec![] });
+    outbox.operation(crate::services::combat::banks::capture_stop(module).expect("captured active generation"));
     assert!(!stop.load(Ordering::Relaxed));
     for entry in outbox.into_entries() {
-        if let OutboxEffect::Operation(change) = entry { apply_online_changed(change); }
+        if let OutboxEffect::Operation(stop) = entry { crate::services::combat::banks::apply_stop(stop); }
     }
     assert!(stop.load(Ordering::Relaxed));
     let st = state();

@@ -6,7 +6,8 @@
 //! Unsupported: client-supplied duration or lifecycle overrides.
 use std::sync::Arc;
 use marshal::Value;
-use crate::{client::filetime_now, consts::FILETIME_DAY, dao::{items::loading::ItemQuery, skills::expert_systems as dao}, db::{self, outbox::{Notification, Outbox}}, messages, sde::Sde, services::{db_err, notify_error, effects::online::{self, OnlineChanged}, identity::Identity, inventory::{self, reachability::{Endpoint, Reachability}}, CallError}, space::World};
+use infinity_core::{consts::FILETIME_DAY, messages};
+use crate::{client::filetime_now, dao::{items::loading::ItemQuery, skills::expert_systems as dao}, db::{self, outbox::{Notification, Outbox}}, sde::Sde, services::{db_err, notify_error, effects::online::{self, OnlineChanged}, identity::Identity, inventory::{self, reachability::{Endpoint, Reachability}}, CallError}, space::World};
 
 /// expertSystems/const.py:7, MAX_CHARACTER_INSTALLATIONS.
 const MAX_ACTIVE: usize = 3;
@@ -23,25 +24,27 @@ fn changed<E>(outbox: &mut Outbox<E>, char_id: i64, rows: &[dao::ExpertSystem], 
 }
 
 /// Advance the same timeline used by skill completion, including expert expiry.
-pub(crate) async fn advance_expired<F>(db: &db::Db, sde: &Arc<Sde>, char_id: i64, at: i64, mut dispatch: F) -> Result<(), CallError>
+pub(crate) async fn advance_expired<F>(db: &db::Db, world: &World, sde: &Arc<Sde>, char_id: i64, at: i64, mut dispatch: F) -> Result<(), CallError>
 where F: FnMut(Notification) -> Result<(), CallError> + Send {
     if char_id <= 0 { return Err(notify_error(messages::expert_systems::INVALID)); }
     let _market = crate::services::market::lock().await;
     let sde = Arc::clone(sde);
-    db.transaction(move |tx, outbox: &mut Outbox<OnlineChanged>| {
+    let fences = online::capture_online_fences(world, &[char_id]).await;
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = Arc::clone(&sde);
+        let fences = fences.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
             let at = at.max(filetime_now());
             let progress = super::completion::advance_tx(tx, outbox, &sde, char_id, at).await?;
-            super::completion::finish_tx(tx, outbox, &sde, char_id, at, &progress, &[]).await
+            super::completion::finish_tx(tx, outbox, &sde, &fences, char_id, at, &progress, &[]).await
         })
-    }, |value, outbox| async move { let result = online::dispatch_entries(value, outbox, &mut dispatch); crate::scheduler::wake(); result }).await
+    }, |value, outbox| async move { let result = online::dispatch_entries(value, outbox, world, &mut dispatch); crate::scheduler::wake(); result }).await
 }
 
-pub(crate) async fn current<F>(identity: &Identity, db: &db::Db, sde: &Arc<Sde>, dispatch: F) -> Result<Value, CallError>
+pub(crate) async fn current<F>(identity: &Identity, db: &db::Db, world: &World, sde: &Arc<Sde>, dispatch: F) -> Result<Value, CallError>
 where F: FnMut(Notification) -> Result<(), CallError> + Send {
-    advance_expired(db, sde, identity.char_id, filetime_now(), dispatch).await?;
+    advance_expired(db, world, sde, identity.char_id, filetime_now(), dispatch).await?;
     Ok(map(&dao::active(db, identity.char_id, filetime_now()).await.map_err(db_err)?))
 }
 
@@ -52,17 +55,21 @@ async fn mutate<F>(identity: &Identity, db: &db::Db, world: &World, sde: &Arc<Sd
 where F: FnMut(Notification) -> Result<(), CallError> + Send {
     if identity.char_id <= 0 { return Err(notify_error(messages::expert_systems::INVALID)); }
     let _market = crate::services::market::lock().await;
-    let reachability = if let Action::Consume(item_id) = action {
+    let captured = if let Action::Consume(item_id) = action {
         let item = crate::services::items::load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::expert_systems::ITEM_NOT_FOUND))?;
-        Some(Reachability::capture(identity, db, world, identity.system_id, &[Endpoint { location: item.location_id, flag: item.flag_id }]).await?)
+        let endpoint = Endpoint { location: item.location_id, flag: item.flag_id };
+        Some((Reachability::capture(identity, db, world, identity.system_id, &[endpoint]).await?,
+            inventory::notifications::Audience::capture(identity, db, world, identity.system_id, &[endpoint]).await?))
     } else { None };
     let identity_fields = (identity.char_id, identity.ship_id, identity.corp_id, identity.station_id, identity.system_id);
     let sde = Arc::clone(sde);
-    db.transaction(move |tx, outbox: &mut Outbox<OnlineChanged>| {
+    let fences = online::capture_online_fences(world, &[identity.char_id]).await;
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let (char_id, ship_id, corp_id, station_id, system_id) = identity_fields;
         let identity = Identity { char_id, ship_id, corp_id, station_id, system_id };
         let sde = Arc::clone(&sde);
-        let reachability = reachability.clone();
+        let captured = captured.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
             let now = filetime_now();
@@ -70,7 +77,10 @@ where F: FnMut(Notification) -> Result<(), CallError> + Send {
             let before = super::attributes::character_attributes_at(tx, &sde, char_id, now).await?;
             let rows = dao::lock_rows(tx, char_id).await.map_err(db_err)?;
             let type_id = match action {
-                Action::Consume(item_id) => inventory::expert_systems::validate_and_consume(tx, &identity, &sde, reachability.as_ref().expect("consume reachability"), item_id, outbox).await?.type_id,
+                Action::Consume(item_id) => {
+                    let (reachability, audience) = captured.as_ref().expect("consume capture");
+                    inventory::expert_systems::validate_and_consume(tx, &identity, &sde, reachability, audience, item_id, outbox).await?.type_id
+                },
                 Action::Install(type_id) | Action::Remove(type_id) => type_id,
             };
             let def = sde.expert_systems.get(type_id).ok_or_else(|| notify_error(messages::expert_systems::INVALID))?;
@@ -96,12 +106,12 @@ where F: FnMut(Notification) -> Result<(), CallError> + Send {
             progress.experts_changed = false;
             progress.brain_changed = true;
             let skills: Vec<_> = def.skills.iter().map(|(id, _)| *id).collect();
-            super::completion::finish_tx(tx, outbox, &sde, char_id, now, &progress, &skills).await?;
+            super::completion::finish_tx(tx, outbox, &sde, &fences, char_id, now, &progress, &skills).await?;
             let active = dao::active(tx, char_id, now).await.map_err(db_err)?;
             changed(outbox, char_id, &active, !matches!(action, Action::Remove(_)) && added, type_id);
             Ok(())
         })
-    }, |value, outbox| async move { let result = online::dispatch_entries(value, outbox, &mut dispatch); crate::scheduler::wake(); result }).await
+    }, |value, outbox| async move { let result = online::dispatch_entries(value, outbox, world, &mut dispatch); crate::scheduler::wake(); result }).await
 }
 
 pub(crate) async fn consume<F>(identity: &Identity, db: &db::Db, world: &World, sde: &Arc<Sde>, item_id: i64, dispatch: F) -> Result<(), CallError>

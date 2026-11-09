@@ -55,7 +55,7 @@ async fn session_categories_and_unbound_connections() {
             if id <= 0 { continue; }
             let mut facts = session.clone(); facts.system_id = Some(id);
             let names = authority::system_channels(&sde, &facts);
-            let expected = if (32_000_000..=32_999_999).contains(&id) || (34_000_000..=34_999_999).contains(&id) || (35_000_000..=35_000_100).contains(&id) || (36_000_000..=36_999_999).contains(&id) { "nolocal" } else if id == 30_100_000 || (crate::consts::WORMHOLE_SYSTEM_START..=31_999_999).contains(&id) { "wormhole" } else if s.faction_id == Some(500_026) { "triglavian" } else { "local" };
+            let expected = if (32_000_000..=32_999_999).contains(&id) || (34_000_000..=34_999_999).contains(&id) || (35_000_000..=35_000_100).contains(&id) || (36_000_000..=36_999_999).contains(&id) { "nolocal" } else if id == 30_100_000 || (infinity_core::consts::WORMHOLE_SYSTEM_START..=31_999_999).contains(&id) { "wormhole" } else if s.faction_id == Some(500_026) { "triglavian" } else { "local" };
             assert_eq!(names.first().unwrap(), &format!("{expected}_{id}"));
             if checked.insert(expected) {
                 assert!(authority::admit(&test_db, &sde, &facts, &names[0]).await.unwrap().is_some());
@@ -257,7 +257,7 @@ async fn corporation_and_alliance_motd_require_real_owning_authority() {
     let alliance: i64 = db.query_one("INSERT INTO game.alliances (name,short_name,executor_corp_id,creator_corp_id,creator_char_id,created) VALUES ('chat-motd-' || nextval('game.alliances_alliance_id_seq')::text, 'CM' || currval('game.alliances_alliance_id_seq')::text, $1,$1,$2,1) RETURNING alliance_id", &[&corp, &ceo.id]).await.unwrap().get("alliance_id");
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id = ANY($2)", &[&corp, &vec![ceo.id, director.id, ordinary.id]]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&other_corp, &foreign.id]).await.unwrap();
-    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&crate::consts::ROLE_DIRECTOR, &director.id]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&infinity_core::consts::ROLE_DIRECTOR, &director.id]).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap()); let world = World::new(test_db.clone(), sde.clone(), 1); let hub = Hub::new("chat.test", test_db.clone(), world.clone());

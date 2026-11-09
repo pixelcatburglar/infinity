@@ -17,6 +17,9 @@
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
 //! back in space when their system is loaded again. Startup moves legacy exploration and
 //! mission sites out of planets, along with exploration overlays and asteroids.
+//! A container is opened only by a durable first-claim update; ordinary site saves
+//! preserve previously claimed containers. Mining arrivals commit their asteroid
+//! field before saving the site; failed site saves release the transient reservation.
 //! Per-character signature completion persists in `game.exploration_scanned`; QA
 //! selected scans share this authorization. Probe and scan timing, recovery, site
 //! respawns and warp-exit callbacks are transient; pending work does not survive restart.
@@ -49,12 +52,13 @@ use sites::*;
 
 use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, value_ids, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_seconds, Client};
-use crate::consts::{dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_REQUIRED_SKILL_1, AU, FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use infinity_core::consts::{dogma::ATTR_EXPLOSION_DELAY, AU, FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
+use crate::lua::events::resources::{FactContext, FactOrigin, HackKind};
 use crate::services::fit::PERCENT_SCALE;
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, seconds_to_ms, Ball, World, MODE_RIGID, V3};
 use marshal::Value;
@@ -62,6 +66,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
+crate::progress::leaf_effect!(Vec<(Site, Site)>);
+
+pub(super) fn fact_context(c: &Client, origin: FactOrigin) -> FactContext {
+    FactContext {
+        corporation_id: None, alliance_id: None, faction_id: None,
+        ship_id: c.session.int("shipid").filter(|id| *id > 0), ship_type_id: None,
+        system_id: c.session.int("solarsystemid").filter(|id| *id > 0), station_id: c.session.int("stationid").filter(|id| *id > 0), origin,
+    }
+}
 
 const GROUP_COSMIC_SIGNATURE: i64 = 502;
 /// Design policy: legacy sites closer than this to a planet's surface are moved (m).
@@ -203,11 +216,11 @@ impl Site {
 
     /// Ore and ice anomalies and gas signatures hold a field to mine (services/mining);
     /// its rocks are kept in `containers`.
-    fn mining_field(&self) -> Option<super::mining::Field> {
+    fn mining_field(&self) -> Option<crate::space::asteroids::Field> {
         match self.archetype {
-            Some(ARCHETYPE_ORE) => Some(super::mining::Field::Ore),
-            Some(ARCHETYPE_ICE) => Some(super::mining::Field::Ice),
-            Some(ARCHETYPE_GAS) => Some(super::mining::Field::Gas),
+            Some(ARCHETYPE_ORE) => Some(crate::space::asteroids::Field::Ore),
+            Some(ARCHETYPE_ICE) => Some(crate::space::asteroids::Field::Ice),
+            Some(ARCHETYPE_GAS) => Some(crate::space::asteroids::Field::Gas),
             _ => None,
         }
     }
@@ -373,7 +386,7 @@ async fn is_scanned(db: &Db, char_id: i64, site_id: i64) -> Result<bool, CallErr
 /// dogmaIM.LaunchProbes(launcherID, count): probes leave the launcher's charge stack.
 pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     let module = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let wanted = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(1).clamp(1, MAX_PROBES as i64) as i32;
+    let wanted = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(1).clamp(1, MAX_PROBES as i64);
     let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
         return Ok(Value::None);
     };
@@ -387,7 +400,7 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     };
     let (type_id, have) = (loaded.type_id, loaded.quantity);
     let out = state().probes.values().filter(|p| p.char_id == char_id && p.system == system).count();
-    let take = wanted.min(have).min((MAX_PROBES - out.min(MAX_PROBES)) as i32);
+    let take = wanted.min(have).min((MAX_PROBES - out.min(MAX_PROBES)) as i64);
     if take <= 0 {
         return Ok(Value::None);
     }
@@ -399,13 +412,14 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     let pos = c.world.with(system, move |s| s.sample_position(ship)).await.flatten().unwrap_or([0.0; 3]);
     let expiry = now + (lifetime_ms * 10_000.0) as i64;
     enum Launch { Probes }
+    crate::progress::leaf_effect!(Launch);
     let user_id = c.login.user_id;
     let db = c.db.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox<Launch>| Box::pin(async move {
             let remaining = crate::dao::exploration::consume_probes(tx, ship, flag, type_id, have, take).await.map_err(db_err)?
                 .ok_or_else(|| super::notify_error(messages::INSUFFICIENT_PROBE_LAUNCHER_PROBES))?;
-            outbox.notify_client("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, remaining as i64, (remaining + take) as i64)]);
+            outbox.notify_client("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, remaining, remaining + take)]);
             outbox.operation(Launch::Probes);
             Ok::<(), CallError>(())
         }),
@@ -414,7 +428,6 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
-                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Launch::Probes) => for _ in 0..take {
                         let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
                         let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
@@ -493,7 +506,7 @@ pub(super) async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64, o
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
-        return super::ship::warp_destination(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, Some((site.pos, 3000.0)), site.pos, min_range, None, Value::Dict(vec![])).await;
+        return super::ship::warp_destination(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, crate::space::system::warp::WarpDestination::Ordinary { point: site.pos, object_radius: Some(3000.0), min_range }, None, Value::Dict(vec![])).await;
     }
     let db = c.db.clone();
     let world = Arc::downgrade(&c.world);
@@ -507,7 +520,7 @@ pub(super) async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64, o
             }
         });
     });
-    super::ship::warp_destination(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, None, site.pos, min_range, Some(on_exit), Value::Dict(vec![])).await
+    super::ship::warp_destination(&super::identity::Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, crate::space::system::warp::WarpDestination::Ordinary { point: site.pos, object_radius: None, min_range }, Some(on_exit), Value::Dict(vec![])).await
 }
 
 
@@ -538,25 +551,55 @@ pub(super) async fn set_container_state(world: &World, system: i64, container: i
     ball.slim = vec![("hackingSecurityState", Value::Int(security_state))];
     let _ = world.add_ship(system, ball).await;
 }
+/// Locked variant for callers that retain the market guard through publication.
+async fn set_container_state_locked(
+    world: &World,
+    system: i64,
+    container: i64,
+    security_state: i64,
+    market: &tokio::sync::MutexGuard<'static, ()>,
+) {
+    let Some(mut ball) = world.remove_ball(system, container).await else { return };
+    ball.slim = vec![("hackingSecurityState", Value::Int(security_state))];
+    let _ = world.add_ship_locked(system, ball, market).await;
+}
 
 /// A won hack: the container opens to its hacker, and once every container of the site
 /// is open the site winds down.
-pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64, char_id: i64) -> Result<(), CallError> {
+pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64, char_id: i64, context: FactContext) -> Result<(), CallError> {
     let _trading = super::market::lock().await;
-    let Some(mut site) = state().sites.values().find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).cloned() else {
+    let Some(site_id) = state().sites.values().find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).map(|s| s.id) else {
         return Ok(());
     };
-    if !site.hacked.contains(&container) {
-        site.hacked.push(container);
-    }
     enum Completion { Open(Site) }
+    crate::progress::leaf_effect!(Completion);
     db.transaction(
         move |tx, outbox: &mut Outbox<Completion>| {
-            let site = site.clone();
+            let mut context = context.clone();
             Box::pin(async move {
-                save_site(tx, &site).await?;
+                let Some(site) = crate::dao::exploration::claim_hacked_container(tx, site_id, container).await.map_err(db_err)? else {
+                    return Ok(());
+                };
+                let kind = match site.strength_attr {
+                    STRENGTH_RADAR => HackKind::Data,
+                    STRENGTH_MAGNETOMETRIC => HackKind::Relic,
+                    _ => return Err(CallError::Internal(anyhow::anyhow!("hack site has unknown classification"))),
+                };
+                let target = crate::dao::items::loading::load_items(tx, crate::dao::items::loading::ItemQuery::Id(container)).await.map_err(db_err)?
+                    .into_iter().next().ok_or_else(|| CallError::Internal(anyhow::anyhow!("hack target missing")))?;
+                let org = crate::dao::characters::members::organization(tx, char_id).await.map_err(db_err)?;
+                context.corporation_id = org.as_ref().map(|o| o.corporation_id);
+                context.alliance_id = org.and_then(|o| o.alliance_id);
+                context.system_id = Some(site.system);
+                if let Some(ship) = context.ship_id {
+                    context.ship_type_id = crate::dao::items::loading::load_items(tx, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.first().map(|item| item.type_id);
+                }
+                outbox.event(crate::lua::events::GameEvent::ContainerHacked {
+                    char_id, container_id: container, container_type: target.type_id, site_id,
+                    archetype: site.archetype, hack_kind: kind, occurred_at: filetime_now(), context,
+                });
                 crate::dao::exploration::set_container_owner(tx, container, char_id).await.map_err(db_err)?;
-                outbox.operation(Completion::Open(site));
+                outbox.operation(Completion::Open(site_from_row(site)));
                 Ok(())
             })
         },
@@ -564,11 +607,10 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(world, None)?,
-                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Completion::Open(site)) => {
                         let site_id = site.id;
                         state().sites.insert(site_id, site.clone());
-                        set_container_state(world, site.system, container, 2).await;
+                        set_container_state_locked(world, site.system, container, 2, &_trading).await;
                         if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
                             let (db, completion_world) = (db.clone(), world.clone());
                             world.schedule(site.system, seconds_to_ms(crate::config::game().npc.hacked_site_linger_secs as f64), move |s| {
@@ -612,7 +654,7 @@ pub(super) async fn gm_wormhole(c: &mut Client) -> Result<String, CallError> {
         }
     };
     let w = site.wormhole.clone().ok_or_else(|| gm_error(messages::GM_NOT_WORMHOLE))?;
-    complete_scans(&c.db, char_id, &[site.id]).await?;
+    complete_scans(&c.db, char_id, &[ResolvedSignature::from(&site)], &fact_context(c, FactOrigin::Gm)).await?;
     ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
     super::ship::teleport(c, site.system, [site.pos[0] + 6000.0, site.pos[1], site.pos[2]]).await?;
     Ok(messages::gm_wormhole_result(&site.target, w.type_id, site.system, w.dest_system, w.dest_class))
@@ -623,8 +665,8 @@ pub(super) async fn gm_scan_all(c: &mut Client) -> Result<String, CallError> {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Err(gm_error(messages::GM_UNDOCK_FIRST)) };
     ensure_loaded(&c.db, &c.world, system).await?;
     let sites = system_sites(system);
-    let ids: Vec<i64> = sites.iter().filter(|s| s.kind == Kind::Signature).map(|s| s.id).collect();
-    complete_scans(&c.db, char_id, &ids).await?;
+    let signatures: Vec<ResolvedSignature> = sites.iter().filter(|s| s.kind == Kind::Signature).map(ResolvedSignature::from).collect();
+    complete_scans(&c.db, char_id, &signatures, &fact_context(c, FactOrigin::Gm)).await?;
     let results: Vec<Value> = sites.iter().map(|s| result_value(s, 1.0, 0.0)).collect();
     state().reported.insert((char_id, system), sites.iter().map(|s| s.target.clone()).collect());
     c.notify("OnSystemScanStopped", vec![Value::list([]), Value::List(results), Value::list([])]);
@@ -660,4 +702,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(super) mod tests;

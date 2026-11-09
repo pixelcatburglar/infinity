@@ -2,7 +2,8 @@
 //! Exercises the clone transition and skill body-change adapter against game data;
 //! ship clones and death transitions are outside this test module.
 use super::*;
-use crate::{consts::{dogma::{ATTR_BOOSTERNESS, ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES}, FILETIME_MINUTE, FLAG_BOOSTER}, db::outbox::{Effect, Notification}};
+use infinity_core::{consts::{dogma::{ATTR_BOOSTERNESS, ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES}, FILETIME_MINUTE, FLAG_BOOSTER}};
+use crate::{db::outbox::{Effect, Notification}};
 use marshal::Value;
 
 fn notices(effects: &[Effect<CloneEffect>], event: &str) -> Vec<Vec<Value>> {
@@ -18,6 +19,7 @@ async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let scenario = crate::tests::catch_scenario(async {
     let (client, _peer) = client(db.clone(), f.character).await;
     let sde = client.sde.clone();
     let station = sde.map.stations().find(|station| {
@@ -55,12 +57,14 @@ async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
     db.execute("UPDATE game.items SET singleton=true,brain_slot=$2,jump_clone_id=$3 WHERE item_id=$1", &[&target_item, &ordinary.1, &target.clone_id]).await.unwrap();
     // Overrides must be attached before the item becomes dormant.
     db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&target_item, &ATTR_FOLLOWS_JUMP_CLONES, &0.0_f64]).await.unwrap();
+    let fences = online::capture_online_fences(&client.world, &[owner]).await;
     let _market = crate::services::market::lock().await;
     let (result, effects) = db.transaction(|tx, outbox: &mut Outbox<CloneEffect>| {
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             let id = Identity { char_id: owner, ship_id: Some(capsule), corp_id: 0, station_id: Some(station), system_id: None };
-            jump_tx(tx, outbox, &sde, &id, station, target.clone_id, policy::service_fee(), false, now).await
+            jump_tx(tx, outbox, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), false, now).await
         })
     }, |result, outbox| async move { Ok((result, outbox.into_entries())) }).await.unwrap();
     let rows = clones::clones(&db, owner).await.unwrap();
@@ -83,18 +87,22 @@ async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
     let return_clone = rows[0].clone_id;
     let effects = db.transaction(|tx, outbox: &mut Outbox<CloneEffect>| {
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             let id = Identity { char_id: owner, ship_id: Some(result.capsule), corp_id: 0, station_id: Some(station), system_id: None };
-            jump_tx(tx, outbox, &sde, &id, station, return_clone, policy::service_fee(), false, now).await
+            jump_tx(tx, outbox, &sde, &fences, &id, station, return_clone, policy::service_fee(), false, now).await
         })
     }, |_, outbox| async move { Ok(outbox.into_entries()) }).await.unwrap();
     for event in ["OnNonDiminishingInjectionsRemoved", "OnNonDiminishingInjectionsAdded", "OnServerBoostersChanged"] {
         assert!(notices(&effects, event).is_empty(), "unexpected {event}");
     }
     assert_eq!(brain::get(&db, owner, ids[3]).await.unwrap().unwrap().expires_at, Some(expiry));
+    }).await;
+    let owner = f.character;
     db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&owner]).await.unwrap();
     db.execute("DELETE FROM game.jump_clones WHERE owner_id=$1", &[&owner]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -103,6 +111,7 @@ async fn follower_slot_collision_refuses_and_rolls_back_all_property() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let scenario = crate::tests::catch_scenario(async {
     let (client, _peer) = client(db.clone(), f.character).await;
     let sde = client.sde.clone();
     let station = sde.map.stations().find(|station| {
@@ -122,12 +131,14 @@ async fn follower_slot_collision_refuses_and_rolls_back_all_property() {
     assert!(dogma::set_override(&db, follower, ATTR_FOLLOWS_JUMP_CLONES, 1.0).await.unwrap());
     let dormant: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,brain_slot,jump_clone_id) VALUES ($1,$2,$2,$3,1,true,$4,$5) RETURNING item_id", &[&implant.0, &owner, &FLAG_IMPLANT, &implant.1, &target.clone_id]).await.unwrap().get("item_id");
     db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&dormant, &ATTR_FOLLOWS_JUMP_CLONES, &0.0_f64]).await.unwrap();
+    let fences = online::capture_online_fences(&client.world, &[owner]).await;
     let _market = crate::services::market::lock().await;
     let result = db.transaction(|tx, outbox: &mut Outbox<CloneEffect>| {
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             let id = Identity { char_id: owner, ship_id: Some(capsule), corp_id: 0, station_id: Some(station), system_id: None };
-            jump_tx(tx, outbox, &sde, &id, station, target.clone_id, policy::service_fee(), false, filetime_now()).await
+            jump_tx(tx, outbox, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), false, filetime_now()).await
         })
     }, |_, _| async move { Ok(()) }).await;
     assert!(result.is_err());
@@ -144,7 +155,10 @@ async fn follower_slot_collision_refuses_and_rolls_back_all_property() {
     assert_eq!((state.ship_id, state.station_id), (Some(capsule), Some(station)));
     assert_eq!(db.query_one("SELECT balance::float8 AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get::<_, f64>("balance"), balance);
     assert_eq!(db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1 AND item_id=ANY($2)", &[&owner, &vec![capsule, follower, dormant]]).await.unwrap().get::<_, i64>("n"), 3);
+    }).await;
+    let owner = f.character;
     db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&owner]).await.unwrap();
     db.execute("DELETE FROM game.jump_clones WHERE owner_id=$1", &[&owner]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }

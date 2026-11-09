@@ -28,7 +28,7 @@ fn jam_clears_locks_and_overlaps_expire_independently() {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: true, interactive: true,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     });
     {
@@ -84,7 +84,7 @@ fn jamming_drone_or_controller_invalidates_its_lock_without_losing_control() {
             pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
             segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
             free: false, global: false, massive: true, interactive: true,
-            warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+            warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
             effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
         };
         s.insert(ball.clone());
@@ -96,9 +96,10 @@ fn jamming_drone_or_controller_invalidates_its_lock_without_losing_control() {
             max_target_range: 0.0, optimal_range: 1000.0, orbit_range: 500.0,
             duration_ms: 1000.0, effect_id: Some(1),
         };
-        s.restore_drone(victim, spec.clone(), Arc::new(|_| Box::pin(async {})));
-        let token = s.reserve_drone_launch(owner, ship, &[5.0], 1.0, 5.0).unwrap();
-        let _ack = s.complete_drone_launch(token, owner, ship, vec![(drone_ball, spec)], Arc::new(|_| Box::pin(async {})));
+        s.insert(victim.clone());
+        s.insert(drone_ball);
+        s.register_drone(target, spec.clone(), Arc::new(|_, _| Some(Box::pin(async {}))), None, None, false);
+        s.register_drone(drone, spec.clone(), Arc::new(|_, _| Some(Box::pin(async {}))), Some(ship), Some(owner), false);
         assert!(s.drone_order(drone, owner, ship, crate::space::drone::DroneOrder::Engage(target)));
         s.tick(1100);
         let before = s.drone(drone).unwrap();

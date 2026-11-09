@@ -5,8 +5,11 @@
 //! Daily Alpha injectors enforce clone grade and cooldown; full Alpha gameplay
 //! restrictions and planetary colonies are not modelled here. Dormant clone
 //! implants protect prerequisites.
+//! `OnItemChange` stack quantities are projected to the client display limit;
+//! consumed and stored quantities stay exact.
 use super::{db_err, CallError};
-use crate::{consts::{dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
+use infinity_core::{consts::{dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, messages};
+use crate::{dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{items::load_items, notify_error}};
 use marshal::Value;
 use std::sync::Arc;
 use crate::services::effects::online::{self, OnlineChanged};
@@ -40,7 +43,7 @@ struct Credit { item: i64, observed: Option<f64>, uses: i64 }
 
 /// Credits are drawn only from boosters active at the captured time.
 async fn credits(tx: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<Vec<Credit>, CallError> {
-    let boosters: Vec<_> = crate::dao::items::fit::brain_items(tx, char_id, at).await.map_err(db_err)?.into_iter().filter(|b| b.flag_id == crate::consts::FLAG_BOOSTER).collect();
+    let boosters: Vec<_> = crate::dao::items::fit::brain_items(tx, char_id, at).await.map_err(db_err)?.into_iter().filter(|b| b.flag_id == infinity_core::consts::FLAG_BOOSTER).collect();
     let ids: Vec<_> = boosters.iter().map(|b| b.item_id).collect();
     let overrides = crate::dao::items::dogma::overrides_for(tx, &ids).await.map_err(db_err)?;
     let mut result = Vec::new();
@@ -151,7 +154,7 @@ pub(super) async fn source(tx: &(impl Executor + ?Sized), sde: &Sde, char_id: i6
     Ok(item)
 }
 
-pub(super) async fn consume<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, item: Item, quantity: i32) -> Result<(), CallError> {
+pub(super) async fn consume<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, item: Item, quantity: i64) -> Result<(), CallError> {
     if quantity <= 0 || quantity > item.quantity { return Err(refusal()); }
     let remaining = item.quantity - quantity;
     let mut changes = BTreeMap::new();
@@ -164,7 +167,7 @@ pub(super) async fn consume<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbo
     } else {
         let old = item.quantity;
         let current = Item { quantity: remaining, ..item };
-        outbox.notify_client("OnItemChange", vec![current.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(i64::from(old)))]), Value::None]);
+        outbox.notify_client("OnItemChange", vec![current.row(), crate::services::inventory::notifications::item_change_dict([(IX_STACK_SIZE, Value::Int(old))]), Value::None]);
     }
     Ok(())
 }
@@ -195,16 +198,17 @@ pub(super) async fn quote(c: &crate::client::Client, char_id: i64, args: &[Value
 pub(super) async fn inject(c: &mut crate::client::Client, char_id: i64, args: &[Value], check: bool) -> Result<Value, CallError> {
     let id = args.first().and_then(Value::as_int).ok_or_else(refusal)?;
     let quantity = args.get(1).and_then(Value::as_int).ok_or_else(refusal)?;
-    let qty = i32::try_from(quantity).map_err(|_| refusal())?;
     let now = crate::client::filetime_now();
     let ship = c.session.int("shipid");
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
     db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
-            inject_tx(tx, outbox, &sde, char_id, ship, id, quantity, qty, now, check).await
+            inject_tx(tx, outbox, &sde, &fences, char_id, ship, id, quantity, now, check).await
         })
     }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
@@ -212,16 +216,17 @@ pub(super) async fn inject(c: &mut crate::client::Client, char_id: i64, args: &[
 pub(super) async fn convert(c: &mut crate::client::Client, char_id: i64, args: &[Value], split: bool) -> Result<Value, CallError> {
     let id = args.first().and_then(Value::as_int).ok_or_else(refusal)?;
     let quantity = args.get(1).and_then(Value::as_int).ok_or_else(refusal)?;
-    let qty = i32::try_from(quantity).map_err(|_| refusal())?;
     let ship = c.session.int("shipid");
     let now = crate::client::filetime_now();
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
     db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
-            convert_tx(tx, outbox, &sde, char_id, ship, id, quantity, qty, now, split).await
+            convert_tx(tx, outbox, &sde, &fences, char_id, ship, id, quantity, now, split).await
         })
     }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
@@ -248,16 +253,18 @@ pub(super) async fn extract(c: &mut crate::client::Client, char_id: i64, args: &
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
+    let fences = online::capture_online_fences(&c.world, &[char_id]).await;
     db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let selected = selected.clone();
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
-            extract_tx(tx, outbox, &sde, char_id, ship, id, now, &selected).await
+            extract_tx(tx, outbox, &sde, &fences, char_id, ship, id, now, &selected).await
         })
     }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
-async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, now: i64, selected: &BTreeMap<i32, i64>) -> Result<Value, CallError> {
+async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, ship: Option<i64>, id: i64, now: i64, selected: &BTreeMap<i32, i64>) -> Result<Value, CallError> {
             use crate::dao::skills::{history, queue, trading, training as skill_dao};
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
             if transfers::docked(tx, char_id).await.map_err(db_err)?.is_none() {
@@ -279,8 +286,8 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             for skill in &skills {
                 let removed = selected.get(&skill.type_id).copied().unwrap_or(0);
                 if removed > skill.skill_points || (removed > 0 && queued.iter().any(|q| q.type_id == skill.type_id)) { return Err(refusal()); }
-                if removed > 0 && !sde.types.get(skill.type_id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true)) { return Err(refusal()); }
-                if removed > 0 && skill.skill_points > super::formulas::sp_for_level(super::training::skill_type(&sde, skill.type_id).rank, i64::from(crate::consts::dogma::MAX_SKILL_LEVEL)) { return Err(refusal()); }
+                if removed > 0 && !sde.types.get(skill.type_id).is_some_and(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true)) { return Err(refusal()); }
+                if removed > 0 && skill.skill_points > super::formulas::sp_for_level(super::training::skill_type(&sde, skill.type_id).rank, i64::from(infinity_core::consts::dogma::MAX_SKILL_LEVEL)) { return Err(refusal()); }
                 let remaining = skill.skill_points - removed;
                 levels.insert(skill.type_id, super::formulas::level_from_points(remaining, super::training::skill_type(&sde, skill.type_id).rank));
             }
@@ -288,9 +295,9 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             // skillExtractorController.py:530-541: each tier protects its clone count.
             let clone_count = crate::dao::characters::clones::clones(tx, char_id).await.map_err(db_err)?.len();
             for (type_id, minimum) in [
-                (crate::consts::SKILL_INFOMORPH_PSYCHOLOGY, clone_count.min(5)),
-                (crate::consts::SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY, clone_count.saturating_sub(5)),
-                (crate::consts::SKILL_ELITE_INFOMORPH_PSYCHOLOGY, clone_count.saturating_sub(10)),
+                (infinity_core::consts::SKILL_INFOMORPH_PSYCHOLOGY, clone_count.min(5)),
+                (infinity_core::consts::SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY, clone_count.saturating_sub(5)),
+                (infinity_core::consts::SKILL_ELITE_INFOMORPH_PSYCHOLOGY, clone_count.saturating_sub(10)),
             ] {
                 if minimum != 0 && selected.contains_key(&type_id) && levels.get(&type_id).copied().unwrap_or(0) < minimum as i32 { return Err(refusal()); }
             }
@@ -324,25 +331,28 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
                     history::append(tx, char_id, skill.type_id, super::history::EXTRACTED, points, now).await.map_err(db_err)?;
                 }
             }
+            if selected.values().any(|removed| *removed > 0) {
+                outbox.event(crate::lua::events::GameEvent::SkillStateChanged { char_id });
+            }
             let output = transfers::insert(tx, FULL_INJECTOR, char_id, location, flag, 1).await.map_err(db_err)?;
             crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
             let changed: Vec<_> = selected.keys().copied().collect();
-            super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &changed).await?;
+            super::completion::finish_tx(tx, outbox, sde, fences, char_id, now, &progress, &changed).await?;
             Ok(Value::None)
 }
 
-async fn inject_tx(tx: &impl Executor, outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, check: bool) -> Result<Value, CallError> {
+async fn inject_tx(tx: &impl Executor, outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, now: i64, check: bool) -> Result<Value, CallError> {
             let initial_type = crate::dao::items::inventory::type_id(tx, id).await.map_err(db_err)?.ok_or_else(refusal)?;
             let alpha = initial_type == super::alpha_injections::TYPE_ID;
             let authority = if alpha {
                 if char_id <= 0 { return Err(refusal()); }
-                let user_id = crate::dao::store::purchases::recipient(tx, char_id).await.map_err(db_err)?.ok_or_else(refusal)?;
+                let user_id = crate::dao::characters::persistence::user_for_character(tx, char_id).await.map_err(db_err)?.ok_or_else(refusal)?;
                 Some(crate::dao::accounts::subscriptions::lock(tx, user_id).await.map_err(db_err)?)
             } else { None };
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
             let now = if alpha { crate::client::filetime_now() } else { now };
             let item = source(tx, sde, char_id, ship, id, false).await?;
-            if item.type_id != initial_type || qty <= 0 || qty > item.quantity { return Err(refusal()); }
+            if item.type_id != initial_type || quantity <= 0 || quantity > item.quantity { return Err(refusal()); }
             let deadline = if let Some(authority) = &authority {
                 let grade = crate::services::subscriptions::rules::effective_grade(authority, now);
                 Some(super::alpha_injections::check_tx(tx, char_id, grade, now).await?)
@@ -359,7 +369,7 @@ async fn inject_tx(tx: &impl Executor, outbox: &mut Outbox<OnlineChanged>, sde: 
             let accrued = super::training::in_training_sp(tx, char_id, now).await?;
             crate::dao::skills::training::write_skills(tx, char_id, &super::training::plan_skills(&[], accrued)).await.map_err(db_err)?;
             let new_balance = balance.checked_add(amount).ok_or_else(refusal)?;
-            consume(tx, outbox, item, qty).await?;
+            consume(tx, outbox, item, quantity).await?;
             if !crate::dao::characters::attributes::replace_free_points(tx, char_id, balance, new_balance).await.map_err(db_err)? { return Err(refusal()); }
             let total_used = used;
             for credit in &mut credits {
@@ -371,17 +381,17 @@ async fn inject_tx(tx: &impl Executor, outbox: &mut Outbox<OnlineChanged>, sde: 
             }
             if total_used > 0 { outbox.notify_pilot(char_id, "OnNonDiminishingInjectionsUsed", vec![Value::Int(total_used)]); }
             outbox.notify_client("OnFreeSkillPointsChanged", vec![Value::Int(new_balance)]);
-            super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
+            super::completion::finish_tx(tx, outbox, sde, fences, char_id, now, &progress, &[]).await?;
             Ok(Value::None)
 }
 
-async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, split: bool) -> Result<Value, CallError> {
+async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, now: i64, split: bool) -> Result<Value, CallError> {
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
             let progress = super::completion::advance_tx(tx, outbox, sde, char_id, now).await?;
             let accrued = super::training::in_training_sp(tx, char_id, now).await?;
             crate::dao::skills::training::write_skills(tx, char_id, &super::training::plan_skills(&[], accrued)).await.map_err(db_err)?;
             let item = source(tx, &sde, char_id, ship, id, false).await?;
-            if qty <= 0 || qty > item.quantity || item.type_id != if split { FULL_INJECTOR } else { SMALL_INJECTOR } { return Err(refusal()); }
+            if quantity <= 0 || quantity > item.quantity || item.type_id != if split { FULL_INJECTOR } else { SMALL_INJECTOR } { return Err(refusal()); }
             if !split && quantity < SMALL_DIVISOR {
                 return Err(CallError::User { msg: messages::MSG_COMBINE_SKILL_INJECTOR_TOO_FEW_INJECTORS.into(), dict: vec![("minQuantity".into(), Value::Int(SMALL_DIVISOR)), ("injectorType".into(), Value::Int(i64::from(SMALL_INJECTOR)))] });
             }
@@ -390,15 +400,14 @@ async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             } else {
                 (FULL_INJECTOR, quantity / SMALL_DIVISOR)
             };
-            let count = i32::try_from(count).map_err(|_| refusal())?;
             let location = item.location_id;
             let flag = item.flag_id;
             // skillsvc.py:1027-1030 permits nonmultiples; retain unused small injectors.
-            let consumed = if split { qty } else { count * SMALL_DIVISOR as i32 };
+            let consumed = if split { quantity } else { count * SMALL_DIVISOR };
             consume(tx, outbox, item, consumed).await?;
             let output = transfers::insert(tx, target, char_id, location, flag, count).await.map_err(db_err)?;
             crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
-            super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
+            super::completion::finish_tx(tx, outbox, sde, fences, char_id, now, &progress, &[]).await?;
             Ok(Value::None)
 }
 

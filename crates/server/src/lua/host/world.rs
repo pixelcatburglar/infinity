@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 use mlua::{Lua, Result, Table, Value};
-use crate::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP, GROUP_ASTEROID_BELT}, lua::value::sequence, sde::Sde, space::{Ball, System, World}};
+use infinity_core::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP, GROUP_ASTEROID_BELT}};
+use crate::{lua::value::sequence, sde::Sde, space::{Ball, System, World}};
 use super::Resources;
 
 fn positive(id: i64) -> Result<i64> {

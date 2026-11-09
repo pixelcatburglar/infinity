@@ -11,7 +11,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("fwWarzoneSolarsystem", "GetLocalOccupationState") => Value::tuple([c.session.get("solarsystemid2").clone(), Value::None]),
         ("fwWarzoneSolarsystem", "GetHQSystemIDs") => {
             let mut systems = Vec::new();
-            for faction_id in crate::consts::WARFARE_FACTIONS {
+            for faction_id in infinity_core::consts::WARFARE_FACTIONS {
                 let Some(system_id) = c.sde.factions.get(faction_id).and_then(|f| f.solar_system_id) else {
                     return Some(Err(CallError::Internal(anyhow::anyhow!("missing home system for warfare faction {faction_id}"))));
                 };

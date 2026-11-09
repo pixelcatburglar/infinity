@@ -1,11 +1,20 @@
 //! Real Lua-host mining cycle acceptance using the actor and committed mining facts.
 
 use std::{sync::{Arc, Mutex}, time::Duration};
-use crate::{consts::{dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITOR_NEED, ATTR_CAPACITY, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}, FLAG_CARGO}, dao::items::loading::ItemQuery, services::{combat, fit::{Fit, Key}, mining}};
+use infinity_core::{consts::{dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITOR_NEED, ATTR_CAPACITY, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION, ATTR_SIGNATURE_RADIUS, EFFECT_MINING_LASER}, FLAG_CARGO}};
+use crate::{dao::items::loading::ItemQuery, services::{combat, fit::{Fit, Key}, mining}};
 
 mod banks;
 #[path = "cycles/mining.rs"]
 mod mining_acceptance;
+
+async fn remove_fixture_rock(db: &crate::db::Db, world: &crate::space::World, system: i64, field: i64, rock: i64) -> anyhow::Result<()> {
+    let actor = world.asteroid_actor(system).ok_or_else(|| anyhow::anyhow!("fixture system stopped"))?;
+    anyhow::ensure!(actor.rock_field(rock).await == Some(field), "fixture rock belongs to another field or actor");
+    db.execute("DELETE FROM game.asteroids WHERE system_id=$1 AND field_id=$2 AND asteroid_id=$3", &[&system, &field, &rock]).await?;
+    anyhow::ensure!(crate::space::asteroids::publish_depletion(world, system, &actor, rock, field, None, None).await, "fixture rock removal was not applied");
+    Ok(())
+}
 
 #[derive(Default)]
 struct Keys {
@@ -76,7 +85,7 @@ pub(super) async fn run(ctx: &super::Context) {
             Some(center)
         }).await.flatten().unwrap();
         saved.lock().unwrap().field = Some(ship);
-        let rocks = mining::grow_field(&r.db, &r.world, system, ship, center, mining::Field::Ore, 1.0, false).await.unwrap();
+        let rocks = mining::grow_field(&r.db, &r.world, system, ship, center, crate::space::asteroids::Field::Ore, 1.0, false).await.unwrap();
         let (rock, ship_radius) = r.world.with(system, move |s| {
             let rock = rocks.into_iter().map(|id| {
                 let b = s.ball(id).unwrap();
@@ -115,6 +124,9 @@ pub(super) async fn run(ctx: &super::Context) {
         idle(&r.world, system, module, duration * 2 + 15_000).await;
         assert_eq!(crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap().len(), 1);
         crate::dao::items::dogma::clear_override(&r.db, ship, ATTR_CAPACITOR_CAPACITY).await.unwrap();
+        let (generation, revision, projection) = r.world.with(system, move |s| (s.combat_membership_generation(ship).unwrap(), s.combat_fit_revision(ship).unwrap(), s.projection_revision(ship))).await.unwrap();
+        let refreshed = Fit::load_in_space(&r.db, &r.world, system, id, ship).await.unwrap();
+        assert!(r.world.with(system, move |s| s.replace_fitted_cache(ship, generation, revision, refreshed, Key::Ship, Some(projection))).await.unwrap());
         combat::groups_health::inject(&r.db, &r.world, system, ship, f64::MAX).await.unwrap();
         lua.load("pilots.activate(cycle_id,cycle_module,cycle_rock,nil)").exec_async().await.unwrap();
         idle(&r.world, system, module, duration + 15_000).await;
@@ -130,14 +142,14 @@ pub(super) async fn run(ctx: &super::Context) {
         assert_eq!(initial - remaining, mined + waste);
         assert_eq!(cargo, mined);
         let volume = r.sde.types.get(rock.3).unwrap().volume.unwrap_or(1.0).max(0.01);
-        let fill = (fit.value(Key::Ship, ATTR_CAPACITY) / volume).ceil() as i32 + 1;
+        let fill = (fit.value(Key::Ship, ATTR_CAPACITY) / volume).ceil() as i64 + 1;
         let stack: i64 = r.db.query_one("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3 AND flag_id=$4", &[&id, &ship, &rock.3, &FLAG_CARGO]).await.unwrap().get("item_id");
         r.db.execute("UPDATE game.items SET quantity=$2 WHERE item_id=$1", &[&stack, &fill]).await.unwrap();
         lua.load("pilots.activate(cycle_id,cycle_module,cycle_rock,nil)").exec_async().await.unwrap();
         idle(&r.world, system, module, duration + 15_000).await;
         assert_eq!(crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap().len(), 4);
         assert_eq!(r.db.query_one("SELECT quantity FROM game.asteroids WHERE asteroid_id=$1", &[&rock.0]).await.unwrap().get::<_, i64>("quantity"), remaining);
-        r.db.execute("UPDATE game.items SET quantity=$2 WHERE item_id=$1", &[&stack, &(mined as i32)]).await.unwrap();
+        r.db.execute("UPDATE game.items SET quantity=$2 WHERE item_id=$1", &[&stack, &mined]).await.unwrap();
         assert!(duration > 5_000, "fixture needs time for actor movement during a real cycle");
         lua.load("pilots.activate(cycle_id,cycle_module,cycle_rock,nil)").exec_async().await.unwrap();
         let far = [rock.1[0] + f64::from(rock.2) + ship_radius + fit.value(Key::Module(module), ATTR_MAX_RANGE) + 1_000.0, rock.1[1], rock.1[2]];
@@ -155,9 +167,15 @@ pub(super) async fn run(ctx: &super::Context) {
             }
         }).await.expect("return relocation");
         lua.load("pilots.activate(cycle_id,cycle_module,cycle_rock,nil)").exec_async().await.unwrap();
-        let ship_ball = r.world.remove_ball(system, ship).await.unwrap();
+        let row = crate::dao::items::space_ships::FreeShip { item_id: ship, type_id: hull.type_id, owner_id: id, corporation_id: 1, alliance_id: -1, pos: position };
+        let mut prepared = crate::services::ship::balls::piloted(&r.db, r.sde.clone(), &row, id, 0.0).await.unwrap();
+        let (ship_ball, snapshot) = r.world.with(system, move |s| {
+            let snapshot = s.combat_condition_snapshot(ship).unwrap();
+            (s.remove_ball(ship).unwrap(), snapshot)
+        }).await.unwrap();
         idle(&r.world, system, module, duration + 15_000).await;
-        r.world.add_ship(system, ship_ball).await.unwrap();
+        prepared.ball = ship_ball;
+        assert!(r.world.with(system, move |s| prepared.install_transfer(s, |s, ball| s.add_ship(ball), snapshot)).await.unwrap());
         lua.load("pilots.activate(cycle_id,cycle_module,cycle_rock,2); pilots.deactivate(cycle_id,cycle_module)").exec_async().await.unwrap();
         let ball = r.world.remove_ball(system, rock.0).await.unwrap();
         idle(&r.world, system, module, duration + 15_000).await;
@@ -188,12 +206,13 @@ pub(super) async fn run(ctx: &super::Context) {
     if let Some(id) = character {
         ctx.lua.globals().set("cycle_cleanup_id", id).unwrap();
         let _ = ctx.lua.load("pilots.offline(cycle_cleanup_id)").exec_async().await;
+        ctx.resources.db.transaction(|tx, _: &mut ()| {
+            Box::pin(async move { crate::services::tests::fixture::cleanup_progress(tx, &[id], &[id]).await })
+        }, |(), ()| async move { Ok(()) }).await.unwrap();
         if let Some(field) = field {
-            let rows = ctx.resources.db.query("SELECT asteroid_id FROM game.asteroids WHERE field_id=$1", &[&field]).await.unwrap();
+            let rows = ctx.resources.db.query("SELECT asteroid_id, system_id FROM game.asteroids WHERE field_id=$1", &[&field]).await.unwrap();
             for row in rows {
-                let rock: i64 = row.get("asteroid_id");
-                mining::reconcile_depleted(&ctx.resources.db, &ctx.resources.world, rock).await.unwrap();
-                ctx.resources.db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND field_id=$2", &[&rock, &field]).await.unwrap();
+                remove_fixture_rock(&ctx.resources.db, &ctx.resources.world, row.get("system_id"), field, row.get("asteroid_id")).await.unwrap();
             }
             ctx.resources.db.execute("DELETE FROM game.asteroid_fields WHERE field_id=$1", &[&field]).await.unwrap();
         }

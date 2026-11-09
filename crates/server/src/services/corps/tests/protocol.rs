@@ -1,5 +1,6 @@
 //! Client-facing corporation governance RPC and wire-shape regressions.
-use crate::{client::Client, consts::ACCOUNT_CASH, dao::corporations::shares as ledger, db::Db, services::{Call, CallError, CallResult, tests::{self, fixture}}};
+use infinity_core::consts::ACCOUNT_CASH;
+use crate::{client::Client, dao::corporations::shares as ledger, db::Db, services::{Call, CallError, CallResult, tests::{self, fixture}}};
 use marshal::{DbRowDescriptor, Value};
 
 async fn rpc(client: &mut Client, service: &str, method: &str, args: &[Value], corp: Option<i64>) -> CallResult {
@@ -47,7 +48,7 @@ async fn real_client_governance_dispatch_and_wire_shapes() {
     let holder = fixture::create(&db).await.unwrap();
     let outsider = fixture::create(&db).await.unwrap();
     let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('governance-wire-' || nextval('game.corporations_corporation_id_seq')::text,'GW' || currval('game.corporations_corporation_id_seq')::text,$1,$1,1,1) RETURNING corporation_id", &[&ceo.character]).await.unwrap().get("corporation_id");
-    db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&corp, &ceo.character]).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$3 WHERE character_id=$2", &[&corp, &ceo.character, &infinity_core::consts::ROLE_DIRECTOR]).await.unwrap();
     assert!(ledger::initialize(&db, corp, 100).await.unwrap());
     db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,100),($1,$3,500)", &[&corp, &ACCOUNT_CASH, &(ACCOUNT_CASH + 1)]).await.unwrap();
     let test_db = db.clone();
@@ -89,12 +90,12 @@ async fn real_client_governance_dispatch_and_wire_shapes() {
             assert!(matches!(rpc(&mut client, "corpRegistry", "PayoutDividend", &args, Some(corp)).await, Err(CallError::User { .. })));
             assert_eq!(fingerprint(&test_db, corp, holder.character).await, before);
         }
-        let holder_before: f64 = test_db.query_one("SELECT balance::float8 AS balance FROM game.characters WHERE character_id=$1", &[&holder.character]).await.unwrap().get("balance");
+        let holder_before = crate::dao::wallets::characters::balance(&test_db, holder.character).await.unwrap();
         rpc(&mut client, "corpRegistry", "PayoutDividend", &[Value::Int(1), Value::Float(100.0)], Some(corp)).await.unwrap();
-        let row = test_db.query_one("SELECT (SELECT balance::float8 FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$3) AS master, (SELECT balance::float8 FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$4) AS division, (SELECT balance::float8 FROM game.characters WHERE character_id=$2) AS holder, (SELECT count(*) FROM game.corp_dividends WHERE corporation_id=$1 AND division=$3) AS receipts", &[&corp, &holder.character, &ACCOUNT_CASH, &(ACCOUNT_CASH + 1)]).await.unwrap();
-        assert_eq!(row.get::<_, f64>("master"), 0.0);
-        assert_eq!(row.get::<_, f64>("division"), 500.0);
-        assert_eq!(row.get::<_, f64>("holder"), holder_before + 60.0);
+        let row = test_db.query_one("SELECT (SELECT balance::text FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$3) AS master, (SELECT balance::text FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$4) AS division, (SELECT balance::text FROM game.characters WHERE character_id=$2) AS holder, (SELECT count(*) FROM game.corp_dividends WHERE corporation_id=$1 AND division=$3) AS receipts", &[&corp, &holder.character, &ACCOUNT_CASH, &(ACCOUNT_CASH + 1)]).await.unwrap();
+        assert_eq!(crate::isk::IskAmount::parse_decimal(&row.get::<_, String>("master")).unwrap(), crate::isk::IskAmount::ZERO);
+        assert_eq!(crate::isk::IskAmount::parse_decimal(&row.get::<_, String>("division")).unwrap(), crate::isk::IskAmount::from_cents(50_000).unwrap());
+        assert_eq!(crate::isk::IskAmount::parse_decimal(&row.get::<_, String>("holder")).unwrap(), crate::isk::IskAmount::from_cents(crate::services::tests::fixture::isk_cents(holder_before) + 6_000).unwrap());
         assert_eq!(row.get::<_, i64>("receipts"), 1);
         let before = fingerprint(&test_db, corp, holder.character).await;
         assert!(matches!(rpc(&mut client, "corpRegistry", "PayoutDividend", &[Value::Int(1), Value::Float(10.0)], Some(corp)).await, Err(CallError::User { .. })));

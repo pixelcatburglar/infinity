@@ -6,9 +6,14 @@
 //! Auction candidates are rechecked in their settlement transaction.
 //! GM expiry advances outstanding deadlines and settles bid auctions in the same transaction.
 //! Escrow volume uses client packaged-item rules and the selected logical quantities.
+//! Escrow creation refuses roots containing descendants owned by someone else.
+//! `OnItemChange` stack quantities are projected to the client display limit; the
+//! moved and stored quantities stay exact.
 
 use super::*;
 use crate::dao::contracts::lifecycle as contract_dao;
+use crate::isk::IskAmount;
+use crate::services::wallets::ownership as wallet_ownership;
 
 /// `CreateContract(ContractStruct, confirm)` -> [contractID]: one contract, or one per item
 /// for a multi-contract (fitted ships).
@@ -24,7 +29,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     let wallet_key = if for_corp {
         i32::try_from(c.session.int("corpAccountKey").unwrap_or(0)).map_err(|_| notify_error(messages::DEPARTMENT_WALLET_WITHDRAW_UNAUTHORIZED))?
     } else { ACCOUNT_CASH };
-    let owner = ownership::actor_owner(me, corp, for_corp, wallet_key);
+    let owner = wallet_ownership::actor_owner(me, corp, for_corp, wallet_key);
     let source_flag = i32::try_from(int("startStationDivision")).unwrap_or(0);
     let kind = int("contractType") as i32;
     if ![TYPE_ITEM_EXCHANGE, TYPE_AUCTION, TYPE_COURIER].contains(&kind) {
@@ -56,11 +61,11 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         .and_then(|v| v.items())
         .unwrap_or(&[])
         .iter()
-        .filter_map(|e| match e.items()? {
-            [id, qty, ..] => Some((id.as_int()?, qty.as_int().unwrap_or(1))),
+        .map(|e| match e.items() {
+            Some([id, qty, ..]) => id.as_int().zip(qty.as_int()).filter(|(_, qty)| *qty > 0),
             _ => None,
-        })
-        .collect();
+        }.ok_or_else(|| notify_error(messages::CONTRACT_ITEM_QUANTITY_INSUFFICIENT)))
+        .collect::<Result<_, _>>()?;
     let mut requested = Vec::new();
     if kind == TYPE_ITEM_EXCHANGE {
         if let Some(value) = field(info, "requestItemTypeList") {
@@ -72,7 +77,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
                 };
                 let type_id = type_id.and_then(|v| i32::try_from(v).ok()).filter(|v| *v > 0)
                     .ok_or_else(|| notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING))?;
-                let qty = qty.and_then(|v| i32::try_from(v).ok()).filter(|v| *v > 0)
+                let qty = qty.filter(|v| *v > 0)
                     .ok_or_else(|| notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING))?;
                 if sde.types.get(type_id).is_none() || requested.iter().any(|(t, _)| *t == type_id) {
                     return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
@@ -122,6 +127,17 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         return Err(notify_error(&messages::contract_limit(open, cap)));
     }
     // Validate the captured source before any escrow mutation.
+    let roots: Vec<_> = groups.iter().flatten().map(|(id, _)| *id).collect();
+    let preparation = custody::prepare(db, &sde, &roots, &[]).await?;
+    let checked_source = custody::issuer_source(db, me, corp, for_corp, start_id, source_flag).await?;
+    if checked_source.owner != source.owner || checked_source.location != source.location || checked_source.flag != source.flag {
+        return Err(notify_error(messages::CONTRACT_ITEM_MUST_BE_IN_START_HANGAR));
+    }
+    let tree = &preparation.closure;
+    let tree_items = load_items(db, &sde, ItemQuery::Ids(tree)).await.map_err(db_err)?;
+    if tree_items.len() != tree.len() || tree_items.iter().any(|item| item.owner_id != source.owner) {
+        return Err(notify_error(messages::CONTRACT_ITEM_MUST_BE_IN_START_HANGAR));
+    }
     let mut loaded = HashMap::new();
     for (id, qty) in groups.iter().flatten() {
         let item = load_items(db, &sde, ItemQuery::Id(*id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
@@ -131,25 +147,25 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         if item.type_id == TYPE_PLASTIC_WRAP && kind != TYPE_COURIER {
             return Err(notify_error(messages::COURIER_PACKAGE_NOT_TRADEABLE));
         }
-        if *qty < 1 || (!item.singleton && *qty > item.quantity as i64) {
+        if *qty < 1 || (!item.singleton && *qty > item.quantity) {
             return Err(notify_error(messages::CONTRACT_ITEM_QUANTITY_INSUFFICIENT));
         }
         if loaded.insert(*id, item).is_some() {
             return Err(notify_error(messages::CONTRACT_ITEM_QUANTITY_INSUFFICIENT));
         }
     }
-    let roots: Vec<_> = loaded.keys().copied().collect();
-    let tree = crate::dao::trades::descendants(db, &roots).await.map_err(db_err)?;
-    if crate::dao::industry::has_active_blueprint_job(db, &tree).await.map_err(db_err)? {
+    // The fresh locked closure is also used for the active blueprint check.
+    if crate::dao::industry::has_active_blueprint_job(db, tree).await.map_err(db_err)? {
         return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
     }
     let escrow_isk = if kind == TYPE_AUCTION { 0.0 } else { reward };
-    let skill = |id| skills.level(id).clamp(0, crate::consts::dogma::MAX_SKILL_LEVEL);
-    let fees = super::fees::calculate(kind, assignee != 0, price, reward, minutes, skill(crate::consts::SKILL_ACCOUNTING), skill(crate::consts::SKILL_BROKER_RELATIONS));
+    let skill = |id| skills.level(id).clamp(0, infinity_core::consts::dogma::MAX_SKILL_LEVEL);
+    let fees = super::fees::calculate(kind, assignee != 0, price, reward, minutes, skill(infinity_core::consts::SKILL_ACCOUNTING), skill(infinity_core::consts::SKILL_BROKER_RELATIONS));
     let creation_fee = fees.brokers_fee + fees.deposit + if kind == TYPE_ITEM_EXCHANGE { fees.sales_tax } else { 0.0 };
+    let charge = IskAmount::from_isk(escrow_isk + creation_fee)?;
     let mut created = vec![];
     for group in groups {
-        ownership::debit(db, outbox, owner, escrow_isk + creation_fee).await?;
+        wallet_ownership::debit(db, outbox, owner, charge).await?;
         let id = contract_dao::insert(db, &contract_dao::NewContract {
             kind, issuer: me, issuer_corp: corp, assignee, start: start_id, end: end_id,
             price, reward, collateral, title, description, num_days,
@@ -161,14 +177,14 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         }).await.map_err(db_err)?;
         for (item_id, qty) in group {
             if let Some(item) = loaded.remove(item_id) {
-                let quantity = if item.singleton { 1 } else { i32::try_from(*qty).map_err(|_| notify_error(messages::CONTRACT_ITEM_QUANTITY_INSUFFICIENT))? };
+                let quantity = if item.singleton { 1 } else { *qty };
                 let root = if !item.singleton && quantity < item.quantity {
                     let root = super::super::inventory::stacks::split_stack(db, &item, quantity, source.owner, source.location, source.flag, false).await?;
                     let remaining = Item { quantity: item.quantity - quantity, ..item.clone() };
                     if for_corp {
                         super::super::inventory::notifications::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
                     } else {
-                        outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(i64::from(item.quantity)))]), Value::None]);
+                        outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), super::super::inventory::notifications::item_change_dict([(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]), Value::None]);
                     }
                     root
                 } else {
@@ -177,7 +193,8 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
                     }
                     item.item_id
                 };
-                custody::hand_over(db, &sde, outbox, &[root], custody::Custody { owner: source.owner, location: -id, flag: FLAG_HANGAR }, source.location).await?;
+                let created = if root != item.item_id { std::slice::from_ref(&root) } else { &[] };
+                custody::hand_over(db, &sde, outbox, &[root], custody::Custody { owner: source.owner, location: -id, flag: FLAG_HANGAR }, source.location, &preparation, created).await?;
                 shared::insert_item(db, id, root, item.type_id, quantity).await.map_err(db_err)?;
             }
         }
@@ -233,7 +250,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let wallet_key = if for_corp { i32::try_from(c.session.int("corpAccountKey").unwrap_or(0)).map_err(|_| notify_error(messages::DEPARTMENT_WALLET_WITHDRAW_UNAUTHORIZED))? } else { ACCOUNT_CASH };
-    let owner = ownership::actor_owner(me, corp, for_corp, wallet_key);
+    let owner = wallet_ownership::actor_owner(me, corp, for_corp, wallet_key);
     let _trading = lock().await;
     let now = filetime_now();
     let sde = Arc::clone(&c.sde);
@@ -257,7 +274,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     // The requested items must all be in the acceptor's hangar at the start station.
                     let wanted = contract_dao::requested_items(db, id).await.map_err(db_err)?;
                     let source = if for_corp && !wanted.is_empty() {
-                        custody::issuer_source(db, me, corp, true, k.start, crate::consts::FLAG_CORP_DELIVERIES).await?
+                        custody::issuer_source(db, me, corp, true, k.start, infinity_core::consts::FLAG_CORP_DELIVERIES).await?
                     } else { custody::receiving(owner.id, k.start) };
                     let mut takes = vec![];
                     let mut types = std::collections::HashSet::new();
@@ -267,8 +284,8 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                             return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
                         }
                         let stacks = load_items(db, &sde, ItemQuery::OwnerLocationFlagTypeDescending(source.owner, source.location, source.flag, type_id)).await.map_err(db_err)?;
-                        let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { i64::from(s.quantity.max(0)) }).sum();
-                        if have < i64::from(qty) {
+                        let have: i128 = stacks.iter().map(|s| if s.singleton { 1 } else { i128::from(s.quantity.max(0)) }).sum();
+                        if have < i128::from(qty) {
                             return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
                         }
                         let mut left = qty;
@@ -282,6 +299,21 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     }
                     takes.sort_unstable_by_key(|(item, _)| item.item_id);
                     let ids: Vec<_> = takes.iter().map(|(item, _)| item.item_id).collect();
+                    let escrow = escrowed_ids(db, id).await?;
+                    let mut transfer_roots = ids.clone();
+                    transfer_roots.extend_from_slice(&escrow);
+                    let preparation = custody::prepare(db, &sde, &transfer_roots, &[]).await?;
+                    if for_corp && !wanted.is_empty() {
+                        let checked = custody::issuer_source(db, me, corp, true, k.start, infinity_core::consts::FLAG_CORP_DELIVERIES).await?;
+                        if checked.owner != source.owner || checked.location != source.location || checked.flag != source.flag {
+                            return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
+                        }
+                    }
+                    if takes.iter().any(|(item, _)| !preparation.locks.row(item.item_id).is_some_and(|row|
+                        row.type_id == item.type_id && row.owner_id == item.owner_id && row.location_id == item.location_id
+                        && row.flag_id == item.flag_id && row.quantity == item.quantity && row.singleton == item.singleton && row.jump_clone_id.is_none())) {
+                        return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
+                    }
                     let tree = crate::dao::trades::descendants(db, &ids).await.map_err(db_err)?;
                     if !crate::dao::trades::reserved(db, &tree).await.map_err(db_err)?.is_empty() {
                         return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
@@ -289,16 +321,19 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     if crate::dao::industry::has_active_blueprint_job(db, &tree).await.map_err(db_err)? {
                         return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
                     }
-                    ownership::debit(db, outbox, owner, k.price).await?;
+                    let price = IskAmount::from_isk(k.price)?;
+                    wallet_ownership::debit(db, outbox, owner, price).await?;
                     let mut roots = Vec::new();
+                    let mut created = Vec::new();
                     for (item, quantity) in takes {
                         let item_id = if !item.singleton && quantity < item.quantity {
                             let id = super::super::inventory::stacks::split_stack(db, &item, quantity, source.owner, source.location, source.flag, false).await?;
+                            created.push(id);
                             let remaining = Item { quantity: item.quantity - quantity, ..item.clone() };
                             if for_corp {
                                 super::super::inventory::notifications::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
                             } else {
-                                outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(i64::from(item.quantity)))]), Value::None]);
+                                outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), super::super::inventory::notifications::item_change_dict([(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]), Value::None]);
                             }
                             id
                         } else {
@@ -309,15 +344,14 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                         };
                         roots.push(item_id);
                     }
-                    custody::hand_over(db, &sde, outbox, &roots, custody::receiving(k.issuer_owner().id, k.start), source.location).await?;
-                    ownership::credit(db, outbox, k.issuer_owner(), k.price).await?;
-                    ownership::credit(db, outbox, owner, k.reward).await?;
-                    let escrow = escrowed_ids(db, id).await?;
-                    custody::hand_over(db, &sde, outbox, &escrow, custody::receiving(owner.id, k.start), -id).await?;
+                    custody::hand_over(db, &sde, outbox, &roots, custody::receiving(k.issuer_owner().id, k.start), source.location, &preparation, &created).await?;
+                    wallet_ownership::credit(db, outbox, k.issuer_owner(), price).await?;
+                    wallet_ownership::credit(db, outbox, owner, IskAmount::from_isk(k.reward)?).await?;
+                    custody::hand_over(db, &sde, outbox, &escrow, custody::receiving(owner.id, k.start), -id, &preparation, &[]).await?;
                     if !contract_dao::accept_exchange(db, id, STATUS_OUTSTANDING, owner.id, wallet_key, now, STATUS_FINISHED, now).await.map_err(db_err)? {
                         return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
                     }
-                    ownership::credit(db, outbox, k.issuer_owner(), k.paid_deposit).await?;
+                    wallet_ownership::credit(db, outbox, k.issuer_owner(), IskAmount::from_isk(k.paid_deposit)?).await?;
                     k.paid_deposit = 0.0;
                     k.acceptor = owner.id;
                     k.acceptor_wallet_key = wallet_key;
@@ -327,9 +361,9 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     ownership::tell(db, outbox, k.issuer_owner().id, "OnContractCompleted", id).await?;
                 }
                 TYPE_COURIER => {
-                    ownership::debit(db, outbox, owner, k.collateral).await?;
+                    wallet_ownership::debit(db, outbox, owner, IskAmount::from_isk(k.collateral)?).await?;
                     let dest = custody::receiving(owner.id, k.start);
-                    let quantity = crate::services::item_volume::encode_wrap_quantity(k.volume)?;
+                    let quantity = i64::from(crate::services::item_volume::encode_wrap_quantity(k.volume)?);
                     let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, owner.id, dest.location, dest.flag, quantity, &messages::contract_package_name(id)).await.map_err(db_err)?;
                     let item = load_items(db, &sde, ItemQuery::Id(wrap)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
                     if for_corp {
@@ -342,7 +376,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                     if !contract_dao::accept_courier(db, id, STATUS_OUTSTANDING, owner.id, wallet_key, now, STATUS_IN_PROGRESS, wrap).await.map_err(db_err)? {
                         return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
                     }
-                    ownership::credit(db, outbox, k.issuer_owner(), k.paid_deposit).await?;
+                    wallet_ownership::credit(db, outbox, k.issuer_owner(), IskAmount::from_isk(k.paid_deposit)?).await?;
                     k.paid_deposit = 0.0;
                     k.acceptor = owner.id;
                     k.acceptor_wallet_key = wallet_key;
@@ -392,10 +426,16 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                     let Some(wrap) = wrap.filter(|w| w.location_id == k.end && (w.owner_id == me || (w.owner_id == k.acceptor && k.acceptor == corp && super::super::corps::is_player_corp(corp)))) else {
                         return Err(notify_error(messages::COURIER_PACKAGE_MUST_BE_AT_DESTINATION));
                     };
-                    custody::remove_package(db, outbox, &wrap).await?;
                     let roots = escrowed_ids(db, id).await?;
-                    custody::hand_over(db, sde, outbox, &roots, custody::receiving(k.issuer_owner().id, k.end), -id).await?;
-                    ownership::credit(db, outbox, k.acceptor_owner(), round2(k.reward + k.collateral)).await?;
+                    let preparation = custody::prepare(db, sde, &roots, &[wrap.item_id]).await?;
+                    if !preparation.locks.row(wrap.item_id).is_some_and(|row| row.type_id == wrap.type_id
+                        && row.owner_id == wrap.owner_id && row.location_id == wrap.location_id && row.flag_id == wrap.flag_id
+                        && row.quantity == wrap.quantity && row.singleton == wrap.singleton && row.jump_clone_id.is_none()) {
+                        return Err(notify_error(messages::COURIER_PACKAGE_MUST_BE_AT_DESTINATION));
+                    }
+                    custody::remove_package(db, outbox, &wrap).await?;
+                    custody::hand_over(db, sde, outbox, &roots, custody::receiving(k.issuer_owner().id, k.end), -id, &preparation, &[]).await?;
+                    wallet_ownership::credit(db, outbox, k.acceptor_owner(), IskAmount::from_isk(round2(k.reward + k.collateral))?).await?;
                     set_status(db, &mut k, STATUS_FINISHED, now).await?;
                     ownership::tell(db, outbox, k.issuer_owner().id, "OnContractCompleted", id).await?;
                 }
@@ -407,7 +447,7 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                     }
                     if acceptor_action && k.acceptor == corp { ownership::authorize_corporate_action(db, me, corp, k.acceptor_wallet_key).await?; }
                     else if issuer_action && k.for_corp { ownership::authorize_corporate_action(db, me, corp, k.issuer_wallet_key).await?; }
-                    ownership::credit(db, outbox, k.issuer_owner(), round2(k.collateral + k.reward)).await?;
+                    wallet_ownership::credit(db, outbox, k.issuer_owner(), IskAmount::from_isk(round2(k.collateral + k.reward))?).await?;
                     let wrap = match k.package {
                         Some(w) => load_items(db, sde, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
                         None => None,
@@ -415,11 +455,17 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                     match wrap {
                         Some(w) => {
                             let destination = custody::Custody { owner: w.owner_id, location: w.location_id, flag: w.flag_id };
-                            custody::remove_package(db, outbox, &w).await?;
                             let roots = escrowed_ids(db, id).await?;
-                            custody::hand_over(db, sde, outbox, &roots, destination, -id).await?;
+                            let preparation = custody::prepare(db, sde, &roots, &[w.item_id]).await?;
+                            if !preparation.locks.row(w.item_id).is_some_and(|row| row.type_id == w.type_id
+                                && row.owner_id == w.owner_id && row.location_id == w.location_id && row.flag_id == w.flag_id
+                                && row.quantity == w.quantity && row.singleton == w.singleton && row.jump_clone_id.is_none()) {
+                                return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
+                            }
+                            custody::remove_package(db, outbox, &w).await?;
+                            custody::hand_over(db, sde, outbox, &roots, destination, -id, &preparation, &[]).await?;
                         }
-                        None => destroy_escrow(db, id).await?,
+                        None => destroy_escrow(db, sde, id).await?,
                     }
                     set_status(db, &mut k, STATUS_FAILED, now).await?;
                     ownership::tell(db, outbox, if issuer_action { k.acceptor } else { k.issuer_owner().id }, "OnContractFailed", id).await?;
@@ -466,9 +512,14 @@ pub(super) async fn delete_one(c: &Client, id: i64) -> Result<(), CallError> {
             }
             let roots = escrowed_ids(db, id).await?;
             let destination = custody::issuer_return(db, &k).await?;
-            custody::hand_over(db, sde, outbox, &roots, destination, -id).await?;
+            let preparation = custody::prepare(db, sde, &roots, &[]).await?;
+            let checked = custody::issuer_return(db, &k).await?;
+            if checked.owner != destination.owner || checked.location != destination.location || checked.flag != destination.flag {
+                return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
+            }
+            custody::hand_over(db, sde, outbox, &roots, destination, -id, &preparation, &[]).await?;
             if k.kind != TYPE_AUCTION {
-                ownership::credit(db, outbox, k.issuer_owner(), k.reward).await?;
+                wallet_ownership::credit(db, outbox, k.issuer_owner(), IskAmount::from_isk(k.reward)?).await?;
             }
             set_status(db, &mut k, STATUS_DELETED, now).await?;
             Ok(())
@@ -487,7 +538,7 @@ pub(super) async fn place_bid(c: &Client, id: i64, amount: f64, for_corp: bool) 
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let wallet_key = if for_corp { i32::try_from(c.session.int("corpAccountKey").unwrap_or(0)).map_err(|_| notify_error(messages::DEPARTMENT_WALLET_WITHDRAW_UNAUTHORIZED))? } else { ACCOUNT_CASH };
-    let owner = ownership::actor_owner(me, corp, for_corp, wallet_key);
+    let owner = wallet_ownership::actor_owner(me, corp, for_corp, wallet_key);
     let _trading = lock().await;
     let now = filetime_now();
     let (amount, buyout) = db.transaction(
@@ -515,14 +566,15 @@ pub(super) async fn place_bid(c: &Client, id: i64, amount: f64, for_corp: bool) 
     if buyout {
         amount = k.collateral;
     }
-    ownership::debit(db, outbox, owner, amount).await?;
+    let bid_amount = IskAmount::from_isk(amount)?;
+    wallet_ownership::debit(db, outbox, owner, bid_amount).await?;
     if let Some(bid) = top {
-        ownership::credit(db, outbox, ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount).await?;
+        wallet_ownership::credit(db, outbox, wallet_ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, IskAmount::from_isk(bid.amount)?).await?;
         ownership::tell(db, outbox, bid.bidder_id, "OnContractOutbid", id).await?;
     }
     contract_dao::insert_bid(db, id, owner.id, wallet_key, amount, now).await.map_err(db_err)?;
     if buyout {
-        settle(db, sde, outbox, &mut k, owner, amount, now).await?;
+        settle(db, sde, outbox, &mut k, owner, amount, bid_amount, now).await?;
         ownership::tell(db, outbox, k.issuer_owner().id, "OnContractBuyout", id).await?;
     }
     Ok((amount, buyout))
@@ -537,12 +589,13 @@ pub(super) async fn place_bid(c: &Client, id: i64, amount: f64, for_corp: bool) 
 }
 
 /// An auction won: the items go to the winner at the start station, the bid to the issuer.
-async fn settle<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, k: &mut Contract, winner: ownership::FinancialOwner, amount: f64, now: i64) -> Result<(), CallError> {
+async fn settle<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, k: &mut Contract, winner: wallet_ownership::FinancialOwner, amount: f64, bid_amount: IskAmount, now: i64) -> Result<(), CallError> {
     let roots = escrowed_ids(db, k.id).await?;
-    custody::hand_over(db, sde, outbox, &roots, custody::receiving(winner.id, k.start), -k.id).await?;
-    ownership::credit(db, outbox, k.issuer_owner(), amount).await?;
-    ownership::credit(db, outbox, k.issuer_owner(), k.paid_deposit).await?;
-    ownership::debit(db, outbox, k.issuer_owner(), super::fees::sales_tax_amount(amount, k.auction_tax_rate, k.auction_tax_maximum)).await?;
+    let preparation = custody::prepare(db, sde, &roots, &[]).await?;
+    custody::hand_over(db, sde, outbox, &roots, custody::receiving(winner.id, k.start), -k.id, &preparation, &[]).await?;
+    wallet_ownership::credit(db, outbox, k.issuer_owner(), bid_amount).await?;
+    wallet_ownership::credit(db, outbox, k.issuer_owner(), IskAmount::from_isk(k.paid_deposit)?).await?;
+    wallet_ownership::debit(db, outbox, k.issuer_owner(), IskAmount::from_isk(super::fees::sales_tax_amount(amount, k.auction_tax_rate, k.auction_tax_maximum))?).await?;
     k.acceptor = winner.id;
     k.acceptor_wallet_key = winner.wallet_key;
     set_status(db, k, STATUS_FINISHED, now).await?;
@@ -571,7 +624,7 @@ pub(super) async fn gm_expire(c: &Client, id: i64) -> CallResult {
                 }
                 if k.kind == TYPE_AUCTION {
                     if let Some(bid) = shared::top_bid(db, id).await.map_err(db_err)? {
-                        settle(db, &sde, outbox, &mut k, ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, now).await?;
+                        settle(db, &sde, outbox, &mut k, wallet_ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, IskAmount::from_isk(bid.amount)?, now).await?;
                     }
                 }
                 Ok(Value::None)
@@ -605,7 +658,7 @@ async fn settle_expired_candidate(db: &Db, sde: &Arc<crate::sde::Sde>, world: &W
                     return Ok(None);
                 }
                 if let Some(bid) = shared::top_bid(db, id).await.map_err(db_err)? {
-                    settle(db, &sde, outbox, &mut k, ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, now).await?;
+                    settle(db, &sde, outbox, &mut k, wallet_ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, IskAmount::from_isk(bid.amount)?, now).await?;
                     Ok(Some((bid.bidder_id, bid.amount)))
                 } else {
                     Ok(None)

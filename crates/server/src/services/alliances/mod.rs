@@ -11,18 +11,19 @@
 //! alliance. Members back an executor (DeclareExecutorSupport); a candidate backed by
 //! corporations holding more than half the alliance's pilots takes over. Membership changes
 //! reach every online member as a session change (allianceid) and as the client's
-//! OnAlliance*Changed row updates. Mutual wars are supported separately; bills,
-//! sovereignty, capital systems and prime time aren't supported.
+//! OnAlliance*Changed row updates. Claimed Hubs are neutralized in the same
+//! membership transaction. Mutual wars are supported separately; bills, ordinary
+//! capital changes and prime time aren't supported.
 
 use super::corps::membership;
 use crate::dao::alliances as dao;
 use super::{crowset, db_err, notify_error, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::ROLE_DIRECTOR;
+use infinity_core::consts::ROLE_DIRECTOR;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
-use crate::messages;
+use infinity_core::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 
@@ -52,9 +53,9 @@ const SUGGESTION_MIN_LENGTH: usize = 2;
 
 /// A director of the alliance's executor corporation.
 pub(super) async fn executor_director(db: &(impl Executor + ?Sized), me: i64, alliance: i64) -> Result<bool, CallError> {
-    let (corp, roles) = membership(db, me).await?;
+    let Some(authority) = super::corps::permissions::load(db, me).await? else { return Ok(false) };
     let executor = dao::executor_corp(db, alliance).await.map_err(db_err)?;
-    Ok(executor == Some(corp) && roles & ROLE_DIRECTOR != 0)
+    Ok(authority.live && executor == Some(authority.corporation) && authority.roles[0] & ROLE_DIRECTOR != 0)
 }
 
 /// `dbutil.CIndexedRowset(header, column)` filled with `rows` keyed by their `column` value.
@@ -141,7 +142,12 @@ fn alliance_line(r: dao::Alliance) -> Vec<Value> {
 }
 
 async fn alliance_line_of(db: &(impl Executor + ?Sized), alliance: i64) -> Result<Option<Vec<Value>>, CallError> {
-    Ok(dao::alliance(db, alliance).await.map_err(db_err)?.map(alliance_line))
+    let Some(row) = dao::alliance(db, alliance).await.map_err(db_err)? else { return Ok(None); };
+    let policy = crate::dao::sovereignty::policy::read(db, alliance).await.map_err(db_err)?;
+    let capital = crate::services::sovereignty::wire::capital(policy.as_ref());
+    let mut line = alliance_line(row);
+    line[14] = crate::services::value_field(&capital, "currentCapitalSystem").expect("capital encoder provides currentCapitalSystem").clone();
+    Ok(Some(line))
 }
 
 async fn alliance_row(db: &Db, alliance: i64) -> CallResult {
@@ -227,11 +233,6 @@ async fn queue_tell<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<
     Ok(())
 }
 
-async fn tell(db: &Db, world: &World, alliance: i64, also_corp: Option<i64>, event: &str, args: Vec<Value>) -> Result<(), CallError> {
-    let mut outbox = Outbox::default();
-    queue_tell(db, &mut outbox, alliance, also_corp, event, args).await?;
-    dispatch_world((), outbox, world)
-}
 
 async fn queue_alliance_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = alliance_line_of(db, alliance).await?;
@@ -239,11 +240,6 @@ async fn queue_alliance_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: 
     queue_tell(db, outbox, alliance, None, "OnAllianceChanged", vec![Value::Int(alliance), ch]).await
 }
 
-async fn alliance_changed(db: &Db, world: &World, alliance: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let mut outbox = Outbox::default();
-    queue_alliance_changed(db, &mut outbox, alliance, old).await?;
-    dispatch_world((), outbox, world)
-}
 
 pub(crate) async fn queue_application_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = application_line_of(db, alliance, corp).await?;
@@ -258,20 +254,18 @@ async fn queue_member_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &m
     queue_tell(db, outbox, alliance, Some(corp), "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
 }
 
-async fn member_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let mut outbox = Outbox::default();
-    queue_member_changed(db, &mut outbox, alliance, corp, old).await?;
-    dispatch_world((), outbox, world)
-}
 
 /// Put `corp` in `alliance` (or none): history, and every member's session.
-pub(crate) async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, alliance: Option<i64>, now: i64) -> Result<(), CallError> {
+pub(crate) async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, alliance: Option<i64>, now: i64, admitted: &crate::services::sovereignty::governance::AdmittedAllianceChange) -> Result<(), CallError> {
+    crate::services::sovereignty::governance::apply(db, outbox, corp, now, admitted).await?;
     if dao::set_corporation_alliance(db, corp, alliance, now).await.map_err(db_err)? == 0 {
         return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
     }
     dao::insert_history(db, corp, alliance, now).await.map_err(db_err)?;
     let value = alliance.map(Value::Int).unwrap_or(Value::None);
-    for char_id in pilots(db, None, Some(corp)).await? {
+    let members = pilots(db, None, Some(corp)).await?;
+    crate::services::sovereignty::invalidate_sources(db, outbox, &members).await?;
+    for char_id in members {
         outbox.notify_pilot(char_id, "__session", vec![Value::tuple([Value::str("allianceid"), value.clone()])]);
     }
     Ok(())
@@ -283,7 +277,7 @@ pub(crate) async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox:
 
 /// Take `corp` out of its alliance: a new executor if it was one, or the alliance closes
 /// with its last member.
-pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, now: i64) -> Result<(), CallError> {
+pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, now: i64, admitted: &crate::services::sovereignty::governance::AdmittedAllianceChange) -> Result<(), CallError> {
     let Some(r) = dao::corporation_membership(db, corp).await.map_err(db_err)?
     else {
         return Ok(());
@@ -293,7 +287,7 @@ pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbo
     let old_alliance = alliance_line_of(db, alliance).await?;
     let ch = change(MEMBER_COLUMNS, old_member.as_deref(), None);
     let recipients = pilots(db, Some(alliance), Some(corp)).await?;
-    set_alliance(db, outbox, corp, None, now).await?;
+    set_alliance(db, outbox, corp, None, now, admitted).await?;
     for char_id in recipients {
         outbox.notify_pilot(char_id, "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch.clone()]);
     }
@@ -350,3 +344,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;

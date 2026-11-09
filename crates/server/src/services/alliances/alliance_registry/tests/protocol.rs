@@ -57,6 +57,7 @@ async fn application_rpc_roundtrip_and_rejected_withdrawal() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, alliance) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
         indexed(corp_rpc(&mut s, corp, "GetAllianceApplications", &[]).await.map_err(|e| anyhow!("query: {e:?}"))?, "allianceID", None)?;
         ensure!(corp_rpc(&mut s, executor, "ApplyToJoinAlliance", &[Value::Int(alliance), Value::unicode("request")]).await.is_err(), "forged binding applied");
@@ -97,6 +98,7 @@ async fn offline_member_inherits_database_alliance() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, alliance) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         let (offline, _) = s.f.add_pilot().await;
         s.pilot(offline, corp, 0).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
@@ -122,12 +124,14 @@ async fn terminal_applications_cannot_be_overwritten() -> Result<()> {
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, _, alliance) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
         s.app(alliance, corp).await?;
         for state in [APP_ACCEPTED, APP_EFFECTIVE, APP_REJECTED] {
             s.f.db.execute("UPDATE game.alliance_applications SET state=$3 WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &corp, &state]).await?;
             let before: String = s.f.db.query_one("SELECT row_to_json(a)::text AS row FROM game.alliance_applications a WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &corp]).await?.get("row");
-            ensure!(corp_rpc(&mut s, corp, "ApplyToJoinAlliance", &[Value::Int(alliance), Value::unicode("overwrite")]).await.is_err(), "terminal application overwritten");
+            ensure!(matches!(corp_rpc(&mut s, corp, "ApplyToJoinAlliance", &[Value::Int(alliance), Value::unicode("overwrite")]).await,
+                Err(crate::services::CallError::User { msg, dict }) if msg == infinity_core::messages::MSG_CANT_APPLY_TWICE_TO_ALLIANCE && dict.is_empty()), "terminal application did not return duplicate-application refusal");
             let after: String = s.f.db.query_one("SELECT row_to_json(a)::text AS row FROM game.alliance_applications a WHERE alliance_id=$1 AND corporation_id=$2", &[&alliance, &corp]).await?.get("row");
             ensure!(before == after && drain(&mut s.joining).is_empty() && drain(&mut s.existing).is_empty(), "terminal refusal changed row or sent notices");
         }
@@ -173,6 +177,7 @@ async fn manager_can_reject_new_application_for_already_allied_corp() -> Result<
     let mut s = Scenario::new().await?;
     let result = catch_scenario(async {
         let (corp, executor, alliance) = setup(&mut s).await?;
+        s.pilot(s.f.owner, corp, ROLE_DIRECTOR).await?;
         s.app(alliance, corp).await?;
         s.f.client.session.apply(vec![("charid", Value::Int(s.f.owner)), ("corpid", Value::Int(corp))]);
         ensure!(crate::services::corps::alliance_corp_registry::gm_join(&mut s.f.client, alliance).await.is_ok(), "GM join failed");

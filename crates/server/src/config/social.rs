@@ -53,6 +53,8 @@ pub struct CorporationsConfig {
     pub bills_maintenance_secs: i64,
     /// Server advance rent billing policy in services/bills.rs.
     pub advance_billing_days: i64,
+    /// Server policy: delay after all corporation rights are removed before exit.
+    pub role_removal_cooldown_secs: i64,
 }
 
 impl Default for CorporationsConfig {
@@ -66,6 +68,7 @@ impl Default for CorporationsConfig {
             office_rent_per_security_isk: 900000.0,
             bills_maintenance_secs: 600,
             advance_billing_days: 7,
+            role_removal_cooldown_secs: 86400,
         }
     }
 }
@@ -81,7 +84,9 @@ impl CorporationsConfig {
         anyhow::ensure!((self.office_rent_base_isk + self.office_rent_per_security_isk).is_finite(), "corporations.office_rent_base_isk={} plus corporations.office_rent_per_security_isk={} must be finite", self.office_rent_base_isk, self.office_rent_per_security_isk);
         anyhow::ensure!(self.bills_maintenance_secs > 0, "corporations.bills_maintenance_secs={} is outside its valid domain", self.bills_maintenance_secs);
         anyhow::ensure!(self.advance_billing_days > 0, "corporations.advance_billing_days={} is outside its valid domain", self.advance_billing_days);
-        super::duration("corporations.advance_billing_days", self.advance_billing_days, crate::consts::FILETIME_DAY, true)?;
+        anyhow::ensure!(self.role_removal_cooldown_secs > 0, "corporations.role_removal_cooldown_secs={} is outside its valid domain", self.role_removal_cooldown_secs);
+        super::duration("corporations.role_removal_cooldown_secs", self.role_removal_cooldown_secs, infinity_core::consts::FILETIME_SECOND, true)?;
+        super::duration("corporations.advance_billing_days", self.advance_billing_days, infinity_core::consts::FILETIME_DAY, true)?;
         Ok(())
     }
 }
@@ -137,9 +142,9 @@ impl ContractsConfig {
         anyhow::ensure!(self.courier_min_days > 0, "contracts.courier_min_days={} is outside its valid domain", self.courier_min_days);
         anyhow::ensure!(self.courier_max_days > 0, "contracts.courier_max_days={} is outside its valid domain", self.courier_max_days);
         anyhow::ensure!(self.courier_max_days <= i64::from(i32::MAX), "contracts.courier_max_days={} must fit i32", self.courier_max_days);
-        super::duration("contracts.expiry_min_minutes", self.expiry_min_minutes, crate::consts::FILETIME_MINUTE, true)?;
-        super::duration("contracts.expiry_max_days", self.expiry_max_days, crate::consts::FILETIME_DAY, true)?;
-        super::duration("contracts.courier_max_days", self.courier_max_days, crate::consts::FILETIME_DAY, true)?;
+        super::duration("contracts.expiry_min_minutes", self.expiry_min_minutes, infinity_core::consts::FILETIME_MINUTE, true)?;
+        super::duration("contracts.expiry_max_days", self.expiry_max_days, infinity_core::consts::FILETIME_DAY, true)?;
+        super::duration("contracts.courier_max_days", self.courier_max_days, infinity_core::consts::FILETIME_DAY, true)?;
         anyhow::ensure!(self.max_items > 0, "contracts.max_items={} is outside its valid domain", self.max_items);
         anyhow::ensure!(self.title_max_len > 0, "contracts.title_max_len={} is outside its valid domain", self.title_max_len);
         anyhow::ensure!(self.description_max_len > 0, "contracts.description_max_len={} is outside its valid domain", self.description_max_len);
@@ -237,6 +242,8 @@ pub struct SpaceConfig {
     pub position_snapshot_secs: i64,
     /// Server policy: mailbox depth above which a space actor logs a warning.
     pub mailbox_budget: i64,
+    /// Server memory budget for unacknowledged sovereignty capture segments per system.
+    pub sovereignty_max_pending_segments: usize,
     /// Server policy: optional sphere collisions; detailed collision shapes are unavailable.
     pub collisions: bool,
 }
@@ -246,6 +253,7 @@ impl Default for SpaceConfig {
         Self {
             position_snapshot_secs: 30,
             mailbox_budget: 10000,
+            sovereignty_max_pending_segments: 1024,
             collisions: false,
         }
     }
@@ -256,6 +264,7 @@ impl SpaceConfig {
         anyhow::ensure!(self.position_snapshot_secs > 0, "space.position_snapshot_secs={} is outside its valid domain", self.position_snapshot_secs);
         super::milliseconds("space.position_snapshot_secs", self.position_snapshot_secs)?;
         anyhow::ensure!(self.mailbox_budget > 0, "space.mailbox_budget={} is outside its valid domain", self.mailbox_budget);
+        anyhow::ensure!(self.sovereignty_max_pending_segments > 0, "space.sovereignty_max_pending_segments must be positive");
         Ok(())
     }
 }

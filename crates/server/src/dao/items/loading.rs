@@ -5,6 +5,7 @@
 //! Transactions, refusals, notifications and World are caller concerns.
 
 use crate::db::{self, executor::Executor};
+use super::pending_reloads::PendingReload;
 use tokio_postgres::Row;
 
 #[derive(Clone)]
@@ -14,7 +15,7 @@ pub(crate) struct Item {
     pub owner_id: i64,
     pub location_id: i64,
     pub flag_id: i32,
-    pub quantity: i32,
+    pub quantity: i64,
     pub singleton: bool,
     pub group_id: i64,
     pub category_id: i64,
@@ -23,17 +24,56 @@ pub(crate) struct Item {
 
 pub(crate) struct GameItem {
     pub item_id: i64, pub type_id: i32, pub owner_id: i64, pub location_id: i64,
-    pub flag_id: i32, pub quantity: i32, pub singleton: bool, pub custom_info: Option<String>,
+    pub flag_id: i32, pub quantity: i64, pub singleton: bool, pub custom_info: Option<String>,
 }
 
 impl GameItem {
-    fn from_row(r: &Row) -> Self {
+    pub(super) fn from_row(r: &Row) -> Self {
         Self {
             item_id: r.get("item_id"), type_id: r.get("type_id"), owner_id: r.get("owner_id"),
             location_id: r.get("location_id"), flag_id: r.get("flag_id"), quantity: r.get("quantity"),
             singleton: r.get("singleton"), custom_info: r.get("custom_info"),
         }
     }
+}
+
+pub(crate) struct CapacitySnapshot {
+    pub(crate) parent: Option<GameItem>,
+    pub(crate) items: Vec<GameItem>,
+    pub(crate) reloads: Vec<PendingReload>,
+}
+
+/// Reads the parent, active direct children and source reservations in one snapshot.
+pub(crate) async fn capacity_snapshot(ex: &(impl Executor + ?Sized), id: i64) -> Result<CapacitySnapshot, db::Error> {
+    let rows = ex.query(
+        "SELECT 'parent'::text AS kind, i.item_id, i.type_id, i.owner_id, i.location_id,
+                i.flag_id, i.quantity::bigint AS quantity, i.singleton, i.custom_info,
+                NULL::bigint AS reload_id, NULL::bigint AS ship_id, NULL::bigint AS module_id,
+                NULL::integer AS source_flag, NULL::bigint AS source_location_id
+         FROM game.items i WHERE i.item_id = $1 AND i.jump_clone_id IS NULL
+         UNION ALL
+         SELECT 'item'::text, i.item_id, i.type_id, i.owner_id, i.location_id,
+                i.flag_id, i.quantity::bigint, i.singleton, i.custom_info,
+                NULL::bigint, NULL::bigint, NULL::bigint, NULL::integer, NULL::bigint
+         FROM game.items i WHERE i.location_id = $1 AND i.jump_clone_id IS NULL
+         UNION ALL
+         SELECT 'reload'::text, NULL::bigint, r.type_id, r.owner_id, NULL::bigint,
+                r.flag_id, r.quantity::bigint, NULL::boolean, NULL::text,
+                r.reload_id, r.ship_id, r.module_id, r.source_flag, r.source_location_id
+         FROM game.pending_reloads r WHERE r.source_location_id = $1
+         ORDER BY kind, item_id, reload_id",
+        &[&id],
+    ).await?;
+    let mut snapshot = CapacitySnapshot { parent: None, items: Vec::new(), reloads: Vec::new() };
+    for row in &rows {
+        match row.get::<_, &str>("kind") {
+            "parent" => snapshot.parent = Some(GameItem::from_row(row)),
+            "item" => snapshot.items.push(GameItem::from_row(row)),
+            "reload" => snapshot.reloads.push(PendingReload::from_row(row)),
+            _ => unreachable!("capacity snapshot tag"),
+        }
+    }
+    Ok(snapshot)
 }
 
 /// The existing item predicates, with parameters in their original SQL order.

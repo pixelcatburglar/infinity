@@ -1,5 +1,5 @@
 use super::*;
-use crate::consts::FILETIME_HOUR;
+use infinity_core::consts::FILETIME_HOUR;
 
 #[test]
 fn python_two_cooldown_rounding_and_ready_boundaries() {
@@ -21,7 +21,7 @@ fn python_two_cooldown_rounding_and_ready_boundaries() {
 fn validation_labels_include_only_the_catalogued_funds_token() {
     assert_eq!(Issue::Docked.label(), Value::str(messages::clones::VALIDATION_DOCKED));
     assert_eq!(Issue::Duplicate.label(), Value::str(messages::clones::VALIDATION_DUPLICATE));
-    assert_eq!(Issue::Funds(900_000.0, 0.0).label(), Value::tuple([Value::str(messages::clones::VALIDATION_FUNDS), Value::dict([("cloneCost", Value::Float(900_000.0))])]));
+    assert_eq!(Issue::Funds(crate::isk::IskAmount::from_whole_isk(900_000).unwrap(), crate::isk::IskAmount::ZERO).label(), Value::tuple([Value::str(messages::clones::VALIDATION_FUNDS), Value::dict([("cloneCost", Value::Float(900_000.0))])]));
 }
 
 #[test]

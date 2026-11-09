@@ -2,8 +2,10 @@
 use super::*;
 use crate::services::combat::groups_health::tests::drain_exact;
 use std::sync::{Arc, atomic::AtomicBool};
-use crate::{
+use infinity_core::{
     consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_QUANTITY, dogma::ATTR_RECHARGE_RATE, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_POWER_BOOSTER, FLAG_FITTING_FIRST},
+};
+use crate::{
     db::{Db, Error},
     services::{combat, effects::{lifecycle::{ActivationOwner, CycleOutcome}, registry}},
     space::{Ball, World, WarpState, MODE_STOP},
@@ -55,7 +57,7 @@ fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
         segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
@@ -127,8 +129,8 @@ async fn cap_booster_db_smoke() {
         let module = Module { id: fixture.module, type_id: module_type, flag: FLAG_FITTING_FIRST };
         let stop = Arc::new(AtomicBool::new(false));
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![module], effect, target: None, repeat: 1,
-            stop: stop.clone(), owner: ActivationOwner { master: fixture.module, generation: stop, armed: false },
-            started: 0, charge_type: None, cycles: 0, duration_ms: 0.0, nominal_start: 0, other: None, repair_amount: 0.0 };
+            stop: stop.clone(), owner: ActivationOwner { master: fixture.module, generation: stop, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
+            started: 0, charge_type: None, cycles: 0, duration_ms: 0.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
         assert_eq!(loaded(&test_db, fixture.ship, FLAG_FITTING_FIRST).await.ok().unwrap(), Some((charge_type, 2)));
         assert!(validate(&cx, &fit, &cycle.modules[0], &cycle.effect, None).await.is_ok());
         for remaining in [1, 0] {
@@ -149,7 +151,7 @@ async fn cap_booster_db_smoke() {
         assert!(rx.try_recv().is_err());
     }).await;
     world.remove_ball(system, fixture.ship).await;
-    world.unregister_pilot(fixture.character);
+    world.unregister_pilot_generation(fixture.character, None);
     let flush = world.flush_positions().await;
     combat::forget_ship(fixture.ship);
     drop(world);

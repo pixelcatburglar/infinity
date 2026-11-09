@@ -16,16 +16,16 @@ async fn insertion_refusals_report_exact_errors_without_rows() {
         let (mut client, _peer) = tests::client(test_db.clone(), applicant.character).await;
         let missing: i64 = test_db.query_one("SELECT GREATEST(COALESCE(max(corporation_id), 98000000), 98000000) + 1000000 AS id FROM game.corporations", &[]).await.unwrap().get("id");
         let cases = [
-            (missing, crate::messages::CORP_NOT_FOUND),
-            (deleted, crate::messages::CORP_NOT_FOUND),
-            (corp, crate::messages::CORP_NOT_RECRUITING),
-            (1, crate::messages::NPC_CORP_DOES_NOT_ACCEPT_APPLICATIONS),
+            (missing, infinity_core::messages::CORP_NOT_FOUND),
+            (deleted, infinity_core::messages::CORP_NOT_FOUND),
+            (corp, infinity_core::messages::CORP_NOT_RECRUITING),
+            (1, infinity_core::messages::NPC_CORP_DOES_NOT_ACCEPT_APPLICATIONS),
         ];
         for (target, message) in cases {
             let error = rpc(&mut client, "InsertApplication", &[Value::Int(target), Value::unicode("申请")], 1).await.unwrap_err();
             match error {
                 crate::services::CallError::User { msg, dict } => {
-                    assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
+                    assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
                     assert_eq!(dict, vec![("notify".to_owned(), Value::unicode(message))]);
                 }
                 other => panic!("expected UserError, got {other:?}"),
@@ -37,8 +37,8 @@ async fn insertion_refusals_report_exact_errors_without_rows() {
         let error = rpc(&mut client, "InsertApplication", &[Value::Int(corp), Value::unicode("申请")], corp).await.unwrap_err();
         match error {
             crate::services::CallError::User { msg, dict } => {
-                assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-                assert_eq!(dict, vec![("notify".to_owned(), Value::unicode(crate::messages::CORP_APPLICATION_ALREADY_PROCESSED))]);
+                assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                assert_eq!(dict, vec![("notify".to_owned(), Value::unicode(infinity_core::messages::CORP_APPLICATION_ALREADY_PROCESSED))]);
             }
             other => panic!("expected UserError, got {other:?}"),
         }

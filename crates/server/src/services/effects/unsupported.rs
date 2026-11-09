@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use marshal::Value;
 use tracing::warn;
 
-use crate::messages;
+use infinity_core::messages;
 
 #[derive(Default)]
 struct State {

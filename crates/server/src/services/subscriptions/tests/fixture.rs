@@ -1,8 +1,8 @@
 use super::rules::{self, ALPHA, OMEGA};
 use crate::dao::accounts::subscriptions::CloneGrade;
-use crate::consts::{FAR_FUTURE, FILETIME_SECOND};
+use infinity_core::consts::{FAR_FUTURE, FILETIME_SECOND};
 
-pub(super) const NOW: i64 = crate::consts::FILETIME_UNIX_EPOCH + 100 * FILETIME_SECOND;
+pub(super) const NOW: i64 = infinity_core::consts::FILETIME_UNIX_EPOCH + 100 * FILETIME_SECOND;
 
 pub(super) fn row(grade: i16, omega_until: Option<i64>, grace_until: Option<i64>) -> CloneGrade {
     CloneGrade { user_id: 7, grade, omega_until, grace_until, revision: 3 }

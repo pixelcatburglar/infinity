@@ -1,5 +1,6 @@
 //! `industryMonitor` dispatch for the client industry package, using authorized materials.
-
+//! `ConnectJob` available quantities are projected to the client display limit;
+//! stored stack quantities stay exact.
 use super::*;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -38,7 +39,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 industry_dao::available(&c.db, owner, input.item_id, input.flag_id).await.map_err(db_err)
             }.await;
             let have = match result { Ok(h) => h, Err(e) => return Some(Err(e)) };
-            Ok(Value::tuple([Value::Int(1), Value::Dict(have.into_iter().map(|(t, q)| (Value::Int(t as i64), Value::Int(q))).collect())]))
+            Ok(Value::tuple([Value::Int(1), Value::Dict(have.into_iter().map(|(t, q)| (Value::Int(t as i64), Value::Int(crate::services::dogma::info::cap_client_quantity(q)))).collect())]))
         }
         ("industryMonitor", "DisconnectJob") => Ok(Value::None),
 

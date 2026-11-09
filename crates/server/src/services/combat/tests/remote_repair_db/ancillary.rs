@@ -1,7 +1,7 @@
 //! Database-backed ancillary remote repair cycles through the dogma activation path.
 //! Uses published SDE modules and charges, game items and module charges; no UI is involved.
 use super::*;
-use crate::consts::{dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER, dogma::ATTR_RELOAD_TIME, CATEGORY_CHARGE, dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, FLAG_CARGO};
+use infinity_core::consts::{dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER, dogma::ATTR_RELOAD_TIME, CATEGORY_CHARGE, dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, FLAG_CARGO};
 
 const RELOAD_MS: f64 = 1_000.0;
 const CARGO_QUANTITY: i32 = 100_000;
@@ -14,7 +14,7 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
     let effect = registry::resolve(&sde, effect_id).expect("ancillary remote effect");
     let name = sde.dogma.effect(effect_id).unwrap().name.clone().unwrap();
     let size_id = sde.dogma.attributes_by_name("chargeSize").next().map(|a| a.attribute_id);
-    let amount_attr = [crate::consts::dogma::ATTR_SHIELD_BONUS, crate::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT][layer];
+    let amount_attr = [infinity_core::consts::dogma::ATTR_SHIELD_BONUS, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT][layer];
     let (module_type, charge_type, other_type) = sde.types.iter().filter(|m| m.published == Some(true)
         && m.category_id == Some(CATEGORY_MODULE) && m.effects().iter().any(|e| e.effect_id == effect_id)
         && effect.attribute(EffectAttribute::Duration).and_then(|a| m.attribute(a)).is_some_and(|v| (3000.0..=10000.0).contains(&v))
@@ -52,9 +52,9 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         }
         test_db.execute("INSERT INTO game.item_attributes (item_id, attribute_id, value) VALUES ($1, $2, $3)", &[&f.module, &ATTR_RELOAD_TIME, &RELOAD_MS]).await.unwrap();
         if reload {
-            test_db.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, false)", &[&charge_type, &f.source, &f.ship, &FLAG_CARGO, &CARGO_QUANTITY]).await.unwrap();
+            test_db.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, false)", &[&charge_type, &f.source, &f.ship, &FLAG_CARGO, &i64::from(CARGO_QUANTITY)]).await.unwrap();
         }
-        let other: i64 = test_db.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, false) RETURNING item_id", &[&other_type, &f.source, &f.ship, &FLAG_CARGO, &OTHER_QUANTITY]).await.unwrap().get("item_id");
+        let other: i64 = test_db.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, false) RETURNING item_id", &[&other_type, &f.source, &f.ship, &FLAG_CARGO, &i64::from(OTHER_QUANTITY)]).await.unwrap().get("item_id");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
@@ -65,40 +65,66 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         client.notify_tx = tx;
         test_world.add_ship(system, ball(f.ship, ship_type, f.source)).await.unwrap();
         test_world.add_ship(system, ball(f.victim, ship_type, f.target)).await.unwrap();
-        let stats = ship_stats(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap();
-        state().condition.insert(f.victim, Condition { now: [0.0; 3], stats: stats.clone(), shield_at: filetime_now() + 60 * FILETIME_SECOND });
+        let checkpoint_gate = test_world.lock_condition_snapshot(system).await.unwrap();
+        let fit = Fit::load_in_space(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap();
+        let mut stats = ShipStats::from_fit(&fit, Key::Ship);
+        // Isolate the discrete remote repair from passive shield recharge.
+        stats.shield_tau_ms = 1e30;
+        test_world.with(system, move |s| s.install_condition(f.victim, Condition {
+            now: [0.0, 0.0, 1.0], stats, shield_at: filetime_now() + 60 * FILETIME_SECOND,
+        }, fit)).await.unwrap();
+        let db_before = crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap();
+        assert!(db_before.is_empty());
         state().targets.entry(f.source).or_default().insert(f.victim);
         let fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
         let base = fit.value(Key::Module(f.module), amount_attr);
         let bonus = fit.value(Key::Module(f.module), ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER);
         let expected = if layer == 1 && charged { base * bonus } else { base };
-        assert!(stats.max[layer] > expected, "fixture must not clamp repair");
+        assert!(ShipStats::from_fit(&Fit::load_in_space(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap(), Key::Ship).max[layer] > expected, "fixture must not clamp repair");
         let cap = fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY);
         let need = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Discharge).unwrap_or(ATTR_CAPACITOR_NEED));
         assert!(cap.is_finite() && need.is_finite() && cap > need && (need > 0.0 || (layer == 0 && charged && need == 0.0)), "invalid fixture capacitor: cap={cap}, need={need}");
         state().capacitor.insert(f.ship, (cap, filetime_now() + 60 * FILETIME_SECOND));
         let duration = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Duration).unwrap()).max(250.0) as u64;
+        install_half(&test_world, system, f.ship, fit).await;
         let args = [Value::Int(f.module), Value::str(name), Value::Int(f.victim), Value::Int(1)];
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
-        assert!(crate::services::combat::dispatch(&mut client, &call).await.expect("combat method").is_ok());
+        assert!(crate::services::dogma::dispatch(&mut client, &call).await.is_ok());
         assert!(test_world.after(system, 1500).await);
         let remaining = crate::dao::items::charges::loaded(&test_db, f.ship, FLAG_FITTING_FIRST).await.unwrap();
         assert!(remaining.is_none(), "last charge consumed or magazine empty");
+        let early = condition(&test_world, system, f.victim).await.now[layer];
+        if layer == 0 {
+            assert!((early - expected).abs() < expected.max(1.0) * 1e-8, "shield repair at cycle start: {early} != {expected}");
+        } else {
+            assert_eq!(early, 0.0, "armor repair at cycle end");
+        }
         let level = state().capacitor.get(&f.ship).unwrap().0;
         let expected_cap = if layer == 0 && charged { cap } else { cap - need };
         assert!((level - expected_cap).abs() < cap * 1e-8, "capacitor debit");
         assert!(test_world.after(system, duration + RELOAD_MS as u64 + 2500).await);
-        let repaired = state().condition[&f.victim].now[layer];
+        let repaired = condition(&test_world, system, f.victim).await.now[layer];
         assert!((repaired - expected).abs() < expected.max(1.0) * 1e-8, "repair amount: {repaired} != {expected}");
+        assert!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap().is_empty());
+        drop(checkpoint_gate);
+        test_world.flush_positions().await.unwrap();
+        let rows = crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap();
+        let value = rows.iter().find(|r| r.attribute_id == [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE][layer]).unwrap().value;
+        let max = condition(&test_world, system, f.victim).await.stats.max[layer];
+        if layer == 0 {
+            assert!((repaired..=max).contains(&value));
+        } else {
+            assert!((value - (max - repaired)).abs() < expected.max(1.0) * 1e-8);
+        }
         let loaded = crate::dao::items::charges::loaded(&test_db, f.ship, FLAG_FITTING_FIRST).await.unwrap();
         if reload {
             let loaded = loaded.expect("automatic reload from compatible cargo");
             assert_eq!(loaded.type_id, charge_type);
             assert!(loaded.quantity > 0);
         } else { assert!(loaded.is_none(), "incompatible cargo must not reload"); }
-        let quantity: i32 = test_db.query_one("SELECT quantity FROM game.items WHERE item_id = $1", &[&other]).await.unwrap().get("quantity");
-        assert_eq!(quantity, OTHER_QUANTITY, "incompatible cargo must not be consumed");
+        let quantity: i64 = test_db.query_one("SELECT quantity FROM game.items WHERE item_id = $1", &[&other]).await.unwrap().get("quantity");
+        assert_eq!(quantity, i64::from(OTHER_QUANTITY), "incompatible cargo must not be consumed");
     }).await;
     // Let an activation or reload already scheduled before a panic finish before deleting rows.
     world.after(system, 15_000).await;

@@ -37,7 +37,11 @@ fn native_rewards_validate_binding_count_and_existence_atomically() {
         assert!(!d.definitions[0].malformed);
         assert_eq!(d.definitions[0].custom[0].quantity, i64::from(i32::MAX));
     }
-    for item in [json!({"loottypeid":3,"lootcount":0,"lootsoulbound":0}), json!({"loottypeid":3,"lootcount":2147483648_i64,"lootsoulbound":0}), json!({"loottypeid":7,"lootcount":1,"lootsoulbound":0}), json!({"loottypeid":3,"lootcount":1,"lootsoulbound":2}), json!({"loottypeid":3,"lootcount":1})] {
+    for quantity in [2147483648_i64, 4294967296, 9007199254740993, i64::MAX] {
+        let d = parse_test(vec![row("a", json!({"typeID":1,"fixedCustomLootItems":[{"loottypeid":3,"lootcount":quantity,"lootsoulbound":0}]}))]);
+        assert_eq!(d.definitions[0].custom[0].quantity, quantity);
+    }
+    for item in [json!({"loottypeid":3,"lootcount":0,"lootsoulbound":0}), json!({"loottypeid":7,"lootcount":1,"lootsoulbound":0}), json!({"loottypeid":3,"lootcount":1,"lootsoulbound":2}), json!({"loottypeid":3,"lootcount":1})] {
         let result = parse_test(vec![row("a", json!({"typeID":1,"fixedLootItems":[2],"fixedCustomLootItems":[item]}))]);
         let d = &result.definitions[0];
         assert!(d.malformed && d.ordinary.is_empty() && d.custom.is_empty());

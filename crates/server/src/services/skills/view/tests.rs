@@ -19,7 +19,7 @@ async fn character_skill_entry_preserves_full_and_incremental_virtual_markers() 
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = crate::sde::Sde::load(&db).await.unwrap();
     let skill = sde.types.iter()
-        .find(|ty| ty.category_id == Some(crate::consts::CATEGORY_SKILL) && ty.published == Some(true))
+        .find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && ty.published == Some(true))
         .expect("published skill in SDE");
     let rank = super::training::skill_type(&sde, skill.type_id).rank;
     let real = [Value::Int(i64::from(skill.type_id)), Value::Int(0), Value::Int(0), Value::Float(rank), Value::None];

@@ -1,5 +1,7 @@
 //! Station reprocessing service using canonical SDE materials and game prices.
 //! Successful reprocessing tax debits emit wallet events after transaction commit.
+//! Material quantities sent on the wire project to the client display limit;
+//! stored amounts and stored tax debits stay exact.
 use super::*;
 use crate::services::inventory;
 
@@ -20,7 +22,7 @@ fn skill_multiplier(skills: &crate::services::skills::effective::SkillSnapshot, 
 struct Quote {
     type_id: i32,
     /// Units left over (less than a portion).
-    leftover: i32,
+    leftover: i64,
     /// (typeID, received, lost, ISK tax)
     materials: Vec<(i32, i64, i64, f64)>,
 }
@@ -33,10 +35,6 @@ pub(super) fn add_output(total: i64, amount: i64) -> Result<i64, CallError> {
     total.checked_add(amount).ok_or_else(output_overflow)
 }
 
-pub(super) fn output_stack_quantity(current: Option<i32>, amount: i64) -> Result<i32, CallError> {
-    let amount = i32::try_from(amount).map_err(|_| output_overflow())?;
-    current.unwrap_or(0).checked_add(amount).ok_or_else(output_overflow)
-}
 
 async fn quote(
     c: &Client,
@@ -44,7 +42,7 @@ async fn quote(
     skills: &crate::services::skills::effective::SkillSnapshot,
     item: &crate::dao::items::loading::Item,
 ) -> Result<Option<Quote>, CallError> {
-    let portion = sde.types.get(item.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", item.type_id)))?.portion_size.unwrap_or(1).max(1);
+    let portion = i64::from(sde.types.get(item.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", item.type_id)))?.portion_size.unwrap_or(1).max(1));
     let quantity = if item.singleton { 1 } else { item.quantity };
     let batches = quantity / portion;
     if batches == 0 {
@@ -59,7 +57,7 @@ async fn quote(
     let efficiency = (crate::config::game().mining.station_reprocessing_efficiency * skill_multiplier(skills, sde, item.type_id)).min(1.0);
     let mut result = Vec::new();
     for r in materials {
-        let total = r.quantity.unwrap_or(0).checked_mul(batches as i64).ok_or_else(output_overflow)?;
+        let total = r.quantity.unwrap_or(0).checked_mul(batches).ok_or_else(output_overflow)?;
         let received = (total as f64 * efficiency).floor() as i64;
         if total > 0 {
             result.push((r.material_type_id, received, total - received, received as f64 * prices.get(&r.material_type_id).copied().unwrap_or(0.0) * crate::config::game().mining.station_reprocessing_tax));
@@ -74,13 +72,13 @@ fn quote_value(item_id: i64, q: &Quote) -> Value {
         .materials
         .iter()
         .map(|(t, received, lost, tax)| {
-            keyval([("typeID", Value::Int(*t as i64)), ("client", Value::Int(*received)), ("unrecoverable", Value::Int(*lost)), ("iskCost", Value::Float(*tax))])
+            keyval([("typeID", Value::Int(*t as i64)), ("client", Value::Int(crate::services::dogma::info::cap_client_quantity(*received))), ("unrecoverable", Value::Int(crate::services::dogma::info::cap_client_quantity(*lost))), ("iskCost", Value::Float(*tax))])
         })
         .collect();
     keyval([
         ("itemID", Value::Int(item_id)),
         ("typeID", Value::Int(q.type_id as i64)),
-        ("leftOvers", Value::Int(q.leftover as i64)),
+        ("leftOvers", Value::Int(q.leftover)),
         ("recoverables", Value::List(recoverables)),
     ])
 }
@@ -156,38 +154,26 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                     for (item, leftover) in &plan.0 {
                         changes.insert(item.item_id, QuantityChange::new(item, (*leftover > 0).then_some(*leftover)));
                     }
-                    let mut inserts = BTreeMap::new();
-                    for (&type_id, &amount) in &plan.1 {
-                        if amount <= 0 { continue; }
-                        let quantity = output_stack_quantity(None, amount)?;
-                        let candidates = crate::services::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::LocationFlagTypeOwnerStack(out_location, out_flag, type_id, char_id)).await.map_err(db_err)?;
-                        let stack = candidates.into_iter().next();
-                        if let Some(item) = stack {
-                            let current = changes.get(&item.item_id).map_or(Some(item.quantity), |change| change.quantity);
-                            let final_quantity = output_stack_quantity(current, amount)?;
-                            changes.entry(item.item_id).and_modify(|change| change.quantity = Some(final_quantity))
-                                .or_insert_with(|| QuantityChange::new(&item, Some(final_quantity)));
-                        } else {
-                            inserts.insert(type_id, quantity);
-                        }
-                    }
                     if !apply(tx, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
                     for (&id, change) in &changes {
                         if change.quantity.is_some() {
-                            inventory::notifications::notify_item_change(tx, &sde, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                            inventory::notifications::notify_item_change(tx, &sde, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity))]).await?;
                         } else {
                             let item = plan.0.iter().find(|(item, _)| item.item_id == id).expect("removed item is a source");
                             inventory::notifications::notify_item_removed(outbox, item.0.clone());
                         }
                     }
-                    for (type_id, quantity) in inserts {
-                        let id = crate::dao::items::transfers::insert(tx, type_id, char_id, out_location, out_flag, quantity).await.map_err(db_err)?;
-                        inventory::notifications::notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
+                    for (&type_id, &quantity) in &plan.1 {
+                        if quantity <= 0 { continue; }
+                        let destination = inventory::destination::Destination::owned(char_id, out_location, out_flag);
+                        crate::services::items::deposit(tx, &sde, outbox, &destination, type_id, quantity, 0).await?;
                     }
                     if tax > 0.0 {
-                        let balance = crate::dao::wallets::characters::debit(tx, char_id, tax).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::INSUFFICIENT_ISK_FOR_REPROCESSING_TAX))?;
-                        outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-                        outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: crate::consts::ACCOUNT_CASH, balance, delta: -tax });
+                        let amount = crate::isk::IskAmount::from_isk(tax)?;
+                        crate::services::wallets::debit(tx, outbox, char_id, amount).await.map_err(|error| match error {
+                            CallError::User { ref msg, .. } if msg == messages::MSG_NOT_ENOUGH_MONEY => notify_error(messages::INSUFFICIENT_ISK_FOR_REPROCESSING_TAX),
+                            error => error,
+                        })?;
                     }
                     Ok::<_, CallError>(Arc::clone(&plan))
                 })
@@ -196,7 +182,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             ).await?;
             let done: Vec<_> = plan.0.iter().map(|(item, _)| Value::Int(item.item_id)).collect();
             info!(user = c.login.user_id, "reprocessed {} items into {} material types ({tax:.0} ISK tax)", done.len(), plan.1.len());
-            Ok(Value::tuple([Value::List(done), Value::Dict(plan.1.iter().map(|(&t, &q)| (Value::Int(t as i64), Value::Int(q))).collect())]))
+            Ok(Value::tuple([Value::List(done), Value::Dict(plan.1.iter().map(|(&t, &q)| (Value::Int(t as i64), Value::Int(crate::services::dogma::info::cap_client_quantity(q)))).collect())]))
         }
         _ => Ok(Value::None),
     }

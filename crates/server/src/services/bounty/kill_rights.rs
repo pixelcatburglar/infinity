@@ -1,7 +1,8 @@
 //! Kill-right lifecycle and durable expiry, mirroring the client kill-right UI.
 //! Rights are persisted in game.kill_rights; suspect flags remain in memory.
 use super::*;
-use crate::{client::filetime_now, consts::{FILETIME_DAY, FILETIME_SECOND}, dao::kill_rights as dao, db::{Db, executor::Executor, outbox::{dispatch_world, Outbox}}, messages, scheduler::{self, Job}, space::World};
+use infinity_core::{consts::{FILETIME_DAY, FILETIME_SECOND}, messages};
+use crate::{client::filetime_now, dao::kill_rights as dao, db::{Db, executor::Executor, outbox::{dispatch_world, Outbox}}, scheduler::{self, Job}, space::World};
 use crate::services::{db_err, keyval, market, notify_error, user_error, wallets, CallError};
 use marshal::Value;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -137,8 +138,9 @@ pub(super) async fn buy(c: &Client, id: i64, price: f64) -> CallResult {
             if !price.is_finite() || price != listed || me == old.from_id { return Err(invalid()); }
             let buyback = me == old.to_id;
             let right = dao::buy(tx, id, price, me, &viewers, now, deadline(now), buyback).await.map_err(db_err)?.ok_or_else(invalid)?;
-            if me < old.from_id { wallets::debit(tx, outbox, me, price).await?; wallets::credit(tx, outbox, old.from_id, price).await?; }
-            else { wallets::credit(tx, outbox, old.from_id, price).await?; wallets::debit(tx, outbox, me, price).await?; }
+            let amount = crate::isk::IskAmount::from_isk(price)?;
+            if me < old.from_id { wallets::debit(tx, outbox, me, amount).await?; wallets::credit(tx, outbox, old.from_id, amount).await?; }
+            else { wallets::credit(tx, outbox, old.from_id, amount).await?; wallets::debit(tx, outbox, me, amount).await?; }
             outbox.notify_pilot(old.from_id, "OnKillRightForYouSold", vec![Value::Int(id)]);
             if buyback { used(tx, outbox, &right).await?; }
             Ok((right.to_id, right.activated_until, buyback))

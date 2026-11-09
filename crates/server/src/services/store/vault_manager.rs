@@ -1,6 +1,5 @@
 //! vaultManager PLEX balance, backed by game.accounts; other currencies are not modelled.
 use super::*;
-const PLX: &str = "PLX";
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {

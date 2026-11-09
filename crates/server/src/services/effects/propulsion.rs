@@ -4,7 +4,7 @@
 //! and do not model native propulsion physics beyond the fitted attributes.
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS};
+use infinity_core::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS};
 use crate::services::{combat::{self, Ctx}, fit::{Fit, Key}};
 use crate::space::{event, Ball, System};
 use marshal::Value;
@@ -14,17 +14,31 @@ pub(crate) struct Kinematics { speed: f64, mass: f64, agility: f64, signature: f
 
 pub(crate) fn kinematics(fit: &Fit, key: Key) -> Kinematics {
     Kinematics { speed: fit.value(key, ATTR_MAX_VELOCITY), mass: fit.value(key, ATTR_MASS),
-        agility: fit.value(key, crate::consts::dogma::ATTR_AGILITY), signature: fit.value(key, ATTR_SIGNATURE_RADIUS) }
+        agility: fit.value(key, infinity_core::consts::dogma::ATTR_AGILITY), signature: fit.value(key, ATTR_SIGNATURE_RADIUS) }
 }
 
 pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematics) {
-    system.command(ship, move |b, stamp, _| {
-        let mut events = propulsion_transition(b, stamp, values.speed, values.mass, values.signature);
-        if b.set_ball_agility(values.agility) {
-            events.push(event(stamp, "SetBallAgility", vec![Value::Int(b.id), Value::Float(values.agility)]));
+    system.command(ship, move |b, stamp, _| apply_kinematics(b, stamp, values));
+}
+
+pub(crate) fn queue_fitting_kinematics(system: &mut System, ship: i64, generation: u64, revision: u64, values: Kinematics) {
+    system.command(ship, move |b, stamp, s| {
+        if s.persistent_generation(ship) != Some(generation)
+            || s.combat_membership_generation(ship) != Some(generation)
+            || s.combat_phase(ship) != Some(crate::space::combat::CombatPhase::Live)
+            || s.projection_revision(ship) != revision {
+            return Vec::new();
         }
-        events
+        apply_kinematics(b, stamp, values)
     });
+}
+
+fn apply_kinematics(b: &mut Ball, stamp: i64, values: Kinematics) -> Vec<Value> {
+    let mut events = propulsion_transition(b, stamp, values.speed, values.mass, values.signature);
+    if b.set_ball_agility(values.agility) {
+        events.push(event(stamp, "SetBallAgility", vec![Value::Int(b.id), Value::Float(values.agility)]));
+    }
+    events
 }
 
 /// The ship's current fitted kinematics for everyone's destiny.

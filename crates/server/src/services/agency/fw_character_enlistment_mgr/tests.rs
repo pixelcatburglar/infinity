@@ -18,17 +18,17 @@ async fn refusal_preserves_character_and_connection_state() {
         services::tests::fixture::assign_corporation(&test_db, fixture.character, corporation, 0).await.unwrap();
         services::tests::fixture::seed_skill(&test_db, fixture.character).await.unwrap();
         for owner in [fixture.character, foreign.character] {
-            crate::dao::items::transfers::insert(&test_db, 1, owner, owner, crate::consts::FLAG_HANGAR, 3).await.unwrap();
+            crate::dao::items::transfers::insert(&test_db, 1, owner, owner, infinity_core::consts::FLAG_HANGAR, 3).await.unwrap();
         }
         let (mut client, peer) = services::tests::client(test_db.clone(), fixture.character).await;
         client.login.user_id = fixture.account;
-        let args = [Value::Int(crate::consts::FACTION_CALDARI)];
+        let args = [Value::Int(infinity_core::consts::FACTION_CALDARI)];
         client.session.apply(vec![("corpid", Value::Int(1_000_001))]);
         let empty_kwargs = Value::Dict(vec![]);
         let whitelist = Call { service: "fwCharacterEnlistmentMgr", method: "GetCorpAllowedEnlistmentFactions", args: &[], kwargs: &empty_kwargs, bound: false, bind_params: None };
         assert_eq!(services::dispatch(&mut client, &whitelist).await.unwrap(), Value::list(WARFARE_FACTIONS.map(Value::Int)));
         client.session.apply(vec![("corpid", Value::Int(corporation))]);
-        let selected = [Value::list([Value::Int(crate::consts::FACTION_CALDARI)])];
+        let selected = [Value::list([Value::Int(infinity_core::consts::FACTION_CALDARI)])];
         let set = Call { service: "fwCharacterEnlistmentMgr", method: "SetMyCorpAllowedEnlistmentFactions", args: &selected, kwargs: &empty_kwargs, bound: false, bind_params: None };
         assert_eq!(services::dispatch(&mut client, &set).await.unwrap(), Value::None);
         let whitelist = Call { service: "fwCharacterEnlistmentMgr", method: "GetCorpAllowedEnlistmentFactions", args: &[], kwargs: &empty_kwargs, bound: false, bind_params: None };

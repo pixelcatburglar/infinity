@@ -22,7 +22,7 @@ impl BountyConfig {
     pub(super) fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.kill_right_lifetime_days > 0, "bounty.kill_right_lifetime_days={} must be positive", self.kill_right_lifetime_days);
         anyhow::ensure!(self.kill_right_suspect_secs > 0, "bounty.kill_right_suspect_secs={} must be positive", self.kill_right_suspect_secs);
-        super::game::duration("bounty.kill_right_lifetime_days", self.kill_right_lifetime_days, crate::consts::FILETIME_DAY, true)?;
-        super::game::duration("bounty.kill_right_suspect_secs", self.kill_right_suspect_secs, crate::consts::FILETIME_SECOND, true)
+        super::game::duration("bounty.kill_right_lifetime_days", self.kill_right_lifetime_days, infinity_core::consts::FILETIME_DAY, true)?;
+        super::game::duration("bounty.kill_right_suspect_secs", self.kill_right_suspect_secs, infinity_core::consts::FILETIME_SECOND, true)
     }
 }

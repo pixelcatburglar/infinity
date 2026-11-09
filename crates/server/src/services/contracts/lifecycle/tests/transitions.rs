@@ -14,7 +14,7 @@ async fn guarded_transitions_and_auction_errors_preserve_atomic_state() {
         let end = stations.find(|s| s.station_id != station.station_id).unwrap().station_id;
         (station.station_id, station.solar_system_id.unwrap(), i32::try_from(station.type_id.unwrap()).unwrap(), end)
     };
-    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
+    let kind = sde.types.iter().find(|t| t.type_id > 0 && t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let issuer = f::setup(&db, start, station_type).await;
     let buyer = f::setup(&db, start, station_type).await;
     let test_db = db.clone();
@@ -50,8 +50,8 @@ async fn guarded_transitions_and_auction_errors_preserve_atomic_state() {
         assert_eq!(row.get::<_, i32>("status"), STATUS_FAILED);
         let row = db.query_one("SELECT owner_id,location_id,flag_id FROM game.items WHERE item_id=$1", &[&root]).await.unwrap();
         assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (buyer.id, start, f::DELIVERIES));
-        let balance: f64 = db.query_one("SELECT balance::float8 AS balance FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$2", &[&issuer.id, &(ACCOUNT_CASH + 1)]).await.unwrap().get("balance");
-        assert_eq!(balance, 990_050.0);
+        let balance = crate::services::wallets::corp_balance(&db, issuer.id, ACCOUNT_CASH + 1).await.unwrap();
+        assert_eq!(balance, IskAmount::from_cents(99_005_000).unwrap());
         let before_issuer = f::fingerprint(&db, issuer).await;
         let before_buyer = f::fingerprint(&db, buyer).await;
         assert!(matches!(complete(&seller, id, STATUS_FAILED).await, Err(CallError::User { .. })));
@@ -109,8 +109,9 @@ async fn guarded_transitions_and_auction_errors_preserve_atomic_state() {
             |tx, outbox: &mut Outbox| {
                 let sde = Arc::clone(&sde);
                 Box::pin(async move {
-                    ownership::debit(tx, outbox, ownership::FinancialOwner { id: buyer.id, wallet_key: ACCOUNT_CASH + 1 }, 10.0).await?;
-                    custody::hand_over(tx, &sde, outbox, &[root], custody::receiving(buyer.id, start), -rejected).await?;
+                    wallet_ownership::debit(tx, outbox, wallet_ownership::FinancialOwner { id: buyer.id, wallet_key: ACCOUNT_CASH + 1 }, IskAmount::from_cents(1_000).unwrap()).await?;
+                    let preparation = custody::prepare(tx, &sde, &[root], &[]).await?;
+                    custody::hand_over(tx, &sde, outbox, &[root], custody::receiving(buyer.id, start), -rejected, &preparation, &[]).await?;
                     outbox.notify_pilot(buyer.actor.character, "OnContractFailed", vec![]);
                     assert!(!shared::set_status(tx, rejected, STATUS_OUTSTANDING, STATUS_FINISHED, 1, buyer.id, ACCOUNT_CASH + 1).await.map_err(db_err)?);
                     let mut stale = contract(tx, rejected).await?;
@@ -169,9 +170,9 @@ async fn guarded_transitions_and_auction_errors_preserve_atomic_state() {
         assert_eq!(f::fingerprint(&db, buyer).await, before_buyer);
         assert!(buyer_rx.try_recv().is_err());
         assert!(owner_rx.try_recv().is_err());
-        seller.world.unregister_pilot(buyer.actor.character);
-        seller.world.unregister_pilot(issuer.actor.character);
-        courier.world.unregister_pilot(issuer.actor.character);
+        seller.world.unregister_pilot_generation(buyer.actor.character, None);
+        seller.world.unregister_pilot_generation(issuer.actor.character, None);
+        courier.world.unregister_pilot_generation(issuer.actor.character, None);
     }).await;
     f::cleanup(&db, issuer).await;
     f::cleanup(&db, buyer).await;

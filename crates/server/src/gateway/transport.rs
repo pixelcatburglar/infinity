@@ -5,7 +5,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use prost::Message;
 use std::sync::Arc;
 use tracing::{debug, warn};
-use super::{Gateway, events, message::UUID_LEN, protocol::Request, requests::handle_request};
+use infinity_core::consts::UUID_LEN;
+use super::{Gateway, events, protocol::Request, requests::handle_request};
 
 /// HTTP/2's 31-bit flow-control window limit (RFC 9113 §6.9.1); h2 0.4.20
 /// casts reservations to WindowSize (share.rs) and uses this maximum (proto/mod.rs).
@@ -13,11 +14,6 @@ const H2_MAX_WINDOW_RESERVATION: usize = (1 << 31) - 1;
 /// gRPC compression flag and four-byte message length.
 const GRPC_HEADER_LEN: usize = 5;
 
-// RFC 4122 section 3: UUID text uses 8-4-4-4-12 hexadecimal digits.
-const UUID_TEXT_LEN: usize = 36;
-const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
-const UUID_HEX_LETTER_OFFSET: u8 = 10;
-const UUID_NIBBLE_BITS: u32 = 4;
 
 // gRPC status codes: https://grpc.github.io/grpc/core/md_doc_statuscodes.html
 const GRPC_OK: &str = "0";
@@ -50,17 +46,7 @@ fn checked_messages(buf: &mut BytesMut) -> Result<Vec<Bytes>, ()> {
 }
 
 fn application_uuid(headers: &http::HeaderMap) -> Option<[u8; UUID_LEN]> {
-    let text = headers.get("application_instance_uuid")?.to_str().ok()?.as_bytes();
-    if text.len() != UUID_TEXT_LEN || UUID_HYPHEN_POSITIONS.iter().any(|&i| text[i] != b'-') { return None; }
-    let mut result = [0; UUID_LEN];
-    let mut digits = 0;
-    for (i, &c) in text.iter().enumerate() {
-        if UUID_HYPHEN_POSITIONS.contains(&i) { continue; }
-        let n = match c { b'0'..=b'9' => c - b'0', b'a'..=b'f' => c - b'a' + UUID_HEX_LETTER_OFFSET, _ => return None };
-        if digits % 2 == 0 { result[digits / 2] = n << UUID_NIBBLE_BITS; } else { result[digits / 2] |= n; }
-        digits += 1;
-    }
-    Some(result)
+    crate::uuid_text::parse(headers.get("application_instance_uuid")?.to_str().ok()?, crate::uuid_text::Case::Lowercase)
 }
 
 fn ok_headers() -> http::Response<()> {

@@ -79,7 +79,6 @@ fn commands(system: &mut System, name: &str) {
                 let point = [x, i as f64 * 10000.0, 0.0];
                 let factor = if i % 2 == 0 { 3000 } else { 13000 };
                 system.command(101 + i, move |b, _, _| {
-                    b.warp_factor = factor;
                     b.warp_to(point, 20000.0, factor);
                     vec![]
                 });

@@ -4,13 +4,13 @@
 //! before transaction retries. Deployed entities require World removal and are
 //! unsupported; only reachable local inventory custody is accepted.
 use std::collections::{BTreeMap, HashSet};
-use crate::{client::filetime_now, consts::{dogma::ATTR_CAPACITY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_BOOSTER, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, FLAG_IMPLANT, FLAG_PILOT, IX_LOCATION_ID, IX_STACK_SIZE, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1}, dao::{self, items::{creation, dogma, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}}}, db::{executor::Executor, outbox::Outbox}, messages::dynamic_items as msg, sde::{Sde, dynamic_items::Mutation}, services::{db_err, fit::base_attribute, has_role_or_is_ceo, inventory, items::load_items, notify_error, CallError}};
+use std::sync::Arc;
+use infinity_core::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_BOOSTER, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, FLAG_IMPLANT, FLAG_PILOT, FLAG_SHIP_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, ROLE_HANGAR_CAN_TAKE_1}, messages::dynamic_items as msg};
+use crate::{client::filetime_now, dao::{self, items::{creation, dogma, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}}}, db::{executor::Executor, outbox::Outbox}, sde::{Sde, dynamic_items::Mutation}, services::{db_err, fit::base_attribute, inventory, items::load_items, notify_error, CallError}};
 use marshal::Value;
 
 /// Server policy: bound ancestry traversal to prevent cycles and pathological nesting.
 const MAX_CUSTODY_DEPTH: usize = 32;
-/// Client inventorycommon/const.py flagShipHangar: ship-maintenance hangar.
-const FLAG_SHIP_HANGAR: i32 = 90;
 
 #[derive(Clone)]
 pub(super) struct Context { pub character: i64, pub station: Option<i64>, pub ship: Option<i64>, pub system: Option<i64> }
@@ -67,7 +67,7 @@ async fn custody(ex: &(impl Executor + ?Sized), sde: &Sde, context: &Context, in
         if let Some(corp) = dao::offices::owner(ex, parent).await.map_err(db_err)? {
             let station = context.station.ok_or_else(|| notify_error(msg::OFFICE))?;
             let division = current.flag_id.checked_sub(FLAG_CORP_SAG1).filter(|division| (0..CORP_HANGAR_DIVISIONS).contains(division)).ok_or_else(|| notify_error(msg::OFFICE))?;
-            if dao::offices::at(ex, corp, station).await.map_err(db_err)? != Some(parent) || !has_role_or_is_ceo(ex, context.character, corp, ROLE_DIRECTOR | (ROLE_HANGAR_CAN_TAKE_1 << division)).await? { return Err(notify_error(msg::OFFICE)); }
+            if dao::offices::at(ex, corp, station).await.map_err(db_err)? != Some(parent) || !crate::services::corps::permissions::has_at(ex, context.character, corp, station, ROLE_HANGAR_CAN_TAKE_1 << division).await? { return Err(notify_error(msg::OFFICE)); }
             return Ok(());
         }
         let container = item(ex, sde, parent).await?.ok_or_else(|| notify_error(msg::INACCESSIBLE))?;
@@ -78,11 +78,45 @@ async fn custody(ex: &(impl Executor + ?Sized), sde: &Sde, context: &Context, in
     Err(notify_error(msg::INACCESSIBLE))
 }
 
-pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox, context: &Context, mutator_id: i64, source_id: i64, draws: &BTreeMap<i32, f64>) -> Result<i64, CallError> {
+pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox, context: &Context, expected_mutator: &Item, expected_source: &Item, draws: &BTreeMap<i32, f64>) -> Result<i64, CallError> {
+    let mutator_id = expected_mutator.item_id;
+    let source_id = expected_source.item_id;
     if mutator_id <= 0 || source_id <= 0 || mutator_id == source_id || context.character <= 0 { return Err(notify_error(msg::INVALID_ARGUMENT)); }
     let mutator = item(ex, sde, mutator_id).await?.ok_or_else(|| notify_error(msg::INVALID_ITEMS))?;
     let source = item(ex, sde, source_id).await?.ok_or_else(|| notify_error(msg::INVALID_ITEMS))?;
     if source.owner_id != context.character || mutator.owner_id != context.character || !source.singleton || source.quantity != 1 || mutator.quantity < 1 || context.ship == Some(source_id) { return Err(notify_error(msg::INVALID_ITEMS)); }
+    if [&mutator, &source].iter().zip([expected_mutator, expected_source]).any(|(current, expected)|
+        (current.type_id, current.owner_id, current.location_id, current.flag_id, current.quantity, current.singleton)
+            != (expected.type_id, expected.owner_id, expected.location_id, expected.flag_id, expected.quantity, expected.singleton)) {
+        return Err(notify_error(msg::CHANGED));
+    }
+    use crate::dao::items::parent_locks::{LockRequest, LockStrength};
+    let source_lineage = dao::items::deliveries::ancestry(ex, source.location_id).await.map_err(db_err)?;
+    let mutator_lineage = dao::items::deliveries::ancestry(ex, mutator.location_id).await.map_err(db_err)?;
+    let mut requests = vec![
+        LockRequest { item_id: source_id, strength: LockStrength::Update },
+        LockRequest { item_id: mutator_id, strength: LockStrength::Update },
+    ];
+    requests.extend(inventory::destination::parent_requests(sde,
+        source_lineage.iter().chain(mutator_lineage.iter()).map(|row| (row.item_id, row.type_id)),
+        LockStrength::Update, LockStrength::Share)?);
+    let mut parents = BTreeMap::new();
+    for (location, lineage) in [(source.location_id, &source_lineage), (mutator.location_id, &mutator_lineage)] {
+        if let Some(row) = lineage.iter().find(|row| row.item_id == location)
+            .filter(|row| inventory::hold_storage::is_ordinary_container(sde, row.type_id)) {
+            parents.insert(location, row.owner_id);
+            requests.push(LockRequest { item_id: location, strength: LockStrength::Update });
+        }
+    }
+    let locks = inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
+    if dao::items::deliveries::ancestry(ex, source.location_id).await.map_err(db_err)? != source_lineage
+        || dao::items::deliveries::ancestry(ex, mutator.location_id).await.map_err(db_err)? != mutator_lineage
+        || [expected_source, expected_mutator].iter().any(|item| !locks.row(item.item_id).is_some_and(|row|
+            row.jump_clone_id.is_none() && row.type_id == item.type_id && row.owner_id == item.owner_id
+                && row.location_id == item.location_id && row.flag_id == item.flag_id
+                && row.quantity == item.quantity && row.singleton == item.singleton)) {
+        return Err(notify_error(msg::CHANGED));
+    }
     let ids = [source_id, mutator_id];
     if !dao::trades::reserved(ex, &ids).await.map_err(db_err)?.is_empty() || dao::industry::has_active_blueprint_job(ex, &ids).await.map_err(db_err)? { return Err(notify_error(msg::RESERVED)); }
     custody(ex, sde, context, &source).await?;
@@ -91,8 +125,21 @@ pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mu
     let mutation = sde.dynamic_items.get(mutator.type_id).ok_or_else(|| notify_error(msg::INCOMPATIBLE))?;
     let result_type = mutation.result_type(source.type_id).ok_or_else(|| notify_error(msg::INCOMPATIBLE))?;
     let (bases, factors) = attributes(sde, source.type_id, mutation, draws)?;
-    // Compatible item types are immutable; inventory, condition, reservation, and job mutations serialize under the held economy lock.
-    let changes = BTreeMap::from([(source_id, QuantityChange::new(&source, None)), (mutator_id, QuantityChange::new(&mutator, (mutator.quantity > 1).then_some(mutator.quantity - 1)))]);
+    for (location, owner) in parents {
+        let mut replaced = Vec::new();
+        let mut additions = Vec::new();
+        if source.location_id == location { replaced.push(source_id); }
+        if mutator.location_id == location {
+            replaced.push(mutator_id);
+            if mutator.quantity > 1 {
+                additions.push(inventory::hold_storage::Addition { type_id: mutator.type_id, singleton: mutator.singleton, quantity: mutator.quantity - 1 });
+            }
+            additions.push(inventory::hold_storage::Addition { type_id: result_type, singleton: true, quantity: 1 });
+        }
+        inventory::hold_storage::check_destination(ex, sde, owner, location, FLAG_CARGO, &additions,
+            inventory::hold_storage::Replaced { items: &replaced, reloads: &[] }, None).await?;
+    }
+    let changes = BTreeMap::from([(source_id, QuantityChange::new(&source, None)), (mutator_id, QuantityChange::new(&mutator, (mutator.quantity > 1).then_some(mutator.quantity - 1))) ]);
     if !quantities::apply(ex, &changes).await.map_err(db_err)? { return Err(notify_error(msg::CHANGED)); }
     let result = creation::rookie_ship(ex, result_type, context.character, mutator.location_id, mutator.flag_id).await.map_err(db_err)?;
     for (&id, &value) in &bases {
@@ -102,7 +149,7 @@ pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mu
     dao::dynamic_items::insert(ex, &metadata).await.map_err(db_err)?;
     inventory::notifications::notify_item_removed(outbox, source);
     if mutator.quantity == 1 { inventory::notifications::notify_item_removed(outbox, mutator); } else {
-        inventory::notifications::notify_item_change(ex, sde, outbox, mutator_id, vec![(IX_STACK_SIZE, Value::Int(i64::from(mutator.quantity)))]).await?;
+        inventory::notifications::notify_item_change(ex, sde, outbox, mutator_id, vec![(IX_STACK_SIZE, Value::Int(mutator.quantity))]).await?;
     }
     inventory::notifications::notify_item_change(ex, sde, outbox, result, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
     Ok(result)

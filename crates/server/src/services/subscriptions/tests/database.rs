@@ -51,13 +51,13 @@ async fn reapplying_schema_preserves_established_alpha_and_finite_rows() {
     let alpha = crate::services::tests::fixture::create(&db).await.unwrap();
     let finite = crate::services::tests::fixture::create(&db).await.unwrap();
     let missing = crate::services::tests::fixture::create(&db).await.unwrap();
-    let expiry = crate::client::filetime_now() + crate::consts::FILETIME_SECOND;
+    let expiry = crate::client::filetime_now() + infinity_core::consts::FILETIME_SECOND;
     db.execute("UPDATE game.account_clone_grades SET grade=0 WHERE user_id=$1", &[&alpha.account]).await.unwrap();
-    db.execute("UPDATE game.account_clone_grades SET omega_until=$2, grace_until=$3 WHERE user_id=$1", &[&finite.account, &expiry, &(expiry + crate::consts::FILETIME_SECOND)]).await.unwrap();
+    db.execute("UPDATE game.account_clone_grades SET omega_until=$2, grace_until=$3 WHERE user_id=$1", &[&finite.account, &expiry, &(expiry + infinity_core::consts::FILETIME_SECOND)]).await.unwrap();
     db.execute("DELETE FROM game.account_clone_grades WHERE user_id=$1", &[&missing.account]).await.unwrap();
     Db::connect(&DatabaseConfig { schema_on_start: true, ..crate::config::tests::test_database() }).await.unwrap();
     let row = dao::by_user(&db, finite.account).await.unwrap();
-    assert_eq!((row.grade, row.omega_until, row.grace_until), (1, Some(expiry), Some(expiry + crate::consts::FILETIME_SECOND)));
+    assert_eq!((row.grade, row.omega_until, row.grace_until), (1, Some(expiry), Some(expiry + infinity_core::consts::FILETIME_SECOND)));
     assert_eq!(dao::by_user(&db, alpha.account).await.unwrap().grade, rules::ALPHA);
     assert_eq!(dao::by_user(&db, missing.account).await.unwrap().grade, rules::OMEGA);
     for fixture in [alpha, finite, missing] { crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap(); }
@@ -92,7 +92,7 @@ async fn deadline_handler_replay_renewal_future_and_recovery() {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let _guard = registration.attach_sender(sender).unwrap();
     let now = crate::client::filetime_now();
-    let second = crate::consts::FILETIME_SECOND;
+    let second = infinity_core::consts::FILETIME_SECOND;
     let expired = arrange(&db, fixture.account, now - 3 * second, now - second).await;
     let old = job(&expired);
     deadlines::schedule(&db, &expired).await.unwrap();
@@ -127,7 +127,7 @@ async fn deadline_handler_replay_renewal_future_and_recovery() {
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn management_grants_are_atomic_and_notify_account_in_order() {
-    use crate::consts::GM_ROLES;
+    use infinity_core::consts::GM_ROLES;
     use marshal::Value;
     let db = db().await;
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -151,7 +151,7 @@ async fn management_grants_are_atomic_and_notify_account_in_order() {
     management::set(&db, &client.world, fixture.account, GM_ROLES, fixture.account, rules::OMEGA, Some(600), 120).await.unwrap();
     let finite = dao::by_user(&db, fixture.account).await.unwrap();
     assert_eq!(finite.revision, alpha.revision + 1);
-    assert_eq!(finite.grace_until.unwrap() - finite.omega_until.unwrap(), 120 * crate::consts::FILETIME_SECOND);
+    assert_eq!(finite.grace_until.unwrap() - finite.omega_until.unwrap(), 120 * infinity_core::consts::FILETIME_SECOND);
     assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionChangedServer".into(), vec![Value::Int(1)]));
     let time = crate::client::unix_ns_from_filetime(finite.omega_until.unwrap()).unwrap();
     assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionTimeUpdateServer".into(), vec![Value::Int(time)]));
@@ -164,10 +164,10 @@ async fn management_grants_are_atomic_and_notify_account_in_order() {
     assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionTimeUpdateServer".into(), vec![Value::Int(crate::client::unix_ns_from_filetime(changed.omega_until.unwrap()).unwrap())]));
     assert!(receiver.try_recv().is_err());
     management::set(&db, &client.world, fixture.account, GM_ROLES, fixture.account, rules::OMEGA, None, 0).await.unwrap();
-    assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionTimeUpdateServer".into(), vec![Value::Int(crate::client::unix_ns_from_filetime(crate::consts::FAR_FUTURE).unwrap())]));
+    assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionTimeUpdateServer".into(), vec![Value::Int(crate::client::unix_ns_from_filetime(infinity_core::consts::FAR_FUTURE).unwrap())]));
     assert!(crate::dao::jobs::lock_job(&db, &format!("{}:{}", deadlines::KIND, fixture.account)).await.unwrap().is_none());
     let now = crate::client::filetime_now();
-    arrange(&db, fixture.account, now - 2 * crate::consts::FILETIME_SECOND, now - crate::consts::FILETIME_SECOND).await;
+    arrange(&db, fixture.account, now - 2 * infinity_core::consts::FILETIME_SECOND, now - infinity_core::consts::FILETIME_SECOND).await;
     management::set(&db, &client.world, fixture.account, GM_ROLES, fixture.account, rules::ALPHA, None, 0).await.unwrap();
     assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionChangedServer".into(), vec![Value::Int(0)]));
     assert_eq!(receiver.try_recv().unwrap(), ("OnSubscriptionTimeUpdateServer".into(), vec![Value::Int(0)]));
@@ -188,7 +188,7 @@ async fn rpc_grade_and_subscription_time_share_grace_authority() {
     let (mut client, _peer) = crate::services::tests::client(db.clone(), 0).await;
     client.login.user_id = fixture.account;
     let now = crate::client::filetime_now();
-    let second = crate::consts::FILETIME_SECOND;
+    let second = infinity_core::consts::FILETIME_SECOND;
     let finite = arrange(&db, fixture.account, now - second, now + 600 * second).await;
     let kwargs = Value::Dict(vec![]);
     let grade = crate::services::dispatch(&mut client, &call("subscriptionMgr", "GetCloneGrade", &kwargs)).await.unwrap();

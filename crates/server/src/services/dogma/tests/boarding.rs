@@ -8,7 +8,7 @@ async fn reconciled_ship_state_is_a_four_tuple_under_outer_lock() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let ship_type = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)).unwrap().type_id;
+    let ship_type = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)).unwrap().type_id;
     let before = fixture::fingerprint(&db).await.unwrap();
     let fixture = fixture::create(&db, ship_type, 1).await.unwrap();
     let test_db = db.clone();

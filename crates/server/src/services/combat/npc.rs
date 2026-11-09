@@ -4,8 +4,8 @@
 //! The client has no NPC server combat implementation to mirror.
 use super::*;
 use crate::services::effects::{notify::fire_fx, weapons::{launch_missile, turret_shot, Missile}};
-use crate::consts::dogma::ATTR_AGILITY;
-use crate::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER};
+use infinity_core::consts::dogma::ATTR_AGILITY;
+use infinity_core::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER};
 use crate::sde::types::TypeData;
 use crate::space::{MODE_STOP, V3};
 
@@ -40,7 +40,6 @@ pub(crate) async fn spawn(db: &Db, world: &Arc<World>, system: i64, data: &TypeD
         massive: true,
         interactive: false,
         warp: crate::space::WarpState::default(),
-        warp_factor: 0,
         last_ms: tick,
         interpolation_anchor_ms: tick,
         effect_stamp: 0,
@@ -131,7 +130,8 @@ pub(super) fn npc_missile_kinematics(velocity: f64, flight_ms: f64, velocity_mul
 
 
 /// `me` and `victim` are the actor-sampled shot snapshots captured before worker dispatch.
-pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball, generation: u64) -> Result<(), CallError> {
+pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball, generation: u64,
+    missile_attempt: Option<crate::services::effects::space_source::PreparedCombatAttempt>, turret_attempt: Option<crate::services::effects::space_source::PreparedCombatAttempt>) -> Result<(), CallError> {
     let target = victim.id;
     let Some(Some(projections)) = world.with(system, move |s|
         s.npc_projection_valid(id, target, generation).then(|| s.projections_on(id))).await else { return Ok(()) };
@@ -148,6 +148,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
     let owner_id = me.owner_id;
     let can_turret = stats.damage.iter().any(|d| *d > 0.0) && gap <= optimal + falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER;
+    let guard = crate::services::effects::space_source::SourceGuard::Npc { source: id, target, generation };
     if let Some((charge, multiplier)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
         let (velocity, flight) = npc_missile_kinematics(
@@ -155,6 +156,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
             attr(world.sde(), charge, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS),
             velocity_multiplier, flight_multiplier);
         if gap <= flight {
+            let attempt = missile_attempt.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing NPC missile admission")))?;
             let missile = Missile {
                 charge,
                 raw: ATTR_DAMAGE.map(|a| attr(world.sde(), charge, a, 0.0) * multiplier),
@@ -166,22 +168,22 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
                 velocity,
                 flight_range: flight,
                 weapon: type_id,
-                attacker: None,
+                illegal: false,
             };
             launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), owner_id, None, missile,
-                Some(crate::services::effects::space_source::SourceGuard::Npc { source: id, target, generation })).await?;
+                Some(guard), attempt).await?;
         }
     }
     if can_turret {
-        if world.with(system, move |s| s.npc_projection_valid(id, target, generation)).await != Some(true) { return Ok(()); }
+        let attempt = turret_attempt.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing NPC turret admission")))?;
         if let Some(guid) = stats.fx.as_deref() {
             let guid = guid.to_owned();
             let duration = stats.rate_of_fire_ms;
             world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, true, duration, 1)]);
         }
-        turret_shot(db, world, system, &me, &victim, None, type_id,
+        turret_shot(db, world, system, &me, &victim, None, type_id, false,
             (optimal, falloff, tracking, stats.opt_sig), stats.damage,
-            Some(crate::services::effects::space_source::SourceGuard::Npc { source: id, target, generation })).await?;
+            Some(guard), attempt).await?;
     }
     Ok(())
 }
@@ -192,20 +194,27 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
 /// A damaged NPC boosts its shield and repairs its armor every repair cycle.
 pub(super) fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
     let (shield, armor, _) = stats.repairs;
-    if shield <= 0.0 && armor <= 0.0 {
-        return;
-    }
-    let health = {
-        let mut st = state();
-        let Some(hp) = st.hp.get_mut(&id) else { return };
-        if hp.now[0] >= hp.max[0] && hp.now[1] >= hp.max[1] {
-            return;
-        }
-        hp.now[0] = (hp.now[0] + shield).min(hp.max[0]);
-        hp.now[1] = (hp.now[1] + armor).min(hp.max[1]);
-        [0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 })
-    };
-    world.set_health(system, id, health);
+    if shield <= 0.0 && armor <= 0.0 { return; }
+    world.post(system, move |s| {
+        if !s.is_npc(id) { return; }
+        let Some((max, current)) = s.combat_health_scalars(id) else { return };
+        if max[2] <= 0.0 || current[2] >= max[2] { return; }
+        let shield_changed = match s.repair_condition(id, 0, shield, crate::space::combat::RepairSource::Local) {
+            Ok(changed) => changed,
+            Err(error) => { tracing::warn!("NPC local shield repair refused: {error:?}"); false }
+        };
+        let armor_changed = match s.repair_condition(id, 1, armor, crate::space::combat::RepairSource::Local) {
+            Ok(changed) => changed,
+            Err(error) => { tracing::warn!("NPC local armor repair refused: {error:?}"); false }
+        };
+        if !shield_changed && !armor_changed { return; }
+        let Some((max, current)) = s.combat_health_scalars(id) else { return };
+        let health = [0, 1, 2].map(|i| if max[i] > 0.0 {
+            if i == 0 { (current[i] / max[i]).clamp(0.0, 1.0) }
+            else { (1.0 - current[i] / max[i]).clamp(0.0, 1.0) }
+        } else { 0.0 });
+        s.set_health(id, health);
+    });
 }
 
 

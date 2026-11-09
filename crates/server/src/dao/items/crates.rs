@@ -38,17 +38,4 @@ pub(crate) async fn acknowledge(
     ).await?.is_some())
 }
 
-pub(crate) async fn cargo_capacity(
-    ex: &(impl Executor + ?Sized),
-    ship_id: i64,
-    cargo_location: i64,
-    cargo_flag: i32,
-) -> Result<Option<(f64, f64)>, db::Error> {
-    let row = ex.query_opt(
-        "SELECT COALESCE((SELECT SUM(i.quantity * t.volume) FROM game.items i JOIN sde.inv_types t ON t.type_id=i.type_id WHERE i.location_id=$2 AND i.flag_id=$3),0)::float8 AS used, COALESCE(ship_t.capacity, 0)::float8 AS capacity
-         FROM game.items ship JOIN sde.inv_types ship_t ON ship_t.type_id=ship.type_id WHERE ship.item_id=$1 FOR UPDATE",
-        &[&ship_id, &cargo_location, &cargo_flag],
-    ).await?;
-    Ok(row.map(|row| (row.get("used"), row.get("capacity"))))
-}
 

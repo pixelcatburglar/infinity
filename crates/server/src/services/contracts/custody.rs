@@ -6,14 +6,51 @@
 //! Transactions and courier package authorization remain with lifecycle callers; structures
 //! are not supported.
 
-use crate::consts::{FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, LOCATION_JUNKYARD};
+use infinity_core::consts::{FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, LOCATION_JUNKYARD};
 use crate::dao::{contracts::Contract, items::{inventory as item_inventory, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}};
 use crate::db::{executor::Executor, outbox::Outbox};
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::services::{corps, db_err, inventory, items::load_items, notify_error, offices, CallError};
 use marshal::Value;
 use std::collections::BTreeMap;
+
+pub(super) struct Preparation<'tx> {
+    pub locks: crate::dao::items::parent_locks::LockedItems<'tx>,
+    pub closure: Vec<i64>,
+}
+
+pub(super) async fn prepare<'tx>(
+    ex: &'tx (impl Executor + ?Sized), sde: &Sde, roots: &[i64], extra: &[i64],
+) -> Result<Preparation<'tx>, CallError> {
+    use crate::dao::items::{deliveries, parent_locks::{self, LockRequest, LockStrength}};
+    let closure = item_inventory::descendants(ex, roots).await.map_err(db_err)?;
+    let mut writes = closure.clone();
+    writes.extend_from_slice(extra);
+    writes.sort_unstable();
+    writes.dedup();
+    let captured = parent_locks::capture(ex, &writes).await.map_err(db_err)?;
+    let lineage = deliveries::ancestry_many(ex, &writes).await.map_err(db_err)?;
+    let mut requests: Vec<_> = writes.iter().map(|&item_id| LockRequest { item_id, strength: LockStrength::Update }).collect();
+    requests.extend(lineage.iter().filter(|row| writes.binary_search(&row.ancestor.item_id).is_err()).map(|row| LockRequest {
+        item_id: row.ancestor.item_id,
+        strength: if sde.types.get(row.ancestor.type_id).is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP)) {
+            LockStrength::Update
+        } else { LockStrength::Share },
+    }));
+    let locks = inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
+    let stale = || notify_error(messages::CONTRACT_ITEM_MISSING);
+    if roots.iter().any(|id| closure.binary_search(id).is_err()) || captured.len() != writes.len()
+        || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row|
+            row.type_id == old.type_id && row.owner_id == old.owner_id && row.location_id == old.location_id
+            && row.flag_id == old.flag_id && row.quantity == old.quantity && row.singleton == old.singleton
+            && row.jump_clone_id == old.jump_clone_id))
+        || item_inventory::descendants(ex, roots).await.map_err(db_err)? != closure
+        || deliveries::ancestry_many(ex, &writes).await.map_err(db_err)? != lineage {
+        return Err(stale());
+    }
+    Ok(Preparation { locks, closure })
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Custody { pub owner: i64, pub location: i64, pub flag: i32 }
@@ -21,7 +58,7 @@ pub(super) struct Custody { pub owner: i64, pub location: i64, pub flag: i32 }
 pub(super) async fn issuer_source(ex: &(impl Executor + ?Sized), actor: i64, corp: i64, for_corp: bool, station: i64, requested_flag: i32) -> Result<Custody, CallError> {
     if !for_corp { return Ok(Custody { owner: actor, location: station, flag: FLAG_HANGAR }); }
     let flag = if requested_flag == FLAG_HANGAR { FLAG_CORP_SAG1 } else { requested_flag };
-    if !corps::is_player_corp(corp) || !inventory::access::may_take_corp_hangar(ex, actor, corp, flag).await? {
+    if !corps::is_player_corp(corp) || !inventory::access::may_take_corp_hangar(ex, actor, corp, station, flag).await? {
         return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE));
     }
     let location = if flag == FLAG_CORP_DELIVERIES { station } else {
@@ -42,7 +79,13 @@ pub(super) async fn issuer_return(ex: &(impl Executor + ?Sized), contract: &Cont
     Ok(receiving(contract.issuer_corp, contract.start))
 }
 
-pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, roots: &[i64], destination: Custody, old_location: i64) -> Result<(), CallError> {
+pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, roots: &[i64], destination: Custody, old_location: i64, preparation: &Preparation<'_>, created: &[i64]) -> Result<(), CallError> {
+    let closure = item_inventory::descendants(ex, roots).await.map_err(db_err)?;
+    if roots.iter().any(|id| closure.binary_search(id).is_err())
+        || created.iter().any(|id| !roots.contains(id))
+        || closure.iter().any(|id| preparation.closure.binary_search(id).is_err() && !created.contains(id)) {
+        return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
+    }
     let old = load_items(ex, sde, ItemQuery::Ids(roots)).await.map_err(db_err)?;
     if old.len() != roots.len() || old.iter().any(|item| item.location_id != old_location) { return Err(notify_error(messages::CONTRACT_ITEM_MISSING)); }
     for item in &old {
@@ -55,7 +98,7 @@ pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde,
         }
     }
     let plan: Vec<_> = old.iter().map(|item| transfers::Transfer { item_id: item.item_id, owner: destination.owner, location: destination.location, flag: destination.flag }).collect();
-    transfers::hand_over(ex, &plan).await.map_err(db_err)?;
+    transfers::hand_over(ex, &plan, &closure, &preparation.locks, created).await.map_err(db_err)?;
     let docked = if corps::is_player_corp(destination.owner) { false } else { transfers::docked(ex, destination.owner).await.map_err(db_err)? == Some(destination.location) };
     for item in load_items(ex, sde, ItemQuery::Ids(roots)).await.map_err(db_err)? {
         let previous = old.iter().find(|old| old.item_id == item.item_id).ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;

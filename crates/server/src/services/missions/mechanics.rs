@@ -172,26 +172,35 @@ async fn goods_at(c: &Client, station: i64, type_id: i32) -> Result<Vec<crate::d
 }
 
 pub(super) async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i32)) -> Result<bool, CallError> {
-    Ok(goods_at(c, station, type_id).await?.iter().map(|i| crate::services::item_volume::stack_size(i.singleton, i64::from(i.quantity))).sum::<i64>() >= qty as i64)
+    let available = goods_at(c, station, type_id).await?.iter().try_fold(0_i128, |total, item| {
+        total.checked_add(i128::from(crate::services::item_volume::stack_size(item.singleton, item.quantity)))
+    }).ok_or_else(|| CallError::Internal(anyhow::anyhow!("mission inventory quantity overflow")))?;
+    Ok(available >= i128::from(qty))
 }
 
-/// Take delivered goods using guarded item changes, retaining inventory notification order.
-async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut crate::db::outbox::Outbox<X>, me: i64, station: i64, ship: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
-    use crate::dao::items::{loading::ItemQuery, quantities::{self, QuantityChange}};
+/// Plan delivered goods before acquiring item locks.
+async fn plan_goods(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, me: i64, station: i64, ship: i64, (type_id, qty): (i32, i32)) -> Result<(Vec<crate::dao::items::loading::Item>, std::collections::BTreeMap<i64, crate::dao::items::quantities::QuantityChange>), CallError> {
+    use crate::dao::items::{loading::ItemQuery, quantities::QuantityChange};
     let items = crate::services::items::load_items(db, sde, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)?;
     if qty <= 0 { return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR)); }
-    let mut left = qty;
+    let mut left = i64::from(qty);
     let mut changes = std::collections::BTreeMap::new();
     for item in &items {
         if left <= 0 { break; }
-        let available = crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity));
-        let take = available.min(i64::from(left)).max(0) as i32;
+        let available = crate::services::item_volume::stack_size(item.singleton, item.quantity);
+        let take = available.min(left).max(0);
         if take == 0 { continue; }
         left -= take;
-        let remaining = if item.singleton || i64::from(take) == available { None } else { Some(item.quantity - take) };
+        let remaining = if item.singleton || take == available { None } else { Some(item.quantity - take) };
         changes.insert(item.item_id, QuantityChange::new(item, remaining));
     }
-    if left > 0 || !quantities::apply(db, &changes).await.map_err(db_err)? {
+    if left > 0 { return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR)); }
+    Ok((items, changes))
+}
+
+/// Apply the guarded plan, retaining inventory notification order.
+async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut crate::db::outbox::Outbox<X>, items: Vec<crate::dao::items::loading::Item>, changes: std::collections::BTreeMap<i64, crate::dao::items::quantities::QuantityChange>) -> Result<(), CallError> {
+    if !crate::dao::items::quantities::apply(db, &changes).await.map_err(db_err)? {
         return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
     }
     for item in items {
@@ -199,7 +208,7 @@ async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized),
             if change.quantity.is_none() {
                 super::inventory::notifications::notify_item_removed(outbox, item);
             } else {
-                super::inventory::notifications::notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                super::inventory::notifications::notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity))]).await?;
             }
         }
     }
@@ -228,14 +237,16 @@ pub(super) async fn ready(c: &Client, m: &Mission, agent: &Agent) -> Result<bool
 pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize>) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let ship = if c.session.int("stationid") == Some(agent.station_id) { c.session.int("shipid").unwrap_or(0) } else { 0 };
+    let fact_ship = c.session.int("shipid").filter(|id| *id > 0);
+    let fact_system = c.session.int("solarsystemid2").filter(|id| *id > 0);
+    let fact_station = c.session.int("stationid").filter(|id| *id > 0);
     let cargo = if matches!(m.kind, Kind::Courier | Kind::Trade) { m.cargo } else { None };
     let mut reward = None;
     let mut unlocked = Vec::new();
     if m.arc_id.is_some() {
         if let Some(data) = c.sde.missions.get(m.mission_id) {
             if let (Some(type_id), Some(quantity)) = (data.reward_type.filter(|id| *id != TYPE_CREDITS as i32), data.reward_quantity) {
-                let qty = i32::try_from(quantity).map_err(|_| CallError::Internal(anyhow::anyhow!("mission reward quantity out of range")))?;
-                reward = Some((type_id, qty.max(1)));
+                reward = Some((type_id, quantity.max(1)));
             }
         }
         let next = c.sde.missions.step(m.mission_id).map(|s| s.next.clone()).unwrap_or_default();
@@ -266,8 +277,38 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
             let arc_states = arc_states.clone();
             let sde = sde.clone();
             Box::pin(async move {
-                if let Some(cargo) = cargo {
-                    take_goods(tx, &sde, outbox, me, station, ship, cargo).await?;
+                use crate::dao::items::parent_locks::{LockRequest, LockStrength};
+                let goods = if let Some(cargo) = cargo {
+                    Some(plan_goods(tx, &sde, me, station, ship, cargo).await?)
+                } else { None };
+                let mut reward_plan = if arc.is_some() {
+                    if let Some((type_id, qty)) = reward {
+                        let destination = crate::services::inventory::destination::Destination::owned(me, station, FLAG_HANGAR);
+                        Some((super::items::DepositPreparation::capture(tx, &sde, &destination, type_id).await?, qty))
+                    } else { None }
+                } else { None };
+                let source_hull = goods.as_ref().is_some_and(|(items, changes)| items.iter().any(|item| item.location_id == ship && changes.contains_key(&item.item_id)));
+                let locks = if source_hull || reward_plan.as_ref().is_some_and(|(prep, _)| !prep.is_excluded()) {
+                    let mut requests: Vec<_> = goods.as_ref().into_iter().flat_map(|(_, changes)| changes.keys())
+                        .map(|&item_id| LockRequest { item_id, strength: LockStrength::Update }).collect();
+                    if source_hull {
+                        requests.push(LockRequest { item_id: ship, strength: LockStrength::Update });
+                    }
+                    let mut candidates = Vec::new();
+                    if let Some((preparation, _)) = &reward_plan {
+                        if let Some(request) = preparation.candidate_request() {
+                            if !requests.iter().any(|mandatory| mandatory.item_id == request.item_id) {
+                                candidates.push(request.item_id);
+                            }
+                            requests.push(request);
+                        }
+                    }
+                    Some(crate::services::inventory::destination::lock_items(tx, &sde, &requests, &candidates).await?)
+                } else {
+                    None
+                };
+                if let Some((items, changes)) = goods {
+                    take_goods(tx, &sde, outbox, items, changes).await?;
                 }
                 if offered_interaction && crate::dao::missions::accept_offered(tx, me, mission_agent, mission_id, STATE_OFFERED, STATE_ACCEPTED, stamp).await.map_err(db_err)? == 0 {
                     return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
@@ -279,19 +320,18 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                     return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
                 }
                 outbox.operation(());
-                if reward_isk > 0 {
-                    let balance = crate::dao::wallets::characters::credit(tx, me, reward_isk as f64).await.map_err(db_err)?;
-                    outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
-                    outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: me, account_key: crate::consts::ACCOUNT_CASH, balance, delta: reward_isk as f64 });
-                }
-                super::standings::add_lp(tx, outbox, me, corp, reward_lp).await?;
+                crate::services::corps::tax::settle_whole_reward(tx, outbox, me, reward_isk, Some(crate::services::corps::tax::LoyaltyReward {
+                    issuer: corp, amount: reward_lp,
+                    mutation: super::standings::LoyaltyMutation {
+                        reason: crate::lua::events::resources::LoyaltyReason::MissionReward,
+                        occurred_at: filetime_now(),
+                        context: crate::lua::events::resources::FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: fact_ship, ship_type_id: None, system_id: fact_system, station_id: fact_station, origin: crate::lua::events::resources::FactOrigin::Natural },
+                    },
+                })).await?;
                 super::standings::mission_completed(tx, outbox, me, agent_id, corp, faction, level).await?;
                 if let Some(arc) = arc {
-                    if let Some((type_id, qty)) = reward {
-                        // Deposit selects its target stack itself, which may sort below consumed
-                        // stacks. The economy lock serializes economy operations; the transaction
-                        // runner retries deadlocks once.
-                        super::items::deposit(tx, &sde, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
+                    if let Some((preparation, qty)) = &mut reward_plan {
+                        super::items::deposit_prepared(tx, &sde, outbox, preparation, *qty, 0, locks.as_ref(), None, Default::default(), None).await?;
                     }
                     for &(id, state, state_stamp) in arc_states.as_ref().unwrap().iter() {
                         if offered_interaction && id == mission_id && state == "completed" {
@@ -312,7 +352,6 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 for entry in outbox.into_entries() {
                     match entry {
                         crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
-                        crate::db::outbox::Effect::Event(event) => crate::lua::on_event(event),
                         crate::db::outbox::Effect::Operation(()) => despawn(client, me, mission_agent),
                     }
                 }

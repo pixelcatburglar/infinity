@@ -7,7 +7,7 @@ use super::{delivery, text_argument, MAX_RECIPIENTS, STATUS_READ};
 use crate::client::Client;
 use crate::dao::mail::{self, LabelAction, Selector};
 use crate::db::Db;
-use crate::messages;
+use infinity_core::messages;
 use marshal::Value;
 use std::io::Write;
 

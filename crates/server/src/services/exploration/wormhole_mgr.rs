@@ -97,7 +97,6 @@ async fn create_pairs(c: &Client, system: i64, count: usize) -> Result<usize, Ca
                             broadcast_sites(world, there.system, &[there], &[]).await;
                         }
                     }
-                    Effect::Event(event) => crate::lua::on_event(event),
                 }
             }
             Ok(())

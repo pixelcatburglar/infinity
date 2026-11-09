@@ -4,19 +4,31 @@ mod reconciliation;
 mod expert_expiry;
 use crate::services::tests::{client, fixture};
 
+async fn require_no_seedable_skill_state(db: &Db) {
+    let queues = queue::active_characters(db).await.expect("failed to inspect active skill queues");
+    let boosters = brain::timed_characters(db).await.expect("failed to inspect timed boosters");
+    let experts = crate::dao::skills::expert_systems::timed_character_ids(db, i64::MAX)
+        .await.expect("failed to inspect expert system expiries");
+    assert!(queues.is_empty() && boosters.is_empty() && experts.is_empty(),
+        "foreign seedable skill state found: active queue character IDs={queues:?}, timed booster owner IDs={boosters:?}, expert system character IDs={experts:?}\nPoint INFINITY_TEST_DATABASE_URL at a separate initialized database with no foreign seedable skill state");
+}
+
 async fn state(ex: &(impl crate::db::executor::Executor + ?Sized), character: i64) -> String {
     let job = format!("{KIND}:{character}");
     ex.query_one("SELECT (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(i)::text, '' ORDER BY item_id), '') FROM game.items i WHERE owner_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(a)::text, '' ORDER BY a.item_id,a.attribute_id), '') FROM game.item_attributes a JOIN game.items i ON i.item_id=a.item_id WHERE i.owner_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') FROM game.skill_history h WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(j)::text, '' ORDER BY job_id), '') FROM game.jobs j WHERE job_id=$2) AS fingerprint", &[&character, &job]).await.unwrap().get("fingerprint")
 }
 
 async fn apply(db: &Db, sde: &Arc<Sde>, character: i64, through: i64) -> Vec<crate::db::outbox::Effect<crate::services::effects::online::OnlineChanged>> {
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    let fences = crate::services::effects::online::capture_online_fences(&world, &[character]).await;
     let _market = crate::services::market::lock().await;
     db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone();
+        let fences = fences.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, character).await.map_err(db_err)?;
             let progress = advance_tx(tx, outbox, &sde, character, through).await?;
-            finish_tx(tx, outbox, &sde, character, through, &progress, &[]).await?;
+            finish_tx(tx, outbox, &sde, &fences, character, through, &progress, &[]).await?;
             Ok(())
         })
     }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("advancing timeline"))
@@ -28,13 +40,12 @@ fn notices(entries: &[crate::db::outbox::Effect<crate::services::effects::online
 }
 
 async fn booster(db: &Db, character: i64, type_id: i32, expiry: i64) -> i64 {
-    db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_expires_at,brain_effect_ids) VALUES ($1,$2,$2,$3,true,$4,ARRAY[]::integer[]) RETURNING item_id", &[&type_id, &character, &crate::consts::FLAG_BOOSTER, &expiry]).await.unwrap().get("item_id")
+    db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_expires_at,brain_effect_ids) VALUES ($1,$2,$2,$3,true,$4,ARRAY[]::integer[]) RETURNING item_id", &[&type_id, &character, &infinity_core::consts::FLAG_BOOSTER, &expiry]).await.unwrap().get("item_id")
 }
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn completion_emits_one_lua_event_per_new_level_and_none_on_replay() {
-    use crate::db::outbox::Effect;
     use crate::lua::events::GameEvent;
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -44,7 +55,7 @@ async fn completion_emits_one_lua_event_per_new_level_and_none_on_replay() {
     let (c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
     let _market = crate::services::market::lock().await;
-    let events = db.transaction(|tx, outbox: &mut Outbox| {
+    db.transaction(|tx, outbox: &mut Outbox| {
         let sde = sde.clone();
         Box::pin(async move {
         crate::dao::characters::selection::lock_character(tx, f.character).await.map_err(db_err)?;
@@ -58,8 +69,8 @@ async fn completion_emits_one_lua_event_per_new_level_and_none_on_replay() {
         assert_eq!(state(tx, f.character).await, before);
         Ok(())
     }) }, |(), outbox| async move { Ok::<_, CallError>(outbox.into_entries()) }).await.unwrap_or_else(|_| panic!("failed to complete and replay skill queue"));
-    let levels: Vec<_> = events.into_iter().filter_map(|entry| match entry {
-        Effect::Event(GameEvent::SkillTrained { char_id, type_id, level }) if char_id == f.character && type_id == 1 => Some(level),
+    let levels: Vec<_> = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.into_iter().filter_map(|entry| match entry {
+        GameEvent::SkillTrained { char_id, type_id, level } if char_id == f.character && type_id == 1 => Some(level),
         _ => None,
     }).collect();
     assert_eq!(levels, vec![1, 2]);
@@ -71,13 +82,14 @@ async fn completion_emits_one_lua_event_per_new_level_and_none_on_replay() {
 }
 #[tokio::test]
 
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+#[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with SDE and no foreign seedable skill state"]
 async fn restart_catches_up_adjacent_levels_and_reschedules_then_cancels() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    require_no_seedable_skill_state(&db).await;
     let f = fixture::create(&db).await.unwrap();
     fixture::seed_skill(&db, f.character).await.unwrap();
-    let future = filetime_now() + crate::consts::FILETIME_MINUTE;
+    let future = filetime_now() + infinity_core::consts::FILETIME_MINUTE;
     db.execute("INSERT INTO game.skill_queue (character_id,position,type_id,to_level,start_sp,dest_sp,start_time,end_time) VALUES ($1,1,1,2,100,200,1,2),($1,2,1,3,200,300,2,$2)", &[&f.character, &future]).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
     seed(&db).await.unwrap_or_else(|_| panic!("failed to seed skill completion jobs after restart"));
@@ -102,14 +114,15 @@ async fn restart_catches_up_adjacent_levels_and_reschedules_then_cancels() {
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL with SDE and serial execution"]
+#[ignore = "requires a job-free dedicated INFINITY_TEST_DATABASE_URL with SDE, no foreign seedable skill state, and serial execution"]
 async fn real_runner_delivers_due_completion_to_online_pilot_channel() {
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    assert!(crate::dao::jobs::next_due(&db, &[]).await.unwrap().is_none());
+    crate::dao::jobs::tests::require_job_free_database(&db).await;
+    require_no_seedable_skill_state(&db).await;
     let f = fixture::create(&db).await.unwrap();
     fixture::seed_skill(&db, f.character).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
@@ -181,10 +194,10 @@ async fn harmless_expiries_preserve_queue_and_notify_once() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let skill_type = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     training::starting_skill(&db, f.character, skill_type, 0, 0).await.unwrap();
     let mut harmless = None;
-    for data in c.sde.types.iter().filter(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()) {
+    for data in c.sde.types.iter().filter(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some()) {
         let first = booster(&db, f.character, data.type_id, 100).await;
         let second = booster(&db, f.character, data.type_id, 200).await;
         let before = super::super::attributes::character_attributes_at(&db, &c.sde, f.character, 99).await.unwrap_or_else(|_| panic!("loading active boosters"));
@@ -222,8 +235,8 @@ async fn live_deadlines_match_delayed_application() {
     let live = fixture::create(&db).await.unwrap();
     let late = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), live.character).await;
-    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
-    let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let booster_type = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
+    let skill_type = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     for character in [live.character, late.character] {
         training::starting_skill(&db, character, skill_type, 0, 0).await.unwrap();
         queue::insert(&db, character, &queue::QueueEntry { position: 0, type_id: skill_type, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(200) }).await.unwrap();
@@ -255,7 +268,7 @@ async fn manual_attribute_changes_retime_only_when_effective_values_change() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     let row = queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 1000, start_time: Some(100), end_time: Some(1100) };
     queue::insert(&db, f.character, &row).await.unwrap();
@@ -271,7 +284,7 @@ async fn manual_attribute_changes_retime_only_when_effective_values_change() {
             assert!(!progress.queue_changed);
             assert!(queue::list(tx, f.character).await.map_err(db_err)? == vec![row]);
             let state = crate::dao::characters::attributes::initialize_respec(tx, f.character, 0).await.map_err(db_err)?;
-            let bases: Vec<i32> = crate::consts::dogma::CHAR_ATTRIBUTES.iter().map(|id| before[id] as i32 + 10).collect();
+            let bases: Vec<i32> = infinity_core::consts::dogma::CHAR_ATTRIBUTES.iter().map(|id| before[id] as i32 + 10).collect();
             assert!(crate::dao::characters::attributes::save_respec(tx, f.character, &bases, &state, 0, 600, 600).await.map_err(db_err)?);
             super::super::training::retime_after_change_tx(tx, &sde, f.character, 600, &before, &mut progress).await?;
             assert!(progress.queue_changed);
@@ -294,23 +307,26 @@ async fn database_failure_after_completion_rolls_back_skill_queue_and_item_chang
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let booster_type = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     queue::insert(&db, f.character, &queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(200) }).await.unwrap();
     let item = booster(&db, f.character, booster_type, 250).await;
-    db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&item, &crate::consts::dogma::ATTR_BOOSTERNESS, &1.0f64]).await.unwrap();
+    db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&item, &infinity_core::consts::dogma::ATTR_BOOSTERNESS, &1.0f64]).await.unwrap();
     reschedule(&db, f.character).await.unwrap_or_else(|_| panic!("scheduling fixture"));
     let before = state(&db, f.character).await;
     let dispatched = Arc::new(AtomicBool::new(false));
     let result = {
         let _market = crate::services::market::lock().await;
+        let world = crate::space::World::new(db.clone(), c.sde.clone(), 1);
+        let fences = crate::services::effects::online::capture_online_fences(&world, &[f.character]).await;
         db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = c.sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
                 crate::dao::characters::selection::lock_character(tx, f.character).await.map_err(db_err)?;
                 let progress = advance_tx(tx, outbox, &sde, f.character, 300).await?;
-                finish_tx(tx, outbox, &sde, f.character, 300, &progress, &[]).await?;
+                finish_tx(tx, outbox, &sde, &fences, f.character, 300, &progress, &[]).await?;
                 assert_eq!(progress.completed, vec![(skill, 1)]);
                 assert!(brain::get(tx, f.character, item).await.map_err(db_err)?.is_none());
                 tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
@@ -336,16 +352,17 @@ async fn database_failure_after_completion_rolls_back_skill_queue_and_item_chang
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL with SDE and serial execution"]
+#[ignore = "requires a job-free dedicated INFINITY_TEST_DATABASE_URL with SDE, no foreign seedable skill state, and serial execution"]
 async fn runner_delivers_idle_booster_expiry_after_restart_seed() {
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    assert!(crate::dao::jobs::next_due(&db, &[]).await.unwrap().is_none());
+    crate::dao::jobs::tests::require_job_free_database(&db).await;
+    require_no_seedable_skill_state(&db).await;
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
+    let booster_type = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
     let due = filetime_now() + crate::client::filetime_ticks_from_seconds(5);
     let item = booster(&db, f.character, booster_type, due).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -403,17 +420,17 @@ async fn receiver_replay_empty(db: &Db, character: i64) -> bool {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
     use crate::services::fit::{Fit, Key};
-    use crate::consts::dogma::CHAR_ATTRIBUTES;
+    use infinity_core::consts::dogma::CHAR_ATTRIBUTES;
     use std::collections::HashMap;
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let live = fixture::create(&db).await.unwrap();
     let late = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), live.character).await;
-    let start = crate::consts::FILETIME_SECOND;
-    let expiry = 10 * crate::consts::FILETIME_MINUTE;
+    let start = infinity_core::consts::FILETIME_SECOND;
+    let expiry = 10 * infinity_core::consts::FILETIME_MINUTE;
     let mut exercised = false;
-    'candidate: for data in c.sde.types.iter().filter(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()) {
+    'candidate: for data in c.sde.types.iter().filter(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some()) {
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
             if effect.effect_category.unwrap_or(0) != 0 { continue; }
@@ -421,7 +438,7 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
                 if !CHAR_ATTRIBUTES.contains(&(modifier.modified as i64)) || modifier.modified == modifier.modifying { continue; }
                 let mut items = Vec::new();
                 for character in [live.character, late.character] {
-                    let item: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at,brain_effect_ids) VALUES ($1,$2,$2,$3,true,$4,$5,ARRAY[$6::integer]) RETURNING item_id", &[&data.type_id, &character, &crate::consts::FLAG_BOOSTER, &start, &expiry, &effect.effect_id]).await.unwrap().get("item_id");
+                    let item: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at,brain_effect_ids) VALUES ($1,$2,$2,$3,true,$4,$5,ARRAY[$6::integer]) RETURNING item_id", &[&data.type_id, &character, &infinity_core::consts::FLAG_BOOSTER, &start, &expiry, &effect.effect_id]).await.unwrap().get("item_id");
                     db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,10)", &[&item, &modifier.modifying]).await.unwrap();
                     items.push(item);
                 }
@@ -430,7 +447,7 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
                 let old: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, old_fit.value(Key::Char, id as i32))).collect();
                 let new: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, new_fit.value(Key::Char, id as i32))).collect();
                 if old != new {
-                    for skill in c.sde.types.iter().filter(|s| s.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()) {
+                    for skill in c.sde.types.iter().filter(|s| s.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()) {
                         let mut row = queue::QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut slower = row.clone();
                         let Ok(old_end) = super::super::training::schedule(&c.sde, &mut row, &old, start) else { continue };
@@ -443,8 +460,8 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
                             queue::insert(&db, character, &row).await.unwrap();
                         }
                         apply(&db, &c.sde, live.character, expiry).await;
-                        apply(&db, &c.sde, live.character, expiry + crate::consts::FILETIME_SECOND).await;
-                        apply(&db, &c.sde, late.character, expiry + crate::consts::FILETIME_SECOND).await;
+                        apply(&db, &c.sde, live.character, expiry + infinity_core::consts::FILETIME_SECOND).await;
+                        apply(&db, &c.sde, late.character, expiry + infinity_core::consts::FILETIME_SECOND).await;
                         let left = queue::list(&db, live.character).await.unwrap();
                         let right = queue::list(&db, late.character).await.unwrap();
                         assert!(left == right);
@@ -488,14 +505,14 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
 async fn committed_effects_follow_timeline() {
     use crate::db::outbox::{Effect, Notification};
     use crate::lua::events::GameEvent;
-    use crate::consts::dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES;
+    use infinity_core::consts::dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES;
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     for completion_at in [50_i64, 150, 100] {
         let f = fixture::create(&db).await.unwrap();
         let (c, _peer) = client(db.clone(), f.character).await;
         let credit_type = c.sde.types.iter().find(|t| t.attribute(ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES).is_some_and(|v| v >= 1.0 && v.fract() == 0.0)).expect("credit type in SDE").type_id;
-        let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("skill in SDE").type_id;
+        let skill_type = c.sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("skill in SDE").type_id;
         training::starting_skill(&db, f.character, skill_type, 0, 0).await.unwrap();
         queue::insert(&db, f.character, &queue::QueueEntry { position: 0, type_id: skill_type, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(completion_at) }).await.unwrap();
         let later = booster(&db, f.character, credit_type, 200).await;
@@ -508,21 +525,20 @@ async fn committed_effects_follow_timeline() {
         assert!(later < early && early < early_second);
         let _market = crate::services::market::lock().await;
         let sde = c.sde.clone();
+        let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+        let fences = crate::services::effects::online::capture_online_fences(&world, &[f.character]).await;
         let (plan, effects) = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
                 crate::dao::characters::selection::lock_character(tx, f.character).await.map_err(db_err)?;
                 let plan = timeline::plan_tx(tx, &sde, f.character, 250).await?;
                 let progress = apply_plan_tx(tx, outbox, &sde, &plan).await?;
-                finish_tx(tx, outbox, &sde, f.character, 250, &progress, &[]).await?;
+                finish_tx(tx, outbox, &sde, &fences, f.character, 250, &progress, &[]).await?;
                 Ok(plan)
             })
         }, |plan, outbox| async move { Ok::<_, CallError>((plan, { let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries })) }).await.unwrap_or_else(|_| panic!("applying timeline"));
         let actual: Vec<String> = effects.iter().map(|effect| match effect {
-            Effect::Event(GameEvent::SkillTrained { char_id, type_id, level }) if *char_id == f.character => {
-                assert_eq!((*type_id, *level), (skill_type, 1));
-                "trained".into()
-            }
             Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnItemChange" => {
                 let Value::DbRow { descriptor, .. } = &args[0] else { panic!("item notice is not a row") };
                 let descriptor = marshal::DbRowDescriptor::from_value(descriptor).expect("item descriptor");
@@ -539,10 +555,11 @@ async fn committed_effects_follow_timeline() {
             Effect::Notification(Notification::Pilot { char_id, event, .. }) if *char_id == f.character => event.clone(),
             _ => panic!("unexpected timeline effect"),
         }).collect();
+        let trained = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await;
+        assert_eq!(trained.len(), 1);
+        assert!(matches!(trained[0], GameEvent::SkillTrained { char_id, type_id, level: 1 } if char_id == f.character && type_id == skill_type));
         let mut expected = Vec::new();
-        if completion_at <= 100 { expected.push("trained".to_string()); }
         expected.extend([format!("item:{early}"), format!("item:{early_second}"), "removed".into(), "added:2".into()]);
-        if completion_at > 100 { expected.push("trained".into()); }
         expected.extend([format!("item:{later}"), "removed".into(), "added:1".into()]);
         expected.extend(["OnServerSkillsChanged".into(), BRAIN_REFRESH.into(), "OnNewSkillQueueSaved".into(), "OnServerBoostersChanged".into()]);
         assert_eq!(actual, expected);

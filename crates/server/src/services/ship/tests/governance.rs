@@ -1,0 +1,93 @@
+//! Real completed-dock pending-kick regressions using the private ship test harness.
+use super::*;
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run alone"]
+async fn completed_dock_respects_pending_deadline_and_executes_due_once() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let system = -1;
+    let station_id = -2;
+    let ceo: i64 = db.query_one("INSERT INTO game.accounts(user_name,password_hash,role) VALUES(nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let ceo_char: i64 = db.query_one("INSERT INTO game.characters(user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id) VALUES($1,nextval('game.characters_character_id_seq')::text,1,1,1,$2,60000001) RETURNING character_id", &[&ceo, &1_i64]).await.unwrap().get("character_id");
+    let corp: i64 = db.query_one("INSERT INTO game.corporations(name,ticker,ceo_id,creator_id,station_id,created) VALUES ('dock-kick-'||nextval('game.corporations_corporation_id_seq')::text,'DK'||currval('game.corporations_corporation_id_seq')::text,$1,$1,60000001,1) RETURNING corporation_id", &[&ceo_char]).await.unwrap().get("corporation_id");
+    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2 WHERE character_id=$3", &[&corp, &infinity_core::consts::ROLE_DIRECTOR, &ceo_char]).await.unwrap();
+    let target: i64 = db.query_one("INSERT INTO game.accounts(user_name,password_hash,role) VALUES(nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let target_char: i64 = db.query_one("INSERT INTO game.characters(user_id,name,race_id,bloodline_id,gender_id,corporation_id,solar_system_id) VALUES($1,nextval('game.characters_character_id_seq')::text,1,1,1,$2,$3) RETURNING character_id", &[&target, &corp, &system]).await.unwrap().get("character_id");
+    let hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, target_char, system, [0.0; 3]).await.unwrap();
+    let removed = crate::client::filetime_now();
+    db.execute("UPDATE game.characters SET ship_id=$2,corp_roles=0,corp_roles_hq=0,station_id=NULL,corp_roles_removed_at=$3 WHERE character_id=$1", &[&target_char, &hull, &removed]).await.unwrap();
+    let (mut manager, _) = crate::services::tests::client(db.clone(), ceo_char).await;
+    let world = manager.world.clone();
+    admit_fixture_ship(&db, &world, system, target_char, hull, true).await;
+    let mut station = ship();
+    station.id = station_id; station.char_id = None; station.mode = MODE_STOP;
+    station.vel = [0.0; 3]; station.old_vel = [0.0; 3]; station.segment_acceleration = None;
+    station.radius = 1000.0; station.pos = [3550.0, 0.0, 0.0]; station.old_pos = station.pos;
+    world.with(system, move |s| s.insert(station)).await.unwrap();
+    let marker_first: i64 = db.query_one("SELECT COALESCE(MAX(notification_id),0) AS marker FROM game.notifications WHERE receiver_id=ANY($1)", &[&[ceo_char,target_char].as_slice()]).await.unwrap().get("marker");
+    manager.session.apply(vec![("charid", Value::Int(ceo_char)), ("corpid", Value::Int(corp)), ("stationid", Value::Int(60000001))]);
+    let identity = crate::services::identity::Identity { char_id: target_char, ship_id: Some(hull), corp_id: corp, station_id: None, system_id: Some(system) };
+    let (target_tx, _target_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = infinity_core::session::OnlineSession { character_id: target_char, user_id: Some(target), session_id: 8, ship_id: Some(hull), station_id: None, system_id: Some(system), corporation_id: Some(corp), alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+    crate::services::presence::online(&identity, &world, &manager.chat, target_tx, None, session);
+    let kick_args = [Value::Int(target_char)];
+    let kwargs = Value::Dict(Vec::new()); let bind = Value::Int(corp);
+    let call = crate::services::Call { service: "corpRegistry", method: "KickOutMember", args: &kick_args, kwargs: &kwargs, bound: true, bind_params: Some(&bind) };
+    let result = super::super::super::corps::dispatch(&mut manager, &call).await.unwrap().unwrap();
+    assert_eq!(marshal::loads(&marshal::dumps(&result)).unwrap(), Value::None);
+    assert_eq!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&target_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
+    let deadline: i64 = db.query_one("SELECT eligible_at FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &target_char]).await.unwrap().get("eligible_at");
+    assert_eq!(deadline, crate::services::corps::exit::deadline(removed).unwrap());
+    assert!(deadline > crate::client::filetime_now());
+    let change = dock(&identity, &db, &world, Some(system), station_id, None::<&mut crate::client::Client>).await.unwrap();
+    assert_eq!(change.updates, vec![("solarsystemid", Value::None), ("stationid", Value::Int(station_id))]);
+    assert_eq!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&target_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
+    assert!(db.query_opt("SELECT character_id FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &target_char]).await.unwrap().is_some());
+    let due_account: i64 = db.query_one("INSERT INTO game.accounts(user_name,password_hash,role) VALUES(nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let due_char: i64 = db.query_one("INSERT INTO game.characters(user_id,name,race_id,bloodline_id,gender_id,corporation_id,solar_system_id) VALUES($1,nextval('game.characters_character_id_seq')::text,1,1,1,$2,$3) RETURNING character_id", &[&due_account, &corp, &system]).await.unwrap().get("character_id");
+    let marker: i64 = db.query_one("SELECT COALESCE(MAX(notification_id),0) AS marker FROM game.notifications WHERE receiver_id=$1", &[&due_char]).await.unwrap().get("marker");
+    let due_hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, due_char, system, [0.0; 3]).await.unwrap();
+    let old_clock = crate::client::filetime_now() - 2 * crate::config::game().corporations.role_removal_cooldown_secs * infinity_core::consts::FILETIME_SECOND;
+    db.execute("UPDATE game.characters SET ship_id=$2,corp_roles=0,corp_roles_hq=0,station_id=NULL,corp_roles_removed_at=$3 WHERE character_id=$1", &[&due_char, &due_hull, &old_clock]).await.unwrap();
+    admit_fixture_ship(&db, &world, system, due_char, due_hull, true).await;
+    let due_identity = crate::services::identity::Identity { char_id: due_char, ship_id: Some(due_hull), corp_id: corp, station_id: None, system_id: Some(system) };
+    let due_hub = manager.chat.clone();
+    let (due_tx, _due_rx) = tokio::sync::mpsc::unbounded_channel();
+    let due_session = infinity_core::session::OnlineSession { character_id: due_char, user_id: Some(due_account), session_id: 9, ship_id: Some(due_hull), station_id: None, system_id: Some(system), corporation_id: Some(corp), alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
+    crate::services::presence::online(&due_identity, &world, &due_hub, due_tx, None, due_session);
+    let due_args = [Value::Int(due_char)];
+    let due_call = crate::services::Call { service: "corpRegistry", method: "KickOutMember", args: &due_args, kwargs: &kwargs, bound: true, bind_params: Some(&bind) };
+    super::super::super::corps::dispatch(&mut manager, &due_call).await.unwrap().unwrap();
+    assert_eq!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&due_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
+    let eligible: i64 = db.query_one("SELECT eligible_at FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &due_char]).await.unwrap().get("eligible_at");
+    assert!(eligible <= crate::client::filetime_now());
+    dock(&due_identity, &db, &world, Some(system), station_id, None::<&mut crate::client::Client>).await.unwrap();
+    assert_ne!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&due_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
+    assert!(db.query_opt("SELECT character_id FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &due_char]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&format!("corporations.pending_kick:{}", due_char)]).await.unwrap().is_none());
+    assert_eq!(db.query("SELECT notification_id FROM game.notifications WHERE receiver_id=$1 AND type_id=92 AND notification_id>$2", &[&due_char, &marker]).await.unwrap().len(), 1);
+    assert_eq!(db.query("SELECT event_id FROM game.corp_member_events WHERE corporation_id=$1 AND character_id=$2", &[&corp, &due_char]).await.unwrap().len(), 1);
+    crate::services::corps::pending_kicks::trigger(&db, &world, due_char).await.unwrap();
+    assert_eq!(db.query("SELECT notification_id FROM game.notifications WHERE receiver_id=$1 AND type_id=92 AND notification_id>$2", &[&due_char, &marker]).await.unwrap().len(), 1);
+    db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        crate::services::tests::fixture::cleanup_progress(tx, &[ceo, target, due_account, ceo_char, target_char, due_char, corp], &[ceo_char, target_char, due_char]).await
+    }), |(), ()| async { Ok(()) }).await.unwrap();
+    world.unregister_pilot_generation(due_char, Some(9));
+    db.execute("DELETE FROM game.notifications WHERE receiver_id=$1 AND notification_id>$2", &[&due_char, &marker]).await.unwrap();
+    world.remove_ball(system, due_hull).await;
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&due_hull]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&due_hull]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&due_char]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&due_account]).await.unwrap();
+    world.unregister_pilot_generation(target_char, Some(8));
+    db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("corporations.pending_kick:{target_char}")]).await.unwrap();
+    db.execute("DELETE FROM game.notifications WHERE receiver_id=ANY($1) AND notification_id>$2", &[&[ceo_char,target_char].as_slice(), &marker_first]).await.unwrap();
+    db.execute("DELETE FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &target_char]).await.unwrap();
+    world.remove_ball(system, hull).await;
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=ANY($1)", &[&[ceo_char, target_char].as_slice()]).await.unwrap();
+    db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=ANY($1)", &[&[ceo, target].as_slice()]).await.unwrap();
+}

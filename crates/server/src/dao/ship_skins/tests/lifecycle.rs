@@ -1,6 +1,6 @@
 //! Dedicated database regression coverage for item-root SKIN cleanup.
 use super::*;
-use crate::consts::FLAG_HANGAR;
+use infinity_core::consts::FLAG_HANGAR;
 use crate::dao::{exploration, items::{fitting, inventory, transfers}};
 use crate::db::executor::Executor;
 
@@ -44,9 +44,14 @@ async fn item_lifecycle_clears_only_invalid_applications() {
         let root = item(tx, a, 3).await?;
         let nested = item(tx, a, root.item_id).await?;
         assert!(set_application(tx, a, &nested, 1, 100).await?);
-        transfers::hand_over(tx, &[transfers::Transfer { item_id: root.item_id, owner: a, location: 4, flag: FLAG_HANGAR }]).await?;
+        let closure = inventory::descendants(tx, &[root.item_id]).await?;
+        let requests: Vec<_> = closure.iter().map(|&item_id| crate::dao::items::parent_locks::LockRequest {
+            item_id, strength: crate::dao::items::parent_locks::LockStrength::Update,
+        }).collect();
+        let locks = crate::dao::items::parent_locks::lock(tx, &[], &requests).await?;
+        transfers::hand_over(tx, &[transfers::Transfer { item_id: root.item_id, owner: a, location: 4, flag: FLAG_HANGAR }], &closure, &locks, &[]).await?;
         assert!(applied(tx, nested.item_id).await?);
-        transfers::hand_over(tx, &[transfers::Transfer { item_id: root.item_id, owner: b, location: 4, flag: FLAG_HANGAR }]).await?;
+        transfers::hand_over(tx, &[transfers::Transfer { item_id: root.item_id, owner: b, location: 4, flag: FLAG_HANGAR }], &closure, &locks, &[]).await?;
         assert!(!applied(tx, nested.item_id).await?);
 
         let container = item(tx, a, 5).await?;

@@ -2,7 +2,8 @@
 //! Mirrors godma effect activation and targetMgr locking using game items and SDE dogma.
 //! Lock completion and effect cycles are actor-timed; runtime state is not persisted.
 use mlua::{Lua, Table};
-use crate::{dao::items::loading::ItemQuery, messages, services::{self, CallError, combat::{self, targeting_charges}, effects}};
+use infinity_core::messages;
+use crate::{dao::items::loading::ItemQuery, services::{self, CallError, combat::{self, targeting_charges}, effects}};
 use super::{lifecycle, lua_error, mutate, positive, space::actual_system, Resources};
 
 async fn default_effect(r: &Resources, item: i64) -> Result<&str, CallError> {

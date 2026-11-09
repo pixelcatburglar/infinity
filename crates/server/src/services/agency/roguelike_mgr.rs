@@ -5,7 +5,7 @@
 
 use super::super::{Call, CallResult};
 use crate::client::Client;
-use crate::consts::SECONDS_PER_HOUR;
+use infinity_core::consts::SECONDS_PER_HOUR;
 use marshal::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 

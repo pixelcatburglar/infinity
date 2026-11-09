@@ -1,3 +1,5 @@
+mod retention;
+
 use super::*;
 use crate::{lua::host::Resources, sde::Sde, space::World};
 use std::future::Future;
@@ -74,6 +76,10 @@ async fn reload_preserves_old_generation_on_failure_and_in_flight_call() {
     std::fs::write(&script, "register.rpc('svc','m',function() end); register.rpc('svc','m',function() end)").unwrap();
     assert!(host.reload().await.is_err());
     assert!(Arc::ptr_eq(&old, &host.snapshot()));
+    std::fs::write(&script, "register.content{key='unknown',schema_version=1,content_version='1',datasets={},state_schema='sovereignty_policy_v1',operations={},progress_rules={}}").unwrap();
+    assert!(host.reload().await.is_err());
+    assert!(Arc::ptr_eq(&old, &host.snapshot()));
+    assert!(!generations.has_changed().unwrap());
     let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
     let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
     let (entered, entry) = tokio::sync::oneshot::channel();

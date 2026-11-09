@@ -3,11 +3,12 @@
 //! `eve/client/script/ui/station/loyaltyPointStore/lpStoreSvc.py`,
 //! `eve/client/script/ui/shared/info/infosvc.py`, `infoContentBase.py`, and
 //! `eve/devtools/script/insider.py`. Names remain client-localized; player
-//! stations, custom descriptions, and alliance sovereignty are not modelled.
+//! stations and custom descriptions are not modelled. Alliance systems come from committed sovereignty.
 
 use super::*;
 
-use crate::{messages, sde::map::{SolarSystem, Station}, services::{keyval, notify_error}};
+use infinity_core::messages;
+use crate::{sde::map::{SolarSystem, Station}, services::{keyval, notify_error}};
 
 fn request_id(call: &Call<'_>) -> Result<i64, CallError> {
     if !match call.kwargs { Value::None => true, Value::Dict(items) => items.is_empty(), _ => false } {
@@ -75,6 +76,16 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("stationSvc", "GetStationsForOwner") => return Some(stations_for_owner(c, call)),
         ("stationSvc", "GetStation") => return Some(station(c, call)),
         ("stationSvc", "GetSolarSystem") => return Some(solar_system(c, call)),
+        ("stationSvc", "GetAllianceSystems") => {
+            if !call.args.is_empty() || !match call.kwargs { Value::None => true, Value::Dict(items) => items.is_empty(), _ => false } {
+                return Some(Err(notify_error(messages::map::INVALID_MAP_REQUEST)));
+            }
+            return Some(crate::services::sovereignty::queries::read(&c.db, &c.sde, crate::services::sovereignty::queries::Query::AllianceSystems).await);
+        }
+        ("stationSvc", "GetSystemsForAlliance") => {
+            let alliance_id = match request_id(call) { Ok(id) => id, Err(error) => return Some(Err(error)) };
+            return Some(crate::services::sovereignty::queries::read(&c.db, &c.sde, crate::services::sovereignty::queries::Query::SystemsForAlliance { alliance_id }).await);
+        }
         _ => return None,
     }))
 }

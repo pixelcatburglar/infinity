@@ -11,9 +11,11 @@ async fn free_points_debit_retimes_queue_and_rolls_back_after_database_failure()
     let _market = crate::services::market::lock().await;
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
     let (c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
-    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).expect("skill without prerequisites").type_id;
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).expect("skill without prerequisites").type_id;
     let points = super::super::formulas::sp_for_level(training::skill_type(&sde, type_id).rank, 1);
     let now = filetime_now();
     db.execute("UPDATE game.characters SET free_skill_points=$2 WHERE character_id=$1", &[&f.character, &(points * 3)]).await.unwrap();
@@ -23,8 +25,8 @@ async fn free_points_debit_retimes_queue_and_rolls_back_after_database_failure()
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
     let failed: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone(); Box::pin(async move {
-            apply_tx(tx, outbox, &sde, f.character, &[(type_id, MAX_SKILL_LEVEL)], Some(&[(type_id, points)]), now).await?;
+        let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move {
+            apply_tx(tx, outbox, &sde, &fences, f.character, &[(type_id, MAX_SKILL_LEVEL)], Some(&[(type_id, points)]), now).await?;
             tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
             Ok(())
         })
@@ -34,8 +36,9 @@ async fn free_points_debit_retimes_queue_and_rolls_back_after_database_failure()
     assert_eq!(attributes::free_points(&db, f.character).await.unwrap(), points * 3);
     assert_eq!(fixture::skill_fingerprint(&db, f.character).await.unwrap(), before);
     assert!(history::list(&db, f.character, 50).await.unwrap().is_empty());
+    assert!(crate::db::outbox::tests::events(&db, "SkillStateChanged", f.character).await.is_empty());
     let effects = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[(type_id, MAX_SKILL_LEVEL)], Some(&[(type_id, points)]), now).await.map(|_| ()) })
+        let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[(type_id, MAX_SKILL_LEVEL)], Some(&[(type_id, points)]), now).await.map(|_| ()) })
     }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("free point settlement failed"));
     assert_eq!(attributes::free_points(&db, f.character).await.unwrap(), points * 2);
     let skill = skill_dao::current(&db, f.character).await.unwrap().pop().unwrap();
@@ -45,17 +48,21 @@ async fn free_points_debit_retimes_queue_and_rolls_back_after_database_failure()
     assert_eq!(rows[0].to_level, 2);
     assert_eq!(history::list(&db, f.character, 50).await.unwrap().len(), 1);
     assert!(effects.iter().any(|e| matches!(e, Effect::Notification(Notification::DirectClient { event, .. }) if event == "OnFreeSkillPointsChanged")));
-    assert!(!effects.iter().any(|e| matches!(e, Effect::Event(crate::lua::events::GameEvent::SkillTrained { .. }))));
+    assert!(crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.is_empty());
+    assert_eq!(crate::db::outbox::tests::events(&db, "SkillStateChanged", f.character).await.len(), 1);
     for amount in [0, -1, points * 3, i64::MAX] {
         let refused: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<crate::services::effects::online::OnlineChanged>| {
-            let sde = sde.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[(type_id, MAX_SKILL_LEVEL)], Some(&[(type_id, amount)]), now).await.map(|_| ()) })
+            let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[(type_id, MAX_SKILL_LEVEL)], Some(&[(type_id, amount)]), now).await.map(|_| ()) })
         }, |(), _| async move { Ok(()) }).await;
         assert!(refused.is_err());
     }
     assert_eq!(attributes::free_points(&db, f.character).await.unwrap(), points * 2);
     assert_eq!(history::list(&db, f.character, 50).await.unwrap().len(), 1);
+    }).await;
+    crate::scheduler::cancel(&db, &format!("{}:{}", super::super::completion::KIND, f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -66,9 +73,11 @@ async fn overdue_completion_is_merged_with_free_points() {
     let _market = crate::services::market::lock().await;
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
     let (c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
-    let types: Vec<_> = sde.types.iter().filter(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).take(2).map(|t| t.type_id).collect();
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
+    let types: Vec<_> = sde.types.iter().filter(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).take(2).map(|t| t.type_id).collect();
     assert_eq!(types.len(), 2);
     let (trained, target) = (types[0], types[1]);
     let trained_sp = super::super::formulas::sp_for_level(training::skill_type(&sde, trained).rank, 1);
@@ -77,9 +86,9 @@ async fn overdue_completion_is_merged_with_free_points() {
     db.execute("UPDATE game.characters SET free_skill_points=$2 WHERE character_id=$1", &[&f.character, &(points * 2)]).await.unwrap();
     db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,0,0),($1,$3,0,0)", &[&f.character, &trained, &target]).await.unwrap();
     db.execute("INSERT INTO game.skill_queue (character_id,position,type_id,to_level,start_sp,dest_sp,start_time,end_time) VALUES ($1,0,$2,1,0,$3,1,2)", &[&f.character, &trained, &trained_sp]).await.unwrap();
-    let booster_type = sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some_and(|slot| slot > 0.0)).expect("booster in SDE").type_id;
-    let booster: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at) VALUES ($1,$2,$2,$3,true,1,3) RETURNING item_id", &[&booster_type, &f.character, &crate::consts::FLAG_BOOSTER]).await.unwrap().get("item_id");
-    db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,0)", &[&booster, &crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT]).await.unwrap();
+    let booster_type = sde.types.iter().find(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some_and(|slot| slot > 0.0)).expect("booster in SDE").type_id;
+    let booster: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at) VALUES ($1,$2,$2,$3,true,1,3) RETURNING item_id", &[&booster_type, &f.character, &infinity_core::consts::FLAG_BOOSTER]).await.unwrap().get("item_id");
+    db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,0)", &[&booster, &infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT]).await.unwrap();
     super::super::completion::reschedule(&db, f.character).await.unwrap_or_else(|_| panic!("scheduling failed"));
     let before = fixture::skill_fingerprint(&db, f.character).await.unwrap();
     let job = format!("{}:{}", super::super::completion::KIND, f.character);
@@ -87,7 +96,7 @@ async fn overdue_completion_is_merged_with_free_points() {
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
     let failed: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[(target, MAX_SKILL_LEVEL)], Some(&[(target, 0)]), now).await.map(|_| ()) })
+        let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[(target, MAX_SKILL_LEVEL)], Some(&[(target, 0)]), now).await.map(|_| ()) })
     }, |(), _| async move { flag.store(true, Ordering::SeqCst); Ok(()) }).await;
     assert!(failed.is_err());
     assert!(!dispatched.load(Ordering::SeqCst));
@@ -95,10 +104,10 @@ async fn overdue_completion_is_merged_with_free_points() {
     assert_eq!(db.query_one("SELECT row_to_json(j)::text AS state FROM game.jobs j WHERE job_id=$1", &[&job]).await.unwrap().get::<_, String>("state"), jobs_before);
     assert_eq!(attributes::free_points(&db, f.character).await.unwrap(), points * 2);
     assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1 AND brain_activated_at=1 AND brain_expires_at=3", &[&booster]).await.unwrap().is_some());
-    assert!(db.query_opt("SELECT item_id FROM game.item_attributes WHERE item_id=$1 AND attribute_id=$2 AND value=0", &[&booster, &crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT]).await.unwrap().is_some());
+    assert!(db.query_opt("SELECT item_id FROM game.item_attributes WHERE item_id=$1 AND attribute_id=$2 AND value=0", &[&booster, &infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT]).await.unwrap().is_some());
     assert!(history::list(&db, f.character, 50).await.unwrap().is_empty());
     let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[(target, MAX_SKILL_LEVEL)], Some(&[(target, points)]), now).await.map(|_| ()) })
+        let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[(target, MAX_SKILL_LEVEL)], Some(&[(target, points)]), now).await.map(|_| ()) })
     }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("free points settlement failed"));
     let batches: Vec<_> = effects.iter().filter_map(|e| match e { Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnServerSkillsChanged" => Some(args), _ => None }).collect();
     assert_eq!(batches.len(), 1);
@@ -116,7 +125,7 @@ async fn overdue_completion_is_merged_with_free_points() {
     }).count(), 1);
     assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&booster]).await.unwrap().is_none());
     assert!(db.query_opt("SELECT item_id FROM game.item_attributes WHERE item_id=$1", &[&booster]).await.unwrap().is_none());
-    let events: Vec<_> = effects.iter().filter_map(|e| match e { Effect::Event(GameEvent::SkillTrained { char_id, type_id, level }) => Some((*char_id, *type_id, *level)), _ => None }).collect();
+    let events: Vec<_> = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.into_iter().filter_map(|e| match e { GameEvent::SkillTrained { char_id, type_id, level } => Some((char_id, type_id, level)), _ => None }).collect();
     assert_eq!(events, vec![(f.character, trained, 1)]);
     assert_eq!(attributes::free_points(&db, f.character).await.unwrap(), points);
     assert!(queue::list(&db, f.character).await.unwrap().is_empty());
@@ -124,9 +133,11 @@ async fn overdue_completion_is_merged_with_free_points() {
     assert_eq!(hist.len(), 2);
     assert!(hist.iter().any(|h| h.event_type_id == super::super::history::TRAINING_COMPLETE && h.absolute_points == trained_sp));
     assert!(hist.iter().any(|h| h.event_type_id == super::super::history::FREE_POINTS_USED && h.absolute_points == points));
+    }).await;
     crate::scheduler::cancel(&db, &format!("{}:{}", super::super::completion::KIND, f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -137,7 +148,7 @@ async fn free_points_queue_order_and_partial_final_entry_match_preview_and_apply
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
     let types: Vec<_> = sde.types.iter()
-        .filter(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none())
+        .filter(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none())
         .take(2).map(|t| t.type_id).collect();
     assert_eq!(types.len(), 2);
     let first = super::super::formulas::sp_for_level(training::skill_type(&sde, types[0]).rank, 1);
@@ -169,7 +180,7 @@ async fn free_points_repeated_type_at_two_target_levels_is_accumulated_once() {
     let f = fixture::create(&db).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
-    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
     let rank = training::skill_type(&sde, type_id).rank;
     let needed = super::super::formulas::sp_for_level(rank, 2);
     db.execute("UPDATE game.characters SET free_skill_points=$2 WHERE character_id=$1", &[&f.character, &needed]).await.unwrap();
@@ -193,7 +204,7 @@ async fn free_points_preview_includes_points_from_in_training_entry() {
     let f = fixture::create(&db).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
-    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
     let rank = training::skill_type(&sde, type_id).rank;
     let target = super::super::formulas::sp_for_level(rank, 1);
     let now = filetime_now();
@@ -216,7 +227,7 @@ async fn free_points_apply_result_and_distribution_equal_preview() {
     let f = fixture::create(&db).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
-    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
     let rank = training::skill_type(&sde, type_id).rank;
     let points = super::super::formulas::sp_for_level(rank, 1);
     db.execute("UPDATE game.characters SET free_skill_points=$2 WHERE character_id=$1", &[&f.character, &points]).await.unwrap();
@@ -236,11 +247,11 @@ async fn free_points_apply_refuses_selected_skill_that_is_not_injected() {
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
-    let type_id = c.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true)).unwrap().type_id;
+    let type_id = c.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true)).unwrap().type_id;
     let name = c.sde.types.get(type_id).and_then(|t| t.name.clone()).unwrap();
     db.execute("UPDATE game.characters SET free_skill_points=1 WHERE character_id=$1", &[&f.character]).await.unwrap();
     let error = apply_targets(&mut c, f.character, vec![(type_id, 1)], None).await.unwrap_err();
-    assert!(matches!(error, CallError::User { ref msg, ref dict } if msg == crate::messages::MSG_CANNOT_APPLY_FREE_POINTS_DO_NOT_HAVE_SKILL && dict.iter().any(|(key, value)| key == "skillName" && *value == Value::unicode(name.clone()))));
+    assert!(matches!(error, CallError::User { ref msg, ref dict } if msg == infinity_core::messages::MSG_CANNOT_APPLY_FREE_POINTS_DO_NOT_HAVE_SKILL && dict.iter().any(|(key, value)| key == "skillName" && *value == Value::unicode(name.clone()))));
     fixture::cleanup(&db, f).await.unwrap();
 }
 
@@ -254,7 +265,7 @@ async fn free_points_zero_balance_returns_empty_preview_dictionary() {
     let f = fixture::create(&db).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
-    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&sde, t.type_id).next().is_none()).unwrap().type_id;
     db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,0,0)", &[&f.character, &type_id]).await.unwrap();
     let Value::Dict(preview) = preview(&mut c, f.character, vec![(type_id, 1)]).await.unwrap() else { panic!("free-point preview dictionary") };
     assert!(preview.is_empty());

@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::{anyhow, ensure, Context as _};
-use crate::{consts::dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, db::outbox::{Effect, Notification}, services::drones::tests::fixture::Fixture};
+use infinity_core::consts::dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST;
+use crate::{db::outbox::{Effect, Notification}, services::drones::tests::fixture::Fixture};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 fn call<'a>(method: &'a str, args: &'a [Value], kwargs: &'a Value) -> Call<'a> {
@@ -23,15 +24,16 @@ fn request_requires_exactly_two_positive_integer_ids() {
 }
 
 #[test]
-fn eligible_requires_direct_owned_positive_stack_in_supported_hold() {
+fn eligible_requires_direct_positive_stack_in_supported_hold() {
     let context = Context { character: 11, ship: 22, system: 33 };
     let mut source = Item { item_id: 44, type_id: 1, owner_id: 11, location_id: 22, flag_id: FLAG_CARGO, quantity: 1, singleton: false, group_id: 1, category_id: 1, custom_info: None };
-    for flag in [FLAG_CARGO, FLAG_MINING_HOLD, FLAG_ASTEROID_HOLD, FLAG_ICE_HOLD, FLAG_GAS_HOLD] {
+    for flag in [FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_GENERAL_MINING_HOLD, FLAG_SPECIAL_ASTEROID_HOLD, FLAG_SPECIALIZED_ICE_HOLD, FLAG_SPECIALIZED_GAS_HOLD] {
         source.flag_id = flag;
         assert!(eligible(&context, &source));
     }
     source.flag_id = FLAG_CARGO;
     let mut bad = source.clone(); bad.owner_id += 1; assert!(!eligible(&context, &bad));
+    let mut guest = source.clone(); guest.owner_id += 1; guest.flag_id = FLAG_FLEET_HANGAR; assert!(eligible(&context, &guest));
     let mut bad = source.clone(); bad.location_id = source.item_id; assert!(!eligible(&context, &bad));
     let mut bad = source.clone(); bad.location_id = context.system; assert!(!eligible(&context, &bad));
     let mut bad = source.clone(); bad.flag_id = 0; assert!(!eligible(&context, &bad));
@@ -66,7 +68,7 @@ fn static_pair(f: &Fixture) -> anyhow::Result<(i32, i32, i64)> {
     Err(anyhow!("real SDE has no supported compression pair"))
 }
 
-async fn stack(f: &Fixture, ty: i32, owner: i64, location: i64, flag: i32, quantity: i32) -> anyhow::Result<i64> {
+async fn stack(f: &Fixture, ty: i32, owner: i64, location: i64, flag: i32, quantity: i64) -> anyhow::Result<i64> {
     Ok(transfers::insert(&f.db, ty, owner, location, flag, quantity).await?)
 }
 
@@ -90,14 +92,21 @@ async fn routed_conversion_holds_merge_replay_and_refusals() -> anyhow::Result<(
         let generation = Arc::new(AtomicBool::new(false));
         install(&f, f.ship, list, generation.clone()).await?;
         let before = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
-        for (flag, count) in [(FLAG_CARGO, 1), (FLAG_MINING_HOLD, 3), (FLAG_ASTEROID_HOLD, i32::MAX), (FLAG_ICE_HOLD, 5), (FLAG_GAS_HOLD, 7)] {
+        for (flag, count, wire) in [(FLAG_CARGO, 1_i64, 1_i64), (FLAG_GENERAL_MINING_HOLD, 3, 3), (FLAG_SPECIAL_ASTEROID_HOLD, i64::MAX, infinity_core::consts::CLIENT_MAX_SHORT_AMOUNT), (FLAG_SPECIALIZED_ICE_HOLD, 5, 5), (FLAG_SPECIALIZED_GAS_HOLD, 7, 7)] {
             let id = stack(&f, source_type, f.owner, f.ship, flag, count).await?;
+            let admission = inventory::hold_storage::check_destination(&f.db, &f.sde, f.owner, f.ship, flag,
+                &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: count }], inventory::hold_storage::Replaced { items: &[id], reloads: &[] }, None).await;
+            if admission.is_err() {
+                ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(id), Value::Int(ship)]).await.is_err(), "invalid hold admitted compression");
+                ensure!(item(&f.db, &f.sde, id).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing after refusal")?.quantity == count, "refusal consumed source");
+                continue;
+            }
             let answer = rpc(&mut f, "CompressItemInSpace", &[Value::Int(id), Value::Int(ship)]).await.map_err(|e| anyhow!("compress: {e:?}"))?;
             let decoded = marshal::loads(&marshal::dumps(&answer)).map_err(|e| anyhow!("marshal: {e:?}"))?;
             let fields = decoded.items().context("compression tuple")?;
             ensure!(fields.len() == 6, "incorrect tuple length");
             let output_id = fields[3].as_int().context("output id")?;
-            ensure!(decoded == Value::tuple([Value::Int(id), Value::Int(source_type.into()), Value::Int(count.into()), Value::Int(output_id), Value::Int(output.into()), Value::Int(count.into())]), "incorrect tuple: {decoded:?}");
+            ensure!(decoded == Value::tuple([Value::Int(id), Value::Int(source_type.into()), Value::Int(wire), Value::Int(output_id), Value::Int(output.into()), Value::Int(wire)]), "incorrect tuple: {decoded:?}");
             ensure!(item(&f.db, &f.sde, id).await.map_err(|e| anyhow!("load: {e:?}"))?.is_none(), "source remains");
             let made = item(&f.db, &f.sde, output_id).await.map_err(|e| anyhow!("load: {e:?}"))?.context("output missing")?;
             ensure!((made.owner_id, made.location_id, made.flag_id, made.quantity) == (f.owner, f.ship, flag, count), "wrong output custody");
@@ -112,7 +121,7 @@ async fn routed_conversion_holds_merge_replay_and_refusals() -> anyhow::Result<(
         let merged = parts[3].as_int().context("merge id")?;
         let merged_item = item(&f.db, &f.sde, merged).await.map_err(|e| anyhow!("load: {e:?}"))?.context("merged output")?;
         ensure!((merged == existing && merged_item.quantity == 11) || (merged != existing && merged_item.quantity == 4), "wrong merge quantity");
-        let source = stack(&f, source_type, f.owner, f.ship, FLAG_GAS_HOLD, 1).await?;
+        let source = stack(&f, source_type, f.owner, f.ship, FLAG_SPECIALIZED_GAS_HOLD, 1).await?;
         generation.store(true, Ordering::Release);
         ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(source), Value::Int(ship)]).await.is_err(), "stopped compressor admitted");
         generation.store(false, Ordering::Release);
@@ -144,9 +153,14 @@ async fn queued_notifications_rollback_without_dispatch() -> anyhow::Result<()> 
         let checked = Arc::new(AtomicBool::new(false));
         let _lock = market::lock().await;
         let result: Result<(), CallError> = f.db.transaction(|tx, outbox: &mut Outbox| {
-            let context = context.clone(); let sde = f.sde.clone(); let checked = checked.clone();
+            let context = context.clone();
+            let sde = f.sde.clone();
+            let checked = checked.clone();
             Box::pin(async move {
-                compress_tx(tx, &sde, outbox, &context, expected_source).await?;
+                let locks = inventory::hold_storage::check_destination(tx, &sde, context.character, context.ship, expected_source.flag_id,
+                    &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: expected_source.quantity }],
+                    inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, None).await?.unwrap();
+                compress_tx(tx, &sde, outbox, &context, expected_source, &locks).await?;
                 let entries = std::mem::take(outbox).into_entries();
                 let notifications: Vec<_> = entries.into_iter().filter_map(|entry| match entry { Effect::Notification(Notification::DirectClient { event, args }) => Some((event, args)), _ => None }).collect();
                 if notifications.len() != 2 || notifications.iter().any(|(name, _)| name != "OnItemChange") {
@@ -164,7 +178,8 @@ async fn queued_notifications_rollback_without_dispatch() -> anyhow::Result<()> 
         ensure!(result.is_err() && checked.load(Ordering::Acquire) && !called.load(Ordering::Acquire), "failed transaction dispatched or did not reach deliberate failure");
         let restored = item(&f.db, &f.sde, id).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing after rollback")?;
         ensure!(restored.quantity == 3 && restored.location_id == f.ship, "source changed after rollback");
-        ensure!(transfers::stack(&f.db, f.ship, FLAG_CARGO, output, f.owner).await?.is_none(), "output survived rollback");
+        let outputs = crate::services::items::load_items(&f.db, &f.sde, crate::dao::items::loading::ItemQuery::LocationFlagTypeOwnerStack(f.ship, FLAG_CARGO, output, f.owner)).await.map_err(|e| anyhow!("load: {e:?}"))?;
+        ensure!(outputs.is_empty(), "output survived rollback");
         ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == before, "rollback changed ledger");
         Ok(())
     }.await;
@@ -196,16 +211,20 @@ async fn routed_refusals_preserve_inventory_and_stale_helper_refuses() -> anyhow
         f.client.session.apply(vec![("stationid", Value::None), ("shipid", Value::Int(other_ship))]);
         ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(source), Value::Int(ship)]).await.is_err(), "mismatched ship admitted");
         f.client.session.apply(vec![("shipid", Value::Int(ship))]);
-        let overflow = stack(&f, output, f.owner, ship, FLAG_CARGO, i32::MAX).await?;
-        ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(source), Value::Int(ship)]).await.is_err(), "overflow admitted");
-        ensure!(item(&f.db, &f.sde, overflow).await.map_err(|e| anyhow!("load: {e:?}"))?.context("overflow output missing")?.quantity == i32::MAX, "overflow output changed");
-        let expected = item(&f.db, &f.sde, source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing")?;
-        ensure!(transfers::add(&f.db, source, 1).await?, "source stack missing");
+        let overflow = stack(&f, output, f.owner, ship, FLAG_CARGO, i64::MAX).await?;
+        ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(source), Value::Int(ship)]).await.is_ok(), "wide output refused");
+        ensure!(item(&f.db, &f.sde, overflow).await.map_err(|e| anyhow!("load: {e:?}"))?.context("overflow output missing")?.quantity == i64::MAX, "wide output not merged");
+        let stale_source = stack(&f, source_type, f.owner, ship, FLAG_CARGO, 2).await?;
+        let expected = item(&f.db, &f.sde, stale_source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing")?;
+        f.db.execute("UPDATE game.items SET quantity = quantity + 1 WHERE item_id = $1", &[&stale_source]).await?;
         let context = Context { character: f.owner, ship, system: f.system };
         let mut outbox = Outbox::default();
-        ensure!(compress_tx(&f.db, &f.sde, &mut outbox, &context, SourceGuard::from(&expected)).await.is_err(), "stale source admitted");
+        let locks = inventory::hold_storage::check_destination(&f.db, &f.sde, context.character, context.ship, expected.flag_id,
+            &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: expected.quantity }],
+            inventory::hold_storage::Replaced { items: &[expected.item_id], reloads: &[] }, None).await.map_err(|e| anyhow!("capacity: {e:?}"))?.unwrap();
+        ensure!(compress_tx(&f.db, &f.sde, &mut outbox, &context, SourceGuard::from(&expected), &locks).await.is_err(), "stale source admitted");
         ensure!(outbox.into_entries().is_empty(), "stale source produced notices");
-        ensure!(item(&f.db, &f.sde, source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing")?.quantity == 3, "refusal changed source");
+        ensure!(item(&f.db, &f.sde, stale_source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("refusal source missing")?.quantity == 3, "refusal changed source");
         Ok(())
     }.await;
     f.cleanup().await;
@@ -267,9 +286,14 @@ async fn helper_merge_reports_old_quantity_in_post_commit_outbox() -> anyhow::Re
         let context = Context { character: f.owner, ship: f.ship, system: f.system };
         let expected_source = SourceGuard::from(&source);
         let _lock = market::lock().await;
-        let (value, entries) = f.db.transaction(|tx, outbox: &mut Outbox| {
+        let ((value, _, _), entries) = f.db.transaction(|tx, outbox: &mut Outbox| {
             let context = context.clone(); let sde = f.sde.clone();
-            Box::pin(async move { compress_tx(tx, &sde, outbox, &context, expected_source).await })
+            Box::pin(async move {
+                let locks = inventory::hold_storage::check_destination(tx, &sde, context.character, context.ship, expected_source.flag_id,
+                    &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: expected_source.quantity }],
+                    inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, None).await?.unwrap();
+                compress_tx(tx, &sde, outbox, &context, expected_source, &locks).await
+            })
         }, |value, outbox: Outbox| async move { Ok::<_, CallError>((value, outbox.into_entries())) }).await.map_err(|e| anyhow!("helper: {e:?}"))?;
         ensure!(value == Value::tuple([Value::Int(id), Value::Int(source_type.into()), Value::Int(3), Value::Int(output_id), Value::Int(output.into()), Value::Int(3)]), "incorrect merge result");
         let mut notices = Vec::new();
@@ -283,6 +307,50 @@ async fn helper_merge_reports_old_quantity_in_post_commit_outbox() -> anyhow::Re
         ensure!(notices[0].1.get(1) == Some(&Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(f.ship))])), "wrong source old location");
         ensure!(notices[1].1.get(1) == Some(&Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(8))])), "wrong output old quantity");
         ensure!(item(&f.db, &f.sde, output_id).await.map_err(|e| anyhow!("load: {e:?}"))?.context("output")?.quantity == 11, "wrong merged quantity");
+        Ok(())
+    }.await;
+    f.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
+async fn shared_bay_guest_compression_preserves_owner_and_private_cargo_refuses() -> anyhow::Result<()> {
+    let mut f = Fixture::with_hold_attributes(&[infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY]).await;
+    let result: anyhow::Result<()> = async {
+        let (source_type, output_type, list) = static_pair(&f)?;
+        let (guest, _) = f.add_pilot().await;
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        f.world.register_pilot(guest, sender);
+        let ship = f.ship;
+        ensure!(dao::items::dogma::set_override(&f.db, ship, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, 1_000_000.0).await?, "missing hull");
+        install(&f, ship, list, Arc::new(AtomicBool::new(false))).await?;
+        let source = stack(&f, source_type, guest, ship, FLAG_FLEET_HANGAR, 2).await?;
+        let original = item(&f.db, &f.sde, source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing")?;
+        let actor_before = f.client.outbox.len();
+        let answer = rpc(&mut f, "CompressItemInSpace", &[Value::Int(source), Value::Int(ship)]).await.map_err(|e| anyhow!("shared compression: {e:?}"))?;
+        ensure!(f.client.outbox.len() - actor_before == 2, "actor must receive one source and one output notice");
+        let output = answer.items().and_then(|values| values.get(3)).and_then(Value::as_int).context("output id")?;
+        let made = item(&f.db, &f.sde, output).await.map_err(|e| anyhow!("load: {e:?}"))?.context("output missing")?;
+        ensure!((made.owner_id, made.location_id, made.flag_id, made.type_id, made.quantity) == (guest, ship, FLAG_FLEET_HANGAR, output_type, 2), "guest custody changed");
+        ensure!(item(&f.db, &f.sde, source).await.map_err(|e| anyhow!("load: {e:?}"))?.is_none(), "source remains");
+        let (name, args) = received.try_recv().context("guest source notification")?;
+        ensure!(name == "OnItemChange", "wrong source notification");
+        let gone = Item { location_id: LOCATION_JUNKYARD, ..original };
+        ensure!(args[0] == gone.row(), "source-only recipient saw destination");
+        ensure!(received.try_recv().is_err(), "unauthorized recipient saw output");
+        let private = stack(&f, source_type, guest, ship, FLAG_CARGO, 2).await?;
+        let actor_notices = f.client.outbox.len();
+        ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(private), Value::Int(ship)]).await.is_err(), "foreign private cargo admitted");
+        ensure!(item(&f.db, &f.sde, private).await.map_err(|e| anyhow!("load: {e:?}"))?.context("private source missing")?.quantity == 2, "refusal changed source");
+        ensure!(f.client.outbox.len() == actor_notices && received.try_recv().is_err(), "refusal emitted notifications");
+        let ship_type = f.world.ball(f.system, ship).await.context("ship ball")?.type_id;
+        let nested_hull = dao::items::creation::rookie_ship(&f.db, ship_type, guest, ship, FLAG_FLEET_HANGAR).await?;
+        let nested = stack(&f, source_type, f.owner, nested_hull, FLAG_CARGO, 2).await?;
+        ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(nested), Value::Int(ship)]).await.is_err(), "nested foreign private hull admitted");
+        let row = item(&f.db, &f.sde, nested).await.map_err(|e| anyhow!("load: {e:?}"))?.context("nested source missing")?;
+        ensure!((row.owner_id, row.location_id, row.quantity) == (f.owner, nested_hull, 2), "nested refusal changed source");
+        ensure!(f.client.outbox.len() == actor_notices && received.try_recv().is_err(), "nested refusal emitted notifications");
         Ok(())
     }.await;
     f.cleanup().await;

@@ -6,7 +6,7 @@
 
 use super::{db_err, value_ids, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{TYPE_CHARACTER, TYPE_CORPORATION, TYPE_ALLIANCE, TYPE_FACTION};
+use infinity_core::consts::{TYPE_CHARACTER, TYPE_CORPORATION, TYPE_ALLIANCE, TYPE_FACTION};
 use marshal::Value;
 use tracing::warn;
 

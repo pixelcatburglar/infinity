@@ -33,3 +33,9 @@ pub(crate) async fn organization(ex: &(impl Executor + ?Sized), character_id: i6
     Ok(ex.query_opt("SELECT ch.corporation_id, a.alliance_id FROM game.characters ch LEFT JOIN game.corporations co ON co.corporation_id = ch.corporation_id LEFT JOIN game.alliances a ON a.alliance_id = co.alliance_id AND NOT a.deleted WHERE ch.character_id = $1 AND NOT ch.deleted AND (co.corporation_id IS NULL OR NOT co.deleted)", &[&character_id])
         .await?.as_ref().map(Organization::from_row))
 }
+
+/// Current corporation IDs for active characters, with the same deletion rules as `organization`.
+pub(crate) async fn organizations(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>, Error> {
+    let rows = ex.query("SELECT ch.character_id, ch.corporation_id FROM game.characters ch LEFT JOIN game.corporations co ON co.corporation_id = ch.corporation_id WHERE ch.character_id = ANY($1) AND NOT ch.deleted AND (co.corporation_id IS NULL OR NOT co.deleted)", &[&ids]).await?;
+    Ok(rows.iter().map(|row| (row.get("character_id"), row.get("corporation_id"))).collect())
+}

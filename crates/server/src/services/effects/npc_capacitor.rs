@@ -1,7 +1,7 @@
 //! Capacitor effects for NPC and drone sources.
 use super::{capacitor::nos_allowed, range::range_multiplier, registry::{EffectAttribute, EffectFlag},
     space_source::{SourceContext, SourceGuard}, EffectKind};
-use crate::consts::{dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_POWER_TRANSFER_AMOUNT};
+use infinity_core::consts::{dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_POWER_TRANSFER_AMOUNT};
 use crate::services::{combat::groups_health::{capacitor_snapshot, drain_exact_guarded, inject_guarded, npc_capacitor_fraction, NpcCapacitorGuard}, CallError};
 use crate::space::{dist, drone::DronePhase};
 
@@ -68,7 +68,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
     }
     if cx.effect.has(EffectFlag::Offensive) {
         if let (Some(attacker), Some((_, Some(victim)))) = (cx.attacker, admitted_owner) {
-            crate::services::crimewatch::aggress(cx.db, cx.world, cx.system, attacker, cx.source.type_id, cx.source.type_id, victim, cx.target.id).await?;
+            crate::services::crimewatch::aggress(cx.db, cx.world, cx.system, attacker, victim).await?;
         }
     }
     Ok(())

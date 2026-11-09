@@ -1,5 +1,10 @@
 use super::*;
 
+#[test]
+fn embedded_descriptors_validate() {
+    validate().expect("embedded gateway descriptors must satisfy startup validation");
+}
+
 pub(super) async fn gateway() -> Arc<Gateway> {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();

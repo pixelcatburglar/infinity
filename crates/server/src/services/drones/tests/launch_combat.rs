@@ -1,6 +1,7 @@
 use std::{collections::HashSet, future::Future, task::Poll};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{Call, fit::{Fit, Key}, effects::{EffectKind, registry}}, space::drone::DroneOrder};
+use infinity_core::{consts::{*, dogma::*}};
+use crate::{services::{Call, fit::{Fit, Key}, effects::{EffectKind, registry}}, space::drone::DroneOrder};
 use super::fixture::Fixture;
 
 async fn catch_scenario(future: impl Future<Output = ()>) -> std::thread::Result<()> {
@@ -49,11 +50,11 @@ async fn launch_limits_and_return_are_inventory_backed() {
     f.world.register_pilot(f.owner, tx);
     let args = [Value::list([Value::tuple([Value::Int(source), Value::Int(5)])]), Value::None, Value::Bool(false)];
     let Value::Dict(refused) = f.call("ship", "LaunchDrones", &args).await.ok().unwrap() else { panic!("launch mapping") };
-    let error = Value::list([Value::tuple([Value::str(crate::messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(crate::messages::drones::BANDWIDTH_EXCEEDED))])])]);
+    let error = Value::list([Value::tuple([Value::str(infinity_core::messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(infinity_core::messages::drones::BANDWIDTH_EXCEEDED))])])]);
     assert_eq!(refused, vec![(Value::Int(source), error.clone())]);
     let row = f.db.query_one("SELECT location_id,quantity,singleton FROM game.items WHERE item_id=$1", &[&source]).await.unwrap();
     assert_eq!(row.get::<_, i64>("location_id"), f.ship);
-    assert_eq!(row.get::<_, i32>("quantity"), 5);
+    assert_eq!(row.get::<_, i64>("quantity"), 5);
     assert!(!row.get::<_, bool>("singleton"));
     let ship = f.ship;
     assert_eq!(f.world.with(f.system, move |s| s.drones().filter(|d| d.controller == Some(ship)).count()).await.unwrap(), 0);
@@ -70,7 +71,7 @@ async fn launch_limits_and_return_are_inventory_backed() {
     for id in &ids {
         let row = f.db.query_one("SELECT owner_id,location_id,singleton,quantity,x,y,z FROM game.items WHERE item_id=$1", &[id]).await.unwrap();
         assert_eq!(row.get::<_, i64>("owner_id"), f.owner); assert_eq!(row.get::<_, i64>("location_id"), f.system);
-        assert!(row.get::<_, bool>("singleton")); assert_eq!(row.get::<_, i32>("quantity"), 1);
+        assert!(row.get::<_, bool>("singleton")); assert_eq!(row.get::<_, i64>("quantity"), 1);
         for col in ["x", "y", "z"] { assert!(row.get::<_, Option<f64>>(col).is_some()); }
     }
     f.set(f.ship, ATTR_DRONE_BANDWIDTH, 6.0 * bandwidth).await;
@@ -80,6 +81,11 @@ async fn launch_limits_and_return_are_inventory_backed() {
     assert_eq!(rows, vec![(Value::Int(extra), error)]);
     assert_eq!(f.db.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&extra]).await.unwrap().get::<_, i64>("location_id"), f.ship);
     assert_eq!(f.world.with(system, move |s| s.drones().filter(|d| d.controller == Some(ship)).count()).await.unwrap(), 5);
+    let damaged = ids[0];
+    let checkpoint = f.world.with(system, move |s| {
+        assert!(s.set_condition_fraction(damaged, 0.5));
+        s.combat_condition_snapshot(damaged).unwrap().condition
+    }).await.unwrap();
     let commands = [Value::list(ids.iter().copied().map(Value::Int))];
     assert_eq!(f.call("entity", "CmdReturnHome", &commands).await.ok().unwrap(), Value::Dict(vec![]));
     assert!(f.world.with(system, { let ids=ids.clone(); move |s| ids.iter().all(|id| s.drone(*id).is_some_and(|d| d.order == DroneOrder::ReturnHome)) }).await.unwrap());
@@ -92,6 +98,13 @@ async fn launch_limits_and_return_are_inventory_backed() {
     assert_eq!(lost, ids.iter().copied().collect());
     assert_eq!(f.call("entity", "CmdReturnBay", &commands).await.ok().unwrap(), Value::Dict(vec![]));
     returned(&f, &ids).await;
+    let saved = crate::dao::items::dogma::overrides(&f.db, damaged).await.unwrap();
+    let shield = saved.iter().find(|row| row.attribute_id == ATTR_SHIELD_CHARGE).unwrap();
+    let armor = saved.iter().find(|row| row.attribute_id == ATTR_ARMOR_DAMAGE).unwrap();
+    let hull = saved.iter().find(|row| row.attribute_id == ATTR_HULL_DAMAGE).unwrap();
+    assert!(shield.value >= checkpoint.now[0] && shield.updated_at >= checkpoint.shield_at);
+    assert!((armor.value - (checkpoint.stats.max[1] - checkpoint.now[1])).abs() < 1e-6);
+    assert!((hull.value - (checkpoint.stats.max[2] - checkpoint.now[2])).abs() < 1e-6);
     }).await;
     f.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
@@ -101,6 +114,8 @@ async fn launch_limits_and_return_are_inventory_backed() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
 async fn combat_drone_and_npc_death_share_real_effect_path() {
     let mut f = Fixture::new().await;
+    let npc_source = crate::dao::map_telemetry::EventSource::NpcOccurrence as i16;
+    let prior_occurrences: HashSet<i64> = f.db.query("SELECT source_id FROM game.map_events WHERE source=$1 AND solar_system_id=$2", &[&npc_source, &f.system]).await.unwrap().iter().map(|row| row.get("source_id")).collect();
     let result = catch_scenario(async {
     let ty = combat_type(&f);
     f.train_drone(ty).await;
@@ -138,7 +153,7 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
     let kwargs = Value::None;
     let args = [Value::Int(npc)];
     let lock = Call { service: "dogmaIM", method: "AddTarget", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
-    crate::services::combat::dispatch(&mut f.client, &lock).await.unwrap().ok().unwrap();
+    crate::services::dogma::dispatch(&mut f.client, &lock).await.ok().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while !crate::services::combat::targeting_charges::targets_of(f.owner).contains(&npc) {
             assert!(f.world.after(f.system, 100).await);
@@ -187,6 +202,8 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
     assert!(death_state);
     assert!(physical_source);
     }).await;
+    let occurrences: Vec<i64> = f.db.query("SELECT source_id FROM game.map_events WHERE source=$1 AND solar_system_id=$2", &[&npc_source, &f.system]).await.unwrap().iter().map(|row| row.get("source_id")).filter(|id| !prior_occurrences.contains(id)).collect();
+    f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND solar_system_id=$2 AND source_id=ANY($3)", &[&npc_source, &f.system, &occurrences]).await.unwrap();
     f.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

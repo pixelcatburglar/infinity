@@ -1,7 +1,8 @@
 use std::future::Future;
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{Call, effects::{registry, EffectKind, JammingType, registry::{EffectAttribute, EffectFlag}}}, space::drone::DroneOrder};
+use infinity_core::{consts::{*, dogma::*}};
+use crate::{services::{Call, effects::{registry, EffectKind, JammingType, registry::{EffectAttribute, EffectFlag}}}, space::drone::DroneOrder};
 use super::{fleet::form_fleet, super::fixture::Fixture};
 
 fn call_error(error: crate::services::CallError) -> anyhow::Error {
@@ -24,8 +25,7 @@ async fn lock(f: &mut Fixture, owner: i64, target: i64) -> Result<()> {
     let args = [Value::Int(target)];
     let kwargs = Value::None;
     let call = Call { service: "dogmaIM", method: "AddTarget", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
-    crate::services::combat::dispatch(&mut f.client, &call).await.ok_or_else(|| anyhow!("missing AddTarget"))?
-        .map_err(call_error)?;
+    crate::services::dogma::dispatch(&mut f.client, &call).await.map_err(call_error)?;
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while !crate::services::combat::targeting_charges::targets_of(owner).contains(&target) {
             ensure!(f.world.after(f.system, 100).await, "system stopped during lock");
@@ -106,11 +106,11 @@ async fn fleet_assist_and_guard_follow_admitted_nonweapon_attacks() -> Result<()
         let args = [Value::Int(module), Value::str(&web_name), Value::Int(npc), Value::Int(0)];
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
-        ensure!(crate::services::combat::dispatch(&mut f.client, &call).await.ok_or_else(|| anyhow!("missing Activate"))?.is_err(), "unlocked web unexpectedly accepted");
+        ensure!(crate::services::dogma::dispatch(&mut f.client, &call).await.is_err(), "unlocked web unexpectedly accepted");
         let current = f.world.with(f.system, move |s| s.drone(drone)).await.flatten().ok_or_else(|| anyhow!("missing drone"))?;
         ensure!(current.order == DroneOrder::Assist(delegate) && current.target.is_none(), "refused web retargeted assist");
         lock(&mut f, delegate, npc).await?;
-        crate::services::combat::dispatch(&mut f.client, &call).await.ok_or_else(|| anyhow!("missing Activate"))?.map_err(call_error)?;
+        crate::services::dogma::dispatch(&mut f.client, &call).await.map_err(call_error)?;
         delegated_target(&f, drone, DroneOrder::Assist(delegate), npc).await?;
         crate::services::combat::reset(&f.client);
         f.client.session.apply(vec![("charid", Value::Int(primary.0)), ("shipid", Value::Int(primary.1))]);

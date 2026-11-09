@@ -41,7 +41,7 @@ fn notice_shapes_and_recipient_deduplication() {
 async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     use prost::Message;
     use crate::gateway::{protocol::{AuthoritativeContext, Identifier32, Request, UserIdentifier}, requests::handle_request, Gateway};
-    use crate::session::OnlineSession;
+    use infinity_core::session::OnlineSession;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -83,11 +83,11 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     let (skin, hull) = client.sde.ship_skins.licenses().find_map(|license| {
         let skin = client.sde.ship_skins.skin(license.skin_id)?;
         if !license.is_permanent() || license.is_single_use || skin.is_structure_skin || !skin.visible(&client.cfg.server.boot_region) { return None; }
-        let hull = skin.type_ids.iter().copied().find(|id| client.sde.types.get(*id).is_some_and(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP)))?;
+        let hull = skin.type_ids.iter().copied().find(|id| client.sde.types.get(*id).is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP)))?;
         Some((skin.skin_id, hull))
     }).expect("visible permanent SKIN with ship hull");
     let station = session.station_id.unwrap();
-    let flag = crate::consts::FLAG_HANGAR;
+    let flag = infinity_core::consts::FLAG_HANGAR;
     let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &fixture.character, &station, &flag]).await.unwrap().get("item_id");
     let mut request = make_request(GET);
     let mut payload = DynamicMessage::new(message(GET).unwrap());
@@ -131,7 +131,7 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     assert!(decoded.get_field_by_name("states").unwrap().as_list().unwrap().is_empty());
     let response = handle_request(&gateway, make_request(GET), None).await;
     assert_eq!(response.status_code, 404);
-    assert_eq!(response.status_message, crate::messages::gateway::NOT_FOUND);
+    assert_eq!(response.status_message, infinity_core::messages::gateway::NOT_FOUND);
     assert!(response.payload.is_none());
     let observer = crate::services::tests::fixture::create(&db).await.unwrap();
     let outsider = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -141,7 +141,7 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0, pos: [character as f64 * 10_000.0, 0.0, 0.0], vel: [0.0; 3],
         old_pos: [character as f64 * 10_000.0, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3],
         follow_id: 0, follow_range: 0.0, free: true, global: false, massive: true, interactive: true,
-        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new()
     };
     db.execute("UPDATE game.items SET location_id=$2 WHERE item_id=$1", &[&ship, &system]).await.unwrap();
@@ -215,10 +215,10 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     assert!(msg_field(&encoded, "skin").unwrap().has_field_by_name("firstparty"));
     assert!(observer_stream.rx.try_recv().is_err());
     assert!(outsider_stream.rx.try_recv().is_err());
-    gateway.world.unregister_pilot(observer.character);
-    gateway.world.unregister_pilot(outsider.character);
+    gateway.world.unregister_pilot_generation(observer.character, None);
+    gateway.world.unregister_pilot_generation(outsider.character, None);
     crate::services::tests::fixture::cleanup(&db, observer).await.unwrap();
     crate::services::tests::fixture::cleanup(&db, outsider).await.unwrap();
-    gateway.world.unregister_pilot(fixture.character);
+    gateway.world.unregister_pilot_generation(fixture.character, None);
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
 }

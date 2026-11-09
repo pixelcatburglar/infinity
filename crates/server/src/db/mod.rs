@@ -11,8 +11,8 @@ pub mod outbox;
 pub mod transaction;
 
 use crate::config::deployment::{DatabaseConfig, DevelopmentConfig};
-use crate::consts::{GM_ROLES, ROLE_PLAYER_LOGIN, ROLE_SERVICE};
-use crate::dao::{accounts::{authentication, simulated}, market::startup};
+use infinity_core::consts::{GM_ROLES, ROLE_PLAYER_LOGIN, ROLE_SERVICE};
+use crate::dao::{accounts::{authentication, simulated}, market::{migration, startup}};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -29,12 +29,16 @@ const RECONNECT_BACKOFF_FACTOR: u64 = 2;
 pub enum Error {
     Pool(deadpool_postgres::PoolError),
     Postgres(tokio_postgres::Error),
+    Progress(anyhow::Error),
+    InvalidItemLockRequest(&'static str),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pool(e) => write!(f, "database pool: {e}"),
+            Self::Progress(e) => write!(f, "progress: {e}"),
+            Self::InvalidItemLockRequest(reason) => write!(f, "invalid item lock request: {reason}"),
             Self::Postgres(e) => write!(f, "PostgreSQL: {e}"),
         }
     }
@@ -44,6 +48,8 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pool(e) => Some(e),
+            Self::Progress(e) => Some(e.as_ref()),
+            Self::InvalidItemLockRequest(_) => None,
             Self::Postgres(e) => Some(e),
         }
     }
@@ -61,7 +67,9 @@ impl From<tokio_postgres::Error> for Error {
 pub struct Db {
     pool: Pool,
     online: Arc<AtomicI64>,
+    pub(crate) progress_registry: Arc<crate::progress::Registry>,
 }
+
 
 pub struct Account {
     pub user_id: i64,
@@ -70,6 +78,13 @@ pub struct Account {
 }
 
 impl Db {
+    pub(crate) fn with_progress_registry(mut self, registry: crate::progress::Registry) -> Self {
+        self.progress_registry = Arc::new(registry);
+        self
+    }
+
+    pub(crate) fn progress_registry(&self) -> &crate::progress::Registry { &self.progress_registry }
+
     pub async fn query<T: ?Sized + ToStatement + Sync>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> std::result::Result<Vec<Row>, Error> {
         Ok(self.pool.get().await?.query(statement, params).await?)
     }
@@ -94,7 +109,7 @@ impl Db {
         let wait_timeout = (cfg.checkout_timeout_secs != 0).then(|| std::time::Duration::from_secs(cfg.checkout_timeout_secs));
         let pool = Pool::builder(manager).max_size(cfg.pool_size).wait_timeout(wait_timeout).runtime(deadpool_postgres::Runtime::Tokio1).build().context("building PostgreSQL pool")?;
         let mut delay = Some(cfg.startup_retry_secs[0]);
-        let client = loop {
+        let mut client = loop {
             match pool.get().await {
                 Ok(c) => break c,
                 Err(e) => match delay {
@@ -107,14 +122,18 @@ impl Db {
                 },
             }
         };
-        // The initial checkout is retained for schema setup, then returned to the pool.
+        // Schema and market cutover commit together before any startup market writes.
+        let tx = client.transaction().await.context("starting schema transaction")?;
         if cfg.schema_on_start {
-            client.batch_execute(GAME_SCHEMA).await.context("applying game schema")?;
+            tx.batch_execute(GAME_SCHEMA).await.context("applying game schema")?;
+            migration::migrate(&tx).await.context("migrating market schema")?;
         } else {
             warn!("game schema application skipped by configuration");
+            migration::validate(&tx).await.context("validating market schema")?;
         }
+        tx.commit().await.context("committing schema transaction")?;
         drop(client);
-        let db = Db { pool, online: Arc::new(AtomicI64::new(0)) };
+        let db = Db { pool, online: Arc::new(AtomicI64::new(0)), progress_registry: Arc::new(crate::progress::Registry::default()) };
         if !simulated::ensure(&db).await.context("ensuring simulated-pilot account")? {
             anyhow::bail!("reserved account {:?} is not a valid server-owned account", simulated::ACCOUNT_NAME);
         }

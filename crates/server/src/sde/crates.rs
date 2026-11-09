@@ -10,6 +10,7 @@ mod policy;
 
 const POLICY: &str = include_str!("../../content/crates.jsonl");
 
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Crates {
     defs: Vec<Definition>,
     by_id: HashMap<i32, usize>,

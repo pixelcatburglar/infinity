@@ -123,6 +123,9 @@ pub(crate) struct NewFolder<'a> {
 pub(crate) async fn all_folders(ex: &(impl Executor + ?Sized)) -> Result<Vec<Folder>, Error> {
     Ok(ex.query(&format!("SELECT {FOLDER_COLUMNS} FROM game.bookmark_folders ORDER BY folder_id"), &[]).await?.iter().map(Folder::from_row).collect())
 }
+pub(crate) async fn bookmark(ex: &(impl Executor + ?Sized), id: i64) -> Result<Option<Bookmark>, Error> {
+    Ok(ex.query_opt(&format!("{BOOKMARK_SELECT} WHERE bookmark_id = $1"), &[&id]).await?.as_ref().map(Bookmark::from_row))
+}
 pub(crate) async fn bookmarks(ex: &(impl Executor + ?Sized), folder_ids: &[i64], now: i64) -> Result<Vec<Bookmark>, Error> {
     Ok(ex.query(&format!("{BOOKMARK_SELECT} WHERE folder_id = ANY($1) AND (expiry IS NULL OR expiry > $2) ORDER BY bookmark_id"), &[&folder_ids, &now]).await?.iter().map(Bookmark::from_row).collect())
 }

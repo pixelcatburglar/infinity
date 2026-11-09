@@ -10,31 +10,44 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
         old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: pilot.is_some(),
-        massive: true, warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        massive: true, warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
         slim: Vec::new(),
     }
 }
-fn setup(owner: Option<i64>) -> (System, mpsc::UnboundedReceiver<EffectJob>, mpsc::UnboundedReceiver<(String, Vec<Value>)>) {
+
+fn install_npc_condition(s: &mut System, id: i64) {
+    use crate::services::combat::groups_health::{Condition, ShipStats};
+    use crate::services::fit::{Fit, Key};
+    let fit = Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, Vec::new());
+    let stats = ShipStats::from_fit(&fit, Key::Ship);
+    s.install_condition_with_key(id, Condition {
+        now: stats.max, stats, shield_at: crate::client::filetime_now(),
+    }, fit, Key::Ship);
+}
+fn setup(owner: Option<i64>) -> (System, mpsc::UnboundedReceiver<NpcAction>, mpsc::UnboundedReceiver<(String, Vec<Value>)>) {
     crate::tests::init_config();
     let registry = Arc::new(Pilots::default());
     let (notify, notifications) = mpsc::unbounded_channel();
     registry.register_pilot(10, notify);
     let mut s = System::new(1, registry, 0);
+    let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
+    s.effect_jobs = Some(worker_tx);
     let (tx, rx) = mpsc::unbounded_channel();
-    s.effect_jobs = Some(tx);
     s.insert(ball(1000, None, 0.0));
-    s.add_npc(1000, NpcBrain::new(owner, NpcConfig {
+    install_npc_condition(&mut s, 1000);
+    assert!(s.add_npc(1000, NpcBrain::new(owner, NpcConfig {
         fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0, scan_resolution: 17_163.0,
         repairs: (0.0, 0.0, 5000.0),
-    }, Arc::new(|_| panic!("effects must run outside the actor"))));
+    }, Arc::new(move |_, action| { let _ = tx.send(action); None }))));
     (s, rx, notifications)
 }
-fn jam_setup(id: i64) -> (System, mpsc::UnboundedReceiver<EffectJob>, mpsc::UnboundedReceiver<(String, Vec<Value>)>) {
+fn jam_setup(id: i64) -> (System, mpsc::UnboundedReceiver<NpcAction>, mpsc::UnboundedReceiver<(String, Vec<Value>)>) {
     let (mut s, jobs, notifications) = setup(Some(HOSTILE_TO_ALL));
     let brain = s.brains.remove(&1000).unwrap();
     s.remove_ball(1000);
     s.insert(ball(id, None, 0.0));
+    install_npc_condition(&mut s, id);
     assert!(s.add_npc(id, brain));
     s.insert(ball(1, Some(10), 50.0));
     s.brains.get_mut(&id).unwrap().next_think_ms = 0;
@@ -44,10 +57,11 @@ fn add_assist_npc(s: &mut System, id: i64, owner: i64, x: f64) {
     let mut b = ball(id, None, x);
     b.owner_id = owner;
     s.insert(b);
-    s.add_npc(id, NpcBrain::new(None, NpcConfig {
+    install_npc_condition(s, id);
+    assert!(s.add_npc(id, NpcBrain::new(None, NpcConfig {
         fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 5000.0),
-    }, Arc::new(|_| panic!("effects must run outside the actor"))));
+    }, Arc::new(|_, _| None))));
 }
 
 #[test]
@@ -175,12 +189,12 @@ fn lock_delay_and_shot_throttling() {
     s.tick(deadline - 1);
     assert!(jobs.try_recv().is_err());
     s.tick(deadline);
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Shot { .. }));
     assert!(s.brains[&1000].announced);
     s.tick(deadline + 2000);
     assert!(jobs.try_recv().is_err());
     s.tick(deadline + 3000);
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Shot { .. }));
     assert!(jobs.try_recv().is_err());
 }
 #[test]
@@ -213,16 +227,16 @@ fn projected_cycles_are_independent_and_stale_jobs_cannot_restore_effects() {
     s.tick(0);
     let deadline = s.brains[&1000].target.unwrap().2;
     s.tick(deadline);
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
-    let EffectJob::Npc { action: NpcAction::Effect { source_module: first, generation, .. }, .. } = jobs.try_recv().unwrap() else { panic!("first projection") };
-    let EffectJob::Npc { action: NpcAction::Effect { source_module: second, .. }, .. } = jobs.try_recv().unwrap() else { panic!("second projection") };
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Shot { .. }));
+    let NpcAction::Effect { source_module: first, generation, .. } = jobs.try_recv().unwrap() else { panic!("first projection") };
+    let NpcAction::Effect { source_module: second, .. } = jobs.try_recv().unwrap() else { panic!("second projection") };
     assert!(first < 0 && second < 0 && first != second);
     assert!(s.npc_projection_valid(1000, 1, generation));
     s.upsert_projection(1, Projection { source_ship: 1000, source_module: first,
         source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
     s.tick(deadline + 1000);
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Effect { source_module, .. }, .. } if source_module == first));
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Effect { source_module, .. } if source_module == first));
     assert!(jobs.try_recv().is_err());
     let mut brain = s.brains.remove(&1000).unwrap();
     s.lose_npc_target(1000, &mut brain);
@@ -244,7 +258,7 @@ fn departing_npc_removes_its_projections_and_invalidates_jobs() {
     let generation = s.brains[&1000].target_generation;
     s.upsert_projection(1, Projection { source_ship: 1000, source_module: -1,
         source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
     s.remove_ball(1000);
     assert!(s.projections_on(1).is_empty());
     assert!(!s.npc_projection_valid(1000, 1, generation));
@@ -259,18 +273,21 @@ fn replacement_rejects_old_lock_and_queued_actions_with_same_target_and_deadline
     let (ship, pilot, deadline) = s.brains[&1000].target.unwrap();
     let old_lock = s.brains[&1000].target_generation;
     s.complete_npc_lock(1000, ship, pilot, deadline, old_lock);
-    let EffectJob::Npc { action: NpcAction::Shot { generation: old_shot, .. }, .. } = jobs.try_recv().unwrap() else { panic!("expected shot") };
-    let EffectJob::Npc { action: NpcAction::Effect { generation: old_effect, .. }, .. } = jobs.try_recv().unwrap() else { panic!("expected effect") };
+    s.admit_effect_jobs();
+    let NpcAction::Shot { generation: old_shot, .. } = jobs.try_recv().unwrap() else { panic!("expected shot") };
+    let NpcAction::Effect { generation: old_effect, .. } = jobs.try_recv().unwrap() else { panic!("expected effect") };
     assert!(s.npc_projection_valid(1000, ship, old_shot));
     assert!(s.npc_projection_valid(1000, ship, old_effect));
     assert!(notifications.try_recv().is_ok());
 
+    let effects = s.brains[&1000].effects.clone();
     s.remove_ball(1000);
     s.insert(ball(1000, None, 0.0));
+    install_npc_condition(&mut s, 1000);
     let mut replacement = NpcBrain::new(Some(HOSTILE_TO_ALL), NpcConfig {
         fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 5000.0),
-    }, Arc::new(|_| panic!("effects must run outside the actor")));
+    }, effects);
     replacement.add_effect(42, 1000.0);
     assert!(s.add_npc(1000, replacement));
     s.brains.get_mut(&1000).unwrap().next_think_ms = s.now_ms();
@@ -282,9 +299,10 @@ fn replacement_rejects_old_lock_and_queued_actions_with_same_target_and_deadline
     assert!(jobs.try_recv().is_err());
     assert!(notifications.try_recv().is_err());
     s.complete_npc_lock(1000, ship, pilot, deadline, new_lock);
+    s.admit_effect_jobs();
     assert!(s.brains[&1000].announced);
-    let EffectJob::Npc { action: NpcAction::Shot { generation: new_shot, .. }, .. } = jobs.try_recv().unwrap() else { panic!("expected replacement shot") };
-    let EffectJob::Npc { action: NpcAction::Effect { generation: new_effect, .. }, .. } = jobs.try_recv().unwrap() else { panic!("expected replacement effect") };
+    let NpcAction::Shot { generation: new_shot, .. } = jobs.try_recv().unwrap() else { panic!("expected replacement shot") };
+    let NpcAction::Effect { generation: new_effect, .. } = jobs.try_recv().unwrap() else { panic!("expected replacement effect") };
     assert!(!s.npc_projection_valid(1000, ship, old_shot));
     assert!(!s.npc_projection_valid(1000, ship, old_effect));
     assert!(s.npc_projection_valid(1000, ship, new_shot));
@@ -299,14 +317,14 @@ fn effect_timers_stop_on_target_generation_change() {
     s.tick(0);
     let deadline = lock_time_ms(17_163.0, 1.0) as i64;
     s.tick(deadline);
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Shot { .. }));
     let generation = match jobs.try_recv().unwrap() {
-        EffectJob::Npc { action: NpcAction::Effect { generation, .. }, .. } => generation,
+        NpcAction::Effect { generation, .. } => generation,
         _ => panic!("expected NPC effect"),
     };
     assert!(s.npc_projection_valid(1000, 1, generation));
     s.tick(deadline + 1000);
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Effect { generation: g, .. }, .. } if g == generation));
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Effect { generation: g, .. } if g == generation));
     let mut brain = s.brains.remove(&1000).unwrap();
     s.lose_npc_target(1000, &mut brain);
     s.brains.insert(1000, brain);
@@ -378,7 +396,7 @@ fn failed_lock_reacquires_and_ignores_stale_completion() {
     s.tick(new_target.2);
     assert!(s.brains[&1000].announced);
     assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otheradd".as_slice()));
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Shot { .. }));
 }
 
 #[test]
@@ -393,7 +411,8 @@ fn jam_cancels_pending_lock_and_prevents_reacquisition_until_expiry() {
     s.brains.get_mut(&id).unwrap().config.repairs = (1.0, 0.0, 5000.0);
     s.brains.get_mut(&id).unwrap().next_think_ms = 0;
     s.think_npcs();
-    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Repair, .. }));
+    s.admit_effect_jobs();
+    assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Repair));
     s.brains.get_mut(&id).unwrap().config.repairs = (0.0, 0.0, 5000.0);
     s.brains.get_mut(&id).unwrap().target = Some((1, 10, deadline));
     let generation = s.brains[&id].target_generation;
@@ -420,12 +439,12 @@ fn jam_drops_completed_lock_and_invalidates_queued_projection() {
     s.tick(0);
     let deadline = s.brains[&id].target.unwrap().2;
     s.tick(deadline);
-    let EffectJob::Npc { action: NpcAction::Shot { generation: shot_generation, .. }, .. } = jobs.try_recv().unwrap() else { panic!("expected shot") };
-    let EffectJob::Npc { action: NpcAction::Effect { source_module, generation, .. }, .. } = jobs.try_recv().unwrap() else { panic!("expected projection") };
+    let NpcAction::Shot { generation: shot_generation, .. } = jobs.try_recv().unwrap() else { panic!("expected shot") };
+    let NpcAction::Effect { source_module, generation, .. } = jobs.try_recv().unwrap() else { panic!("expected projection") };
     assert!(s.npc_projection_valid(id, 1, shot_generation));
     s.upsert_projection(1, Projection { source_ship: id, source_module, source_type: 1,
         effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
     assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otheradd".as_slice()));
     crate::services::combat::jamming::apply(&mut s, 1, -8_901_002, id, 4000.0);
     assert!(s.brains[&id].target.is_none());
@@ -461,12 +480,13 @@ fn sampled_acquisition_nearest_loss_and_shot_capture() {
 
     let generation = s.brains[&1000].target_generation;
     s.complete_npc_lock(1000, ship, pilot, deadline, generation);
+    s.admit_effect_jobs();
     assert!(s.brains[&1000].announced);
     s.brains.get_mut(&1000).unwrap().next_think_ms = 1500;
     s.tick(1500);
     assert!(s.sample_position(1).unwrap()[0] > 200.0);
     assert_eq!(s.brains[&1000].target.unwrap().0, 2);
-    let EffectJob::Npc { action: NpcAction::Shot { me, victim, .. }, .. } = jobs.try_recv().unwrap() else {
+    let NpcAction::Shot { me, victim, .. } = jobs.try_recv().unwrap() else {
         panic!("expected captured shot");
     };
     assert_eq!(me.pos, [0.0, 0.0, 0.0]);
@@ -499,17 +519,17 @@ async fn deferred_jobs_progress_while_npc_effects_remain_fifo() {
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let release = Arc::new(Mutex::new(Some(release_rx)));
-    let effects: NpcEffects = Arc::new(move |_| {
+    let effects: NpcEffects = Arc::new(move |_, _| {
         let started_tx = started_tx.clone();
         let release = release.lock().unwrap().take();
-        Box::pin(async move {
+        Some(Box::pin(async move {
             started_tx.send(()).unwrap();
             if let Some(release) = release { let _ = release.await; }
-        })
+        }))
     });
-    let tx = s.effect_jobs.as_ref().unwrap();
-    assert!(tx.send(EffectJob::Npc { effects: effects.clone(), action: NpcAction::Repair }).is_ok());
-    assert!(tx.send(EffectJob::Npc { effects, action: NpcAction::Repair }).is_ok());
+    s.effect_staging.push(EffectJob::Npc { effects: effects.clone(), action: NpcAction::Repair });
+    s.effect_staging.push(EffectJob::Npc { effects, action: NpcAction::Repair });
+    s.admit_effect_jobs();
     started_rx.recv().await.unwrap();
     let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();

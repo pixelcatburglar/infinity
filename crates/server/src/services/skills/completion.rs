@@ -4,7 +4,8 @@
 //! one job per character uses the shared planner and reconciles fitted resources.
 //! Legacy boosters without expiry have no scheduled deadline.
 use super::{db_err, timeline, view::incremental_skill_info, CallError};
-use crate::{client::{filetime_now, BRAIN_REFRESH}, consts::{IX_LOCATION_ID, LOCATION_JUNKYARD}, dao::{items::{brain, loading::{Item, ItemQuery}}, skills::{queue, training}}, db::{executor::Executor, outbox::Outbox, Db}, scheduler::{self, Job}, sde::Sde, services::effects::online::{self, OnlineChanged}, space::World};
+use infinity_core::{consts::{IX_LOCATION_ID, LOCATION_JUNKYARD}};
+use crate::{client::{filetime_now, BRAIN_REFRESH}, dao::{items::{brain, loading::{Item, ItemQuery}}, skills::{queue, training}}, db::{executor::Executor, outbox::Outbox, Db}, scheduler::{self, Job}, sde::Sde, services::effects::online::{self, OnlineChanged}, space::World};
 use marshal::Value;
 use std::{collections::{BTreeMap, BTreeSet}, future::Future, pin::Pin, sync::Arc};
 
@@ -100,9 +101,10 @@ pub(super) async fn apply_plan_tx<E>(tx: &(impl Executor + ?Sized), outbox: &mut
     for event in &plan.events {
         match event {
             timeline::Event::Completion(done) => {
-                crate::dao::skills::history::append(tx, char_id, done.type_id, super::history::TRAINING_COMPLETE, done.points, done.end_time).await.map_err(db_err)?;
+                let history_id = crate::dao::skills::history::append(tx, char_id, done.type_id, super::history::TRAINING_COMPLETE, done.points, done.end_time).await.map_err(db_err)?;
                 result.completed.push((done.type_id, done.level));
-                super::training::queue_training_events(outbox, char_id, &[(done.type_id, done.level)]);
+                outbox.event_from(crate::db::outbox::SourceKey::new("SkillTrained", history_id),
+                    crate::lua::events::GameEvent::SkillTrained { char_id, type_id: done.type_id, level: done.level });
             }
             timeline::Event::Expiry { at, items } => {
                 for item in items {
@@ -134,9 +136,9 @@ pub(super) async fn advance_tx<E>(tx: &(impl Executor + ?Sized), outbox: &mut Ou
     apply_plan_tx(tx, outbox, sde, &plan).await
 }
 
-pub(super) async fn finish_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, char_id: i64, now: i64, progress: &AdvanceResult, additional: &[i32]) -> Result<(), CallError> {
+pub(super) async fn finish_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, now: i64, progress: &AdvanceResult, additional: &[i32]) -> Result<(), CallError> {
     reschedule(tx, char_id).await?;
-    online::reconcile_owner(tx, sde, outbox, char_id).await?;
+    online::reconcile_owner(tx, sde, outbox, fences, char_id).await?;
     let types: BTreeSet<_> = progress.completed.iter().map(|(type_id, _)| *type_id).chain(progress.expert_skills.iter().copied()).chain(additional.iter().copied()).collect();
     if !types.is_empty() {
         let snapshot = super::effective::snapshot_at(tx, sde, char_id, now).await?;
@@ -168,12 +170,14 @@ pub(crate) fn handle(db: Db, world: Arc<World>, job: Job) -> Pin<Box<dyn Future<
         let char_id: i64 = serde_json::from_str(&job.payload)?;
         let now = filetime_now();
         let _market = crate::services::market::lock().await;
+        let fences = online::capture_online_fences(&world, &[char_id]).await;
         let result = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = world.sde().clone();
+            let fences = fences.clone();
             Box::pin(async move {
                 crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
                 let progress = advance_tx(tx, outbox, &sde, char_id, now).await?;
-                finish_tx(tx, outbox, &sde, char_id, now, &progress, &[]).await
+                finish_tx(tx, outbox, &sde, &fences, char_id, now, &progress, &[]).await
             })
         }, |value, outbox| {
             let world = &world;

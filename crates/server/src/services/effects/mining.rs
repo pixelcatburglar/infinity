@@ -1,11 +1,11 @@
 //! Mining effect validation, animations and yield phase.
 //! Client dogma mining effects use the cycle-start fit when extracting ore.
-//! Rock storage and depletion are owned by services/mining; later families are unsupported.
+//! Rock identity is system-owned; storage and depletion are owned by services/mining.
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::notify::fire_fx;
 use super::registry::EffectFlag;
-use crate::consts::{dogma::ATTR_MAX_RANGE, dogma::EFFECT_MINING_CLOUDS};
-use crate::messages;
+use infinity_core::consts::{dogma::ATTR_MAX_RANGE, dogma::EFFECT_MINING_CLOUDS};
+use infinity_core::messages;
 use crate::services::{combat::{Ctx, targeting_charges::targets_of}, fit::{Fit, Key}, user_error, CallError};
 use crate::space::{dist, metres_to_km, System};
 use marshal::Value;
@@ -19,13 +19,15 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, target: Optio
     let Some(t) = target.filter(|t| targets_of(cx.char_id).contains(t)) else {
         return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
     };
-    if !crate::services::mining::is_rock(t) {
+    let ship = cx.ship_id;
+    let (valid, gap) = cx.world.with(cx.system_id, move |s| {
+        let valid = s.rock_type(t).is_some();
+        let gap = s.ball(ship).zip(s.ball(t)).map(|(a, b)| dist(a.position_at(s.now_ms()), b.position_at(s.now_ms())) - a.radius as f64 - b.radius as f64);
+        (valid, gap)
+    }).await.unwrap_or((false, None));
+    if !valid {
         return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::MINING_MODULE_TARGET_INVALID))]));
     }
-    let ship = cx.ship_id;
-    let gap = cx.world.with(cx.system_id, move |s| {
-        s.ball(ship).zip(s.ball(t)).map(|(a, b)| dist(a.position_at(s.now_ms()), b.position_at(s.now_ms())) - a.radius as f64 - b.radius as f64)
-    }).await.flatten();
     let range = fit.value(Key::Module(module.id), ATTR_MAX_RANGE);
     if gap.is_none_or(|g| g > range) {
         return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::mining_range(metres_to_km(range))))]));

@@ -64,8 +64,8 @@ async fn creation_saves_skill_capacity_and_charges_startup_cost() {
         let bonus = skills.iter().find(|(id, _)| *id == skill).unwrap().1;
         let level = i32::try_from(crate::config::game().corporations.min_management_skill_level).unwrap().max(1);
         test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0)", &[&ceo.character, &skill, &level]).await.unwrap();
-        let starting = super::super::super::STARTUP_COST * 2.0;
-        test_db.execute("UPDATE game.characters SET balance=$2::float8::numeric WHERE character_id=$1", &[&ceo.character, &starting]).await.unwrap();
+        let starting = super::super::super::STARTUP_COST * 2;
+        test_db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&ceo.character, &starting.to_string()]).await.unwrap();
         let ticker = unique_ticker(&test_db, &client.sde, ceo.character).await;
         let lp_tax = 0.25;
         let args = [Value::unicode(format!("Fixture Corporation {}", ceo.character)), Value::unicode(ticker), Value::unicode("description"), Value::unicode(""), Value::Float(0.0), Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::Bool(false), Value::Bool(true), Value::Float(lp_tax)];
@@ -73,7 +73,7 @@ async fn creation_saves_skill_capacity_and_charges_startup_cost() {
         let events: Vec<_> = std::iter::from_fn(|| founder_rx.try_recv().ok()).collect();
         let session = events.iter().position(|e| e.0 == "__session").unwrap();
         assert!(events[session].1.contains(&Value::tuple([Value::str("corpid"), Value::Int(corp)])));
-        assert!(events[session].1.contains(&Value::tuple([Value::str("corpAccountKey"), Value::Int(crate::consts::ACCOUNT_CASH as i64)])));
+        assert!(events[session].1.contains(&Value::tuple([Value::str("corpAccountKey"), Value::Int(infinity_core::consts::ACCOUNT_CASH as i64)])));
         let members: Vec<_> = events.iter().enumerate().filter(|(_, e)| e.0 == "OnCorporationMemberChanged").collect();
         assert_eq!(members.len(), 1);
         assert!(session < members[0].0);
@@ -88,10 +88,70 @@ async fn creation_saves_skill_capacity_and_charges_startup_cost() {
         assert!(!row.get::<_, bool>("is_recruiting"));
         assert!(row.get::<_, bool>("friendly_fire"));
         assert_eq!(corp_of(&test_db, ceo.character).await, corp);
-        assert_eq!(crate::services::wallets::balance(&test_db, ceo.character).await.unwrap(), starting - super::super::super::STARTUP_COST);
+        assert_eq!(crate::services::wallets::balance(&test_db, ceo.character).await.unwrap(), crate::isk::IskAmount::from_whole_isk(starting).unwrap().checked_sub(crate::isk::IskAmount::from_whole_isk(super::super::super::STARTUP_COST).unwrap()).unwrap());
     }).await;
     cleanup_founder(&db, ceo, &[]).await;
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
+async fn creation_refuses_nonfinite_tax_rates_without_persisting() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    for field in [4, 14] {
+        for rate in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let ceo = fixture::create(&db).await.unwrap();
+            let test_db = db.clone();
+            let result = tokio::spawn(async move {
+                let (mut client, _peer) = tests::client(test_db.clone(), ceo.character).await;
+                client.session.apply(vec![("corpid", Value::Int(1)), ("stationid", Value::Int(1))]);
+                let skill = super::super::super::SKILL_CORPORATION_MANAGEMENT;
+                let level = i32::try_from(crate::config::game().corporations.min_management_skill_level).unwrap().max(1);
+                test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0)", &[&ceo.character, &skill, &level]).await.unwrap();
+                let starting = super::super::super::STARTUP_COST * 2;
+                test_db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&ceo.character, &starting.to_string()]).await.unwrap();
+                let ticker = unique_ticker(&test_db, &client.sde, ceo.character).await;
+                let mut args = [Value::unicode(format!("Fixture Tax {}", ceo.character)), Value::unicode(ticker), Value::unicode("description"), Value::unicode(""), Value::Float(0.0), Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::Bool(false), Value::Bool(false), Value::Float(0.0)];
+                args[field] = Value::Float(rate);
+                let response = rpc(&mut client, "AddCorporation", &args, 1).await;
+                let count: i64 = test_db.query_one("SELECT count(*) AS n FROM game.corporations WHERE creator_id=$1 OR ceo_id=$1", &[&ceo.character]).await.unwrap().get("n");
+                assert_eq!(count, 0, "field {field}, rate {rate:?} persisted a corporation");
+                assert!(matches!(response, Err(crate::services::CallError::User { .. })), "field {field}, rate {rate:?}: {response:?}");
+                assert_eq!(crate::services::wallets::balance(&test_db, ceo.character).await.unwrap(), crate::isk::IskAmount::from_whole_isk(starting).unwrap());
+            }).await;
+            cleanup_founder(&db, ceo, &[]).await;
+            result.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
+async fn creation_clamps_finite_tax_rates() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    for (tax, lp_tax, expected_tax, expected_lp_tax) in [(-0.5, 1.5, 0.0, 1.0), (1.5, -0.5, 1.0, 0.0)] {
+        let ceo = fixture::create(&db).await.unwrap();
+        let test_db = db.clone();
+        let result = tokio::spawn(async move {
+            let (mut client, _peer) = tests::client(test_db.clone(), ceo.character).await;
+            client.session.apply(vec![("corpid", Value::Int(1)), ("stationid", Value::Int(1))]);
+            let skill = super::super::super::SKILL_CORPORATION_MANAGEMENT;
+            let level = i32::try_from(crate::config::game().corporations.min_management_skill_level).unwrap().max(1);
+            test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0)", &[&ceo.character, &skill, &level]).await.unwrap();
+            let starting = super::super::super::STARTUP_COST * 2;
+            test_db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&ceo.character, &starting.to_string()]).await.unwrap();
+            let ticker = unique_ticker(&test_db, &client.sde, ceo.character).await;
+            let args = [Value::unicode(format!("Fixture Tax Clamp {}", ceo.character)), Value::unicode(ticker), Value::unicode("description"), Value::unicode(""), Value::Float(tax), Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::Bool(false), Value::Bool(false), Value::Float(lp_tax)];
+            let corp = rpc(&mut client, "AddCorporation", &args, 1).await.unwrap().as_int().unwrap();
+            let row = test_db.query_one("SELECT tax_rate,lp_tax_rate FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();
+            assert_eq!(row.get::<_, f64>("tax_rate"), expected_tax);
+            assert_eq!(row.get::<_, f64>("lp_tax_rate"), expected_lp_tax);
+        }).await;
+        cleanup_founder(&db, ceo, &[]).await;
+        result.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -108,8 +168,8 @@ async fn creation_persists_boolean_and_integer_recruiting_and_lp_tax() {
             let skill = super::super::super::SKILL_CORPORATION_MANAGEMENT;
             let level = i32::try_from(crate::config::game().corporations.min_management_skill_level).unwrap().max(1);
             test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0)", &[&ceo.character, &skill, &level]).await.unwrap();
-            let starting = super::super::super::STARTUP_COST * 2.0;
-            test_db.execute("UPDATE game.characters SET balance=$2::float8::numeric WHERE character_id=$1", &[&ceo.character, &starting]).await.unwrap();
+            let starting = super::super::super::STARTUP_COST * 2;
+            test_db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&ceo.character, &starting.to_string()]).await.unwrap();
             let ticker = unique_ticker(&test_db, &client.sde, ceo.character).await;
             let lp_tax = 0.25;
             let args = [Value::unicode(format!("Fixture Recruiting {}", ceo.character)), Value::unicode(ticker), Value::unicode("description"), Value::unicode(""), Value::Float(0.0), Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, recruiting, Value::Bool(false), Value::Float(lp_tax)];
@@ -139,8 +199,8 @@ async fn concurrent_foundings_by_same_character_charge_once() {
         let skill = super::super::super::SKILL_CORPORATION_MANAGEMENT;
         let level = i32::try_from(crate::config::game().corporations.min_management_skill_level).unwrap().max(1);
         test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0)", &[&ceo.character, &skill, &level]).await.unwrap();
-        let starting = super::super::super::STARTUP_COST * 3.0;
-        test_db.execute("UPDATE game.characters SET balance=$2::float8::numeric WHERE character_id=$1", &[&ceo.character, &starting]).await.unwrap();
+        let starting = super::super::super::STARTUP_COST * 3;
+        test_db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&ceo.character, &starting.to_string()]).await.unwrap();
         let ticker1 = unique_ticker(&test_db, &first.sde, ceo.character).await;
         let mut seed = ceo.character + 1;
         let ticker2 = loop {
@@ -159,9 +219,9 @@ async fn concurrent_foundings_by_same_character_charge_once() {
         };
         match loser {
             crate::services::CallError::User { msg, dict } => {
-                assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-                assert!(dict == vec![("notify".to_owned(), Value::unicode(crate::messages::CORP_APPLICATION_ALREADY_PROCESSED))]
-                    || dict == vec![("notify".to_owned(), Value::unicode(crate::messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE))]);
+                assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                assert!(dict == vec![("notify".to_owned(), Value::unicode(infinity_core::messages::CORP_APPLICATION_ALREADY_PROCESSED))]
+                    || dict == vec![("notify".to_owned(), Value::unicode(infinity_core::messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE))]);
             }
             other => panic!("expected UserError, got {other:?}"),
         }
@@ -173,17 +233,18 @@ async fn concurrent_foundings_by_same_character_charge_once() {
         assert!(!rows[0].get::<_, bool>("deleted"));
         assert!(rows[0].get::<_, bool>("is_recruiting"));
         assert_eq!(corp_of(&test_db, ceo.character).await, corp);
-        assert_eq!(crate::services::wallets::balance(&test_db, ceo.character).await.unwrap(), starting - super::super::super::STARTUP_COST);
+        assert_eq!(crate::services::wallets::balance(&test_db, ceo.character).await.unwrap(), crate::isk::IskAmount::from_whole_isk(starting).unwrap().checked_sub(crate::isk::IskAmount::from_whole_isk(super::super::super::STARTUP_COST).unwrap()).unwrap());
         let count: i64 = test_db.query_one("SELECT count(*) AS n FROM game.employment_history WHERE char_id=$1 AND corporation_id=$2", &[&ceo.character, &corp]).await.unwrap().get("n");
         assert_eq!(count, 1);
         let error = rpc(&mut second, "AddCorporation", &args2, 1).await.unwrap_err();
         match error {
             crate::services::CallError::User { msg, dict } => {
-                assert_eq!(msg, crate::messages::MSG_CUSTOM_NOTIFY);
-                assert_eq!(dict, vec![("notify".to_owned(), Value::unicode(crate::messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE))]);
+                assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                assert_eq!(dict, vec![("notify".to_owned(), Value::unicode(infinity_core::messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE))]);
             }
             other => panic!("expected UserError, got {other:?}"),
         }
+        assert_eq!(crate::services::wallets::balance(&test_db, ceo.character).await.unwrap(), crate::isk::IskAmount::from_whole_isk(starting).unwrap().checked_sub(crate::isk::IskAmount::from_whole_isk(super::super::super::STARTUP_COST).unwrap()).unwrap());
     }).await;
     cleanup_founder(&db, ceo, &[]).await;
     result.unwrap();
@@ -202,7 +263,7 @@ async fn gm_zero_capacity_keeps_ceo_and_refuses_join_without_changing_npc_projec
         client.session.apply(vec![("corpid", Value::Int(1)), ("stationid", Value::Int(1))]);
         let npc = client.sde.npc_corporations.iter().find(|c| c.corporation_id != 1).unwrap();
         let npc_id = npc.corporation_id;
-        let npc_limit = npc.member_limit.unwrap_or(crate::consts::CORPORATION_UNLIMITED_MEMBER_LIMIT);
+        let npc_limit = npc.member_limit.unwrap_or(infinity_core::consts::CORPORATION_UNLIMITED_MEMBER_LIMIT);
         let kwargs = Value::Dict(vec![]);
         let args = [Value::Int(npc_id)];
         let call = Call { service: "corpmgr", method: "GetPublicInfo", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
@@ -256,3 +317,5 @@ async fn all_management_skill_level_combinations_use_sde_bonuses() {
     cleanup(&db, corp, &[ceo]).await;
     result.unwrap();
 }
+
+mod exit_boundaries;

@@ -186,7 +186,7 @@ async fn service_contacts_and_presence() {
     assert!(char_call(&mut client, "EditContact", &[Value::Int(target), Value::Float(-2.0), Value::Bool(true), Value::Bool(true), Value::unicode("edited")]).await.is_ok());
     assert_eq!(target_rx.try_recv().unwrap().0, "OnNotificationReceived");
     assert_eq!(owner_rx.try_recv().unwrap().0, "OnPersonalContactsUpdated");
-    world.unregister_pilot(target);
+    world.unregister_pilot_generation(target, None);
     assert!(!world.is_online(target));
     online_status::presence_changed(&db, &world, target, false).await;
     let event = owner_rx.try_recv().unwrap();

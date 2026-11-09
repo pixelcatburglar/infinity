@@ -1,12 +1,16 @@
 //! Scheduler arithmetic and database lease regression tests.
-//! Run ignored tests serially against a dedicated database with no live jobs.
+//! Run ignored tests serially; runner tests require a database without scheduled or running jobs.
 use super::*;
 use crate::{client::filetime_now, dao::jobs};
 
 async fn test_db() -> Db {
-    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    assert!(jobs::next_due(&db, &[]).await.unwrap().is_none(), "scheduler tests require a dedicated database without scheduled or running jobs");
-    db
+    Db::connect(&crate::config::tests::test_database()).await.unwrap()
+}
+
+async fn test_client() -> tokio_postgres::Client {
+    let (client, connection) = crate::config::tests::test_database().to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move { connection.await.unwrap(); });
+    client
 }
 
 #[test]
@@ -27,8 +31,8 @@ fn duplicate_registry_is_rejected() {
     assert!(runner::registry(vec![register("first", unused_handler), register("second", unused_handler)]).is_ok());
 }
 
-struct FailedWrite<'a>(&'a Db);
-impl crate::db::executor::Executor for FailedWrite<'_> {
+struct FailedWrite<'a, E: crate::db::executor::Executor>(&'a E);
+impl<E: crate::db::executor::Executor> crate::db::executor::Executor for FailedWrite<'_, E> {
     async fn query<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, sql: &T, args: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<tokio_postgres::Row>, Error> { self.0.query(sql, args).await }
     async fn query_one<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, sql: &T, args: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<tokio_postgres::Row, Error> { self.0.query_one(sql, args).await }
     async fn query_opt<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, sql: &T, args: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Option<tokio_postgres::Row>, Error> { self.0.query_opt(sql, args).await }
@@ -36,126 +40,165 @@ impl crate::db::executor::Executor for FailedWrite<'_> {
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL; run serially"]
 async fn failed_periodic_completion_leaves_expired_claim_reclaimable() {
-    let db = test_db().await;
+    let mut client = test_client().await;
+    let mut tx = client.transaction().await.unwrap();
+    let existing = jobs::tests::existing_ids(&tx).await.unwrap();
+    let excluded: Vec<&str> = existing.iter().map(String::as_str).collect();
     let now = filetime_now();
     let id = format!("scheduler-completion-test:{now}");
+    assert!(!existing.contains(&id), "test job ID already exists");
     let job = Job { id: id.clone(), kind: "test".into(), due_at: now, payload: "{}".into() };
-    schedule(&db, &job).await.unwrap();
-    let claim = jobs::claim(&db, now, now + 1, 100, &[]).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
-    assert!(jobs::complete_periodic(&FailedWrite(&db), &id, claim.token, now + 100, now).await.is_err());
-    let reclaimed = jobs::claim(&db, now + 2, now + 3, 100, &[]).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
+    schedule(&tx, &job).await.unwrap();
+    let claim = jobs::claim(&tx, now, now + 1, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
+    let save = tx.savepoint("failed_completion").await.unwrap();
+    assert!(jobs::complete_periodic(&FailedWrite(&save), &id, claim.token, now + 100, now).await.is_err());
+    save.rollback().await.unwrap();
+    let reclaimed = jobs::claim(&tx, now + 2, now + 3, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     assert_ne!(claim.token, reclaimed.token);
-    cancel(&db, &id).await.unwrap();
+    cancel(&tx, &id).await.unwrap();
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL; run serially"]
 async fn claims_reclaim_and_stale_ack() {
     let db = test_db().await;
+    let existing = jobs::tests::existing_ids(&db).await.unwrap();
     let now = filetime_now();
     let id = format!("scheduler-test:{}", now);
+    assert!(!existing.contains(&id), "test job ID already exists");
     let job = Job { id: id.clone(), kind: "test".into(), due_at: now, payload: "{}".into() };
     assert_eq!(schedule(&db, &job).await.unwrap(), 1);
-    assert_eq!(schedule(&db, &job).await.unwrap(), 0);
-    let (a, b) = tokio::join!(jobs::claim(&db, now, now + 1, 1, &[]), jobs::claim(&db, now, now + 1, 1, &[]));
-    let mut claims = a.unwrap(); claims.extend(b.unwrap());
-    assert_eq!(claims.iter().filter(|claim| claim.job.id == id).count(), 1);
-    let first = claims.into_iter().find(|claim| claim.job.id == id).expect("job claimed");
-    assert!(jobs::claim(&db, now + 2, now + 3, 100, &[id.as_str()]).await.unwrap().iter().all(|claim| claim.job.id != id));
-    let reclaimed = jobs::claim(&db, now + 2, now + 3, 100, &[]).await.unwrap().into_iter().find(|claim| claim.job.id == id).expect("lease reclaimed");
-    assert_ne!(first.token, reclaimed.token);
-    assert_eq!(jobs::ack(&db, &id, first.token).await.unwrap(), 0);
-    let mut changed = job.clone(); changed.due_at += 10;
-    schedule(&db, &changed).await.unwrap();
-    assert_eq!(jobs::ack(&db, &id, reclaimed.token).await.unwrap(), 0);
-    let next = jobs::claim(&db, changed.due_at, changed.due_at + 1, 1, &[]).await.unwrap().pop().unwrap();
-    assert_eq!(next.attempt, reclaimed.attempt + 1);
-    assert_ne!(next.token, reclaimed.token);
-    assert_eq!(jobs::ack(&db, &id, next.token).await.unwrap(), 1);
+    let task_db = db.clone();
+    let task_id = id.clone();
+    let result = tokio::spawn(async move {
+        let db = task_db;
+        let id = task_id;
+        let excluded: Vec<&str> = existing.iter().map(String::as_str).collect();
+        assert_eq!(schedule(&db, &job).await.unwrap(), 0);
+        let (a, b) = tokio::join!(jobs::claim(&db, now, now + 1, 1, &excluded), jobs::claim(&db, now, now + 1, 1, &excluded));
+        let mut claims = a.unwrap(); claims.extend(b.unwrap());
+        assert_eq!(claims.iter().filter(|claim| claim.job.id == id).count(), 1);
+        let first = claims.into_iter().find(|claim| claim.job.id == id).expect("job claimed");
+        let mut excluded_with_own = excluded.clone();
+        excluded_with_own.push(id.as_str());
+        assert!(jobs::claim(&db, now + 2, now + 3, 100, &excluded_with_own).await.unwrap().iter().all(|claim| claim.job.id != id));
+        let reclaimed = jobs::claim(&db, now + 2, now + 3, 100, &excluded).await.unwrap().into_iter().find(|claim| claim.job.id == id).expect("lease reclaimed");
+        assert_ne!(first.token, reclaimed.token);
+        assert_eq!(jobs::ack(&db, &id, first.token).await.unwrap(), 0);
+        let mut changed = job.clone(); changed.due_at += 10;
+        schedule(&db, &changed).await.unwrap();
+        assert_eq!(jobs::ack(&db, &id, reclaimed.token).await.unwrap(), 0);
+        let next = jobs::claim(&db, changed.due_at, changed.due_at + 1, 1, &excluded).await.unwrap().pop().unwrap();
+        assert_eq!(next.attempt, reclaimed.attempt + 1);
+        assert_ne!(next.token, reclaimed.token);
+        assert_eq!(jobs::ack(&db, &id, next.token).await.unwrap(), 1);
+    }).await;
+    let cleanup = cancel(&db, &id).await;
+    if let Err(error) = result {
+        cleanup.expect("failed to clean up test job after task failure");
+        std::panic::resume_unwind(error.into_panic());
+    }
+    cleanup.expect("failed to clean up test job");
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL; run serially"]
 async fn retry_and_periodic_completion_are_token_guarded() {
-    let db = test_db().await;
+    let mut client = test_client().await;
+    let tx = client.transaction().await.unwrap();
+    let existing = jobs::tests::existing_ids(&tx).await.unwrap();
+    let excluded: Vec<&str> = existing.iter().map(String::as_str).collect();
     let now = filetime_now();
     let id = format!("scheduler-retry-test:{now}");
+    assert!(!existing.contains(&id), "test job ID already exists");
     let job = Job { id: id.clone(), kind: "test".into(), due_at: now, payload: "{}".into() };
-    schedule(&db, &job).await.unwrap();
-    let first = jobs::claim(&db, now, now + 10, 100, &[]).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
+    schedule(&tx, &job).await.unwrap();
+    let first = jobs::claim(&tx, now, now + 10, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     assert_eq!(first.attempt, 1);
-    assert_eq!(jobs::fail(&db, &id, first.token, now + 20, now, "failure", false).await.unwrap(), 1);
-    let second = jobs::claim(&db, now + 20, now + 30, 100, &[]).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
+    assert_eq!(jobs::fail(&tx, &id, first.token, now + 20, now, "failure", false).await.unwrap(), 1);
+    let second = jobs::claim(&tx, now + 20, now + 30, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     assert_eq!(second.attempt, 2);
-    assert_eq!(jobs::complete_periodic(&db, &id, first.token, now + 40, now + 20).await.unwrap(), 0);
-    assert_eq!(jobs::complete_periodic(&db, &id, second.token, now + 40, now + 20).await.unwrap(), 1);
-    let third = jobs::claim(&db, now + 40, now + 50, 100, &[]).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
+    assert_eq!(jobs::complete_periodic(&tx, &id, first.token, now + 40, now + 20).await.unwrap(), 0);
+    assert_eq!(jobs::complete_periodic(&tx, &id, second.token, now + 40, now + 20).await.unwrap(), 1);
+    let third = jobs::claim(&tx, now + 40, now + 50, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     assert_eq!(third.attempt, 1);
-    assert_eq!(jobs::fail(&db, &id, third.token, now + 60, now + 40, "dead", true).await.unwrap(), 1);
-    assert!(jobs::claim(&db, now + 60, now + 70, 100, &[]).await.unwrap().iter().all(|c| c.job.id != id));
-    jobs::seed(&db, &job, now + 80).await.unwrap();
-    let revived = jobs::claim(&db, now + 80, now + 90, 100, &[]).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
+    assert_eq!(jobs::fail(&tx, &id, third.token, now + 60, now + 40, "dead", true).await.unwrap(), 1);
+    assert!(jobs::claim(&tx, now + 60, now + 70, 100, &excluded).await.unwrap().iter().all(|c| c.job.id != id));
+    jobs::seed(&tx, &job, now + 80).await.unwrap();
+    let revived = jobs::claim(&tx, now + 80, now + 90, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     assert_eq!(revived.attempt, 1);
-    cancel(&db, &id).await.unwrap();
+    cancel(&tx, &id).await.unwrap();
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL; run serially"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL; run serially"]
 async fn distinct_tokens_seed_and_dead_revival() {
-    let db = test_db().await;
+    let mut client = test_client().await;
+    let tx = client.transaction().await.unwrap();
+    let existing = jobs::tests::existing_ids(&tx).await.unwrap();
+    let excluded: Vec<&str> = existing.iter().map(String::as_str).collect();
     let now = filetime_now();
     let ids = [format!("seed-a:{now}"), format!("seed-b:{now}")];
+    assert!(ids.iter().all(|id| !existing.contains(id)), "test job ID already exists");
     let first = Job { id: ids[0].clone(), kind: "test".into(), due_at: now, payload: "{}".into() };
     let second = Job { id: ids[1].clone(), ..first.clone() };
-    assert_eq!(jobs::seed(&db, &first, now).await.unwrap(), 1);
-    assert_eq!(jobs::seed(&db, &second, now).await.unwrap(), 1);
+    assert_eq!(jobs::seed(&tx, &first, now).await.unwrap(), 1);
+    assert_eq!(jobs::seed(&tx, &second, now).await.unwrap(), 1);
     let mut later = first.clone(); later.due_at += 100;
-    assert_eq!(jobs::seed(&db, &later, now + 1).await.unwrap(), 0);
-    let claims = jobs::claim(&db, now, now + 10, 2, &[]).await.unwrap();
+    assert_eq!(jobs::seed(&tx, &later, now + 1).await.unwrap(), 0);
+    let claims = jobs::claim(&tx, now, now + 10, 2, &excluded).await.unwrap();
     assert_eq!(claims.len(), 2);
     assert_ne!(claims[0].token, claims[1].token);
-    assert_eq!(jobs::seed(&db, &later, now + 1).await.unwrap(), 0);
+    assert_eq!(jobs::seed(&tx, &later, now + 1).await.unwrap(), 0);
     let claim = claims.iter().find(|c| c.job.id == ids[0]).unwrap();
-    assert_eq!(jobs::fail(&db, &ids[0], claim.token, now, now, "dead error", true).await.unwrap(), 1);
-    assert_eq!(schedule(&db, &first).await.unwrap(), 1);
-    let row = jobs::tests::inspect(&db, &ids[0]).await.unwrap();
-    assert_eq!(row.attempt, 0);
-    assert_eq!(row.last_error, None);
-    let revived = jobs::claim(&db, now, now + 1, 1, &[]).await.unwrap().pop().unwrap();
+    assert_eq!(jobs::fail(&tx, &ids[0], claim.token, now, now, "dead error", true).await.unwrap(), 1);
+    assert_eq!(schedule(&tx, &first).await.unwrap(), 1);
+    let row = tx.query_one("SELECT attempt,last_error,due_at FROM game.jobs WHERE job_id=$1", &[&ids[0]]).await.unwrap();
+    assert_eq!(row.get::<_, i32>("attempt"), 0);
+    assert_eq!(row.get::<_, Option<String>>("last_error"), None);
+    let revived = jobs::claim(&tx, now, now + 1, 1, &excluded).await.unwrap().pop().unwrap();
     assert_eq!(revived.attempt, 1);
-    assert_eq!(jobs::fail(&db, &ids[0], revived.token, now, now, "dead again", true).await.unwrap(), 1);
-    assert_eq!(jobs::seed(&db, &later, now).await.unwrap(), 1);
-    let row = jobs::tests::inspect(&db, &ids[0]).await.unwrap();
-    assert_eq!(row.attempt, 0);
-    assert_eq!(row.last_error, None);
-    assert_eq!(row.due_at, later.due_at);
-    for id in &ids { cancel(&db, id).await.unwrap(); }
+    assert_eq!(jobs::fail(&tx, &ids[0], revived.token, now, now, "dead again", true).await.unwrap(), 1);
+    assert_eq!(jobs::seed(&tx, &later, now).await.unwrap(), 1);
+    let row = tx.query_one("SELECT attempt,last_error,due_at FROM game.jobs WHERE job_id=$1", &[&ids[0]]).await.unwrap();
+    assert_eq!(row.get::<_, i32>("attempt"), 0);
+    assert_eq!(row.get::<_, Option<String>>("last_error"), None);
+    assert_eq!(row.get::<_, i64>("due_at"), later.due_at);
+    for id in &ids { cancel(&tx, id).await.unwrap(); }
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL; run serially"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL; run serially"]
 async fn three_failures_increment_attempts_and_backoff() {
-    let db = test_db().await;
+    let mut client = test_client().await;
+    let tx = client.transaction().await.unwrap();
+    let existing = jobs::tests::existing_ids(&tx).await.unwrap();
+    let excluded: Vec<&str> = existing.iter().map(String::as_str).collect();
     let now = filetime_now();
     let id = format!("retries:{now}");
+    assert!(!existing.contains(&id), "test job ID already exists");
     let job = Job { id: id.clone(), kind: "test".into(), due_at: now, payload: "{}".into() };
-    schedule(&db, &job).await.unwrap();
+    schedule(&tx, &job).await.unwrap();
     let mut due = now;
     let mut previous_delay = 0;
     for attempt in 1..=3 {
-        let claim = jobs::claim(&db, due, due + 1, 1, &[]).await.unwrap().pop().unwrap();
+        let claim = jobs::claim(&tx, due, due + 1, 1, &excluded).await.unwrap().pop().unwrap();
         assert_eq!(claim.attempt, attempt);
         let delay = jobs::duration_ticks(runner::backoff(30, attempt));
         assert!(delay > previous_delay);
         let next = due.saturating_add(delay);
-        assert_eq!(jobs::fail(&db, &id, claim.token, next, due, "failure", false).await.unwrap(), 1);
-        assert!(jobs::claim(&db, next - 1, next, 1, &[]).await.unwrap().is_empty());
+        assert_eq!(jobs::fail(&tx, &id, claim.token, next, due, "failure", false).await.unwrap(), 1);
+        assert!(jobs::claim(&tx, next - 1, next, 1, &excluded).await.unwrap().is_empty());
         due = next;
         previous_delay = delay;
     }
-    cancel(&db, &id).await.unwrap();
+    cancel(&tx, &id).await.unwrap();
+    tx.rollback().await.unwrap();
 }
 
 static SLOW_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -171,9 +214,10 @@ fn panic_handler(_: Db, _: Arc<World>, _: Job) -> Pin<Box<dyn Future<Output = an
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL without scheduled or running jobs and with SDE; run serially"]
 async fn runner_dead_letters_at_configured_threshold_but_not_periodic() {
     let db = test_db().await;
+    jobs::tests::require_job_free_database(&db).await;
     let world = World::new(db.clone(), Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
     let now = filetime_now();
     let ids = [format!("threshold:{now}"), format!("periodic-threshold:{now}")];
@@ -211,9 +255,10 @@ async fn runner_dead_letters_at_configured_threshold_but_not_periodic() {
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with SDE"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL without scheduled or running jobs and with SDE; run serially"]
 async fn runner_excludes_local_slow_claim_and_retries_panic_and_missing_handler() {
     let db = test_db().await;
+    jobs::tests::require_job_free_database(&db).await;
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let world = World::new(db.clone(), sde, 0);
     let now = filetime_now();
@@ -257,9 +302,10 @@ fn long_handler(_: Db, _: Arc<World>, _: Job) -> Pin<Box<dyn Future<Output = any
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with SDE"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL without scheduled or running jobs and with SDE; run serially"]
 async fn aborting_drain_aborts_owned_handler_and_leaves_lease() {
     let db = test_db().await;
+    jobs::tests::require_job_free_database(&db).await;
     let world = World::new(db.clone(), Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
     let now = filetime_now();
     let id = format!("shutdown:{now}");
@@ -283,9 +329,10 @@ async fn aborting_drain_aborts_owned_handler_and_leaves_lease() {
 }
 
 #[tokio::test]
-#[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL without scheduled or running jobs and with SDE; run serially"]
 async fn shutdown_prevents_new_due_jobs_during_unrelated_teardown() {
     let db = test_db().await;
+    jobs::tests::require_job_free_database(&db).await;
     let world = World::new(db.clone(), Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
     let now = filetime_now();
     let running_id = format!("shutdown-running:{now}");

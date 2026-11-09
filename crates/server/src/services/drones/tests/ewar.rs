@@ -1,7 +1,8 @@
 use std::{future::Future, task::Poll, time::Duration};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::{*, dogma::*}, services::{Call, CallError, combat, effects::{registry::{self, EffectAttribute}, EffectKind, JammingType}, fit::{Fit, Key}}};
+use infinity_core::{consts::{*, dogma::*}};
+use crate::{services::{Call, CallError, combat, effects::{registry::{self, EffectAttribute}, EffectKind, JammingType}, fit::{Fit, Key}}};
 use super::fixture::Fixture;
 
 fn error(e: CallError) -> anyhow::Error {
@@ -21,7 +22,7 @@ async fn lock(f: &mut Fixture, owner: i64, target: i64) -> Result<()> {
     let args = [Value::Int(target)];
     let kwargs = Value::None;
     let call = Call { service: "dogmaIM", method: "AddTarget", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
-    combat::dispatch(&mut f.client, &call).await.ok_or_else(|| anyhow!("missing AddTarget"))?.map_err(error)?;
+    crate::services::dogma::dispatch(&mut f.client, &call).await.map_err(error)?;
     tokio::time::timeout(Duration::from_secs(30), async {
         while !combat::targeting_charges::targets_of(owner).contains(&target) {
             ensure!(f.world.after(f.system, 100).await, "system stopped while locking");

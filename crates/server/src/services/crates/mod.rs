@@ -3,6 +3,8 @@
 //! composed from native crate data and server-authored content, and instance
 //! previews check authenticated inventory access.
 //!
+//! Destination queries apply the same authorization and eligibility checks as
+//! opening, without reserving anything; opening checks the current state again.
 //! Authorized, reachable ordinary direct-list crates are opened transactionally:
 //! source quantities are consumed, rewards are created at the destination, and
 //! durable receipts are recorded in `game.crate_rewards`. `ClaimLoot` only

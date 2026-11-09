@@ -8,7 +8,7 @@ fn ball(id: i64, type_id: i32) -> Ball {
         mode: MODE_STOP, radius: 1.0, mass: 1.0, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3], follow_id: 0, follow_range: 0.0, free: false, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
 
@@ -43,9 +43,9 @@ async fn npc_ecm_requires_current_target_generation() {
         let mut brain = NpcBrain::new(None, NpcConfig {
             fly_range: 1.0, aggro_range: 1000.0, rate_of_fire_ms: 60000.0,
             scan_resolution: 1.0, repairs: (0.0, 0.0, 60000.0),
-        }, Arc::new(move |action| {
+        }, Arc::new(move |_, action| {
             let events = events.clone();
-            Box::pin(async move { let _ = events.send(action); })
+            Some(Box::pin(async move { let _ = events.send(action); }))
         }));
         brain.target = Some((-102, 1, 0));
         brain.announced = true;

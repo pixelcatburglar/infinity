@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::dao::characters::{contacts, crimewatch, routing};
-use crate::session::OnlineSession;
+use infinity_core::session::OnlineSession;
 use crate::services::{db_err, value_field};
 use std::collections::{HashSet, VecDeque};
 

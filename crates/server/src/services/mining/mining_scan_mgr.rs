@@ -1,4 +1,4 @@
-//! Mining scanner service over the in-memory asteroid state.
+//! Mining scanner service over the system actor's committed asteroid projection.
 //! Scanner range uses ship and rock positions sampled at the same system-actor time.
 //! The modern overlay triggers this RPC itself; survey module cycles do not push results.
 //! Online fitted survey scanners supply their effective range, otherwise the configured
@@ -28,17 +28,11 @@ async fn perform_scan(c: &Client) -> Value {
             && online.iter().any(|entry| entry.item_id == item.item_id)
             && c.sde.types.effects(item.type_id).iter().any(|effect| crate::services::effects::registry::kind(&c.sde, effect.effect_id) == Some(crate::services::effects::EffectKind::SurveyScan)))
         .map(|item| fit.value(Key::Module(item.item_id), ATTR_SURVEY_SCAN_RANGE)));
-    let rocks: Vec<(i64, i32, i64)> = state().rocks.iter().filter(|(_, r)| r.system == system).map(|(id, r)| (*id, r.type_id, r.quantity)).collect();
-    c.world.with(system, move |s| {
-        let me = s.sample_position(ship)?;
-        Some(Value::List(
-            rocks
-                .into_iter()
-                .filter(|(id, _, _)| s.sample_position(*id).is_some_and(|pos| dist(pos, me) <= range))
-                .map(|(id, type_id, quantity)| Value::tuple([Value::Int(id), Value::Int(type_id as i64), Value::Int(quantity)]))
-                .collect(),
-        ))
-    }).await.flatten().unwrap_or(Value::None)
+    c.world.with(system, move |s| s.rocks_in_range(ship, range)).await.flatten()
+        .map(|rocks| Value::List(rocks.into_iter()
+            .map(|(id, type_id, quantity)| Value::tuple([Value::Int(id), Value::Int(type_id as i64), Value::Int(quantity)]))
+            .collect()))
+        .unwrap_or(Value::None)
 }
 
 #[cfg(test)] mod tests;

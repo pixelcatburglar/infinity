@@ -5,6 +5,7 @@
 //! missions require a player choice and are not supported by this command.
 //! Actor effects run after database commit: a stopped actor can leave deposited
 //! goods committed while the command reports failure.
+//! Mission cargo deposits hold the market lock through transaction dispatch.
 use super::*;
 use std::collections::BTreeMap;
 use crate::dao::items::loading::ItemQuery;
@@ -17,9 +18,8 @@ fn add_requirement(goods: &mut BTreeMap<(i64, i32), i64>, station: i64, type_id:
     Ok(())
 }
 
-fn missing_amount(required: i64, available: i64) -> Result<i32, CallError> {
-    i32::try_from(required.saturating_sub(available).max(0))
-        .map_err(|_| CallError::Internal(anyhow::anyhow!("mission cargo deposit exceeds item quantity limit")))
+fn missing_amount(required: i64, available: i128) -> i64 {
+    (i128::from(required) - available).clamp(0, i128::from(required.max(0))) as i64
 }
 
 /// Make accepted mission objectives ready for their normal agent hand-in.
@@ -52,6 +52,7 @@ pub(crate) async fn force_complete(c: &mut Client, agent: Option<i64>) -> Result
     }
     let db = c.db.clone();
     let sde = c.sde.clone();
+    let _market = crate::services::market::lock().await;
     db.transaction(
         move |tx, outbox: &mut Outbox<(i64, i64)>| {
             let sde = sde.clone();
@@ -62,11 +63,12 @@ pub(crate) async fn force_complete(c: &mut Client, agent: Option<i64>) -> Result
                 for ((station, type_id), qty) in goods {
                     let cargo_ship = if docked == Some(station) { ship } else { 0 };
                     let rows = items::load_items(tx, &sde, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, cargo_ship, FLAG_CARGO)).await.map_err(db_err)?;
-                    let available = rows.iter().try_fold(0_i64, |sum, item| sum.checked_add(i64::from(item.quantity)))
+                    let available = rows.iter().try_fold(0_i128, |total, item| total.checked_add(i128::from(item.quantity)))
                         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("mission inventory quantity overflow")))?;
-                    let missing = missing_amount(qty, available)?;
+                    let missing = missing_amount(qty, available);
                     if missing > 0 {
-                        items::deposit(tx, &sde, outbox, me, station, FLAG_HANGAR, type_id, missing, 0).await?;
+                        let destination = crate::services::inventory::destination::Destination::owned(me, station, FLAG_HANGAR);
+                        items::deposit(tx, &sde, outbox, &destination, type_id, missing, 0).await?;
                     }
                 }
                 Ok(())
@@ -85,7 +87,6 @@ pub(crate) async fn force_complete(c: &mut Client, agent: Option<i64>) -> Result
                             }
                         }
                         Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
-                        Effect::Event(event) => crate::lua::on_event(event),
                     }
                 }
                 if let Some(error) = actor_error { return Err(error); }

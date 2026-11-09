@@ -1,7 +1,8 @@
 //! Atomic trade settlement and cancellation over `game.trades`, `game.trade_items`
 //! and character wallets. `pvptradesvc.py` consumes the emitted events.
 //! Terminal transitions cancel durable idle jobs in the same transaction.
-use crate::{consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_OWNER_ID}, dao::{items::{loading::ItemQuery, transfers}, trades::{self, Trade}}, db::{executor::Executor, outbox::Outbox, Db}, sde::Sde, services::{db_err, items::load_items, market, wallets, CallError}, space::World};
+use infinity_core::{consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_OWNER_ID}};
+use crate::{dao::{items::{loading::ItemQuery, transfers}, trades::{self, Trade}}, db::{executor::Executor, outbox::Outbox, Db}, sde::Sde, services::{db_err, items::load_items, market, wallets, CallError}, space::World};
 use std::sync::Arc;
 use marshal::Value;
 use super::{TradeEffect, dispatch, timeout};
@@ -52,7 +53,9 @@ pub(super) enum Settled { Done, Underfunded }
 
 
 pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, trade: &mut Trade) -> Result<Settled, CallError> {
-    for (char_id, amount) in [(trade.a, trade.money_a), (trade.b, trade.money_b)] {
+    let money_a = crate::isk::IskAmount::from_isk(trade.money_a)?;
+    let money_b = crate::isk::IskAmount::from_isk(trade.money_b)?;
+    for (char_id, amount) in [(trade.a, money_a), (trade.b, money_b)] {
         if !crate::dao::wallets::characters::covers(ex, char_id, amount).await.map_err(db_err)? {
             trade.accepted_a = false;
             trade.accepted_b = false;
@@ -67,6 +70,28 @@ pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &
     let roots = trades::items(ex, trade.id).await.map_err(db_err)?;
     let ids: Vec<_> = roots.iter().map(|item| item.id).collect();
     let all = trades::descendants(ex, &ids).await.map_err(db_err)?;
+    let captured = crate::dao::items::parent_locks::capture(ex, &all).await.map_err(db_err)?;
+    let ancestry = crate::dao::items::deliveries::ancestry_many(ex, &ids).await.map_err(db_err)?;
+    let mut requests: Vec<_> = all.iter().map(|&item_id| crate::dao::items::parent_locks::LockRequest {
+        item_id, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }).collect();
+    requests.extend(ancestry.iter().filter(|row| !all.contains(&row.ancestor.item_id)).map(|row| crate::dao::items::parent_locks::LockRequest {
+        item_id: row.ancestor.item_id,
+        strength: if sde.types.get(row.ancestor.type_id).is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP)) {
+            crate::dao::items::parent_locks::LockStrength::Update
+        } else { crate::dao::items::parent_locks::LockStrength::Share },
+    }));
+    let locks = crate::services::inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
+    if captured.len() != all.len() || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row|
+        row.type_id == old.type_id && row.owner_id == old.owner_id && row.location_id == old.location_id
+        && row.flag_id == old.flag_id && row.quantity == old.quantity && row.singleton == old.singleton
+        && row.jump_clone_id == old.jump_clone_id)) {
+        return Err(CallError::Internal(anyhow::anyhow!("trade item metadata changed")));
+    }
+    if trades::descendants(ex, &ids).await.map_err(db_err)? != all
+        || crate::dao::items::deliveries::ancestry_many(ex, &ids).await.map_err(db_err)? != ancestry {
+        return Err(CallError::Internal(anyhow::anyhow!("trade item closure changed")));
+    }
     let before = load_items(ex, sde, ItemQuery::Ids(&all)).await.map_err(db_err)?;
     if before.len() != all.len() {
         return Err(CallError::Internal(anyhow::anyhow!("trade item type missing from SDE")));
@@ -79,12 +104,12 @@ pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &
         let recipient = if item.owner == trade.a { trade.b } else if item.owner == trade.b { trade.a } else { return Err(CallError::Internal(anyhow::anyhow!("invalid trade item owner"))) };
         plan.push(transfers::Transfer { item_id: item.id, owner: recipient, location: trade.station, flag: FLAG_HANGAR });
     }
-    transfers::hand_over(ex, &plan).await.map_err(db_err)?;
+    transfers::hand_over(ex, &plan, &all, &locks, &[]).await.map_err(db_err)?;
     changes(ex, sde, outbox, trade, &before).await?;
-    wallets::debit(ex, outbox, trade.a, trade.money_a).await?;
-    wallets::credit(ex, outbox, trade.b, trade.money_a).await?;
-    wallets::debit(ex, outbox, trade.b, trade.money_b).await?;
-    wallets::credit(ex, outbox, trade.a, trade.money_b).await?;
+    wallets::debit(ex, outbox, trade.a, money_a).await?;
+    wallets::credit(ex, outbox, trade.b, money_a).await?;
+    wallets::debit(ex, outbox, trade.b, money_b).await?;
+    wallets::credit(ex, outbox, trade.a, money_b).await?;
     trade.state = "done".into();
     if !trades::update(ex, trade, crate::client::filetime_now()).await.map_err(db_err)? { return Err(CallError::Internal(anyhow::anyhow!("trade is no longer open"))); }
     trades::clear_items(ex, trade.id).await.map_err(db_err)?;

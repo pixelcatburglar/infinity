@@ -3,11 +3,11 @@
 //! Charge effects, transactions, refusals, notifications and World are caller concerns.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
-pub(crate) struct Charge { pub flag_id: i32, pub type_id: i32, pub quantity: i32 }
+pub(crate) struct Charge { pub flag_id: i32, pub type_id: i32, pub quantity: i64 }
 impl Charge { pub(super) fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id"), type_id: r.get("type_id"), quantity: r.get("quantity") } } }
 pub(crate) async fn positive(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<Charge>, Error> { Ok(ex.query("SELECT flag_id, type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND quantity > 0", &[&ship]).await?.iter().map(Charge::from_row).collect()) }
 
-pub(crate) struct Loaded { pub type_id: i32, pub quantity: i32 }
+pub(crate) struct Loaded { pub type_id: i32, pub quantity: i64 }
 impl Loaded { pub(super) fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), quantity: r.get("quantity") } } }
 pub(crate) struct Slave { pub slave_id: i64 }
 impl Slave { pub(super) fn from_row(r: &Row) -> Self { Self { slave_id: r.get("slave_id") } } }

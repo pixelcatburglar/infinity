@@ -5,7 +5,7 @@ fn spec() -> DroneSpec {
     DroneSpec { type_id: 1, bandwidth: 5.0, scan_resolution: 100.0, control_range: 10000.0,
         max_target_range: 10000.0, optimal_range: 1000.0, orbit_range: 500.0, duration_ms: 1000.0, effect_id: Some(1) }
 }
-fn effects() -> DroneEffects { Arc::new(|_| Box::pin(async {})) }
+fn effects() -> DroneEffects { Arc::new(|_, _| Some(Box::pin(async {}))) }
 fn setup() -> System {
     let mut s = System::new(1, Arc::default(), 1000);
     s.insert(ball(10, Some(20), 0.0));
@@ -18,10 +18,13 @@ fn drone_ball(id: i64) -> Ball {
 #[test]
 fn combat_owner_uses_live_pilot_or_owned_drone() {
     let mut s = setup();
-    s.restore_drone(drone_ball(30), spec(), effects());
+    let first_ball = drone_ball(30);
+    s.insert(first_ball);
+    s.register_drone(30, spec(), effects(), None, Some(20), false);
     let mut unowned = drone_ball(31);
-    unowned.owner_id = crate::consts::OWNER_UNOWNED;
-    s.restore_drone(unowned, spec(), effects());
+    unowned.owner_id = infinity_core::consts::OWNER_UNOWNED;
+    s.insert(unowned);
+    s.register_drone(31, spec(), effects(), None, None, false);
     s.insert(ball(32, None, 0.0));
 
     assert_eq!(s.combat_owner(10), Some(20));
@@ -43,7 +46,11 @@ fn reservations_count_pending_and_release() {
     assert!(s.reserve_drone_launch(20, 10, &[f64::NAN], 2.0, 10.0).is_none());
     s.cancel_drone_launch(first);
     let second = s.reserve_drone_launch(20, 10, &[5.0, 5.0], 2.0, 10.0).unwrap();
-    let _ack = s.complete_drone_launch(second, 20, 10, vec![(drone_ball(30), spec()), (drone_ball(31), spec())], effects());
+    assert!(s.complete_drone_launch_reservation(second, 20, 10));
+    for id in [30, 31] {
+        s.insert(drone_ball(id));
+        s.register_drone(id, spec(), effects(), Some(10), Some(20), false);
+    }
     assert_eq!(s.drones().count(), 2);
     assert!(s.reserve_drone_launch(20, 10, &[1.0], 2.0, 100.0).is_none());
     assert_eq!(s.pilots().count(), 1);
@@ -52,7 +59,8 @@ fn reservations_count_pending_and_release() {
 #[test]
 fn restored_drone_return_and_generation_are_distinct() {
     let mut s = setup();
-    s.restore_drone(drone_ball(30), spec(), effects());
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), None, Some(20), false);
     let old = s.drone(30).unwrap();
     assert_eq!(old.controller, None);
     assert!(s.drone_order(30, 20, 10, DroneOrder::ReturnBay));
@@ -68,7 +76,9 @@ fn stale_reservation_still_materializes_uncontrolled_item() {
     let mut s = setup();
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
     s.cancel_drone_launch(token);
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), spec())], effects());
+    assert!(!s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), None, Some(20), false);
     assert!(s.contains(30));
     assert_eq!(s.drone(30).unwrap().controller, None);
     assert_eq!(s.persistent_balls().count(), 2);
@@ -77,7 +87,8 @@ fn stale_reservation_still_materializes_uncontrolled_item() {
 #[test]
 fn contact_claim_serializes_orders_and_checks_generation() {
     let mut s = setup();
-    s.restore_drone(drone_ball(30), spec(), effects());
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), None, Some(20), false);
     assert!(s.drone_order(30, 20, 10, DroneOrder::ReturnBay));
     let d = s.drone(30).unwrap();
     assert_eq!(d.controller, None);
@@ -101,7 +112,13 @@ fn launch_state_waits_for_add_balls_boundary() {
     let (destiny, mut updates) = mpsc::unbounded_channel();
     s.observe(1, 10, destiny);
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let mut ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), spec())], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.add_ship(drone_ball(30));
+    s.register_drone(30, spec(), effects(), Some(10), Some(20), false);
+    s.queue_drone_announcement(30);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    s.queue_drone_launch_ack(ack_tx);
+    let mut ack = ack_rx;
     assert!(notices.try_recv().is_err());
     assert!(updates.try_recv().is_err());
     assert!(ack.try_recv().is_err());
@@ -115,7 +132,9 @@ fn launch_state_waits_for_add_balls_boundary() {
 fn controller_jam_invalidates_locked_drone_generation() {
     let mut s = setup();
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), spec())], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), Some(10), Some(20), false);
     let mut target = ball(40, None, 20.0);
     target.signature_radius = Some(1.0);
     s.insert(target);
@@ -133,7 +152,8 @@ fn controller_jam_invalidates_locked_drone_generation() {
 fn observer_bootstrap_only_registers_local_owned_drones() {
     let mut s = setup();
     s.insert(ball(11, Some(21), 0.0));
-    s.restore_drone(drone_ball(30), spec(), effects());
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), None, Some(20), false);
     let (tx1, _rx1) = mpsc::unbounded_channel();
     let (tx2, _rx2) = mpsc::unbounded_channel();
     let owner = s.observe(1, 10, tx1);
@@ -156,25 +176,38 @@ fn observer_bootstrap_only_registers_local_owned_drones() {
 fn contact_claim_survives_controller_loss_and_stale_release() {
     let mut s = setup();
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), spec())], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), Some(10), Some(20), false);
     assert!(s.drone_order(30, 20, 10, DroneOrder::ReturnBay));
     let old = s.drone(30).unwrap().generation;
     s.tick(1100);
+    assert!(!s.drone_owns_contact(30, old));
     assert!(s.drone_claim_contact(30, old).is_some());
+    assert!(s.drone_owns_contact(30, old));
     s.drone_controller_lost(10);
     assert_eq!(s.drone(30).unwrap().controller, None);
+    assert!(s.drone_owns_contact(30, old));
     assert!(!s.drone_order(30, 20, 10, DroneOrder::ReturnBay));
     s.drone_release_contact(30, old);
+    assert!(!s.drone_owns_contact(30, old));
     assert!(s.drone_order(30, 20, 10, DroneOrder::ReturnBay));
     let new = s.drone(30).unwrap().generation;
     s.tick(1200);
     assert!(s.drone_claim_contact(30, new).is_some());
+    assert!(s.drone_owns_contact(30, new));
+    assert!(!s.drone_owns_contact(30, old));
     s.drone_release_contact(30, old);
+    assert!(s.drone_owns_contact(30, new));
     assert!(!s.drone_order(30, 20, 10, DroneOrder::ReturnBay));
     s.remove_ball(30);
     assert!(!s.contains(30));
     assert!(s.drone(30).is_none());
-    s.restore_drone(drone_ball(30), spec(), effects());
+    assert!(!s.drone_owns_contact(30, new));
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), None, Some(20), false);
+    assert!(!s.drone_owns_contact(30, old));
+    assert!(!s.drone_owns_contact(30, new));
     s.drone_release_contact(30, old);
     assert_eq!(s.drones().count(), 1);
 }
@@ -189,7 +222,9 @@ fn zero_targeting_attributes_and_positive_shared_lock() {
     zero.scan_resolution = 0.0;
     zero.max_target_range = 0.0;
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), zero)], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, zero, effects(), Some(10), Some(20), false);
     assert!(s.drone_order(30, 20, 10, DroneOrder::Engage(40)));
     s.tick(1100);
     let generation = s.drone(30).unwrap().generation;
@@ -202,7 +237,9 @@ fn zero_targeting_attributes_and_positive_shared_lock() {
     let mut positive = spec();
     positive.max_target_range = 5.0;
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), positive)], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, positive, effects(), Some(10), Some(20), false);
     assert!(s.drone_order(30, 20, 10, DroneOrder::Engage(40)));
     s.tick(1100);
     assert!(!s.drone_valid(30, 40, s.drone(30).unwrap().generation));
@@ -212,7 +249,9 @@ fn zero_targeting_attributes_and_positive_shared_lock() {
     target.signature_radius = Some(1.0);
     s.insert(target);
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), spec())], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, spec(), effects(), Some(10), Some(20), false);
     assert!(s.drone_order(30, 20, 10, DroneOrder::Engage(40)));
     s.tick(1100);
     let generation = s.drone(30).unwrap().generation;
@@ -234,7 +273,9 @@ fn raw_mining_pending_lifecycle() {
     let mut mining_spec = spec();
     mining_spec.scan_resolution = 0.0;
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
-    let _ack = s.complete_drone_launch(token, 20, 10, vec![(drone_ball(30), mining_spec)], effects());
+    assert!(s.complete_drone_launch_reservation(token, 20, 10));
+    s.insert(drone_ball(30));
+    s.register_drone(30, mining_spec, effects(), Some(10), Some(20), false);
     assert!(s.drone_order(30, 20, 10, DroneOrder::Mine(40)));
     s.tick(1100);
     let generation = s.drone(30).unwrap().generation;

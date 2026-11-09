@@ -1,6 +1,7 @@
 //! Snapshot-weighted voting, ballot replay and durable close behavior.
 use super::fixtures;
-use crate::{consts::FILETIME_DAY, dao::corporations::{shares, votes as dao}, db::outbox::Outbox, services::corps::{vote_close, votes}};
+use infinity_core::consts::FILETIME_DAY;
+use crate::{dao::corporations::{shares, votes as dao}, db::outbox::Outbox, services::corps::{vote_close, votes}};
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]

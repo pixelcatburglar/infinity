@@ -10,9 +10,9 @@
 use std::sync::{Arc, atomic::Ordering};
 use super::{EffectKind, lifecycle::{Cycle, CycleOutcome, Module}, range::range_multiplier, registry::{Effect, EffectAttribute, EffectFlag}};
 use super::space_source::{SourceContext, SourceGuard};
-use crate::consts::{dogma::ATTR_SCAN_GRAVIMETRIC_STRENGTH, dogma::ATTR_SCAN_LADAR_STRENGTH, dogma::ATTR_SCAN_MAGNETOMETRIC_STRENGTH, dogma::ATTR_SCAN_RADAR_STRENGTH, CATEGORY_SHIP, CATEGORY_ENTITY, CATEGORY_DRONE};
+use infinity_core::consts::{dogma::ATTR_SCAN_GRAVIMETRIC_STRENGTH, dogma::ATTR_SCAN_LADAR_STRENGTH, dogma::ATTR_SCAN_MAGNETOMETRIC_STRENGTH, dogma::ATTR_SCAN_RADAR_STRENGTH, CATEGORY_SHIP, CATEGORY_ENTITY, CATEGORY_DRONE};
 use crate::db::Db;
-use crate::messages;
+use infinity_core::messages;
 use crate::sde::Sde;
 use crate::services::{combat::{self, Ctx, targeting_charges::targets_of}, crimewatch, fit::{Fit, Key}, rand01, user_error, CallError};
 use crate::space::{dist, Ball, System, World, MODE_WARP, drone::DronePhase};
@@ -105,7 +105,7 @@ async fn apply_one(db: &Db, world: &Arc<World>, system: i64, src: &Source, victi
         let fit = Fit::load_in_space(db, world, system, character, id).await?;
         let revision = fit.projection_revision();
         (fit, Key::Ship, revision, None)
-    } else if let Some(record) = record.filter(|d| d.owner != crate::consts::OWNER_UNOWNED) {
+    } else if let Some(record) = record.filter(|d| d.owner != infinity_core::consts::OWNER_UNOWNED) {
         let ship = crate::dao::characters::selection::ship_id(db, record.owner).await.map_err(crate::services::db_err)?
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character has no selected ship")))?;
         let fit = Fit::drone_in_space(db, world, system, record.owner, id).await?;
@@ -166,8 +166,8 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
     for (victim, _) in candidates {
         let admitted = apply_one(&cx.db, &cx.world, cx.system_id, &src, &victim, Some((cx.char_id, cycle.stop.clone())), None).await?;
         if src.offensive {
-            if let (Some(Some(character)), Some(source_type)) = (admitted, src.type_id) {
-                crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, source_type, module.type_id, character, victim.id).await?;
+            if let (Some(Some(character)), Some(_)) = (admitted, src.type_id) {
+                crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, character).await?;
             }
         }
     }
@@ -183,7 +183,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
     let admitted = apply_one(cx.db, cx.world, cx.system, &src, cx.target, None, Some(cx.guard)).await?;
     if src.offensive {
         if let (Some(attacker), Some(Some(victim))) = (cx.attacker, admitted) {
-            crimewatch::aggress(cx.db, cx.world, cx.system, attacker, cx.source.type_id, cx.source.type_id, victim, cx.target.id).await?;
+            crimewatch::aggress(cx.db, cx.world, cx.system, attacker, victim).await?;
         }
     }
     Ok(())

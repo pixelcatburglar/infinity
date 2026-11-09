@@ -12,13 +12,13 @@
 //! Cycles are runtime-only and are not resumed after restart.
 //! A non-targeted module's first-cycle FX may be unseen by observers until the next
 //! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
-use super::{EffectKind, registry, unsupported, repair, capacitor, ecm};
+//! Activation and retirement update the system actor's cached fitted defenses.
+use super::{EffectKind, registry, unsupported, repair};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::notify::{fire_fx, ship_effect};
-use super::propulsion::apply_propulsion;
-use super::behaviors::{Activation, on_activate, on_cycle_start, on_cycle_end, on_stop};
+use super::behaviors::{Activation, on_activate, on_cycle_end, on_stop};
 use crate::services::combat::{state, ActiveModule, Ctx};
-use crate::services::combat::groups_health::{drain_capacitor, inject};
+use crate::services::combat::groups_health::inject;
 use crate::services::combat::targeting_charges::{bank, charge_key, loaded};
 use crate::services::fit::{Fit, Key};
 use crate::services::items::load_items;
@@ -26,9 +26,9 @@ use crate::services::{db_err, notify_error, user_error, CallError, CallResult};
 use crate::services::identity::Identity;
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::client::filetime_now;
-use crate::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_CAPACITOR_NEED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, FLAG_HANGAR};
-use crate::consts::{dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
-use crate::messages;
+use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, FLAG_HANGAR};
+use infinity_core::consts::{dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
+use infinity_core::messages;
 use crate::space::{ms_to_seconds, seconds_to_ms, NotifyTx, System, World, MODE_WARP};
 use marshal::Value;
 use std::collections::HashMap;
@@ -40,6 +40,7 @@ use crate::db::outbox::Notification;
 use crate::sde::Sde;
 use crate::lua::events::{GameEvent, ModuleCycleOutcome};
 use super::online::OnlinePolicy;
+mod begin;
 
 
 pub(in crate::services) fn stop_generation(stop: &AtomicBool) {
@@ -66,7 +67,10 @@ pub(in crate::services) async fn stop_offensive(cx: &Ctx, except_module: i64) {
             let module = item.item_id;
             let ship = cx.ship_id;
             cx.world.post(cx.system_id, move |s| {
-                if force_inactive(module, &generation) { s.refresh_projection_target(ship); }
+                if force_inactive(module, &generation) {
+                    s.fitted_module_active(ship, module, false);
+                    s.refresh_projection_target(ship);
+                }
             });
             break;
         }
@@ -100,22 +104,80 @@ pub(super) fn weapon_fx(cx: &Ctx, modules: &[Module], effect: &Effect, target: O
     });
 }
 
+/// Replay identity owned by one actual fitted member for the whole activation.
+pub(super) struct NativeCombatGeneration {
+    pub(super) module_id: i64,
+    pub(super) generation: u64,
+    pub(super) sequence: u64,
+}
+
+/// Reserve at native admission; the returned token owns cancellation cleanup.
+pub(super) async fn prepare_combat_source(cycle: &mut Cycle, module_id: i64, weapon_type_id: Option<i32>)
+    -> Result<Option<super::space_source::PreparedCombatAttempt>, CallError>
+{
+    let Some(member) = cycle.owner.combat_generations.iter_mut().find(|member| member.module_id == module_id) else {
+        return Err(CallError::Internal(anyhow::anyhow!("combat activation member missing")));
+    };
+    let Some(sequence) = member.sequence.checked_add(1) else {
+        return Err(CallError::Internal(anyhow::anyhow!("combat activation sequence exhausted")));
+    };
+    member.sequence = sequence;
+    let generation = member.generation;
+    let (ship, character, system, effect, master) = (cycle.cx.ship_id, cycle.cx.char_id, cycle.cx.system_id, cycle.effect.id, cycle.owner.master);
+    let stop = cycle.stop.clone();
+    let weak = Arc::downgrade(&cycle.cx.world);
+    cycle.cx.world.with(system, move |s| {
+        let valid = |s: &System| {
+            !stop.load(Ordering::Relaxed)
+                && state().active.get(&master).is_some_and(|active|
+                    active.char_id == character && !active.forced_inactive && Arc::ptr_eq(&active.stop, &stop))
+                && s.pilot_ball(character).is_some_and(|ball| ball.id == ship)
+        };
+        if !valid(s) { return Ok(None); }
+        let source = s.prepare_combat_source(ship, Some(module_id), Some(effect), weapon_type_id,
+            crate::lua::events::resources::FactOrigin::Natural, generation, sequence, 1, valid)
+            .map_err(|refusal| match refusal {
+                crate::space::combat_facts::Refusal::Full => crate::services::combat::capacity::refusal(system),
+                other => CallError::Internal(anyhow::anyhow!("combat source admission refused: {other:?}")),
+            })?;
+        Ok(Some(super::space_source::PreparedCombatAttempt::new(source, weak, system).with_activation(master, stop)))
+    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("combat actor unavailable")))?
+}
+
+fn retire_combat_generations(s: &mut System, generations: Vec<NativeCombatGeneration>) {
+    for member in generations {
+        let _ = s.retire_combat_source(member.generation);
+    }
+}
+
 /// Owns the markers for one activation, even while a callback or worker is queued.
 pub(super) struct ActivationOwner {
     pub(super) master: i64,
     pub(super) generation: Arc<AtomicBool>,
     pub(super) armed: bool,
+    pub(super) combat_generations: Vec<NativeCombatGeneration>,
+    pub(super) pending_combat: Option<super::space_source::PreparedCombatAttempt>,
+    pub(super) world: std::sync::Weak<World>,
+    pub(super) system: i64,
 }
 
 impl Drop for ActivationOwner {
     fn drop(&mut self) {
-        if !self.armed { return; }
-        let mut st = state();
-        if st.active.get(&self.master).is_some_and(|current| Arc::ptr_eq(&current.stop, &self.generation)) {
-            st.active.remove(&self.master);
+        if self.armed {
+            let mut st = state();
+            if st.active.get(&self.master).is_some_and(|current| Arc::ptr_eq(&current.stop, &self.generation)) {
+                st.active.remove(&self.master);
+            }
+            if st.activation_generation.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
+                st.activation_generation.remove(&self.master);
+            }
         }
-        if st.activation_generation.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
-            st.activation_generation.remove(&self.master);
+        drop(self.pending_combat.take());
+        let generations = std::mem::take(&mut self.combat_generations);
+        if !generations.is_empty() {
+            if let Some(world) = self.world.upgrade() {
+                world.post(self.system, move |s| retire_combat_generations(s, generations));
+            }
         }
     }
 }
@@ -136,6 +198,7 @@ pub(super) struct Cycle {
     pub(super) nominal_start: i64,
     pub(super) other: Option<Value>,
     pub(super) repair_amount: f64,
+    pub(super) illegal: bool,
 }
 
 pub(super) fn cycle_valid(s: &System, cycle: &Cycle) -> bool {
@@ -168,7 +231,7 @@ pub(super) async fn target_loss(cycle: &Cycle) -> CycleOutcome {
 
 fn publish_cycle(cycle: &Cycle, outcome: ModuleCycleOutcome) {
     for module in &cycle.modules {
-        crate::lua::on_event(GameEvent::ModuleCycleEnded {
+        crate::progress::publish_live(cycle.cx.world.progress_registry(), &GameEvent::ModuleCycleEnded {
             char_id: cycle.cx.char_id, module_item_id: module.id, effect_id: cycle.effect.id, outcome,
         });
     }
@@ -259,9 +322,12 @@ pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) 
         cycle_stop(s, cycle);
         return;
     }
+    if cycle.cycles == 0 {
+        for module in &cycle.modules { s.fitted_module_active(cycle.cx.ship_id, module.id, true); }
+    }
     cycle.nominal_start = nominal_start;
     super::heat::begin_cycle(s, &cycle);
-    s.defer(async move { cycle_begin_work(cycle).await; });
+    s.defer(async move { begin::cycle_begin_work(cycle).await; });
 }
 
 #[derive(Debug, PartialEq)]
@@ -296,101 +362,19 @@ async fn refund_refused_charge(cx: &Ctx, amount: f64) -> Result<(), CallError> {
     Ok(())
 }
 
-
-pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
-    let cx = cycle.cx.clone();
-    let master = cycle.modules[0].id;
-    if cycle.effect.kind == EffectKind::Propulsion {
-        apply_propulsion(&cx, master, cycle.stop.clone(), true).await;
-    }
-    let mut public = None;
-    let mut check_target = false;
-    let result = async {
-        let fit = match Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await {
-            Ok(fit) => fit,
-            Err(_) => return Err("fit unavailable"),
-        };
-        let resource_kind = charge_kind(cycle.effect.id, cycle.effect.kind);
-        if charge_sensitive(resource_kind) && cycle.modules.iter().any(|m| state().reloading.get(&m.id).is_some_and(|until| *until > filetime_now())) {
-            return Err("module reloading");
-        }
-        if charge_sensitive(resource_kind)
-            && !crate::dao::items::pending_reloads::for_flags(&cx.db, cx.ship_id, &[cycle.modules[0].flag]).await.map_err(|_| "reload unavailable")?.is_empty() {
-            return Err("module reloading");
-        }
-        let charge = if charge_sensitive(resource_kind) {
-            loaded(&cx.db, cx.ship_id, cycle.modules[0].flag).await.map_err(|_| "charge unavailable")?.filter(|(_, quantity)| *quantity > 0)
-        } else { None };
-        if charge_sensitive(resource_kind) && charge.map(|(kind, _)| kind) != fit.source_type(Key::Charge(master)) {
-            return Err("charge changed since fit snapshot");
-        }
-        if needs_charge(cycle.effect.kind) && charge.is_none() { return Err("out of charges"); }
-        let charged = charge.is_some();
-        if charge_sensitive(resource_kind) { cycle.charge_type = charge.map(|(kind, _)| kind); }
-        if charge_sensitive(resource_kind) {
-            cycle.other = charge.map(|(kind, _)| charge_key(cx.ship_id, cycle.modules[0].flag, kind));
-        }
-        cycle.duration_ms = cycle.effect.attribute(EffectAttribute::Duration).map(|a| fit.value(Key::Module(master), a)).unwrap_or(cycle.duration_ms).max(MIN_MODULE_DURATION_MS);
-        if matches!(cycle.effect.kind, EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu)
-            && capacitor::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() {
-            check_target = true;
-            return Err("target lost");
-        }
-        if matches!(cycle.effect.kind, EffectKind::Ecm | EffectKind::BurstJammer) && ecm::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { check_target = true; return Err("target lost"); }
-        let discharge = cycle.effect.attribute(EffectAttribute::Discharge).unwrap_or(ATTR_CAPACITOR_NEED);
-        let need = cycle_discharge(resource_kind, charged, cycle.modules.iter().map(|m| fit.value(Key::Module(m.id), discharge)).sum());
-        if !drain_capacitor(&cx, &fit, need) {
-            cx.notify("OnEffectMessage", vec![Value::str("NotEnoughCharge"), Value::Dict(vec![])]);
-            public = Some(ModuleCycleOutcome::OutOfCapacitor);
-            return Err("out of capacitor");
-        }
-        match on_cycle_start(&cx, &fit, &mut cycle, charged).await {
-            Ok(CycleOutcome::Continue) => {}
-            Ok(result) => {
-                let reason = match result {
-                    CycleOutcome::Stop(reason) => reason,
-                    CycleOutcome::Ended { reason, outcome } => { public = Some(outcome); reason }
-                    CycleOutcome::Continue => unreachable!(),
-                };
-                if (charge_sensitive(resource_kind) && matches!(reason, "out of charges" | "source lost or in warp")
-                    || matches!(cycle.effect.kind, EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu) && reason == "target lost") && need > 0.0 {
-                    if let Err(error) = refund_refused_charge(&cx, need).await {
-                        warn!("module {master} capacitor refund failed: {}", match error { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
-                    }
-                }
-                return Err(reason);
-            }
-            Err(e) => { warn!("module {master} cycle start failed: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); return Err("phase failed"); }
-        }
-        if let Err(e) = super::heat::connect_cycle(&cx, &fit, &cycle).await {
-            warn!("module {master} heat connection failed: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
-            return Err("heat connection failed");
-        }
-        if cycle.effect.kind == EffectKind::Smartbomb || cycle.cycles == 0 && matches!(cycle.effect.kind, EffectKind::Bomb | EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer) {
-            weapon_fx(&cx, &cycle.modules, &cycle.effect, cycle.target, cycle.charge_type, true, cycle.duration_ms, cycle.repeat);
-        }
-        Ok(fit)
-    }.await;
-    match result {
-        Ok(fit) => {
-            cycle.cycles += 1;
-            let (start, duration) = (cycle.nominal_start, cycle.duration_ms);
-            cx.world.post(cx.system_id, move |s| {
-                schedule_cycle_end(s, start, duration, move |s, end| cycle_end(s, cycle, fit, end));
-            });
-        }
-        Err(reason) => {
-            debug!("module {master} stopped: {reason}");
-            cx.world.post(cx.system_id, move |s| {
-                if cycle_source_current(s, &cycle) {
-                    if let Some(outcome) = public { publish_cycle(&cycle, outcome); }
-                    else if check_target && cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
-                }
-                cycle_stop(s, cycle);
-            });
+fn report_cycle_error(cx: &Ctx, module: i64, phase: &str, error: CallError) {
+    if crate::services::combat::capacity::is_refusal(&error) {
+        cx.notify("OnRemoteMessage", vec![Value::str(messages::MSG_CUSTOM_NOTIFY),
+            Value::dict([("notify", Value::unicode(messages::effects::COMBAT_CAPACITY_FULL))])]);
+    } else {
+        match error {
+            CallError::Internal(error) => warn!("module {module} cycle {phase} failed: {error:#}"),
+            CallError::User { msg, .. } => warn!("module {module} cycle {phase} failed: {msg}"),
         }
     }
 }
+
+
 
 pub(super) fn cycle_end(s: &mut System, cycle: Cycle, fit: Fit, end: i64) {
     if !cycle_valid(s, &cycle) {
@@ -400,12 +384,13 @@ pub(super) fn cycle_end(s: &mut System, cycle: Cycle, fit: Fit, end: i64) {
     }
     let final_cycle = cycle_is_final(cycle.stop.load(Ordering::Relaxed), cycle.effect.has(EffectFlag::DisallowAutoRepeat), cycle.repeat, cycle.cycles);
     let Some(receiver) = super::heat::finish_cycle(s, &cycle, end, final_cycle) else { cycle_stop(s, cycle); return };
-    s.defer(async move { cycle_end_work(cycle, fit, end, final_cycle, receiver).await; });
+    let membership = s.combat_membership_generation(cycle.cx.ship_id);
+    s.defer(async move { cycle_end_work(cycle, fit, end, final_cycle, membership, receiver).await; });
 }
 
 /// Family end, then heat damage, then one actor closure that completes heat
 /// immediately before the repeat or the retirement.
-async fn cycle_end_work(mut cycle: Cycle, fit: Fit, end: i64, final_cycle: bool, receiver: tokio::sync::oneshot::Receiver<Option<Vec<super::heat::SourceSnapshot>>>) {
+async fn cycle_end_work(mut cycle: Cycle, fit: Fit, end: i64, final_cycle: bool, membership: Option<u64>, receiver: tokio::sync::oneshot::Receiver<Option<Vec<super::heat::SourceSnapshot>>>) {
     let cx = cycle.cx.clone();
     let captured = match receiver.await {
         Ok(Some(sources)) => Some(sources),
@@ -417,9 +402,9 @@ async fn cycle_end_work(mut cycle: Cycle, fit: Fit, end: i64, final_cycle: bool,
             Ok(CycleOutcome::Continue) => { public = Some(ModuleCycleOutcome::Completed); final_cycle }
             Ok(CycleOutcome::Ended { outcome, .. }) => { public = Some(outcome); true }
             Ok(CycleOutcome::Stop(_)) => true,
-            Err(e) => { warn!("module {} cycle end failed: {}", cycle.modules[0].id, match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); true }
+            Err(e) => { report_cycle_error(&cx, cycle.modules[0].id, "end", e); true }
         };
-        if let Err(e) = super::heat::damage::apply(&cx, sources).await {
+        if let Err(e) = super::heat::damage::apply(&cx, membership, sources).await {
             warn!("module {} heat damage failed: {}", cycle.modules[0].id, match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
             finished = true;
         }
@@ -444,15 +429,26 @@ pub(super) fn cycle_stop(s: &mut System, mut cycle: Cycle) {
     let cx = cycle.cx.clone();
     debug!("module {master} stopped after {} cycles", cycle.cycles);
     super::heat::stop_cycle(s, &cycle);
+    if let Some(mut pending) = cycle.owner.pending_combat.take() {
+        s.finish_combat_attempt(&pending.facts());
+        pending.disarm();
+    }
+    retire_combat_generations(s, std::mem::take(&mut cycle.owner.combat_generations));
     let mut st = state();
     let retired = retire_activation(&mut st.active, master, &cycle.stop, || {
-        ship_effect(&cx, master, cycle.effect.id, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
+        if cycle.effect.kind != EffectKind::Entosis || cycle.cycles > 0 {
+            ship_effect(&cx, master, cycle.effect.id, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
+        }
     });
     if retired && cycle.effect.kind != EffectKind::Propulsion && st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &cycle.stop)) {
         st.activation_generation.remove(&master);
     }
     if retired { cycle.owner.armed = false; }
     drop(st);
+    if cycle.effect.kind == EffectKind::Entosis { super::entosis::stop(s, &cycle); }
+    if retired {
+        for module in &cycle.modules { s.fitted_module_active(cx.ship_id, module.id, false); }
+    }
     if retired && matches!(cycle.effect.kind, EffectKind::Cloak | EffectKind::MicroJumpDrive) {
         s.refresh_projection_target(cx.ship_id);
     }
@@ -554,7 +550,7 @@ pub(crate) async fn activate(
         }
         EffectKind::Online => {
             super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::online::set_online(identity, db, sde, sender, login_user, cx.ship_id, item_id, true, notify).await;
+            return super::online::set_online(identity, db, world, sde, sender, login_user, cx.ship_id, item_id, true, notify).await;
         }
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
         EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
@@ -564,7 +560,7 @@ pub(crate) async fn activate(
         EffectKind::Smartbomb | EffectKind::Vorton | EffectKind::Cloak |
         EffectKind::MicroJumpDrive | EffectKind::Salvage | EffectKind::Tractor |
         EffectKind::CargoScan | EffectKind::ShipScan | EffectKind::SurveyScan |
-        EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb | EffectKind::Compression => {}
+        EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb | EffectKind::Compression | EffectKind::Entosis => {}
         EffectKind::ProbeLaunch => return Err(unsupported::refusal(Some(id), effect_name, module.type_id)),
     }
     super::cloak::before_activate(&cx, item_id, kind).await?;
@@ -594,14 +590,12 @@ pub(crate) async fn activate(
     let activating: Vec<i64> = modules.iter().map(|module| module.id).collect();
     super::fitting::validate_active(&cx.db, sde.clone(), &fit, cx.ship_id, &active, &activating).await?;
     on_activate(&cx, &fit, &activation).await?;
+    let mut illegal = false;
     if matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Neutralizer | EffectKind::Nosferatu) {
         let t = target.unwrap_or(0);
-        let ship = cx.ship_id;
-        let (own_type, victim) = cx.world.with(cx.system_id, move |s| {
-            (s.ball(ship).map(|b| b.type_id).unwrap_or(0), s.ball(t).and_then(|b| b.char_id))
-        }).await.unwrap_or((0, None));
+        let victim = cx.world.with(cx.system_id, move |s| s.ball(t).and_then(|b| b.char_id)).await.flatten();
         if let Some(victim) = victim {
-            super::super::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, own_type, module.type_id, victim, t).await?;
+            illegal = super::super::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, victim).await?;
         }
     }
     let other = loaded(&cx.db, cx.ship_id, module.flag_id).await?.map(|(type_id, _)| charge_key(cx.ship_id, module.flag_id, type_id));
@@ -622,11 +616,17 @@ pub(crate) async fn activate(
             s.refresh_projection_target(ship);
         }
     });
-    let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };
-    ship_effect(&cx, item_id, effect.id, target, other.clone(), true, filetime_now(), duration_ms, repeat);
+    let combat_generations = modules.iter().map(|module| NativeCombatGeneration {
+        module_id: module.id, generation: crate::space::targeting::next_generation(), sequence: 0,
+    }).collect();
+    let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true,
+        combat_generations, pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id };
+    if kind != EffectKind::Entosis {
+        ship_effect(&cx, item_id, effect.id, target, other.clone(), true, filetime_now(), duration_ms, repeat);
+    }
     info!(user = login_user, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());
     let world = cx.world.clone();
-    let cycle = Cycle { cx, modules, effect, target, repeat, stop, owner, started: filetime_now(), charge_type: None, cycles: 0, duration_ms, nominal_start: 0, other, repair_amount: 0.0 };
+    let cycle = Cycle { cx, modules, effect, target, repeat, stop, owner, started: filetime_now(), charge_type: None, cycles: 0, duration_ms, nominal_start: 0, other, repair_amount: 0.0, illegal };
     world.post(cycle.cx.system_id, move |s| {
         let now = s.now_ms();
         cycle_start(s, cycle, now);
@@ -657,7 +657,7 @@ pub(crate) async fn deactivate(
         || !registry::activation_in_scope(module.category_id, module.group_id, kind) {
         return Err(unsupported::refusal(Some(id), name, module.type_id));
     }
-    if kind == EffectKind::Online { return super::online::set_online(identity, db, sde, sender, login_user, cx.ship_id, item_id, false, notify).await; }
+    if kind == EffectKind::Online { return super::online::set_online(identity, db, world, sde, sender, login_user, cx.ship_id, item_id, false, notify).await; }
     if let Some(stop) = state().active.get(&item_id) {
         stop_generation(&stop.stop);
     }

@@ -33,7 +33,7 @@ pub(in crate::space) fn ship(id: i64, pos: V3, velocity: V3) -> Ball {
         pos, vel: velocity, goto: [0.0; 3], follow_id: 0,
         old_pos: pos, old_vel: velocity, segment_acceleration: None,
         follow_range: 0.0, free: true, global: false, massive: true, interactive: true,
-        warp: Default::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        warp: Default::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; DAMAGE_LAYER_COUNT],
         launcher: 0, slim: vec![],
     }

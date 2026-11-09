@@ -4,7 +4,8 @@
 //! `game.notifications`. The client may send a None contact message. Contact label management is not supported.
 
 use super::{char_id, db_err, keyval, rowset, CallError, CallResult, Client, Value};
-use crate::{dao::characters::{contacts as dao, social}, db::outbox::{dispatch_world, Outbox}, messages, services::{mail, notify_error}};
+use infinity_core::messages;
+use crate::{dao::characters::{contacts as dao, social}, db::outbox::{dispatch_world, Outbox}, services::{mail, notify_error}};
 use std::sync::Arc;
 
 /// Client notificationconst.py: notificationTypeContactAdd.

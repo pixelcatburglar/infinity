@@ -369,7 +369,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
                             crate::dao::missions::set_arc_state(tx, me, arc, mission_id, "accepted", Some(stamp)).await.map_err(db_err)?;
                         }
                         if let Some((type_id, qty)) = cargo {
-                            super::items::deposit(tx, &sde, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
+                            super::items::deposit(tx, &sde, outbox, &crate::services::inventory::destination::Destination::owned(me, station, FLAG_HANGAR), type_id, i64::from(qty), 0).await?;
                         }
                         outbox.event(crate::lua::events::GameEvent::MissionAccepted { char_id: me, agent_id, mission_id });
                         outbox.notify_client("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent_id)]);
@@ -443,7 +443,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             ensure_site(c, &m).await?;
-            super::ship::warp_destination(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, here, order, None, m.pos, range, None, Value::Dict(vec![])).await
+            super::ship::warp_destination(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, here, order, crate::space::system::warp::WarpDestination::Ordinary { point: m.pos, object_radius: None, min_range: range }, None, Value::Dict(vec![])).await
         }
         "agenthomebase" => {
             let (station, _, system, pos) = agent_station(c, agent).await?;
@@ -451,7 +451,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(FALLBACK_STATION_RADIUS);
-            super::ship::warp_destination(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, here, order, Some((pos, radius)), pos, range, None, Value::dict([("celestialID", Value::Int(station))])).await
+            super::ship::warp_destination(&crate::services::identity::Identity::of_client(c), &c.db, &c.world, here, order, crate::space::system::warp::WarpDestination::Ordinary { point: pos, object_radius: Some(radius), min_range: range }, None, Value::dict([("celestialID", Value::Int(station))])).await
         }
         _ => Ok(Value::None),
     }

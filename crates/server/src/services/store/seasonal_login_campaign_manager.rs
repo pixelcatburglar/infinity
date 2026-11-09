@@ -27,7 +27,7 @@ async fn claim_reward(db: &Db, world: &World, campaign: &Campaign, user: i64, se
                     if !crate::dao::store::rewards::mark_omega(tx, user, *campaign, row.ordinal).await.map_err(db_err)? {
                         return Err(db_err(anyhow::anyhow!("seasonal history changed during settlement")));
                     }
-                    crate::dao::store::purchases::grant(tx, user, type_id, quantity, "UI/LoginRewards/WindowCaption", now).await.map_err(db_err)?;
+                    crate::dao::store::purchases::grant(tx, user, type_id, i64::from(quantity), "UI/LoginRewards/WindowCaption", now).await.map_err(db_err)?;
                     crate::dao::store::rewards::audit_retro(tx, user, *campaign, row.ordinal, type_id, quantity, now).await.map_err(db_err)?;
                     changed = true;
                 }
@@ -39,7 +39,6 @@ async fn claim_reward(db: &Db, world: &World, campaign: &Campaign, user: i64, se
                     return Err(db_err(anyhow::anyhow!("seasonal claim was not inserted")));
                 }
                 for &(type_id, quantity) in std::iter::once(&alpha[day]).chain((grade == rules::OMEGA).then_some(&omega[day])) {
-                    let quantity = i32::try_from(quantity).map_err(db_err)?;
                     crate::dao::store::purchases::grant(tx, user, type_id, quantity, "UI/LoginRewards/WindowCaption", now).await.map_err(db_err)?;
                 }
                 changed = true;

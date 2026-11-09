@@ -1,5 +1,6 @@
 use super::{GatewayNotice, NoticeHub};
-use crate::{gateway::{message::message, protocol::{Notice, target_group::Target}}, session::OnlineSession};
+use infinity_core::session::OnlineSession;
+use crate::{gateway::{message::message, protocol::{Notice, target_group::Target}}};
 use prost::Message;
 use prost_reflect::DynamicMessage;
 

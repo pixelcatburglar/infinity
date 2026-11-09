@@ -1,5 +1,5 @@
 use super::*;
-use crate::consts::{FLAG_CORP_DELIVERIES, ROLE_ACCOUNTANT};
+use infinity_core::consts::{FLAG_CORP_DELIVERIES, ROLE_ACCOUNTANT};
 
 #[tokio::test]
 #[ignore = "requires a dedicated test database with SDE"]

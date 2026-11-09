@@ -92,13 +92,15 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
     // A failed transaction discards both the DB mutation and queued side effects.
     let policy = online::OnlinePolicy::from_identity(&crate::services::identity::Identity::of_client(client), client.notify_tx.clone()).ok().expect("online policy");
     let sde = client.sde.clone();
+    let fences = online::capture_online_fences(&client.world, &[owner]).await;
     let rollback: Result<(), CallError> = db.transaction(
         |tx, outbox: &mut Outbox<online::OnlineChanged>| {
             let policy = policy.clone();
             let sde = sde.clone();
             let replacement = replacement.clone();
+            let fences = fences.clone();
             Box::pin(async move {
-                assert!(online::set_online_core(tx, &sde, &policy, outbox, ship, b, false).await?);
+                assert!(online::set_online_core(tx, &sde, &policy, outbox, &fences, ship, b, false).await?.0);
                 assert!(!stopped(&replacement));
                 Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))
             })
@@ -112,29 +114,29 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
     assert!(direct_bank_pushes(client).is_empty());
 
     // Docked clients still receive the bank map through their own sender.
-    client.world.unregister_pilot(owner);
-    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, b, false, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("offline slave");
+    client.world.unregister_pilot_generation(owner, None);
+    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, b, false, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("offline slave");
     assert!(stopped(&replacement));
     assert!(rows(db, ship).await.is_empty());
     assert!(!db.query_one("SELECT online FROM game.items WHERE item_id=$1", &[&b]).await.unwrap().get::<_, bool>("online"));
     assert_eq!(bank_pushes(rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
-    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, b, false, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("repeat offline slave");
+    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, b, false, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("repeat offline slave");
     assert!(bank_pushes(rx).is_empty());
-    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, b, true, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("online slave");
+    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, b, true, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("online slave");
     assert!(rpc(client, "LinkWeapons", ship, a, b).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, c).await.is_ok());
     let master = active(a, owner);
-    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, a, false, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("offline master");
+    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, a, false, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("offline master");
     assert!(stopped(&master));
     assert!(rows(db, ship).await.is_empty());
     assert_eq!(bank_pushes(rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
-    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, a, true, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("online master");
+    online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, a, true, |notification| online::dispatch_notification(notification, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("online master");
 
     assert!(rpc(client, "LinkWeapons", ship, a, b).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, c).await.is_ok());
     let master = active(a, owner);
     let cargo = Container::Item(ship);
-    assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &cargo, b, Some(ship + 1), Some(crate::consts::FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
+    assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &cargo, b, Some(ship + 1), Some(infinity_core::consts::FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
     assert_eq!(rows(db, ship).await, vec![(a, b), (a, c)]);
     assert!(!stopped(&master));
     assert!(bank_pushes(rx).is_empty());
@@ -143,12 +145,12 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
     assert!(!stopped(&master));
     assert!(bank_pushes(rx).is_empty());
     assert!(direct_bank_pushes(client).is_empty());
-    inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &cargo, b, Some(ship), Some(crate::consts::FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("move slave to cargo");
+    inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &cargo, b, Some(ship), Some(infinity_core::consts::FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("move slave to cargo");
     assert_eq!(rows(db, ship).await, vec![(a, c)]);
     assert!(stopped(&master));
     assert_eq!(all_bank_pushes(client, rx), vec![vec![Value::Int(ship), Value::Dict(vec![(Value::Int(a), Value::List(vec![Value::Int(c)]))])]]);
     let master = active(a, owner);
-    inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &cargo, a, Some(ship), Some(crate::consts::FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("move master to cargo");
+    inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &cargo, a, Some(ship), Some(infinity_core::consts::FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.expect("move master to cargo");
     assert!(stopped(&master));
     assert!(rows(db, ship).await.is_empty());
     assert_eq!(all_bank_pushes(client, rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);

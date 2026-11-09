@@ -12,23 +12,24 @@ mod chat;
 mod client;
 mod conn;
 mod config;
-mod consts;
 mod dao;
 mod db;
 mod framing;
 mod gateway;
 mod handshake;
+mod hash;
 mod images;
+mod isk;
 mod live_sessions;
 mod logging;
 mod macho;
 mod lua;
-mod messages;
+mod progress;
 mod scheduler;
 mod sde;
 mod services;
-mod session;
 mod space;
+mod uuid_text;
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -56,10 +57,16 @@ async fn main() -> Result<()> {
     let _logging_guards = logging::init(&cfg.logging)?;
     info!(source = cfg.source(), "configuration loaded");
     config::init_game(cfg.game_config())?;
-    let db = db::Db::connect(&cfg.database).await?;
+    gateway::validate()?;
+    let db = db::Db::connect(&cfg.database).await?
+        .with_progress_registry(progress::Registry::new(vec![progress::lua_observer], vec![services::skill_plans::progress::registration(), services::daily_goals::progress::registration()])?);
+    progress::migration::migrate(&db).await?;
+    progress::reconcile(&db).await?;
     services::corps::shares::seed(&db).await.map_err(startup_call_error)?;
     services::standings::initialize(&db).await?;
     let sde = Arc::new(sde::Sde::load(&db).await?);
+    services::corps::initialize(&db, &sde).await.map_err(startup_call_error)?;
+    services::skill_plans::validation::audit(&db, &sde).await?;
     let types = sde.types.len();
     info!(target: "infinity_server::db", "database ready ({types} types in SDE)");
     services::recover_pending_reloads(&db, &sde).await.map_err(startup_call_error)?;
@@ -70,15 +77,26 @@ async fn main() -> Result<()> {
     let hub = chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     services::trade::recover(&db, &world, sde.clone()).await.map_err(startup_call_error)?;
     lua::start(&cfg, &db, &sde, &world, &hub).await?;
+    lua::content_policy("sovereignty").map_err(startup_call_error)?;
+    let sovereignty_resources = services::sovereignty::Resources { db: db.clone(), sde: sde.clone(), world: world.clone() };
+    services::sovereignty::recovery::recover(&sovereignty_resources).await.map_err(startup_call_error)?;
+    space::sovereignty::open(&world);
     let restored = services::bounty::restore_activations(&db, &world).await.map_err(startup_call_error)?;
     info!(restored, "restored active kill rights");
     services::skills::completion::seed(&db).await.map_err(startup_call_error)?;
+    services::skill_plans::recovery::seed(&db).await.map_err(startup_call_error)?;
     services::industry::completion::seed(&db).await.map_err(startup_call_error)?;
     services::subscriptions::deadlines::recover(&db).await.map_err(startup_call_error)?;
     services::ship_cosmetics_mgr::expiry::recover(&db, &world).await.map_err(startup_call_error)?;
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
-    let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
+    let mut registrations = services::scheduler_registrations();
+    registrations.push(services::sovereignty::jobs::registration());
+    registrations.push(scheduler::periodic(progress::DRAIN_KIND, progress::drain, cfg.scheduler.poll_secs));
+    registrations.push(scheduler::periodic(services::daily_goals::rollover::KIND, services::daily_goals::rollover::run, cfg.scheduler.poll_secs));
+    let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), registrations, cfg.scheduler.clone(), scheduler_shutdown)?;
     scheduler::seed(&db).await?;
+    progress::seed(&db).await?;
+    services::daily_goals::rollover::seed(&db).await?;
     let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway.bind.clone(), gateway::Gateway::new(db.clone(), world.clone(), cfg.clone()))));
     let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat.bind.clone(), hub.clone())));
     let upstream = images::Upstream::new(&cfg.images.upstream, cfg.images.upstream_timeout_secs);
@@ -112,6 +130,7 @@ async fn main() -> Result<()> {
             biased;
             result = &mut shutdown => {
                 result?;
+                space::sovereignty::close(&world);
                 let _ = scheduler_stop.send(true);
                 break;
             }
@@ -165,6 +184,7 @@ async fn main() -> Result<()> {
             let _ = scheduler_task.await;
         }
     }
+    services::sovereignty::recovery::recover(&sovereignty_resources).await.map_err(startup_call_error)?;
     match tokio::time::timeout(
         std::time::Duration::from_secs(cfg.server.shutdown_flush_timeout_secs),
         world.flush_positions(),

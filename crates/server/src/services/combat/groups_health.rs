@@ -1,22 +1,25 @@
 //! Ship health and memory-only capacitor state; routing lives in the parent module.
 //! The client reads capacitor charge through clientDogmaLocation; player attributes come
 //! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
-//! Hostile capacitor mutations validate their source and range in the system actor.
-//! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
+//! Ordinary warp debits the same balance synchronously at its activation boundary.
+//! Guarded capacitor mutations validate source and range in the system actor; remote
+//! injections also respect active Entosis assistance restrictions on capital hulls.
+//! NPC death is journaled before native removal; bounty and wreck processing follow separately.
 //! NPC bounty net and corporation tax commit together; wallet notices and events follow commit.
-//! NPC repairs use the damage cache in the system actor and are not persisted; missing
-//! cache entries represent undamaged NPCs. Persistent unpiloted ships use the fitted
-//! ship condition cache and commit damage and repairs before publishing health.
+//! NPC repairs use actor-owned condition and are not persisted. Persistent ships and
+//! drones publish live condition from their actor and checkpoint it in batches.
 //! Positive pilot damage with a supplied source ball emits after actor health update or actual removal.
 use super::*;
-use crate::consts::CATEGORY_MODULE;
+use infinity_core::consts::CATEGORY_MODULE;
+pub(crate) mod death;
+pub(crate) use death::settle_npc_loss;
 
 
 // ---------------------------------------------------------------- capacitor and hit points
 
 /// Capacitor or shield after `dt` seconds of passive recharge from `level` (the game's
 /// curve: recharge peaks at 25%, ~98% after one recharge time `tau_ms`).
-pub(super) fn recharge(level: f64, max: f64, tau_ms: f64, dt: f64) -> f64 {
+pub(crate) fn recharge(level: f64, max: f64, tau_ms: f64, dt: f64) -> f64 {
     if max <= 0.0 {
         return 0.0;
     }
@@ -92,6 +95,36 @@ fn mutate(entries: &mut HashMap<i64, (f64, i64)>, ship: i64, capacity: f64, tau:
     entries.insert(ship, (after, now));
     Mutation { before, after, amount }
 }
+/// Result of an atomic recharge and partial capacitor debit for warp.
+pub(crate) struct WarpCapacitorDrain {
+    pub(crate) before: f64,
+    pub(crate) after: f64,
+    pub(crate) drained: f64,
+}
+
+/// Debit a validated positive warp cost using the shared capacitor authority.
+pub(crate) fn drain_warp_capacitor(
+    ship: i64, capacity: f64, tau: f64, full_cost: f64, at: i64,
+) -> WarpCapacitorDrain {
+    let mut st = state();
+    let result = mutate(&mut st.capacitor, ship, capacity, tau, at, Operation::Drain(full_cost));
+    WarpCapacitorDrain { before: result.before, after: result.after, drained: result.amount }
+}
+
+
+/// Rebase the live capacitor using its old recharge curve before changing its capacity.
+pub(crate) fn rebase_capacitor(ship: i64, old_capacity: f64, old_tau: f64, new_capacity: f64, _new_tau: f64) -> (f64, f64) {
+    let mut st = state();
+    rebase_capacitor_at(&mut st.capacitor, ship, old_capacity, old_tau, new_capacity, filetime_now())
+}
+
+fn rebase_capacitor_at(entries: &mut HashMap<i64, (f64, i64)>, ship: i64, old_capacity: f64, old_tau: f64, new_capacity: f64, now: i64) -> (f64, f64) {
+    let before = mutate(entries, ship, old_capacity, old_tau, now, Operation::Snapshot).before;
+    let capacity = if new_capacity.is_finite() { new_capacity.max(0.0) } else { 0.0 };
+    let after = before.min(capacity);
+    entries.insert(ship, (after, now));
+    (before, after)
+}
 /// Read an NPC's recharged fraction synchronously from the shared combat state.
 pub(crate) fn npc_capacitor_fraction(sde: &crate::sde::Sde, ball: &Ball) -> Option<f64> {
     let capacity = attr(sde, ball.type_id, ATTR_CAPACITOR_CAPACITY, 0.0);
@@ -111,6 +144,12 @@ pub(crate) enum NpcCapacitorGuard {
 }
 
 impl NpcCapacitorGuard {
+    fn source(&self) -> i64 {
+        match self {
+            Self::Assistance { source, .. } | Self::DroneAssistance { source, .. } | Self::Attack { source, .. } => *source,
+        }
+    }
+
     pub(crate) fn valid(&self, s: &crate::space::System) -> bool {
         match self.clone() {
             Self::Attack { source, target, source_guard, player, optimal, falloff, .. } => {
@@ -133,7 +172,7 @@ impl NpcCapacitorGuard {
                     && s.sampled_ball(source).zip(s.sampled_ball(target)).is_some_and(|(me, other)| {
                         let player = other.char_id.is_some_and(|pilot| s.pilot_ball(pilot).is_some_and(|ball| ball.id == target))
                             && s.sde().and_then(|sde| sde.types.get(other.type_id))
-                                .is_some_and(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP));
+                                .is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP));
                         let eligible = player || s.is_npc(target) || s.drone(target).is_some();
                         let distance = (crate::space::dist(me.pos, other.pos) - f64::from(me.radius) - f64::from(other.radius)).max(0.0);
                         eligible && me.mode != crate::space::MODE_WARP && other.mode != crate::space::MODE_WARP && other.cloak == 0
@@ -167,6 +206,8 @@ async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op:
         if (ball.type_id, ball.char_id) != (type_id, pilot)
             || revision.is_some_and(|revision| s.projection_revision(ship) != revision)
             || guard.as_ref().is_some_and(|guard| !guard.valid(s))
+            || matches!(op, Operation::Inject(_)) && guard.as_ref().is_some_and(|guard|
+                guard.source() != ship && crate::space::sovereignty::links::assistance_blocked(s, ship))
         {
             return None;
         }
@@ -195,7 +236,7 @@ pub(crate) async fn inject(db: &Db, world: &World, system: i64, ship: i64, amoun
     Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
-/// Inject energy only while the NPC projection remains valid.
+/// Inject energy only while the source and range guard remain valid.
 pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
     Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), Some(guard)).await?.map_or(0.0, |(_, amount, _)| amount))
 }
@@ -207,15 +248,15 @@ pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, shi
 }
 
 /// A ship's hit points and resistances, from its fit.
-#[derive(Clone)]
-pub(super) struct ShipStats {
-    pub(super) max: [f64; 3],
-    pub(super) resonance: [[f64; 4]; 3],
-    pub(super) shield_tau_ms: f64,
+#[derive(Clone, Debug)]
+pub(crate) struct ShipStats {
+    pub(crate) max: [f64; 3],
+    pub(crate) resonance: [[f64; 4]; 3],
+    pub(crate) shield_tau_ms: f64,
 }
 
 impl ShipStats {
-    pub(super) fn from_fit(fit: &Fit, key: Key) -> Self {
+    pub(crate) fn from_fit(fit: &Fit, key: Key) -> Self {
         Self {
             max: ATTR_HP.map(|a| fit.value(key, a)),
             resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(key, a))),
@@ -225,179 +266,30 @@ impl ShipStats {
 }
 
 /// A player ship's condition: shield (recharging since `shield_at`), armor and structure left.
-#[derive(Clone)]
-pub(super) struct Condition {
-    pub(super) stats: ShipStats,
-    pub(super) now: [f64; 3],
-    pub(super) shield_at: i64,
+#[derive(Clone, Debug)]
+pub(crate) struct Condition {
+    pub(crate) stats: ShipStats,
+    pub(crate) now: [f64; 3],
+    pub(crate) shield_at: i64,
 }
 
-pub(super) async fn ship_stats(db: &Db, world: &World, system: i64, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
-    let fit = Fit::load_in_space(db, world, system, char_id, ship).await?;
-    Ok(ShipStats::from_fit(&fit, Key::Ship))
+/// Apply selected damage fractions while preserving absolute unselected damage.
+pub(crate) fn set_damage_layers(now: [f64; 3], old_max: [f64; 3], max: [f64; 3], layers: [bool; 3], fraction: f64) -> [f64; 3] {
+    [0, 1, 2].map(|i| {
+        if layers[i] { max[i] * (1.0 - fraction.clamp(0.0, 1.0)) }
+        else if i == 0 { now[i].min(max[i]) }
+        else { max[i] - (old_max[i] - now[i]).max(0.0) }
+    })
 }
 
-/// (shieldCharge, armorDamage, damage) of a ship that has taken damage since it was last
-/// repaired, with its shield recharged to now; None for an undamaged ship.
 
 
-/// Docking repairs the ship.
 
 
-/// A ship being (re)loaded by its pilot (undocking, boarding) starts with a full capacitor.
-
-
-/// Forget a destroyed ship.
-
-
-/// Take raw damage (em, thermal, kinetic, explosive) through layers with resonances;
-/// returns the damage dealt.
-pub(super) fn absorb(now: &mut [f64; 3], resonance: &[[f64; 4]; 3], raw: [f64; 4]) -> f64 {
-    let mut left = raw;
-    let mut dealt = 0.0;
-    for layer in 0..3 {
-        let effective: f64 = (0..4).map(|i| left[i] * resonance[layer][i]).sum();
-        if effective <= 0.0 {
-            break;
-        }
-        if effective <= now[layer] {
-            now[layer] -= effective;
-            dealt += effective;
-            break;
-        }
-        // This layer breaks; what it didn't absorb carries on to the next.
-        let used = now[layer] / effective;
-        dealt += now[layer];
-        now[layer] = 0.0;
-        left = left.map(|d| d * (1.0 - used));
-    }
-    dealt
-}
-
-fn damage_npc_cached(target: i64, initial: impl FnOnce() -> Hp, raw: [f64; 4]) -> (f64, bool, [f64; 3]) {
-    let mut st = state();
-    let hp = st.hp.entry(target).or_insert_with(initial);
-    let dealt = absorb(&mut hp.now, &hp.resonance, raw);
-    let destroyed = hp.now[2] <= 0.0 && (hp.max[2] > 0.0 || hp.now.iter().all(|v| *v <= 0.0));
-    let health = [0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 });
-    (dealt, destroyed, health)
-}
-
-fn restore_drone_hp(target: i64, previous: Option<Hp>) {
-    let mut st = state();
-    match previous {
-        Some(hp) => { st.hp.insert(target, hp); }
-        None => { st.hp.remove(&target); }
-    }
-}
-
-enum NpcDamage {
-    Drone { owner: i64, generation: u64, type_id: i32 },
-    Applied { dealt: f64, destroyed: Option<Ball>, npc: bool },
-}
-
-fn apply_npc_damage(s: &mut crate::space::System, sde: &crate::sde::Sde, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Option<NpcDamage> {
-    let ball = s.ball(target)?;
-    if ball.char_id.is_some() || (s.persistent_generation(target).is_some()
-        && sde.types.get(ball.type_id).and_then(|t| t.category_id) == Some(crate::consts::CATEGORY_SHIP)) {
-        return None;
-    }
-    let type_id = ball.type_id;
-    if let Some(drone) = s.drone(target) {
-        return Some(NpcDamage::Drone { owner: drone.owner, generation: drone.generation, type_id });
-    }
-    let npc = s.is_npc(target);
-    if let Some(pilot) = attacker { s.add_aggressor(target, pilot); }
-    let (dealt, destroyed, health) = damage_npc_cached(target, || {
-        let max = ATTR_HP.map(|id| attr(sde, type_id, id, 0.0));
-        Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(sde, type_id, id, 1.0))) }
-    }, raw);
-    let destroyed = if destroyed {
-        let ball = s.destroy_ball(target);
-        forget_ship(target);
-        ball
-    } else {
-        s.set_health(target, health);
-        None
-    };
-    Some(NpcDamage::Applied { dealt, destroyed, npc })
-}
-
-/// Damage an NPC (or any non-player ball); destroys it at zero structure.
-pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
-    let sde = world.sde().clone();
-    let Some(result) = world.with(system, move |s| apply_npc_damage(s, &sde, target, raw, attacker)).await.flatten() else { return Ok(0.0) };
-    let (owner, generation, type_id) = match result {
-        NpcDamage::Applied { dealt, destroyed, npc } => {
-            if let Some(ball) = destroyed {
-                forget_target(world, target);
-                if npc { finish_npc_kill(db, world, system, target, ball, attacker).await?; }
-            }
-            return Ok(dealt);
-        }
-        NpcDamage::Drone { owner, generation, type_id } => (owner, generation, type_id),
-    };
-    let _lock = super::super::market::lock().await;
-    super::drone_health::refresh_locked(db, world, system, target, owner).await?;
-    if !world.with(system, move |s| s.drone_current(target, generation) && s.drone(target).is_some_and(|d| d.owner == owner)).await.unwrap_or(false) {
-        return Ok(0.0);
-    }
-    let previous = state().hp.get(&target).cloned();
-    if let Some(pilot) = attacker {
-        world.post(system, move |s| {
-            s.add_aggressor(target, pilot);
-        });
-    }
-    let (dealt, destroyed, health) = damage_npc_cached(target, || {
-        let max = ATTR_HP.map(|id| attr(world.sde(), type_id, id, 0.0));
-        Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), type_id, id, 1.0))) }
-    }, raw);
-    if destroyed {
-        let result = db.transaction(
-            |tx, _: &mut Outbox| Box::pin(async move {
-                crate::dao::items::drones::destroy(tx, target, owner, system).await.map_err(db_err)
-            }),
-            |value, _| async move { Ok(value) },
-        ).await;
-        match result {
-            Ok(true) => {}
-            Ok(false) => {
-                forget_ship(target);
-                return Ok(0.0);
-            }
-            Err(error) => {
-                restore_drone_hp(target, previous);
-                return Err(error);
-            }
-        }
-        let destroyed = world.with(system, move |s| {
-            if s.drone_current(target, generation) && s.drone(target).is_some_and(|d| d.owner == owner)
-                && s.ball(target).is_some_and(|b| b.char_id.is_none()) {
-                s.destroy_ball(target)
-            } else { None }
-        }).await.flatten();
-        if destroyed.is_some() {
-            forget_ship(target);
-            forget_target(world, target);
-        }
-    } else {
-        if let Err(error) = super::drone_health::save_condition_in(db, target).await {
-            restore_drone_hp(target, previous);
-            return Err(error);
-        }
-        world.set_health(system, target, health);
-    }
-    Ok(dealt)
-}
 
 async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball: Ball, attacker: Option<i64>) -> Result<(), CallError> {
     info!("ball {target} (type {}) destroyed", ball.type_id);
     super::super::map::events::npc_lost(db, system, filetime_now()).await;
-    if let Some(char_id) = attacker {
-        let mut outbox = Outbox::default();
-        outbox.event(crate::lua::events::GameEvent::NpcKilled { char_id, npc_id: target, type_id: ball.type_id, system_id: system });
-        dispatch_world((), outbox, world)?;
-    }
     if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
         warn!("wreck of {target}: {}", match e {
             CallError::Internal(e) => format!("{e:#}"),
@@ -407,199 +299,39 @@ async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball:
     Ok(())
 }
 
-/// Damage a player's ship; at zero structure it explodes and its pilot is told to eject
-/// (`__ship_destroyed`, handled by the pilot's connection).
-pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, raw: [f64; 4], attacker: Option<i64>, attacker_ball_id: Option<i64>) -> Result<f64, CallError> {
-    let _lock = super::super::market::lock().await;
-    if world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
-        return Ok(0.0);
-    }
-    // Resistances and hit points as fitted right now (hardeners running, modules offline...).
-    let stats = ship_stats(db, world, system, char_id, ship).await?;
-    let known = state().condition.get(&ship).cloned();
-    let mut cond = match known {
-        Some(mut c) => {
-            c.now = [0, 1, 2].map(|i| c.now[i].min(stats.max[i]));
-            c.stats = stats;
-            c
-        }
-        None => Condition { now: stats.max, stats, shield_at: filetime_now() },
-    };
-    let now = filetime_now();
-    let old = cond.now;
-    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
-    cond.shield_at = now;
-    let dealt = absorb(&mut cond.now, &cond.stats.resonance, raw);
-    if let Some(attacker) = attacker {
-        super::super::crimewatch::note_damage(ship, attacker, dealt);
-    }
-    let max = cond.stats.max;
-    let changes = vec![
-        attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
-        attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(max[1] - old[1])),
-        attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(max[2] - old[2])),
-    ];
-    world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
-    if cond.now[2] <= 0.0 {
-        info!("ship {ship} of {char_id} destroyed");
-        let removed = destroy_player_ship(world, system, ship, char_id).await;
-        if let Some(attacker_ball_id) = attacker_ball_id.filter(|_| removed && dealt > 0.0) {
-            crate::lua::on_event(crate::lua::events::GameEvent::Damaged { char_id, ship_id: ship, attacker_ball_id, system_id: system });
-        }
-    } else {
-        let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
-        state().condition.insert(ship, cond);
-        world.post(system, move |s| {
-            s.set_health(ship, health);
-            if s.ball(ship).is_some_and(|ball| ball.char_id == Some(char_id)) {
-                if let Some(attacker_ball_id) = attacker_ball_id.filter(|_| dealt > 0.0) {
-                    crate::lua::on_event(crate::lua::events::GameEvent::Damaged { char_id, ship_id: ship, attacker_ball_id, system_id: system });
-                }
-            }
-        });
-    }
-    Ok(dealt)
-}
-
-/// A player's ship explodes: its pilot is told to eject (`__ship_destroyed`, handled by
-/// the pilot's connection). Also how CONCORD ends a criminal.
-
-
-/// Damage whatever `target` is: a player's ship or an NPC. `attacker` is the pilot
-/// responsible, if any (NPCs remember them; kills pay them).
-pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>, attacker_ball_id: Option<i64>) -> Result<f64, CallError> {
-    let Some(char_id) = world.with(system, move |s| s.ball(target).map(|ball| ball.char_id)).await.flatten() else { return Ok(0.0) };
-    match char_id {
-        Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker, attacker_ball_id).await,
-        None => match super::unpiloted::damage(db, world, system, target, raw).await? {
-            Some(dealt) => Ok(dealt),
-            None => damage_npc(db, world, system, target, raw, attacker).await,
-        },
-    }
-}
-/// NPC layer health for assistance selection; an uncached NPC is undamaged.
+/// NPC layer health for assistance selection; the actor publishes authoritative fractions on the ball.
 pub(crate) fn npc_health_fraction(ball: &Ball, layer: usize) -> Option<f64> {
     if layer >= 3 { return None; }
-    let st = state();
-    let (now, max) = if let Some(cond) = st.condition.get(&ball.id) {
-        (cond.now[layer], cond.stats.max[layer])
-    } else if let Some(hp) = st.hp.get(&ball.id) {
-        (hp.now[layer], hp.max[layer])
-    } else { return Some(1.0) };
-    if !now.is_finite() || !max.is_finite() || max <= 0.0 { return None; }
-    Some((now / max).clamp(0.0, 1.0))
+    let value = ball.health[layer];
+    value.is_finite().then_some(value.clamp(0.0, 1.0))
 }
 
-/// Apply a repair only to a live, valid cached NPC health record.
-fn repair_npc_hp(hp: &mut Hp, layer: usize, amount: f64) -> Option<[f64; 3]> {
-    if layer >= 3 || !amount.is_finite() || amount <= 0.0
-        || !hp.now[2].is_finite() || hp.now[2] <= 0.0
-        || hp.now.iter().chain(hp.max.iter()).any(|v| !v.is_finite())
-        || hp.max[layer] <= 0.0 || hp.now[layer] >= hp.max[layer]
-    {
-        return None;
-    }
-    hp.now[layer] += amount.min(hp.max[layer] - hp.now[layer]);
-    Some([0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 }))
-}
 
-/// Repair a present unpiloted NPC or ship and publish health in the actor turn.
-pub(crate) fn repair_npc_in_system(s: &mut crate::space::System, sde: &crate::sde::Sde, target: i64, layer: usize, amount: f64) -> bool {
-    let Some(ball) = s.ball(target) else { return false };
-    let category = sde.types.get(ball.type_id).and_then(|ty| ty.category_id);
-    if ball.char_id.is_some() || (category == Some(crate::consts::CATEGORY_SHIP) && s.persistent_generation(target).is_some())
-        || !(category == Some(crate::consts::CATEGORY_SHIP)
-            || (category == Some(crate::consts::CATEGORY_ENTITY) && s.is_npc(target))
-            || (category == Some(crate::consts::CATEGORY_DRONE) && s.drone(target).is_some()))
-    {
-        return false;
-    }
-    let health = {
-        let mut st = state();
-        st.hp.get_mut(&target).and_then(|hp| repair_npc_hp(hp, layer, amount))
-    };
-    if let Some(health) = health {
-        s.set_health(target, health);
-        true
-    } else {
-        false
-    }
-}
-
-/// Repair a player's ship layer (0 shield, 1 armor, 2 structure) by `amount`.
-pub(crate) async fn repair_player(
-    db: &Db, world: &World, system: i64, ship: i64, char_id: i64, layer: usize,
-    amount: f64, guard: impl FnOnce(&crate::space::System) -> bool + Send + 'static,
-) -> Result<(), CallError> {
-    let _lock = super::super::market::lock().await;
-    if layer >= 3 || !amount.is_finite() || amount <= 0.0 { return Ok(()); }
-    if world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
-        return Ok(());
-    }
-    let stats = ship_stats(db, world, system, char_id, ship).await?;
-    world.with(system, move |s| {
-        if s.ball(ship).is_none_or(|ball| ball.char_id != Some(char_id)) || !guard(s) {
-            return;
-        }
-        let mut st = state();
-        let Some(cond) = st.condition.get_mut(&ship) else { return };
-        let old_max = cond.stats.max;
-        let old = cond.now;
-        cond.now = [0, 1, 2].map(|i| cond.now[i].min(stats.max[i]));
-        cond.stats = stats;
-        let now = filetime_now();
-        cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
-        cond.shield_at = now;
-        cond.now[layer] = (cond.now[layer] + amount).min(cond.stats.max[layer]);
-        let max = cond.stats.max;
-        let changes = vec![
-            attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
-            attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(old_max[1] - old[1])),
-            attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(old_max[2] - old[2])),
-        ];
-        let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
-        drop(st);
-        s.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
-        s.set_health(ship, health);
-    }).await;
-    Ok(())
-}
 /// Set the damage fraction of selected layers of the active player ship.
 pub(crate) async fn set_damage(c: &Client, system: i64, ship: i64, char_id: i64, layers: [bool; 3], fraction: f64) -> Result<(), CallError> {
-    let _lock = super::super::market::lock().await;
-    if c.world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
-        return Ok(());
-    }
-    let stats = ship_stats(&c.db, &c.world, system, char_id, ship).await?;
-    let now = filetime_now();
-    let mut cond = state().condition.get(&ship).cloned().unwrap_or_else(|| Condition {
-        now: stats.max, stats: stats.clone(), shield_at: now,
+    if !fraction.is_finite() { return Ok(()); }
+    let mask = layers.into_iter().enumerate().fold(0, |mask, (layer, selected)| {
+        if selected { mask | (1 << layer) } else { mask }
     });
-    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
-    let old = cond.now;
-    let old_max = cond.stats.max;
-    cond.now = set_damage_layers(cond.now, old_max, stats.max, layers, fraction);
-    let max = stats.max;
-    cond.stats = stats;
-    cond.shield_at = now;
-    persist_condition_in(&c.db, ship, &cond).await?;
-    let changes = vec![
-        attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
-        attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(old_max[1] - old[1])),
-        attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(old_max[2] - old[2])),
-    ];
-    let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
-    state().condition.insert(ship, cond);
-    c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
-    c.world.set_health(system, ship, health);
+    let changed = c.world.with(system, move |s| {
+        if !s.ball(ship).is_some_and(|ball| ball.char_id == Some(char_id)) { return None; }
+        let (_, old) = s.combat_health_scalars(ship)?;
+        if !s.set_condition_fraction_mask(ship, mask, 1.0 - fraction.clamp(0.0, 1.0)) { return None; }
+        let (max, now) = s.combat_health_scalars(ship)?;
+        let health = [0, 1, 2].map(|i| if max[i] > 0.0 {
+            if i == 0 { (now[i] / max[i]).clamp(0.0, 1.0) }
+            else { (1.0 - now[i] / max[i]).clamp(0.0, 1.0) }
+        } else { 0.0 });
+        s.set_health(ship, health);
+        Some((old, now))
+    }).await.flatten();
+    if let Some((old, now)) = changed {
+        let ids = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
+        let changes = (0..3).map(|i| attribute_change(char_id, Value::Int(ship), ids[i],
+            Value::Float(now[i]), Value::Float(old[i]))).collect();
+        c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
+    }
     Ok(())
-}
-fn set_damage_layers(now: [f64; 3], old_max: [f64; 3], max: [f64; 3], layers: [bool; 3], fraction: f64) -> [f64; 3] {
-    [0, 1, 2].map(|i| {
-        if layers[i] { max[i] * (1.0 - fraction) }
-        else if i == 0 { now[i].min(max[i]) }
-        else { (max[i] - (old_max[i] - now[i])).clamp(0.0, max[i].max(0.0)) }
-    })
 }
 
 
@@ -618,20 +350,13 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("nonfinite bounty payout for NPC type {}", npc.type_id)))?;
         if payout > 0.0 {
             let _lock = super::super::market::lock().await;
-            let tax = db.transaction(
+            db.transaction(
                 |tx, outbox: &mut Outbox| Box::pin(async move {
-                    let corp_tax = crate::dao::characters::combat::corporation_tax(tx, pilot).await.map_err(db_err)?
-                        .map(|r| (r.corporation_id, r.tax_rate.clamp(0.0, 1.0)));
-                    let tax = corp_tax.map(|(_, rate)| super::super::market::round2(payout * rate)).unwrap_or(0.0);
-                    super::super::wallets::credit(tx, outbox, pilot, payout - tax).await?;
-                    if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
-                        super::super::wallets::corp_credit(tx, outbox, corp, ACCOUNT_CASH, tax).await?;
-                    }
-                    Ok(tax)
+                    super::super::corps::tax::settle_reward(tx, outbox, pilot, payout, None).await
                 }),
                 |value, outbox| async move { dispatch_world(value, outbox, world) },
             ).await?;
-            info!("{pilot} earned {payout:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
+            info!("{pilot} earned {payout:.0} ISK bounty for {}", npc.type_id);
         }
         super::super::crimewatch::npc_killed(db, world, pilot).await?;
     }
@@ -659,7 +384,7 @@ pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type:
     }
     loot.truncate(picks as usize);
     for &(type_id, category) in &loot {
-        let quantity: i32 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i32 } else { 1 };
+        let quantity: i64 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i64 } else { 1 };
         crate::dao::items::combat::insert_loot(db, type_id, owner, wreck_id, quantity).await.map_err(db_err)?;
     }
     let ball = Ball {
@@ -687,7 +412,6 @@ pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type:
         massive: true,
         interactive: false,
         warp: crate::space::WarpState::default(),
-        warp_factor: 0,
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
         effect_stamp: 0,

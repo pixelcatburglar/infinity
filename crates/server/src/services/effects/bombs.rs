@@ -5,7 +5,7 @@ use super::aoe;
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::Effect;
 use super::weapons::{consume_charge, next_missile_id};
-use crate::consts::{dogma::ATTR_EMP_FIELD_RANGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_MAX_VELOCITY};
+use infinity_core::consts::{dogma::ATTR_EMP_FIELD_RANGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_MAX_VELOCITY};
 use crate::services::combat::{self, Ctx, ATTR_DAMAGE};
 use crate::services::fit::{Fit, Key};
 use crate::services::CallError;
@@ -23,9 +23,13 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
 
 pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let master = cycle.modules[0].id;
-    for module in &cycle.modules {
+    for index in 0..cycle.modules.len() {
+        let module = cycle.modules[index].clone();
         let key = Key::Charge(module.id);
         let Some(expected) = fit.source_type(key) else { return Ok(CycleOutcome::Stop("out of charges")); };
+        let Some(attempt) = super::lifecycle::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
+            return Ok(CycleOutcome::Stop("source lost or activation replaced"));
+        };
         let velocity = fit.value(key, ATTR_MAX_VELOCITY);
         let delay = fit.value(key, ATTR_EXPLOSION_DELAY);
         let radius = fit.value(key, ATTR_EMP_FIELD_RANGE);
@@ -44,7 +48,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
             let source = s.sampled_ball(ship_id).filter(|ship| ship.mode != MODE_WARP)?;
             Some((source, s.heading(ship_id)?))
         }).await.flatten() else { return Ok(CycleOutcome::Stop("source lost, in warp or activation replaced")); };
-        let Some(charge) = consume_charge(cx, module, Some(expected)).await? else { return Ok(CycleOutcome::Stop("out of charges")); };
+        let Some(charge) = consume_charge(cx, &module, Some(expected)).await? else { return Ok(CycleOutcome::Stop("out of charges")); };
         cycle.charge_type = Some(charge);
         let id = next_missile_id();
         let launch_ms = crate::space::now_ms();
@@ -54,7 +58,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
             mass, max_vel: velocity as f32, agility: 1.0, speed_fraction: 0.0,
             pos: source.pos, vel: [0.0; 3], old_pos: source.pos, old_vel: [0.0; 3], segment_acceleration: None,
             goto: source.pos, follow_id: 0, follow_range: 0.0, free: true, global: false,
-            massive: false, interactive: false, warp: crate::space::WarpState::default(), warp_factor: 0,
+            massive: false, interactive: false, warp: crate::space::WarpState::default(), 
             last_ms: launch_ms, interpolation_anchor_ms: launch_ms, effect_stamp: 0, cloak: 0, cloak_until: 0,
             health: [1.0; 3], launcher: 0,
             slim: vec![("sourceShipID", Value::Int(ship_id)), ("launchModules", Value::list([Value::Int(module.id)]))],
@@ -68,10 +72,14 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
                 let victims = aoe::victims(s, id, center, radius);
                 s.destroy_ball(id);
                 s.defer(async move {
-                    match aoe::apply_damage(&context, weapon, victims, raw).await {
+                    match aoe::apply_damage_guarded(&context.db, &context.world, context.system_id, weapon, victims, raw, None, attempt, None).await {
                         Ok(()) => {}
                         Err(CallError::Internal(error)) => tracing::warn!(%error, bomb = id, "bomb damage failed"),
-                        Err(CallError::User { msg, .. }) => tracing::warn!(%msg, bomb = id, "bomb damage refused"),
+                        Err(CallError::User { msg, dict }) if msg == infinity_core::messages::MSG_CUSTOM_NOTIFY
+                            && dict == vec![("notify".into(), Value::unicode(infinity_core::messages::effects::COMBAT_CAPACITY_FULL))] => {}
+                        Err(CallError::User { msg, dict }) => {
+                            context.notify("OnRemoteMessage", vec![Value::str(msg), Value::dict(dict)]);
+                        }
                     }
                 });
             });

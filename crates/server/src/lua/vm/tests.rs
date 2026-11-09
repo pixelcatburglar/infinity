@@ -181,7 +181,7 @@ async fn protected_async_call_obeys_no_context_deadline() -> mlua::Result<()> {
     })?)?;
     let function = lua.load("return function() pcall(wait); resumed = true end").set_environment(env.clone()).eval()?;
     let handler = Handler { script: "test".into(), function };
-    let registry = Registry { lua, claims: Claims::default(), overrides: Mutex::new(Default::default()) };
+    let registry = Registry { lua, claims: Claims::default(), content: Default::default(), overrides: Mutex::new(Default::default()) };
     let config = LuaConfig { call_budget_ms: 100, ..LuaConfig::default() };
     let call = super::super::invoke_no_context(&registry, &config, &handler, Ok(mlua::Value::Nil));
     tokio::pin!(call);
@@ -357,10 +357,10 @@ fn bundled_motd_uses_current_command_and_notification_protocol() -> mlua::Result
     let open = Arc::new(AtomicBool::new(true));
     register_claims(&lua, &env, claims.clone(), "motd".into(), open.clone())?;
     let messages = lua.create_table()?;
-    messages.set("motd_help", crate::messages::lua::LUA_MOTD_HELP)?;
-    messages.set("motd_saved", crate::messages::lua::LUA_MOTD_SAVED)?;
-    messages.set("motd_empty", crate::messages::lua::LUA_MOTD_EMPTY)?;
-    messages.set("custom_notify", crate::messages::MSG_CUSTOM_NOTIFY)?;
+    messages.set("motd_help", infinity_core::messages::lua::LUA_MOTD_HELP)?;
+    messages.set("motd_saved", infinity_core::messages::lua::LUA_MOTD_SAVED)?;
+    messages.set("motd_empty", infinity_core::messages::lua::LUA_MOTD_EMPTY)?;
+    messages.set("custom_notify", infinity_core::messages::MSG_CUSTOM_NOTIFY)?;
     env.set("messages", messages)?;
     lua.load("local data = {}; store = { get = function(k) return data[k] end, set = function(k,v) data[k]=v end }; ctx = {}; world = { notify_pilot = function(char_id, event, args) notification = {char_id, event, args[1], args[2]} end }").set_environment(env.clone()).exec()?;
     let source = std::fs::read(root.join("motd.lua")).unwrap();
@@ -370,16 +370,16 @@ fn bundled_motd_uses_current_command_and_notification_protocol() -> mlua::Result
     let command = &claims.commands.get("motd").unwrap();
     assert!(command.gm);
     let ctx: Table = env.get("ctx")?;
-    assert_eq!(command.handler.function.call::<String>((ctx.clone(), lua.create_table()?))?, crate::messages::lua::LUA_MOTD_EMPTY);
+    assert_eq!(command.handler.function.call::<String>((ctx.clone(), lua.create_table()?))?, infinity_core::messages::lua::LUA_MOTD_EMPTY);
     let args = lua.create_sequence_from(["set", "测试", "公告"])?;
-    assert_eq!(command.handler.function.call::<String>((ctx.clone(), args))?, crate::messages::lua::LUA_MOTD_SAVED);
+    assert_eq!(command.handler.function.call::<String>((ctx.clone(), args))?, infinity_core::messages::lua::LUA_MOTD_SAVED);
     assert_eq!(command.handler.function.call::<String>((ctx.clone(), lua.create_table()?))?, "测试 公告");
     let event = super::super::events::GameEvent::CharacterSelected { user_id: 11, char_id: 22 };
     claims.events["CharacterSelected"][0].function.call::<()>(event.to_lua(&lua)?)?;
     let notification: Table = env.get("notification")?;
     assert_eq!(notification.get::<i64>(1)?, 22);
     assert_eq!(notification.get::<String>(2)?, "OnRemoteMessage");
-    assert_eq!(value::from_lua(notification.get(3)?)?, marshal::Value::str(crate::messages::MSG_CUSTOM_NOTIFY));
+    assert_eq!(value::from_lua(notification.get(3)?)?, marshal::Value::str(infinity_core::messages::MSG_CUSTOM_NOTIFY));
     assert_eq!(value::from_lua(notification.get(4)?)?, marshal::Value::dict([("notify", marshal::Value::unicode("测试 公告"))]));
     Ok(())
 }

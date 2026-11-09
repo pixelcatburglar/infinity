@@ -5,7 +5,7 @@ mod target_warp;
 mod damage;
 mod cycles;
 
-use std::{future::Future, path::PathBuf, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use crate::lua::{self, events::GameEvent, host::{self, Resources}};
 use crate::{client::Client, services::{self, Call}};
 use marshal::Value;
@@ -19,6 +19,7 @@ local function record(ev)
 end
 register.event('Targeted', record)
 register.event('Damaged', record)
+register.event('ShipLost', record)
 register.event('ModuleCycleEnded', record)
 register.event('WarpArrived', record)
 register.event('CharacterSelected', function(ev)
@@ -50,13 +51,14 @@ pub(super) struct Context {
     _peer: tokio::net::TcpStream,
     driver: String,
     dir: PathBuf,
-    next_barrier: AtomicI64,
+    barriers: Mutex<Vec<i64>>,
 }
 
 impl Context {
     pub(super) async fn new() -> Self {
         crate::tests::init_config();
-        let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+        let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap()
+            .with_progress_registry(crate::progress::Registry::new(vec![crate::progress::lua_observer], vec![]).unwrap());
         let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
         let world = crate::space::World::new(db.clone(), sde.clone(), 1);
         let mut config = crate::config::Config::default();
@@ -79,13 +81,20 @@ impl Context {
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: 0, user_name: "event-observer".into(), role: 0, client_id: 0, session_id: 0, language_id: "EN".into() };
         let client = Client::new(crate::conn::Conn::new(stream, address), Arc::new(config), db, sde, hub, world, login);
-        Self { resources, lua, client: Mutex::new(client), _peer: peer, driver, dir, next_barrier: AtomicI64::new(0) }
+        Self { resources, lua, client: Mutex::new(client), _peer: peer, driver, dir, barriers: Mutex::new(Vec::new()) }
     }
 
     async fn snapshot_after_barrier(&self) -> Vec<serde_json::Value> {
         let mut client = self.client.lock().await;
-        let n = self.next_barrier.fetch_add(1, Ordering::Relaxed) + 1;
-        lua::on_event(GameEvent::CharacterSelected { user_id: n, char_id: 0 });
+        let n = -crate::dao::map_telemetry::next_occurrence(&self.resources.db).await.unwrap();
+        self.barriers.lock().await.push(n);
+        self.resources.db.transaction(
+            |_, outbox: &mut crate::db::outbox::Outbox| Box::pin(async move {
+                outbox.event(GameEvent::CharacterSelected { user_id: n, char_id: n });
+                Ok::<_, crate::services::CallError>(())
+            }),
+            |(), outbox| async move { crate::db::outbox::dispatch_world((), outbox, &self.resources.world) },
+        ).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let kwargs = Value::Dict(vec![]);
@@ -124,6 +133,10 @@ impl Context {
     }
 
     pub(super) async fn cleanup(&self) {
+        for n in self.barriers.lock().await.iter() {
+            self.resources.db.execute("DELETE FROM game.progress_deliveries WHERE event_id IN (SELECT event_id FROM game.progress_events WHERE kind = 'CharacterSelected' AND subject_character_id = $1 AND (payload->'CharacterSelected'->>'user_id')::bigint = $1)", &[n]).await.unwrap();
+            self.resources.db.execute("DELETE FROM game.progress_events WHERE kind = 'CharacterSelected' AND subject_character_id = $1 AND (payload->'CharacterSelected'->>'user_id')::bigint = $1", &[n]).await.unwrap();
+        }
         for key in crate::dao::lua_store::keys(&self.resources.db, &self.driver, "").await.unwrap() {
             crate::dao::lua_store::delete(&self.resources.db, &self.driver, &key).await.unwrap();
         }

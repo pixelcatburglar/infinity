@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::consts::{CATEGORY_MODULE, dogma::EFFECT_MICROWARPDRIVE, FLAG_HI_SLOT_FIRST};
+use infinity_core::consts::{CATEGORY_MODULE, dogma::EFFECT_MICROWARPDRIVE, FLAG_HI_SLOT_FIRST};
 use crate::services::combat::{ActiveModule, Ctx};
 use crate::services::effects::lifecycle::{ActivationOwner, Cycle, Module};
 use crate::services::effects::registry;
@@ -42,7 +42,7 @@ fn ball() -> Ball {
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3],
         goto: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: false, massive: true,
-        warp: Default::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: Default::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     }
 }
@@ -54,9 +54,10 @@ fn cycle(cx: &Ctx, effect: &registry::Effect, module_type: i32, generation: Arc<
         modules: vec![Module { id: CLEARED, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }],
         effect: effect.clone(),
         target: None, repeat: 1, stop: generation.clone(),
-        owner: ActivationOwner { master: CLEARED, generation, armed: false },
+        owner: ActivationOwner { master: CLEARED, generation, armed: false, combat_generations: Vec::new(),
+            pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1_000.0, nominal_start: nominal,
-        other: None, repair_amount: 0.0,
+        other: None, repair_amount: 0.0, illegal: false,
     }
 }
 
@@ -124,4 +125,99 @@ async fn committed_clear_after_begin_before_connect_releases_only_that_marker() 
     assert!(!state().modules.contains_key(&CLEARED));
     let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(events.iter().all(|(name, _)| name != "OnHeatAdded" && name != "OnHeatRemoved"));
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn fitting_detach_defers_actor_cleanup_and_preserves_replacement_membership() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let world = World::new(db.clone(), sde, 0);
+    let _cleanup = Cleanup;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let registry = Arc::new(crate::space::Pilots::default());
+    registry.register_pilot(OWNER, tx.clone());
+    let mut system = System::new(SYSTEM_ID, registry, NOW);
+    system.insert(ball());
+    let cx = Ctx { db, world, notify: tx, char_id: OWNER, ship_id: SHIP, system_id: SYSTEM_ID };
+    let entry = Entry { owner: OWNER, ship: SHIP, effect: 7, effective: true, desired: true,
+        cx, source_generation: None };
+    state().modules.insert(CLEARED, entry.clone());
+    let cleanup = super::super::detach_for_fitting(SHIP, SYSTEM_ID, &[CLEARED]);
+    assert!(!state().modules.contains_key(&CLEARED));
+    assert!(rx.try_recv().is_err());
+    state().modules.insert(CLEARED, entry);
+    super::super::apply_fitting_cleanup(&mut system, cleanup);
+    assert!(state().modules.get(&CLEARED).is_some_and(|current| current.effective));
+    assert!(rx.try_recv().is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL; run serially"]
+async fn fitting_cleanup_publishes_effective_overload_and_preserves_replacement() {
+    use infinity_core::consts::dogma::ATTR_ARMOR_HP;
+    use crate::services::combat::groups_health::{Condition, ShipStats};
+    use crate::services::fit::{attributes::tests::module_fit, Key};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = crate::sde::types::tests::overload_fixture();
+    let world = World::new(db.clone(), Arc::clone(&sde), 0);
+    for replacement in [false, true] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = Arc::new(crate::space::Pilots::default());
+        registry.register_pilot(OWNER, tx.clone());
+        let mut system = System::new(SYSTEM_ID, registry, NOW);
+        system.add_persistent_ship(ball());
+        let generation = system.persistent_generation(SHIP).unwrap();
+        let before = module_fit(Arc::clone(&sde), 1, 2, true);
+        let patch = module_fit(Arc::clone(&sde), 1, 2, true).into_committed_fitting(&before);
+        let mut current = module_fit(Arc::clone(&sde), 1, 2, true);
+        current.set_module_overloaded(2, true);
+        assert_eq!(current.value(Key::Ship, ATTR_ARMOR_HP), 150.0);
+        let stats = ShipStats::from_fit(&current, Key::Ship);
+        system.install_condition(SHIP, Condition { now: stats.max, stats, shield_at: crate::client::filetime_now() }, current);
+        let cx = Ctx { db: db.clone(), world: world.clone(), notify: tx, char_id: OWNER, ship_id: SHIP, system_id: SYSTEM_ID };
+        let entry = Entry { owner: OWNER, ship: SHIP, effect: 7, effective: true, desired: true,
+            cx, source_generation: None };
+        state().modules.insert(2, entry.clone());
+        let cleanup = super::super::detach_for_fitting(SHIP, SYSTEM_ID, &[2]);
+        if replacement { state().modules.insert(2, entry); }
+        assert!(system.publish_fitting(SHIP, OWNER, generation, patch, vec![cleanup]));
+        let expected = if replacement { 150.0 } else { 100.0 };
+        assert_eq!(system.ship_condition(SHIP).unwrap().1, 0.0);
+        if !replacement {
+            let mut found = false;
+            while let Ok((name, args)) = rx.try_recv() {
+                if name != "OnModuleAttributeChanges" { continue; }
+                let [marshal::Value::List(rows)] = args.as_slice() else { panic!("expected batch") };
+                found = rows.iter().any(|row| {
+                    let marshal::Value::Tuple(fields) = row else { return false };
+                    fields[3].as_int() == Some(i64::from(ATTR_ARMOR_HP))
+                        && fields[5] == marshal::Value::Float(expected)
+                        && fields[6] == marshal::Value::Float(150.0)
+                });
+            }
+            assert!(found);
+        } else {
+            assert!(state().modules.get(&2).is_some_and(|entry| entry.effective));
+            let before = module_fit(Arc::clone(&sde), 1, 2, true);
+            let offline = module_fit(Arc::clone(&sde), 1, 2, false);
+            let patch = offline.into_committed_fitting(&before);
+            assert!(system.publish_fitting(SHIP, OWNER, generation, patch, vec![]));
+            let mut found = false;
+            while let Ok((name, args)) = rx.try_recv() {
+                if name != "OnModuleAttributeChanges" { continue; }
+                let [marshal::Value::List(rows)] = args.as_slice() else { panic!("expected batch") };
+                found |= rows.iter().any(|row| {
+                    let marshal::Value::Tuple(fields) = row else { return false };
+                    fields[3].as_int() == Some(i64::from(ATTR_ARMOR_HP))
+                        && fields[5] == marshal::Value::Float(100.0)
+                        && fields[6] == marshal::Value::Float(150.0)
+                });
+            }
+            assert!(found);
+        }
+        state().modules.remove(&2);
+    }
 }

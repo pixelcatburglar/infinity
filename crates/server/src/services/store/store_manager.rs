@@ -5,12 +5,18 @@
 //! DAO. Balance notifications include `userid`; clients cannot display oversized
 //! balances exactly. Crates are listed, sold and reported purchasable only when
 //! their shared catalogue definition supports sale; opening is not implemented.
+//! External pre-payment period purchase marking is unsupported and refused.
+//! `get_products`/`get_offers` quantities are projected to the client display
+//! limit; offer and purchase quantities stay exact.
 use super::*;
-const PLX: &str = "PLX";
-const TYPE_PLEX: i32 = 44992;
+use infinity_core::consts::TYPE_PLEX;
 const PERIOD_DAY: i64 = 1;
 /// Protocol offer ID for the daily free gift.
 const DAILY_GIFT_OFFER: i64 = 1;
+/// Server-selected expert child category under skills/services (root 2, injector sibling 201).
+const EXPERT_CATEGORY: i64 = 202;
+/// Category tag used by `expertSystems/client/util.py:browse_expert_systems`.
+const EXPERT_CATEGORY_TAG: &str = "expert system";
 // ---------------------------------------------------------------- catalogue
 
 struct Category {
@@ -40,6 +46,9 @@ struct Catalogue {
 fn service_price(average: Option<f64>, plex_isk: f64, list_price: i64) -> i64 {
     average.filter(|p| crate::dao::store::catalogue::positive_price(*p)).map(|p| ((p / plex_isk).round() as i64).max(1)).unwrap_or(list_price)
 }
+fn expert_saleable(definition: &crate::sde::expert_systems::ExpertSystem) -> bool {
+    !definition.hidden && !definition.retired
+}
 
 async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
@@ -64,6 +73,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     };
     sub(&mut cat, 6201, messages::DAILY_FREE_CATEGORY_NAME, 62);
     sub(&mut cat, 201, messages::SKILL_INJECTOR_CATEGORY_NAME, 2);
+    sub(&mut cat, EXPERT_CATEGORY, messages::expert_systems::STORE_CATEGORY, 2);
     sub(&mut cat, 4901, messages::SUPPLY_CRATE_CATEGORY_NAME, 49);
     for (id, name) in [(101, messages::AMARR_CATEGORY_NAME), (102, messages::CALDARI_CATEGORY_NAME), (103, messages::GALLENTE_CATEGORY_NAME), (104, messages::MINMATAR_CATEGORY_NAME), (105, messages::OTHER_FACTION_CATEGORY_NAME)] {
         sub(&mut cat, id, name, 1);
@@ -72,7 +82,6 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     // Daily free gift.
     let gift = &crate::config::game().store.daily_gift;
     let type_id = i32::try_from(gift.type_id).map_err(|e| db_err(anyhow::anyhow!("daily gift type out of range: {e}")))?;
-    i32::try_from(gift.quantity).map_err(|e| db_err(anyhow::anyhow!("daily gift quantity out of range: {e}")))?;
     let (name, image) = presentation(type_id)?;
     cat.offers.push(Offer {
         id: DAILY_GIFT_OFFER,
@@ -91,6 +100,13 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
         let price = service_price(prices.get(&type_id).copied(), plex_isk, list_price);
         cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category: 201, price, daily: false });
     }
+    for entry in sde.store.expert_offers() {
+        let Some(definition) = sde.expert_systems.get(entry.type_id) else { continue };
+        if !expert_saleable(definition) { continue; }
+        let (name, image) = presentation(entry.type_id)?;
+        cat.offers.push(Offer { id: i64::from(entry.type_id), type_id: entry.type_id, quantity: i64::from(entry.quantity), name, image, category: EXPERT_CATEGORY, price: entry.plex_price, daily: false });
+    }
+
 
     // Supported permanent SKINs visible in this region, by the first hull's race.
     for r in sde.ship_skins.licenses().filter(|r| r.is_permanent() && !r.is_single_use) {
@@ -140,7 +156,7 @@ fn category_json(cat: &Category) -> Value {
         ("name", s(&cat.name)),
         ("href", s("")),
         ("parent", cat.parent.map(|p| Value::dict([("id", Value::Int(p))])).unwrap_or(Value::None)),
-        ("tags", Value::list([])),
+        ("tags", if cat.id == EXPERT_CATEGORY { Value::list([s(EXPERT_CATEGORY_TAG)]) } else { Value::list([]) }),
         ("isHomePage", Value::Bool(cat.home)),
         ("sortPriority", Value::Int(cat.id)),
     ])
@@ -152,7 +168,7 @@ fn product_json(o: &Offer) -> Value {
         ("name", s(&o.name)),
         ("href", s("")),
         ("typeId", Value::Int(o.type_id as i64)),
-        ("quantity", Value::Int(o.quantity)),
+        ("quantity", Value::Int(crate::services::dogma::info::cap_client_quantity(o.quantity))),
         ("productName", s(&o.name)),
         ("imageUrl", s(&o.image)),
     ])
@@ -183,32 +199,40 @@ async fn claimed_daily_gift(c: &Client) -> Result<bool, CallError> {
 }
 /// buy_offer(offer_id, currency, qty, from_character_id=, to_character_id=, ...) -> success
 async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
-    let offer_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let qty = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(1).max(1);
-    let gift_to = call.kwargs.get("to_character_id").and_then(|v| v.as_int());
+    let Some(Value::Int(offer_id)) = call.args.first() else { return Ok(Value::Bool(false)) };
+    let offer_id = *offer_id;
+    if call.args.get(1).and_then(Value::as_text).as_deref() != Some(PLX) { return Ok(Value::Bool(false)); }
+    let Some(Value::Int(qty)) = call.args.get(2) else { return Ok(Value::Bool(false)) };
+    let qty = *qty;
+    let gift_to = match call.kwargs.get("to_character_id") {
+        None | Some(Value::None) => None,
+        Some(Value::Int(id)) if *id > 0 => Some(*id),
+        _ => return Ok(Value::Bool(false)),
+    };
     let cat = catalogue(c).await?;
     let Some(offer) = cat.offers.iter().find(|o| o.id == offer_id && !o.daily) else { return Ok(Value::Bool(false)) };
     if c.sde.crates.get(offer.type_id).is_some_and(|entry| !entry.sale_supported()) { return Ok(Value::Bool(false)); }
-    let cost = offer.price * qty;
-    let recipient = match gift_to {
-        Some(ch) => match crate::dao::store::purchases::recipient(&c.db, ch).await.map_err(db_err)? {
-            Some(user) => user,
-            None => return Ok(Value::Bool(false)),
+    let Some(purchase) = purchasing::Purchase::new(offer.id, offer.type_id, offer.quantity, offer.price, qty) else { return Ok(Value::Bool(false)) };
+    let payer = c.login.user_id;
+    let now = filetime_now();
+    let selected = c.session.int("charid");
+    let audience = match selected {
+        Some(character_id) if c.world.is_online(character_id) => crate::services::plex_vault::VaultAudience::Account,
+        character_id => crate::services::plex_vault::VaultAudience::UnpublishedCaller { character_id },
+    };
+    let _lock = crate::services::market::lock().await;
+    let db = c.db.clone();
+    let result = db.transaction(
+        move |tx, outbox| {
+            let purchase = purchase;
+            Box::pin(async move { purchasing::purchase(tx, outbox, payer, gift_to, &purchase, now, audience).await })
         },
-        None => c.login.user_id,
-    };
-    let Some(balance) = crate::dao::store::purchases::debit(&c.db, c.login.user_id, cost).await.map_err(db_err)? else {
-        info!(user = c.login.user_id, "store: cannot afford offer {offer_id} x{qty} ({cost} PLEX)");
-        return Ok(Value::Bool(false));
-    };
-    crate::dao::store::purchases::purchase(&c.db, c.login.user_id, offer_id as i32, qty as i32, cost).await.map_err(db_err)?;
-    grant_token(c, recipient, offer.type_id, offer.quantity * qty, "UI/VirtualGoodsStore/StoreName").await?;
-    info!(user = c.login.user_id, "store: bought offer {offer_id} ({}) x{qty} for {cost} PLEX", offer.name);
-    notify_plex_balance(c, balance);
-    if recipient == c.login.user_id {
-        c.notify("OnRedeemingQueueUpdated", vec![]);
+        |value, outbox| async move { crate::db::outbox::dispatch_client(value, outbox, c) },
+    ).await?;
+    if result {
+        info!(user = payer, offer_id, quantity = qty, "store purchase");
     }
-    Ok(Value::Bool(true))
+    Ok(Value::Bool(result))
 }
 
 /// free_to_get(offer_id, is_game_time=, store_id=): the daily gift.
@@ -220,7 +244,7 @@ async fn free_to_get(c: &mut Client, call: &Call<'_>) -> CallResult {
         return Ok(Value::Bool(false));
     }
     crate::dao::store::purchases::free_purchase(&c.db, c.login.user_id, offer_id as i32).await.map_err(db_err)?;
-    grant_token(c, c.login.user_id, offer.type_id, offer.quantity, "UI/VirtualGoodsStore/StoreName").await?;
+    grant_token(c, c.login.user_id, offer.type_id, offer.quantity, TOKEN_LABEL).await?;
     c.notify("OnRedeemingQueueUpdated", vec![]);
     Ok(Value::Bool(true))
 }
@@ -265,7 +289,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 Value::Bool(can_purchase)
             })
         }.await,
-        ("storeManager", "set_offer_purchased") => Ok(Value::None),
+        ("storeManager", "set_offer_purchased") => Err(crate::services::notify_error(messages::store::EXTERNAL_PAYMENT_UNSUPPORTED)),
 
         _ => return None,
     })

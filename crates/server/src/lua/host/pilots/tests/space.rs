@@ -8,7 +8,7 @@ async fn spatial_operations_authorize_and_use_actor() {
     let (race, bloodline, school, station) = fixture::creation_inputs(&r).await;
     let fields = fixture::FieldSnapshot::capture(&r, station).await;
     let fixture_system = r.sde.map.station(station).unwrap().solar_system_id.unwrap();
-    assert!(r.sde.map.celestials(fixture_system).any(|celestial| celestial.group_id == Some(i64::from(crate::consts::GROUP_ASTEROID_BELT))), "fixture system must contain SDE asteroid belts");
+    assert!(r.sde.map.celestials(fixture_system).any(|celestial| celestial.group_id == Some(i64::from(infinity_core::consts::GROUP_ASTEROID_BELT))), "fixture system must contain SDE asteroid belts");
     let lua = Lua::new();
     register(&lua, &lua.globals(), &r).unwrap();
     let globals = lua.globals();
@@ -111,12 +111,20 @@ async fn spatial_operations_authorize_and_use_actor() {
         let wrong = r.world.ball(system, ship).await.unwrap();
         assert_eq!((wrong.char_id, wrong.mode, wrong.goto, wrong.follow_id), (Some(peer), original.mode, original.goto, original.follow_id));
         assert_eq!(lua.load("return #pilots.targeters(id)").eval_async::<i64>().await?, 0);
-        let missing_actor: Table = lua.load("return pilots.condition(id)").eval_async().await?;
-        for field in ["shield", "armor_damage", "hull_damage"] { assert!(missing_actor.get::<Option<f64>>(field)?.is_some(), "{field}"); }
-        assert!(missing_actor.get::<Option<f64>>("capacitor")?.is_none());
+        let missing_actor = lua.load("return pilots.condition(id)").eval_async::<Table>().await.unwrap_err();
+        assert!(missing_actor.to_string().contains("active ship membership is unavailable"));
         assert!(lua.load("pilots.dock(id,station)").exec_async().await.is_err());
         r.world.remove_ball(system, ship).await;
-        r.world.add_ship(system, original).await?;
+        let fit = crate::services::fit::Fit::load(&r.db, r.sde.clone(), id, ship).await.ok().unwrap();
+        let condition = crate::services::combat::prepare_condition_with_fit(&r.db, ship, &fit).await.ok().unwrap();
+        r.world.with(system, move |s| {
+            s.add_ship(original);
+            s.install_condition(ship, condition.into_condition(), fit);
+            assert_eq!(s.pilot_ball(id).map(|ball| ball.id), Some(ship));
+            assert!(s.persistent_generation(ship).is_some());
+            assert_eq!(s.combat_membership_generation(ship), s.persistent_generation(ship));
+            assert!(s.ship_condition(ship).is_some());
+        }).await.unwrap();
         let npc = -id;
         let mut npc_ball = r.world.ball(system, ship).await.unwrap();
         npc_ball.id = npc;
@@ -126,7 +134,7 @@ async fn spatial_operations_authorize_and_use_actor() {
             let mut brain = crate::space::NpcBrain::new(None, crate::space::NpcConfig {
                 fly_range: 1.0, aggro_range: 1e9, rate_of_fire_ms: 1e9,
                 scan_resolution: 1.0, repairs: (0.0, 0.0, 1000.0),
-            }, Arc::new(|_| Box::pin(async {})));
+            }, Arc::new(|_, _| Some(Box::pin(async {}))));
             brain.target = Some((ship, id, 0));
             brain.announced = true;
             assert!(s.add_npc(npc, brain));
@@ -176,7 +184,7 @@ async fn spatial_operations_authorize_and_use_actor() {
         let location = r.db.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&id]).await?;
         assert_eq!((location.get::<_, Option<i64>>("station_id"), location.get::<_, i64>("solar_system_id")), (Some(station), system));
         let item = r.db.query_one("SELECT location_id, flag_id FROM game.items WHERE item_id=$1", &[&ship]).await?;
-        assert_eq!((item.get::<_, i64>("location_id"), item.get::<_, i32>("flag_id")), (station, crate::consts::FLAG_HANGAR));
+        assert_eq!((item.get::<_, i64>("location_id"), item.get::<_, i32>("flag_id")), (station, infinity_core::consts::FLAG_HANGAR));
         let (notice, args) = peer_rx.try_recv()?;
         assert_eq!(notice, "OnCharNowInStation");
         assert_eq!(args, vec![crate::services::presence::guest_record(&current)]);

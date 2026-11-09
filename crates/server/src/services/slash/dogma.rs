@@ -4,10 +4,12 @@
 //! Owned drone queries evaluate the owner's fit and live incoming projections.
 //! Hull and fitted-module overrides reconcile online resources atomically.
 //! Charges, characters, structures, NPCs and stacked items are not supported.
+//! Live overrides publish fitted defenses without replacing actor-owned condition.
 use super::{slash_error, Client, CallError};
-use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
-use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER, CATEGORY_STARBASE, CATEGORY_STRUCTURE};
-use crate::consts::dogma::{CHAR_ATTRIBUTES, ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY};
+use infinity_core::messages;
+use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}};
+use infinity_core::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER, CATEGORY_STARBASE, CATEGORY_STRUCTURE};
+use infinity_core::consts::dogma::{CHAR_ATTRIBUTES, ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY};
 use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
 use crate::db::outbox::Outbox;
 use crate::services::effects::online::{self, OnlineChanged};
@@ -153,7 +155,7 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
         drone_key
     } else if Some(id) == ship { Some(Key::Ship) } else if modules.iter().any(|m| m.item_id == id) { Some(Key::Module(id)) } else { None };
     if key.is_none() && item.category_id != i64::from(CATEGORY_DRONE) {
-        let candidate = if item.category_id == i64::from(crate::consts::CATEGORY_SHIP) { id }
+        let candidate = if item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP) { id }
             else if item.category_id == i64::from(CATEGORY_MODULE) { item.location_id } else { 0 };
         let hull = if candidate == id { Some(item.clone()) } else {
             load_items(&c.db, &c.sde, ItemQuery::Id(candidate)).await.map_err(db_err)?.into_iter().next()
@@ -179,10 +181,10 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
         }
     }
     let cascade_ship = if matches!(action, Action::Query(_)) { None }
-        else if item.category_id == i64::from(crate::consts::CATEGORY_SHIP) { Some(id) }
+        else if item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP) { Some(id) }
         else if item.category_id == i64::from(CATEGORY_MODULE) && crate::services::inventory::is_fitting_flag(item.flag_id) {
             let hull = load_items(&c.db, &c.sde, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next();
-            hull.filter(|h| h.owner_id == item.owner_id && h.category_id == i64::from(crate::consts::CATEGORY_SHIP) && h.singleton).map(|h| h.item_id)
+            hull.filter(|h| h.owner_id == item.owner_id && h.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP) && h.singleton).map(|h| h.item_id)
         } else { None };
     let rows = dao::overrides(&c.db, id).await.map_err(db_err)?;
     let old_override = rows.iter().find(|r| r.attribute_id == attr).map(|r| r.value);
@@ -208,14 +210,33 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     } else { None };
     let old_base = old_fit.as_ref().zip(key).map(|(fit, key)| fit.base(key, attr)).unwrap_or(old_override.unwrap_or(fallback));
     let old_effective = old_fit.as_ref().zip(key).map(|(fit, key)| fit.value(key, attr));
+    let cache_token = if !matches!(action, Action::Query(_)) {
+        if let (Some(system), Some(ship)) = (fit_system, fit_ship) {
+            c.world.with(system, move |s| {
+                Some((s.combat_membership_generation(ship)?, s.combat_fit_revision(ship)?))
+            }).await.flatten()
+        } else { None }
+    } else { None };
+    let drone_token = if !matches!(action, Action::Query(_)) {
+        if let Some(system) = drone_location(&item) {
+            let owner = item.owner_id;
+            c.world.with(system, move |s| {
+                let drone = s.drone(id)?;
+                if drone.owner != owner || owner == infinity_core::consts::OWNER_UNOWNED { return None; }
+                Some((system, owner, drone.generation, s.combat_membership_generation(id)?, s.combat_fit_revision(id)?))
+            }).await.flatten()
+        } else { None }
+    } else { None };
     if !matches!(action, Action::Query(_)) {
         let db = c.db.clone();
         let sde = c.sde.clone();
         let owner = item.owner_id;
+        let fences = online::capture_online_fences(&c.world, &[owner]).await;
         let value = if let Action::Set(_, value) = action { Some(value) } else { None };
         let client = &*c;
         db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
+            let fences = fences.clone();
             Box::pin(async move {
                 if let Some(hull) = cascade_ship {
                     if !crate::dao::items::ship::lock_reload_ship(tx, hull).await.map_err(db_err)? {
@@ -234,10 +255,58 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
                 } else {
                     dao::clear_override(tx, id, attr).await.map_err(db_err)?;
                 }
-                if let Some(hull) = cascade_ship { online::reconcile_core(tx, &sde, outbox, owner, hull).await?; }
+                if let Some(hull) = cascade_ship {
+                    let before = online::fitting::capture(tx, &sde, &fences, owner, hull).await?;
+                    let fit = online::reconcile_core(tx, &sde, outbox, &fences, owner, hull).await?;
+                    online::fitting::finish(tx, before, fit, outbox).await?;
+                }
                 Ok(())
             })
         }, |(), outbox| async move { online::dispatch_changed((), outbox, client) }).await?;
+        if key.is_none() {
+            if let Some((hull, (system, generation))) = cascade_ship.and_then(|hull| fences.membership(hull).map(|fence| (hull, fence))) {
+                c.world.post(system, move |s| {
+                    if s.combat_membership_generation(hull) == Some(generation) { s.refresh_projection_target(hull); }
+                });
+            }
+        }
+    }
+    let cache_token = if key.is_some() && cascade_ship == fit_ship {
+        if let (Some(system), Some(ship), Some((generation, _))) = (fit_system, fit_ship, cache_token) {
+            c.world.with(system, move |s| {
+                if s.combat_membership_generation(ship) != Some(generation)
+                    || s.combat_phase(ship) != Some(crate::space::combat::CombatPhase::Live)
+                    || s.pilot_ball(fit_pilot).is_none_or(|ball| ball.id != ship || ball.char_id != Some(fit_pilot)) {
+                    return None;
+                }
+                Some((generation, s.combat_fit_revision(ship)?))
+            }).await.flatten()
+        } else { None }
+    } else { cache_token };
+    if let Some((system, owner, drone_generation, generation, fit_revision)) = drone_token {
+        let ship = crate::dao::characters::selection::ship_id(&c.db, owner).await.map_err(db_err)?;
+        if let Some(ship) = ship {
+            let snapshot = c.world.with(system, move |s| {
+                (s.projections_on(ship), s.projection_revision(ship), s.projections_on(id), s.projection_revision(id),
+                    s.combat_membership_generation(ship), s.combat_fit_revision(ship))
+            }).await;
+            if let Some((ship_projections, ship_revision, drone_projections, revision, ship_generation, ship_fit_revision)) = snapshot {
+                let fit = Fit::load_drone(&c.db, c.sde.clone(), owner, ship, id, ship_projections, drone_projections).await?;
+                let selected = crate::dao::characters::selection::ship_id(&c.db, owner).await.map_err(db_err)?;
+                c.world.post(system, move |s| {
+                    if !s.drone(id).is_some_and(|drone| drone.owner == owner && drone.generation == drone_generation) { return; }
+                    if selected != Some(ship) || ship_revision != s.projection_revision(ship)
+                        || ship_generation != s.combat_membership_generation(ship) || ship_fit_revision != s.combat_fit_revision(ship) {
+                        s.refresh_projection_target(id);
+                        return;
+                    }
+                    if !s.replace_fitted_cache(id, generation, fit_revision, fit, Key::Drone(id), Some(revision))
+                        && s.combat_membership_generation(id) == Some(generation) && s.combat_phase(id) == Some(crate::space::combat::CombatPhase::Live) {
+                        s.refresh_projection_target(id);
+                    }
+                });
+            }
+        }
     }
     let changed = !matches!(action, Action::Query(_));
     let new_fit = if changed && key.is_some() {
@@ -265,14 +334,24 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
             }
             let entry = notify::attribute_change(fit_pilot, Value::Int(id), attr, Value::Float(new.value(key, attr)), Value::Float(old.value(key, attr)));
             c.world.notify_pilot(fit_pilot, "OnModuleAttributeChanges", vec![Value::list([entry])]);
-            if fit_pilot == char_id && key == Key::Ship && new.type_has_attribute(key, attr) { crate::services::dogma::brain::update(c).await?; }
+            if fit_pilot == char_id && key == Key::Ship && new.type_has_attribute(key, attr) { crate::services::dogma::brain::update_from_fit(c, new, char_id, fit_ship.unwrap()); }
+        }
+    }
+    if let (Some(system), Some(ship), Some((generation, fit_revision)), Some(fit)) = (fit_system, fit_ship, cache_token, new_fit) {
+        if let Some(revision) = fit.projection_revision() {
+            c.world.post(system, move |s| {
+                if !s.replace_fitted_cache(ship, generation, fit_revision, fit, Key::Ship, Some(revision))
+                    && s.combat_membership_generation(ship) == Some(generation) && s.combat_phase(ship) == Some(crate::space::combat::CombatPhase::Live) {
+                    s.refresh_projection_target(ship);
+                }
+            });
         }
     }
     let overridden = match action { Action::Set(..) => true, Action::Reset(_) => false, _ => old_override.is_some() };
     let mut result = messages::gm::gm_dogma_result(id, attr_name, attr, old_base, new_base, old_effective.zip(new_effective), overridden);
     if key.is_none() { result.push_str("\n"); result.push_str(messages::gm::GM_DOGMA_BASE_ONLY); }
-    let hull_foreign = item.category_id == i64::from(crate::consts::CATEGORY_SHIP)
-        && attr != crate::consts::dogma::ATTR_CAPACITY
+    let hull_foreign = item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP)
+        && attr != infinity_core::consts::dogma::ATTR_CAPACITY
         && c.sde.types.get(item.type_id).is_none_or(|data| data.attribute(attr).is_none());
     if item.category_id == i64::from(CATEGORY_MODULE) || hull_foreign {
         result.push_str("\n"); result.push_str(messages::gm::GM_DOGMA_VISIBILITY);

@@ -1,5 +1,7 @@
 use super::*;
 
+mod fitting;
+
 #[test]
 fn resolved_kinematic_overrides_follow_ball_validation() {
     for attr in [ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY] {
@@ -72,7 +74,7 @@ fn late_gm_snapshot_requests_refresh_without_overwriting_newer_projection() {
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
         old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
-        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     });
     let old = system.projection_revision(1);
@@ -136,7 +138,7 @@ async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
             max_vel: 1.0, agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3],
             old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3],
             follow_id: 0, follow_range: 0.0, free: false, global: false, massive: false, interactive: false,
-            warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+            warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
             effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() };
         w.add_ship(1, ball).await.unwrap();
         assert!(w.after(1, 1200).await);
@@ -167,7 +169,7 @@ async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
     }).await;
     world.unobserve(character);
     world.remove_ball(1, ship).await;
-    world.unregister_pilot(character);
+    world.unregister_pilot_generation(character, None);
     let flush = world.flush_positions().await;
     crate::services::combat::forget_ship(ship);
     db.execute("DELETE FROM game.item_attributes WHERE item_id = $1", &[&ship]).await.unwrap();

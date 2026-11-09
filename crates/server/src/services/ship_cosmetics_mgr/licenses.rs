@@ -6,7 +6,8 @@
 //! Structure and single-use license activation are unsupported.
 use std::collections::{BTreeMap, BTreeSet};
 use marshal::Value;
-use crate::{consts::IX_STACK_SIZE, dao::{items::{loading::ItemQuery, quantities::{self, QuantityChange}}, ship_skins, trades}, db::{executor::Executor, outbox::Outbox}, messages::{self, ship_skins as text}, sde::Sde, services::{db_err, identity::Identity, inventory::{self, reachability::{Endpoint, Reachability}}, items::load_items, notify_error, user_error, CallError}};
+use infinity_core::{consts::IX_STACK_SIZE, messages::{self, ship_skins as text}};
+use crate::{dao::{items::{loading::ItemQuery, quantities::{self, QuantityChange}}, ship_skins, trades}, db::{executor::Executor, outbox::Outbox}, sde::Sde, services::{db_err, identity::Identity, inventory::{self, reachability::{Endpoint, Reachability}}, items::load_items, notify_error, user_error, CallError}};
 
 pub(super) async fn grant_tx(ex: &(impl Executor + ?Sized), sde: &Sde, region: &str, character: i64, skin: i32, duration: Option<i64>, now: i64) -> Result<(), CallError> {
     if !sde.ship_skins.skin(skin).is_some_and(|s| !s.is_structure_skin && s.visible(region)) {
@@ -17,7 +18,7 @@ pub(super) async fn grant_tx(ex: &(impl Executor + ?Sized), sde: &Sde, region: &
     let expires = match duration {
         None => None,
         Some(days) => {
-            let ticks = days.checked_mul(crate::consts::FILETIME_DAY).filter(|_| days > 0).ok_or_else(|| notify_error(text::INVALID_ARGUMENT))?;
+            let ticks = days.checked_mul(infinity_core::consts::FILETIME_DAY).filter(|_| days > 0).ok_or_else(|| notify_error(text::INVALID_ARGUMENT))?;
             let base = stored.as_ref().and_then(|row| row.expires_at).unwrap_or(now).max(now);
             let expiry = base.checked_add(ticks).ok_or_else(|| notify_error(text::INVALID_ARGUMENT))?;
             expiry.checked_add(1).ok_or_else(|| notify_error(text::INVALID_ARGUMENT))?;

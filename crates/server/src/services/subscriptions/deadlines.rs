@@ -32,27 +32,33 @@ pub(crate) fn handle(db: Db, world: Arc<World>, job: Job) -> Pin<Box<dyn Future<
         let payload: Payload = serde_json::from_str(&job.payload)?;
         if job.kind != KIND || job.id != id(payload.user) { return Ok(()); }
         let now = filetime_now();
-        let result: Result<(), CallError> = db.transaction(
+        let result: Result<bool, CallError> = db.transaction(
             |tx, outbox: &mut Outbox| {
                 let payload = payload;
                 Box::pin(async move {
                     let row = dao::lock(tx, payload.user).await?;
-                    if row.revision != payload.revision || row.grade != rules::OMEGA || row.omega_until.is_none() || row.grace_until != Some(payload.deadline) { return Ok(()); }
+                    if row.revision != payload.revision || row.grade != rules::OMEGA || row.omega_until.is_none() || row.grace_until != Some(payload.deadline) { return Ok(false); }
                     if now < payload.deadline {
                         schedule(tx, &row).await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                     if !dao::set_grade(tx, row.user_id, rules::ALPHA, None, None, row.revision).await? {
                         return Err(CallError::Internal(anyhow::anyhow!("clone-grade expiry revision conflict or overflow")));
                     }
                     dao::audit(tx, row.user_id, None, &row, rules::ALPHA, None, None, "expiry").await?;
                     management::notify(outbox, row.user_id, rules::ALPHA, 0, true, true);
-                    Ok(())
+                    Ok(true)
                 })
             },
             |value, outbox| { let world = Arc::clone(&world); async move { let result = dispatch_world(value, outbox, &world); scheduler::wake(); result } },
         ).await;
-        result.map_err(|error| anyhow::anyhow!("clone-grade expiry failed: {error:?}"))
+        let changed = result.map_err(|error| anyhow::anyhow!("clone-grade expiry failed: {error:?}"))?;
+        if changed {
+            if let Err(error) = crate::services::daily_goals::qualification::changed(&world, payload.user, now).await {
+                tracing::warn!(user = payload.user, ?error, "daily qualification refresh after grade expiry failed");
+            }
+        }
+        Ok(())
     })
 }
 

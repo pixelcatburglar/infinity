@@ -2,7 +2,8 @@
 //! Eligibility mirrors `omega/client/clone_grade_svc.py` using authority rows in
 //! `game.account_clone_grades`. Subscription commerce and full Alpha skill and
 //! ship restrictions are outside these rules.
-use crate::{client::unix_ns_from_filetime, consts::{FAR_FUTURE, FILETIME_SECOND}, dao::accounts::subscriptions as dao, db::executor::Executor, messages, services::{notify_error, CallError}};
+use infinity_core::{consts::{FAR_FUTURE, FILETIME_SECOND}, messages};
+use crate::{client::unix_ns_from_filetime, dao::accounts::subscriptions as dao, db::executor::Executor, services::{notify_error, CallError}};
 
 /// `clonegrade/const.py`: client Alpha clone grade.
 pub(crate) const ALPHA: i16 = 0;

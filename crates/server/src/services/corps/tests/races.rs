@@ -1,6 +1,7 @@
 //! Cross-connection governance serialization and durable vote recovery.
 use super::fixtures;
-use crate::{consts::{ACCOUNT_CASH, FILETIME_DAY}, dao::{corporations::{shares, votes as dao}, jobs}, db::{Db, outbox::Outbox}, services::corps::{dividends, shares as service_shares, vote_close, votes}};
+use infinity_core::{consts::{ACCOUNT_CASH, FILETIME_DAY}};
+use crate::{dao::{corporations::{shares, votes as dao}, jobs}, db::{Db, outbox::Outbox}, services::corps::{dividends, shares as service_shares, vote_close, votes}};
 use std::{sync::Arc, time::Duration};
 use tokio_postgres::{Client, Transaction};
 
@@ -106,14 +107,15 @@ async fn waiting_operations_recheck_authority_after_issuer_lock() {
     let (pid, op) = recv.await.unwrap();
     blocked(&tx, pid).await;
     tx.execute("UPDATE game.corporations SET ceo_id=$2 WHERE corporation_id=$1", &[&issuer, &replacement]).await.unwrap();
-    tx.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&issuer, &replacement]).await.unwrap();
+    tx.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$3 WHERE character_id=$2", &[&issuer, &replacement, &infinity_core::consts::ROLE_DIRECTOR]).await.unwrap();
     tx.commit().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
-    let row = first.query_one("SELECT (SELECT count(*) FROM game.corp_dividends WHERE operation_id=$1) AS receipts, (SELECT balance::float8 FROM game.corp_wallets WHERE corporation_id=$2 AND account_key=$3) AS balance", &[&op, &issuer, &ACCOUNT_CASH]).await.unwrap();
+    let row = first.query_one("SELECT (SELECT count(*) FROM game.corp_dividends WHERE operation_id=$1) AS receipts, (SELECT balance::text FROM game.corp_wallets WHERE corporation_id=$2 AND account_key=$3) AS balance", &[&op, &issuer, &ACCOUNT_CASH]).await.unwrap();
     assert_eq!(row.get::<_, i64>("receipts"), 0);
-    assert_eq!(row.get::<_, f64>("balance"), 100.0);
+    assert_eq!(crate::isk::IskAmount::parse_decimal(&row.get::<_, String>("balance")).unwrap(), crate::isk::IskAmount::from_cents(10_000).unwrap());
     let mut second = fixtures::connect().await;
     let tx = first.transaction().await.unwrap();
+    assert!(crate::services::corps::permissions::is_active_ceo(&tx, replacement, issuer).await.unwrap());
     assert!(shares::lock_issuer(&tx, issuer).await.unwrap());
     let (send, recv) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {

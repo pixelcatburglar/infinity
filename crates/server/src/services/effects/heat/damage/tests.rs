@@ -36,7 +36,7 @@ fn published_chance_includes_offline_slot_distance() {
 
 #[test]
 fn burnout_reduces_later_chances_and_burnt_source_still_deals_owed_damage() {
-    use crate::consts::FLAG_FITTING_FIRST;
+    use infinity_core::consts::FLAG_FITTING_FIRST;
     use std::sync::atomic::AtomicBool;
 
     let flag = FLAG_FITTING_FIRST;

@@ -2,11 +2,13 @@
 //! recruitment_crate_controller.py. Definitions come from the startup SDE
 //! catalogue; item access uses game.items and inventory reachability. Opening,
 //! reward selection and inventory changes are not supported.
+//! Wire preview quantities are projected to the client display limit;
+//! catalogue definitions stay exact.
 
 use crate::client::Client;
-use crate::consts::FLAG_CORP_DELIVERIES;
+use infinity_core::consts::FLAG_CORP_DELIVERIES;
 use crate::dao::{items::loading::ItemQuery, skills::training};
-use crate::messages::crates as messages;
+use infinity_core::messages::crates as messages;
 use crate::services::{db_err, notify_error, CallError, CallResult};
 use crate::services::identity::Identity;
 use crate::services::inventory::access::{corporate_custody, may_view_corp_hangar};
@@ -28,7 +30,7 @@ pub(super) async fn directory(c: &Client, type_id: i32, custom: bool, identity: 
     let entries = definition.preview(custom, race_id)
         .map_err(|_| notify_error(messages::METADATA_UNAVAILABLE))?;
     Ok(Value::list(entries.into_iter().map(|(kind, quantity)| {
-        Value::tuple([Value::Int(i64::from(kind)), Value::Int(quantity), Value::None])
+        Value::tuple([Value::Int(i64::from(kind)), Value::Int(crate::services::dogma::info::cap_client_quantity(quantity)), Value::None])
     })))
 }
 
@@ -39,9 +41,10 @@ pub(super) async fn instance(c: &Client, item_id: i64, custom: bool) -> CallResu
     let item = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?
         .into_iter().next().ok_or_else(invalid)?;
     if let Some((corp, location, flag)) = corporate_custody(&c.db, Some(&c.sde), item.item_id).await? {
+        let station = crate::services::inventory::access::custody_station(&c.db, location, flag).await?.ok_or_else(invalid)?;
         if corp != identity.corp_id || (item.owner_id != corp && item.owner_id != identity.char_id)
             || (flag == FLAG_CORP_DELIVERIES && identity.station_id != Some(location))
-            || !may_view_corp_hangar(&c.db, identity.char_id, corp, flag).await? {
+            || !may_view_corp_hangar(&c.db, identity.char_id, corp, station, flag).await? {
             return Err(invalid());
         }
     } else if item.owner_id != identity.char_id {

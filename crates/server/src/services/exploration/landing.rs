@@ -1,5 +1,6 @@
 //! Actual-exit site spawning for beyonce scan warps. Site state and persistence
-//! are described in the parent module; pending arrivals are transient.
+//! are described in the parent module; pending arrivals are transient. Mining
+//! reservations remain retryable until the site and its committed rocks are saved.
 
 use super::*;
 
@@ -28,10 +29,16 @@ pub(super) async fn arrive(db: &Db, world: &Arc<World>, user: i64, system: i64, 
             let info = system_info(world.sde(), system)?;
             let jspace = (1..=6).contains(&info.class);
             let rocks = super::super::mining::grow_field(db, world, system, site.id, site.pos, field, info.security, jspace).await?;
-            if let Some(s) = state().sites.get_mut(&site.id) {
+            let snapshot = state().sites.get(&site.id).cloned().map(|mut s| {
                 s.containers = Some(rocks.clone());
+                s
+            });
+            if let Some(s) = snapshot {
+                save_site(db, &s).await?;
+                if let Some(s) = state().sites.get_mut(&site.id).filter(|s| s.system == system) {
+                    s.containers = Some(rocks.clone());
+                }
             }
-            persist(db, site.id).await?;
             track_site_clearance(db.clone(), world.clone(), site.id, system, rocks);
             Ok(())
         }.await

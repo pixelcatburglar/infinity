@@ -34,7 +34,7 @@
 //! Shared vector distances are defined here for simulation and service callers.
 //! Shared special effects follow fxSequencer.OnSpecialFX's 14-field protocol.
 
-use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
+use infinity_core::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
 use crate::db::Db;
 use crate::sde::Sde;
 use anyhow::Result;
@@ -45,14 +45,18 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 mod actor;
+pub(crate) mod asteroids;
 pub(crate) mod ship_cosmetics;
 pub(crate) mod system;
 mod projections;
 mod npc;
 pub(crate) mod drone;
-mod targeting;
+pub(crate) mod combat;
+pub(crate) mod sovereignty;
+pub(crate) mod combat_facts;
+pub(crate) mod targeting;
 mod warpin;
-mod snapshot;
+pub(crate) mod snapshot;
 mod persistent_ships;
 mod stop;
 mod goto;
@@ -200,7 +204,6 @@ pub struct Ball {
     /// Destiny isInteractive, independent of movement; Partitionable.cpp AddBall and Thunkers WriteBallToStream.
     pub interactive: bool,
     pub warp: WarpState,
-    pub warp_factor: i64,
     /// Last integration time in logical destiny milliseconds.
     pub last_ms: i64,
     /// Wall-clock segment anchor, separate from logical `last_ms`; native Ball.h
@@ -376,7 +379,7 @@ pub(crate) fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Optio
 #[derive(Default)]
 pub struct Pilots {
     capacity: usize,
-    notify: Mutex<HashMap<i64, (NotifyTx, Option<crate::session::OnlineSession>)>>,
+    notify: Mutex<HashMap<i64, (NotifyTx, Option<infinity_core::session::OnlineSession>)>>,
     queues: Mutex<HashMap<i64, JumpQueue>>,
 }
 impl Pilots {
@@ -384,7 +387,7 @@ impl Pilots {
         self.notify.lock().unwrap().insert(char_id, (tx, None));
     }
 
-    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<crate::session::OnlineSession>) {
+    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<infinity_core::session::OnlineSession>) {
         let mut notify = self.notify.lock().unwrap();
         let Some(entry) = notify.get_mut(&char_id) else { return };
         if let (Some(live), Some(next)) = (entry.1.as_ref(), session.as_ref()) {
@@ -395,31 +398,50 @@ impl Pilots {
         entry.1 = session;
     }
 
-    pub(crate) fn online_session(&self, char_id: i64) -> Option<crate::session::OnlineSession> {
+    pub(crate) fn online_session(&self, char_id: i64) -> Option<infinity_core::session::OnlineSession> {
         self.notify.lock().unwrap().get(&char_id).filter(|(tx, _)| !tx.is_closed()).and_then(|(_, session)| session.clone()).filter(|s| s.character_id == char_id)
     }
 
-    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::OnlineSession> {
+    pub(crate) fn replace_online_session(&self, character: i64, expected: Option<&infinity_core::session::OnlineSession>, next: Option<infinity_core::session::OnlineSession>) -> bool {
+        let mut notify = self.notify.lock().unwrap();
+        match notify.get_mut(&character) {
+            Some((tx, session)) if !tx.is_closed() => {
+                if expected.is_none() || session.as_ref() != expected { return false; }
+                if next.as_ref().is_some_and(|s| s.character_id != character || Some(s.session_id) != expected.map(|e| e.session_id)) { return false; }
+                *session = next;
+                true
+            }
+            _ => expected.is_none() && next.is_none(),
+        }
+    }
+
+    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<infinity_core::session::OnlineSession> {
         self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, session))| {
             session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id && s.station_id == Some(station_id)).cloned()
         }).collect()
     }
 
-    pub fn unregister_pilot(&self, char_id: i64) {
-        self.unregister_pilot_generation(char_id, None);
+    /// Live session snapshot of every online pilot, cloned under the one notify lock. The
+    /// result is instantaneous: a session may change or disconnect before the caller uses it.
+    /// No ordering is imposed; callers sort outside the lock.
+    pub(crate) fn online_sessions(&self) -> Vec<infinity_core::session::OnlineSession> {
+        self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, session))| {
+            session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id).cloned()
+        }).collect()
     }
 
-    pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: Option<i64>) {
+    pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: Option<i64>) -> bool {
         let mut notify = self.notify.lock().unwrap();
-        let Some((_, session)) = notify.get(&char_id) else { return };
+        let Some((_, session)) = notify.get(&char_id) else { return false };
         if let Some(sid) = session_id {
-            if session.as_ref().is_none_or(|live| live.session_id != sid) { return; }
+            if session.as_ref().is_none_or(|live| live.session_id != sid) { return false; }
         }
         notify.remove(&char_id);
         drop(notify);
         for q in self.queues.lock().unwrap().values_mut() {
             q.waiting.retain(|c| *c != char_id);
         }
+        true
     }
 
     pub fn is_online(&self, char_id: i64) -> bool {
@@ -506,30 +528,37 @@ impl Pilots {
 pub struct World {
     db: Db,
     sde: Arc<Sde>,
+    progress_registry: Arc<crate::progress::Registry>,
     systems: Arc<Mutex<HashMap<i64, SystemHandle>>>,
     observers: Mutex<HashMap<i64, i64>>,
     pilots: Arc<Pilots>,
     weak: std::sync::Weak<World>,
     notice_hub: crate::gateway::notices::NoticeHub,
+    sovereignty_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 impl World {
     pub fn new(db: Db, sde: Arc<Sde>, capacity: usize) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self { db, sde, systems: Default::default(),
+        let progress_registry = db.progress_registry.clone();
+        Arc::new_cyclic(|weak| Self { db, sde, progress_registry, systems: Default::default(),
             observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }),
-            weak: weak.clone(), notice_hub: crate::gateway::notices::NoticeHub::new() })
+            weak: weak.clone(), notice_hub: crate::gateway::notices::NoticeHub::new(), sovereignty_ready: Default::default() })
     }
     pub(crate) fn notice_hub(&self) -> crate::gateway::notices::NoticeHub { self.notice_hub.clone() }
+    pub(crate) fn progress_registry(&self) -> &crate::progress::Registry { &self.progress_registry }
+    pub(crate) fn shared(&self) -> Option<Arc<Self>> { self.weak.upgrade() }
     pub fn sde(&self) -> &Arc<Sde> { &self.sde }
+    pub(crate) fn db(&self) -> &Db { &self.db }
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
-    pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: i64) {
-        self.pilots.unregister_pilot_generation(char_id, Some(session_id));
+    pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: Option<i64>) -> bool {
+        self.pilots.unregister_pilot_generation(char_id, session_id)
     }
-    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<crate::session::OnlineSession>) {
+    pub(crate) fn set_online_session(&self, char_id: i64, session: Option<infinity_core::session::OnlineSession>) {
         self.pilots.set_online_session(char_id, session);
     }
-    pub(crate) fn online_session(&self, char_id: i64) -> Option<crate::session::OnlineSession> { self.pilots.online_session(char_id) }
-    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<crate::session::OnlineSession> { self.pilots.station_guests(station_id) }
-    pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
+    pub(crate) fn online_session(&self, char_id: i64) -> Option<infinity_core::session::OnlineSession> { self.pilots.online_session(char_id) }
+    pub(crate) fn replace_online_session(&self, character: i64, expected: Option<&infinity_core::session::OnlineSession>, next: Option<infinity_core::session::OnlineSession>) -> bool { self.pilots.replace_online_session(character, expected, next) }
+    pub(crate) fn station_guests(&self, station_id: i64) -> Vec<infinity_core::session::OnlineSession> { self.pilots.station_guests(station_id) }
+    pub(crate) fn online_sessions(&self) -> Vec<infinity_core::session::OnlineSession> { self.pilots.online_sessions() }
     pub fn is_online(&self, char_id: i64) -> bool { self.pilots.is_online(char_id) }
     pub fn online_pilots(&self) -> Vec<i64> { self.pilots.online_pilots() }
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) { self.pilots.notify_pilot(char_id, name, args); }
@@ -537,17 +566,42 @@ impl World {
     /// Construction is serialized with the live-handle check.
     pub async fn system(&self, system_id: i64) -> Result<()> {
         if self.running(system_id).is_some() { return Ok(()); }
+        let market = crate::services::market::lock().await;
+        self.system_locked(system_id, &market).await
+    }
+
+    /// Load a system while the caller holds the existing market guard.
+    pub(crate) async fn system_locked(&self, system_id: i64, _market: &tokio::sync::MutexGuard<'static, ()>) -> Result<()> {
+        if self.running(system_id).is_some() { return Ok(()); }
         let restored = crate::services::drones::inventory::restore_specs(&self.db, self.sde.clone(), system_id).await
             .map_err(|error| match error {
                 crate::services::CallError::Internal(error) => error,
                 crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
             })?;
         let persistent_ships = self.restore_persistent_ships(system_id).await?;
+        let (sovereignty, policies) = sovereignty::cold(self, system_id).await?;
+        let inputs = Arc::new(asteroids::cold_inputs(&self.sde, system_id).map_err(|error| match error {
+            crate::services::CallError::Internal(error) => error,
+            crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+        })?);
+        let now = crate::client::filetime_now();
+        let asteroid_batch = self.db.transaction::<_, _, crate::services::CallError, crate::db::outbox::Outbox<()>, _, _, _>(
+            |tx, _| {
+                let inputs = inputs.clone();
+                let sde = self.sde.clone();
+                Box::pin(async move { asteroids::prepare(tx, &sde, system_id, now, &inputs).await })
+            },
+            |batch, _| async move { Ok(batch) },
+        ).await.map_err(|error| match error {
+            crate::services::CallError::Internal(error) => error,
+            crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+        })?;
         let mut systems = self.systems.lock().unwrap();
         if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
         if systems.contains_key(&system_id) { return Ok(()); }
         let tick = now_ms();
         let mut system = System::new(system_id, self.pilots.clone(), tick);
+        system.progress_registry = self.progress_registry.clone();
         system.world = self.weak.clone();
         system.projection_sde = Some(self.sde.clone());
         for r in self.sde.map.celestials(system_id) {
@@ -606,7 +660,6 @@ impl World {
                     massive: true,
                     interactive: false,
                     warp: WarpState::default(),
-                    warp_factor: 0,
                     last_ms: tick,
                     interpolation_anchor_ms: tick,
                     effect_stamp: 0,
@@ -618,12 +671,14 @@ impl World {
                 },
             );
         }
+        sovereignty::initialize(&mut system, sovereignty, policies, self.sovereignty_ready.clone())?;
         let effects = crate::services::drones::worker::effects(self.db.clone(), self.weak.clone(), system_id);
-        for (ball, spec) in restored { system.restore_drone(ball, spec, effects.clone()); }
+        for prepared in restored { system.restore_drone(prepared, effects.clone()); }
         for ship in persistent_ships {
-            if !system.contains(ship.ball.id) { system.add_persistent_ship(ship.install()); }
+            if !system.contains(ship.ball.id) { ship.install(&mut system, |s, ball| s.add_persistent_ship(ball)); }
         }
         info!("loaded solar system {system_id} with {} celestials", system.balls().count());
+        system.install_cold_asteroids(asteroid_batch);
 
         let handle = actor::start(system, system_id, Arc::downgrade(&self.systems), self.db.clone());
         systems.insert(system_id, handle);
@@ -670,11 +725,13 @@ impl World {
     pub async fn after(&self, system: i64, delay_ms: u64) -> bool {
         actor::after(self.running(system), delay_ms).await
     }
-    pub async fn ball(&self, system: i64, id: i64) -> Option<Ball> {
-        self.with(system, move |s| s.ball(id).cloned()).await.flatten()
-    }
     pub async fn add_ship(&self, system: i64, ball: Ball) -> Result<()> {
         self.system(system).await?;
+        self.with(system, move |s| s.add_ship(ball)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+    }
+    pub(crate) async fn add_ship_locked(&self, system: i64, ball: Ball,
+        market: &tokio::sync::MutexGuard<'static, ()>) -> Result<()> {
+        self.system_locked(system, market).await?;
         self.with(system, move |s| s.add_ship(ball)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
     }
     pub async fn remove_ball(&self, system: i64, id: i64) -> Option<Ball> {
@@ -683,20 +740,11 @@ impl World {
     pub async fn destroy_ball(&self, system: i64, id: i64) -> Option<Ball> {
         self.with(system, move |s| s.destroy_ball(id)).await.flatten()
     }
-    pub async fn uncloak(&self, system: i64, id: i64) -> bool {
-        self.with(system, move |s| s.drop_jump_cloak(id)).await.unwrap_or(false)
-    }
     pub async fn request_entry(&self, system: i64, pilot: i64) -> Result<(), i64> {
         self.with(system, move |s| s.request_entry(pilot)).await.unwrap_or(Err(1))
     }
-    pub fn set_health(&self, system: i64, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
-        self.post(system, move |s| s.set_health(id, health));
-    }
     pub fn broadcast(&self, system: i64, about: i64, factory: impl FnOnce(i64) -> Vec<Value> + Send + 'static) {
         self.post(system, move |s| s.broadcast(about, factory(s.current_time())));
-    }
-    pub fn command(&self, system: i64, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
-        self.post(system, move |s| s.command(ship, f));
     }
     pub async fn observe(&self, system: i64, client: i64, ego: i64, tx: DestinyTx) -> Result<Value> {
         self.system(system).await?;

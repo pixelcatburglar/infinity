@@ -2,7 +2,8 @@
 //! Type metadata comes from the loaded SDE; settlement and quantity mutations are caller concerns.
 //! Singleton items and stacks outside the owner's station hangar are not eligible.
 
-use crate::{consts::FLAG_HANGAR, db::{self, executor::Executor}, sde::Sde};
+use infinity_core::consts::FLAG_HANGAR;
+use crate::{db::{self, executor::Executor}, sde::Sde};
 use super::loading::Item;
 
 /// Return eligible stacks in item ID order for guarded changes via `quantities::apply`.

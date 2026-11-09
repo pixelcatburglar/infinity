@@ -3,7 +3,8 @@
 //! A concurrent mission reward between /setlp's read and adjustment can change
 //! the final balance; the adjustment itself is atomic and never makes it negative.
 use super::{slash_error, Client, CallError};
-use crate::{db::outbox::dispatch_world, messages, services::{corps, standings}};
+use infinity_core::messages;
+use crate::{db::outbox::dispatch_world, services::{corps, standings}};
 
 pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> Result<String, CallError> {
     let me = c.session.int("charid").ok_or_else(|| slash_error(messages::gm::GM_SOCIAL_USAGE.into()))?;
@@ -72,6 +73,9 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             }
             let amount = parsed.i64(1).map_err(|_| slash_error(messages::gm::GM_LP_CHANGE_USAGE.into()))?;
             let set_mode = command == "setlp";
+            let fact_ship = c.session.int("shipid").filter(|id| *id > 0);
+            let fact_system = c.session.int("solarsystemid2").filter(|id| *id > 0);
+            let fact_station = c.session.int("stationid").filter(|id| *id > 0);
             let world = &*c.world;
             let balance = c.db.transaction(
                 |tx, outbox| Box::pin(async move {
@@ -80,7 +84,11 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
                         .ok_or_else(|| slash_error(messages::gm::GM_LP_BALANCE_INVALID.into()))?;
                     before.checked_add(delta).filter(|v| *v >= 0)
                         .ok_or_else(|| slash_error(messages::gm::GM_LP_BALANCE_INVALID.into()))?;
-                    standings::add_lp(tx, outbox, me, corp, delta).await?;
+                    standings::add_lp(tx, outbox, me, corp, delta, standings::LoyaltyMutation {
+                        reason: crate::lua::events::resources::LoyaltyReason::GmAdjustment,
+                        occurred_at: crate::client::filetime_now(),
+                        context: crate::lua::events::resources::FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: fact_ship, ship_type_id: None, system_id: fact_system, station_id: fact_station, origin: crate::lua::events::resources::FactOrigin::Gm },
+                    }).await?;
                     standings::lp_balance(tx, me, corp).await
                 }),
                 |value, outbox| async move { dispatch_world(value, outbox, world) },

@@ -330,7 +330,7 @@ pub(super) async fn generate(db: &Db, sde: &Sde, system: i64, mut taken: HashSet
 
 /// Ore anomalies everywhere, ice fields in some of known space, gas clouds to scan for.
 pub(super) fn mining_sites(sde: &Sde, system: i64, info: &SystemInfo, taken: &mut HashSet<String>) -> Result<Vec<Site>, CallError> {
-    use crate::services::mining::Field;
+    use crate::space::asteroids::Field;
     let jspace = (1..=6).contains(&info.class);
     let mut out = vec![];
     for _ in 0..if info.class == 9 { 2 } else { 1 } {
@@ -374,8 +374,8 @@ fn hack_candidates<'a>(
 }
 
 /// An ore or ice anomaly, or a gas signature, named after one of the build's sites.
-pub(super) fn mining_site(sde: &Sde, system: i64, info: &SystemInfo, field: crate::services::mining::Field, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
-    use crate::services::mining::Field;
+pub(super) fn mining_site(sde: &Sde, system: i64, info: &SystemInfo, field: crate::space::asteroids::Field, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
+    use crate::space::asteroids::Field;
     let jspace = (1..=6).contains(&info.class);
     let (archetype, needle, suffix) = match field {
         Field::Ore => (ARCHETYPE_ORE, if jspace { "Perimeter" } else { "Deposit" }, false),
