@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 use crate::space::{Ball, WarpState, MODE_STOP};
 
 fn ball(id: i64, x: f64) -> Ball {

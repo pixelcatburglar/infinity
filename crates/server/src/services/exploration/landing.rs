@@ -39,7 +39,7 @@ pub(super) async fn arrive(db: &Db, world: &Arc<World>, user: i64, system: i64, 
                     s.containers = Some(rocks.clone());
                 }
             }
-            track_site_clearance(db.clone(), world.clone(), site.id, system, rocks);
+            track_site_clearance(db.clone(), world.clone(), site.id, system, rocks, None);
             Ok(())
         }.await
     } else if containers {
@@ -55,4 +55,4 @@ pub(super) async fn arrive(db: &Db, world: &Arc<World>, user: i64, system: i64, 
     result
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

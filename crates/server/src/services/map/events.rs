@@ -6,7 +6,9 @@
 //! gameplay occurrence IDs, killmail IDs and persistent ship IDs as sources.
 //! World/actor-to-database crash gaps can lose NPC deaths; this projection is
 //! not a second death lifecycle authority. Arrivals are recorded by ship movement.
-use crate::{dao::map_telemetry::{self as dao, EventKind, EventSource}, db::{Db, executor::Executor}, services::CallError};
+//! NPC death rows opt into a loss-tolerant commit because a crash may already drop
+//! the observation; player, pod and unpiloted losses keep the connection policy.
+use crate::{dao::map_telemetry::{self as dao, EventKind, EventSource}, db::{transaction::CommitMode, Db, executor::Executor}, services::CallError};
 use tracing::warn;
 
 
@@ -20,7 +22,7 @@ pub(crate) async fn npc_lost(db: &Db, system: i64, now: i64) {
         Ok(id) => id,
         Err(error) => { warn!(system, occurrence = "unavailable", %error, "map NPC sequence allocation failed"); return; }
     };
-    let result: Result<(), crate::db::Error> = db.transaction(|tx, _: &mut ()| Box::pin(async move {
+    let result: Result<(), crate::db::Error> = db.transaction_with_commit(CommitMode::LossTolerant, |tx, _: &mut ()| Box::pin(async move {
         dao::append(tx, EventSource::NpcOccurrence, occurrence, system, now, EventKind::Npc).await?;
         Ok(())
     }), |(), ()| async { Ok(()) }).await;

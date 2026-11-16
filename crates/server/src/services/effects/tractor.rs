@@ -3,13 +3,14 @@
 //! existence and positioning come from game.items. Loot-right restrictions are not
 //! modelled, matching the inventory service's existing access policy.
 //! Tractor beams follow to surface contact; the client supplies no stand-off distance.
-use super::{lifecycle::{Cycle, CycleOutcome, Module, subject_valid}, registry::{Effect, EffectAttribute, EffectFlag}, notify::fire_fx};
-use infinity_core::consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, CARGO_CONTAINER_GROUPS, GROUP_WRECK};
+//! Effect animations are published through the system's ordered scene channel.
+use super::{lifecycle::{cycle_subject_valid, source_subject_current, Cycle, CycleOutcome, Module}, parameters::MasterPacket, registry::{Effect, EffectAttribute, EffectFlag}};
+use infinity_core::consts::{dogma::ATTR_MAX_RANGE, CARGO_CONTAINER_GROUPS, GROUP_WRECK};
 use crate::dao::items::loading::ItemQuery;
 use infinity_core::messages;
-use crate::services::{combat::{Ctx, state, targeting_charges::targets_of}, fit::{Fit, Key}, items::load_items, user_error, db_err, CallError};
-use crate::space::{dist, System, MODE_WARP};
-use std::sync::Arc;
+use crate::services::{combat::{Ctx, targeting_charges::targets_of}, fit::{Fit, Key}, items::load_items, user_error, db_err, CallError};
+use crate::space::{dist, FxModule, System, MODE_WARP, system::presentation::{FxRetention, ModuleFx}};
+use marshal::Value;
 
 
 fn container_group(group: i64) -> bool {
@@ -28,7 +29,7 @@ async fn target_exists(cx: &Ctx, target: i64) -> Result<bool, CallError> {
     Ok(crate::dao::items::social::position(&cx.db, target).await.map_err(db_err)?.is_some_and(|p| p.location_id == cx.system_id))
 }
 
-fn range(fit: &Fit, module: &Module, effect: &Effect) -> f64 {
+pub(super) fn range(fit: &Fit, module: &Module, effect: &Effect) -> f64 {
     fit.value(Key::Module(module.id), effect.attribute(EffectAttribute::Range).unwrap_or(ATTR_MAX_RANGE))
 }
 
@@ -41,33 +42,51 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
     Ok(())
 }
 
-pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
-    if !subject_valid(cx, &cycle.modules[0], &cycle.effect).await? { return Ok(CycleOutcome::Stop("target lost")); }
-    if validate(cx, fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Ok(super::lifecycle::target_loss(cycle).await); }
-    let velocity = fit.value(Key::Module(cycle.modules[0].id), ATTR_MAX_TRACTOR_VELOCITY) as f32;
+pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+    if !cycle_subject_valid(cycle).await { return Ok(CycleOutcome::Stop("target lost")); }
+    let Some(MasterPacket::Tractor(inputs)) = cycle.inputs.frame.as_ref().map(|frame| &frame.packet) else {
+        return Err(CallError::Internal(anyhow::anyhow!("tractor cycle captured without tractor inputs")));
+    };
+    let (range, velocity) = (inputs.range, inputs.velocity);
+    let Some(target) = cycle.target.filter(|id| targets_of(cx.char_id).contains(id)) else {
+        return Ok(super::lifecycle::target_loss(cycle).await);
+    };
+    if !target_exists(cx, target).await? { return Ok(super::lifecycle::target_loss(cycle).await); }
+    let source = cx.ship_id;
+    if !cx.world.with(cx.system_id, move |s| in_range(s, source, target, range)).await.unwrap_or(false) {
+        return Ok(super::lifecycle::target_loss(cycle).await);
+    }
     if !velocity.is_finite() || velocity <= 0.0 { return Ok(CycleOutcome::Stop("invalid tractor velocity")); }
-    let (target, master, generation, source, character, range) = (cycle.target.unwrap(), cycle.modules[0].id, cycle.stop.clone(), cx.ship_id, cx.char_id, range(fit, &cycle.modules[0], &cycle.effect));
     if cycle.cycles == 0 {
+        let Some(membership) = cycle.source_membership else { return Ok(CycleOutcome::Stop("target lost")) };
+        let (master, generation, module, effect_id, character) =
+            (cycle.modules[0].id, cycle.stop.clone(), cycle.modules[0].clone(), cycle.effect.id, cx.char_id);
+        let modules = cycle.modules.clone();
+        let guid = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned);
+        let (duration, repeat, offensive) = (cycle.duration_ms, cycle.repeat, cycle.effect.has(EffectFlag::Offensive));
         let accepted = cx.world.with(cx.system_id, move |s| {
-            let active = state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &generation));
-            if !active || !targets_of(character).contains(&target) || !in_range(s, source, target, range) { return false; }
-            s.begin_tractor(target, master, generation, velocity, 0.0, source)
+            if !source_subject_current(s, source, character, membership, &module, effect_id, &generation)
+                || !targets_of(character).contains(&target) || !in_range(s, source, target, range) { return false; }
+            if !s.begin_tractor(target, master, generation.clone(), velocity, 0.0, source) { return false; }
+            if let Some(guid) = guid {
+                for m in &modules {
+                    s.publish_module_fx(master, &generation, ModuleFx {
+                        module: FxModule { item: Some(m.id), type_id: m.type_id },
+                        guid: guid.clone(), charge: None, offensive,
+                        duration_ms: duration, repeat, graphic_info: Value::None,
+                    }, true, FxRetention::Current);
+                }
+            }
+            true
         }).await.unwrap_or(false);
         if !accepted { return Ok(CycleOutcome::Stop("tractor unavailable")); }
-        if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) {
-            let (modules, duration, repeat, offensive) = (cycle.modules.clone(), cycle.duration_ms, cycle.repeat, cycle.effect.has(EffectFlag::Offensive));
-            cx.world.broadcast(cx.system_id, source, move |stamp| modules.iter().map(|m| fire_fx(stamp, source, Some((m.id, m.type_id)), &guid, Some(target), None, offensive, true, duration, repeat)).collect());
-        }
     }
     Ok(CycleOutcome::Continue)
 }
 
-pub(super) fn stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
+pub(super) fn stop(s: &mut System, _cx: &Ctx, cycle: &Cycle) {
     if let Some(target) = cycle.target { s.end_tractor(target, cycle.modules[0].id, &cycle.stop); }
-    if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()) {
-        let events = cycle.modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid, cycle.target, None, cycle.effect.has(EffectFlag::Offensive), false, cycle.duration_ms, cycle.repeat)).collect();
-        s.broadcast(cx.ship_id, events);
-    }
+    s.retire_fx_activation(cycle.modules[0].id, &cycle.stop);
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

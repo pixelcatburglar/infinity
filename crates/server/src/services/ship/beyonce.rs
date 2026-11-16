@@ -3,7 +3,9 @@
 //! Explicit stop and movement commands cancel an arrival jump cloak.
 //! Warp target visibility comes from the space actor, independently of client observers.
 //! Point and bookmark navigation and diagnostics use the current system actor;
-//! bookmark access is resolved by the bookmark service.
+//! bookmark access is resolved by the bookmark service. Fleet warp requests carry
+//! the client's `fleetFormationSettings` dictionary, which is forwarded to fleet
+//! authorization; single-pilot requests ignore it.
 //! `michelle.py` receives a refusal for tutorial site positions; tutorial instances
 //! are not modelled and that query uses no data or space state.
 use super::*;
@@ -16,7 +18,7 @@ fn wants_fleet(call: &Call<'_>) -> bool {
 
 async fn fleet_order(c: &Client, call: &Call<'_>) -> Result<Option<super::super::fleets::warp::Order>, CallError> {
     if wants_fleet(call) {
-        super::super::fleets::warp::authorize(c).await.map(Some)
+        super::super::fleets::warp::authorize(c, call.kwargs.get("fleetFormationSettings")).await.map(Some)
     } else {
         Ok(None)
     }
@@ -105,7 +107,7 @@ pub(crate) async fn warp_to_ball(
     if by_pilot {
         if let Some(order) = order.as_mut() { super::super::fleets::warp::target(order, target, id); }
     }
-    let on_exit: Option<Timer> = if !by_pilot {
+    let on_exit: Option<ArrivalCallback> = if !by_pilot {
         space_system.map(|system| {
             let db = db.clone();
             let world = std::sync::Arc::downgrade(world);
@@ -117,7 +119,7 @@ pub(crate) async fn warp_to_ball(
                         warn!(user, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
                     }
                 });
-            }) as Timer
+            }) as ArrivalCallback
         })
     } else { None };
     // Suns, planets, moons and belts land at their warp-in point, not off the surface.
@@ -204,7 +206,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let id = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
             let fleet = wants_fleet(call);
-            navigation::warp_bookmark(c, id, min_range, fleet).await
+            navigation::warp_bookmark(c, id, min_range, fleet, call.kwargs.get("fleetFormationSettings")).await
         }
         ("beyonce", "CmdWarpToStuffAutopilot") if a.len() == 1 => {
             let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);

@@ -20,16 +20,10 @@ impl Destination {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::services) enum Custody { Preserve, TakeSubtree }
 
-use crate::dao::items::{deliveries::Ancestor, loading::Item, parent_locks::{self, LockRequest, LockStrength, LockedItems, Parent}};
+use crate::dao::items::{deliveries::{Ancestor, LineageRow}, loading::Item, parent_locks::{self, LockRequest, LockStrength, LockedItems, Parent}};
 use crate::db::executor::Executor;
 use crate::sde::Sde;
 use crate::services::{db_err, notify_error, CallError};
-
-fn same_row(a: &Parent, b: &Parent) -> bool {
-    a.item_id == b.item_id && a.type_id == b.type_id && a.owner_id == b.owner_id
-        && a.location_id == b.location_id && a.flag_id == b.flag_id
-        && a.quantity == b.quantity && a.singleton == b.singleton && a.jump_clone_id == b.jump_clone_id
-}
 
 fn is_hull(sde: &Sde, type_id: i32) -> Result<bool, CallError> {
     let ty = sde.types.get(type_id).ok_or_else(|| notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
@@ -43,6 +37,24 @@ pub(crate) fn parent_requests(
         item_id,
         strength: if is_hull(sde, type_id)? { hull_strength } else { nonhull_strength },
     })).collect()
+}
+
+/// Build requests from already-read lineage; callers own locking and revalidation.
+pub(crate) fn custody_requests(sde: &Sde, ids: &[i64], lineage: &[LineageRow]) -> Result<Vec<LockRequest>, CallError> {
+    let mut requests = Vec::with_capacity(ids.len() + 2 * lineage.len());
+    requests.extend(ids.iter().map(|&item_id| LockRequest { item_id, strength: LockStrength::Update }));
+    for row in lineage {
+        requests.push(LockRequest {
+            item_id: row.ancestor.item_id,
+            strength: if is_hull(sde, row.ancestor.type_id)? { LockStrength::Update } else { LockStrength::Share },
+        });
+    }
+    for row in lineage {
+        if row.office.is_some() || super::hold_storage::is_ordinary_container(sde, row.ancestor.type_id) {
+            requests.push(LockRequest { item_id: row.ancestor.item_id, strength: LockStrength::Update });
+        }
+    }
+    Ok(requests)
 }
 
 /// Capture and classify the complete requested set before acquiring any item row.
@@ -68,7 +80,8 @@ pub(crate) async fn lock_items<'tx>(
             None => !optional_candidates.contains(&old.item_id),
             Some(row) => row.type_id != old.type_id
                 || is_hull(sde, row.type_id).ok() != Some(hulls.contains(&row.item_id))
-                || (!optional_candidates.contains(&old.item_id) && !same_row(old, row)),
+                || (!optional_candidates.contains(&old.item_id)
+                    && !(old.item_id == row.item_id && old.same_metadata(row))),
         }) { return Err(refuse()); }
     Ok(locks)
 }
@@ -95,9 +108,7 @@ impl<'locks, 'tx> ParentGuard<'locks, 'tx> {
             let item = &snapshot.item;
             if item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP) { return Err(refuse()); }
             let row = locks.row(item.item_id).ok_or_else(refuse)?;
-            if row.jump_clone_id.is_some() || row.type_id != item.type_id || row.owner_id != item.owner_id
-                || row.location_id != item.location_id || row.flag_id != item.flag_id
-                || row.quantity != item.quantity || row.singleton != item.singleton
+            if row.jump_clone_id.is_some() || !row.matches_item_metadata(item)
                 || snapshot.ancestry.iter().any(|old| !locks.row(old.item_id).is_some_and(|row|
                     row.jump_clone_id.is_none() && row.type_id == old.type_id && row.owner_id == old.owner_id
                         && row.location_id == old.location_id && row.flag_id == old.flag_id

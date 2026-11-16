@@ -35,7 +35,7 @@ async fn office_custody_requires_current_division_take_role() {
     let ceo: i64 = f.db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&f.account]).await.unwrap().get("character_id");
     let corp: i64 = f.db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES (nextval('game.corporations_corporation_id_seq')::text,nextval('game.corporations_corporation_id_seq')::text,$1,$1,$2,0) RETURNING corporation_id", &[&ceo, &f.station]).await.unwrap().get("corporation_id");
     let office = crate::dao::items::transfers::insert(&f.db, f.source_type, corp, f.station, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::offices::insert(&f.db, office, corp, f.station, 1).await.unwrap();
+    crate::dao::offices::insert(&f.db, office, corp, f.station, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
     let scenario = f.clone();
     let outcome = tokio::spawn(async move {
         let f = scenario;
@@ -54,6 +54,9 @@ async fn office_custody_requires_current_division_take_role() {
         assert!(matches!(f.create(f.context(), f.mutator, f.source, false, dispatched.clone()).await, Err(CallError::User { .. })));
         assert_eq!(f.fingerprint().await, before);
         f.db.execute("UPDATE game.items SET flag_id=$2 WHERE item_id=$1", &[&f.source, &FLAG_CORP_SAG1]).await.unwrap();
+        f.db.execute("UPDATE game.offices SET lease_state=1 WHERE office_id=$1", &[&office]).await.unwrap();
+        assert!(matches!(f.create(f.context(), f.mutator, f.source, false, dispatched.clone()).await, Err(CallError::User { .. })));
+        f.db.execute("UPDATE game.offices SET lease_state=0 WHERE office_id=$1", &[&office]).await.unwrap();
         f.db.execute("UPDATE game.offices SET station_id=$2 WHERE office_id=$1", &[&office, &(f.station + 1)]).await.unwrap();
         let before = f.fingerprint().await;
         assert!(matches!(f.create(f.context(), f.mutator, f.source, false, dispatched.clone()).await, Err(CallError::User { .. })));

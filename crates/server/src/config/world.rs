@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use infinity_core::consts::FILETIME_SECOND;
 
 /// Per-level mission payout from services/missions/mechanics.rs.
 #[derive(Clone, PartialEq, Deserialize)]
@@ -106,6 +107,11 @@ pub struct CombatConfig {
     pub progress_key_capacity: usize,
     /// Server combat checkpoint policy: in-flight batch handles sharing the key capacity.
     pub progress_pending_batches: usize,
+    /// Minimum effective damage resonance published by services/fit.rs for the
+    /// twelve shield, armor and structure resonance attributes.
+    pub resonance_floor: f64,
+    /// Seconds from a character's first unpaid NPC bounty kill to its durable payout.
+    pub bounty_payout_interval_secs: i64,
 }
 
 impl Default for CombatConfig {
@@ -119,6 +125,8 @@ impl Default for CombatConfig {
             npc_target_loss_range_factor: 2.0,
             progress_key_capacity: 4096,
             progress_pending_batches: 4,
+            resonance_floor: 0.05,
+            bounty_payout_interval_secs: 1200,
         }
     }
 }
@@ -134,6 +142,8 @@ impl CombatConfig {
         anyhow::ensure!(self.npc_target_loss_range_factor.is_finite() && self.npc_target_loss_range_factor > 0.0, "combat.npc_target_loss_range_factor={} is outside its valid domain", self.npc_target_loss_range_factor);
         anyhow::ensure!(self.progress_key_capacity > 0, "combat.progress_key_capacity={} is outside its valid domain", self.progress_key_capacity);
         anyhow::ensure!(self.progress_pending_batches > 0, "combat.progress_pending_batches={} is outside its valid domain", self.progress_pending_batches);
+        anyhow::ensure!(self.resonance_floor.is_finite() && self.resonance_floor > 0.0 && self.resonance_floor <= 1.0, "combat.resonance_floor={} is outside its valid domain", self.resonance_floor);
+        super::positive_duration("combat.bounty_payout_interval_secs", self.bounty_payout_interval_secs, FILETIME_SECOND)?;
         anyhow::ensure!(self.lock_time_min_secs <= self.lock_time_max_secs, "combat.lock_time_min_secs={} exceeds combat.lock_time_max_secs={}", self.lock_time_min_secs, self.lock_time_max_secs);
         Ok(())
     }
@@ -197,6 +207,10 @@ pub struct CrimewatchConfig {
     pub pvp_timer_secs: i64,
     /// Existing server criminal timer policy.
     pub criminal_timer_secs: i64,
+    /// crimewatch.const npcTimerTimeout: NPC combat timer policy.
+    pub npc_timer_secs: i64,
+    /// crimewatch.const disapprovalTimerTimeout: disapproval timer policy.
+    pub disapproval_timer_secs: i64,
     /// Existing server engagement timer policy.
     pub engagement_secs: i64,
     /// Outlaw threshold: anyone may shoot an outlaw.
@@ -224,6 +238,8 @@ impl Default for CrimewatchConfig {
             weapons_timer_secs: 60,
             pvp_timer_secs: 900,
             criminal_timer_secs: 900,
+            npc_timer_secs: 300,
+            disapproval_timer_secs: 300,
             engagement_secs: 300,
             outlaw_threshold: -5.0,
             highsec_threshold: 0.45,
@@ -244,6 +260,8 @@ impl CrimewatchConfig {
         anyhow::ensure!(self.pvp_timer_secs > 0, "crimewatch.pvp_timer_secs={} is outside its valid domain", self.pvp_timer_secs);
         anyhow::ensure!(self.criminal_timer_secs > 0, "crimewatch.criminal_timer_secs={} is outside its valid domain", self.criminal_timer_secs);
         anyhow::ensure!(self.engagement_secs > 0, "crimewatch.engagement_secs={} is outside its valid domain", self.engagement_secs);
+        anyhow::ensure!(self.npc_timer_secs > 0, "crimewatch.npc_timer_secs={} is outside its valid domain", self.npc_timer_secs);
+        anyhow::ensure!(self.disapproval_timer_secs > 0, "crimewatch.disapproval_timer_secs={} is outside its valid domain", self.disapproval_timer_secs);
         anyhow::ensure!(self.outlaw_threshold.is_finite() && (-10.0..=10.0).contains(&self.outlaw_threshold), "crimewatch.outlaw_threshold={} is outside its valid domain", self.outlaw_threshold);
         anyhow::ensure!(self.highsec_threshold.is_finite() && (0.0..=1.0).contains(&self.highsec_threshold), "crimewatch.highsec_threshold={} is outside its valid domain", self.highsec_threshold);
         anyhow::ensure!(self.concord_base_delay_secs > 0, "crimewatch.concord_base_delay_secs={} is outside its valid domain", self.concord_base_delay_secs);
@@ -257,7 +275,7 @@ impl CrimewatchConfig {
         anyhow::ensure!(self.security_loss_aggression.is_finite() && (0.0..=1.0).contains(&self.security_loss_aggression), "crimewatch.security_loss_aggression={} is outside its valid domain", self.security_loss_aggression);
         anyhow::ensure!(self.security_loss_kill.is_finite() && (0.0..=1.0).contains(&self.security_loss_kill), "crimewatch.security_loss_kill={} is outside its valid domain", self.security_loss_kill);
         anyhow::ensure!(self.killmail_attacker_window_secs > 0, "crimewatch.killmail_attacker_window_secs={} is outside its valid domain", self.killmail_attacker_window_secs);
-        for (key, value) in [("crimewatch.weapons_timer_secs", self.weapons_timer_secs), ("crimewatch.pvp_timer_secs", self.pvp_timer_secs), ("crimewatch.criminal_timer_secs", self.criminal_timer_secs), ("crimewatch.engagement_secs", self.engagement_secs)] {
+        for (key, value) in [("crimewatch.weapons_timer_secs", self.weapons_timer_secs), ("crimewatch.pvp_timer_secs", self.pvp_timer_secs), ("crimewatch.criminal_timer_secs", self.criminal_timer_secs), ("crimewatch.engagement_secs", self.engagement_secs), ("crimewatch.npc_timer_secs", self.npc_timer_secs), ("crimewatch.disapproval_timer_secs", self.disapproval_timer_secs)] {
             super::duration(key, value, infinity_core::consts::FILETIME_SECOND, true)?;
         }
         super::duration("crimewatch.killmail_attacker_window_secs", self.killmail_attacker_window_secs, infinity_core::consts::FILETIME_SECOND, false)?;

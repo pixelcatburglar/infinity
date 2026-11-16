@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{dao::progress::{self as journal, JournalEvent}, db::outbox::{Outbox, SourceKey}, lua::events::{GameEvent, resources::{FactContext, FactOrigin}}, progress::{self, ApplyOutcome, ClaimMode, ContentProgressResources, DeliveryKey, PrepareOutcome}};
 
 #[tokio::test]
-#[ignore = "requires isolated test process, dedicated INFINITY_TEST_DATABASE_URL with SDE, and external flock"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn real_prepared_receipts_preserve_cascades_and_replay() {
     const CHILD: &str = "INFINITY_DAILY_PREPARED_NO_EFFECT_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -15,10 +15,10 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     }
     crate::tests::init_config();
     let registration = super::super::registration();
-    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap()
-        .with_progress_registry(progress::Registry::new(vec![], vec![registration]).unwrap());
-    db.execute("INSERT INTO game.progress_subscriptions (consumer_key,generation,activated_at,version,enabled) VALUES ($1,1,1,1,true) ON CONFLICT (consumer_key) DO NOTHING", &[&registration.consumer_key]).await.unwrap();
-    db.execute("INSERT INTO game.progress_subscription_kinds (consumer_key,kind) VALUES ($1,'WreckSalvaged') ON CONFLICT DO NOTHING", &[&registration.consumer_key]).await.unwrap();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let registry = progress::tests::fixture_registry(&db, progress::Registry::new(vec![], vec![registration]).unwrap()).await;
+    let db = db.with_progress_registry(registry);
+    let (consumers, kinds) = db.progress_registry().subscription_arrays();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.expect("real SDE required"));
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
@@ -39,6 +39,7 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     let mut config = crate::config::Config::default();
     config.lua.enabled = true;
     config.lua.scripts_dir = root.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
     crate::lua::start(&config, &db, &sde, &world, &hub).await.expect("real daily host required");
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
     let now = crate::client::filetime_now();
@@ -46,14 +47,14 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     let context = FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: None, ship_type_id: None, system_id: None, station_id: None, origin: FactOrigin::Gm };
     let event = GameEvent::WreckSalvaged { char_id: fixture.character, wreck_id: wreck, wreck_type: 1, occurred_at: now, context };
     let row = JournalEvent { source_namespace: "business".into(), source_key: format!("WreckSalvaged:{wreck}"), schema_version: progress::codec::SCHEMA_VERSION, kind: event.kind().into(), occurred_at: now, recorded_at: now, payload: progress::codec::encode(&event).unwrap(), context: serde_json::to_string(&context).unwrap(), origin: context.origin.as_str().into(), ordinal: 0, subject_character_id: Some(fixture.character) };
-    let inserted = journal::insert_batch(&db, &[row]).await.unwrap();
+    let inserted = journal::insert_batch(&db, &[row], consumers, kinds).await.unwrap();
     assert!(inserted[0].2);
     let key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() };
     let resources = ContentProgressResources { db: db.clone(), sde: sde.clone(), world: world.clone(), policies: crate::lua::retained_policies().unwrap() };
     let plan = match super::super::prepare::delivery(resources.clone(), key.clone()).await.unwrap() { PrepareOutcome::Ready(plan) => plan, PrepareOutcome::AlreadyApplied => panic!("new receipt already applied") };
-    let (mut client, connection) = tokio_postgres::connect(&crate::config::tests::test_database().url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let tx = client.transaction().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&crate::config::tests::test_database().url, tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let mut outbox = Outbox::default();
     assert!(matches!(progress::apply_once_tx(&tx, &mut outbox, &sde, &registration, key.clone(), Some(plan.as_ref()), ClaimMode::Blocking).await.unwrap(), ApplyOutcome::Applied));
     tx.commit().await.unwrap();
@@ -61,16 +62,15 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     let count: i64 = db.query_one("SELECT count(*) AS count FROM game.daily_goal_instances WHERE character_id=$1", &[&fixture.character]).await.unwrap().get("count");
     assert_eq!(count, 0);
     let occurrence = crate::dao::daily_goals::periods::bounds(&db, now).await.unwrap().month_end + 1;
-    db.execute("INSERT INTO game.progress_subscription_kinds (consumer_key,kind) VALUES ($1,'Jumped') ON CONFLICT DO NOTHING", &[&registration.consumer_key]).await.unwrap();
     let jump = GameEvent::Jumped { char_id: fixture.character, ship_id: 2, from_system_id: 3, to_system_id: 4 };
     let row = JournalEvent { source_namespace: "business".into(), source_key: format!("Jumped:{wreck}"), schema_version: progress::codec::SCHEMA_VERSION, kind: jump.kind().into(), occurred_at: occurrence, recorded_at: now, payload: progress::codec::encode(&jump).unwrap(), context: "{}".into(), origin: "server".into(), ordinal: 0, subject_character_id: Some(fixture.character) };
-    let inserted = journal::insert_batch(&db, &[row]).await.unwrap();
+    let inserted = journal::insert_batch(&db, &[row], consumers, kinds).await.unwrap();
     assert!(inserted[0].2);
     let jump_key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() };
     let jump_plan = match super::super::prepare::delivery(resources.clone(), jump_key.clone()).await.unwrap() { PrepareOutcome::Ready(plan) => plan, PrepareOutcome::AlreadyApplied => panic!("new receipt already applied") };
     let grade = crate::dao::accounts::subscriptions::by_user(&db, fixture.account).await.unwrap();
     assert!(crate::dao::accounts::subscriptions::set_grade(&db, fixture.account, grade.grade, grade.omega_until, grade.grace_until, grade.revision).await.unwrap());
-    let tx = client.transaction().await.unwrap();
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     assert!(matches!(progress::apply_once_tx(&tx, &mut Outbox::default(), &sde, &registration, jump_key.clone(), Some(jump_plan.as_ref()), ClaimMode::Blocking).await, Err(progress::ApplyError::Reprepare)));
     tx.rollback().await.unwrap();
     assert!(matches!(journal::delivery(&db, &jump_key).await.unwrap(), journal::DeliveryState::Pending(_)));
@@ -82,14 +82,14 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     extra.generation += 1;
     extra.goal_id = crate::services::daily_goals::ids::goal(fixture.character, extra.period_start, &extra.version, &extra.slot_key, extra.generation);
     assert!(crate::dao::daily_goals::instances::insert(&db, &extra).await.unwrap());
-    let tx = client.transaction().await.unwrap();
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     assert!(matches!(progress::apply_once_tx(&tx, &mut Outbox::default(), &sde, &registration, jump_key.clone(), Some(stale.as_ref()), ClaimMode::Blocking).await, Err(progress::ApplyError::Reprepare)));
     tx.rollback().await.unwrap();
     assert!(matches!(journal::delivery(&db, &jump_key).await.unwrap(), journal::DeliveryState::Pending(_)));
     db.execute("DELETE FROM game.daily_goal_instances WHERE character_id=$1 AND goal_id=$2::text::uuid", &[&fixture.character, &extra.goal_id]).await.unwrap();
     let update = crate::dao::daily_goals::instances::ProgressUpdate { progress: other.progress, remainder: other.remainder.clone(), completed_at: other.completed_at, earned_omega: other.earned_omega, paid: other.paid, has_unclaimed: other.has_unclaimed };
     assert!(crate::dao::daily_goals::instances::update_progress(&db, fixture.character, &other.goal_id, other.revision, &update).await.unwrap());
-    let tx = client.transaction().await.unwrap();
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     assert!(matches!(progress::apply_once_tx(&tx, &mut Outbox::default(), &sde, &registration, jump_key.clone(), Some(stale.as_ref()), ClaimMode::Blocking).await, Err(progress::ApplyError::Reprepare)));
     tx.rollback().await.unwrap();
     assert!(matches!(journal::delivery(&db, &jump_key).await.unwrap(), journal::DeliveryState::Pending(_)));
@@ -130,7 +130,6 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     assert_eq!(event.ordinal, 0);
     assert!(matches!(super::super::prepare::delivery(resources.clone(), jump_key).await.unwrap(), PrepareOutcome::AlreadyApplied));
     use crate::lua::events::combat::{BinaryAmount, CombatEntity, CombatSlice, HpLayer};
-    db.execute("INSERT INTO game.progress_subscription_kinds (consumer_key,kind) VALUES ($1,'DamageApplied') ON CONFLICT DO NOTHING", &[&registration.consumer_key]).await.unwrap();
     let natural = FactContext { origin: FactOrigin::Natural, ..context };
     let actor = CombatEntity { item_id: 1, type_id: 1, incarnation: [1; 16], character_id: Some(fixture.character), corporation_id: None, alliance_id: None, faction_id: None };
     let recipient = CombatEntity { item_id: 2, type_id: 1, incarnation: [2; 16], character_id: None, corporation_id: None, alliance_id: None, faction_id: None };
@@ -139,7 +138,7 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
     let next_day = occurrence + infinity_core::consts::FILETIME_DAY;
     let damage = GameEvent::DamageApplied { char_id: Some(fixture.character), context: natural, source: actor, target: recipient, module_id: None, weapon_type_id: None, effect_id: None, layer: HpLayer::Shield, slices: vec![slice(0, occurrence), slice(1, occurrence + 1), slice(2, next_day)] };
     let row = JournalEvent { source_namespace: "business".into(), source_key: format!("DamageApplied:{wreck}:1:0:0:0"), schema_version: progress::codec::SCHEMA_VERSION, kind: damage.kind().into(), occurred_at: occurrence, recorded_at: now, payload: progress::codec::encode(&damage).unwrap(), context: serde_json::to_string(&natural).unwrap(), origin: natural.origin.as_str().into(), ordinal: 0, subject_character_id: Some(fixture.character) };
-    let inserted = journal::insert_batch(&db, &[row]).await.unwrap();
+    let inserted = journal::insert_batch(&db, &[row], consumers, kinds).await.unwrap();
     assert!(inserted[0].2);
     let damage_key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() };
     let plan = match super::super::prepare::delivery(resources.clone(), damage_key.clone()).await.unwrap() { PrepareOutcome::Ready(plan) => plan, PrepareOutcome::AlreadyApplied => panic!("new damage receipt already applied") };
@@ -166,16 +165,16 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
         let id = i64::try_from(crate::handshake::random_u64() & i64::MAX as u64).unwrap().max(1);
         let event = GameEvent::Jumped { char_id: fixture.character, ship_id: 2, from_system_id: 3, to_system_id: 4 };
         let row = JournalEvent { source_namespace: "business".into(), source_key: format!("Jumped:{id}"), schema_version: progress::codec::SCHEMA_VERSION, kind: event.kind().into(), occurred_at: at, recorded_at: now, payload: progress::codec::encode(&event).unwrap(), context: "{}".into(), origin: "server".into(), ordinal: 0, subject_character_id: Some(fixture.character) };
-        let inserted = journal::insert_batch(&db, &[row]).await.unwrap();
+        let inserted = journal::insert_batch(&db, &[row], consumers, kinds).await.unwrap();
         assert!(inserted[0].2);
         day_keys.push(DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() });
     }
     let first_plan = match super::super::prepare::delivery(resources.clone(), day_keys[0].clone()).await.unwrap() { PrepareOutcome::Ready(plan) => plan, PrepareOutcome::AlreadyApplied => panic!("new receipt already applied") };
     let second_plan = match super::super::prepare::delivery(resources.clone(), day_keys[1].clone()).await.unwrap() { PrepareOutcome::Ready(plan) => plan, PrepareOutcome::AlreadyApplied => panic!("new receipt already applied") };
-    let (mut client2, connection2) = tokio_postgres::connect(&crate::config::tests::test_database().url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection2.await.unwrap(); });
-    let tx1 = client.transaction().await.unwrap();
-    let tx2 = client2.transaction().await.unwrap();
+    let (client2, connection2) = tokio_postgres::connect(&crate::config::tests::test_database().url, tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper2 = deadpool_postgres::ClientWrapper::new(client2, tokio::spawn(async move { connection2.await.unwrap(); }));
+    let tx1 = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
+    let tx2 = crate::db::Transaction::from(wrapper2.transaction().await.unwrap());
     first_plan.prelock(&tx1).await.unwrap();
     tx2.batch_execute("SET LOCAL lock_timeout = '100ms'").await.unwrap();
     assert!(matches!(second_plan.prelock(&tx2).await, Err(progress::ApplyError::Call(_))));
@@ -205,7 +204,7 @@ async fn real_prepared_receipts_preserve_cascades_and_replay() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated test process, dedicated INFINITY_TEST_DATABASE_URL with SDE, and external flock"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn retained_completion_matchers_filter_real_virtual_cascades() {
     const CHILD: &str = "INFINITY_DAILY_RESTRICTED_CASCADE_CHILD";
     let scenario = match std::env::var(CHILD) {
@@ -244,7 +243,7 @@ async fn retained_completion_matchers_filter_real_virtual_cascades() {
     }
     std::fs::write(root.join("content/daily_goals/data/daily_goals.json"), serde_json::to_vec(&data).unwrap()).unwrap();
     let registry = progress::Registry::new(vec![], vec![]).unwrap();
-    let (db, resources) = fixture_host::environment(&root, false, registry).await;
+    let (db, resources) = fixture_host::environment(&root, registry).await;
     let outcome = crate::services::daily_goals::assignment::ensure_at(&resources, fixture.account, fixture.character, now, false).await.unwrap();
     let day = outcome.day.unwrap();
     let month = outcome.month.unwrap();

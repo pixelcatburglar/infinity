@@ -1,0 +1,18 @@
+[package]
+name = "infinity-content"
+description = "Captured retail content CDN, verified achievement catalogue and UUID text"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+marshal = { path = "../marshal" }
+infinity-core = { path = "../core" }
+anyhow.workspace = true
+tracing.workspace = true
+flate2 = "1"
+flatbuffers = "=25.2.10"
+
+[dev-dependencies]
+sha2.workspace = true
+serde_json.workspace = true

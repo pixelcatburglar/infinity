@@ -79,6 +79,6 @@ pub(in crate::services) async fn regroup(c: &Client) -> CallResult {
     Ok(Value::None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 #[path = "tests/navigation.rs"]
 mod tests;

@@ -21,11 +21,15 @@ fn actor_visibility_is_independent_of_delivery_observer() {
     };
     check(&s, false);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(1_000_000_000_001, 101, tx);
+    let (completed, _done) = tokio::sync::oneshot::channel();
+    s.observe(1_000_000_000_001, 101, tx, completed);
+    s.apply_scene_prefix(crate::space::collision::enabled());
     check(&s, true);
     drop(rx);
     check(&s, false);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(1_000_000_000_001, 102, tx);
+    let (completed, _done) = tokio::sync::oneshot::channel();
+    s.observe(1_000_000_000_001, 102, tx, completed);
+    s.apply_scene_prefix(crate::space::collision::enabled());
     check(&s, false);
 }

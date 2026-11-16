@@ -12,6 +12,7 @@ mod paper_doll_server;
 mod corporation_svc;
 mod repair_svc;
 pub(super) mod home_station;
+pub(crate) mod npc_control;
 mod station;
 pub(super) mod provisioning;
 pub(crate) mod creation;

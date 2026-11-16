@@ -3,8 +3,9 @@
 use super::*;
 use std::sync::Arc;
 
-/// Called outside the space actor with the damaged ball's captured visibility.
-pub(crate) async fn route(world: Arc<World>, damaged: i64, source_system: i64, ship: i64, cloak: u8, health: Value, only: Option<i64>) {
+/// Called outside the space actor with the damaged ball's actor-owned state;
+/// each receiving actor evaluates live scene visibility of the ball.
+pub(crate) async fn route(world: Arc<World>, damaged: i64, source_system: i64, ship: i64, health: Value, only: Option<i64>) {
     let watchers = {
         let st = state();
         let Some(&fleet_id) = st.of.get(&damaged) else { return };
@@ -18,7 +19,7 @@ pub(crate) async fn route(world: Arc<World>, damaged: i64, source_system: i64, s
     for watcher in watchers {
         let Some(system) = world.online_session(watcher).and_then(|session| session.system_id) else { continue };
         let damage = health.clone();
-        world.post(system, move |actor| actor.fleet_damage_update(watcher, source_system, ship, cloak, damage));
+        world.post(system, move |actor| actor.fleet_damage_update(watcher, source_system, ship, damage));
     }
 }
 
@@ -26,7 +27,7 @@ pub(crate) async fn route(world: Arc<World>, damaged: i64, source_system: i64, s
 pub(super) async fn initial(world: Arc<World>, watcher: i64, targets: Vec<i64>) {
     for target in targets {
         let Some(system) = world.online_session(target).and_then(|session| session.system_id) else { continue };
-        let Some(Some((ship, cloak, health))) = world.with(system, move |actor| actor.fleet_damage_snapshot(target)).await else { continue };
-        route(world.clone(), target, system, ship, cloak, health, Some(watcher)).await;
+        let Some(Some((ship, health))) = world.with(system, move |actor| actor.fleet_damage_snapshot(target)).await else { continue };
+        route(world.clone(), target, system, ship, health, Some(watcher)).await;
     }
 }

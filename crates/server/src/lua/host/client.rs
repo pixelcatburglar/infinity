@@ -214,12 +214,12 @@ async fn apply_mutation(c: &mut Client, operation: Mutation) -> Result<Option<i6
             Ok(None)
         }
         Mutation::Standing { character, from, value } => {
+            let actor = c.session.int("charid");
+            let occurred_at = crate::client::filetime_now();
             let world = c.world.clone();
             c.db.transaction(
                 |tx, outbox: &mut Outbox| Box::pin(async move {
-                    standings::set(tx, character, from, value).await?;
-                    standings::notify_set(outbox, character, from, value);
-                    Ok(())
+                    standings::mutation::apply_tx(tx, outbox, character, &[standings::mutation::Change { from_id: from, operation: standings::mutation::Operation::Set(value) }], standings::mutation::Mutation { occurred_at, cause: standings::mutation::Cause::Script { actor } }).await.map(|_| ())
                 }),
                 |value, outbox| async move { dispatch_world(value, outbox, &world) },
             ).await?;
@@ -289,7 +289,6 @@ async fn submit_adaption(c: &Client, host: Arc<crate::lua::reload::Host>, pin: c
                 Err(error) => Err(error),
             },
             Err(AdmissionError::Stale) => Err(operations::refusal(pin.adaption().expect("validated adaptation package"), adaption::CONFLICT)),
-            Err(AdmissionError::Infrastructure(error)) => Err(error),
         };
         if let Err(Err(error)) = tx.send(result) { tracing::warn!("adaptation owned operation failed after caller departed: {error:?}"); }
     });
@@ -301,7 +300,7 @@ struct InvocationGuard { live: Arc<AtomicBool>, hook_thread: Arc<Mutex<Option<Th
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
         self.live.store(false, Ordering::Release);
-        if let Some(thread) = self.hook_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(thread) = crate::poison::lock_or_exit(self.hook_thread.lock()).take() {
             thread.remove_hook();
         }
     }
@@ -402,5 +401,5 @@ pub(crate) async fn invoke(c: &mut Client, lua: &Lua, invocation: super::super::
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-lua", feature = "tests-storage")))]
 mod tests;

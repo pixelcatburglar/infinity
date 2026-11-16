@@ -55,7 +55,7 @@ async fn permanent_activation_and_application() {
     assert_eq!(projected.skin_id, None);
     assert_eq!(projected.ship_id, ship);
     assert!(state::get(&db, &c.world, &docked, i64::MAX, filetime_now()).await.unwrap().is_none());
-    assert!(state::all(&db, &c.world, &c.sde, &docked, filetime_now()).await.unwrap().is_empty());
+    assert!(state::all(&c.world, &docked).await.unwrap().is_empty());
     let kwargs = Value::Dict(vec![]);
     for (args, expected) in [
         (vec![Value::Int(first)], text::STRUCTURE),
@@ -130,8 +130,8 @@ async fn permanent_activation_and_application() {
                 let changed = application::apply_tx(tx, &identity, &sde, &region, &reach, ship, requested, now).await?;
                 assert!(changed.is_some());
                 let facts = [crate::space::ship_cosmetics::Ship { ship_id: ship, type_id: hull, character_id: Some(identity.char_id), is_npc: false }];
-                let states = state::project(tx, &sde, &facts, now).await?;
-                let notice = crate::gateway::ship_cosmetics::notice(&states[0], &[identity.char_id])?.remove(0);
+                let states = state::prepare(tx, &sde, &facts, now).await?;
+                let notice = crate::gateway::ship_cosmetics::notice(&states[0].state, &[identity.char_id])?.remove(0);
                 outbox.notify_gateway(notice.retarget(Target::ApplicationInstanceUuid(app.to_vec())).map_err(crate::gateway::notices::producer_error)?);
                 if mode == 1 { return Err(CallError::Internal(anyhow::anyhow!("rollback"))); }
                 if mode == 2 && attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -172,7 +172,7 @@ async fn permanent_activation_and_application() {
     crate::db::outbox::dispatch_client((), outbox, &mut c).unwrap();
     assert!(registration.rx.try_recv().is_ok());
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    crate::db::outbox::Notification::Gateway(make_notice()).dispatch_sender(&c.world, &sender).unwrap();
+    crate::db::outbox::Notification::Gateway(make_notice()).dispatch_sender(&c.world, Some(&sender)).unwrap();
     assert!(registration.rx.try_recv().is_ok());
     let mut custom = Outbox::<crate::services::effects::online::OnlineChanged>::default();
     custom.notify_gateway(make_notice());

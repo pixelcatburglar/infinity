@@ -50,6 +50,15 @@ impl Industry {
         self.activities.get(&(blueprint, activity))
     }
 
+    /// `cfg.blueprints` `MANUFACTURING` products and their build times, for a
+    /// startup product-to-build-time reverse index; mirrors
+    /// `repairableShip/common/methods.py:GetBlueprintBuildTime` inputs.
+    pub(crate) fn manufacturing_products(&self) -> impl Iterator<Item = (i32, f64)> + '_ {
+        self.activities.iter()
+            .filter(|((_, activity), _)| *activity == MANUFACTURING)
+            .flat_map(|(_, activity)| activity.products.iter().map(move |&(type_id, _, _)| (type_id, activity.time)))
+    }
+
     pub(crate) fn has_service(&self, operation: Option<i64>, service: i32) -> bool {
         operation.and_then(|id| self.operations.get(&id)).is_some_and(|ids| ids.contains(&service))
     }

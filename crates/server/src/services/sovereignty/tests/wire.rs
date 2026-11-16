@@ -24,17 +24,45 @@ fn constructors_use_real_claim_time_and_corporation() {
 
 #[test]
 fn neutral_structure_remains_visible_and_capital_is_real() {
-    let neutral = wire::structures(&[hub(false)], &[policy()]);
+    let neutral = wire::structures(&[hub(false)], &[policy()], None).unwrap();
     assert_eq!(neutral.len(), 1);
     assert_eq!(value_field(&neutral[0], "itemID"), Some(&Value::Int(1_000_000_000_123)));
     assert_eq!(value_field(&neutral[0], "allianceID"), Some(&Value::None));
     assert_eq!(value_field(&neutral[0], "isCapital"), Some(&Value::Bool(false)));
-    let claimed = wire::structures(&[hub(true)], &[policy()]);
+    let claimed = wire::structures(&[hub(true)], &[policy()], None).unwrap();
     assert_eq!(value_field(&claimed[0], "corporationID"), Some(&Value::Int(8)));
     assert_eq!(value_field(&claimed[0], "isCapital"), Some(&Value::Bool(true)));
     assert_eq!(value_field(&claimed[0], "campaignState"), Some(&Value::None));
     assert_eq!(value_field(&wire::capital(Some(&policy())), "currentCapitalSystem"), Some(&Value::Int(42)));
     assert_eq!(value_field(&wire::capital(None), "newCapitalSystemValidAfter"), Some(&Value::None));
+}
+
+fn view() -> crate::services::sovereignty::indices::model::DevelopmentView {
+    let level = crate::services::sovereignty::indices::model::IndexLevel { level: 0, remainder: 0.0 };
+    crate::services::sovereignty::indices::model::DevelopmentView { system_id: 42,
+        military_points: 0.0, industrial_points: 0.0, strategic_seconds: 0.0,
+        military_increasing: false, industrial_increasing: false, strategic_increasing: false,
+        military: level, industrial: level, strategic: level, defense_multiplier: 2.5 }
+}
+
+#[test]
+fn defense_multiplier_is_real_omitted_or_refused() {
+    let views = [view()];
+    let unavailable = wire::structures(&[hub(true)], &[policy()], None).unwrap();
+    assert!(value_field(&unavailable[0], "defenseMultiplier").is_none());
+    let available = wire::structures(&[hub(true)], &[policy()], Some(&views)).unwrap();
+    assert_eq!(value_field(&available[0], "defenseMultiplier"), Some(&Value::Float(2.5)));
+    assert!(wire::structures(&[hub(true)], &[policy()], Some(&[])).is_err());
+    let mut corrupt = views.clone();
+    corrupt[0].defense_multiplier = f64::NAN;
+    assert!(wire::structures(&[hub(true)], &[policy()], Some(&corrupt)).is_err());
+    corrupt[0] = view();
+    corrupt[0].military_points = f64::NAN;
+    assert!(wire::structures(&[hub(true)], &[policy()], Some(&corrupt)).is_err());
+    assert!(wire::structures(&[hub(true)], &[policy()], Some(&[view(), view()])).is_err());
+    let mut foreign = views.clone();
+    foreign[0].system_id = 43;
+    assert!(wire::structures(&[hub(true)], &[policy()], Some(&foreign)).is_err());
 }
 
 #[test]

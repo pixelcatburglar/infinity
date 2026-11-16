@@ -110,5 +110,5 @@ events! {
     WarpArrived { char_id, system_id },
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

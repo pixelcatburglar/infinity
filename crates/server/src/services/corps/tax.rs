@@ -8,35 +8,34 @@ const MIN_CORPORATION_TAX_AMOUNT: f64 = 100_000.0;
 
 pub(crate) struct LoyaltyReward { pub issuer: i64, pub amount: i64, pub mutation: super::super::standings::LoyaltyMutation }
 
+/// The exact settled split of one reward: the net personal credit and the
+/// corporation's actual positive tax, when one was credited.
+pub(crate) struct RewardSettlement {
+    pub net: crate::isk::IskAmount,
+    pub corporation: Option<(i64, crate::isk::IskAmount)>,
+}
+
 /// Split one actual reward item using current corporation terms and the existing outbox.
+/// The caller constructs the exact `gross_isk`; settlement preserves it and subtracts
+/// the rounded tax in cents. The floating tax-rate policy itself is unchanged.
 /// Positive corporate credits use the existing member-audience notification paths.
-pub(crate) async fn settle_reward<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, recipient: i64, gross_isk: f64, loyalty: Option<LoyaltyReward>) -> Result<(), CallError> {
-    if !gross_isk.is_finite() { return Err(CallError::Internal(anyhow::anyhow!("nonfinite corporation reward"))); }
-    let gross = super::super::market::round2(gross_isk);
-    if !gross.is_finite() { return Err(CallError::Internal(anyhow::anyhow!("corporation reward overflow"))); }
-    let exact_gross = crate::isk::IskAmount::from_isk(gross)?;
-    settle_exact_reward(ex, outbox, recipient, gross, exact_gross, loyalty).await
-}
-
-pub(crate) async fn settle_whole_reward<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, recipient: i64, gross: i64, loyalty: Option<LoyaltyReward>) -> Result<(), CallError> {
-    let exact_gross = crate::isk::IskAmount::from_whole_isk(i128::from(gross)).ok_or(crate::isk::AmountError)?;
-    settle_exact_reward(ex, outbox, recipient, gross as f64, exact_gross, loyalty).await
-}
-
-async fn settle_exact_reward<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, recipient: i64, gross: f64, exact_gross: crate::isk::IskAmount, loyalty: Option<LoyaltyReward>) -> Result<(), CallError> {
+pub(crate) async fn settle_reward<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, recipient: i64, gross_isk: crate::isk::IskAmount, loyalty: Option<LoyaltyReward>) -> Result<RewardSettlement, CallError> {
     let terms = dao::terms(ex, recipient).await.map_err(db_err)?.filter(|row| super::is_player_corp(row.corporation_id));
     if let Some(row) = &terms {
         if !row.isk_rate.is_finite() || !(0.0..=1.0).contains(&row.isk_rate) || !row.lp_rate.is_finite() || !(0.0..=1.0).contains(&row.lp_rate) {
             return Err(CallError::Internal(anyhow::anyhow!("invalid stored corporation tax rate")));
         }
     }
+    let gross = gross_isk.wire_isk();
     let isk_tax = terms.as_ref().filter(|_| gross > MIN_CORPORATION_TAX_AMOUNT)
         .map_or(0.0, |row| super::super::market::round2(gross * row.isk_rate));
     let exact_tax = crate::isk::IskAmount::from_isk(isk_tax)?;
-    let net = exact_gross.checked_sub(exact_tax).ok_or(crate::isk::AmountError)?;
+    let net = gross_isk.checked_sub(exact_tax).ok_or(crate::isk::AmountError)?;
     super::super::wallets::credit(ex, outbox, recipient, net).await?;
+    let mut corporation = None;
     if let Some(row) = terms.as_ref().filter(|_| isk_tax > 0.0) {
         super::super::wallets::corp_credit(ex, outbox, row.corporation_id, ACCOUNT_CASH, exact_tax).await?;
+        corporation = Some((row.corporation_id, exact_tax));
     }
     if let Some(loyalty) = loyalty {
         let lp_tax = match terms.as_ref() {
@@ -53,8 +52,8 @@ async fn settle_exact_reward<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mu
             super::super::standings::change_lp(ex, outbox, row.corporation_id, loyalty.issuer, lp_tax, true, mutation).await?;
         }
     }
-    Ok(())
+    Ok(RewardSettlement { net, corporation })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

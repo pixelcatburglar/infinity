@@ -108,7 +108,7 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_HACKING => Hacking,
         EFFECT_PROBE_LAUNCHING => ProbeLaunch,
         EFFECT_EMP_WAVE => Smartbomb,
-        EFFECT_CHAIN_LIGHTNING => Vorton,
+        EFFECT_CHAIN_LIGHTNING | EFFECT_ENTITY_CHAIN_LIGHTNING => Vorton,
         EFFECT_FUELED_ARMOR_REPAIR => FueledLocalRepair { layer: 1, amount_attr: ATTR_ARMOR_DAMAGE_AMOUNT, charge_bonus_attr: Some(ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER) },
         EFFECT_FUELED_SHIELD_BOOSTING => FueledLocalRepair { layer: 0, amount_attr: ATTR_SHIELD_BONUS, charge_bonus_attr: None },
         EFFECT_POWER_BOOSTER => CapBooster,
@@ -243,5 +243,5 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

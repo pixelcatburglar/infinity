@@ -1,7 +1,8 @@
 //! Service-path regression for logical singleton quantities in trade staging.
 use std::sync::Arc;
 use marshal::Value;
-use crate::{client::Client, config::{Config, deployment::DatabaseConfig}, conn::Conn, dao::{items::transfers, trades}, db::Db, handshake::Login, sde::Sde, services::Call, space::World};
+use crate::{client::Client, config::{Config, deployment::DatabaseConfig}, dao::{items::transfers, trades}, db::Db, handshake::Login, sde::Sde, services::Call, space::World};
+use infinity_wire::conn::Conn;
 
 #[tokio::test]
 #[ignore]

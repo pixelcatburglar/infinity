@@ -2,7 +2,7 @@
 //! Fixtures exercise existing System APIs without a native runtime or database.
 
 use super::*;
-use super::destiny_reference::{replay, replay_fractions, ship, STREAM_TICKS};
+use super::destiny_reference::{launch_native, replay, replay_fractions, ship, STREAM_TICKS};
 
 fn setup(name: &str) -> Vec<Ball> {
     match name {
@@ -345,7 +345,7 @@ fn commands(system: &mut System, name: &str) {
         }
         "missile-owner-target" => {
             let missile = system.ball(2).unwrap().clone();
-            system.launch_missile(missile, 3, 1, 121_000, |_| {});
+            launch_native(system, missile, 3, 1);
         }
         _ => panic!("unknown collision scenario {name}"),
     }

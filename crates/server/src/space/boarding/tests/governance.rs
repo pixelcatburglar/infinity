@@ -13,7 +13,7 @@ struct Fixture {
     corp: i64,
     ship: i64,
     system: i64,
-    station: i64,
+    destination: station::Destination,
 }
 
 impl Fixture {
@@ -22,7 +22,10 @@ impl Fixture {
         let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
         let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
         let system = sde.map.systems().next().unwrap().solar_system_id;
-        let station = -2;
+        let station_row = sde.map.stations().find(|row| row.solar_system_id.is_some()
+            && row.constellation_id.is_some() && row.region_id.is_some()).unwrap();
+        let destination = station::Destination { station_id: station_row.station_id, system_id: station_row.solar_system_id.unwrap(),
+            constellation_id: station_row.constellation_id.unwrap(), region_id: station_row.region_id.unwrap() };
         let kind = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
         let (issuer_account, issuer, corp, account, owner, ship) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
             let issuer_account: i64 = tx.query_one("INSERT INTO game.accounts(user_name,password_hash,role) VALUES(nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
@@ -44,7 +47,7 @@ impl Fixture {
         let row = FreeShip { item_id: ship, type_id: kind, owner_id: owner, corporation_id: corp, alliance_id: -1, pos: [0.0; 3] };
         let prepared = balls::piloted(&db, sde, &row, owner, 0.0).await.ok().unwrap();
         world.with(system, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
-        Self { db, world, account, owner, issuer_account, issuer, corp, ship, system, station }
+        Self { db, world, account, owner, issuer_account, issuer, corp, ship, system, destination }
     }
 
     async fn transition(&self) -> CombatTransition {
@@ -78,7 +81,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run alone"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn committed_dock_completes_kick_after_caller_cancellation() {
     let f = Fixture::new().await;
     let config = crate::config::tests::test_database();
@@ -87,18 +90,19 @@ async fn committed_dock_completes_kick_after_caller_cancellation() {
     let tx = client.transaction().await.unwrap();
     let blocker: i32 = tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
     tx.query_one("SELECT character_id FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2 FOR UPDATE", &[&f.corp, &f.owner]).await.unwrap();
+    let admission = f.world.admission(f.system).unwrap();
     let market = crate::services::market::lock().await;
     let gate = f.world.lock_condition_snapshot(f.system).await.unwrap();
     let transition = f.transition().await;
-    let (world, db, owner, ship, system, station) = (f.world.clone(), f.db.clone(), f.owner, f.ship, f.system, f.station);
-    let caller = tokio::spawn(async move { world.checkpoint_dock(db, owner, ship, system, station, transition, market, gate).await });
+    let (world, db, owner, ship, system, destination) = (f.world.clone(), f.db.clone(), f.owner, f.ship, f.system, f.destination);
+    let caller = tokio::spawn(async move { world.checkpoint_dock(db, owner, ship, system, destination, transition, market, gate, admission).await });
     let result = crate::tests::catch_scenario(async {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let blocked: bool = f.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))) AS blocked", &[&blocker]).await.unwrap().get("blocked");
                 let location: i64 = f.db.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap().get("location_id");
                 let gone = f.world.with(system, move |s| s.ball(ship).is_none()).await.unwrap();
-                if blocked && location == station && gone { break; }
+                if blocked && location == destination.station_id && gone { break; }
                 tokio::task::yield_now().await;
             }
         }).await.expect("committed dock did not reach the blocked kick");
@@ -122,7 +126,7 @@ async fn committed_dock_completes_kick_after_caller_cancellation() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run alone"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn reconciled_dock_kicks_once_and_rollback_does_not_kick() {
     let f = Fixture::new().await;
     let result = crate::tests::catch_scenario(async {
@@ -130,15 +134,17 @@ async fn reconciled_dock_kicks_once_and_rollback_does_not_kick() {
         let (token, generation) = (transition.entries[0].0, transition.entries[0].1.generation);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let plan = Arc::new(DockSettlement { world: Arc::downgrade(&f.world), db: f.db.clone(), character: f.owner,
-            ship: f.ship, system: f.system, station: f.station, token, generation, facts: transition.facts.clone(), expected: None, receipt: Mutex::new(Some(sender)) });
+            ship: f.ship, source_system: f.system, destination: f.destination, token, generation, facts: transition.facts.clone(), bounties: None, expected: None,
+            admission: f.world.admission(f.system).unwrap(), receipt: Mutex::new(Some(sender)) });
         plan.reconcile().await;
         assert!(receiver.await.unwrap().is_err());
         drop(transition);
-        f.db.execute("ALTER TABLE game.characters ADD CONSTRAINT test_dock_governance_rollback CHECK (station_id IS DISTINCT FROM -2) NOT VALID", &[]).await.unwrap();
+        f.db.execute(&format!("ALTER TABLE game.characters ADD CONSTRAINT test_dock_governance_rollback CHECK (station_id IS DISTINCT FROM {}) NOT VALID", f.destination.station_id), &[]).await.unwrap();
+        let admission = f.world.admission(f.system).unwrap();
         let market = crate::services::market::lock().await;
         let gate = f.world.lock_condition_snapshot(f.system).await.unwrap();
         let transition = f.transition().await;
-        let failed = f.world.checkpoint_dock(f.db.clone(), f.owner, f.ship, f.system, f.station, transition, market, gate).await;
+        let failed = f.world.checkpoint_dock(f.db.clone(), f.owner, f.ship, f.system, f.destination, transition, market, gate, admission).await;
         f.db.execute("ALTER TABLE game.characters DROP CONSTRAINT test_dock_governance_rollback", &[]).await.unwrap();
         assert!(failed.is_err());
         assert_eq!(f.counts().await, (f.corp, 0, 0, true));
@@ -147,15 +153,18 @@ async fn reconciled_dock_kicks_once_and_rollback_does_not_kick() {
         assert_eq!(f.db.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap().get::<_, i64>("location_id"), f.system);
         let transition = f.transition().await;
         let (token, generation) = (transition.entries[0].0, transition.entries[0].1.generation);
-        let (owner, ship, station, system) = (f.owner, f.ship, f.station, f.system);
+        let (owner, ship, system, destination) = (f.owner, f.ship, f.system, f.destination);
         f.db.transaction(|tx, _: &mut ()| Box::pin(async move {
-            crate::dao::items::ship::dock(tx, ship, station, infinity_core::consts::FLAG_HANGAR).await?;
-            crate::dao::characters::ship::dock(tx, owner, station, system).await?;
+            tx.execute("UPDATE game.items SET location_id=$2, flag_id=$3, x=NULL, y=NULL, z=NULL WHERE item_id=$1",
+                &[&ship, &destination.station_id, &infinity_core::consts::FLAG_HANGAR]).await?;
+            tx.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3, constellation_id=$4, region_id=$5 WHERE character_id=$1",
+                &[&owner, &destination.station_id, &destination.system_id, &destination.constellation_id, &destination.region_id]).await?;
             Ok::<_, crate::db::Error>(())
         }), |(), ()| async { Ok(()) }).await.unwrap();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let plan = Arc::new(DockSettlement { world: Arc::downgrade(&f.world), db: f.db.clone(), character: owner,
-            ship, system, station, token, generation, facts: transition.facts.clone(), expected: None, receipt: Mutex::new(Some(sender)) });
+            ship, source_system: system, destination, token, generation, facts: transition.facts.clone(), bounties: None, expected: None,
+            admission: f.world.admission(system).unwrap(), receipt: Mutex::new(Some(sender)) });
         plan.clone().reconcile().await;
         assert!(receiver.await.unwrap().is_ok());
         let counts = f.counts().await;

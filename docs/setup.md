@@ -73,6 +73,21 @@ historical incomplete validation is retained as provenance, not a claim that
 node or task gameplay is complete. The ordinary `sde-import` default binary
 and its importer CLI remain unchanged.
 
+Sovereignty indices can be published independently, or combined with the
+adaptation inputs above. Supply a matching client source root and build:
+
+```sh
+cargo run --release --locked -p sde-import --bin adaption-content -- \
+  --sovereignty-source <client-source-root> --client-build <build> \
+  --output <external-root> --publish
+```
+
+The publisher extracts only its supported numeric definitions without executing
+client code. Older version-one roots remain readable without republication.
+Without a current dataset, retained activated index policies continue to serve;
+if none was ever activated the index capability is unavailable while Hub
+ownership remains available. A declared corrupt dataset fails validation.
+
 Set `lua.content_data_dir` or `LUA_CONTENT_DATA_DIR` to the external root.
 The loader checks schema, build, paths, hashes and references against the
 startup SDE, and captures the bundle once per Lua generation; requests do not

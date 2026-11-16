@@ -1,24 +1,44 @@
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway"))]
 use super::*;
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway"))]
 use std::sync::Arc;
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-space", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway", feature = "tests-runtime"))]
 pub(crate) mod fixture;
+#[cfg(feature = "tests-services")]
 mod account;
+#[cfg(feature = "tests-services")]
 mod brawl;
+#[cfg(feature = "tests-services")]
 mod item_descriptor;
+#[cfg(feature = "tests-services")]
 mod keeper;
+#[cfg(feature = "tests-services")]
 mod node_graph;
+#[cfg(feature = "tests-services")]
 mod operations;
+#[cfg(feature = "tests-services")]
 mod world_tasks;
+#[cfg(feature = "tests-services")]
 mod ship_adaption;
+#[cfg(feature = "tests-services")]
 mod travel;
+#[cfg(feature = "tests-services")]
 mod survey_pvp;
+#[cfg(feature = "tests-services")]
 mod platform_login;
+#[cfg(feature = "tests-services")]
 mod platform_tools;
+#[cfg(feature = "tests-services")]
 mod support;
+#[cfg(feature = "tests-services")]
 mod season;
+#[cfg(feature = "tests-services")]
 mod paid_platform;
+#[cfg(feature = "tests-services")]
 mod tourney;
 
+#[cfg(feature = "tests-content")]
 pub(super) fn database_message(error: &anyhow::Error) -> Option<&str> {
     match error.downcast_ref::<crate::db::Error>()? {
         crate::db::Error::Postgres(error) => error.as_db_error().map(|error| error.message()),
@@ -26,21 +46,44 @@ pub(super) fn database_message(error: &anyhow::Error) -> Option<&str> {
     }
 }
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway"))]
 pub(crate) async fn client(db: crate::db::Db, character: i64) -> (Client, tokio::net::TcpStream) {
-    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
-    let cfg = Arc::new(crate::config::Config::default());
+    let sde = crate::tests::shared_sde(&db).await;
+    client_with_sde(db, character, sde).await
+}
+
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway", feature = "tests-runtime"))]
+/// Bind a loopback socket and construct a `Client` from the caller's resources.
+/// Does not load static data, build a world, apply a character, register a
+/// session or start the client.
+pub(crate) async fn connected_client(
+    db: crate::db::Db, sde: std::sync::Arc<crate::sde::Sde>,
+    world: std::sync::Arc<crate::space::World>, cfg: std::sync::Arc<crate::config::Config>,
+    login: crate::handshake::Login,
+) -> (tokio::net::TcpListener, tokio::net::TcpStream, crate::client::Client)
+{
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
-    let conn = crate::conn::Conn::new(stream, address);
-    let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
-    let mut client = Client::new(conn, cfg, db, sde, chat, world, login);
+    let client = crate::client::Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, chat, world, login);
+    (listener, peer, client)
+}
+
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway"))]
+/// Fresh-`Sde` wrapper around the raw client factory: callers supply the static
+/// dataset so tests that mutate static-data rows can pass a freshly loaded
+/// `Sde` instead of the process-wide shared one.
+pub(crate) async fn client_with_sde(db: crate::db::Db, character: i64, sde: Arc<crate::sde::Sde>) -> (Client, tokio::net::TcpStream) {
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    let cfg = Arc::new(crate::config::Config::default());
+    let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
+    let (_listener, peer, mut client) = connected_client(db, sde, world, cfg, login).await;
     client.session.apply(vec![("charid", Value::Int(character))]);
     (client, peer)
 }
 
+#[cfg(feature = "tests-services")]
 #[test]
 fn unit_from_bits_covers_unit_interval() {
     assert_eq!(unit_from_bits(0), 0.0);
@@ -50,6 +93,7 @@ fn unit_from_bits_covers_unit_interval() {
     assert_eq!(unit_from_bits(0x4000_0000_0000_0000), 0.25);
 }
 
+#[cfg(feature = "tests-services")]
 #[test]
 fn surface_offset_includes_radius() {
     let center = [1.0e9, -2.0e9, 3.0e9];
@@ -61,6 +105,7 @@ fn surface_offset_includes_radius() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn login_campaign_fixed_dispatch_roundtrips_none() {
@@ -76,6 +121,7 @@ async fn login_campaign_fixed_dispatch_roundtrips_none() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn rw_nearest_stations_dispatch_roundtrips_without_session_changes() {
@@ -96,6 +142,7 @@ async fn rw_nearest_stations_dispatch_roundtrips_without_session_changes() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn structure_empty_reads_dispatch_without_session_changes() {
@@ -131,6 +178,7 @@ async fn structure_empty_reads_dispatch_without_session_changes() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn map_insurgency_fixed_dispatch_roundtrips_empty_list() {
@@ -161,12 +209,14 @@ async fn map_insurgency_fixed_dispatch_roundtrips_empty_list() {
     assert_eq!(dispatch(&mut client, &unknown).await.unwrap(), Value::None);
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn item_locking_dispatch_returns_empty_collections() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let (mut client, _peer) = client(db, 1).await;
+    let character = fixture::create(&db).await.unwrap();
+    let (mut client, _peer) = client(db.clone(), character.character).await;
     let kwargs = Value::Dict(vec![]);
     let location_args = [Value::Int(1)];
     for (method, args, expected) in [
@@ -178,8 +228,10 @@ async fn item_locking_dispatch_returns_empty_collections() {
         assert_eq!(reply, expected);
         assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), expected);
     }
+    fixture::cleanup(&db, character).await.unwrap();
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn item_fixed_dispatch_roundtrips_encoded_decode_responses() {
@@ -198,6 +250,7 @@ async fn item_fixed_dispatch_roundtrips_encoded_decode_responses() {
     assert_eq!(marshal::loads(&marshal::dumps(&wire_error)).unwrap(), wire_error);
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn character_selection_fixed_dispatch_without_selected_character() {
@@ -215,6 +268,7 @@ async fn character_selection_fixed_dispatch_without_selected_character() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn corporate_mining_ledger_fixed_dispatch_returns_empty_lists() {
@@ -234,6 +288,7 @@ async fn corporate_mining_ledger_fixed_dispatch_returns_empty_lists() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn mobile_binding_callback_dispatch_returns_none() {
@@ -249,6 +304,7 @@ async fn mobile_binding_callback_dispatch_returns_none() {
     }
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn closed_structure_dispatch_preserves_fixture_state() {
@@ -347,6 +403,7 @@ async fn closed_structure_dispatch_preserves_fixture_state() {
     result.unwrap();
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn moon_boundary_dispatch_preserves_fixture_state() {
@@ -414,6 +471,7 @@ async fn moon_boundary_dispatch_preserves_fixture_state() {
     result.unwrap();
 }
 
+#[cfg(feature = "tests-services")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn starbase_boundary_dispatch_preserves_fixture_state() {
@@ -468,4 +526,13 @@ async fn starbase_boundary_dispatch_preserves_fixture_state() {
     fixture::cleanup(&db, owner).await.unwrap();
     fixture::cleanup(&db, foreign).await.unwrap();
     result.unwrap();
+}
+
+#[cfg(feature = "tests-services")]
+#[test]
+fn arg_int_maps_bool_nonint_missing_and_signed() {
+    let args = [Value::Bool(true), Value::unicode("x"), Value::Int(-7)];
+    let kwargs = Value::Dict(vec![]);
+    let call = Call { service: "calendarMgr", method: "DeleteEvent", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+    assert_eq!((arg_int(&call, 0), arg_int(&call, 1), arg_int(&call, 3), arg_int(&call, 2)), (1, 0, 0, -7));
 }

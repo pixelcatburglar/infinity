@@ -230,7 +230,7 @@ async fn return_locked<X: Send>(tx: &(impl Executor + ?Sized), sde: &Arc<Sde>, o
         let prep = refund.deposits.get_mut(&(owner, location, flag, type_id)).ok_or_else(refuse)?;
         let parent = guard.contains_parent(location).then_some(&guard);
         let replaced = crate::services::inventory::hold_storage::Replaced { items: &[], reloads: &group_ids };
-        receipts.push(deposit_prepared(tx, sde, outbox, prep, quantity, ship, Some(locks), parent, replaced, None).await?);
+        receipts.push(deposit_prepared(tx, sde, outbox, prep, quantity, ship, Some(locks), parent, replaced, crate::services::inventory::hold_storage::CapacitySource::Current).await?);
         for row in rows {
             if pending_reloads::take(tx, row.reload_id).await.map_err(db_err)?.as_ref() != Some(&row) { return Err(refuse()); }
         }
@@ -315,4 +315,4 @@ pub(crate) async fn recover_pending_reloads(db: &Db, sde: &Arc<Sde>) -> Result<(
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

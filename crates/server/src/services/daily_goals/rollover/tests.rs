@@ -35,7 +35,7 @@ async fn rescheduled_job_survives_old_periodic_completion() {
 
 
 #[tokio::test]
-#[ignore = "requires isolated process, dedicated initialized SDE database and externally serialized Lua publication"]
+#[ignore = "requires dedicated initialized SDE database and externally serialized Lua publication; run this exact test in its own process"]
 async fn real_rollover_continues_across_online_batches() {
     const CHILD: &str = "INFINITY_DAILY_ROLLOVER_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -45,24 +45,21 @@ async fn real_rollover_continues_across_online_batches() {
         return;
     }
     use infinity_core::consts::FILETIME_DAY;
-    use crate::{dao::{daily_goals::{instances, periods}, lua_content::{self, activations}}, lua::tests::daily_goals::{environment, reload, source}};
+    use crate::{dao::daily_goals::{instances, periods}, lua::tests::daily_goals::{environment, reload, source}};
     let nonce = crate::handshake::random_u64();
     let root = std::env::temp_dir().join(format!("daily-rollover-{nonce}"));
     let a = format!("rollover-{nonce}-a");
     let b = format!("rollover-{nonce}-b");
     source(&root, &a, false);
     let registry = crate::progress::Registry::new(vec![], vec![crate::services::daily_goals::progress::registration()]).unwrap();
-    let (db, resources) = environment(&root, false, registry).await;
-    let row = lua_content::load(&db, "daily_goals", &a).await.unwrap().unwrap();
+    let (db, resources) = environment(&root, registry).await;
     source(&root, &b, false);
     reload().await;
     let now = filetime_now();
     let bounds = periods::bounds(&db, now).await.unwrap();
     let previous = bounds.month_start - 2 * FILETIME_DAY;
-    db.transaction(|tx, _: &mut ()| { let row = row.clone(); Box::pin(async move {
-        assert!(activations::append_if_changed(tx, &row, previous).await?);
-        Ok::<_, crate::db::Error>(())
-    }) }, |(), ()| async { Ok(()) }).await.unwrap();
+    source(&root, &a, false);
+    crate::lua::reload::tests::publish_at(previous).await.unwrap();
     source(&root, &a, false);
     reload().await;
     let mut profiles = Vec::new();

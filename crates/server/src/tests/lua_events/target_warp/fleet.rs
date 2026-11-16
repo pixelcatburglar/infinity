@@ -38,7 +38,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
             let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (stream, address) = listener.accept().await.unwrap();
             let login = crate::handshake::Login { user_id: account, user_name: format!("fleet-event-{account}"), role: 0, client_id: ship, session_id: character, language_id: "EN".into() };
-            let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg.clone(), db.clone(), ctx.resources.sde.clone(), hub.clone(), world.clone(), login);
+            let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg.clone(), db.clone(), ctx.resources.sde.clone(), hub.clone(), world.clone(), login);
             client.change_session(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("corpid", Value::Int(1)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
             clients.push(client);
             peers.push(peer);

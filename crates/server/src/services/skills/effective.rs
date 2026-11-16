@@ -98,5 +98,5 @@ pub(crate) fn project(
     }, at)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-skills"))]
 mod tests;

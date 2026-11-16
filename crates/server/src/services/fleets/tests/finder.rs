@@ -113,21 +113,22 @@ async fn leader_transfer_withdraws_or_refreshes_advert() {
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external listener flock"]
 async fn application_becomes_normal_invitation_without_membership() {
-    use crate::{conn::Conn, handshake::Login};
+    use crate::handshake::Login;
+    use infinity_wire::conn::Conn;
     use std::sync::Arc;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let now = crate::client::filetime_now();
     let account = -now;
-    let leader = 1_500_000_000 + now % 100_000_000;
-    let applicant = leader + 1;
     let name = format!("finder-test-{now}");
     let password: Vec<u8> = Vec::new();
     db.execute("INSERT INTO game.accounts (user_id,user_name,password_hash,role) VALUES ($1,$2,$3,0)", &[&account, &name, &password]).await.unwrap();
-    for id in [leader, applicant] {
-        let character_name = format!("{name}-{id}");
-        db.execute("INSERT INTO game.characters (character_id,user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,$3,1,1,1,$4,0)", &[&id, &account, &character_name, &account]).await.unwrap();
+    let mut characters = [0_i64; 2];
+    let scenario = crate::tests::catch_scenario(async {
+    for (id, suffix) in characters.iter_mut().zip(["leader", "applicant"]) {
+        *id = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,1,1,1,$3,0) RETURNING character_id", &[&account, &format!("{name}-{suffix}"), &account]).await.unwrap().get("character_id");
     }
+    let [leader, applicant] = characters;
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let world = World::new(db.clone(), sde.clone(), 1);
     let (leader_tx, mut leader_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -161,6 +162,8 @@ async fn application_becomes_normal_invitation_without_membership() {
     assert_eq!(invitation.0, "OnFleetInvite");
     assert_eq!(&invitation.1[..2], &[Value::Int(fleet_id), Value::Int(leader)]);
     { let mut st = state(); let f = st.fleets.remove(&fleet_id).unwrap(); assert_eq!(f.invites.get(&applicant), Some(&(10, 11, ROLE_MEMBER))); assert!(!f.members.contains_key(&applicant)); assert!(f.join_requests.is_empty()); st.of.remove(&leader); }
+    }).await;
     db.execute("DELETE FROM game.characters WHERE user_id=$1", &[&account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }

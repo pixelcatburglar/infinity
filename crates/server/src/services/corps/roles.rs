@@ -215,9 +215,7 @@ pub(super) async fn update_members(db: &Db, world: &World, sde: &Arc<Sde>, me: i
                         }
                     }
                     if previous.roles != current.roles || previous.grantable != current.grantable {
-                        let names = ["corprole", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther"];
-                        let masks = [current.roles[0], current.roles[0], current.roles[1], current.roles[2], current.roles[3]];
-                        outbox.notify_pilot(current.character, "__session", names.into_iter().zip(masks).map(|(name, value)| Value::tuple([Value::str(name), Value::Int(value)])).collect());
+                        super::notifications::role_projection(outbox, current.character, current.roles);
                     }
                 }
                 crate::services::sovereignty::invalidate_sources(tx, outbox, &changed_sources).await?;
@@ -387,9 +385,7 @@ async fn mutate_titles(db: &Db, world: &World, sde: &Arc<Sde>, me: i64, corp: i6
                         if previous.roles[0] & ROLE_DIRECTOR != 0 && current.roles[0] & ROLE_DIRECTOR == 0 {
                             pending_kicks::cancel_issued(tx, corp, current.character).await.map_err(db_err)?;
                         }
-                        let names = ["corprole", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther"];
-                        let masks = [current.roles[0], current.roles[0], current.roles[1], current.roles[2], current.roles[3]];
-                        outbox.notify_pilot(current.character, "__session", names.into_iter().zip(masks).map(|(name, value)| Value::tuple([Value::str(name), Value::Int(value)])).collect());
+                        super::notifications::role_projection(outbox, current.character, current.roles);
                     }
                 }
                 crate::services::sovereignty::invalidate_sources(tx, outbox, &changed_sources).await?;
@@ -466,7 +462,6 @@ pub(super) async fn resign_ceo(db: &Db, sde: &Arc<Sde>, world: &World, me: i64, 
             if !potential_ceos(db, sde, corp, me).await?.contains(&next) {
                 return Err(notify_error(messages::MEMBER_CANNOT_BECOME_CEO));
             }
-            let masks = sde.corporation_roles.scope_masks();
             let now = filetime_now();
             db.transaction(
                 |tx, outbox: &mut Outbox| {
@@ -478,35 +473,7 @@ pub(super) async fn resign_ceo(db: &Db, sde: &Arc<Sde>, world: &World, me: i64, 
                     if members(tx, corp, registry::MemberFilter::Include, &[me]).await?.first().and_then(|row| row.station_id).is_none() {
                         return Err(notify_error(messages::corporations::CEO_RESIGN_DOCK));
                     }
-                    let before_old = permissions::load(tx, me).await?.ok_or_else(|| notify_error(messages::MEMBER_CANNOT_BECOME_CEO))?;
-                    let before_next = permissions::load(tx, next).await?.ok_or_else(|| notify_error(messages::MEMBER_CANNOT_BECOME_CEO))?;
-                    if before_next.blocked { return Err(notify_error(messages::MEMBER_CANNOT_BECOME_CEO)); }
-                    if !role_dao::transfer_ceo(tx, corp, me, next, masks).await.map_err(db_err)? { return Err(notify_error(messages::MEMBER_CANNOT_BECOME_CEO)); }
-                    crate::services::sovereignty::invalidate_sources(tx, outbox, &[me, next]).await?;
-                    role_dao::removal_clock(tx, next, None).await.map_err(db_err)?;
-                    if let Some(pending) = crate::dao::corporations::pending_kicks::get(tx, corp, next).await.map_err(db_err)? {
-                        crate::dao::corporations::pending_kicks::delete(tx, corp, next).await.map_err(db_err)?;
-                        pending_kicks::cancel(tx, &pending).await.map_err(db_err)?;
-                    }
-                    if !permissions::has(tx, me, corp, ROLE_DIRECTOR).await? {
-                        pending_kicks::cancel_issued(tx, corp, me).await.map_err(db_err)?;
-                    }
-                    audit::event(tx, me, me, corp, audit::CEASED_CEO, now).await?;
-                    audit::event(tx, next, me, corp, audit::BECAME_CEO, now).await?;
-                    for (char_id, before) in [(me, before_old), (next, before_next)] {
-                        let after = permissions::load(tx, char_id).await?.ok_or_else(|| notify_error(messages::MEMBER_CANNOT_BECOME_CEO))?;
-                        for scope in 0..4 {
-                            crate::dao::corporations::audit::role(tx, char_id, corp, me, now, before.roles[scope], after.roles[scope], false, scope as i16).await.map_err(db_err)?;
-                        }
-                        let names = ["corprole", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther"];
-                        let values = [after.roles[0], after.roles[0], after.roles[1], after.roles[2], after.roles[3]];
-                        outbox.notify_pilot(char_id, "__session", names.into_iter().zip(values).map(|(key, mask)| Value::tuple([Value::str(key), Value::Int(mask)])).collect());
-                    }
-                    let audience = crate::dao::characters::members::active_ids(tx, corp).await.map_err(db_err)?;
-                    notifications::ceo(tx, outbox, &audience, corp).await?;
-                    let change = Value::dict([("ceoID", Value::tuple([Value::Int(me), Value::Int(next)]))]);
-                    for recipient in &audience { outbox.notify_pilot(*recipient, "OnCorporationChanged", vec![Value::Int(corp), change.clone()]); }
-                    Ok(())
+                    ceo::handover_in(tx, &sde, outbox, corp, me, next, me, now).await
                     })
                 },
                 |value, outbox| async move { crate::scheduler::wake(); dispatch_world(value, outbox, world) },

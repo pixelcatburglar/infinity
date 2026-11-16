@@ -46,6 +46,23 @@ generation swap; after a crash in that interval, rebuilding the same files
 reuses the latest activation rather than recording a second publication. Retain
 both package bytes and activation history when backing up or restoring.
 
+At startup every stored package and activation is loaded once into one shared
+catalogue, whether or not Lua is enabled; operations resolve packages and
+history from memory and never read the tables again. When Lua is disabled, the
+catalogue still validates retained identities and sovereignty recovery still
+runs, but current content and development indices are unavailable; ordinary
+scheduler, progress and rollover jobs continue. Disabled mode does not compile
+Lua policy semantics, and no VM calls, authored policy pins or script events are
+started. The
+publication step is the only runtime writer: after its transaction commits it
+installs the new packages and appended activations into the catalogue, then
+swaps the generation; a failed commit changes nothing. Packages are validated
+once when they enter the catalogue, so a corrupted stored package or activation
+reference fails startup and must be fixed in the tables before restarting.
+Direct edits to the tables outside publication take effect at the next
+restart. The retained adaptation definitions are built without a Lua VM, so
+the ship-adaptation read service answers identically when Lua is disabled.
+
 The shipped `ship_adaption_mgr.lua` uses the generic context operations:
 
 ```lua
@@ -321,6 +338,13 @@ is cancelled and must never be stored for later use.
 The shipped sovereignty RPC script claims four exact `sovMgr` reads and the bound alliance structure and capital reads; `ctx:content_snapshot('sovereignty')` returns the host's typed, already encoded result for the current request. It is not a generic selector or a grant of authority. For the two bound alliance reads, the request must be bound with exactly `Tuple(Int(allianceID), Int(1))` and no arguments or keyword arguments. The host checks the character's current database corporation-to-alliance membership for that request against the selector. OID provenance, session fallback and the second tuple value do not grant authority. Context expiry applies to this host function too; the existing call ABI is unchanged.
 
 The authored sovereignty policy package defines capital initialization, capital loss and self-destruct rules. Policy evaluation uses restricted immutable inputs; deployment and capture obligations retain their required frozen parameters and content identity. Package versions are immutable: reusing a namespace and version for different bytes is refused. Reload prepares and persists the replacement before publication, and a failed reload keeps the old generation; only the current generation admits new writes. Referenced older packages are retained and reopened for existing obligations. Missing, corrupt or incompatible packages fail closed rather than substituting the latest policy.
+
+The separate sovereignty-indices package combines server-authored Lua policy
+with the external dataset. The original sovereignty package and older version-one
+roots remain unchanged. Activated historical packages are retained for replay,
+including when the current root no longer contains the dataset. A missing host,
+never-activated capability or missing retained package is unavailable; invalid
+available data is an error, not an omitted or fabricated multiplier.
 
 Startup recovery validates referenced packages before opening Hub admission, cancels unfinished self-destruct requests and reanchors capture without offline progress. Shutdown closes admission before the existing market fence drains. For rollback, preserve a mutually compatible server binary, database and every referenced authored policy package; an older binary or database alone is not a safe rollback.
 

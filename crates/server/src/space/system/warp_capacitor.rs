@@ -1,14 +1,16 @@
 //! Activation-time capacitor payment and completed-state warp correction.
 //! Fitted dogma supplies pricing; capacitor state remains process-local.
+//! Corrections use the live observer audience rather than membership replay.
 
 use super::*;
+use crate::space::system::observers::DestinyAudience;
 use infinity_core::consts::dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_RECHARGE_RATE, ATTR_WARP_CAPACITOR_NEED};
 use crate::services::combat::groups_health::drain_warp_capacitor;
 use crate::services::effects::notify::attribute_change;
 use crate::services::fit::Key;
 
 impl System {
-    pub(super) fn prepare_warp_activation(&mut self, ship: i64, stamp: i64, logical_ms: i64) {
+    pub(super) fn prepare_warp_activation(&mut self, ship: i64, stamp: i64, logical_ms: i64, collisions: bool) {
         let Some(intent) = self.warp_exits.get(&ship) else { return };
         if !intent.pending { return; }
         let Some(ball) = self.balls.get(&ship) else { self.cancel_warp_intent(ship); return };
@@ -35,7 +37,7 @@ impl System {
         });
         if !valid {
             tracing::error!(ship, "invalid warp capacitor state");
-            self.stop_unpaid_warp(ship, stamp);
+            self.stop_unpaid_warp(ship, stamp, collisions);
             return;
         }
         let (_, cost, capacity_tau) = values.unwrap();
@@ -53,7 +55,7 @@ impl System {
             }
         }
         if debit.drained == 0.0 {
-            self.stop_unpaid_warp(ship, stamp);
+            self.stop_unpaid_warp(ship, stamp, collisions);
         } else if debit.drained < cost {
             let shortened = add(pos, scale(sub(endpoint, pos), debit.drained / cost));
             self.balls.get_mut(&ship).unwrap().activate_warp_to(stamp, shortened);
@@ -69,24 +71,28 @@ impl System {
         }
     }
 
-    fn stop_unpaid_warp(&mut self, ship: i64, stamp: i64) {
+    fn stop_unpaid_warp(&mut self, ship: i64, stamp: i64, collisions: bool) {
         self.cancel_warp_intent(ship);
-        self.apply_command(ship, stamp, |ball, stamp, _| {
+        self.apply_command(ship, stamp, collisions, |ball, stamp, _| {
             ball.stop();
             vec![event(stamp, "Stop", vec![Value::Int(ship)])]
         });
     }
 
+    /// Completed-state warp corrections. They run before the boundary scene
+    /// projection, so `Visible` resolves to the pre-delta committed holders:
+    /// an observer that gains the ball only through this boundary's delta
+    /// already gets its corrected state inside the Add, never a second one.
     pub(super) fn broadcast_warp_corrections(&mut self, stamp: i64, collisions: bool) {
         for index in 0..self.warp_corrections.len() {
             let ship = self.warp_corrections[index];
             if let Some(ball) = self.balls.get(&ship) {
                 let visibility = (ball.id, ball.cloak);
                 let update = add_balls_event(stamp, ball, collisions);
-                self.deliver(Some(visibility), vec![update]);
+                self.emit_destiny(DestinyAudience::Visible { id: visibility.0, cloak: visibility.1 }, vec![update]);
             }
         }
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

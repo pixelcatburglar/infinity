@@ -8,21 +8,15 @@ use crate::{client::Client, dao::{accounts::plex, characters::persistence, items
 use super::notifications::{notify_item_change, notify_item_removed};
 
 fn invalid() -> CallError { notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION) }
-fn integer(value: Option<&Value>) -> Option<i64> {
-    match value { Some(Value::Int(n)) => Some(*n), _ => None }
-}
-fn quantity(value: Option<&Value>) -> Option<i64> {
-    integer(value).filter(|n| *n > 0)
-}
 
 pub(super) async fn convert(c: &mut Client, call: &Call<'_>, withdrawal: bool) -> CallResult {
     let args = call.args;
     let (location, amount, item) = if withdrawal {
-        if args.len() != 4 || !args.get(2).and_then(Value::as_text).is_some_and(|v| v == "VaultToMarket") || integer(args.get(3)) != Some(i64::from(FLAG_HANGAR)) { return Err(invalid()); }
-        (integer(args.get(1)), quantity(args.first()), None)
+        if args.len() != 4 || !args.get(2).and_then(Value::as_text).is_some_and(|v| v == "VaultToMarket") || crate::services::value_int(args.get(3)) != Some(i64::from(FLAG_HANGAR)) { return Err(invalid()); }
+        (crate::services::value_int(args.get(1)), crate::services::value_positive_id(args.first()), None)
     } else {
         if args.len() != 4 || !args.get(3).and_then(Value::as_text).is_some_and(|v| v == "InventoryToVault") { return Err(invalid()); }
-        (integer(args.first()), quantity(args.get(2)), integer(args.get(1)))
+        (crate::services::value_int(args.first()), crate::services::value_positive_id(args.get(2)), crate::services::value_int(args.get(1)))
     };
     let location = location.ok_or_else(invalid)?;
     let amount = amount.ok_or_else(|| notify_error(messages::INSUFFICIENT_ITEM_QUANTITY))?;
@@ -66,4 +60,4 @@ pub(super) async fn convert(c: &mut Client, call: &Call<'_>, withdrawal: bool) -
     }, |value, outbox| async move { crate::db::outbox::dispatch_client(value, outbox, c) }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

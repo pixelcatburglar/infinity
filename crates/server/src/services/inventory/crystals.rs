@@ -82,5 +82,5 @@ pub(super) async fn get_damage(c: &Client, call: &Call<'_>) -> Result<Value, Cal
     Ok(Value::Dict(result))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-inventory"))]
 mod tests;

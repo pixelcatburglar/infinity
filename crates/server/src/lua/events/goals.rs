@@ -23,7 +23,7 @@ pub(crate) fn metadata(event: &GameEvent) -> Option<(i64, &FactContext)> {
 pub(crate) fn validate(event: &GameEvent) -> anyhow::Result<()> {
     let (time, context) = metadata(event).ok_or_else(|| anyhow::anyhow!("not a daily goal event"))?;
     anyhow::ensure!(time > 0 && [context.corporation_id, context.alliance_id, context.faction_id, context.ship_id, context.system_id, context.station_id].iter().flatten().all(|id| *id > 0) && context.ship_type_id.is_none_or(|id| id > 0), "invalid daily fact context");
-    let uuid = |s: &str| crate::uuid_text::parse(s, crate::uuid_text::Case::Lowercase).is_some();
+    let uuid = |s: &str| infinity_content::uuid_text::parse(s, infinity_content::uuid_text::Case::Lowercase).is_some();
     match event {
         GameEvent::DailyGoalCompleted { char_id, goal_id, category, period, period_start, period_end, paid, reason, .. } => {
             let origin_ok = match reason { CompletionReason::Natural | CompletionReason::Paid => context.origin == FactOrigin::Natural, CompletionReason::Qa => context.origin == FactOrigin::Qa, CompletionReason::Derived => matches!(context.origin, FactOrigin::Natural | FactOrigin::Qa) };
@@ -51,4 +51,4 @@ pub(crate) fn encode_lua(event: &GameEvent, lua: &Lua, table: &Table) -> mlua::R
     }
     Ok(())
 }
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

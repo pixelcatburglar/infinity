@@ -71,4 +71,4 @@ pub(super) async fn start_training(c: &mut Client, char_id: i64, args: &[Value])
     }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

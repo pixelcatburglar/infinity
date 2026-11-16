@@ -70,4 +70,4 @@ impl Dogma {
     pub(crate) fn effect_count(&self) -> usize { self.effects.len() }
 }
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-effects", feature = "tests-space")))] pub(crate) mod tests;

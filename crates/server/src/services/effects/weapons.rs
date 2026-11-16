@@ -1,28 +1,35 @@
-//! Turret accuracy and missile launches using fitted dogma and charge data.
+//! Turret accuracy and missile launches using fitted dogma, module-owned
+//! damage for turrets with no charge compatibility, and charge data otherwise.
 //! Mirrors clientDogmaLocation and michelle, with accuracy from native GetAccuracy
-//! and SDE attributes; missile flight remains an approximation of native physics.
+//! and SDE attributes; missiles fly as actor-owned native-steered flights that
+//! detonate on swept target contact or expire at their effective lifetime.
 //! Admitted combat source identities remain frozen until their damage is resolved.
+//! Fitted player turret banks fire as one volley: the master's captured roll
+//! inputs, summed member raw damage and one `isBanked` report per observer.
+//! The shared precursor-turret spool binds once per activation to a target
+//! incarnation and resolves wholly inside the final actor turn.
 use super::lifecycle::Module;
+use super::parameters::{MissileInputs, SourceInputs, TurretInputs};
 use super::space_source::PreparedCombatAttempt;
-use crate::services::combat::{quantity_change, Ctx, ATTR_DAMAGE};
-use crate::services::combat::damage::{apply_damage_guarded, DamageSource};
+use super::spool::{SpoolBinding, SpoolParameters, SpoolState};
+use crate::services::combat::{quantity_change, state, Ctx, ATTR_DAMAGE};
+use crate::services::combat::damage::{apply_damage_guarded, apply_damage_in_actor, DamageSource};
+use crate::services::combat::targeting_charges::targets_of;
 use crate::services::fit::{Fit, Key};
-use crate::services::{db_err, rand01, CallError};
-use infinity_core::consts::{dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED};
+use crate::services::{rand01, CallError};
+use infinity_core::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED};
 use crate::db::Db;
-use crate::db::outbox::{dispatch_world, Outbox};
+use crate::space::combat::inputs::ChargeToken;
+use crate::space::combat::loaded::LoadedPermit;
+use crate::space::combat::CombatPhase;
 use crate::sde::Sde;
-use crate::space::{dist, ms_to_seconds, now_ms, seconds_to_ms, Ball, World};
+use crate::space::{dist, now_ms, Ball, System, World, MODE_WARP};
 use marshal::Value;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
-/// Existing missile flight-time clamp.
-const MIN_MISSILE_FLIGHT_SECONDS: f64 = 0.5;
-/// Existing missile flight-time clamp.
-const MAX_MISSILE_FLIGHT_SECONDS: f64 = 30.0;
-/// Existing missile reach tolerance.
-const MISSILE_REACH_ALLOWANCE_METRES: f64 = 2000.0;
+pub(in crate::services::effects) mod bank;
+
 /// SDE signatureRadius default when the attribute metadata is unavailable.
 const DEFAULT_SIGNATURE_RADIUS: f64 = 100.0;
 /// Existing turret falloff hit-chance formula.
@@ -68,48 +75,29 @@ pub(super) fn next_missile_id() -> i64 {
     NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Use one charge from a module; `None` when it is empty.
-pub(super) async fn consume_charge(cx: &Ctx, module: &Module, expected: Option<i32>) -> Result<Option<i32>, CallError> {
-    let (ship, flag, char_id) = (cx.ship_id, module.flag, cx.char_id);
-    let notify = cx.notify.clone();
-    cx.db.transaction(
-        |tx, outbox: &mut Outbox| {
-            let notify = notify.clone();
-            Box::pin(async move {
-            if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?
-                || !crate::dao::items::pending_reloads::for_flags(tx, ship, &[flag]).await.map_err(db_err)?.is_empty() {
-                return Ok(None);
-            }
-            if let Some(expected) = expected {
-                if crate::services::combat::targeting_charges::loaded(tx, ship, flag).await?.is_none_or(|(kind, quantity)| kind != expected || quantity <= 0) {
-                    return Ok(None);
-                }
-            }
-            let Some(r) = crate::dao::items::combat::consume_charge(tx, ship, flag).await.map_err(db_err)? else { return Ok(None) };
-            if r.quantity == 0 {
-                crate::dao::items::combat::delete_empty_charge(tx, ship, flag).await.map_err(db_err)?;
-            }
-            outbox.notify_sender(notify, "OnModuleAttributeChanges", vec![quantity_change(char_id, ship, flag, r.type_id, r.quantity as i64, r.quantity as i64 + 1)]);
-            Ok(Some(r.type_id))
-            })
-        },
-        |value, outbox| async move { dispatch_world(value, outbox, &cx.world) },
-    ).await
+/// Pay one admitted loaded use through the actor: the member's captured
+/// permit and charge token debit one unit, remove an emptied node in the same
+/// turn and emit the quantity delta; any refusal releases the permit unpaid.
+pub(super) async fn consume_charge(cx: &Ctx, permit: Option<LoadedPermit>, token: Option<ChargeToken>) -> Option<i32> {
+    let Some(permit) = permit else { return None };
+    let flag = permit.flag;
+    let Some(token) = token else {
+        cx.world.post(cx.system_id, move |s| s.release_loaded_use(permit));
+        return None;
+    };
+    let (type_id, remaining) = cx.world.with(cx.system_id, move |s| match s.consume_fitted_loaded(permit, token) {
+        done @ Some(_) => done,
+        None => { s.release_loaded_use(permit); None }
+    }).await.flatten()?;
+    cx.notify("OnModuleAttributeChanges", vec![quantity_change(cx.char_id, cx.ship_id, flag, type_id, remaining, remaining + 1)]);
+    Some(type_id)
 }
 
-/// Confirm an uncharged ancillary cycle did not race a reload or a new charge.
-pub(super) async fn empty_charge(cx: &Ctx, module: &Module) -> Result<bool, CallError> {
-    let (ship, flag) = (cx.ship_id, module.flag);
-    cx.db.transaction(
-        |tx, _: &mut Outbox| Box::pin(async move {
-            if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?
-                || !crate::dao::items::pending_reloads::for_flags(tx, ship, &[flag]).await.map_err(db_err)?.is_empty() {
-                return Ok(false);
-            }
-            Ok(crate::services::combat::targeting_charges::loaded(tx, ship, flag).await?.is_none_or(|(_, quantity)| quantity <= 0))
-        }),
-        |value, outbox| async move { dispatch_world(value, outbox, &cx.world) },
-    ).await
+/// An uncharged ancillary cycle may proceed only while the actor proves the
+/// slot has no quantity and no pending, held or unknown race on it.
+pub(super) async fn empty_charge(cx: &Ctx, module: &Module) -> bool {
+    let (ship, module) = (cx.ship_id, module.id);
+    cx.world.with(cx.system_id, move |s| s.loaded_empty_proof(ship, module)).await.unwrap_or(false)
 }
 
 /// The game's hit quality for the combat log: 0 miss .. 6 wrecking.
@@ -179,13 +167,13 @@ pub(crate) fn turret_roll(chance: f64) -> f64 {
 }
 
 /// `OnDamageMessage` for the shooter (`target`) or the victim (`source`).
-pub(super) fn damage_message(key: &str, other: i64, weapon: i32, damage: f64, quality: i64) -> Value {
+pub(super) fn damage_message(key: &str, other: i64, weapon: i32, damage: f64, quality: i64, banked: bool) -> Value {
     Value::dict([
         (key, Value::Int(other)),
         ("weapon", Value::Int(weapon as i64)),
         ("damage", Value::Float(damage)),
         ("hitQuality", Value::Int(quality)),
-        ("isBanked", Value::Bool(false)),
+        ("isBanked", Value::Bool(banked)),
         // uilog: "me" picks AttackHits ("to {target}"), "otherPlayerWeapons" AttackHitsR
         // ("from {source}").
         ("attackType", Value::str(if key == "source" { "otherPlayerWeapons" } else { "me" })),
@@ -194,19 +182,88 @@ pub(super) fn damage_message(key: &str, other: i64, weapon: i32, damage: f64, qu
 }
 
 /// Tell both sides of a hit: the shooter (if a pilot) and the victim (if a pilot).
-pub(crate) fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot: Option<i64>, target_pilot: Option<i64>, weapon: i32, damage: f64, quality: i64) {
+pub(crate) fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot: Option<i64>, target_pilot: Option<i64>, weapon: i32, damage: f64, quality: i64, banked: bool) {
     if let Some(ch) = shooter_pilot {
-        world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("target", target, weapon, damage, quality)]);
+        world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("target", target, weapon, damage, quality, banked)]);
     }
     if let Some(ch) = target_pilot {
-        world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("source", shooter, weapon, damage, quality)]);
+        world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("source", shooter, weapon, damage, quality, banked)]);
     }
+}
+
+/// The shared fitted-source check inside the actor: master's activation
+/// generation owns the activation, the pilot flies a live, unwarped ship and
+/// the admitted source membership stands. Singleton shots and bank volleys
+/// share this one predicate.
+pub(crate) fn fitted_source_current(s: &System, ship: i64, master: i64, pilot: i64, stop: &Arc<AtomicBool>, source_membership: Option<u64>) -> bool {
+    !stop.load(Ordering::Relaxed)
+        && state().active.get(&master).is_some_and(|active|
+            active.char_id == pilot && !active.forced_inactive && Arc::ptr_eq(&active.stop, stop))
+        && s.combat_membership_generation(ship) == source_membership
+        && s.combat_phase(ship) == Some(CombatPhase::Live)
+        && s.pilot_ball(pilot).is_some_and(|ball| ball.id == ship && ball.mode != MODE_WARP)
+}
+
+/// The shared locked-target check: the frozen combat generation, still live
+/// (not dying, transitioning or replaced) and still locked by the pilot.
+pub(crate) fn fitted_target_current(s: &System, pilot: i64, target: i64, target_generation: u64) -> bool {
+    s.combat_membership_generation(target) == Some(target_generation)
+        && s.combat_phase(target) == Some(CombatPhase::Live)
+        && targets_of(pilot).contains(&target)
+}
+
+/// The typed spool context a turret shot carries between its admission and
+/// the final actor turn. `Fitted` borrows the member buffer's bound state so
+/// the caller can write the advanced ramp back; `Npc` reads and commits the
+/// brain-owned ramp inside the actor, so its result carries no state.
+pub(crate) enum TurretSpool {
+    Fitted {
+        binding: SpoolBinding,
+        module: i64,
+        master: i64,
+        pilot: i64,
+        stop: Arc<AtomicBool>,
+        parameters: SpoolParameters,
+        state: SpoolState,
+    },
+    Npc { binding: SpoolBinding, parameters: SpoolParameters },
+}
+
+/// A fitted member's committed ramp after a fired shot: the advanced pure
+/// state and the bonus this shot actually applied.
+pub(crate) struct FittedSpoolResult {
+    pub(crate) state: SpoolState,
+    pub(crate) applied_bonus: f64,
+}
+
+/// How one turret shot ended: only an admitted, rolled shot counts as fired —
+/// a genuine miss and a fully resisted accepted hit both advance the ramp,
+/// while guard refusal, an unadmitted source, a replaced incarnation or an
+/// out-of-optimal gap do not.
+pub(crate) enum TurretResolution {
+    NotFired,
+    Fired { fitted_spool: Option<FittedSpoolResult> },
 }
 
 /// Resolve and apply one source-neutral turret shot.
 pub(crate) async fn turret_shot(db: &Db, world: &Arc<World>, system: i64, source: &Ball, target: &Ball,
     attacker: Option<i64>, weapon: i32, illegal: bool, parameters: (f64, f64, f64, f64), raw: [f64; 4],
-    guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
+    guard: Option<super::space_source::SourceGuard>, spool: Option<TurretSpool>, attempt: PreparedCombatAttempt) -> Result<TurretResolution, CallError> {
+    turret_shot_with_roll(db, world, system, source, target, attacker, weapon, illegal, parameters, raw, guard, spool, attempt, turret_roll).await
+}
+
+/// The shared single-shot core behind `turret_shot`; the roll step is a plain
+/// injected call so singleton tests can steer it without any global hook.
+/// A spooled shot resolves entirely inside one actor turn; a plain shot keeps
+/// the original sample-then-guarded-apply shape.
+#[allow(clippy::too_many_arguments)]
+async fn turret_shot_with_roll(db: &Db, world: &Arc<World>, system: i64, source: &Ball, target: &Ball,
+    attacker: Option<i64>, weapon: i32, illegal: bool, parameters: (f64, f64, f64, f64), raw: [f64; 4],
+    guard: Option<super::space_source::SourceGuard>, spool: Option<TurretSpool>, mut attempt: PreparedCombatAttempt,
+    roll: impl FnOnce(f64) -> f64 + Send + 'static) -> Result<TurretResolution, CallError> {
+    if let Some(spool) = spool {
+        return turret_spool_shot(db, world, system, source, target, weapon, illegal, parameters, raw, guard, spool, attempt, roll).await;
+    }
     let (optimal, falloff, tracking, signature) = parameters;
     let source_id = source.id;
     let target_id = target.id;
@@ -220,9 +277,9 @@ pub(crate) async fn turret_shot(db: &Db, world: &Arc<World>, system: i64, source
         let victim = s.combat_owner(target_id);
         s.drone_attack(source_id, target_id);
         Some((source, target, victim, generation))
-    }).await else { return Ok(()) };
+    }).await else { return Ok(TurretResolution::NotFired) };
     let chance = turret_chance(&sampled_source, &sampled_target, optimal, falloff, tracking, signature, target_signature(world.sde(), &sampled_target));
-    let multiplier = turret_roll(chance);
+    let multiplier = roll(chance);
     let _ = attacker;
     let mut illegal = illegal;
     if matches!(guard, Some(super::space_source::SourceGuard::Drone { .. })) {
@@ -237,27 +294,149 @@ pub(crate) async fn turret_shot(db: &Db, world: &Arc<World>, system: i64, source
             weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
         }, false, move |s| s.combat_membership_generation(target_id) == Some(target_generation)
             && guard.is_none_or(|guard| guard.valid(s))).await?;
-        if outcome.is_some() { attempt.disarm(); }
-        outcome.map_or(0.0, |outcome| outcome.dealt)
+        match outcome {
+            // A guard, target or damage refusal is not a shot: the attempt
+            // drops with its normal finish semantics and nothing reports.
+            None => return Ok(TurretResolution::NotFired),
+            Some(outcome) => { attempt.disarm(); outcome.dealt }
+        }
     } else { 0.0 };
-    report_hit(world, source_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, hit_quality(multiplier));
-    Ok(())
+    report_hit(world, source_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, hit_quality(multiplier), false);
+    Ok(TurretResolution::Fired { fitted_spool: None })
 }
 
-/// Calculate a fitted turret's parameters and unscaled typed damage.
-pub(super) fn turret_parameters(fit: &Fit, module: &Module) -> ((f64, f64, f64, f64), [f64; 4]) {
+/// Resolve one spooling turret shot inside a single actor turn: the bound
+/// identities, sampled geometry, bonus-scaled roll, damage application and
+/// ramp commit share the turn, so a queued successor can never observe or
+/// spend a stale bonus. The member's ramp bonus scales its own raw before the
+/// roll multiplier; the turn's surface gap gates the beam at `optimal` rather
+/// than degrading into a zero chance roll. A genuine miss and a fully
+/// resisted accepted hit both count as fired and advance the ramp.
+#[allow(clippy::too_many_arguments)]
+async fn turret_spool_shot(
+    db: &Db, world: &Arc<World>, system: i64, source: &Ball, target: &Ball,
+    weapon: i32, illegal: bool, parameters: (f64, f64, f64, f64), raw: [f64; 4],
+    guard: Option<super::space_source::SourceGuard>, mut spool: TurretSpool,
+    mut attempt: PreparedCombatAttempt,
+    roll: impl FnOnce(f64) -> f64 + Send + 'static,
+) -> Result<TurretResolution, CallError> {
+    let source_id = source.id;
+    let target_id = target.id;
+    let facts = attempt.facts();
+    let shooter_pilot = facts.actual_actor_character;
+    let sde = world.sde().clone();
+    let db_worker = db.clone();
+    /// The actor turn's verdict carried back to the worker: the typed
+    /// resolution, the report values and any loss receipt to await outside.
+    struct Turn {
+        resolution: TurretResolution,
+        dealt: f64,
+        multiplier: f64,
+        victim_pilot: Option<i64>,
+        receipt: Option<tokio::sync::oneshot::Receiver<Result<(), CallError>>>,
+    }
+    let turn = world.with(system, move |s| -> Result<Turn, CallError> {
+        // An NPC bound shot that cannot fire ends its ramp and beam inside
+        // this same turn: nothing queues a reset behind a later shot.
+        let npc_binding = match &spool { TurretSpool::Npc { binding, .. } => Some(*binding), _ => None };
+        let not_fired = |attempt: &mut PreparedCombatAttempt, s: &mut crate::space::System| {
+            if let Some(binding) = npc_binding { s.npc_spool_reset(source_id, binding); }
+            attempt.finish_in_actor(s);
+            Turn { resolution: TurretResolution::NotFired, dealt: 0.0, multiplier: 0.0, victim_pilot: None, receipt: None }
+        };
+        if guard.is_some_and(|guard| !guard.valid(s)) { return Ok(not_fired(&mut attempt, s)); }
+        // The bound identity is the only ramp authority; current membership
+        // values are compared, never rebound.
+        let bonus = match &mut spool {
+            TurretSpool::Fitted { binding, module, master, pilot, stop, parameters, state, .. } => {
+                // The singleton path only fires the activation's own master.
+                debug_assert_eq!(module, master);
+                if binding.target != target_id
+                    || !fitted_source_current(s, source_id, *master, *pilot, stop, Some(binding.source_membership))
+                    || !fitted_target_current(s, *pilot, target_id, binding.target_membership) {
+                    return Ok(not_fired(&mut attempt, s));
+                }
+                state.current(*parameters)
+            }
+            TurretSpool::Npc { binding, parameters } => {
+                if binding.target != target_id { return Ok(not_fired(&mut attempt, s)); }
+                match s.npc_spool_current(source_id, *binding, *parameters) {
+                    Some(bonus) => bonus,
+                    None => return Ok(not_fired(&mut attempt, s)),
+                }
+            }
+        };
+        let Some((sampled_source, sampled_target)) = s.sampled_ball(source_id).zip(s.sampled_ball(target_id)) else {
+            return Ok(not_fired(&mut attempt, s));
+        };
+        let (_, surface, _, _) = turret_geometry(&sampled_source, &sampled_target);
+        if surface > parameters.0 { return Ok(not_fired(&mut attempt, s)); }
+        s.drone_attack(source_id, target_id);
+        let chance = turret_chance(&sampled_source, &sampled_target, parameters.0, parameters.1, parameters.2, parameters.3,
+            target_signature(&sde, &sampled_target));
+        let multiplier = roll(chance);
+        let victim_pilot = s.combat_owner(target_id);
+        let (dealt, receipt) = if multiplier > 0.0 {
+            // Once invoked, the helper finishes this attempt's token on every
+            // return; a fired attempt is disarmed, never finished twice.
+            match apply_damage_in_actor(s, &db_worker, system, target_id,
+                raw.map(|damage| damage * (1.0 + bonus) * multiplier), DamageSource {
+                    attacker_id: shooter_pilot, attacker_ball_id: Some(facts.entity.item_id),
+                    source_ship_id: Some(facts.entity.item_id), source_ship_type: Some(facts.entity.type_id),
+                    weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
+                }, false)
+            {
+                Ok(Some((outcome, receipt))) => (outcome.dealt, receipt),
+                // The helper already finished the token; disarm it without
+                // finishing twice and report the refusal as not fired.
+                Ok(None) => { attempt.disarm(); return Ok(not_fired(&mut attempt, s)); },
+                Err(error) => { attempt.disarm(); return Err(error); }
+            }
+        } else {
+            // A genuine miss still fires and reports zero damage.
+            attempt.finish_in_actor(s);
+            (0.0, None)
+        };
+        // The accepted point advances the ramp exactly once, in the same turn.
+        let fitted_spool = match spool {
+            TurretSpool::Fitted { mut state, parameters, .. } => {
+                state.advance(parameters);
+                Some(FittedSpoolResult { state, applied_bonus: bonus })
+            }
+            TurretSpool::Npc { binding, parameters } => {
+                s.npc_spool_advance(source_id, binding, parameters);
+                None
+            }
+        };
+        if multiplier > 0.0 { attempt.disarm(); }
+        Ok(Turn { resolution: TurretResolution::Fired { fitted_spool }, dealt, multiplier, victim_pilot, receipt })
+    }).await;
+    let Some(turn) = turn else { return Err(CallError::Internal(anyhow::anyhow!("combat actor unavailable"))) };
+    let turn = turn?;
+    if let Some(receipt) = turn.receipt {
+        receipt.await.map_err(|_| CallError::Internal(anyhow::anyhow!("combat loss worker stopped")))??;
+    }
+    if matches!(turn.resolution, TurretResolution::Fired { .. }) {
+        report_hit(world, source_id, target_id, shooter_pilot, turn.victim_pilot, weapon, turn.dealt, hit_quality(turn.multiplier), false);
+    }
+    Ok(turn.resolution)
+}
+
+/// Calculate a fitted turret's parameters and unscaled typed damage. A turret
+/// with no charge compatibility reads raw damage from the module itself.
+pub(super) fn turret_parameters(fit: &Fit, module: &Module, direct_damage: bool) -> ((f64, f64, f64, f64), [f64; 4]) {
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
-    let raw = ATTR_DAMAGE.map(|id| fit.value(ch, id) * fit.value(m, ATTR_DAMAGE_MULTIPLIER).max(0.0));
+    let damage = if direct_damage { m } else { ch };
+    let raw = ATTR_DAMAGE.map(|id| fit.value(damage, id) * fit.value(m, ATTR_DAMAGE_MULTIPLIER).max(0.0));
     ((fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF),
         fit.value(m, ATTR_TRACKING_SPEED), fit.value(m, ATTR_OPTIMAL_SIG_RADIUS)), raw)
 }
 
-pub(super) async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64, illegal: bool, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
+pub(super) async fn fire_turret(cx: &Ctx, inputs: &TurretInputs, module: &Module, target: i64, illegal: bool, spool: Option<TurretSpool>, attempt: PreparedCombatAttempt) -> Result<TurretResolution, CallError> {
     let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
-    let (parameters, raw) = turret_parameters(fit, module);
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(TurretResolution::NotFired) };
     turret_shot(&cx.db, &cx.world, cx.system_id, &ship, &t, Some(cx.char_id), module.type_id, illegal,
-        parameters, raw, None, attempt).await
+        inputs.parameters, inputs.raw, None, spool, attempt).await
 }
 
 /// What a missile does when it arrives.
@@ -268,17 +447,22 @@ pub(crate) struct Missile {
     pub(crate) aoe_velocity: f64,
     pub(crate) drf: f64,
     pub(crate) velocity: f64,
-    pub(crate) flight_range: f64,
+    /// Effective lifetime in fractional milliseconds from the applied launch.
+    pub(crate) flight_time_ms: f64,
     pub(crate) weapon: i32,
     pub(crate) illegal: bool,
 }
 
 
-/// Launch a native-steered missile actor; the separate gameplay impact timer
-/// applies explosion radius and velocity against the impact-time target state.
+/// Launch a native-steered missile flight; the actor sweeps target contact and
+/// expires the flight at its frozen effective lifetime. A committed contact
+/// applies explosion radius and velocity against the target at that actor turn.
 pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile, guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
+    if !m.flight_time_ms.is_finite() || m.flight_time_ms <= 0.0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {}", m.flight_time_ms)));
+    }
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
     let launch_ms = now_ms();
@@ -317,14 +501,13 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         slim,
     };
     let missile_id = missile.id;
-    let distance = dist(from.pos, target.pos);
-    let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
+    let flight_time_ms = m.flight_time_ms;
     let shooter_id = from.id;
     let target_id = target.id;
     let facts = attempt.facts();
     let shooter_pilot = facts.actual_actor_character;
-    let (flight_range, aoe_cloud, aoe_velocity, drf, raw, weapon) =
-        (m.flight_range, m.aoe_cloud, m.aoe_velocity, m.drf, m.raw, m.weapon);
+    let (aoe_cloud, aoe_velocity, drf, raw, weapon) =
+        (m.aoe_cloud, m.aoe_velocity, m.drf, m.raw, m.weapon);
     let sde = world.sde().clone();
     let world_ref = Arc::downgrade(&world);
     let impact_db = db.clone();
@@ -343,43 +526,62 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         if s.combat_membership_generation(target_id) != Some(target_generation) { return None; }
         if drone_admission.is_some() && s.combat_owner(target_id) != victim_pilot { return None; }
         s.drone_attack(shooter_id, target_id);
-        s.launch_missile(missile, target_id, shooter_id, delay_ms, move |s| {
-            if !s.contains(missile_id) { return; }
-            s.destroy_ball(missile_id);
-            let application = (s.combat_membership_generation(target_id) == Some(target_generation))
-                .then(|| s.sampled_ball(target_id)).flatten()
-                .filter(|target| target.cloak == 0 && target.mode != crate::space::MODE_WARP)
-                .map(|target| {
-                    (missile_applied(target_signature(&sde, &target), dist(target.vel, [0.0; 3]), aoe_cloud, aoe_velocity, drf),
-                        s.combat_owner(target_id))
+        s.launch_missile(missile, target_id, shooter_id, flight_time_ms, move |s, contact| {
+            // The actor already resolved the flight's terminal. `Some` is the
+            // single committed contact: read the effective target state in this
+            // actor turn and apply damage in place. Everything else is a miss.
+            let applied = contact.and_then(|contact| {
+                if s.combat_membership_generation(contact.target) != Some(target_generation) { return None; }
+                let signature = target_signature(&sde, s.ball(contact.target)?);
+                let victim = s.combat_owner(contact.target);
+                Some((contact, signature, victim))
+            });
+            let Some((contact, signature, victim)) = applied else {
+                attempt.finish_in_actor(s);
+                let victim = (s.combat_membership_generation(target_id) == Some(target_generation))
+                    .then(|| s.combat_owner(target_id)).flatten();
+                s.defer(async move {
+                    if let Some(world) = world_ref.upgrade() {
+                        report_hit(&world, shooter_id, target_id, shooter_pilot, victim, weapon, 0.0, HIT_MISS, false);
+                    }
                 });
-            let reached = distance <= flight_range + MISSILE_REACH_ALLOWANCE_METRES;
+                return;
+            };
+            let target_id = contact.target;
+            let scaled = missile_applied(signature, dist(contact.target_velocity, [0.0; 3]), aoe_cloud, aoe_velocity, drf);
+            let result = apply_damage_in_actor(s, &impact_db, system, target_id, raw.map(|d| d * scaled), DamageSource {
+                attacker_id: shooter_pilot, attacker_ball_id: Some(facts.entity.item_id),
+                source_ship_id: Some(facts.entity.item_id), source_ship_type: Some(facts.entity.type_id),
+                weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
+            }, false);
+            attempt.disarm();
+            let (dealt, capacity, receipt) = match result {
+                Ok(Some((outcome, receipt))) => (outcome.dealt, false, receipt),
+                Ok(None) => (0.0, false, None),
+                Err(error) if crate::services::combat::capacity::is_refusal(&error) => (0.0, true, None),
+                Err(error) => {
+                    tracing::warn!(?error, missile = missile_id, "missile impact damage failed");
+                    (0.0, false, None)
+                }
+            };
             s.defer(async move {
+                let mut dealt = dealt;
+                if let Some(receipt) = receipt {
+                    match receipt.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(?error, missile = missile_id, "missile loss settlement failed");
+                            dealt = 0.0;
+                        }
+                        Err(_) => {
+                            tracing::warn!(missile = missile_id, "missile loss worker stopped");
+                            dealt = 0.0;
+                        }
+                    }
+                }
                 let Some(world) = world_ref.upgrade() else { return };
-                let (dealt, quality, victim_pilot) = if let Some((application, victim_pilot)) = application.filter(|_| reached) {
-                    let outcome = apply_damage_guarded(&impact_db, &world, system, target_id, raw.map(|d| d * application), DamageSource {
-                        attacker_id: shooter_pilot, attacker_ball_id: Some(facts.entity.item_id),
-                        source_ship_id: Some(facts.entity.item_id), source_ship_type: Some(facts.entity.type_id),
-                        weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
-                    }, false, move |s| s.combat_membership_generation(target_id) == Some(target_generation)
-                        && s.ball(target_id).is_some_and(|target| target.cloak == 0 && target.mode != crate::space::MODE_WARP)).await;
-                    let dealt = match outcome {
-                        Ok(Some(outcome)) => { attempt.disarm(); outcome.dealt }
-                        Ok(None) => 0.0,
-                        Err(error) if crate::services::combat::capacity::is_refusal(&error) => {
-                            attempt.report_capacity_refusal();
-                            0.0
-                        }
-                        Err(error) => {
-                            tracing::warn!(?error, missile = missile_id, "missile impact damage failed");
-                            0.0
-                        }
-                    };
-                    (dealt, HIT_NORMAL, victim_pilot)
-                } else {
-                    (0.0, HIT_MISS, application.and_then(|(_, owner)| owner))
-                };
-                report_hit(&world, shooter_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, quality);
+                if capacity { attempt.report_capacity_refusal(); }
+                report_hit(&world, shooter_id, target_id, shooter_pilot, victim, weapon, dealt, HIT_NORMAL, false);
             });
         });
         Some(())
@@ -392,26 +594,24 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
     Ok(())
 }
 
-pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64, illegal: bool, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
+pub(super) async fn fire_missile(cx: &Ctx, inputs: &MissileInputs, module: &Module, charge: i32, target: i64, illegal: bool, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
-    let ch = Key::Charge(module.id);
-    let velocity = fit.value(ch, ATTR_MAX_VELOCITY).max(1.0);
     let missile = Missile {
         charge,
-        raw: ATTR_DAMAGE.map(|id| fit.value(ch, id) * fit.value(Key::Char, ATTR_MISSILE_DAMAGE_MULTIPLIER).max(0.0)),
-        aoe_cloud: fit.value(ch, ATTR_AOE_CLOUD_SIZE),
-        aoe_velocity: fit.value(ch, ATTR_AOE_VELOCITY),
-        drf: fit.value(ch, ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
-        velocity,
-        flight_range: velocity * ms_to_seconds(fit.value(ch, ATTR_EXPLOSION_DELAY)),
+        raw: inputs.raw,
+        aoe_cloud: inputs.aoe_cloud,
+        aoe_velocity: inputs.aoe_velocity,
+        drf: inputs.drf,
+        velocity: inputs.velocity,
+        flight_time_ms: inputs.flight_time_ms,
         weapon: module.type_id,
         illegal,
     };
     launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile, None, attempt).await
 }
 
-/// Execute an actor-owned weapon using the sampled source and effective fit.
+/// Execute an actor-owned weapon using the sampled source and its typed inputs.
 pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>, attempt: Option<PreparedCombatAttempt>) -> Result<(), CallError> {
     use crate::space::drone::DronePhase;
     if !matches!(cx.phase, DronePhase::Begin) { return Ok(()); }
@@ -426,44 +626,34 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>, att
         }).await.flatten()
     };
     let Some((from, victim)) = sample().await else { return Ok(()) };
-    if matches!(cx.effect.kind, super::EffectKind::Missile) {
-        let charge = cx.fit.value(cx.key, infinity_core::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
-        if charge <= 0 || cx.world.sde().types.get(charge).is_none() {
-            let id = cx.effect.id as i32;
-            let name = cx.world.sde().dogma.effect(id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
-            return Err(super::unsupported::refusal(Some(id), name, from.type_id));
-        }
-    }
-    let fit = cx.fit;
-    let key = cx.key;
-    match cx.effect.kind {
-        super::EffectKind::Turret => {
-            let raw = ATTR_DAMAGE.map(|id| fit.value(key, id) * fit.value(key, ATTR_DAMAGE_MULTIPLIER).max(0.0));
+    match cx.inputs {
+        SourceInputs::Turret(inputs) => {
             turret_shot(cx.db, cx.world, cx.system, &from, &victim, cx.attacker, from.type_id, false,
-                (fit.value(key, ATTR_MAX_RANGE), fit.value(key, ATTR_FALLOFF), fit.value(key, ATTR_TRACKING_SPEED), fit.value(key, ATTR_OPTIMAL_SIG_RADIUS)), raw, Some(cx.guard), attempt).await
+                inputs.parameters, inputs.raw, Some(cx.guard), None, attempt).await.map(|_| ())
         }
-        super::EffectKind::Missile => {
-            let charge = fit.value(key, infinity_core::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
-            let sde = cx.world.sde();
-            let attr = |id| sde.types.attribute(charge, id).or_else(|| sde.dogma.attribute(id).and_then(|a| a.default_value)).unwrap_or(0.0);
-            let velocity = (attr(ATTR_MAX_VELOCITY) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER)).max(1.0);
+        SourceInputs::Missile(inputs) => {
+            let Some(charge) = inputs.charge else {
+                let id = cx.effect.id as i32;
+                let name = cx.world.sde().dogma.effect(id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
+                return Err(super::unsupported::refusal(Some(id), name, from.type_id));
+            };
             let missile = Missile {
                 charge,
-                raw: ATTR_DAMAGE.map(|id| attr(id) * fit.value(key, ATTR_MISSILE_DAMAGE_MULTIPLIER)),
-                aoe_cloud: attr(ATTR_AOE_CLOUD_SIZE) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
-                aoe_velocity: attr(ATTR_AOE_VELOCITY) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
-                drf: attr(ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
-                velocity,
-                flight_range: velocity * ms_to_seconds(attr(ATTR_EXPLOSION_DELAY) * fit.value(key, infinity_core::consts::dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER)),
+                raw: inputs.raw,
+                aoe_cloud: inputs.aoe_cloud,
+                aoe_velocity: inputs.aoe_velocity,
+                drf: inputs.drf,
+                velocity: inputs.velocity,
+                flight_time_ms: inputs.flight_time_ms,
                 weapon: from.type_id,
                 illegal: false,
             };
             let owner = cx.attacker.unwrap_or(from.owner_id);
             launch_missile(cx.db.clone(), cx.world.clone(), cx.system, from, victim, owner, None, missile, Some(cx.guard), attempt).await
         }
-        _ => unreachable!(),
+        _ => Err(CallError::Internal(anyhow::anyhow!("weapon source captured without weapon inputs"))),
     }
 }
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

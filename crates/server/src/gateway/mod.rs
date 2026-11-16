@@ -29,7 +29,7 @@ pub(crate) mod handlers;
 mod insurgency;
 pub(crate) mod message;
 pub(crate) mod notices;
-mod plex;
+pub(crate) mod plex;
 pub(crate) mod protocol;
 mod requests;
 pub(crate) mod ship_cosmetics;
@@ -37,7 +37,7 @@ mod skill_plans;
 mod space_content;
 mod transport;
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-content", feature = "tests-economy", feature = "tests-gateway", feature = "tests-lua", feature = "tests-ships", feature = "tests-space")))] pub(crate) mod tests;
 
 use crate::{config::Config, db::Db, space::World};
 use anyhow::Result;
@@ -75,13 +75,21 @@ pub(crate) fn validate() -> Result<()> {
     Ok(())
 }
 
+/// Server policy: simultaneous gateway connections.
+const MAX_CONNECTIONS: usize = 256;
+/// Server policy: simultaneous gateway connections from one address.
+const MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
+
 pub async fn serve(bind: String, gw: Arc<Gateway>) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     info!("public gateway (gRPC) listening on {bind}; {} message types loaded", pool().all_messages().count());
+    let gate = crate::admission::Admission::new(MAX_CONNECTIONS, MAX_CONNECTIONS_PER_ADDRESS);
     loop {
         let (sock, peer) = listener.accept().await?;
+        let Some(permit) = gate.try_acquire(peer.ip()) else { continue };
         let gw = gw.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = connection(sock, gw).await {
                 debug!("gateway connection {peer} ended: {e:#}");
             }

@@ -8,5 +8,5 @@ pub(crate) mod instances;
 pub(crate) mod rewards;
 pub(crate) mod receipts;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

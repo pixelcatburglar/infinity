@@ -1,7 +1,8 @@
 //! Game-data constants shared by server modules, grouped by source.
 //!
 //! IDs follow the SDE and the client's inventorycommon, dogma and corporation
-//! constants. FILETIME durations use Windows 100 ns ticks; AU is in metres.
+//! constants, including the client owner ID ranges. FILETIME durations use
+//! Windows 100 ns ticks; AU is in metres.
 //! Runtime configuration, formulas and module-owned wire protocol constants do
 //! not belong here. Shared gateway protocol units are included. This module
 //! provides no data lookup or runtime state.
@@ -301,6 +302,8 @@ pub const GROUP_CHARACTER_ENHANCEMENT: i32 = 4194;
 
 /// `inventorycommon/const.py:48-59`: first wormhole solar-system ID.
 pub const WORMHOLE_SYSTEM_START: i64 = 31_000_000;
+/// `inventorycommon/const.py:48-59`: last wormhole solar-system ID (inclusive).
+pub const WORMHOLE_SYSTEM_END: i64 = 31_999_999;
 /// `inventorycommon/const.py:45`: first known-space solar system.
 pub const KNOWN_SPACE_SYSTEM_START: i64 = 30_000_000;
 /// `inventorycommon/const.py:1019`: groupSun.
@@ -348,6 +351,12 @@ pub const DRONE_SCOOP_RANGE: f64 = 2500.0;
 /// `inventorycommon/const.py:3374`: ownerSystem (EVE System), also the owner of unowned items.
 pub const OWNER_UNOWNED: i64 = 1;
 
+// Client owner ID ranges.
+/// Client inventorycommon/const.py `minPlayerCorporation`, checked by idCheckers.IsPlayerCorporation.
+pub const MIN_PLAYER_CORPORATION_ID: i64 = 98_000_000;
+/// Client inventorycommon/const.py `maxPlayerCorporation`, checked by idCheckers.IsPlayerCorporation.
+pub const MAX_PLAYER_CORPORATION_ID: i64 = 98_999_999;
+
 /// Client entityConst: idle drone activity.
 pub const DRONE_STATE_IDLE: i32 = 0;
 /// Client entityConst: combat drone activity.
@@ -386,6 +395,13 @@ pub const TYPE_FACTION: i64 = 30;
 pub const TYPE_SOLAR_SYSTEM: i32 = 5;
 /// SDE invTypes: Capsule.
 pub const TYPE_CAPSULE: i32 = 670;
+/// Client `inventorycommon/const.py` typeOffice.
+pub const TYPE_OFFICE: i32 = 27;
+/// Client `inventorycommon/const.py` typeAssetSafetyWrap.
+pub const TYPE_ASSET_SAFETY_WRAP: i32 = 60;
+/// Client `inventorycommon/const.py` typeOfficeRental; the bill wire externalID for
+/// office rent bills (`corpBillsUtil.GetTextForBill` compares it to this type).
+pub const TYPE_OFFICE_RENTAL: i32 = 26;
 /// Client `inventorycommon/const.py` groupBattleship.
 pub const GROUP_BATTLESHIP: i32 = 27;
 /// Client `inventorycommon/const.py` groupIndustrial.
@@ -478,6 +494,10 @@ pub const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
 pub const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
 /// Client inventorycommon/const.py: typeEliteInfomorphPsychology.
 pub const SKILL_ELITE_INFOMORPH_PSYCHOLOGY: i32 = 73910;
+/// SDE types.jsonl: Drone Durability (23618); passive skillBonusDroneDurability (6665).
+pub const SKILL_DRONE_DURABILITY: i32 = 23618;
+/// Client inventorycommon/const.py `typeSocial`.
+pub const SKILL_SOCIAL: i32 = 3355;
 
 // SDE faction IDs.
 /// SDE chrFactions: Caldari State.
@@ -492,6 +512,18 @@ pub const FACTION_GALLENTE: i64 = 500004;
 pub const FACTION_GURISTAS: i64 = 500010;
 /// SDE chrFactions: Angel Cartel.
 pub const FACTION_ANGEL_CARTEL: i64 = 500011;
+/// SDE chrFactions: The Blood Raider Covenant.
+pub const FACTION_BLOOD_RAIDER_COVENANT: i64 = 500012;
+/// SDE chrFactions: Sansha's Nation.
+pub const FACTION_SANSHAS_NATION: i64 = 500019;
+/// SDE chrFactions: Serpentis.
+pub const FACTION_SERPENTIS: i64 = 500020;
+/// SDE chrFactions: Deathless Circle.
+pub const FACTION_DEATHLESS: i64 = 500029;
+
+/// `appConst.factionsWhoseStandingsAreNotAffectedBySkillBonuses`; see
+/// `standingUtil.GetStandingBonusSkillTypeID` for the skill exemption.
+pub const STANDING_SKILL_EXEMPT_FACTIONS: [i64; 4] = [500024, 500025, 500026, 500027];
 
 // Client inventory flags, locations and row-change keys.
 /// Client inventorycommon.const.flagHangar.
@@ -514,6 +546,12 @@ pub const FLAG_RIG_LAST: i32 = 99;
 pub const FLAG_SUBSYSTEM_FIRST: i32 = 125;
 /// Client inventorycommon.const.flagSubSystemSlot7.
 pub const FLAG_SUBSYSTEM_LAST: i32 = 132;
+/// Client inventorycommon/const.py `flagSubSystemSlot3`; the repairable-ship
+/// service-life flag ranges cover subsystem slots 0-3, not the full fitted range.
+pub const FLAG_SUBSYSTEM_SLOT3: i32 = 128;
+/// Client inventorycommon/const.py `flagFixedSlot` (also `flagSlotLast`); the
+/// repairable-ship flag ranges treat slots 11-35 as fitting slots.
+pub const FLAG_FIXED_SLOT: i32 = 35;
 /// Client inventorycommon.const.flagPilot.
 pub const FLAG_PILOT: i32 = 57;
 /// Client inventorycommon.const.flagDroneBay.
@@ -528,6 +566,10 @@ pub const FLAG_CORP_SAG1: i32 = 115;
 pub const CORP_HANGAR_DIVISIONS: i32 = 7;
 /// Client inventorycommon.const.flagCorpDeliveries.
 pub const FLAG_CORP_DELIVERIES: i32 = 62;
+/// Client `inventorycommon/const.py` flagAssetSafety.
+pub const FLAG_ASSET_SAFETY: i32 = 36;
+/// Client `inventorycommon/const.py` flagCapsuleerDeliveries.
+pub const FLAG_CAPSULEER_DELIVERIES: i32 = 187;
 /// Client inventorycommon.const.locationJunkyard: deleted items.
 pub const LOCATION_JUNKYARD: i64 = 10;
 /// Client carbon const.ixOwnerID: inventory row owner column.
@@ -651,6 +693,27 @@ pub const REF_BROKER_FEE: i32 = 46;
 pub const REF_TRANSACTION_TAX: i32 = 54;
 /// Client appConst.refMarketSecurityTax (appConst:804; market category:931).
 pub const REF_MARKET_SECURITY_TAX: i32 = 194;
+/// Native `sde_native.accountingentrytypes` key 160 "Rehabilitation Costs":
+/// fees charged for recovery restoration and distribution.
+pub const REF_REHABILITATION_COSTS: i32 = 160;
+/// Client appConst.refBountyPrizes: wallet journal entry type for NPC bounty rewards.
+pub const REF_BOUNTY_PRIZES: i32 = 85;
+/// Client appConst.refCorporationTaxNpcBounties: wallet journal entry type for
+/// corporation tax withheld from NPC bounty rewards.
+pub const REF_CORPORATION_TAX_NPC_BOUNTIES: i32 = 92;
+/// Client `repairableShip/common/const.py` NPCCORP_INTERBUS_ID: owner of the
+/// physical escrow rows while a recovery group is open.
+pub const NPC_CORP_INTERBUS: i64 = 1_000_148;
+
+// Server recovery-lifecycle identity band: group and member IDs share
+// `game.repairable_recovery_groups_group_id_seq` in this reserved range above
+// the player item sequence floor and NPC temporary IDs, keeping recovery
+// record identities semantically distinct from physical `game.items` IDs; the
+// item sequence has no upper bound, so this is a reservation, not a proof.
+/// First recovery group or member ID.
+pub const RECOVERY_ID_FIRST: i64 = 10_000_000_000_000;
+/// Last recovery group or member ID.
+pub const RECOVERY_ID_LAST: i64 = 10_049_999_999_999;
 /// Client appConst.corpRoleAccountCanTake1; subsequent divisions shift by one bit.
 pub const ROLE_ACCOUNT_CAN_TAKE_1: i64 = 134_217_728;
 /// Client carbon/common/lib/const.py UE_LOC.
@@ -661,3 +724,39 @@ pub const OWNER_SCC: i64 = 1_000_132;
 pub const OWNER_DED: i64 = 1_000_137;
 /// Client appConst.rentalPeriodOffice, in days.
 pub const RENTAL_DAYS: i64 = 30;
+
+// Client appConst.billType* values; only billTypeRental is produced by the
+// server's billing scan while the rest are settled as existing debts.
+/// Client appConst.billTypeMarketFine.
+pub const BILL_TYPE_MARKET_FINE: i32 = 1;
+/// Client appConst.billTypeRental: office rent renewal bills.
+pub const BILL_TYPE_RENTAL: i32 = 2;
+/// Client appConst.billTypeBrokerFee.
+pub const BILL_TYPE_BROKER_FEE: i32 = 3;
+/// Client appConst.billTypeWarDeclaration.
+pub const BILL_TYPE_WAR: i32 = 4;
+/// Client appConst.billTypeAllianceMaintainance.
+pub const BILL_TYPE_ALLIANCE_MAINTENANCE: i32 = 5;
+/// Client appConst.billTypeSovereignityMarker.
+pub const BILL_TYPE_SOVEREIGNTY_MARKER: i32 = 6;
+/// Client appConst.billTypeInfrastructureHub.
+pub const BILL_TYPE_INFRASTRUCTURE_HUB: i32 = 7;
+/// The bill types the shared settlement accepts: the office rental plus the
+/// existing pure-debt types; unknown values refuse.
+pub const SETTLED_BILL_TYPES: [i32; 7] = [
+    BILL_TYPE_MARKET_FINE, BILL_TYPE_RENTAL, BILL_TYPE_BROKER_FEE,
+    BILL_TYPE_WAR, BILL_TYPE_ALLIANCE_MAINTENANCE, BILL_TYPE_SOVEREIGNTY_MARKER,
+    BILL_TYPE_INFRASTRUCTURE_HUB,
+];
+
+// Server bill statuses in game.bills.status. Values 0-2 mirror the client's
+// appConst.bill* (billUnpaid, billPaid, billCancelled); 3 is the client's
+// billHidden and is never produced, 4 is the server-only terminal expiry.
+/// appConst.billUnpaid.
+pub const BILL_STATUS_UNPAID: i32 = 0;
+/// appConst.billPaid.
+pub const BILL_STATUS_PAID: i32 = 1;
+/// appConst.billCancelled.
+pub const BILL_STATUS_CANCELLED: i32 = 2;
+/// Server-only terminal status for a bill whose covered term expired unpaid.
+pub const BILL_STATUS_EXPIRED: i32 = 4;

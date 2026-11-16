@@ -27,7 +27,7 @@ pub(super) async fn open(listener: &TcpListener, hub: &Arc<Hub>, tasks: &mut Tas
     let (accepted, _) = listener.accept().await.unwrap();
     let hub = hub.clone();
     let token = hub.token_for(id);
-    tasks.0.push(tokio::spawn(async move { let _ = connection(accepted, hub).await; }));
+    tasks.0.push(tokio::spawn(async move { let _ = connection(accepted, hub, Duration::from_secs(infinity_wire::conn::DEFAULT_CLIENT_WRITE_TIMEOUT_SECS), crate::admission::deadline(std::time::Instant::now(), super::super::AUTH_TIMEOUT_SECS).unwrap()).await; }));
     stream.write_all(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams'>").await.unwrap();
     read_until(&mut stream, "</stream:features>").await;
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("\0{id}\0{token}"));

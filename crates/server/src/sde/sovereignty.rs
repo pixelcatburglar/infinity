@@ -133,4 +133,4 @@ fn flag(value: &Value, key: &str) -> anyhow::Result<bool> {
     match integer(value, key)? { 0 => Ok(false), 1 => Ok(true), _ => bail!("{key} must be numeric 0 or 1") }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-sde"))] mod tests;

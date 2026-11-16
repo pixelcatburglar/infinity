@@ -130,5 +130,5 @@ pub fn register(lua: &Lua, env: &Table) -> mlua::Result<()> {
     env.set("eve", eve)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

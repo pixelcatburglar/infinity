@@ -15,7 +15,7 @@ async fn startup_seed_pages_existing_viewers_and_handler_settles_overdue_trainin
     let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, 1);
     let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
     let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
-    plans::create(&db, &plan, owner.character, "plan", "", &[skill], &[1]).await.unwrap();
+    plans::create(&db, &plan, plans::Owner::Character(owner.character), "plan", "", &[skill], &[1], None).await.unwrap();
     plan_milestones::create(&db, &milestone, &plan, "skill", skill, Some(1)).await.unwrap();
     training::starting_skill(&db, owner.character, skill, 0, 0).await.unwrap();
     queue::insert(&db, owner.character, &queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: points, start_time: Some(1), end_time: Some(2) }).await.unwrap();
@@ -47,7 +47,38 @@ async fn startup_seed_pages_existing_viewers_and_handler_settles_overdue_trainin
     assert_eq!(crate::db::outbox::tests::events(&db, "SkillTrained", owner.character).await.len(), 1);
     for viewer in &viewers { db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", super::KIND, viewer.character)]).await.unwrap(); }
     db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", crate::services::skills::completion::KIND, owner.character)]).await.unwrap();
-    plans::delete(&db, owner.character, &plan).await.unwrap();
+    plans::delete(&db, plans::Owner::Character(owner.character), &plan).await.unwrap();
     for viewer in viewers { fixture::cleanup(&db, viewer).await.unwrap(); }
     fixture::cleanup(&db, absent).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn startup_recovery_covers_corporation_viewers() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let member = fixture::create(&db).await.unwrap();
+    let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('plan-' || nextval('game.corporations_corporation_id_seq')::text, 'SP' || currval('game.corporations_corporation_id_seq')::text, $1,$1,1,1) RETURNING corporation_id", &[&member.character]).await.unwrap().get("corporation_id");
+    db.execute("UPDATE game.characters SET corporation_id=$2 WHERE character_id=$1", &[&member.character, &corp]).await.unwrap();
+    let skill = sde.types.iter().find(|t| super::super::validation::valid_skill(&sde, t.type_id) && sde.skill_plans.requirements(t.type_id).is_empty()).unwrap().type_id;
+    let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, 1);
+    let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
+    let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
+    plans::create(&db, &plan, plans::Owner::Corporation(corp), "corp plan", "", &[skill], &[1], Some(&[0u8; 16])).await.unwrap();
+    plan_milestones::create(&db, &milestone, &plan, "skill", skill, Some(1)).await.unwrap();
+    db.execute("INSERT INTO game.skills(character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&member.character, &skill, &points]).await.unwrap();
+    crate::dao::skills::plan_progress::upsert(&db, member.character, &[crate::dao::skills::plan_progress::Snapshot { milestone_id: milestone.clone(), required_sp: 0, trained_sp: 0, queued_sp: 0, completed: false, valid: true }], 1).await.unwrap();
+    super::seed(&db).await.unwrap();
+    let world = World::new(db.clone(), sde, 1);
+    let job = Job { id: format!("{}:{}", super::KIND, member.character), kind: super::KIND.into(), due_at: 1, payload: member.character.to_string() };
+    super::handle(db.clone(), world, job.clone()).await.unwrap();
+    let row = db.query_one("SELECT completed,trained_sp FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&member.character, &milestone]).await.unwrap();
+    assert!(row.get::<_, bool>("completed"));
+    db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", super::KIND, member.character)]).await.unwrap();
+    db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", crate::services::skills::completion::KIND, member.character)]).await.unwrap();
+    plans::delete(&db, plans::Owner::Corporation(corp), &plan).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=1 WHERE character_id=$1", &[&member.character]).await.unwrap();
+    db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    fixture::cleanup(&db, member).await.unwrap();
 }

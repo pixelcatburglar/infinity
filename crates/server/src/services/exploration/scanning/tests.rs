@@ -9,20 +9,17 @@ async fn refused_probe_recovery_keeps_probe_and_sends_no_notification() {
     let owner = fixture::create(&db).await.unwrap();
     let character = owner.character;
     let (mut client, _peer) = crate::services::tests::client(db.clone(), character).await;
-    let system = client.sde.map.systems().next().unwrap().solar_system_id;
-    let hull = client.sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && ty.capacity.is_some_and(|v| v > 0.0)).unwrap();
+    let system = crate::dao::characters::ship::current(&db, character).await.unwrap().and_then(|location| location.system).unwrap();
+    let hull = client.sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && ty.group_id != Some(infinity_core::consts::GROUP_CAPSULE) && ty.capacity.is_some_and(|v| v > 0.0)).unwrap();
     let kind = client.sde.types.iter().find(|ty| ty.volume.is_some_and(|v| v > hull.capacity.unwrap() * 1000.0)).unwrap().type_id;
-    let ship = crate::dao::items::transfers::insert(&db, hull.type_id, character, system, 0, 1).await.unwrap();
-    db.execute("UPDATE game.items SET singleton=true WHERE item_id=$1", &[&ship]).await.unwrap();
-    db.execute("UPDATE game.characters SET ship_id=$2 WHERE character_id=$1", &[&character, &ship]).await.unwrap();
-    client.session.apply(vec![("shipid", Value::Int(ship))]);
+    let ship = recovery_ship(&db, &mut client.session, character, system, hull.type_id).await;
     let id = character * 100 + 50;
     state().probes.insert(id, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: filetime_now() + FILETIME_SECOND * 60, strength: 1.0 });
     let args = [Value::list([Value::Int(id)])];
     let kwargs = Value::None;
     let call = Call { service: "scanMgr", method: "RecoverProbes", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
     let before = client.outbox.len();
-    assert!(recover_probes(&mut client, &call, false).await.is_err());
+    assert!(matches!(recover_probes(&mut client, &call, false).await, Err(CallError::User { msg, .. }) if msg == messages::MSG_NOT_ENOUGH_CARGO_SPACE));
     assert!(state().probes.contains_key(&id));
     assert_eq!(client.outbox.len(), before);
     assert!(crate::dao::items::loading::load_items(&db, crate::dao::items::loading::ItemQuery::Location(ship)).await.unwrap().is_empty());
@@ -39,13 +36,10 @@ async fn recovery_excludes_expired_probes_and_deposits_live_probe_once() {
     let owner = fixture::create(&db).await.unwrap();
     let character = owner.character;
     let (mut client, _peer) = crate::services::tests::client(db.clone(), character).await;
-    let system = client.sde.map.systems().next().unwrap().solar_system_id;
-    let hull = client.sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && ty.capacity.is_some_and(|v| v > 0.0)).unwrap();
-    let kind = client.sde.types.iter().find(|ty| ty.group_id == Some(infinity_core::consts::GROUP_SCANNER_PROBE) && ty.volume.is_some_and(|v| v > 0.0 && v < hull.capacity.unwrap())).unwrap().type_id;
-    let ship = crate::dao::items::transfers::insert(&db, hull.type_id, character, system, 0, 1).await.unwrap();
-    db.execute("UPDATE game.items SET singleton=true WHERE item_id=$1", &[&ship]).await.unwrap();
-    db.execute("UPDATE game.characters SET ship_id=$2 WHERE character_id=$1", &[&character, &ship]).await.unwrap();
-    client.session.apply(vec![("shipid", Value::Int(ship))]);
+    let system = crate::dao::characters::ship::current(&db, character).await.unwrap().and_then(|location| location.system).unwrap();
+    let (hull_type, hull_capacity) = client.sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && ty.group_id != Some(infinity_core::consts::GROUP_CAPSULE) && ty.capacity.is_some_and(|v| v > 0.0)).map(|ty| (ty.type_id, ty.capacity.unwrap())).unwrap();
+    let kind = client.sde.types.iter().find(|ty| ty.group_id == Some(infinity_core::consts::GROUP_SCANNER_PROBE) && ty.volume.is_some_and(|v| v > 0.0 && v < hull_capacity)).unwrap().type_id;
+    let ship = recovery_ship(&db, &mut client.session, character, system, hull_type).await;
     let expired = character * 100 + 51;
     let live = character * 100 + 52;
     let now = filetime_now();
@@ -60,6 +54,26 @@ async fn recovery_excludes_expired_probes_and_deposits_live_probe_once() {
     assert!(crate::dao::items::loading::load_items(&db, crate::dao::items::loading::ItemQuery::Location(ship)).await.unwrap().is_empty());
     let live_args = [Value::list([Value::Int(live), Value::Int(live)])];
     let live_call = Call { service: "scanMgr", method: "RecoverProbes", args: &live_args, kwargs: &kwargs, bound: true, bind_params: None };
+    let station = client.sde.map.stations().find(|s| s.solar_system_id == Some(system)).unwrap_or_else(|| client.sde.map.stations().next().unwrap()).station_id;
+    let capsule = client.sde.types.iter().find(|ty| ty.group_id == Some(infinity_core::consts::GROUP_CAPSULE)).unwrap().type_id;
+    for (stationed, type_id, selected, explicit) in [
+        (Some(station), hull_type, Some(ship), None),
+        (None, capsule, Some(ship), Some(system)),
+        (None, hull_type, None, Some(system)),
+        (None, hull_type, Some(ship), None),
+    ] {
+        db.execute("UPDATE game.characters SET station_id=$2, ship_id=$3 WHERE character_id=$1", &[&character, &stationed, &selected]).await.unwrap();
+        db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&ship, &type_id]).await.unwrap();
+        client.session.apply(vec![("stationid", stationed.map_or(Value::None, Value::Int)), ("solarsystemid", explicit.map_or(Value::None, Value::Int))]);
+        let CallError::User { msg, dict } = recover_probes(&mut client, &live_call, false).await.unwrap_err() else { panic!("recovery outside a valid space context must refuse") };
+        assert_eq!((msg.as_str(), dict), (messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert!(state().probes.contains_key(&live));
+        assert_eq!(client.outbox.len(), before);
+        assert!(crate::dao::items::loading::load_items(&db, crate::dao::items::loading::ItemQuery::Location(ship)).await.unwrap().is_empty());
+        db.execute("UPDATE game.characters SET station_id=NULL, ship_id=$2 WHERE character_id=$1", &[&character, &ship]).await.unwrap();
+        db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&ship, &hull_type]).await.unwrap();
+        client.session.apply(vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
+    }
     assert_eq!(recover_probes(&mut client, &live_call, false).await.unwrap(), Value::list([Value::Int(live)]));
     assert_eq!(recover_probes(&mut client, &live_call, false).await.unwrap(), Value::list([]));
     let items = crate::dao::items::loading::load_items(&db, crate::dao::items::loading::ItemQuery::Location(ship)).await.unwrap();
@@ -249,6 +263,11 @@ async fn concurrent_resolution_journals_once() {
     fixture::cleanup(&db, owner).await.unwrap();
 }
 
+fn notify(packet: &infinity_wire::macho::Packet) -> (String, Vec<Value>) {
+    let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = &packet.destination else { panic!("broadcast expected") };
+    (broadcast_id.as_text().unwrap().into_owned(), marshal::loads(packet.body[0].items().unwrap()[1].as_bytes().unwrap()).unwrap().items().unwrap()[1].items().unwrap().to_vec())
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
 async fn gm_scan_all_journals_only_first_resolution() {
@@ -257,24 +276,57 @@ async fn gm_scan_all_journals_only_first_resolution() {
     let owner = fixture::create(&db).await.unwrap();
     let character = owner.character;
     let system = character * 100 + 91;
-    let mut site = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_RADAR, 1.0, &mut HashSet::new());
+    let foreign = system + 60;
+    let mut taken = HashSet::new();
+    let mut site = new_site(system, [1.0, 2.0, 3.0], Kind::Signature, STRENGTH_RADAR, 1.0, &mut taken);
     site.id = crate::dao::exploration::next_site_id(&db).await.unwrap();
     save_site(&db, &site).await.unwrap();
-    let id = site.id;
+    let (id, target, pos) = (site.id, site.target.clone(), site.pos);
+    let mut extra = |sys: i64, id: i64, kind: Kind| { let mut s = new_site(sys, [0.0; 3], kind, STRENGTH_ALL, 1.0, &mut taken); s.id = id; s };
+    let (old, added, alien) = (extra(system, system + 7, Kind::Anomaly), extra(system, system + 8, Kind::Signature), extra(foreign, foreign + 7, Kind::Signature));
     let scenario_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut client, _peer) = crate::services::tests::client(scenario_db.clone(), character).await;
         client.session.apply(vec![("solarsystemid", Value::Int(system))]);
-        { let mut st = state(); st.loaded.insert(system); st.sites.insert(id, site); }
-        gm_scan_all(&mut client).await.unwrap();
-        gm_scan_all(&mut client).await.unwrap();
+        let rpc = crate::services::slash::tests::support::rpc;
+        client.login.role = infinity_core::consts::ROLE_GML;
+        // Docked (solarsystemid2 only) or an unloaded tracker refuses without a packet or a load.
+        client.session.apply(vec![("solarsystemid", Value::None), ("solarsystemid2", Value::Int(system))]);
+        assert!(rpc(&mut client, "/overlayrefresh").await.is_err());
+        client.session.apply(vec![("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::None)]);
+        assert!(rpc(&mut client, "/overlayrefresh").await.is_err() && client.outbox.is_empty() && !state().loaded.contains(&system));
+        { let mut st = state(); st.loaded.insert(system); for s in [site, old, alien] { st.sites.insert(s.id, s); } }
+        rpc(&mut client, "/sigscan").await.unwrap();
+        rpc(&mut client, "/scanall").await.unwrap();
+        let (name, stopped) = notify(client.outbox.last().unwrap());
+        assert_eq!(name, "OnSystemScanStopped");
+        let found = stopped[1].items().unwrap().iter().find(|v| matches!(v, Value::Instance(_, d) if d.get("id").and_then(|i| i.as_text()).as_deref() == Some(target.as_str()))).unwrap();
+        let Value::Instance(_, data) = found else { unreachable!() };
+        assert_eq!((data.get("certainty"), data.get("pos")), (Some(&Value::Float(1.0)), Some(&pos_value(pos))));
         let rows = scenario_db.query("SELECT origin, payload::text AS payload FROM game.progress_events WHERE kind='SignatureResolved' AND subject_character_id=$1", &[&character]).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, String>("origin"), "gm");
         let event = crate::progress::codec::decode(crate::progress::codec::SCHEMA_VERSION, "SignatureResolved", &rows[0].get::<_, String>("payload")).unwrap();
         assert!(matches!(event, crate::lua::events::GameEvent::SignatureResolved { site_id, context, .. } if site_id == id && context.origin == FactOrigin::Gm));
+        // The refresh resends the caller's loaded tracker with remove-old set.
+        { let mut st = state(); st.sites.remove(&(system + 7)); st.sites.insert(system + 8, added); }
+        rpc(&mut client, "/overlayrefresh").await.unwrap();
+        let (name, args) = notify(&client.outbox.pop().unwrap());
+        assert_eq!(name, "OnSignalTrackerFullState");
+        assert_eq!(args.as_slice(), &[Value::Int(system), args[1].clone(), Value::Bool(true)]);
+        let [Value::Dict(a), Value::Dict(signatures), Value::Dict(b), Value::Dict(c)] = args[1].items().unwrap() else { panic!("4 dicts expected") };
+        assert!(a.is_empty() && b.is_empty() && c.is_empty());
+        let mut keys: Vec<i64> = signatures.iter().map(|(k, _)| k.as_int().unwrap()).collect();
+        assert_eq!({ keys.sort_unstable(); keys }, [system + 8, id]);
+        { let st = state(); assert!(st.reported.get(&(character, system)).unwrap().contains(&target) && st.scanned.contains(&(character, id)) && st.sites.get(&id).unwrap().pos == pos); }
+        assert!(crate::dao::exploration::is_scanned(&scenario_db, character, id).await.unwrap());
+        // Warp/bookmark authorization falls back to the persisted row.
+        state().scanned.remove(&(character, id));
+        assert_eq!(scan_result_position(&scenario_db, system, character, &target).await.unwrap(), Some(pos));
+        let rows = scenario_db.query("SELECT event_id FROM game.progress_events WHERE kind='SignatureResolved' AND subject_character_id=$1", &[&character]).await.unwrap();
+        assert_eq!(rows.len(), 1);
     }).await;
-    { let mut st = state(); st.sites.remove(&id); st.loaded.remove(&system); st.scanned.remove(&(character, id)); st.reported.remove(&(character, system)); }
+    { let mut st = state(); for i in [id, system + 7, system + 8, foreign + 7] { st.sites.remove(&i); } st.loaded.remove(&system); st.scanned.remove(&(character, id)); st.reported.remove(&(character, system)); }
     delete_site(&db, id).await.unwrap();
     fixture::cleanup(&db, owner).await.unwrap();
     result.unwrap();
@@ -320,4 +372,13 @@ async fn ordinary_partial_known_and_anomaly_do_not_journal() {
     for id in ids { delete_site(&db, id).await.unwrap(); }
     fixture::cleanup(&db, owner).await.unwrap();
     result.unwrap();
+}
+
+async fn recovery_ship(db: &Db, session: &mut infinity_core::session::Session, character: i64, system: i64, hull_type: i32) -> i64 {
+    let ship = crate::dao::items::transfers::insert(db, hull_type, character, system, 0, 1).await.unwrap();
+    db.execute("UPDATE game.items SET singleton=true WHERE item_id=$1", &[&ship]).await.unwrap();
+    db.execute("UPDATE game.characters SET ship_id=$2 WHERE character_id=$1", &[&character, &ship]).await.unwrap();
+    crate::dao::characters::ship::undock(db, character, system).await.unwrap();
+    session.apply(vec![("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system)), ("stationid", Value::None)]);
+    ship
 }

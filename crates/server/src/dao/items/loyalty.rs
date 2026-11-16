@@ -27,3 +27,6 @@ pub(crate) async fn requirement_stacks(
         }
     }).collect())
 }
+
+#[cfg(all(test, feature = "tests-storage"))]
+mod tests;

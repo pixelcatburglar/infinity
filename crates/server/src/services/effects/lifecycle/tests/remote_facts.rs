@@ -6,7 +6,8 @@ use infinity_core::consts::dogma::ATTR_CAPACITOR_NEED;
 use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST,
     dogma::{ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE,
         ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, EFFECT_REMOTE_SHIELD_BOOSTER,
-        EFFECT_REMOTE_ARMOR_REPAIRER, EFFECT_REMOTE_HULL_REPAIRER}};
+        EFFECT_REMOTE_ARMOR_REPAIRER, EFFECT_REMOTE_HULL_REPAIRER, ATTR_CPU, ATTR_CPU_OUTPUT,
+        ATTR_POWER, ATTR_POWER_OUTPUT}};
 use crate::lua::events::combat::{BinaryAmount, HpLayer};
 use crate::space::combat::RepairSource;
 
@@ -16,16 +17,20 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
-        && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE,
-            ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 10.0))).unwrap().type_id;
     for (effect_id, layer, expected_layer) in [(EFFECT_REMOTE_SHIELD_BOOSTER, 0, HpLayer::Shield),
         (EFFECT_REMOTE_ARMOR_REPAIRER, 1, HpLayer::Armor), (EFFECT_REMOTE_HULL_REPAIRER, 2, HpLayer::Hull)] {
         let effect = registry::resolve(&sde, effect_id).unwrap();
         let amount_attr = super::super::super::repair::amount_attribute(layer);
-        let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
-            && t.effects().iter().any(|e| e.effect_id == effect_id)
-            && t.attribute(amount_attr).is_some_and(|v| v > 0.0)).unwrap().type_id;
+        let (ship_type, module_type) = sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
+            && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE,
+                ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 10.0)))
+            .find_map(|h| sde.types.iter().find(|m| m.published == Some(true) && m.category_id == Some(CATEGORY_MODULE)
+                && m.effects().iter().any(|e| e.effect_id == effect_id)
+                && m.attribute(amount_attr).is_some_and(|v| v > 0.0)
+                && m.attribute(ATTR_CPU).zip(h.fit_attribute(ATTR_CPU_OUTPUT)).is_some_and(|(need, out)| out >= need)
+                && m.attribute(ATTR_POWER).zip(h.fit_attribute(ATTR_POWER_OUTPUT)).is_some_and(|(need, out)| out >= need))
+                .map(|m| (h.type_id, m.type_id)))
+            .expect("legal effect module and hull pair");
         let f = fixture::create(&db, ship_type, module_type, 1).await.unwrap();
         crate::dao::items::dogma::set_override(&db, f.module, amount_attr, 1e30).await.unwrap();
         let world = World::new(db.clone(), sde.clone(), 1);
@@ -33,7 +38,6 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
         world.register_pilot(f.source, notify.clone());
         world.add_ship(1, fixture::ball(f.ship, ship_type, f.source)).await.unwrap();
         world.add_ship(1, fixture::ball(f.victim, ship_type, f.target)).await.unwrap();
-        let fit = Fit::load_in_space(&db, &world, 1, f.source, f.ship).await.unwrap();
         fixture::install_half(&world, 1, f.ship, Fit::load_in_space(&db, &world, 1, f.source, f.ship).await.unwrap()).await;
         fixture::install_half(&world, 1, f.victim, Fit::load_in_space(&db, &world, 1, f.target, f.victim).await.unwrap()).await;
         crate::services::combat::damage::repair_target(&world, 1, f.victim, layer, 1.0, RepairSource::Local, |_| true).await.unwrap();
@@ -51,25 +55,39 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
                 combat_generations: vec![NativeCombatGeneration { module_id: f.module, generation, sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&world), system: 1 },
             started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0,
-            other: None, repair_amount: 0.0, illegal: false };
+            other: None, repair_amount: 0.0, illegal: false,
+            source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
         if layer != 0 {
-            assert!(matches!(on_cycle_start(&cx, &fit, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
+            cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
+            assert!(matches!(on_cycle_start(&cx, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
             let cancelled = cycle.owner.pending_combat.as_ref().unwrap().facts();
             fixture::set_locked_target(f.source, f.victim, false);
-            assert!(matches!(on_cycle_end(&cx, &fit, &mut cycle).await.unwrap(), CycleOutcome::Stop(_) | CycleOutcome::Ended { .. }));
+            assert!(matches!(on_cycle_end(&cx, &mut cycle).await.unwrap(), CycleOutcome::Stop(_) | CycleOutcome::Ended { .. }));
             assert!(cycle.owner.pending_combat.is_none());
             assert_eq!(fixture::condition(&world, 1, f.victim).await.now[layer], before.now[layer]);
             assert!(world.with(1, move |s| s.prepare_combat_source(f.ship, Some(f.module), Some(i64::from(effect_id)), None,
                 crate::lua::events::resources::FactOrigin::Natural, generation, cancelled.sequence, 1, |_| true)).await.unwrap().is_err());
             fixture::set_locked_target(f.source, f.victim, true);
         }
-        assert!(matches!(on_cycle_start(&cx, &fit, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
+        cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
+        assert!(matches!(on_cycle_start(&cx, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
         let after_start = fixture::condition(&world, 1, f.victim).await;
         if layer == 0 { assert_eq!(after_start.now[layer], before.stats.max[layer]); }
         else {
             assert_eq!(after_start.now[layer], before.now[layer]);
+            let old_amount = cycle.repair_amount;
+            let (mut client, _peer) = crate::services::tests::client(db.clone(), f.source).await;
+            client.world = world.clone();
+            client.session.apply(vec![("charid", Value::Int(f.source)), ("shipid", Value::Int(f.ship)),
+                ("solarsystemid", Value::Int(1))]);
+            let required = crate::services::skills::requirements::requirements(&sde, module_type).collect::<Vec<_>>();
+            crate::services::skills::gm::apply(&mut client, f.source, crate::services::skills::gm::Change::Set(required)).await.unwrap();
+            crate::services::effects::tests::fixture::gm_value(&mut client, f.module, amount_attr, 1.0).await;
+            assert!(crate::dao::items::dogma::online(&db, f.ship).await.unwrap().iter().any(|m| m.item_id == f.module), "fixture pilot must meet the module's prerequisites after first GM write (module {})", f.module);
+            world.with(1, |_| ()).await.unwrap();
+            assert_eq!(cycle.repair_amount, old_amount);
             world.with(1, move |s| s.refresh_pilot_affiliation(f.source, f.ship, Some(2), Some(3))).await.unwrap();
-            assert!(matches!(on_cycle_end(&cx, &fit, &mut cycle).await.unwrap(), CycleOutcome::Continue));
+            assert!(matches!(on_cycle_end(&cx, &mut cycle).await.unwrap(), CycleOutcome::Continue));
         }
         let after = fixture::condition(&world, 1, f.victim).await;
         assert_eq!(after.now[layer], before.stats.max[layer]);
@@ -88,7 +106,9 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
         } else { before.now[layer] };
         assert_eq!(slices[0].amount, BinaryAmount::from_f64(after.now[layer] - before_repair).unwrap());
         if layer != 0 {
-            assert!(matches!(on_cycle_start(&cx, &fit, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
+            cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
+            assert!(matches!(on_cycle_start(&cx, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
+            assert_eq!(cycle.repair_amount, 1.0);
             assert!(cycle.owner.pending_combat.is_some());
         }
         world.with(1, move |s| cycle_stop(s, cycle)).await.unwrap();
@@ -141,13 +161,15 @@ async fn full_remote_repair_refuses_and_driver_retires_activation() {
     state().activation_generation.insert(f.module, stop.clone());
     fixture::set_locked_target(f.source, f.victim, true);
     let cx = Ctx { db: db.clone(), world: world.clone(), notify, char_id: f.source, ship_id: f.ship, system_id: 1 };
-    let cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
+    let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
         effect: effect.clone(), target: Some(f.victim), repeat: 1, stop: stop.clone(),
         owner: ActivationOwner { master: f.module, generation: stop.clone(), armed: true,
             combat_generations: vec![NativeCombatGeneration { module_id: f.module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
             pending_combat: None, world: Arc::downgrade(&world), system: 1 },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0,
-        other: None, repair_amount: 0.0, illegal: false };
+        other: None, repair_amount: 0.0, illegal: false,
+        source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
+    cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
     begin::cycle_begin_work(cycle).await;
     world.with(1, |_| ()).await.unwrap();
     assert_eq!(fixture::condition(&world, 1, f.victim).await.now, before);
@@ -162,7 +184,8 @@ async fn full_remote_repair_refuses_and_driver_retires_activation() {
         owner: ActivationOwner { master: f.module, generation: stop, armed: true,
             combat_generations: Vec::new(), pending_combat: None, world: Arc::downgrade(&world), system: 1 },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0,
-        other: None, repair_amount: 0.0, illegal: false };
+        other: None, repair_amount: 0.0, illegal: false,
+        source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
     world.with(1, move |s| cycle_stop(s, stale)).await.unwrap();
     assert!(state().active.get(&f.module).is_some_and(|active| Arc::ptr_eq(&active.stop, &replacement)));
     state().active.remove(&f.module);

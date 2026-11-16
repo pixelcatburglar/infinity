@@ -4,6 +4,10 @@
 //! departure use character, item and skill data and the SDE to restore or save
 //! pilots. Interactive departure checkpoints the actor's selected pilot even when
 //! a committed boarding receipt was not applied to the departing client session.
+//! Whether the logout checkpoint commits or not, unregistering the matching
+//! session generation stops that character's combat state (module stop flags,
+//! outgoing and pending locks); a retained ship keeps deferred cycle retirement,
+//! not immediate timer or admitted-effect cancellation.
 //! The process-local pilot registry also supplies station guest records:
 //! online, station changes and offline send arrival or departure notices to
 //! other registered guests in the same station. Transport lifecycle and
@@ -17,7 +21,7 @@ use crate::dao::characters::selection::SelectedCharacter;
 use crate::db::{Db, outbox::Notification};
 use crate::sde::Sde;
 use infinity_core::session::OnlineSession;
-use crate::space::{NotifyTx, World};
+use crate::space::{containment::ActorAdmission, NotifyTx, World};
 use super::identity::Identity;
 use super::{db_err, CallError};
 
@@ -45,11 +49,16 @@ pub(crate) struct Prepared {
 
 async fn publish_selected_ship(
     db: &Db, world: &World, sde: &Arc<Sde>, char_id: i64, ship: i64,
-    selected: &SelectedCharacter,
+    selected: &SelectedCharacter, admission: ActorAdmission,
 ) -> Result<i64, CallError> {
     // Reconciliation owns its own market guard and finishes before this one.
     // Lock order: market, database reads, then actor publication.
     let _lock = super::market::lock().await;
+    admission.check().map_err(db_err)?;
+    // Owned drone instances are captured inside the same market lock before
+    // the arrival so the owner-domain publish below can only reach the exact
+    // incarnations that existed at this boundary, in whichever system they are.
+    let drones = super::effects::online::capture_owned_drone_fences(world, char_id).await;
     if !crate::dao::combat::victim_current(db, char_id, ship, selected.solar_system_id).await.map_err(db_err)? {
         return Err(CallError::Internal(anyhow::anyhow!("selected ship is no longer in space")));
     }
@@ -67,12 +76,48 @@ async fn publish_selected_ship(
     };
     let security = super::crimewatch::security_status(db, char_id).await?;
     let ball = super::ship::balls::piloted(db, sde.clone(), &vessel, char_id, security).await?;
-    super::ship::arrive_cloaked(world, selected.solar_system_id, ball, &_lock).await
+    let cloak_until = super::ship::arrive_cloaked(world, selected.solar_system_id, ball, &_lock).await?;
+    if !drones.is_empty() {
+        // The new hull's identity and the owner-domain package are verified and
+        // extracted in one actor turn off the just-installed cold fit; a
+        // mismatch publishes nothing at all.
+        let inputs = world.with(selected.solar_system_id, move |s| {
+            if !s.pilot_ball(char_id).is_some_and(|ball| ball.id == ship && ball.char_id == Some(char_id) && ball.owner_id == char_id) {
+                return None;
+            }
+            s.with_combat_fit(ship, |fit, _, _| fit.owner_inputs()).flatten()
+        }).await.flatten();
+        if let Some(inputs) = inputs {
+            let inputs = Arc::new(inputs);
+            for (system, drone, owner, generation, membership) in drones {
+                let inputs = inputs.clone();
+                world.post(system, move |s| {
+                    s.publish_drone_owner_inputs(drone, owner, generation, membership, inputs.as_ref());
+                });
+            }
+        }
+    }
+    Ok(cloak_until)
 }
 
 pub(crate) async fn prepare(
     db: &Db, world: &World, sde: &Arc<Sde>, char_id: i64,
     selected: &SelectedCharacter,
+    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
+) -> Result<Prepared, CallError> {
+    let admission = if selected.station_id.is_none() {
+        Some(world.admission(selected.solar_system_id).map_err(db_err)?)
+    } else {
+        None
+    };
+    prepare_for_entry(db, world, sde, char_id, selected, admission, notify).await
+}
+
+/// The preparation body under a caller-owned admission token: a space caller
+/// captured it before its first market guard; a station caller passes `None`.
+pub(crate) async fn prepare_for_entry(
+    db: &Db, world: &World, sde: &Arc<Sde>, char_id: i64,
+    selected: &SelectedCharacter, admission: Option<ActorAdmission>,
     mut notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
 ) -> Result<Prepared, CallError> {
     super::skills::expert_systems::advance_expired(db, world, sde, char_id, crate::client::filetime_now(), &mut notify).await?;
@@ -94,7 +139,10 @@ pub(crate) async fn prepare(
         super::combat::load_docked_condition(db, world, char_id, ship).await?;
     }
     let cloak_until = if station.is_none() {
-        Some(publish_selected_ship(db, world, sde, char_id, ship, selected).await?)
+        let Some(token) = admission else {
+            return Err(CallError::Internal(anyhow::anyhow!("space entry lost its actor admission")));
+        };
+        Some(publish_selected_ship(db, world, sde, char_id, ship, selected, token).await?)
     } else {
         None
     };
@@ -176,6 +224,9 @@ struct LogoutCleanup {
     chat: Weak<Hub>,
     sde: Arc<Sde>,
     expected: Option<OnlineSession>,
+    /// The actor-selected (system, ship) pair whose combat state stops when the
+    /// matching session generation is unregistered, whatever the checkpoint did.
+    space_ship: Mutex<Option<(i64, i64)>>,
     unobserve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     receipt: Mutex<Option<tokio::sync::oneshot::Sender<LogoutResult>>>,
 }
@@ -209,7 +260,7 @@ impl LogoutCleanup {
     }
 
     async fn finish(&self, mut result: LogoutResult) {
-        if let Some(unobserve) = self.unobserve.lock().unwrap().take() { unobserve(); }
+        if let Some(unobserve) = crate::poison::lock_or_exit(self.unobserve.lock()).take() { unobserve(); }
         if let Some(world) = self.world.upgrade() {
             let character = self.identity.char_id;
             let current = world.online_session(character);
@@ -224,6 +275,8 @@ impl LogoutCleanup {
                     removed
                 };
                 if removed {
+                    let space_ship = *crate::poison::lock_or_exit(self.space_ship.lock());
+                    super::combat::reset_pilot(&world, character, space_ship);
                     super::drones::settings::logged_off(character);
                     if checkpoint_ok {
                         if let Err(error) = super::corps::pending_kicks::trigger(&self.db, &world, character).await {
@@ -244,7 +297,7 @@ impl LogoutCleanup {
         } else if result.is_ok() {
             result = Err("world stopped during logout".into());
         }
-        if let Some(sender) = self.receipt.lock().unwrap().take() { let _ = sender.send(result); }
+        if let Some(sender) = crate::poison::lock_or_exit(self.receipt.lock()).take() { let _ = sender.send(result); }
     }
 }
 
@@ -255,6 +308,9 @@ struct LogoutSettlement {
     token: u64,
     snapshot: crate::space::combat::ActorConditionSnapshot,
     facts: Option<Arc<crate::space::snapshot::FactCheckpoint>>,
+    /// The character's captured source bucket writer riding the same
+    /// transaction; the receipt stays in actor state until proven.
+    bounties: Option<Arc<crate::services::bounty::npc::checkpoint::Checkpoint>>,
     position: [f64; 3],
     before: Mutex<Option<(Option<[f64; 3]>, ConditionRows)>>,
     logoff_possible: bool,
@@ -315,6 +371,7 @@ impl LogoutSettlement {
                 return;
             }
         };
+        if !crate::space::system::boarding::pending_loaded_retry(&world, &self.cleanup.db, self.system, self.ship, self.token, self.snapshot.generation).await { return; }
         let read = self.cleanup.db.transaction(
             |tx, _: &mut ()| {
                 let plan = self.clone();
@@ -338,8 +395,23 @@ impl LogoutSettlement {
             },
             |value, ()| async move { Ok(value) },
         ).await;
-        let before = *self.before.lock().unwrap();
-        let prior_logoff = self.before_logoff.lock().unwrap().clone();
+        let before = *crate::poison::lock_or_exit(self.before.lock());
+        // The bounty receipt proves itself under its own row-lock fence; a
+        // committed or unchanged outcome needs the matching bounty proof.
+        let bounty_outcome = match &self.bounties {
+            Some(receipt) => match crate::services::bounty::npc::resolve_receipt(&self.cleanup.db, receipt).await {
+                Ok(outcome) => {
+                    let _ = receipt.settle(&world, outcome).await;
+                    Some(outcome)
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+        use crate::services::bounty::npc::checkpoint::CheckpointOutcome::*;
+        let bounty_durable = self.bounties.is_none() || bounty_outcome == Some(Durable);
+        let bounty_unchanged = self.bounties.is_none() || bounty_outcome == Some(Unchanged);
+        let prior_logoff = crate::poison::lock_or_exit(self.before_logoff.lock()).clone();
         let mut verified = Default::default();
         let outcome = match (read, before) {
             (Ok(((false, _, _), _, _, _)), _) => Some(LogoutCheckpoint::Moved),
@@ -358,9 +430,9 @@ impl LogoutSettlement {
                 let business_proven = if !no_event {
                     timestamps.is_some() && prior_logoff.is_some() && timestamps != prior_logoff
                 } else { position == Some(self.position) && hp_matches };
-                if business_proven && fact_receipt != Some(false) {
+                if business_proven && fact_receipt != Some(false) && bounty_durable {
                     Some(LogoutCheckpoint::Committed)
-                } else if unchanged && (fact_receipt == Some(false) || (no_event && fact_receipt.is_none()))
+                } else if unchanged && bounty_unchanged && (fact_receipt == Some(false) || (no_event && fact_receipt.is_none()))
                     && (no_event || timestamps == prior_logoff) {
                     Some(LogoutCheckpoint::Unchanged)
                 } else if !business_proven || fact_receipt == Some(false) {
@@ -375,13 +447,7 @@ impl LogoutSettlement {
                     let _ = world.with(self.system, move |s| facts.acknowledge(s, &verified)).await;
                 }
                 match self.retire(&world).await {
-                    Some(true) => {
-                        let character = self.cleanup.identity.char_id;
-                        if world.online_session(character) == self.cleanup.expected {
-                            super::combat::reset_pilot(&world, character, Some((self.system, self.ship)));
-                        }
-                        Ok(())
-                    }
+                    Some(true) => Ok(()),
                     Some(false) => Err("logout membership changed during settlement".into()),
                     None => Err("system stopped during logout settlement".into()),
                 }
@@ -427,10 +493,24 @@ pub(crate) async fn leave(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let cleanup = Arc::new(LogoutCleanup {
         identity: *identity, db: db.clone(), world: Arc::downgrade(world), chat: Arc::downgrade(chat),
-        sde: sde.clone(), expected, unobserve: Mutex::new(Some(Box::new(unobserve))),
-        receipt: Mutex::new(Some(sender)),
+        sde: sde.clone(), expected, space_ship: Mutex::new(space_system.zip(identity.ship_id)),
+        unobserve: Mutex::new(Some(Box::new(unobserve))), receipt: Mutex::new(Some(sender)),
     });
+    // Refuse new loaded use on the departing hull and wait out admitted finite
+    // work before the market guard serializes the checkpoint; the guard holds
+    // the ship's slots until the settlement receipt resolves.
     if let (Some(ship), Some(system)) = (identity.ship_id, space_system.filter(|_| char_id != 0)) {
+        let held_loaded = match crate::space::system::boarding::quiesce_ship_loaded(world, system, &[ship]).await {
+            Ok(held) => Some(held),
+            Err(crate::space::system::boarding::LoadedQuiesceRefusal::Busy) => {
+                cleanup.finish(Err("ship or system unavailable for logout".into())).await;
+                return receiver.await.map_err(|_| anyhow::anyhow!("logout worker unavailable"))?.map_err(anyhow::Error::msg);
+            }
+            Err(crate::space::system::boarding::LoadedQuiesceRefusal::Stopped) => {
+                cleanup.finish(Err("system stopped during logout settlement".into())).await;
+                return receiver.await.map_err(|_| anyhow::anyhow!("logout worker unavailable"))?.map_err(anyhow::Error::msg);
+            }
+        };
         let market = super::market::lock().await;
         let gate = match world.lock_condition_snapshot(system).await {
             Ok(gate) => gate,
@@ -441,6 +521,13 @@ pub(crate) async fn leave(
             }
         };
         let owned = cleanup.clone();
+        // Resolve older bounty receipts under the held gate before the actor
+        // capture below issues a new writer for the same rows.
+        for receipt in world.with(system, move |s| s.bounty_pending_receipts(Some(char_id))).await.unwrap_or_default() {
+            if let Ok(outcome) = crate::services::bounty::npc::resolve_receipt(db, &receipt).await {
+                let _ = receipt.settle(world.as_ref(), outcome).await;
+            }
+        }
         let submitted = world.with(system, move |s| {
             if !s.combat_session_current(char_id, owned.expected.as_ref()) { return LogoutAdmission::NoMembership; }
             let actual_pilot = session_id.is_some_and(|sid| owned.expected.as_ref().is_some_and(|live|
@@ -449,20 +536,28 @@ pub(crate) async fn leave(
                     && live.ship_id == Some(ship)));
             let Some(ball) = s.pilot_ball(char_id).filter(|ball| actual_pilot || ball.id == ship).cloned() else { return LogoutAdmission::NoMembership };
             let ship = ball.id;
-            let Some(transition) = s.begin_condition_transitions(&[ship]) else { return LogoutAdmission::Unavailable };
+            *crate::poison::lock_or_exit(owned.space_ship.lock()) = Some((system, ship));
+            let Some(mut transition) = s.begin_condition_transitions(&[ship]) else { return LogoutAdmission::Unavailable };
+            transition.held_loaded = held_loaded;
             let logoff_possible = user_id.is_some() && owned.expected.is_some();
             let plan = Arc::new(LogoutSettlement {
                 cleanup: owned, system, ship, token: transition.entries[0].0,
-                snapshot: transition.entries[0].1.clone(), facts: transition.facts.clone(), position: ball.pos, before: Mutex::new(None),
+                snapshot: { let mut snapshot = transition.entries[0].1.clone(); snapshot.loaded.clear(); snapshot },
+                facts: transition.facts.clone(), position: ball.pos, before: Mutex::new(None),
+                bounties: s.capture_npc_bounties(Some(char_id)).unwrap_or_default(),
                 logoff_possible,
                 skipped_logoff: std::sync::atomic::AtomicBool::new(false),
                 before_logoff: Mutex::new(None),
             });
-            if s.defer_condition_transition(transition, move |_| async move {
+            if s.defer_condition_transition(transition, move |mut transition| async move {
                 let Some(world) = plan.cleanup.world.upgrade() else {
                     plan.cleanup.finish(Err("world stopped during logout".into())).await;
                     return;
                 };
+                // This attempt's transient loaded capture rides the write
+                // transaction; the settlement keeps none.
+                let snapshot = transition.entries[0].1.clone();
+                let mut loaded = transition.held_loaded.take();
                 let baseline = plan.cleanup.db.transaction(|tx, _: &mut ()| {
                     let plan = plan.clone();
                     Box::pin(async move {
@@ -477,6 +572,9 @@ pub(crate) async fn leave(
                     Ok(((true, position, rows), timestamps)) => ((position, rows), timestamps),
                     Ok(((false, _, _), _)) => {
                         let _ = plan.retire(&world).await;
+                        if let Some(bounty_receipt) = &plan.bounties {
+                            let _ = bounty_receipt.settle(&world, crate::services::bounty::npc::checkpoint::CheckpointOutcome::Unchanged).await;
+                        }
                         drop(gate);
                         drop(market);
                         plan.cleanup.finish(Err("ship moved before logout checkpoint".into())).await;
@@ -484,6 +582,9 @@ pub(crate) async fn leave(
                     }
                     Err(_) => {
                         let (token, generation) = (plan.token, plan.snapshot.generation);
+                        if let Some(bounty_receipt) = &plan.bounties {
+                            let _ = bounty_receipt.settle(&world, crate::services::bounty::npc::checkpoint::CheckpointOutcome::Unchanged).await;
+                        }
                         world.with(system, move |s| s.cancel_combat_transition(ship, token, generation)).await;
                         drop(gate);
                         drop(market);
@@ -491,13 +592,16 @@ pub(crate) async fn leave(
                         return;
                     }
                 };
-                *plan.before.lock().unwrap() = Some((position, rows));
-                *plan.before_logoff.lock().unwrap() = timestamps;
+                *crate::poison::lock_or_exit(plan.before.lock()) = Some((position, rows));
+                *crate::poison::lock_or_exit(plan.before_logoff.lock()) = timestamps;
+                // The guard arms right before the write transaction may
+                // execute; the baseline reads above stay rollback-owned.
+                if let Some(hold) = loaded.as_mut() { hold.may_execute(); }
                 let mut gate = Some(gate);
                 let mut market = Some(market);
                 let result: Result<bool, CallError> = plan.cleanup.db.transaction(
                     |tx, outbox: &mut crate::db::outbox::Outbox| {
-                        let snapshot = plan.snapshot.clone();
+                        let snapshot = snapshot.clone();
                         let position = plan.position;
                         let world = world.clone();
                         let facts = plan.facts.clone();
@@ -513,6 +617,9 @@ pub(crate) async fn leave(
                             if snapshot.revision != snapshot.saved_revision && !written.contains(&ship) {
                                 return Err(CallError::Internal(anyhow::anyhow!("ship condition was not checkpointed")));
                             }
+                            if let Some(bounties) = &decision_plan.bounties {
+                                bounties.write_in(tx).await?;
+                            }
                             if items::positions::save(tx, ship, &position).await.map_err(db_err)? != 1 {
                                 return Err(CallError::Internal(anyhow::anyhow!("ship position was not checkpointed")));
                             }
@@ -527,16 +634,20 @@ pub(crate) async fn leave(
                         let world = &world;
                         let gate = &mut gate;
                         let market = &mut market;
+                        let loaded = &mut loaded;
                         async move {
+                        if let Some(bounties) = &plan.bounties {
+                            let _ = bounties.acknowledge(world).await;
+                        }
                         if let Some(facts) = plan.facts.clone() {
                             let written = written.into_iter().collect();
                             let _ = world.with(system, move |s| facts.acknowledge(s, &written)).await;
                         }
                         let removed = plan.retire(&world).await == Some(true);
-                        if removed && world.online_session(char_id) == plan.cleanup.expected {
-                            super::combat::reset_pilot(&world, char_id, Some((system, ship)));
-                        }
                         if removed {
+                            if let Some(hold) = loaded.take() {
+                                crate::services::combat::loaded::commit_disposition(world, system, hold).await;
+                            }
                             drop(gate.take());
                             drop(market.take());
                             plan.cleanup.finish(Ok(())).await;
@@ -547,6 +658,9 @@ pub(crate) async fn leave(
                 ).await;
                 if matches!(result, Ok(true)) {
                     return;
+                }
+                if let Some(hold) = loaded.take() {
+                    crate::services::combat::loaded::unknown_disposition(&plan.cleanup.db, &world, system, hold).await;
                 }
                 let callback = plan.callback();
                 let (token, generation) = (plan.token, plan.snapshot.generation);
@@ -563,11 +677,13 @@ pub(crate) async fn leave(
             _ => cleanup.finish(Err("ship or system unavailable for logout".into())).await,
         }
     } else {
-        if char_id != 0 { super::combat::reset_pilot(world, char_id, space_system.zip(identity.ship_id)); }
         cleanup.finish_without_checkpoint(user_id).await;
     }
     receiver.await.map_err(|_| anyhow::anyhow!("logout worker unavailable"))?.map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;
+#[cfg(all(test, feature = "tests-social"))]
+#[path = "presence/tests/logout.rs"]
+mod logout_tests;

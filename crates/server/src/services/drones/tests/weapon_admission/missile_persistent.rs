@@ -63,8 +63,7 @@ async fn scenario(fault: bool) -> Result<()> {
             .collect();
         for attr in durations { f.set(source, attr, 0.0).await; }
         let fit = Fit::load_in_space(&f.db, &f.world, f.system, victim, victim_ship).await.map_err(|e| anyhow!("victim fit: {e:?}"))?;
-        let (generation, revision, projection) = f.world.with(f.system, move |s| Some((s.combat_membership_generation(victim_ship)?, s.combat_fit_revision(victim_ship)?, s.projection_revision(victim_ship)))).await.flatten().ok_or_else(|| anyhow!("missing victim cache"))?;
-        ensure!(f.world.with(f.system, move |s| s.replace_fitted_cache(victim_ship, generation, revision, fit, Key::Ship, Some(projection))).await == Some(true), "victim fit publication failed");
+        ensure!(crate::services::tests::fixture::publish_fitting(&f.world, f.system, victim, victim_ship, fit).await, "victim fit publication failed");
         let ship = f.ship;
         f.world.with(f.system, move |s| {
             // Place the engagement beyond every existing ball, including the system's sun.
@@ -102,12 +101,12 @@ async fn scenario(fault: bool) -> Result<()> {
         let security_before = crate::services::crimewatch::security_status(&f.db, f.owner).await.ok().ok_or_else(|| anyhow!("security lookup failed"))?;
         let missile = Missile { charge: weapon, raw: [1.0, 0.0, 0.0, 0.0],
             aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(), aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(),
-            drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: 25.0, flight_range: 1_000_000.0,
+            drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: 25.0, flight_time_ms: 20_000.0,
             weapon, illegal: false };
         let cold_world = crate::space::World::new(f.db.clone(), f.sde.clone(), 1);
         let cold_missile = Missile { charge: weapon, raw: [1.0, 0.0, 0.0, 0.0],
             aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(), aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(),
-            drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: 25.0, flight_range: 1_000_000.0,
+            drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: 25.0, flight_time_ms: 20_000.0,
             weapon, illegal: false };
         let cold_attempt = admitted(&f, guard, source, from.type_id).await?;
         tokio::time::timeout(Duration::from_secs(15), weapons::launch_missile(f.db.clone(), cold_world, f.system, from.clone(), target.clone(), f.owner, None, cold_missile, Some(guard), cold_attempt))
@@ -125,20 +124,8 @@ async fn scenario(fault: bool) -> Result<()> {
         }
         ensure!(crate::services::crimewatch::weapons_timer(f.owner).is_some()
             && crate::services::crimewatch::retaliation_allowed(victim, f.owner, crate::client::filetime_now()), "accepted launch did not apply aggression");
-        let (owner, ship) = (f.owner, f.ship);
-        ensure!(f.world.with(f.system, move |s| s.drone_order(source, owner, ship, DroneOrder::ReturnHome)).await == Some(true), "recall failed");
-        f.world.remove_ball(f.system, source).await;
-        f.world.remove_ball(f.system, ship).await;
-        f.world.unregister_pilot_generation(f.owner, None);
-        let replacement = crate::dao::items::creation::positioned(&f.db, original_ship.type_id, f.owner, f.system, [0.0; 3]).await?;
-        crate::dao::characters::selection::set_ship(&f.db, f.owner, replacement).await?;
-        let mut replacement_ball = original_ship;
-        replacement_ball.id = replacement;
-        f.world.add_ship(f.system, replacement_ball).await?;
-        let fit = Fit::load(&f.db, f.sde.clone(), f.owner, replacement).await.map_err(|error| anyhow!("replacement fit: {error:?}"))?;
-        let condition = crate::services::combat::prepare_condition_with_fit(&f.db, replacement, &fit).await.map_err(|error| anyhow!("replacement condition: {error:?}"))?;
-        f.world.with(f.system, move |s| s.install_condition(replacement, condition.into_condition(), fit)).await.ok_or_else(|| anyhow!("actor stopped"))?;
-        ensure!(f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?.is_empty(), "impact occurred before source swap and disconnect");
+        // The real contact must commit while the source is still present; once
+        // it has, disconnect and ship swap cannot revert the contribution.
         tokio::time::timeout(Duration::from_secs(35), async {
             loop {
                 let rows = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;
@@ -154,15 +141,31 @@ async fn scenario(fault: bool) -> Result<()> {
             .ok_or_else(|| anyhow!("missing victim condition after impact"))?;
         ensure!(hit.revision > prehit.revision && hit.condition.now[0] < prehit.condition.now[0],
             "missile impact did not reduce victim shield HP");
-        let before_zero = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;
-        let original = before_zero.iter().find(|r| r.attacker_id == f.owner).ok_or_else(|| anyhow!("missing contribution"))?;
+        let committed = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;
+        let original = committed.iter().find(|r| r.attacker_id == f.owner).ok_or_else(|| anyhow!("missing contribution"))?;
         let saved = (original.source_ship_id, original.source_ship_type, original.weapon_type_id, original.damage, original.last_damage_at, original.illegal);
+        let (owner, ship) = (f.owner, f.ship);
+        ensure!(f.world.with(f.system, move |s| s.drone_order(source, owner, ship, DroneOrder::ReturnHome)).await == Some(true), "recall failed");
+        f.world.remove_ball(f.system, source).await;
+        f.world.remove_ball(f.system, ship).await;
+        f.world.unregister_pilot_generation(f.owner, None);
+        let replacement = crate::dao::items::creation::positioned(&f.db, original_ship.type_id, f.owner, f.system, [0.0; 3]).await?;
+        crate::dao::characters::selection::set_ship(&f.db, f.owner, replacement).await?;
+        let mut replacement_ball = original_ship;
+        replacement_ball.id = replacement;
+        f.world.add_ship(f.system, replacement_ball).await?;
+        let fit = Fit::load(&f.db, f.sde.clone(), f.owner, replacement).await.map_err(|error| anyhow!("replacement fit: {error:?}"))?;
+        let condition = crate::services::combat::prepare_condition_with_fit(&f.db, replacement, &fit).await.map_err(|error| anyhow!("replacement condition: {error:?}"))?;
+        f.world.with(f.system, move |s| s.install_condition(replacement, condition.into_condition(), fit)).await.ok_or_else(|| anyhow!("actor stopped"))?;
+        let after_swap = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;
+        let current = after_swap.iter().find(|r| r.attacker_id == f.owner).ok_or_else(|| anyhow!("committed contribution lost on disconnect"))?;
+        ensure!((current.source_ship_id, current.source_ship_type, current.weapon_type_id, current.damage, current.last_damage_at, current.illegal) == saved, "committed contribution changed on disconnect");
         let (from, target) = f.world.with(f.system, move |s| Some((s.sampled_ball(replacement)?, s.sampled_ball(victim_ship)?))).await.flatten().ok_or_else(|| anyhow!("missing replacement or victim"))?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         f.world.register_pilot(victim, tx);
         let zero = Missile { charge: weapon, raw: [0.0; 4], aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(),
             aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(), drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(),
-            velocity: 1_000_000.0, flight_range: 1_000_000.0, weapon: from.type_id, illegal: false };
+            velocity: 1_000_000.0, flight_time_ms: 5_000.0, weapon: from.type_id, illegal: false };
         let weak = std::sync::Arc::downgrade(&f.world);
         let system = f.system;
         let facts = f.world.with(system, move |s| {
@@ -171,7 +174,7 @@ async fn scenario(fault: bool) -> Result<()> {
                 generation, 1, 1, |_| true)
         }).await.ok_or_else(|| anyhow!("actor stopped"))?.map_err(|error| anyhow!("replacement source: {error:?}"))?;
         let attempt = crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system);
-        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, zero, None, attempt).await.ok().ok_or_else(|| anyhow!("zero missile launch failed"))?;
+        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from.clone(), target.clone(), f.owner, None, zero, None, attempt).await.ok().ok_or_else(|| anyhow!("zero missile launch failed"))?;
         tokio::time::timeout(Duration::from_secs(35), async {
             loop {
                 while let Ok((event, args)) = rx.try_recv() {
@@ -183,6 +186,22 @@ async fn scenario(fault: bool) -> Result<()> {
         let after_zero = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;
         let current = after_zero.iter().find(|r| r.attacker_id == f.owner).ok_or_else(|| anyhow!("missing contribution after zero hit"))?;
         ensure!((current.source_ship_id, current.source_ship_type, current.weapon_type_id, current.damage, current.last_damage_at, current.illegal) == saved, "zero hit stole provenance");
+        // A launcher removed before contact cancels the flight entirely.
+        let hot = Missile { charge: weapon, raw: [1.0, 0.0, 0.0, 0.0], aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(),
+            aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(), drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(),
+            velocity: 1_000_000.0, flight_time_ms: 5_000.0, weapon: from.type_id, illegal: false };
+        let facts = f.world.with(system, move |s| {
+            let generation = s.combat_membership_generation(replacement).unwrap();
+            s.prepare_combat_source(replacement, None, None, None, crate::lua::events::resources::FactOrigin::Natural,
+                generation, 2, 1, |_| true)
+        }).await.ok_or_else(|| anyhow!("actor stopped"))?.map_err(|error| anyhow!("removal source: {error:?}"))?;
+        let attempt = crate::services::effects::space_source::PreparedCombatAttempt::new(facts, std::sync::Arc::downgrade(&f.world), system);
+        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, hot, None, attempt).await.ok().ok_or_else(|| anyhow!("removal missile launch failed"))?;
+        f.world.remove_ball(f.system, replacement).await;
+        ensure!(f.world.after(f.system, 6_000).await, "actor stopped awaiting expiry");
+        let after_removal = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;
+        let current = after_removal.iter().find(|r| r.attacker_id == f.owner).ok_or_else(|| anyhow!("committed contribution lost"))?;
+        ensure!((current.source_ship_id, current.source_ship_type, current.weapon_type_id, current.damage, current.last_damage_at, current.illegal) == saved, "removed launcher still landed");
         Ok(())
     }).await;
     let fault_cleanup = if fault {

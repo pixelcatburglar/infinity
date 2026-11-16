@@ -11,6 +11,10 @@
 //! random system of its target class, where a K162 leads back; both ends share one mass
 //! budget and lifetime.
 //! Belt spawning, rat ranges and cleared or hacked site linger times are operator policies.
+//! A belt's or combat site's surviving rat group is marked at spawn so a
+//! proven-quiescent system unload may hold it in the process-local NPC sleep
+//! store and restore it on the next cold load; other NPC groups stay strict
+//! unload blockers.
 //!
 //! Static placement and generation use the shared startup SDE. Sites are stored in
 //! `game.exploration_sites`;
@@ -38,6 +42,12 @@
 //! - bound scanMgr.QAScanSites((targetID, ...)) -> selected full-certainty results for QA.
 //! - bound scanMgr.ConeScan(angle, range, x, y, z) -> [record(id, typeID, groupID)].
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
+//! GM slash diagnostics: `/sigscan` aliases `/scanall` and `/sigs` aliases
+//! `/sites`; the site list names real site IDs and content classes and is capped
+//! at 50 rows. `/overlayrefresh` resends the system's already-loaded tracker to
+//! the caller only (OnSignalTrackerFullState with the remove-old-sites flag);
+//! it requires space and a loaded tracker and never loads, generates or expires
+//! sites or changes scan authorization.
 
 mod scan_mgr;
 pub(crate) mod wormhole_mgr;
@@ -62,6 +72,7 @@ use crate::lua::events::resources::{FactContext, FactOrigin, HackKind};
 use crate::services::fit::PERCENT_SCALE;
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, seconds_to_ms, Ball, World, MODE_RIGID, V3};
 use marshal::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -254,7 +265,7 @@ struct State {
 
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(STATE.get_or_init(Default::default).lock())
 }
 
 fn system_sites(system: i64) -> Vec<Site> {
@@ -394,56 +405,84 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     else {
         return Ok(Value::None);
     };
-    let Some(loaded) = crate::dao::items::charges::loaded(&c.db, ship, flag).await.map_err(db_err)?
+    let rows = super::combat::loaded::rows(&c.db, &c.world, Some(system), ship).await?;
+    let Some((_, have)) = rows.iter().find(|r| r.flag_id == flag).map(|r| (r.type_id, r.quantity))
     else {
         return Err(CallError::User { msg: messages::MSG_NO_CHARGES.into(), dict: vec![] });
     };
-    let (type_id, have) = (loaded.type_id, loaded.quantity);
     let out = state().probes.values().filter(|p| p.char_id == char_id && p.system == system).count();
-    let take = wanted.min(have).min((MAX_PROBES - out.min(MAX_PROBES)) as i64);
-    if take <= 0 {
+    let cap = (MAX_PROBES - out.min(MAX_PROBES)) as i64;
+    if wanted.min(have).min(cap) <= 0 {
         return Ok(Value::None);
     }
-    let attrs = &c.world.sde().types;
-    let base = attrs.attribute(type_id, ATTR_BASE_SENSOR_STRENGTH).unwrap_or(40.0);
-    let lifetime_ms = attrs.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
     let now = filetime_now();
     let (skill, _) = probe_skills(&c.db, &c.sde, char_id, now).await?;
-    let pos = c.world.with(system, move |s| s.sample_position(ship)).await.flatten().unwrap_or([0.0; 3]);
-    let expiry = now + (lifetime_ms * 10_000.0) as i64;
+    let armed = super::combat::loaded::LoadedHolds::arm(&c.world, &[(system, ship)], notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _market = crate::services::market::lock().await;
+    let mut holds = super::combat::loaded::LoadedHolds::lock(&c.world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
+    let (pos, token) = c.world.with(system, move |s| {
+        (s.sample_position(ship).unwrap_or([0.0; 3]), s.fitted_charge_token(ship, module))
+    }).await.unwrap_or(([0.0; 3], None));
     enum Launch { Probes }
     crate::progress::leaf_effect!(Launch);
     let user_id = c.login.user_id;
     let db = c.db.clone();
-    db.transaction(
-        move |tx, outbox: &mut Outbox<Launch>| Box::pin(async move {
-            let remaining = crate::dao::exploration::consume_probes(tx, ship, flag, type_id, have, take).await.map_err(db_err)?
-                .ok_or_else(|| super::notify_error(messages::INSUFFICIENT_PROBE_LAUNCHER_PROBES))?;
-            outbox.notify_client("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, remaining, remaining + take)]);
-            outbox.operation(Launch::Probes);
-            Ok::<(), CallError>(())
-        }),
-        |(), outbox: Outbox<Launch>| async move {
+    holds.may_execute();
+    let result = db.transaction(
+        move |tx, outbox: &mut Outbox<Launch>| {
+            let settle = settle.clone();
+            Box::pin(async move {
+                super::combat::loaded::settle_in(tx, &settle).await?;
+                let Some(row) = crate::dao::items::charges::loaded(tx, ship, flag).await.map_err(db_err)?
+                else {
+                    return Err(super::notify_error(messages::INSUFFICIENT_PROBE_LAUNCHER_PROBES));
+                };
+                let (type_id, have, take) = (row.type_id, row.quantity, wanted.min(row.quantity).min(cap));
+                if take <= 0 { return Ok((false, type_id, take, Vec::new())); }
+                let remaining = crate::dao::exploration::consume_probes(tx, ship, flag, type_id, have, take).await.map_err(db_err)?
+                    .ok_or_else(|| super::notify_error(messages::INSUFFICIENT_PROBE_LAUNCHER_PROBES))?;
+                outbox.notify_client("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, remaining, remaining + take)]);
+                outbox.operation(Launch::Probes);
+                let seeds = super::combat::loaded::seed_entries(tx, ship, &[(module, flag)]).await?;
+                Ok::<_, CallError>((remaining == 0, type_id, take, seeds))
+            })
+        },
+        |(depleted, type_id, take, seeds), outbox: Outbox<Launch>| {
+            let c = &mut *c;
+            async move {
             let world = c.world.clone();
+            if let Some(token) = token.filter(|token| depleted && token.type_id == type_id) {
+                world.post(system, move |s| {
+                    s.remove_fitted_charge(token);
+                });
+            }
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
-                    Effect::Operation(Launch::Probes) => for _ in 0..take {
-                        let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
-                        let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
-                        c.notify("OnNewProbe", vec![probe_value(id, &probe)]);
-                        state().probes.insert(id, probe);
+                    Effect::Operation(Launch::Probes) => {
+                        let attrs = &world.sde().types;
+                        let base = attrs.attribute(type_id, ATTR_BASE_SENSOR_STRENGTH).unwrap_or(40.0);
+                        let lifetime_ms = attrs.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
+                        let expiry = now + (lifetime_ms * 10_000.0) as i64;
+                        for _ in 0..take {
+                            let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+                            let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
+                            c.notify("OnNewProbe", vec![probe_value(id, &probe)]);
+                            state().probes.insert(id, probe);
+                        }
                     },
                 }
             }
-            Ok(())
+            Ok((type_id, take, seeds))
+            }
         },
-    ).await?;
+    ).await;
+    let seeds = match &result { Ok((_, _, seeds)) => vec![(ship, seeds.clone())], _ => Vec::new() };
+    let (type_id, take, _) = holds.finish(&db, &c.world, result, &seeds).await?;
     info!(user = user_id, "launched {take} probes of {type_id} from {module}");
     Ok(Value::None)
 }
-
-
 
 /// A pilot arrived at `belt`: unless disabled, its rats are still about, or it
 /// was cleared within the configured respawn delay, the region's pirates spawn.
@@ -469,11 +508,18 @@ pub async fn belt_rats(db: &Db, world: &Arc<World>, user_id: i64, system: i64, b
     };
     info!(user = user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
     world.post(system, move |s| {
-        s.spawn_group(spawned, move |s| {
+        let group = s.spawn_group(spawned, move |s| {
             s.schedule(seconds_to_ms(crate::config::game().npc.belt_rat_respawn_secs as f64), move |_| {
                 state().belts.remove(&belt);
             });
         });
+        // A live, non-empty group gets its belt origin for the idle-unload
+        // sleep admission in this same actor turn; a refused mark only keeps
+        // the strict blocker and rolls nothing back.
+        if s.group_remaining(group) != 0
+            && !s.mark_npc_group_sleepable(group, crate::space::system::npc_sleep::NpcSpawnOrigin::Belt(belt)) {
+            warn!(system, belt, group, "belt NPC group refused sleep marking");
+        }
     });
     Ok(())
 }
@@ -512,7 +558,7 @@ pub(super) async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64, o
     let world = Arc::downgrade(&c.world);
     let user = c.login.user_id;
     let site_id = site.id;
-    let on_exit: crate::space::system::Timer = Box::new(move |s| {
+    let on_exit: crate::space::system::warp_arrival::ArrivalCallback = Box::new(move |s| {
         s.defer(async move {
             let Some(world) = world.upgrade() else { return };
             if let Err(e) = landing::arrive(&db, &world, user, system, site_id).await {
@@ -557,20 +603,23 @@ async fn set_container_state_locked(
     system: i64,
     container: i64,
     security_state: i64,
-    market: &tokio::sync::MutexGuard<'static, ()>,
-) {
-    let Some(mut ball) = world.remove_ball(system, container).await else { return };
+    market: &crate::services::market::economy_lock::Guard,
+) -> Result<(), CallError> {
+    let Some(mut ball) = world.remove_ball(system, container).await else { return Ok(()) };
     ball.slim = vec![("hackingSecurityState", Value::Int(security_state))];
-    let _ = world.add_ship_locked(system, ball, market).await;
+    world.add_ship_locked(system, ball, market).await.map_err(CallError::Internal)
 }
 
 /// A won hack: the container opens to its hacker, and once every container of the site
 /// is open the site winds down.
 pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64, char_id: i64, context: FactContext) -> Result<(), CallError> {
-    let _trading = super::market::lock().await;
-    let Some(site_id) = state().sites.values().find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).map(|s| s.id) else {
+    let Some((site_id, system)) = state().sites.values()
+        .find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).map(|s| (s.id, s.system)) else {
         return Ok(());
     };
+    let admission = world.admission(system).map_err(db_err)?;
+    let _trading = super::market::lock().await;
+    admission.check().map_err(db_err)?;
     enum Completion { Open(Site) }
     crate::progress::leaf_effect!(Completion);
     db.transaction(
@@ -610,7 +659,7 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
                     Effect::Operation(Completion::Open(site)) => {
                         let site_id = site.id;
                         state().sites.insert(site_id, site.clone());
-                        set_container_state_locked(world, site.system, container, 2, &_trading).await;
+                        set_container_state_locked(world, site.system, container, 2, &_trading).await?;
                         if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
                             let (db, completion_world) = (db.clone(), world.clone());
                             world.schedule(site.system, seconds_to_ms(crate::config::game().npc.hacked_site_linger_secs as f64), move |s| {
@@ -673,25 +722,49 @@ pub(super) async fn gm_scan_all(c: &mut Client) -> Result<String, CallError> {
     Ok(messages::gm_sites_scanned(sites.len()))
 }
 
-/// /sites: what this system holds.
+/// The content class a /sites row reports, most specific first: wormhole, mined
+/// field, then the signature's strength attribute. Static labels are borrowed;
+/// only the wormhole's dynamic detail allocates.
+fn gm_site_class(s: &Site) -> Cow<'static, str> {
+    if let Some(w) = &s.wormhole {
+        return Cow::Owned(messages::gm::gm_wormhole_site(w.type_id, w.dest_system, w.dest_class));
+    }
+    use crate::space::asteroids::Field;
+    Cow::Borrowed(match s.mining_field() {
+        Some(Field::Ore) => messages::gm::GM_SITE_ORE,
+        Some(Field::Ice) => messages::gm::GM_SITE_ICE,
+        Some(Field::Gas) => messages::gm::GM_SITE_GAS,
+        None => match s.strength_attr {
+            STRENGTH_RADAR => messages::gm::GM_SITE_DATA,
+            STRENGTH_MAGNETOMETRIC => messages::gm::GM_SITE_RELIC,
+            STRENGTH_LADAR => messages::gm::GM_SITE_GAS,
+            STRENGTH_GRAVIMETRIC => messages::gm::GM_SITE_MINING,
+            STRENGTH_ALL => messages::gm::GM_SITE_COMBAT,
+            _ => messages::gm::GM_SITE_UNKNOWN,
+        },
+    })
+}
+
+/// /sites (alias /sigs): what this system holds, by real site ID.
 pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
     let Some(system) = c.session.int("solarsystemid") else { return Err(gm_error(messages::GM_UNDOCK_FIRST)) };
     ensure_loaded(&c.db, &c.world, system).await?;
     let mut lines = vec![];
     for s in system_sites(system) {
         let name = s.name_id.and_then(|id| c.world.sde().localization.chinese(id)).unwrap_or_default();
-        let what = match (&s.wormhole, s.strength_attr) {
-            (Some(w), _) => messages::gm_wormhole_site(w.type_id, w.dest_system, w.dest_class),
-            (None, STRENGTH_RADAR) => messages::GM_SITE_DATA.into(),
-            (None, STRENGTH_MAGNETOMETRIC) => messages::GM_SITE_RELIC.into(),
-            _ => messages::GM_SITE_COMBAT.into(),
-        };
-        let kind = if s.kind == Kind::Anomaly { messages::GM_SITE_ANOMALY } else { messages::GM_SITE_SIGNATURE };
+        let what = gm_site_class(&s);
+        let kind = if s.kind == Kind::Anomaly { messages::gm::GM_SITE_ANOMALY } else { messages::gm::GM_SITE_SIGNATURE };
         let strength = (s.kind == Kind::Signature).then_some(s.ease * PERCENT_SCALE);
-        lines.push(messages::gm::gm_site_row_strength(&s.target, kind, &what, name, strength));
+        lines.push(messages::gm::gm_site_row_strength(s.id, &s.target, kind, &what, name, strength));
     }
     lines.sort();
     Ok(lines.join("\n"))
+}
+
+/// /overlayrefresh: resend the caller's already-loaded tracker; the mechanism
+/// lives in scanning.rs with the other overlay code.
+pub(super) fn gm_overlay_refresh(c: &mut Client) -> Result<String, CallError> {
+    scanning::refresh_overlay(c)
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -702,4 +775,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)] pub(super) mod tests;
+#[cfg(all(test, feature = "tests-content"))] pub(super) mod tests;

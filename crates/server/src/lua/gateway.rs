@@ -63,7 +63,7 @@ struct Guard { state: Arc<Admission>, hook: Arc<Mutex<Option<mlua::Thread>>> }
 impl Drop for Guard {
     fn drop(&mut self) {
         self.state.live.store(false, Ordering::Release);
-        if let Ok(mut hook) = self.hook.lock() { if let Some(thread) = hook.take() { thread.remove_hook(); } }
+        if let Some(thread) = crate::poison::lock_or_exit(self.hook.lock()).take() { thread.remove_hook(); }
     }
 }
 
@@ -101,4 +101,4 @@ async fn invoke_in_generation(registry: Arc<Registry>, config: &crate::config::l
     Ok(response)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

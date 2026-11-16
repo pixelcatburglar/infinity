@@ -16,7 +16,7 @@ fn supported_numeric_effects_and_unknown() {
         (EFFECT_HACKING, Hacking), (EFFECT_PROBE_LAUNCHING, ProbeLaunch),
         (EFFECT_SURVEY_SCAN, SurveyScan),
         (EFFECT_EMP_WAVE, Smartbomb), (EFFECT_NPC_BEHAVIOR_SMARTBOMB, Smartbomb),
-        (EFFECT_CHAIN_LIGHTNING, Vorton), (EFFECT_BOMB_LAUNCHING, Bomb),
+        (EFFECT_CHAIN_LIGHTNING, Vorton), (EFFECT_ENTITY_CHAIN_LIGHTNING, Vorton), (EFFECT_BOMB_LAUNCHING, Bomb),
         (EFFECT_CLOAKING, Cloak), (EFFECT_CLOAKING_PROTOTYPE, Cloak), (EFFECT_CLOAKING_WARP_SAFE, Cloak),
         (EFFECT_MICRO_JUMP_DRIVE, MicroJumpDrive), (EFFECT_TRACTOR_BEAM, Tractor),
         (EFFECT_CARGO_SCAN, CargoScan), (EFFECT_SHIP_SCAN, ShipScan),

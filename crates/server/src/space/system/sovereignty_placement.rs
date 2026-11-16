@@ -35,5 +35,5 @@ impl System {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-space"))]
 mod tests;

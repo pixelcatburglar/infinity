@@ -49,5 +49,5 @@ pub(crate) async fn advance(ex: &(impl Executor + ?Sized), character: i64, expec
     Ok(ex.execute("UPDATE game.ship_adaption_characters SET revision = revision + 1, content_version = $3 WHERE character_id = $1 AND revision = $2 AND revision < 9223372036854775807", &[&character, &expected, &version]).await? == 1)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

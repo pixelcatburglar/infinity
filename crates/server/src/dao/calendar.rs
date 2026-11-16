@@ -48,18 +48,6 @@ impl OwnerDate {
         Self { owner_id: r.get("owner_id"), event_date: r.get("event_date") }
     }
 }
-struct Owner { owner_id: i64 }
-impl Owner {
-    fn from_row(r: &Row) -> Self { Self { owner_id: r.get("owner_id") } }
-}
-struct EventId { event_id: i64 }
-impl EventId {
-    fn from_row(r: &Row) -> Self { Self { event_id: r.get("event_id") } }
-}
-struct CharId { char_id: i64 }
-impl CharId {
-    fn from_row(r: &Row) -> Self { Self { char_id: r.get("char_id") } }
-}
 pub(crate) struct EventResponse {
     pub event_id: i64,
     pub status: i64,
@@ -95,7 +83,7 @@ pub(crate) async fn invitees(ex: &impl Executor, event: i64, deleted: i32) -> Re
         "SELECT char_id FROM game.calendar_responses WHERE event_id = $1 AND status <> $2",
         &[&event, &deleted],
     ).await?;
-    Ok(rows.iter().map(|r| CharId::from_row(r).char_id).collect())
+    Ok(rows.iter().map(|r| r.get::<_, i64>("char_id")).collect())
 }
 pub(crate) struct NewEvent<'a> {
     pub owner: i64,
@@ -113,7 +101,7 @@ pub(crate) async fn create(ex: &impl Executor, e: &NewEvent<'_>) -> Result<i64, 
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING event_id",
         &[&e.owner, &e.creator, &e.when, &e.duration, &e.title, &e.description, &e.importance, &e.modified],
     ).await?;
-    Ok(EventId::from_row(&row).event_id)
+    Ok(row.get::<_, i64>("event_id"))
 }
 pub(crate) async fn initial_responses(
     ex: &impl Executor, event: i64, me: i64, guests: &[i64], undecided: i32, accepted: i32,
@@ -135,7 +123,7 @@ pub(crate) async fn initial_responses(
 }
 pub(crate) async fn owner(ex: &impl Executor, event: i64) -> Result<Option<i64>, Error> {
     let row = ex.query_opt("SELECT owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await?;
-    Ok(row.as_ref().map(|r| Owner::from_row(r).owner_id))
+    Ok(row.as_ref().map(|r| r.get::<_, i64>("owner_id")))
 }
 pub(crate) async fn details(ex: &impl Executor, event: i64) -> Result<Option<Details>, Error> {
     let row = ex.query_opt("SELECT description, creator_id, owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await?;

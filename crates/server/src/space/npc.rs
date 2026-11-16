@@ -3,11 +3,22 @@
 //! Weapon, repair and projected effects use a sequential worker outside the actor.
 //! Projected cycles have independent actor timers and capture sampled positions;
 //! process-unique target generations prevent queued jobs from applying to an
-//! obsolete target or NPC incarnation. Think intervals and AI target-loss range use
-//! combat configuration; projected scan resolution and dogma target range refresh
-//! separately under actor revisions. ECM immediately removes locks and prevents
+//! obsolete target or NPC incarnation. A disintegrator brain binds its turret
+//! ramp to that generation and loses it when the target does. Think intervals
+//! and AI target-loss range use combat configuration; projected scan resolution
+//! and dogma target range refresh separately under actor revisions. ECM
+//! immediately removes locks and prevents
 //! targeting and offensive actions until the jam expires.
-//! Brains and groups are transient; persistent NPC simulation is not supported.
+//! Brains and groups are transient to the owning actor; a proven-quiescent,
+//! marked cohort may instead move to the owning World's same-process sleep
+//! store across an idle unload and return on the next cold load. Persistent
+//! NPC simulation is still not supported.
+//! A persistent per-character GM flag projected onto pilot and drone scalars
+//! removes that character's balls from acquisition, maintenance, lock
+//! completion and queued projection eligibility without altering damage.
+pub(super) mod worker;
+mod sleep;
+mod spool;
 use super::*;
 use std::collections::HashSet;
 use std::future::Future;
@@ -57,6 +68,12 @@ pub struct NpcBrain {
     modules: Vec<NpcModule>,
     target_generation: u64,
     aggressors: HashSet<i64>,
+    /// The shared precursor-turret ramp bound to this target generation; a
+    /// disintegrator (SDE 6995) brain runs the same pure arithmetic as a
+    /// fitted gun, resolved inside the shared shot's actor turn.
+    turret_spool: crate::services::effects::spool::SpoolState,
+    /// The sustained beam FX currently published for the bound ramp.
+    beam: Option<spool::NpcBeam>,
 }
 
 struct NpcModule {
@@ -68,8 +85,12 @@ impl NpcBrain {
     pub fn new(owner: Option<i64>, config: NpcConfig, effects: NpcEffects) -> Self {
         Self { owner, config, effects, target: None, announced: false,
             next_shot_ms: 0, next_repair_ms: 0, next_think_ms: 0,
-            max_target_range: None, aggressors: HashSet::new(), modules: Vec::new(), target_generation: next_npc_target_generation() }
+            max_target_range: None, aggressors: HashSet::new(), modules: Vec::new(), target_generation: next_npc_target_generation(),
+            turret_spool: Default::default(), beam: None }
     }
+    /// The brain's current target-lock generation, bumped on every acquisition.
+    #[cfg(all(test, feature = "tests-combat"))]
+    pub(crate) fn target_generation(&self) -> u64 { self.target_generation }
     /// Register an SDE effect instance with a process-unique negative module ID.
     pub(crate) fn add_effect(&mut self, effect_id: i32, duration_ms: f64) {
         if !duration_ms.is_finite() || (duration_ms < 1.0 && duration_ms != -1.0) { return; }
@@ -83,37 +104,11 @@ pub(super) enum EffectJob {
     Npc { effects: NpcEffects, action: NpcAction },
     Drone { effects: drone::DroneEffects, action: drone::DroneAction },
 }
-pub(super) fn start_worker(system: &mut System) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<NpcFuture>();
-    let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel::<NpcFuture>();
-    system.effect_jobs = Some(tx);
-    system.deferred_jobs = Some(deferred_tx);
-    let worker = tokio::spawn(async move {
-        while let Some(job) = rx.recv().await { job.await; }
-    });
-    tokio::spawn(async move {
-        if let Err(error) = worker.await { tracing::warn!(%error, "space NPC worker failed"); }
-    });
-    tokio::spawn(async move {
-        let mut tasks = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                job = deferred_rx.recv() => match job {
-                    Some(job) => { tasks.spawn(job); }
-                    None => break,
-                },
-                result = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Some(Err(error)) = result { tracing::warn!(%error, "space deferred job failed"); }
-                }
-            }
-        }
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result { tracing::warn!(%error, "space deferred job failed"); }
-        }
-    });
-}
 
 pub(super) struct SpawnGroup {
+    /// Content authority that produced this group; only set by
+    /// `mark_npc_group_sleepable` on a live, non-empty, all-NPC group.
+    pub(in crate::space) origin: Option<crate::space::system::npc_sleep::NpcSpawnOrigin>,
     members: HashSet<i64>,
     on_cleared: Box<dyn FnOnce(&mut System) + Send>,
 }
@@ -136,10 +131,7 @@ impl System {
             if !self.actor_combat.contains_key(&id) { return false; }
         }
         brain.next_think_ms = self.ms.saturating_add(id.rem_euclid(crate::config::game().combat.npc_think_ms));
-        let first = self.brains.insert(id, brain).is_none();
-        if first {
-            super::ship_cosmetics::announce(self, id);
-        }
+        self.brains.insert(id, brain);
         true
     }
     /// Whether the system has an NPC brain for this ball.
@@ -183,7 +175,7 @@ impl System {
             on_cleared(self);
         } else {
             for member in &members { self.member_groups.entry(*member).or_default().insert(id); }
-            self.groups.insert(id, SpawnGroup { members, on_cleared: Box::new(on_cleared) });
+            self.groups.insert(id, SpawnGroup { origin: None, members, on_cleared: Box::new(on_cleared) });
         }
         id
     }
@@ -192,7 +184,7 @@ impl System {
         self.groups.get(&id).map_or(0, |g| g.members.len())
     }
     pub(super) fn npc_removed(&mut self, id: i64) {
-        self.brains.remove(&id);
+        if let Some(mut brain) = self.brains.remove(&id) { self.npc_spool_stop(id, &mut brain); }
         if let Some(groups) = self.member_groups.remove(&id) {
             for group in groups {
                 let Some(g) = self.groups.get_mut(&group) else { continue };
@@ -228,13 +220,14 @@ impl System {
             let Some(mut brain) = self.brains.remove(&id) else { continue };
             brain.next_think_ms = self.ms.saturating_add(crate::config::game().combat.npc_think_ms);
             self.think_npc(id, &mut brain);
-            if self.contains(id) { self.brains.insert(id, brain); }
+            if self.contains(id) { self.brains.insert(id, brain); } else { self.npc_spool_stop(id, &mut brain); }
         }
         due.clear();
         self.due_brains = due;
     }
     fn lose_npc_target(&mut self, id: i64, brain: &mut NpcBrain) {
         self.remove_projections_from(id);
+        self.npc_spool_stop(id, brain);
         if let Some((_, pilot, _)) = brain.target.take() {
             brain.target_generation = next_npc_target_generation();
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
@@ -251,6 +244,19 @@ impl System {
         self.lose_npc_target(id, &mut brain);
         self.brains.insert(id, brain);
     }
+    /// Drop every brain lock currently held on `character`'s protected balls
+    /// (piloted ship or owned drone) through the ordinary target-loss path,
+    /// bumping each target generation so queued work cannot reapply.
+    pub(super) fn retire_npc_targets_for(&mut self, character: i64) {
+        let ids: Vec<i64> = self.brains.iter()
+            .filter(|(_, brain)| brain.target.is_some_and(|(_, pilot, _)| pilot == character))
+            .map(|(&id, _)| id).collect();
+        for id in ids {
+            let Some(mut brain) = self.brains.remove(&id) else { continue };
+            self.lose_npc_target(id, &mut brain);
+            self.brains.insert(id, brain);
+        }
+    }
     pub(super) fn refresh_npc_targeting(&mut self, id: i64, scan_resolution: f64, max_target_range: Option<f64>) {
         let Some(mut brain) = self.brains.remove(&id) else { return };
         brain.config.scan_resolution = scan_resolution;
@@ -266,7 +272,7 @@ impl System {
         let Some(me) = self.ball(id) else { return };
         let pos = me.position_at(self.ms);
         let current = brain.target.and_then(|(ship, _, _)| self.ball(ship))
-            .filter(|b| targeting::target_visible(b) && b.signature_radius.is_some()
+            .filter(|b| !self.npc_target_ignored(b.id) && targeting::target_visible(b) && b.signature_radius.is_some()
                 && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
                 && brain.max_target_range.is_none_or(|range| len(sub(b.position_at(self.ms), pos)) <= range));
         let victim_id = current.map(|b| b.id);
@@ -283,7 +289,8 @@ impl System {
             self.lose_npc_target(id, brain);
             let nearest = self.pilots().filter_map(|b| b.char_id.map(|owner| (b, owner)))
                 .chain(self.drones().filter_map(|d| self.ball(d.id).map(|b| (b, d.owner))))
-                .filter(|(b, pilot)| (brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(*pilot) || brain.aggressors.contains(pilot))
+                .filter(|(b, pilot)| !self.npc_target_ignored(b.id)
+                    && (brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(*pilot) || brain.aggressors.contains(pilot))
                     && targeting::target_visible(b) && b.signature_radius.is_some())
                 .map(|(b, pilot)| (b, pilot, len(sub(b.position_at(self.ms), pos))))
                 .filter(|(_, _, distance)| *distance <= brain.config.aggro_range && brain.max_target_range.is_none_or(|range| *distance <= range))
@@ -318,6 +325,7 @@ impl System {
     pub(crate) fn npc_projection_valid(&self, id: i64, target: i64, generation: u64) -> bool {
         let Some(brain) = self.brains.get(&id) else { return false };
         !crate::services::combat::jamming::is_jammed(id, self.now_ms())
+            && !self.npc_target_ignored(target)
             && brain.target_generation == generation && brain.announced
             && brain.target.is_some_and(|(ship, _, _)| ship == target)
             && self.ball(id).zip(self.ball(target)).is_some_and(|(me, victim)|
@@ -348,6 +356,7 @@ impl System {
         let current = brain.target_generation == generation
             && brain.target == Some((ship, pilot, deadline)) && !brain.announced;
         let valid = current && !crate::services::combat::jamming::is_jammed(id, self.now_ms())
+            && !self.npc_target_ignored(ship)
             && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
                 (victim.char_id == Some(pilot) || self.drone(ship).is_some_and(|d| d.owner == pilot))
                 && targeting::target_visible(victim) && victim.signature_radius.is_some()
@@ -375,4 +384,4 @@ impl System {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

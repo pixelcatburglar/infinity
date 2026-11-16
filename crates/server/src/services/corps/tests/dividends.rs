@@ -7,8 +7,9 @@ use crate::progress::{prepare_batch, AfterCommit, Registry};
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
 async fn mixed_holders_receive_floored_amounts_from_master_only() {
-    let mut client = fixtures::connect().await;
-    let tx = client.transaction().await.unwrap();
+    let (client, connection) = crate::config::tests::test_database().to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let ceo = fixtures::character(&tx).await;
     let person = fixtures::character(&tx).await;
     let other_ceo = fixtures::character(&tx).await;
@@ -33,7 +34,7 @@ async fn mixed_holders_receive_floored_amounts_from_master_only() {
     assert_eq!(receipt.get::<_, i64>("shares"), 3);
     assert_eq!(receipt.get::<_, String>("total"), "0.99");
     let invocation = (u128::from(crate::handshake::random_u64()) << u64::BITS) | u128::from(crate::handshake::random_u64());
-    let inserted = prepare_batch(&mut effects, &tx, invocation).await.unwrap();
+    let inserted = prepare_batch(&mut effects, &tx, invocation, &Registry::default()).await.unwrap();
     assert!(!inserted.is_empty());
     let _publication = effects.after_commit(&Registry::default(), &inserted);
     assert!(!effects.into_entries().is_empty());

@@ -12,6 +12,11 @@ use marshal::Value;
 #[derive(Clone, Copy)]
 enum Operation { Board, Store, BoardStored }
 
+/// Shared scenario for committed-selection recovery after the owning actor
+/// stops. The five named wrappers below stop the actor through the real
+/// idle-stop control channel and must run in an exact test process with
+/// `INFINITY_TEST_ENABLE_IDLE_STOP` set; a broad invocation without it fails
+/// loudly on the disabled control channel rather than silently degrading.
 async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: bool, session_changed: bool, force_collision: bool, selective: bool, missing_receipt: bool, postcommit_failure: bool, capsule_drift: bool) {
     let mut f = Fixture::real_system().await;
     let owner = f.owner;
@@ -25,8 +30,27 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
     let host = creation::positioned(&f.db, old_type, owner, system, [10.0, 0.0, 0.0]).await.unwrap();
     let target_type = if matches!(operation, Operation::Store) { TYPE_CAPSULE } else { old_type };
     let prior_owner = if matches!(operation, Operation::BoardStored) { f.add_pilot().await.0 } else { owner };
+    let anchor = f.sde.map.stations().find(|s| s.solar_system_id == Some(system))
+        .and_then(|s| f.sde.map.celestial(s.station_id)).expect("an SDE station in the fixture system");
+    let anchor_pos = [anchor.x.unwrap(), anchor.y.unwrap(), anchor.z.unwrap()];
+    let anchor_radius = f64::from(f.sde.celestial_radius(anchor));
+    let old_radius = f64::from(balls::radius(f.sde.as_ref(), old_type).unwrap());
+    let target_radius = f64::from(balls::radius(f.sde.as_ref(), target_type).unwrap());
+    let old_pos = [anchor_pos[0] + anchor_radius + old_radius + target_radius + 1_000.0, anchor_pos[1], anchor_pos[2]];
+    let target_pos = [old_pos[0] + 3_000.0, old_pos[1], old_pos[2]];
+    for (point, radius) in [(old_pos, old_radius), (target_pos, target_radius)] {
+        for celestial in f.sde.map.celestials(system) {
+            let (Some(cx), Some(cy), Some(cz)) = (celestial.x, celestial.y, celestial.z) else { continue };
+            let clearance = f64::from(f.sde.celestial_radius(celestial)) + radius;
+            let distance = ((point[0] - cx).powi(2) + (point[1] - cy).powi(2) + (point[2] - cz).powi(2)).sqrt();
+            assert!(distance > clearance, "fixture point {point:?} lies within {clearance}m of celestial {}", celestial.item_id);
+        }
+    }
+    f.db.execute("UPDATE game.items SET x=$2,y=$3,z=$4 WHERE item_id=$1",
+        &[&old, &old_pos[0], &old_pos[1], &old_pos[2]]).await.unwrap();
+    f.world.with(system, move |s| s.set_ball_position(old, old_pos, |_, _| true)).await.unwrap();
     let target = match operation {
-        Operation::Board => creation::positioned(&f.db, target_type, owner, system, [2.0, 0.0, 0.0]).await.unwrap(),
+        Operation::Board => creation::positioned(&f.db, target_type, owner, system, target_pos).await.unwrap(),
         Operation::BoardStored => creation::rookie_ship(&f.db, target_type, prior_owner, host, FLAG_SHIP_HANGAR).await.unwrap(),
         Operation::Store => 0,
     };
@@ -86,16 +110,16 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
         }).await.unwrap();
         let sde = f.sde.clone();
         let selected = settle_space(f.world.clone(), f.db.clone(), f.sde.clone(), system, owner, client,
-            expected.clone(), transition, market, gate, plan,
+            expected.clone(), transition, market, gate, f.world.admission(system).unwrap(), plan,
             move |tx, outbox, states, facts| {
                 let sde = sde.clone();
                 Box::pin(async move {
                     let written = checkpoint(tx, outbox, system, states, facts).await?;
                     let target = if matches!(operation, Operation::Store) {
-                        creation::positioned(tx, TYPE_CAPSULE, owner, system, [0.0; 3]).await.map_err(crate::services::db_err)?
+                        creation::positioned(tx, TYPE_CAPSULE, owner, system, target_pos).await.map_err(crate::services::db_err)?
                     } else { target };
                     match operation {
-                        Operation::Board => assert!(boarding::board_in_space(tx, owner, old, target, system, old_type, target_type, [0.0; 3], [2.0, 0.0, 0.0]).await.map_err(crate::services::db_err)?),
+                        Operation::Board => assert!(boarding::board_in_space(tx, owner, old, target, system, old_type, target_type, old_pos, target_pos).await.map_err(crate::services::db_err)?),
                         Operation::Store | Operation::BoardStored => {
                             assert!(boarding::guard_current(tx, owner, user, old, system, old_type).await.map_err(crate::services::db_err)?);
                             let transfer = if matches!(operation, Operation::Store) {
@@ -108,14 +132,14 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
                             let locks = crate::services::inventory::destination::lock_items(tx, &sde, &requests, &[]).await?;
                             transfers::hand_over(tx, &[transfer], &closure, &locks, &[]).await.map_err(crate::services::db_err)?;
                             if matches!(operation, Operation::BoardStored) {
-                                assert!(boarding::position_moved(tx, target, owner, system, [2.0, 0.0, 0.0]).await.map_err(crate::services::db_err)?);
+                                assert!(boarding::position_moved(tx, target, owner, system, target_pos).await.map_err(crate::services::db_err)?);
                             }
                             assert!(boarding::select_moved(tx, owner, user, old, target, system).await.map_err(crate::services::db_err)?);
                         }
                     }
                     let row = crate::dao::items::space_ships::FreeShip {
                         item_id: target, type_id: target_type, owner_id: owner, corporation_id: corporation,
-                        alliance_id: alliance, pos: [2.0, 0.0, 0.0],
+                        alliance_id: alliance, pos: target_pos,
                     };
                     let prepared = balls::piloted(tx, sde, &row, owner, 0.0).await?;
                     // A mismatched reservation makes the real after-COMMIT conversion fail.
@@ -137,7 +161,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
     let settlement = BoardSettlement {
         world: Arc::downgrade(&f.world), db: f.db.clone(), sde: f.sde.clone(), system,
         character: owner, client, expected, plan, entries, facts: Some(frame.clone()), actor_gate: handle.gate.clone(),
-        receipt: Mutex::new(Some((sender, None))),
+        receipt: Mutex::new(Some((sender, None))), admission: f.world.admission(system).unwrap(),
     };
     let rolled_back: Result<(), CallError> = f.db.transaction(
         |tx, outbox: &mut crate::db::outbox::Outbox<()>| {
@@ -165,10 +189,10 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
             let written = checkpoint(tx, outbox, system, &states, if missing_receipt { None } else { Some(&frame) }).await?;
             assert!(written.contains(&old));
             let target = if matches!(operation, Operation::Store) {
-                creation::positioned(tx, TYPE_CAPSULE, owner, system, [0.0; 3]).await.map_err(crate::services::db_err)?
+                creation::positioned(tx, TYPE_CAPSULE, owner, system, target_pos).await.map_err(crate::services::db_err)?
             } else { target };
             match operation {
-                Operation::Board => assert!(boarding::board_in_space(tx, owner, old, target, system, old_type, target_type, [0.0; 3], [2.0, 0.0, 0.0]).await.map_err(crate::services::db_err)?),
+                Operation::Board => assert!(boarding::board_in_space(tx, owner, old, target, system, old_type, target_type, old_pos, target_pos).await.map_err(crate::services::db_err)?),
                 Operation::Store | Operation::BoardStored => {
                     assert!(boarding::guard_current(tx, owner, user, old, system, old_type).await.map_err(crate::services::db_err)?);
                     let transfer = if matches!(operation, Operation::Store) {
@@ -183,7 +207,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
                     let locks = crate::services::inventory::destination::lock_items(tx, &sde, &requests, &[]).await?;
                     transfers::hand_over(tx, &[transfer], &closure, &locks, &[]).await.map_err(crate::services::db_err)?;
                     if matches!(operation, Operation::BoardStored) {
-                        assert!(boarding::position_moved(tx, target, owner, system, [2.0, 0.0, 0.0]).await.map_err(crate::services::db_err)?);
+                        assert!(boarding::position_moved(tx, target, owner, system, target_pos).await.map_err(crate::services::db_err)?);
                     }
                     assert!(boarding::select_moved(tx, owner, user, old, target, system).await.map_err(crate::services::db_err)?);
                 }
@@ -226,7 +250,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
             let condition = s.combat_condition_snapshot(old).unwrap();
             (s.pilot_ball(owner).map(|ball| ball.id), s.persistent_generation(old),
                 s.combat_phase(old), s.ship_condition(old).map(|v| (v.1, v.2)),
-                s.observers.get(&client).map(|entry| entry.0), condition.revision, condition.saved_revision)
+                s.observer_ego(client), condition.revision, condition.saved_revision)
         }).await.unwrap();
         drop(gate);
         drop(market);
@@ -271,7 +295,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
             let condition = s.combat_condition_snapshot(old).unwrap();
             (s.pilot_ball(owner).map(|ball| ball.id), s.persistent_generation(old),
                 s.combat_phase(old), s.ship_condition(old).map(|v| (v.1, v.2)),
-                s.observers.get(&client).map(|entry| entry.0), condition.revision, condition.saved_revision)
+                s.observer_ego(client), condition.revision, condition.saved_revision)
         }).await.unwrap();
         assert_eq!(actor_after, actor_before);
         assert!(settlement.receipt.lock().unwrap().is_some());
@@ -317,10 +341,50 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
         f.cleanup().await;
         return;
     }
-    assert!(f.world.with(system, |_| -> () { panic!("stop actor before committed publication") }).await.is_none());
-    handle.tx.closed().await;
+    // Release only this case's own actor blockers so the original actor can
+    // prove a genuine idle stop: gate and market drop first so the public
+    // leave path cannot invert their locks, the pilot unregisters through the
+    // real pilot/session registry, combat reservations are cancelled, hulls
+    // and the own observer leave the actor and the committed fact ledger
+    // goes with it. Busy, error or failed exit fails loudly — never a
+    // synthetic panic, a closed-channel witness or a fake tombstone.
     drop(gate);
     drop(market);
+    assert!(f.world.unregister_pilot_generation(owner, Some(settlement.expected.session_id)));
+    let stop_entries: Vec<_> = settlement.entries.iter().map(|(token, state)| (state.item_id, *token, state.generation)).collect();
+    let board_target = matches!(operation, Operation::Board).then_some(target);
+    // Unselected hulls owned by fixture characters at this system (earlier
+    // loads or fixture rows) are this case's residual ball blockers too;
+    // old/target keep their own explicit removals below.
+    let stray: Vec<i64> = f.db.query(
+        "SELECT item_id FROM game.items WHERE owner_id = ANY(SELECT character_id FROM game.characters WHERE solar_system_id=$1) AND location_id=$1",
+        &[&system]).await.unwrap().iter().map(|row| row.get("item_id")).collect();
+    let mut blocked = f.world.with(system, move |s| {
+        for &(item_id, token, generation) in &stop_entries { s.cancel_combat_transition(item_id, token, generation); }
+        s.combat_facts = None;
+        for id in stray.iter().copied().filter(|&id| id != old && id != target) { if s.ball(id).is_some() { s.remove_ball(id); } }
+        assert!(s.remove_ball(old).is_some());
+        if let Some(target) = board_target { assert!(s.remove_ball(target).is_some()); }
+        s.unobserve(client);
+        s.unload_blocked()
+    }).await.expect("actor stopped before its own blockers were released");
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while blocked.is_some() {
+            tokio::task::yield_now().await;
+            blocked = f.world.with(system, |s| s.unload_blocked()).await
+                .expect("actor stopped while draining its own blockers");
+        }
+    }).await;
+    assert!(drained.is_ok(), "actor could not go idle before the explicit stop (last reason: {blocked:?})");
+    match handle.request_idle_stop(None).await {
+        Ok(crate::space::actor::lifecycle::StopDecision::Stopping) => {}
+        other => panic!("explicit idle stop refused after releasing own blockers: {other:?}"),
+    }
+    handle.wait_exited().await.unwrap_or_else(|error| panic!("idle actor did not exit cleanly: {error:#}"));
+    // Restore the world-side session facts cleared by the real leave
+    // (replacement sessions overwrite this registration themselves).
+    f.world.register_pilot(owner, f.client.notify_tx.clone());
+    f.world.set_online_session(owner, Some(settlement.expected.clone()));
     if force_collision {
         f.world.system(system).await.unwrap();
         f.world.with(system, move |s| {
@@ -395,7 +459,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
             (
                 s.pilot_ball(owner).map(|ball| ball.id),
                 s.pilots().filter(|ball| ball.char_id == Some(owner)).count(),
-                s.observers.get(&client).map(|entry| entry.0),
+                s.observer_ego(client),
                 s.persistent_generation(target),
                 s.persistent_generation(old),
                 s.ship_condition(target).map(|condition| (condition.1, condition.2)),
@@ -410,7 +474,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
         f.client.change_session(vec![("shipid", Value::Int(target))]);
         crate::services::ship::send_state(&mut f.client).await.unwrap();
         let packet = f.client.outbox.iter().rev().find(|packet| matches!(&packet.destination,
-            crate::macho::Address::Broadcast { broadcast_id, idtype, .. }
+            infinity_wire::macho::Address::Broadcast { broadcast_id, idtype, .. }
                 if broadcast_id.as_text().as_deref() == Some("DoDestinyUpdate")
                     && idtype.as_text().as_deref() == Some("clientID"))).unwrap();
         let envelope = packet.body[0].items().unwrap();
@@ -426,7 +490,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
         f.world.with(system, move |s| {
             assert_eq!(s.pilot_ball(owner).unwrap().id, target);
             assert_eq!(s.pilots().filter(|ball| ball.char_id == Some(owner)).count(), 1);
-            assert_eq!(s.observers.get(&client).unwrap().0, target);
+            assert_eq!(s.observer_ego(client), Some(target));
             assert!(s.ship_condition(target).is_some());
             assert!(s.combat_health_scalars(target).is_some());
             if matches!(operation, Operation::Store) { assert!(s.ball(old).is_none()); }
@@ -457,7 +521,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE and INFINITY_TEST_ENABLE_IDLE_STOP in this exact process; run serially"]
 async fn committed_selection_recovers_after_actor_stop() {
     for operation in [Operation::Board, Operation::Store, Operation::BoardStored] {
         recover_after_stop(operation, false, false, false, false, false, false, false, false).await;
@@ -465,7 +529,7 @@ async fn committed_selection_recovers_after_actor_stop() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE and INFINITY_TEST_ENABLE_IDLE_STOP in this exact process; run serially"]
 async fn disconnected_selection_defers_to_login_restoration() {
     for operation in [Operation::Board, Operation::Store, Operation::BoardStored] {
         recover_after_stop(operation, true, false, false, false, false, false, false, false).await;
@@ -473,7 +537,7 @@ async fn disconnected_selection_defers_to_login_restoration() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE and INFINITY_TEST_ENABLE_IDLE_STOP in this exact process; run serially"]
 async fn replacement_pilot_and_condition_are_not_overwritten() {
     for operation in [Operation::Board, Operation::Store, Operation::BoardStored] {
         recover_after_stop(operation, false, true, false, false, false, false, false, false).await;
@@ -481,7 +545,7 @@ async fn replacement_pilot_and_condition_are_not_overwritten() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE and INFINITY_TEST_ENABLE_IDLE_STOP in this exact process; run serially"]
 async fn changed_session_defers_committed_selection_to_login() {
     for operation in [Operation::Board, Operation::Store, Operation::BoardStored] {
         recover_after_stop(operation, false, false, true, false, false, false, false, false).await;
@@ -489,7 +553,7 @@ async fn changed_session_defers_committed_selection_to_login() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE and INFINITY_TEST_ENABLE_IDLE_STOP in this exact process; run serially"]
 async fn collision_moved_old_hull_keeps_committed_recovery_valid() {
     for session_changed in [true, false] {
         for operation in [Operation::Board, Operation::BoardStored] {
@@ -532,7 +596,6 @@ async fn stored_recovery_refuses_selected_capsule_custody_drift() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn session_fence_refusal_thaws_all_reservations_before_any_write() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use crate::services::drones::tests::fixture::table_fingerprint;
     use crate::space::combat::CombatPhase;
 
     let mut f = Fixture::real_system().await;
@@ -566,15 +629,18 @@ async fn session_fence_refusal_thaws_all_reservations_before_any_write() {
     f.world.register_pilot(owner, replacement_tx);
     f.world.set_online_session(owner, Some(newer.clone()));
     assert_eq!(f.world.online_session(owner), Some(newer));
-    let tables = ["items", "item_attributes", "pending_reloads", "characters", "progress_events"];
-    let mut before = Vec::new();
-    for table in tables { before.push(table_fingerprint(&f.db, table).await.unwrap()); }
+    let persisted = |db: crate::db::Db| async move {
+        let character: String = db.query_one("SELECT row_to_json(c)::text AS row FROM game.characters c WHERE c.character_id=$1", &[&owner]).await.unwrap().get("row");
+        let progress: Vec<String> = db.query("SELECT row_to_json(e)::text AS row FROM game.progress_events e WHERE e.subject_character_id=$1 ORDER BY e.event_id", &[&owner]).await.unwrap().iter().map(|row| row.get("row")).collect();
+        (crate::dao::tests::item_state(&db, &[old, target]).await.unwrap(), character, progress)
+    };
+    let before = persisted(f.db.clone()).await;
     let notices = f.client.outbox.len();
     let native_notices = notice_rx.len();
     let ran = Arc::new(AtomicBool::new(false));
     let worker_ran = ran.clone();
     let result = settle_space(f.world.clone(), f.db.clone(), f.sde.clone(), system, owner, f.client.login.client_id,
-        expected, transition, market, gate,
+        expected, transition, market, gate, f.world.admission(system).unwrap(),
         RecoveryPlan::Board { character: owner, user, system, old, old_type: kind, target, target_type: kind },
         move |_, _, _, _| {
             let worker_ran = worker_ran.clone();
@@ -585,9 +651,7 @@ async fn session_fence_refusal_thaws_all_reservations_before_any_write() {
         }).await;
     assert!(result.is_err());
     assert!(!ran.load(Ordering::SeqCst));
-    for (index, table) in tables.into_iter().enumerate() {
-        assert_eq!(before[index], table_fingerprint(&f.db, table).await.unwrap());
-    }
+    assert_eq!(persisted(f.db.clone()).await, before);
     assert_eq!(f.client.outbox.len(), notices);
     assert!(!notice_rx.is_closed());
     assert_eq!(notice_rx.len(), native_notices);
@@ -665,7 +729,7 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     let settlement = Arc::new(BoardSettlement {
         world: Arc::downgrade(&f.world), db: f.db.clone(), sde: f.sde.clone(), system, character: owner,
         client: f.client.login.client_id, expected: expected.clone(), plan, entries: entries.clone(), facts: Some(frame.clone()), actor_gate: handle.gate.clone(),
-        receipt: Mutex::new(Some((sender, Some(CallError::Internal(anyhow::anyhow!("original board error")))))),
+        receipt: Mutex::new(Some((sender, Some(CallError::Internal(anyhow::anyhow!("original board error")))))), admission: f.world.admission(system).unwrap(),
     });
     let rows: Vec<_> = frame.condition_rows().collect();
     let attrs = [infinity_core::consts::dogma::ATTR_SHIELD_CHARGE, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE, infinity_core::consts::dogma::ATTR_HULL_DAMAGE];
@@ -704,7 +768,7 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     let settlement = Arc::new(BoardSettlement {
         world: Arc::downgrade(&f.world), db: f.db.clone(), sde: f.sde.clone(), system, character: owner,
         client: f.client.login.client_id, expected, plan, entries: entries.clone(), facts: None, actor_gate: handle.gate.clone(),
-        receipt: Mutex::new(Some((sender, None))),
+        receipt: Mutex::new(Some((sender, None))), admission: f.world.admission(system).unwrap(),
     });
     crate::dao::characters::selection::set_ship(&f.db, owner, other).await.unwrap();
     assert!(!settlement.mark_pending(&f.world).await);

@@ -153,11 +153,11 @@ async fn native_mining_advances_daily_goal() {
             assert!(offline.is_ok(), "refusing to remove an online pilot");
             mining::progress::handle(r.db.clone(), r.world.clone(), job(scheduler::MINING_PROGRESS)).await.unwrap();
             for _ in 0..64 {
-                let pending = journal::pending_for_character(&r.db, crate::services::daily_goals::progress::registration().consumer_key, id, 1).await.unwrap();
+                let pending = journal::pending_for_character(&r.db, crate::services::daily_goals::progress::registration().consumer_key, id, 1, r.db.progress_registry().enabled_keys()).await.unwrap();
                 if pending.is_empty() { break; }
                 crate::progress::drain(r.db.clone(), r.world.clone(), job(crate::progress::DRAIN_KIND)).await.unwrap();
             }
-            assert!(journal::pending_for_character(&r.db, crate::services::daily_goals::progress::registration().consumer_key, id, 1).await.unwrap().is_empty(), "owned deliveries must be drained before cleanup");
+            assert!(journal::pending_for_character(&r.db, crate::services::daily_goals::progress::registration().consumer_key, id, 1, r.db.progress_registry().enabled_keys()).await.unwrap().is_empty(), "owned deliveries must be drained before cleanup");
             r.db.transaction(|tx, _: &mut ()| Box::pin(async move {
                 tx.execute("DELETE FROM game.daily_goal_admin_audit WHERE subject_id=$1 OR actor_id=$1", &[&id]).await?;
                 tx.execute("DELETE FROM game.daily_goal_payments WHERE character_id=$1", &[&id]).await?;

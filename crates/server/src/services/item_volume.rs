@@ -65,4 +65,4 @@ fn calculate(type_id: i32, group_id: Option<i32>, raw_volume: f64, singleton: bo
     Ok(volume * if count < 0 { 1 } else { count } as f64)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

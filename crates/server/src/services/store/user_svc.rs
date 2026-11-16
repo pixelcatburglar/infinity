@@ -77,7 +77,7 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
 }
 
 async fn claim_in_transaction(
-    tx: &tokio_postgres::Transaction<'_>,
+    tx: &crate::db::Transaction<'_>,
     outbox: &mut crate::db::outbox::Outbox,
     sde: &crate::sde::Sde,
     user: i64,
@@ -169,4 +169,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

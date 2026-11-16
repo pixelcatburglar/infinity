@@ -17,7 +17,7 @@ fn warning_due(last: &mut Option<Instant>, now: Instant, interval: Duration) -> 
 /// A full ledger refuses the effective cycle; the checkpoint policy is unchanged.
 pub(crate) fn refusal(system: i64) -> CallError {
     let interval = Duration::from_secs(crate::config::game().space.position_snapshot_secs as u64);
-    if warning_due(&mut LAST_WARNING.lock().unwrap(), Instant::now(), interval) {
+    if warning_due(&mut *crate::poison::lock_or_exit(LAST_WARNING.lock()), Instant::now(), interval) {
         tracing::warn!(system, "combat facts capacity full; effective cycles are refused until checkpoint recovery");
     }
     user_error(infinity_core::messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(infinity_core::messages::effects::COMBAT_CAPACITY_FULL))])
@@ -30,4 +30,4 @@ pub(crate) fn is_refusal(error: &CallError) -> bool {
         && dict[0].1 == Value::unicode(infinity_core::messages::effects::COMBAT_CAPACITY_FULL))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

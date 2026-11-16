@@ -225,11 +225,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         }
 
         // ---- corporations ----
-        // eve/client/script/ui/services/corporation/itemLocking.py:59 caches an itemID-to-row mapping for membership checks.
-        ("itemLocking", "GetItemsByLocation") => Value::Dict(vec![]),
-        // eve/client/script/ui/services/corporation/itemLocking.py:73-77 caches and mutates the set of locations containing locked items.
-        ("itemLocking", "GetLockedItemLocations") => Value::reduce("__builtin__.set", vec![Value::list([])], None),
-        ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
         ("allianceRegistry", "GetDaysInAlliance") => Value::Int(0),
@@ -275,7 +270,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("corporationSvc", "GetMedalsReceived") => Value::tuple([Value::list([]), Value::list([])]),
         // An NPC corporation's market supply and demand (typeID, sellPrice, buyPrice...): none traded.
         ("corporationSvc", "GetCorpInfo") => Value::list([]),
-        ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),
         ("monolithTaskTrackerMgr", "UpdateClientAchievmentsAndCounters") => Value::None,
         _ => return None,
     }))
@@ -290,7 +284,6 @@ pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
         ("petitioner", "GetUnreadMessages") => Value::list([]),
         // No external help centre: the help window keeps the in-game petition flow.
         ("petitioner", "IsZendeskEnabled") | ("petitioner", "IsZendeskSwapEnabled") => Value::Bool(false),
-        ("shipKillCounter", "GetItemKillCountPlayer") => int(0),
         ("shipCosmeticsMgr", "GetEnabledCosmetics") => empty_dict(),
         ("keeper", "GetCurrentDungeonForCharacter") => Value::None,
         ("scanMgr", "SignalTrackerRegister") => Value::None,
@@ -571,5 +564,5 @@ pub(super) fn fleets(call: &Call<'_>) -> Option<CallResult> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

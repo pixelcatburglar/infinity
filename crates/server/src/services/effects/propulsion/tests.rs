@@ -16,7 +16,12 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     };
     system.insert(ball);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(1, 1, tx);
+    let (completed_1, mut completion_1) = tokio::sync::oneshot::channel();
+    system.observe(1, 1, tx, completed_1);
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(completion_1.try_recv(), Ok(true));
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
     queue_kinematics(&mut system, 1, Kinematics { speed: 20.0, mass: 30.0, agility: 0.25, signature: 40.0 });
     queue_kinematics(&mut system, 1, Kinematics { speed: f64::MAX, mass: 0.0, agility: f64::MIN_POSITIVE, signature: 40.0 });
     system.tick(12_999);
@@ -26,7 +31,7 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.tick(13_000);
     let ship = system.ball(1).unwrap();
     assert_eq!((ship.max_vel, ship.mass, ship.agility, ship.signature_radius), (20.0, 30.0, 0.25, Some(40.0)));
-    let events = rx.try_recv().unwrap();
+    let events = crate::space::system::tests::events::destiny(rx.try_recv().unwrap());
     assert_eq!(events.len(), 3);
     assert_eq!(events[0], event(12, "SetMaxSpeed", vec![Value::Int(1), Value::Float(20.0)]));
     assert_eq!(events[1], event(12, "SetBallMass", vec![Value::Int(1), Value::Float(30.0)]));
@@ -96,10 +101,18 @@ fn refused_kinematics_preserve_moving_segment_and_wire_state() {
         let expected = control.sampled_ball(1).unwrap();
         let actual = refused.sampled_ball(1).unwrap();
         assert_eq!((actual.pos, actual.vel), (expected.pos, expected.vel));
-        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (refused_tx, _refused_rx) = tokio::sync::mpsc::unbounded_channel();
-        let control_state = control.observe(1, 1, control_tx);
-        let refused_state = refused.observe(1, 1, refused_tx);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (refused_tx, mut refused_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completed_2, mut completion_2) = tokio::sync::oneshot::channel();
+        assert!(control.observe(1, 1, control_tx, completed_2));
+        let (completed_3, mut completion_3) = tokio::sync::oneshot::channel();
+        assert!(refused.observe(1, 1, refused_tx, completed_3));
+        crate::space::system::tests::events::publish_scene_prefix(&mut control, crate::space::collision::enabled());
+        crate::space::system::tests::events::publish_scene_prefix(&mut refused, crate::space::collision::enabled());
+        assert_eq!(completion_2.try_recv(), Ok(true));
+        assert_eq!(completion_3.try_recv(), Ok(true));
+        let control_state = crate::space::system::tests::events::initial_state(&mut control_rx);
+        let refused_state = crate::space::system::tests::events::initial_state(&mut refused_rx);
         assert_eq!(state_bytes(&control_state), state_bytes(&refused_state));
     }
 }

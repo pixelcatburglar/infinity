@@ -10,21 +10,39 @@
 //! without pilot skills, brain items, controlled drones or active module state.
 //! Skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
-//! Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100).
+//! Passive skill effects use effective levels, including expert-only grants,
+//! once per skill type. The loader keeps the raw trained, installation and
+//! brain rows it already read, so a live fit can replace its whole character
+//! domain on a committed publish and let real booster and expert deadlines
+//! expire in place without another query. Expired expert grants fall back to
+//! trained levels; selected booster chance effects are never rerolled.
 //! Committed fitting changes merge persisted fields into a current fit without
 //! replacing its projections or runtime activation state.
+//! A hull's persisted unlimited-cargo mode is tracked separately from numeric
+//! evaluation and only reaches the wire representation, never the quota math.
+//! The twelve damage resonance attributes are bounded below by
+//! combat.resonance_floor at the public value boundary only when the attribute
+//! has an authored source; operand reads through modifier_value and the memo
+//! keep raw guarded results, and absent nodes or attributes stay zero.
+
 
 pub(crate) mod attributes;
+pub(crate) mod cargo;
+pub(crate) mod character;
 
 use super::{db_err, CallError};
-use infinity_core::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_REQUIRED_SKILLS, dogma::ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, dogma::EFFECT_AFTERBURNER, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, dogma::EFFECT_SKILL, TYPE_CHARACTER};
+use infinity_core::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_REQUIRED_SKILLS, dogma::ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, dogma::EFFECT_AFTERBURNER, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_SKILL_LEVEL, dogma::ATTR_SKILL_POINTS, dogma::ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS, FLAG_IMPLANT};
+use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_SKILL_LEVEL, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS};
+use infinity_core::consts::dogma::{ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE};
+use infinity_core::consts::dogma::{ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE};
+use infinity_core::consts::dogma::{ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE};
+
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 /// SDE dogma effect category: active.
@@ -67,6 +85,17 @@ const STACKING_PENALTY_EXPONENT: i32 = 2;
 pub(crate) const PERCENT_SCALE: f64 = 100.0;
 /// SDE modifier skillTypeID sentinel selecting the source item's type.
 const MODIFIER_SOURCE_ITEM_TYPE: i32 = -1;
+/// The twelve effective damage resonance attributes bounded at the public
+/// evaluation boundary: structure 109/110/111/113, armor 267-270, shield 271-274.
+/// Hull resonance operand attributes 974-977 are modifier inputs, not bounded.
+const RESONANCE_FLOOR_ATTRIBUTES: [i32; 12] = [
+    ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE,
+    ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE,
+    ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE,
+    ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE,
+    ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE,
+    ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE,
+];
 
 
 /// An item in the fit.
@@ -86,6 +115,7 @@ pub enum Key {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Location { Ship, Char, Space }
 
+#[derive(Clone)]
 struct Node {
     type_id: i32,
     // Positions remain stable in the immutable types owned by the retained Arc<Sde>.
@@ -99,6 +129,7 @@ struct Node {
     charge_type: Option<i32>,
     level: Option<i32>,
     overrides: Vec<(i32, f64)>,
+    cargo_unlimited: bool,
     charge_values: Vec<(i32, f64)>,
 }
 
@@ -146,8 +177,13 @@ pub struct Fit {
     passive_by_attribute: HashMap<i32, Vec<usize>>,
     sde: Arc<Sde>,
     memo: Mutex<HashMap<(Key, i32), f64>>,
+    ship_id: Option<i64>,
     projection_revision: Option<u64>,
     drone_projection_revision: Option<u64>,
+    character: Option<character::CharacterInputs>,
+    character_at: i64,
+    charge_incarnations: HashMap<i64, u64>,
+    loaded_seeds: Vec<crate::space::combat::loaded::LoadedSeed>,
 }
 
 impl Fit {
@@ -157,6 +193,16 @@ impl Fit {
     pub(crate) fn module_state(&self, item: i64) -> Option<(bool, bool)> {
         self.nodes.get(&Key::Module(item)).map(|node| (node.online, node.active))
     }
+
+    /// Fitted module nodes as (item id, type id) pairs without copying the fit.
+    pub(crate) fn fitted_modules(&self) -> impl Iterator<Item = (i64, i32)> + '_ {
+        self.nodes.iter().filter_map(|(key, node)| match key {
+            Key::Module(item) => Some((*item, node.type_id)),
+            _ => None,
+        })
+    }
+    #[cfg(all(test, any(feature = "tests-ships", feature = "tests-slash")))]
+    pub(crate) fn module_overloaded(&self, item: i64) -> Option<bool> { self.nodes.get(&Key::Module(item)).map(|node| node.overloaded) }
 
     /// Load a fit outside space, without incoming projections.
     pub async fn load(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
@@ -192,10 +238,10 @@ impl Fit {
         nodes.insert(Key::Ship, Node {
             type_id, data_position: sde.types.position(type_id), location: Location::Space,
             online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
-            charge_type: None, level: None, overrides: Vec::new(), charge_values: Vec::new(),
+            charge_type: None, level: None, overrides: Vec::new(), cargo_unlimited: false, charge_values: Vec::new(),
         });
         Self::insert_projections(&sde, &mut nodes, Key::Ship, projections);
-        Fit { nodes, selected_effects: HashMap::new(), passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), projection_revision: None, drone_projection_revision: None }
+        Fit { nodes, selected_effects: HashMap::new(), passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), ship_id: None, projection_revision: None, drone_projection_revision: None, character: None, character_at: 0, charge_incarnations: HashMap::new(), loaded_seeds: Vec::new() }
     }
 
     fn insert_projections(sde: &Sde, nodes: &mut HashMap<Key, Node>, receiver: Key, projections: Vec<super::effects::projection::Projection>) {
@@ -209,7 +255,7 @@ impl Fit {
             nodes.insert(Key::Projected(key), Node {
                 type_id: p.source_type, data_position: sde.types.position(p.source_type),
                 location: Location::Space, online: true, active: true, overloaded: false,
-                projected_effect: Some(p.effect_id), receiver: Some(receiver), charge_type: p.charge_type, level: None, overrides: values, charge_values,
+                projected_effect: Some(p.effect_id), receiver: Some(receiver), charge_type: p.charge_type, level: None, overrides: values, cargo_unlimited: false, charge_values,
             });
         }
     }
@@ -247,22 +293,31 @@ impl Fit {
         supplied_installations: Option<&[crate::dao::skills::expert_systems::ExpertSystem]>,
     ) -> Result<Fit, CallError> {
         let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
-        let skill_snapshot = if let Some(skills) = supplied_skills {
-            let installations = supplied_installations.unwrap_or(&[]);
-            super::skills::effective::project(skills, installations, &sde, at)
+        let (trained, installations) = if let Some(skills) = supplied_skills {
+            (skills.to_vec(), supplied_installations.unwrap_or(&[]).to_vec())
         } else if let Some(char_id) = char_id {
-            super::skills::effective::snapshot_at(db, &sde, char_id, at).await?
+            tokio::try_join!(
+                crate::dao::skills::training::current(db, char_id),
+                crate::dao::skills::expert_systems::active(db, char_id, at),
+            ).map_err(db_err)?
         } else {
-            super::skills::effective::project(&[], &[], &sde, at)
+            (Vec::new(), Vec::new())
         };
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
-        let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
+        let charges = crate::dao::items::charges::all(db, ship).await.map_err(db_err)?;
+        let pendings: HashSet<i32> = if ship > 0 {
+            crate::dao::items::pending_reloads::for_ship(db, ship).await.map_err(db_err)?.into_iter().map(|r| r.flag_id).collect()
+        } else { HashSet::new() };
         let brain = if let Some(char_id) = char_id { fit_dao::brain_items(db, char_id, at).await.map_err(db_err)? } else { Vec::new() };
         let drones = if let Some(char_id) = char_id { fit_dao::drones(db, char_id, ship).await.map_err(db_err)? } else { Vec::new() };
         let ids: Vec<i64> = std::iter::once(ship).chain(char_id).chain(modules.iter().map(|m| m.item_id))
             .chain(brain.iter().map(|m| m.item_id)).chain(drones.iter().map(|m| m.item_id)).collect();
         let mut overrides: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
+        let mut ship_cargo_unlimited = false;
         for row in crate::dao::items::dogma::overrides_for(db, &ids).await.map_err(db_err)? {
+            if row.item_id == ship && row.attribute_id == infinity_core::consts::dogma::ATTR_CAPACITY {
+                ship_cargo_unlimited = row.cargo_unlimited;
+            }
             overrides.entry(row.item_id).or_default().push((row.attribute_id, row.value));
         }
         for values in overrides.values_mut() { values.sort_by_key(|entry| entry.0); }
@@ -279,22 +334,13 @@ impl Fit {
         let mut nodes = HashMap::new();
         let node = |type_id, location, online, active, level, overrides| Node {
             type_id, data_position: sde.types.position(type_id), location, online, active,
-            overloaded: false, projected_effect: None, receiver: None, charge_type: None, level, overrides, charge_values: Vec::new(),
+            overloaded: false, projected_effect: None, receiver: None, charge_type: None, level, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         };
-        if let Some(character) = character { nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character)); }
-        nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
-        for (type_id, entry) in skill_snapshot.iter() {
-            let rank = sde.types.get(type_id).and_then(|d| d.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap_or(0.0);
-            let trained_points = entry.trained.as_ref().map_or(0, |skill| skill.skill_points);
-            let trained_level = super::skills::formulas::level_from_points(trained_points, rank);
-            let level = entry.effective_level();
-            let points = if entry.virtual_level.is_some_and(|virtual_level| virtual_level > trained_level) {
-                trained_points.max(super::skills::formulas::sp_for_level(rank, i64::from(level)))
-            } else {
-                trained_points
-            };
-            nodes.insert(Key::Skill(type_id), node(type_id, Location::Char, true, false, Some(level), vec![(ATTR_SKILL_POINTS, points as f64)]));
-        }
+
+        let mut ship_node = node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default());
+        ship_node.cargo_unlimited = ship_cargo_unlimited;
+        nodes.insert(Key::Ship, ship_node);
+
         let mut module_by_flag = HashMap::new();
         for r in &modules {
             module_by_flag.insert(r.flag_id, r.item_id);
@@ -302,50 +348,36 @@ impl Fit {
             module.overloaded = char_id.is_some() && r.online && overloaded.contains(&r.item_id);
             nodes.insert(Key::Module(r.item_id), module);
         }
+        let mut charge_incarnations = HashMap::new();
         for r in &charges {
             if let Some(m) = module_by_flag.get(&r.flag_id) {
                 nodes.insert(Key::Charge(*m), node(r.type_id, Location::Ship, true, false, None, Vec::new()));
+                charge_incarnations.insert(*m, crate::space::targeting::next_generation());
             }
         }
-        let mut selected_effects = HashMap::new();
-        for r in brain {
-            let key = if r.flag_id == FLAG_IMPLANT { Key::Implant(r.item_id) } else { Key::Booster(r.item_id) };
-            nodes.insert(key, node(r.type_id, Location::Char, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
-            if let Some(mut ids) = r.effect_ids {
-                ids.sort_unstable();
-                selected_effects.insert(r.item_id, ids);
-            }
-        }
+        let brain_inputs: Vec<character::BrainInput> = brain.into_iter().map(|item| character::BrainInput {
+            overrides: overrides.remove(&item.item_id).unwrap_or_default(),
+            item,
+        }).collect();
         for r in &drones {
             if sde.types.get(r.type_id).and_then(|d| d.category_id) == Some(CATEGORY_DRONE) {
                 nodes.insert(Key::Drone(r.item_id), node(r.type_id, Location::Space, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
             }
         }
         Self::insert_projections(&sde, &mut nodes, Key::Ship, projections);
-        let mut skill_effects = Vec::new();
-        for (type_id, entry) in skill_snapshot.iter() {
-            if entry.trained.is_none() { continue; }
-            if nodes.get(&Key::Skill(type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
-            if let Some(data) = sde.types.get(type_id) {
-                for effect_entry in data.effects() {
-                    if effect_entry.effect_id == EFFECT_SKILL { continue; }
-                    if sde.dogma.effect(effect_entry.effect_id).is_some_and(|effect| effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE && chance_enabled(&selected_effects, Key::Skill(type_id), data, effect)) {
-                        skill_effects.push((type_id, effect_entry.effect_id));
-                    }
-                }
-            }
-        }
-        skill_effects.sort_unstable();
-        let mut passive_modifiers = Vec::new();
-        let mut passive_by_attribute: HashMap<i32, Vec<usize>> = HashMap::new();
-        for (id, effect_id) in skill_effects {
-            let Some(effect) = sde.dogma.effect(effect_id) else { continue };
-            for (position, modifier) in effect.modifiers().iter().enumerate() {
-                passive_by_attribute.entry(modifier.modified).or_default().push(passive_modifiers.len());
-                passive_modifiers.push((Key::Skill(id), effect_id, position));
-            }
-        }
-        Ok(Fit { nodes, selected_effects, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None, drone_projection_revision: None })
+        let character = char_id.map(|_| character::CharacterInputs {
+            at, attributes: character, trained, installations, brain: brain_inputs });
+        let ship_id = (ship > 0 && sde.types.get(ship_type).and_then(|data| data.category_id) == Some(CATEGORY_SHIP)).then_some(ship);
+        let charged: HashMap<i32, &crate::dao::items::charges::Charge> = charges.iter().map(|r| (r.flag_id, r)).collect();
+        let loaded_seeds = modules.iter().filter_map(|m| {
+            let charge = charged.get(&m.flag_id);
+            (charge.is_some() || pendings.contains(&m.flag_id)).then_some(crate::space::combat::loaded::LoadedSeed {
+                module: m.item_id, flag: m.flag_id, type_id: charge.map(|c| c.type_id),
+                quantity: charge.map_or(0, |c| c.quantity), pending: pendings.contains(&m.flag_id) })
+        }).collect();
+        let mut fit = Fit { nodes, selected_effects: HashMap::new(), passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), ship_id, projection_revision: None, drone_projection_revision: None, character, character_at: at, charge_incarnations, loaded_seeds };
+        fit.rebuild_character_domain(at);
+        Ok(fit)
     }
 
     /// Include a prospective fitted item with its persisted dogma overrides.
@@ -357,9 +389,9 @@ impl Fit {
         self.nodes.insert(Key::Module(item), Node {
             type_id, data_position: self.sde.types.position(type_id), location: Location::Ship,
             online: false, active: false, overloaded: false, projected_effect: None, receiver: None,
-            charge_type: None, level: None, overrides, charge_values: Vec::new(),
+            charge_type: None, level: None, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         });
-        self.memo.get_mut().unwrap().clear();
+        crate::poison::lock_or_exit(self.memo.get_mut()).clear();
         Ok(())
     }
 
@@ -369,9 +401,9 @@ impl Fit {
         self.nodes.insert(Key::Drone(id), Node {
             type_id, data_position: self.sde.types.position(type_id),
             location: Location::Space, online: true, active: false, overloaded: false,
-            projected_effect: None, receiver: None, charge_type: None, level: None, overrides, charge_values: Vec::new(),
+            projected_effect: None, receiver: None, charge_type: None, level: None, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         });
-        self.memo.get_mut().unwrap().clear();
+        crate::poison::lock_or_exit(self.memo.get_mut()).clear();
     }
 
     /// Change a prospective module state and invalidate all dependent values.
@@ -380,7 +412,7 @@ impl Fit {
         if node.online != online {
             node.online = online;
             if !online { node.active = false; node.overloaded = false; }
-            self.memo.get_mut().unwrap().clear();
+            crate::poison::lock_or_exit(self.memo.get_mut()).clear();
         }
         true
     }
@@ -394,15 +426,16 @@ impl Fit {
             Key::Drone(_) => self.drone_projection_revision = revision,
             _ => {}
         }
-        self.memo.get_mut().unwrap().clear();
+        crate::poison::lock_or_exit(self.memo.get_mut()).clear();
     }
 
+    /// Change a prospective module active flag and invalidate dependent
+    /// values; returns whether the bit actually changed.
     pub(crate) fn set_module_active(&mut self, item: i64, active: bool) -> bool {
         let Some(node) = self.nodes.get_mut(&Key::Module(item)) else { return false };
-        if node.active != active {
-            node.active = active;
-            self.memo.get_mut().unwrap().clear();
-        }
+        if node.active == active { return false; }
+        node.active = active;
+        crate::poison::lock_or_exit(self.memo.get_mut()).clear();
         true
     }
 
@@ -410,7 +443,7 @@ impl Fit {
         let Some(node) = self.nodes.get_mut(&Key::Module(item)) else { return false };
         if node.overloaded != overloaded {
             node.overloaded = overloaded;
-            self.memo.get_mut().unwrap().clear();
+            crate::poison::lock_or_exit(self.memo.get_mut()).clear();
         }
         true
     }
@@ -449,7 +482,7 @@ impl Fit {
             .into_iter().map(|r| (r.attribute_id, r.value)).collect();
         fit.include_drone(drone_item, item.type_id, overrides);
         Self::insert_projections(&fit.sde, &mut fit.nodes, Key::Drone(drone_item), drone_projections);
-        fit.memo.get_mut().unwrap().clear();
+        crate::poison::lock_or_exit(fit.memo.get_mut()).clear();
         Ok(fit)
     }
 
@@ -526,13 +559,35 @@ impl Fit {
         modifier_applies(source, self.nodes.get(&source).and_then(|node| node.receiver), m, target, t, group, required(m.skill))
     }
 
-    /// The effective value of `attr` on `key`.
+    /// The effective value of `attr` on `key`. The twelve damage resonance
+    /// attributes are bounded below by combat.resonance_floor at this public
+    /// boundary only when `key` actually carries the attribute; operand reads
+    /// use modifier_value for raw results.
     pub fn value(&self, key: Key, attr: i32) -> f64 {
+        let value = self.value_guarded(key, attr, &mut HashSet::new());
+        if RESONANCE_FLOOR_ATTRIBUTES.contains(&attr) && self.attribute_present(key, attr) { bounded(attr, value) } else { value }
+    }
+
+    /// The raw effective value of `attr` on `key` for dogma operand reads, with
+    /// no resonance boundary applied. Brain compilation and projected snapshots
+    /// consume operands through this so the floor cannot leak into arithmetic.
+    pub(crate) fn modifier_value(&self, key: Key, attr: i32) -> f64 {
         self.value_guarded(key, attr, &mut HashSet::new())
     }
 
+    /// Whether `key` carries an authored source for `attr`: an override, a type
+    /// attribute, or an attribute default. The same inputs `base` reads.
+    /// Missing nodes and absent attributes keep the historical zero result, so
+    /// the resonance floor bounds only values that actually exist.
+    fn attribute_present(&self, key: Key, attr: i32) -> bool {
+        let Some(node) = self.nodes.get(&key) else { return false };
+        node.overrides.binary_search_by_key(&attr, |entry| entry.0).is_ok()
+            || node.data_position.is_some_and(|i| self.sde.types.at_position(i).fit_attribute(attr).is_some())
+            || self.sde.dogma.attribute(attr).is_some_and(|meta| meta.default_value.is_some())
+    }
+
     fn value_guarded(&self, key: Key, attr: i32, visiting: &mut HashSet<(Key, i32)>) -> f64 {
-        if let Some(value) = self.memo.lock().unwrap().get(&(key, attr)).copied() {
+        if let Some(value) = crate::poison::lock_or_exit(self.memo.lock()).get(&(key, attr)).copied() {
             return value;
         }
         let base = self.base(key, attr);
@@ -590,7 +645,7 @@ impl Fit {
         }
         visiting.remove(&(key, attr));
         let value = apply(base, &mods);
-        self.memo.lock().unwrap().insert((key, attr), value);
+        crate::poison::lock_or_exit(self.memo.lock()).insert((key, attr), value);
         value
     }
 }
@@ -610,6 +665,16 @@ fn stacking_exempt(category: i32) -> bool {
 
 fn projected_value(node: &Node, data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
     node.base(data, meta, attr)
+}
+
+/// Boundary clamp for the twelve damage resonance attributes: finite values
+/// below combat.resonance_floor rise to the floor; nonfinite results and every
+/// other attribute pass through unchanged. Only Fit::value applies this, and
+/// only for attributes with an authored source. The guarded evaluator, the
+/// memo and operand reads keep raw values.
+fn bounded(attr: i32, value: f64) -> f64 {
+    if !RESONANCE_FLOOR_ATTRIBUTES.contains(&attr) || !value.is_finite() { return value; }
+    value.max(crate::config::game().combat.resonance_floor)
 }
 
 fn effect_running(source: Key, node: &Node, effect_id: i32, category: i32, domain: &str) -> bool {
@@ -729,4 +794,4 @@ fn apply(base: f64, mods: &[(i32, f64, bool)]) -> f64 {
     v
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

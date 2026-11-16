@@ -10,7 +10,7 @@ use super::{policy, CloneEffect, MAX_CLONE_NAME_LENGTH};
 
 fn missing() -> CallError { notify_error(messages::JUMP_CLONE_NOT_FOUND) }
 
-fn invalidate<E>(outbox: &mut Outbox<E>, owner: i64, location: i64) {
+pub(super) fn invalidate<E>(outbox: &mut Outbox<E>, owner: i64, location: i64) {
     outbox.notify_pilot(owner, "OnJumpCloneCacheInvalidated", vec![]);
     outbox.notify_pilot(owner, "OnStationJumpCloneCacheInvalidated", vec![Value::Int(location), Value::Int(owner)]);
 }
@@ -72,4 +72,4 @@ pub(super) async fn reset_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;

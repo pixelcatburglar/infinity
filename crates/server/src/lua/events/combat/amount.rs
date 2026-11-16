@@ -144,4 +144,4 @@ pub(crate) fn accumulate_capped(remainder: &BinaryAmount, increment: &BinaryAmou
     Ok((integer, sum.to_amount()))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

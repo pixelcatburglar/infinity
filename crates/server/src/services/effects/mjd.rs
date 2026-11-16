@@ -21,9 +21,8 @@ fn resolve_range(type_row: Option<f64>, fitted: impl FnOnce() -> f64) -> Option<
     (range.is_finite() && range > 0.0).then_some(range)
 }
 
-fn jump_range(cx: &Ctx, fit: &Fit, module: &Module) -> Option<f64> {
-    let row = cx.world.sde().types.attribute(module.type_id, ATTR_MJD_JUMP_RANGE);
-    resolve_range(row, || fit.value(Key::Module(module.id), ATTR_MJD_JUMP_RANGE))
+fn jump_range(fit: &Fit, has_row: bool, module: i64) -> Option<f64> {
+    resolve_range(has_row.then_some(0.0), || fit.value(Key::Module(module), ATTR_MJD_JUMP_RANGE))
 }
 
 fn blocked(fit: &Fit, module: i64) -> bool {
@@ -36,11 +35,11 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Eff
     if cx.world.with(cx.system_id, move |s| s.ball(ship).is_none_or(|b| b.mode == MODE_WARP)).await.unwrap_or(true) {
         return Err(notify_error(messages::effects::MICRO_JUMP_BLOCKED));
     }
-    if jump_range(cx, fit, module).is_none() { return Err(CallError::Internal(anyhow::anyhow!("invalid micro jump range for module {}", module.id))); }
+    if jump_range(fit, cx.world.sde().types.attribute(module.type_id, ATTR_MJD_JUMP_RANGE).is_some(), module.id).is_none() { return Err(CallError::Internal(anyhow::anyhow!("invalid micro jump range for module {}", module.id))); }
     Ok(())
 }
 
-pub(super) async fn start(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let module = cycle.modules[0].id;
     let ship = cx.ship_id;
     let generation = cycle.stop.clone();
@@ -51,19 +50,23 @@ pub(super) async fn start(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<Cyc
     Ok(if registered { CycleOutcome::Continue } else { CycleOutcome::Stop("source lost") })
 }
 
-pub(super) async fn end(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+pub(super) async fn end(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let module = &cycle.modules[0];
     let ship = cx.ship_id;
-    let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, ship).await?;
-    let range = jump_range(cx, &fit, module);
+    // The type row is immutable SDE; the fitted range and the actual blocker
+    // come from the resident fit through the one prepared mutable gate.
+    let has_row = cx.world.sde().types.attribute(module.type_id, ATTR_MJD_JUMP_RANGE).is_some();
     let module = module.id;
-    let Some(revision) = fit.projection_revision() else { return Ok(CycleOutcome::Stop("fit unavailable")); };
-    let Some(range) = range.filter(|_| !blocked(&fit, module)) else { return Ok(CycleOutcome::Stop("micro jump blocked")); };
+    let admitted = cycle.source_membership;
     let generation = cycle.stop.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
     cx.world.with(cx.system_id, move |s| {
         let current = combat::state().active.get(&module).is_some_and(|a| Arc::ptr_eq(&a.stop, &generation));
-        if !current || generation.load(Ordering::Relaxed) || s.projection_revision(ship) != revision { return; }
+        if !current || generation.load(Ordering::Relaxed) { return; }
+        let Some(range) = s.with_combat_fit(ship, move |fit, _key, stamp| {
+            if Some(stamp.membership) != admitted || blocked(fit, module) { return None; }
+            jump_range(fit, has_row, module)
+        }).flatten() else { return };
         let Some(ball) = s.sampled_ball(ship).filter(|b| b.mode != MODE_WARP) else { return };
         let Some(membership) = s.persistent_generation(ship) else { return };
         let Some(heading) = s.heading(ship) else { return };
@@ -80,5 +83,5 @@ pub(super) async fn end(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<Cycle
     } else { CycleOutcome::Stop("micro jump completed") })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

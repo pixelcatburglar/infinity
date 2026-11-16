@@ -44,15 +44,15 @@ struct Catalogue {
     offers: Vec<Offer>,
 }
 fn service_price(average: Option<f64>, plex_isk: f64, list_price: i64) -> i64 {
-    average.filter(|p| crate::dao::store::catalogue::positive_price(*p)).map(|p| ((p / plex_isk).round() as i64).max(1)).unwrap_or(list_price)
+    average.filter(|p| crate::sde::prices::positive_price(*p)).map(|p| ((p / plex_isk).round() as i64).max(1)).unwrap_or(list_price)
 }
 fn expert_saleable(definition: &crate::sde::expert_systems::ExpertSystem) -> bool {
     !definition.hidden && !definition.retired
 }
 
-async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
-    let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
-    let plex_isk = prices.get(&TYPE_PLEX).copied().unwrap_or(crate::config::game().store.plex_price_isk_fallback);
+fn catalogue(c: &Client) -> Result<Catalogue, CallError> {
+    let prices = &c.sde.prices;
+    let plex_isk = prices.get(TYPE_PLEX).map(|p| p.average).unwrap_or(crate::config::game().store.plex_price_isk_fallback);
     let to_plex = |isk: f64| ((isk / plex_isk).round() as i64).max(1);
     let sde = &c.sde;
     let presentation = |type_id: i32| -> Result<(String, String), CallError> {
@@ -97,7 +97,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     // Skill services: retail price where it traded, else the store's list price.
     for (type_id, list_price) in [(40520, 250), (45635, 50), (34133, 485)] {
         let (name, image) = presentation(type_id)?;
-        let price = service_price(prices.get(&type_id).copied(), plex_isk, list_price);
+        let price = service_price(prices.get(type_id).map(|p| p.average), plex_isk, list_price);
         cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category: 201, price, daily: false });
     }
     for entry in sde.store.expert_offers() {
@@ -112,7 +112,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     for r in sde.ship_skins.licenses().filter(|r| r.is_permanent() && !r.is_single_use) {
         let Some(skin) = sde.ship_skins.skin(r.skin_id).filter(|skin| !skin.is_structure_skin && skin.visible(&c.cfg.server.boot_region)) else { continue };
         let Some(t) = sde.types.get(r.license_type_id).filter(|t| t.published == Some(true)) else { continue };
-        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let Some(average) = prices.get(t.type_id).map(|p| p.average).filter(|p| crate::sde::prices::positive_price(*p)) else { continue };
         let race = skin.type_ids.first().and_then(|id| sde.types.get(*id)).and_then(|h| h.race_id).unwrap_or(0);
         let category = match race { 4 => 101, 1 => 102, 8 => 103, 2 => 104, _ => 105 };
         let (name, image) = presentation(t.type_id)?;
@@ -123,7 +123,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     // Apparel that traded on Serenity, under its market group's parent (男装, 女装, 饰品...).
     for t in sde.types.iter().filter(|t| t.published == Some(true)) {
         if t.category_id.and_then(|id| sde.types.category(id)).and_then(|c| c.name.as_deref()) != Some("Apparel") { continue; }
-        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let Some(average) = prices.get(t.type_id).map(|p| p.average).filter(|p| crate::sde::prices::positive_price(*p)) else { continue };
         let Some(group) = t.market_group_id.and_then(|id| sde.store.group(id)) else { continue };
         let Some(group) = sde.store.group(group.parent.unwrap_or(group.id)) else { continue };
         let category = 21_000_000 + i64::from(group.id);
@@ -139,7 +139,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     // Crates that traded on Serenity, with their splash art.
     for r in sde.crates.iter().filter(|entry| entry.sale_supported()) {
         let Some(t) = sde.types.get(r.type_id).filter(|t| t.published == Some(true)) else { continue };
-        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let Some(average) = prices.get(t.type_id).map(|p| p.average).filter(|p| crate::sde::prices::positive_price(*p)) else { continue };
         let type_id = t.type_id;
         let (name, image) = presentation(type_id)?;
         let image = if r.splash.is_empty() { image } else { r.splash.clone() };
@@ -149,7 +149,6 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     Ok(cat)
 }
 
-async fn catalogue(c: &Client) -> Result<Catalogue, CallError> { build_catalogue(c).await }
 fn category_json(cat: &Category) -> Value {
     Value::dict([
         ("id", Value::Int(cat.id)),
@@ -209,7 +208,7 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
         Some(Value::Int(id)) if *id > 0 => Some(*id),
         _ => return Ok(Value::Bool(false)),
     };
-    let cat = catalogue(c).await?;
+    let cat = catalogue(c)?;
     let Some(offer) = cat.offers.iter().find(|o| o.id == offer_id && !o.daily) else { return Ok(Value::Bool(false)) };
     if c.sde.crates.get(offer.type_id).is_some_and(|entry| !entry.sale_supported()) { return Ok(Value::Bool(false)); }
     let Some(purchase) = purchasing::Purchase::new(offer.id, offer.type_id, offer.quantity, offer.price, qty) else { return Ok(Value::Bool(false)) };
@@ -238,7 +237,7 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
 /// free_to_get(offer_id, is_game_time=, store_id=): the daily gift.
 async fn free_to_get(c: &mut Client, call: &Call<'_>) -> CallResult {
     let offer_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let cat = catalogue(c).await?;
+    let cat = catalogue(c)?;
     let Some(offer) = cat.offers.iter().find(|o| o.id == offer_id && o.daily) else { return Ok(Value::Bool(false)) };
     if claimed_daily_gift(c).await? {
         return Ok(Value::Bool(false));
@@ -251,13 +250,13 @@ async fn free_to_get(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {
-        ("storeManager", "get_categories") => catalogue(c).await.map(|cat| Value::list(cat.categories.iter().map(category_json))),
-        ("storeManager", "get_products") => catalogue(c).await.map(|cat| Value::list(cat.offers.iter().map(product_json))),
-        ("storeManager", "get_offers") => match (catalogue(c).await, claimed_daily_gift(c).await) {
+        ("storeManager", "get_categories") => catalogue(c).map(|cat| Value::list(cat.categories.iter().map(category_json))),
+        ("storeManager", "get_products") => catalogue(c).map(|cat| Value::list(cat.offers.iter().map(product_json))),
+        ("storeManager", "get_offers") => match (catalogue(c), claimed_daily_gift(c).await) {
             (Ok(cat), Ok(claimed)) => Ok(Value::list(cat.offers.iter().map(|o| offer_json(o, !(o.daily && claimed))))),
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
-        ("storeManager", "get_offer_states") => match (catalogue(c).await, claimed_daily_gift(c).await) {
+        ("storeManager", "get_offer_states") => match (catalogue(c), claimed_daily_gift(c).await) {
             (Ok(cat), Ok(claimed)) => Ok(Value::list(cat.offers.iter().map(|o| {
                 let mut state = vec![("offerId", Value::Int(o.id)), ("canPurchase", Value::Bool(!(o.daily && claimed)))];
                 if o.daily {
@@ -275,7 +274,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let offer_id = id.and_then(|v| v.as_int().or_else(|| {
                 v.as_text().and_then(|s| s.strip_prefix("VEVC-").and_then(|s| s.parse::<i64>().ok()))
             }));
-            let cat = catalogue(c).await?;
+            let cat = catalogue(c)?;
             let offer = cat.offers.iter().find(|o| Some(o.id) == offer_id);
             let can_purchase = if let Some(offer) = offer {
                 !c.sde.crates.get(offer.type_id).is_some_and(|entry| !entry.sale_supported())
@@ -295,5 +294,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;
 

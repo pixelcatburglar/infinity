@@ -120,4 +120,4 @@ pub(super) async fn apply(c: &mut Client, char_id: i64, args: &[Value]) -> Resul
     apply_targets(c, char_id, vec![(type_id, MAX_SKILL_LEVEL)], Some(vec![(type_id, points)])).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

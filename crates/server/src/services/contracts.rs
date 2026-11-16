@@ -23,6 +23,8 @@
 //! corporation custody uses authorized office divisions or station Deliveries.
 //! Corporation-assigned contracts are available to current members acting personally;
 //! corporate courier completion requires current membership and actual package custody.
+//! Corporation blueprint locks and pending vote-case reservations freeze originals
+//! inside escrow handovers and outright escrow destruction.
 //! Contract lifecycle mutations guard the previous persisted status and commit atomically;
 //! their notifications are delivered only after commit. Overdue couriers remain in progress
 //! until manually failed, and their acceptors may still complete them.
@@ -291,6 +293,9 @@ async fn destroy_escrow(db: &(impl Executor + ?Sized), sde: &Sde, contract_id: i
         || shared::escrow_closure(db, &ids).await.map_err(db_err)? != closure {
         return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
     }
+    // The same freeze applies when the escrow is lost outright.
+    let blueprints = crate::services::corps::item_locks::locked_blueprints(sde, &locks, &closure)?;
+    crate::services::corps::item_locks::ensure_mutable(db, &blueprints).await?;
     shared::destroy_escrow(db, &ids, &closure, &locks).await.map_err(db_err)?;
     Ok(())
 }

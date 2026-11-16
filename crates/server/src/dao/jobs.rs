@@ -5,7 +5,7 @@ use crate::{client::filetime_ticks_from_seconds, db::{executor::Executor, Error}
 use crate::scheduler::Job;
 use tokio_postgres::Row;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-economy", feature = "tests-skills", feature = "tests-slash", feature = "tests-storage")))]
 pub(crate) mod tests;
 
 /// Server design: show at most ten upcoming active jobs to an operator.
@@ -61,6 +61,11 @@ pub(crate) async fn schedule(ex: &(impl Executor + ?Sized), job: &Job, now: i64)
 }
 pub(crate) async fn seed(ex: &(impl Executor + ?Sized), job: &Job, now: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.jobs (job_id,kind,due_at,payload,state,created_at,updated_at) VALUES ($1,$2,$3,$4,'scheduled',$5,$5) ON CONFLICT (job_id) DO UPDATE SET kind=EXCLUDED.kind,due_at=EXCLUDED.due_at,payload=EXCLUDED.payload,state='scheduled',attempt=0,lease_until=NULL,lease_token=NULL,last_error=NULL,updated_at=EXCLUDED.updated_at WHERE game.jobs.state='dead'", &[&job.id,&job.kind,&job.due_at,&job.payload,&now]).await
+}
+/// Insert a job only when none exists; an existing scheduled, running or dead
+/// row keeps its due, attempt, lease and error fields completely untouched.
+pub(crate) async fn ensure_once(ex: &(impl Executor + ?Sized), job: &Job, now: i64) -> Result<u64, Error> {
+    ex.execute("INSERT INTO game.jobs (job_id,kind,due_at,payload,state,created_at,updated_at) VALUES ($1,$2,$3,$4,'scheduled',$5,$5) ON CONFLICT (job_id) DO NOTHING", &[&job.id,&job.kind,&job.due_at,&job.payload,&now]).await
 }
 pub(crate) async fn cancel(ex: &(impl Executor + ?Sized), id: &str) -> Result<u64, Error> { ex.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&id]).await }
 // Local exclusions prevent only same-process reclaim; multi-process

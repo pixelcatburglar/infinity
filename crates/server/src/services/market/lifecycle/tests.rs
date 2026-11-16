@@ -5,35 +5,6 @@ use crate::db::Db;
 use crate::services::{Call, CallError, market, tests::{client, fixture}};
 use marshal::Value;
 
-#[test]
-fn owned_order_deadline_is_strict_and_checked() {
-    let issued = 10;
-    let deadline = issued + FILETIME_DAY;
-    let mut order = crate::dao::market::orders::Order {
-        id: 1, type_id: 1, char_id: Some(1),
-        at: crate::dao::market::orders::Station { id: 1, system: 1, constellation: 1, region: 1, owner: 1 },
-        corporation_id: None, wallet_key: infinity_core::consts::ACCOUNT_CASH,
-        source_location_id: None, source_flag_id: None,
-        price: crate::isk::IskAmount::from_whole_isk(1).unwrap(),
-        vol_entered: 1, vol_remaining: 1, min_volume: 1, bid: true, range: -1,
-        duration: 1, issued: Some(issued), escrow: crate::isk::IskAmount::from_whole_isk(1).unwrap(),
-        scope: crate::dao::market::orders::MarketScope::Regional, vault_user_id: None,
-        plex_escrow: 0, created_at: Some(issued), expires_at: None,
-    };
-    assert!(super::owned_order_active(&order, deadline - 1));
-    assert!(!super::owned_order_active(&order, deadline));
-    assert!(!super::owned_order_active(&order, deadline + 1));
-    order.issued = None;
-    assert!(!super::owned_order_active(&order, deadline - 1));
-    order.issued = Some(i64::MAX);
-    assert!(super::owned_order_active(&order, deadline));
-    order.issued = Some(0);
-    order.duration = i64::MAX;
-    assert!(super::owned_order_active(&order, deadline));
-    order.expires_at = Some(deadline);
-    assert!(!super::owned_order_active(&order, deadline));
-}
-
 async fn snapshot(db: &Db, character: i64) -> String {
     db.query_one("SELECT json_build_object(
         'balance', (SELECT balance::text FROM game.characters WHERE character_id=$1),

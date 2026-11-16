@@ -9,9 +9,6 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
     let db = db.clone();
     let world = world.clone();
     let notify = notify.clone();
-    let _market = if !automatic && client.is_some() {
-        Some(crate::services::market::lock().await)
-    } else { None };
     let selected = if !automatic && generated.is_none() {
         if let Some(client) = client.as_deref() {
             let identity = crate::services::identity::Identity { system_id: system, ..crate::services::identity::Identity::of_client(client) };
@@ -24,12 +21,23 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
         } else { None }
     } else { None };
     let fences = online::capture_online_fences(&world, &[owner]).await;
-    let loads = db.transaction(
+    let armed = super::super::loaded::LoadedHolds::arm(&world, &system.map(|system| (system, ship)).into_iter().collect::<Vec<_>>(), notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    // Automatic and generated reloads serialize like manual ones: the market
+    // guard always sits between the claim and the gate.
+    let _market = crate::services::market::lock().await;
+    let mut holds = super::super::loaded::LoadedHolds::lock(&world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
+    let engaged_ship = holds.held(ship);
+    let charge_view = holds.view(ship);
+    holds.may_execute();
+    let result = db.transaction(
         |tx, outbox: &mut Outbox<OnlineChanged>| {
             let modules = modules.clone();
             let mut charge_ids = charge_ids.clone();
             let sde = sde.clone();
             let selected = selected.clone();
+            let settle = settle.clone();
+            let charge_view = charge_view.clone();
             let fences = fences.clone();
             Box::pin(async move {
                 let refuse = || notify_error(messages::INSUFFICIENT_AMMUNITION);
@@ -57,7 +65,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                 let mut planned_charges = Vec::new();
                 let mut planned_candidates = Vec::new();
                 for module in &planned_fitted {
-                    let charge = loaded(tx, ship, module.flag_id).await?;
+                    let charge = if engaged_ship { charge_view.get(&module.flag_id).copied() } else { loaded(tx, ship, module.flag_id).await? };
                     if let Some((type_id, quantity)) = charge {
                         if quantity > 0 {
                             if let Some(item) = load_items(tx, &sde, ItemQuery::LocationFlagTypeOwnerStack(ship, FLAG_CARGO, type_id, owner)).await.map_err(db_err)?.into_iter().next() {
@@ -96,6 +104,8 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                 let optional: Vec<_> = refund.candidate_ids().into_iter().filter(|id| !mandatory.contains(id)).collect();
                 requests.extend_from_slice(refund.requests());
                 let locks = destination::lock_items(tx, &sde, &requests, &optional).await?;
+                // The charge-row drift reads below compare against the settled absolute.
+                crate::services::combat::loaded::settle_in(tx, &settle).await?;
                 let current_locations = crate::dao::items::parent_locks::capture(tx, &locations).await.map_err(db_err)?;
                 if current_locations.len() != captured_locations.len() || captured_locations.iter().any(|old| {
                     !current_locations.iter().any(|row| row.item_id == old.item_id && row.type_id == old.type_id
@@ -126,6 +136,9 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     || (active_ship != Some(ship) && !(hull.singleton && station == Some(hull.location_id) && hull.flag_id == FLAG_HANGAR)) {
                     return Err(refuse());
                 }
+                if automatic {
+                    crate::services::combat::loaded::settle_in(tx, &settle).await?;
+                }
                 let source_flags: &[i32] = if station == Some(source) {
                     &[FLAG_HANGAR]
                 } else {
@@ -149,7 +162,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     if quantity <= 0 { return Err(refuse()); }
                     let flag = if station == Some(source) { FLAG_HANGAR } else { FLAG_CARGO };
                     crate::services::inventory::hold_storage::check_destination(tx, &sde, owner, source, flag,
-                        &[crate::services::inventory::hold_storage::Addition { type_id, singleton: false, quantity: i64::from(quantity) }], Default::default(), None).await?;
+                        &[crate::services::inventory::hold_storage::Addition { type_id, singleton: false, quantity: i64::from(quantity) }], Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await?;
                     let id = crate::dao::items::transfers::insert(tx, type_id, owner, source, flag, quantity).await.map_err(db_err)?;
                     notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
                     inserted_ids.push(id);
@@ -174,10 +187,10 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     return Err(refuse());
                 }
                 if automatic {
-                    if !older.is_empty() { return Ok(Vec::new()); }
-                    let Some(module) = fitted.first() else { return Ok(Vec::new()) };
+                    if !older.is_empty() { return Ok((Vec::new(), Vec::new())); }
+                    let Some(module) = fitted.first() else { return Ok((Vec::new(), Vec::new())) };
                     if loaded(tx, ship, module.flag_id).await?.is_some_and(|(_, quantity)| quantity > 0) {
-                        return Ok(Vec::new());
+                        return Ok((Vec::new(), Vec::new()));
                     }
                 }
                 if let Some(refund) = &mut refund {
@@ -285,7 +298,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     }
                 }
                 crate::services::inventory::hold_storage::check_destination(
-                    tx, &sde, owner, ship, FLAG_CARGO, &cargo_additions, crate::services::inventory::hold_storage::Replaced { items: &cargo_excluded, reloads: &[] }, None,
+                    tx, &sde, owner, ship, FLAG_CARGO, &cargo_additions, crate::services::inventory::hold_storage::Replaced { items: &cargo_excluded, reloads: &[] }, crate::services::inventory::hold_storage::CapacitySource::Current,
                 ).await?;
                 let changes = items.iter().filter_map(|(&id, (item, quantity))| {
                     (*quantity != item.quantity).then(|| (id, QuantityChange::new(item, (*quantity > 0).then_some(*quantity))))
@@ -334,7 +347,9 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     let final_fit = Fit::load(tx, sde.clone(), owner, ship).await?;
                     online::fitting::finish(tx, before, final_fit, outbox).await?;
                 }
-                Ok(pending)
+                let touched: Vec<_> = fitted.iter().map(|item| (item.item_id, item.flag_id)).collect();
+                let seeds = super::super::loaded::seed_entries(tx, ship, &touched).await?;
+                Ok((pending, seeds))
             })
         },
         |value, outbox| {
@@ -345,12 +360,14 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     |n| online::dispatch_notification(n, world, notify, Some(owner)))
             }
         },
-    ).await?;
+    ).await;
+    let seeds = match &result { Ok((_, seeds)) => vec![(ship, seeds.clone())], _ => Vec::new() };
+    let (loads, _) = holds.finish(&db, &world, result, &seeds).await?;
     drop(_market);
     let count = loads.len();
     if loads.is_empty() { return Ok(0); }
     let Some(system) = system else {
-        apply_loads(&db, &world, &notify, ship, loads).await?;
+        super::completion::apply_loads(&db, &world, &notify, ship, loads).await?;
         return Ok(count);
     };
     let groups = if let Some(ms) = automatic_reload_ms {
@@ -396,7 +413,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
         world.post(system, move |s| {
             s.schedule_at(deadline, move |s| {
                 s.defer(async move {
-                    if let Err(e) = apply_loads(&db, &timer_world, &notify, ship, loads).await {
+                    if let Err(e) = super::completion::apply_loads(&db, &timer_world, &notify, ship, loads).await {
                         warn!("reload of {ids:?} failed: {}", match e {
                             CallError::Internal(e) => format!("{e:#}"),
                             CallError::User { msg, .. } => msg,

@@ -83,7 +83,7 @@ async fn iq(c: &mut Conn, el: &Element) -> Result<()> {
         if !c.password.as_deref().is_some_and(|password| c.hub.check(&user, password)) || user.parse::<i64>().ok().and_then(|id| c.hub.world.online_session(id).filter(|s| s.character_id == id)).is_none() { error(c, el, "not-authorized", ""); return Ok(()); }
         let resource = bind.child("resource").map(|r| r.text.trim()).filter(|r| !r.is_empty()).unwrap_or("eve");
         let jid = format!("{user}@{}/{resource}", c.hub.host);
-        c.hub.users.lock().unwrap().insert(format!("{user}@{}", c.hub.host), (jid.clone(), c.tx.clone()));
+        crate::poison::lock_or_exit(c.hub.users.lock()).insert(format!("{user}@{}", c.hub.host), (jid.clone(), c.tx.clone()));
         c.full_jid = Some(jid.clone());
         reply(c, el, &format!("<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>{}</jid></bind>", esc(&jid)));
         return Ok(());
@@ -143,7 +143,7 @@ async fn iq(c: &mut Conn, el: &Element) -> Result<()> {
         match authority::disco_info(&c.hub.db, c.hub.world.sde(), &s, name).await {
             Ok(Some(info)) => {
                 let room = format!("{name}@{}", c.hub.conference());
-                let count = c.hub.rooms.lock().unwrap().entries.get(&room).map_or(0, |o| o.len());
+                let count = crate::poison::lock_or_exit(c.hub.rooms.lock()).entries.get(&room).map_or(0, |o| o.len());
                 let node = q.attr("node").map(|v| format!(" node='{}'", esc(v))).unwrap_or_default();
                 reply(c, el, &format!("<query xmlns='{INFO}'{node}><identity category='conference' type='text' name='{}'/><x xmlns='jabber:x:data' type='result'>{}</x></query>", esc(&info.display_name), form_field("muc#roominfo_occupants", "text-single", &count.to_string())));
             }
@@ -154,7 +154,7 @@ async fn iq(c: &mut Conn, el: &Element) -> Result<()> {
     }
     if ns == ITEMS && kind == "get" && q.attr("node") == Some("norole") {
         match authority::admit(&c.hub.db, c.hub.world.sde(), &s, name).await {
-            Ok(Some(_)) => { let mut out = format!("<query xmlns='{ITEMS}' node='norole'>"); let room = format!("{name}@{}", c.hub.conference()); if let Some(occupants) = c.hub.rooms.lock().unwrap().entries.get(&room) { for (nick, o) in occupants { if o.affiliation == "none" { out.push_str(&format!("<item name='{}'/>", esc(nick))); } } } out.push_str("</query>"); reply(c, el, &out); }
+            Ok(Some(_)) => { let mut out = format!("<query xmlns='{ITEMS}' node='norole'>"); let room = format!("{name}@{}", c.hub.conference()); if let Some(occupants) = crate::poison::lock_or_exit(c.hub.rooms.lock()).entries.get(&room) { for (nick, o) in occupants { if o.affiliation == "none" { out.push_str(&format!("<item name='{}'/>", esc(nick))); } } } out.push_str("</query>"); reply(c, el, &out); }
             Ok(None) => error(c, el, "forbidden", text::FORBIDDEN),
             Err(e) => domain_error(c, el, e),
         }
@@ -200,7 +200,7 @@ async fn iq(c: &mut Conn, el: &Element) -> Result<()> {
             if let Some(role) = item.attr("role") {
                 if !["moderator", "participant", "visitor", "none"].contains(&role) || item.attr("affiliation").is_some() { error(c, el, "feature-not-implemented", ""); return Ok(()) }
                 match authority::admit(&c.hub.db, c.hub.world.sde(), &s, name).await {
-                    Ok(Some(_)) => { let mut out = format!("<query xmlns='{ADMIN}'>"); let room = format!("{name}@{}", c.hub.conference()); if let Some(occupants) = c.hub.rooms.lock().unwrap().entries.get(&room) { for o in occupants.values().filter(|o| o.role == role) { out.push_str(&format!("<item jid='{}' affiliation='{}' role='{}'/>", esc(&o.full_jid), esc(&o.affiliation), esc(&o.role))); } } out.push_str("</query>"); reply(c, el, &out); }
+                    Ok(Some(_)) => { let mut out = format!("<query xmlns='{ADMIN}'>"); let room = format!("{name}@{}", c.hub.conference()); if let Some(occupants) = crate::poison::lock_or_exit(c.hub.rooms.lock()).entries.get(&room) { for o in occupants.values().filter(|o| o.role == role) { out.push_str(&format!("<item jid='{}' affiliation='{}' role='{}'/>", esc(&o.full_jid), esc(&o.affiliation), esc(&o.role))); } } out.push_str("</query>"); reply(c, el, &out); }
                     Ok(None) => error(c, el, "forbidden", text::FORBIDDEN),
                     Err(e) => domain_error(c, el, e),
                 }
@@ -258,21 +258,21 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
     let Some(to) = el.attr("to") else { return Ok(()) };
     if let Some(name) = channel(&c.hub, to) {
         let room = to.split('/').next().unwrap_or(to);
-        let epoch = c.hub.rooms.lock().unwrap().epoch;
+        let epoch = crate::poison::lock_or_exit(c.hub.rooms.lock()).epoch;
         let admitted = authority::admit(&c.hub.db, c.hub.world.sde(), &s, name).await;
         let admitted = match admitted { Ok(Some(admitted)) => admitted, Ok(None) => { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }, Err(e) => { domain_error(c, el, e); return Ok(()) } };
         if let Some(decline) = el.child("x").filter(|x| x.attr("xmlns") == Some(USER)).and_then(|x| x.child("decline")) {
-            let rooms = c.hub.rooms.lock().unwrap();
+            let rooms = crate::poison::lock_or_exit(c.hub.rooms.lock());
             if rooms.epoch != epoch || c.hub.world.online_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
             let Some(id) = decline.attr("to").and_then(|v| target(&c.hub, v)) else { error(c, el, "bad-request", ""); return Ok(()) };
             let key = format!("{id}@{}", c.hub.host);
-            if let Some((jid, tx)) = c.hub.users.lock().unwrap().get(&key) {
+            if let Some((jid, tx)) = crate::poison::lock_or_exit(c.hub.users.lock()).get(&key) {
                 let reason = decline.child("reason").map_or("", |r| r.text.as_str());
                 let _ = tx.send(format!("<message from='{}' to='{}'><x xmlns='{USER}'><decline from='{}'><reason>{}</reason></decline></x></message>", esc(room), esc(jid), esc(&full), esc(reason)));
             }
             return Ok(());
         }
-        let occupied = { let rooms = c.hub.rooms.lock().unwrap(); rooms.epoch == epoch && c.hub.world.online_session(s.character_id).as_ref() == Some(&s) && rooms.entries.get(room).and_then(|o| o.get(&s.character_id.to_string())).is_some_and(|o| o.matches_socket(&full, &c.tx)) };
+        let occupied = { let rooms = crate::poison::lock_or_exit(c.hub.rooms.lock()); rooms.epoch == epoch && c.hub.world.online_session(s.character_id).as_ref() == Some(&s) && rooms.entries.get(room).and_then(|o| o.get(&s.character_id.to_string())).is_some_and(|o| o.matches_socket(&full, &c.tx)) };
         if !occupied { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
         if let Some(x) = el.child("x").filter(|x| x.attr("xmlns") == Some(USER)) {
             if let Some(invite) = x.child("invite") {
@@ -285,7 +285,7 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
         if el.attr("type") == Some("groupchat") {
             if let Some(subject) = el.child("subject") { if let Err(e) = authority::set_subject(&c.hub.db, &c.hub, &s, name, &subject.text).await { domain_error(c, el, e); } return Ok(()) }
             if admitted.role == "visitor" || admitted.role == "none" { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
-            let rooms = c.hub.rooms.lock().unwrap();
+            let rooms = crate::poison::lock_or_exit(c.hub.rooms.lock());
             if rooms.epoch != epoch || c.hub.world.online_session(s.character_id).as_ref() != Some(&s) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()) }
             if let Some(occ) = rooms.entries.get(room) { if occ.get(&s.character_id.to_string()).is_some_and(|o| o.matches_socket(&full, &c.tx)) { let from = format!("{room}/{}", s.character_id); for o in occ.values() { o.send(el.to_xml_with(&[("from", &from), ("to", &o.full_jid)])); } } }
         } else { error(c, el, "feature-not-implemented", ""); }
@@ -293,6 +293,6 @@ async fn message(c: &mut Conn, el: &Element) -> Result<()> {
     }
     if el.children.iter().any(|x| x.local() == "x" && x.attr("xmlns") == Some(USER)) { error(c, el, "forbidden", text::FORBIDDEN); return Ok(()); }
     let bare = to.split('/').next().unwrap_or(to);
-    if target(&c.hub, bare).is_some() { if let Some((jid, tx)) = c.hub.users.lock().unwrap().get(bare) { let _ = tx.send(el.to_xml_with(&[("from", &full), ("to", jid)])); } }
+    if target(&c.hub, bare).is_some() { if let Some((jid, tx)) = crate::poison::lock_or_exit(c.hub.users.lock()).get(bare) { let _ = tx.send(el.to_xml_with(&[("from", &full), ("to", jid)])); } }
     Ok(())
 }

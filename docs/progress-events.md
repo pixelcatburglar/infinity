@@ -6,6 +6,12 @@ that namespace, while a duplicate source does not send another Lua event or
 create more consumer receipts. Journal rows and receipts are not retained for a
 limited period or deleted automatically.
 
+Sovereignty development consumes natural NPC deaths and delivered mining-volume
+slices through the existing durable journal. Late facts replay in occurrence
+order against their retained policy segments; continuous decay also applies
+while systems are offline. Historical activations and packages are not
+automatically collected, because replay still requires them.
+
 Durable event schema 2 stores `WalletChanged` balance and delta as canonical
 fixed two-decimal strings, preserving exact cents rather than client-capped
 values. Lua receives uncapped numbers instead; large numbers can lose precision.
@@ -21,12 +27,21 @@ recorded events. Historical integer quantities remain readable without changing
 event identity or delivery receipts.
 
 Consumers register a stable key and event kinds before recovery starts. Startup
-fails if an enabled subscription has no installed handler. New registrations
-receive only future events. Each delivery is applied and acknowledged in the
-same transaction; failures remain pending with bounded exponential retry. The
-scheduler polls pending receipts after restart at its configured polling interval.
-Consumer handlers must use their transaction and outbox rather than independently
-committing changes.
+reconciliation writes the declared subscriptions, reads back the enabled flags
+and kinds once, and fails if an enabled subscription has no installed handler;
+receipt creation and polling afterwards use only that projected snapshot, so a
+manually changed `enabled` flag applies at the next startup. New registrations
+receive only future events, and a re-enabled consumer is not given receipts for
+events journaled while it was disabled. Each delivery is applied and
+acknowledged in the same transaction; transient failures remain pending with
+bounded exponential retry. A consumer that reports an explicit permanent
+refusal is retried until its recorded permanent rejections strictly exceed
+`progress.permanent_retry_limit`; the receipt then becomes terminal, is never
+polled again and is restored only by the manual procedure in
+[database](database.md). A terminal receipt is never acknowledged as applied.
+The scheduler polls pending receipts after restart at its configured polling
+interval. Consumer handlers must use their transaction and outbox rather than
+independently committing changes.
 
 The legacy `Targeted`, `Damaged`, `ModuleCycleEnded` and `WarpArrived` events
 are live-only: they do not write journal or receipt rows. They are distinct
@@ -41,8 +56,11 @@ consumer without being journaled. `SkillStateChanged { char_id }` records a
 trained skill change from free skill point application, extraction or GM
 operations. It is a state invalidation, not a `SkillTrained` completion;
 unallocated skill points and expert system changes do not emit it. The durable
-personal milestone consumer handles both kinds by recomputing the viewer's
-snapshot from current state rather than replaying event levels.
+`personal-skill-plan-milestones` consumer handles both kinds by recomputing each
+viewer's snapshot from current state rather than replaying event levels. The same
+consumer covers milestones on the viewer's current live corporation plans; it adds
+no event kind. A former member's snapshot remains stored but is not refreshed or
+used to restore access.
 
 Resource facts carry an occurrence FILETIME and a historical context with optional
 corporation, alliance, faction, ship, ship type, system and station identifiers,

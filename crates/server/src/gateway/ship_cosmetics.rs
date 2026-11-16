@@ -58,12 +58,12 @@ pub(super) async fn handle(ctx: &HandlerContext<'_>, name: &str, request: &Dynam
     let map_error = |error: CallError| GatewayError::Internal(anyhow::anyhow!("ship state projection failed: {error:?}"));
     if name == GET {
         let ship = msg_field(request, "ship").and_then(|m| m.get_field_by_name("sequential").and_then(|v| v.as_u64())).and_then(|id| i64::try_from(id).ok()).filter(|id| *id > 0)
-            .ok_or_else(|| GatewayError::refusal(FailureCode::BadRequest, infinity_core::messages::gateway::INVALID_REQUEST))?;
+            .ok_or_else(|| GatewayError::refusal(FailureCode::BadRequest))?;
         let state = state::get(ctx.db, ctx.world, &identity, ship, filetime_now()).await.map_err(map_error)?
-            .ok_or_else(|| GatewayError::refusal(FailureCode::NotFound, infinity_core::messages::gateway::NOT_FOUND))?;
+            .ok_or_else(|| GatewayError::refusal(FailureCode::NotFound))?;
         set(&mut response, "state", PV::Message(encode(&state).map_err(GatewayError::Internal)?)).map_err(GatewayError::Internal)?;
     } else if name == ALL {
-        let states = state::all(ctx.db, ctx.world, ctx.sde, &identity, filetime_now()).await.map_err(map_error)?;
+        let states = state::all(ctx.world, &identity).await.map_err(map_error)?;
         let values = states.iter().map(|s| encode(s).map(PV::Message)).collect::<anyhow::Result<Vec<_>>>().map_err(GatewayError::Internal)?;
         set(&mut response, "states", PV::List(values)).map_err(GatewayError::Internal)?;
     }
@@ -89,4 +89,4 @@ pub(super) fn validate() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

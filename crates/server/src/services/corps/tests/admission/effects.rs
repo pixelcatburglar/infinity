@@ -110,7 +110,7 @@ async fn admission_session_precedes_member_events_and_late_mail_failure_rolls_ba
     let station = client.sde.map.stations().find(|station| station.solar_system_id.is_some()).unwrap();
     let station_id = station.station_id;
     let system_id = station.solar_system_id.unwrap();
-    crate::dao::characters::ship::dock(&db, applicant.character, station_id, system_id).await.unwrap();
+    db.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&applicant.character, &station_id, &system_id]).await.unwrap();
     db.execute("UPDATE game.corporations SET member_limit=10,welcome_mail='Welcome' WHERE corporation_id=$1", &[&corp]).await.unwrap();
     let id = application(&db, corp, applicant.character, 6).await;
     let constraint = format!("admission_mail_reject_{corp}");

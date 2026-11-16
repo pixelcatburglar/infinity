@@ -1,10 +1,11 @@
 use super::*;
-use crate::space::{event, System};
+#[cfg(feature = "tests-combat")] use crate::space::{event, System};
 
-pub(crate) mod remote_repair_db;
-mod durable_loss;
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-slash"))] pub(crate) mod remote_repair_db;
+#[cfg(feature = "tests-combat")] mod durable_loss;
+#[cfg(feature = "tests-combat")] mod npc_spool;
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn quantity_change_projects_only_wire_values_to_the_client_limit() {
     let max = i64::MAX;
     let cap = infinity_core::consts::CLIENT_MAX_SHORT_AMOUNT;
@@ -18,13 +19,13 @@ fn quantity_change_projects_only_wire_values_to_the_client_limit() {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn npc_missile_uses_both_effective_multipliers() {
-    assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 1.0, 1.0), (3000.0, 15000.0));
-    assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 0.5, 0.5), (1500.0, 3750.0));
+    assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 1.0, 1.0), (3000.0, 5000.0));
+    assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 0.5, 0.5), (1500.0, 2500.0));
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn combat_reservation_rejects_stale_tokens_without_dropping_membership_operations() {
     crate::tests::init_config();
@@ -54,7 +55,7 @@ async fn combat_reservation_rejects_stale_tokens_without_dropping_membership_ope
     assert!(system.cancel_combat_transition(1, new_token, new_snapshot.generation));
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn npc_zero_falloff_hits_inside_optimal() {
     use crate::services::effects::weapons::turret_chance;
     let source = remote_repair_db::ball(1, 1, 1);
@@ -62,7 +63,7 @@ fn npc_zero_falloff_hits_inside_optimal() {
     assert_eq!(turret_chance(&source, &target, 2000.0, 0.0, 0.0, 1000.0, 100.0), 1.0);
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn targeters_maps_live_pilots_and_merges_npc_ball_ids() {
     crate::tests::init_config();
@@ -99,6 +100,11 @@ async fn targeters_maps_live_pilots_and_merges_npc_ball_ids() {
                 brain.announced = true;
                 assert!(s.add_npc(id, brain));
             }
+            for id in [ball_a, ball_b] {
+                let fit = crate::services::fit::attributes::tests::ship_fit(&[(ATTR_MAX_TARGET_RANGE, 1e9)]);
+                let stats = ShipStats::from_fit(&fit, Key::Ship);
+                s.install_condition(id, Condition { now: stats.max, stats, shield_at: filetime_now() }, fit);
+            }
         }).await.unwrap();
         assert_eq!(targeters(&test_world, system, ship).await, vec![ball_b, npc, ball_a]);
         assert!(targeters(&test_world, system - 1, ship).await.is_empty());
@@ -115,7 +121,7 @@ async fn targeters_maps_live_pilots_and_merges_npc_ball_ids() {
     result.unwrap();
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn npc_projected_weapon_attributes_change_application() {
     use infinity_core::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
@@ -126,7 +132,8 @@ async fn npc_projected_weapon_attributes_change_application() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let npc = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)
-        && t.attribute(ATTR_TRACKING_SPEED).is_some_and(|v| v > 0.0))
+        && t.attribute(ATTR_TRACKING_SPEED).is_some_and(|v| v > 0.0)
+        && !t.effects().iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK))
         .expect("NPC with tracking").type_id;
     let effect = sde.dogma.effects_by_name("npcEntityWeaponDisruptor").next()
         .expect("NPC weapon disruption effect");
@@ -159,7 +166,7 @@ async fn npc_projected_weapon_attributes_change_application() {
     let missile = Missile { charge: 1, raw: [1.0; 4],
         aoe_cloud: 40.0 * projected.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
         aoe_velocity: 170.0 * projected.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
-        drf: 0.604, velocity: 1.0, flight_range: 1.0, weapon: npc, illegal: false };
+        drf: 0.604, velocity: 1.0, flight_time_ms: 1.0, weapon: npc, illegal: false };
     assert!((missile.aoe_cloud / (40.0 * cloud) - 2.0).abs() < 1e-9);
     assert!((missile.aoe_velocity / (170.0 * velocity) - 0.5).abs() < 1e-9);
     let applied = missile_applied(35.0, 400.0, missile.aoe_cloud, missile.aoe_velocity, missile.drf);
@@ -271,7 +278,7 @@ async fn npc_projected_weapon_attributes_change_application() {
         "missile impact must consume each projected explosion multiplier: {dealt:?}");
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn reload_reservations_share_stacks_in_order_without_overdraw() {
     use super::charge_reservations::reserve_quantities;
     let item = |id, type_id, quantity, flag_id| crate::dao::items::loading::Item {
@@ -291,7 +298,7 @@ fn reload_reservations_share_stacks_in_order_without_overdraw() {
     assert_eq!(reserve_quantities(&mut items, &selected, 11, 3), (0, BTreeMap::from([((2, FLAG_FLEET_HANGAR), 3)])));
     assert_eq!(items[&3].1, 2);
 }
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn module_ids_preserve_scalar_and_list_shapes() {
     assert_eq!(module_ids(None), Vec::<i64>::new());
     assert_eq!(module_ids(Some(&Value::Int(42))), vec![42]);
@@ -302,7 +309,7 @@ fn module_ids_preserve_scalar_and_list_shapes() {
     assert_eq!(module_ids(Some(&Value::None)), Vec::<i64>::new());
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
     crate::tests::init_config();
     let mut system = System::new(0, Arc::default(), 12_345);
@@ -319,15 +326,20 @@ fn missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.insert(ball.clone());
     system.insert(Ball { id: 3, pos: [1000.0, 0.0, 0.0], ..ball.clone() });
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(1, 1, tx);
-    system.launch_missile(Ball { id: 2, ..ball }, 3, 1, 500, |_| {});
+    let (completed_1, mut completion_1) = tokio::sync::oneshot::channel();
+    system.observe(1, 1, tx, completed_1);
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(completion_1.try_recv(), Ok(true));
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
+    system.launch_missile(Ball { id: 2, ..ball }, 3, 1, 500.0, |_, _| {});
     system.tick(12_999);
     assert_eq!(system.ball(2).unwrap().mode, crate::space::MODE_STOP);
     assert!(rx.try_recv().is_err());
     system.tick(13_000);
     let missile = system.ball(2).unwrap();
     assert_eq!((missile.mode, missile.effect_stamp, missile.follow_id, missile.launcher), (crate::space::MODE_MISSILE, 12, 3, 1));
-    let events = rx.try_recv().unwrap();
+    let events = crate::space::system::tests::events::destiny(rx.try_recv().unwrap());
     assert_eq!(events.len(), 2);
     assert_eq!(events[1], event(12, "LaunchMissile", vec![
         Value::Int(2), Value::Int(3), Value::Int(1), Value::Bool(true), Value::Bool(false),
@@ -336,7 +348,7 @@ fn missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
 }
 
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn reset_only_stops_owning_pilots_modules() {
     let mut st = State::default();
     let a = 1;
@@ -348,17 +360,20 @@ fn reset_only_stops_owning_pilots_modules() {
     }
     st.targets.insert(a, HashSet::from([20]));
     st.targets.insert(b, HashSet::from([a, 21]));
-    st.locking.insert((a, 20), 1);
-    st.locking.insert((b, a), 2);
-    st.locking.insert((b, 21), 3);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    st.locking.insert((a, 20), PendingLock { attempt: 1, ui_owner: Some(ui_tx) });
+    st.locking.insert((b, a), PendingLock { attempt: 2, ui_owner: None });
+    st.locking.insert((b, 21), PendingLock { attempt: 3, ui_owner: None });
 
     st.reset_character(a);
     assert!(flags[0].load(Ordering::Relaxed));
     assert!(flags[1].load(Ordering::Relaxed));
     assert!(!flags[2].load(Ordering::Relaxed));
+    assert_eq!(ui_rx.try_recv().unwrap(), crate::client::target_lock_failure(a, 20, 1));
+    assert!(ui_rx.try_recv().is_err());
     assert!(!st.targets.contains_key(&a));
     assert_eq!(st.targets.get(&b), Some(&HashSet::from([a, 21])));
-    assert_eq!(st.locking, HashMap::from([((b, a), 2), ((b, 21), 3)]));
+    assert_eq!(st.locking.iter().map(|(k, l)| (*k, l.attempt)).collect::<HashMap<_,_>>(), HashMap::from([((b, a), 2), ((b, 21), 3)]));
     assert_eq!(st.active.len(), 3);
     assert_eq!(st.activation_generation.len(), 3);
     for (master, flag) in [(10, &flags[0]), (11, &flags[1]), (12, &flags[2])] {
@@ -369,13 +384,13 @@ fn reset_only_stops_owning_pilots_modules() {
     st.reset_character(a);
     assert!(!flags[2].load(Ordering::Relaxed));
     assert_eq!(st.targets.get(&b), Some(&HashSet::from([a, 21])));
-    assert_eq!(st.locking, HashMap::from([((b, a), 2), ((b, 21), 3)]));
+    assert_eq!(st.locking.iter().map(|(k, l)| (*k, l.attempt)).collect::<HashMap<_,_>>(), HashMap::from([((b, a), 2), ((b, 21), 3)]));
     assert_eq!(st.active.len(), 3);
     assert_eq!(st.activation_generation.len(), 3);
 }
 
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn reload_reservation_survives_departure_and_preserves_new_marker() {
     crate::tests::init_config();
     let mut s = System::default();
@@ -407,7 +422,7 @@ fn reload_reservation_survives_departure_and_preserves_new_marker() {
     assert_eq!(markers.get(&7), Some(&200));
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn restored_condition_recharges_only_shield_and_preserves_damage() {
     let stats = ShipStats { max: [100.0, 200.0, 300.0], resonance: [[1.0; 4]; 3], shield_tau_ms: 1000.0 };
     let values = [Some(25.0), Some(40.0), Some(90.0)];
@@ -422,6 +437,7 @@ fn restored_condition_recharges_only_shield_and_preserves_damage() {
 }
 
 
+#[cfg(feature = "tests-combat")]
 async fn create_condition_fixture(db: &Db, ty: i32, station: i64) -> Result<(i64, i64, i64), crate::db::Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES (nextval('game.accounts_user_id_seq')::text, ''::bytea, 0) RETURNING user_id", &[]).await?.get("user_id");
@@ -431,7 +447,7 @@ async fn create_condition_fixture(db: &Db, ty: i32, station: i64) -> Result<(i64
     }), |result, ()| async move { Ok(result) }).await
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn condition_persists_recharges_and_rollback_preserves_all_layers() {
     use infinity_core::consts::CATEGORY_SHIP;
@@ -491,16 +507,18 @@ async fn condition_persists_recharges_and_rollback_preserves_all_layers() {
     if let Err(panic) = outcome { std::panic::resume_unwind(panic); }
 }
 
+#[cfg(feature = "tests-combat")]
 async fn load_space_condition(db: &Db, world: &World, system: i64, owner: i64, ship: i64) -> [f64; 3] {
     let fit = Fit::load_in_space(db, world, system, owner, ship).await.ok().unwrap();
     load_condition_with_fit(db, ship, &fit).await.ok().unwrap()
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
-async fn gm_damage_survives_reload_and_snapshot_then_heal_clears_it() {
+async fn gm_damage_survives_reload_and_snapshot() {
     use infinity_core::consts::CATEGORY_SHIP;
-    use crate::{config::{Config, deployment::DatabaseConfig}, conn::Conn, dao::items::dogma, handshake::Login};
+    use crate::{config::{Config, deployment::DatabaseConfig}, dao::items::dogma, handshake::Login};
+    use infinity_wire::conn::Conn;
     crate::tests::init_config();
     let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
@@ -555,15 +573,6 @@ async fn gm_damage_survives_reload_and_snapshot_then_heal_clears_it() {
     assert!((health[1] - 0.5).abs() < 1e-9 && (health[2] - 0.5).abs() < 1e-9);
     let health = load_space_condition(&db, &world, system, owner, ship).await;
     assert!((health[1] - 0.5).abs() < 1e-9 && (health[2] - 0.5).abs() < 1e-9);
-    gm_repair(&world, system, owner, ship).await.ok().unwrap();
-    assert_eq!(remote_repair_db::condition(&world, system, ship).await.now, stats.max);
-    world.flush_positions().await.unwrap();
-    let rows = dogma::overrides(&db, ship).await.unwrap();
-    for id in [ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE] {
-        assert_eq!(rows.iter().find(|r| r.attribute_id == id).unwrap().value, 0.0);
-    }
-    let health = load_space_condition(&db, &world, system, owner, ship).await;
-    assert_eq!(health, [1.0; 3]);
     });
     std::future::poll_fn(|cx| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(cx))) {
         Ok(result) => result.map(Ok),

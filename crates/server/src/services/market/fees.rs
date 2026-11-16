@@ -232,5 +232,5 @@ pub(super) async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i6
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

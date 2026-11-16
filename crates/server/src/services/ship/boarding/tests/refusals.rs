@@ -6,15 +6,13 @@ use crate::services::ship::balls;
 use crate::space::MODE_WARP;
 
 // The periodic native position save may advance only the warping hull's coordinates.
-async fn motion_fingerprint(db: &Db, warp: i64, start: [f64; 3], end: [f64; 3], phase: &str) -> Vec<(String, Vec<(String, String)>)> {
-    let mut snapshot = fingerprint(db).await;
-    let row = db.query_one("SELECT md5((to_jsonb(t) - 'x' - 'y' - 'z')::text) AS hash, x, y, z FROM game.items t WHERE item_id=$1", &[&warp]).await.unwrap();
-    let pos = [row.get::<_, f64>("x"), row.get::<_, f64>("y"), row.get::<_, f64>("z")];
-    assert_warp_path(pos, start, end, phase);
-    let items = snapshot.iter_mut().find(|(table, _)| table == "items").unwrap();
-    let item = items.1.iter_mut().find(|(key, _)| key == &warp.to_string()).expect("warp item in fingerprint");
-    item.1 = row.get("hash");
-    snapshot
+async fn motion_state(db: &Db, warp: i64, owners: &[i64], ids: &[i64], start: [f64; 3], end: [f64; 3], phase: &str)
+    -> (crate::dao::tests::ItemState, Vec<Option<i64>>, Vec<(i64, i32, i32, i64)>) {
+    let mut state = board_state(db, owners, ids).await;
+    let hull = state.0.items.iter_mut().find(|row| row.item_id == warp).expect("warp hull in state");
+    assert_warp_path(hull.coordinates.map(|axis| axis.expect("warp hull coordinates")), start, end, phase);
+    hull.coordinates = [None; 3];
+    state
 }
 
 fn assert_warp_path(pos: [f64; 3], start: [f64; 3], end: [f64; 3], phase: &str) {
@@ -41,7 +39,6 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
             base(skill) > 0.0 && base(level) > 0.0
         })).map(|t| t.type_id).min().expect("published ship requiring a skill");
     let nonship_type = sde.types.iter().find(|t| t.category_id != Some(CATEGORY_SHIP) && t.published == Some(true)).expect("published nonship").type_id;
-    let before = fingerprint(&db).await;
     let (account, owner) = fixture(&db, &sde, system, None).await;
     let foreign_db = db.clone();
     let foreign_sde = sde.clone();
@@ -109,6 +106,7 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
         world.observe(system, c.login.client_id, old, events).await.unwrap();
         assert!(world.after(system, 1_100).await);
         while received.try_recv().is_ok() {}
+        let hull_ids = [old, foreign, nonship, packaged, occupied, warp, cloak, far, unskilled];
         let actor = || async {
             world.with(system, move |s| {
                 let mut rows: Vec<_> = s.balls().filter(|b| [old, occupied, warp, cloak, far, unskilled].contains(&b.id))
@@ -148,7 +146,7 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
                 while received.try_recv().is_ok() {}
                 Some(frame)
             } else { None };
-            let snapshot = motion_fingerprint(&test_db, warp, warp_pos, warp_destination, &format!("{label} before database")).await;
+            let snapshot = motion_state(&test_db, warp, &[owner, foreign_owner], &hull_ids, warp_pos, warp_destination, &format!("{label} before database")).await;
             let state = actor().await;
             assert_warp_path(state.2.0, warp_pos, warp_destination, &format!("{label} before actor mode={} stamp={} active={}", state.2.1, state.2.2, state.2.3));
             let queued = c.outbox.len();
@@ -203,7 +201,7 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
                     state.revision != state.saved_revision
                 }).await.unwrap());
             }
-            assert_eq!(motion_fingerprint(&test_db, warp, warp_pos, warp_destination, &format!("{label} after database")).await, snapshot, "{label}");
+            assert_eq!(motion_state(&test_db, warp, &[owner, foreign_owner], &hull_ids, warp_pos, warp_destination, &format!("{label} after database")).await, snapshot, "{label}");
             let after = actor().await;
             assert_warp_path(after.2.0, warp_pos, warp_destination, &format!("{label} after actor mode={} stamp={} active={}", after.2.1, after.2.2, after.2.3));
             assert_eq!((&after.0, &after.1), (&state.0, &state.1), "{label}");
@@ -212,8 +210,10 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
             assert!(received.try_recv().is_err(), "{label} emitted a destiny notification");
         }
     }).await;
+    let captured = capture_fixture_rows(&db, &[Fixture { account, character: owner },
+        Fixture { account: foreign_account, character: foreign_owner }], &[]).await.unwrap();
     cleanup(&db, foreign_account, foreign_owner).await;
     cleanup(&db, account, owner).await;
-    assert_eq!(fingerprint(&db).await, before);
+    assert_fixture_removed(&db, &captured).await.unwrap();
     result.unwrap();
 }

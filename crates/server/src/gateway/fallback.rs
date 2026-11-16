@@ -1,6 +1,8 @@
 //! Populate unclaimed responses for `requestBroker.py:_send_request`.
-//! Uses request and descriptor fields without World or DAO access; unclaimed
-//! requests with a `no_local_version_available` field instead have no payload.
+//! Uses request and descriptor fields without World or DAO access; unsupported
+//! action requests are refused by exact name, unclaimed requests with a
+//! `no_local_version_available` field instead have no payload, and other
+//! unclaimed requests receive defaults.
 use std::collections::HashMap;
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, ReflectMessage};
@@ -86,4 +88,137 @@ pub(super) fn fill_defaults(m: &mut DynamicMessage, depth: u32, ids: &HashMap<St
     }
 }
 
-#[cfg(test)] mod tests;
+/// The refusal a known unsupported action gets instead of a manufactured reply.
+pub(super) enum UnsupportedAction {
+    /// Status only: no response payload is sent.
+    Bodyless,
+    /// The typed response with `unspecified_error` selected, which the freelance
+    /// project and item-delivery messengers read on their error paths
+    /// (`freelanceprojects/client/messenger.py`, item delivery messenger).
+    TypedFailure,
+}
+
+/// Exact request names of unsupported actions refused instead of default-filled.
+/// Every other unclaimed request keeps the existing default response.
+pub(super) fn unsupported_action(name: &str) -> Option<UnsupportedAction> {
+    Some(match name {
+        "eve_public.freelance.contributionmethod.itemdelivery.api.DeliverRequest"
+        | "eve_public.freelance.project.api.CloseRequest"
+        | "eve_public.freelance.project.api.CommitRequest"
+        | "eve_public.freelance.project.api.CreateRequest"
+        | "eve_public.freelance.project.api.KickRequest"
+        | "eve_public.freelance.project.api.ResignRequest" => UnsupportedAction::TypedFailure,
+        "eve_public.achievement.api.admin.AddProgressRequest"
+        | "eve_public.achievement.api.admin.CompleteRequest"
+        | "eve_public.achievement.api.admin.ResetAllRequest"
+        | "eve_public.achievement.api.admin.ResetRequest"
+        | "eve_public.achievement.reward.api.ClaimRequest"
+        | "eve_public.brawl.career.achievement.character.ClaimRewardRequest"
+        | "eve_public.brawl.career.achievement.character.UnlockShipRequest"
+        | "eve_public.brawl.match.ChangeShipFittingPlanRequest"
+        | "eve_public.brawl.match.LeaveMatchRequest"
+        | "eve_public.brawl.match.PrepareRequest"
+        | "eve_public.brawl.room.KickCharacterRequest"
+        | "eve_public.brawl.room.LeaveRoomRequest"
+        | "eve_public.brawl.room.LockRoomSlotRequest"
+        | "eve_public.brawl.room.PrepareRoomRequest"
+        | "eve_public.brawl.room.UnPrepareRoomRequest"
+        | "eve_public.brawl.room.UnlockRoomSlotRequest"
+        | "eve_public.campaign.objective.api.CommitRequest"
+        | "eve_public.campaign.objective.api.RedeemRewardsRequest"
+        | "eve_public.campaign.objective.api.ResignRequest"
+        | "eve_public.career.goal.api.ClaimRewardRequest"
+        | "eve_public.career.goal.api.admin.CompleteRequest"
+        | "eve_public.career.goal.api.admin.ProgressRequest"
+        | "eve_public.chat.local.api.BroadcastMessageRequest"
+        | "eve_public.chat.local.api.admin.MuteRequest"
+        | "eve_public.cloudcomputing.scheme.DeleteSchemeRequest"
+        | "eve_public.cloudcomputing.scheme.RenameSchemeRequest"
+        | "eve_public.cloudcomputing.scheme.SaveSchemeRequest"
+        | "eve_public.cloudcomputing.scheme.UpdateSchemeShipsRequest"
+        | "eve_public.corporationgoal.api.RedeemMyRewardsRequest"
+        | "eve_public.cosmetic.character.title.api.EquipRequest"
+        | "eve_public.cosmetic.character.title.api.UnequipRequest"
+        | "eve_public.cosmetic.character.title.api.admin.GrantRequest"
+        | "eve_public.cosmetic.character.title.api.admin.RevokeRequest"
+        | "eve_public.cosmetic.corporation.palette.api.SetRequest"
+        | "eve_public.cosmetic.market.component.listing.api.InitiatePurchaseListingRequest"
+        | "eve_public.cosmetic.market.skin.listing.api.CancelListingRequest"
+        | "eve_public.cosmetic.market.skin.listing.api.InitiateCreateListingRequest"
+        | "eve_public.cosmetic.market.skin.listing.api.InitiatePurchaseListingRequest"
+        | "eve_public.cosmetic.market.skin.listing.api.admin.SetExpirationRequest"
+        | "eve_public.cosmetic.ship.logo.ClearRequest"
+        | "eve_public.cosmetic.ship.logo.DisplayRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.component.license.finite.api.admin.GrantRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.component.license.finite.api.admin.RevokeRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.component.license.infinite.api.admin.GrantRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.component.license.infinite.api.admin.RevokeRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.component.license.item.api.ConsumeRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.draft.api.DeleteRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.draft.api.SaveRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.draft.api.UpdateRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.license.api.ActivateRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.license.api.ApplyRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.license.api.UnapplyRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.license.api.admin.GrantRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.license.api.admin.RevokeRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.sequencing.job.api.CompleteEarlyRequest"
+        | "eve_public.cosmetic.ship.skin.thirdparty.sequencing.job.api.InitiateRequest"
+        | "eve_public.cosmetic.structure.paintwork.license.api.IssueRequest"
+        | "eve_public.cosmetic.structure.paintwork.license.api.RevokeRequest"
+        | "eve_public.cosmetic.structure.paintwork.license.api.admin.IssueRequest"
+        | "eve_public.cosmetic.structure.paintwork.preset.license.api.IssueRequest"
+        | "eve_public.cosmetic.structure.paintwork.preset.license.character.RevokeRequest"
+        | "eve_public.entitlement.character.ship.admin.alliancelogo.GrantRequest"
+        | "eve_public.entitlement.character.ship.admin.alliancelogo.RevokeRequest"
+        | "eve_public.entitlement.character.ship.admin.corplogo.GrantRequest"
+        | "eve_public.entitlement.character.ship.admin.corplogo.RevokeRequest"
+        | "eve_public.faction.activity.admin.IncrementContributionScoreRequest"
+        | "eve_public.faction.activity.admin.SetContributionScoreRequest"
+        | "eve_public.freelance.project.api.RedeemRewardRequest"
+        | "eve_public.gacha.activity.DrawRewardRequest"
+        | "eve_public.gacha.activity.PickEntryRequest"
+        | "eve_public.goal.api.CloseRequest"
+        | "eve_public.goal.api.CreateRequest"
+        | "eve_public.goal.api.DeleteRequest"
+        | "eve_public.goal.api.SetCurrentProgressRequest"
+        | "eve_public.matrix.api.ConfirmRegenerateRequest"
+        | "eve_public.matrix.api.DestroyRequest"
+        | "eve_public.matrix.api.LockRequest"
+        | "eve_public.matrix.api.OnlineRequest"
+        | "eve_public.matrix.api.PrimaryLevelUpRequest"
+        | "eve_public.matrix.api.RegenerateRequest"
+        | "eve_public.matrix.api.RollbackRequest"
+        | "eve_public.matrix.api.SecondaryLevelUpRequest"
+        | "eve_public.matrix.api.SecondaryStageUpRequest"
+        | "eve_public.matrix.api.TrainRequest"
+        | "eve_public.matrix.api.UnbindRequest"
+        | "eve_public.matrix.market.api.BuyRequest"
+        | "eve_public.matrix.market.api.CancelRequest"
+        | "eve_public.matrix.market.api.SellRequest"
+        | "eve_public.payment.purchase.api.TokenRequest"
+        | "eve_public.plex.vault.api.PurchaseRequest"
+        | "eve_public.recruitment.recruitedtarget.CreateRecruitedTargetRequest"
+        | "eve_public.recruitment.recruitedtarget.CreateRelationshipRequest"
+        | "eve_public.recruitment.recruitedtarget.WithdrawRelationshipRequest"
+        | "eve_public.recruitment.recruiter.CreateRecruiterRequest"
+        | "eve_public.recruitment.recruiter.HandleRelationshipRequest"
+        | "eve_public.recruitment.recruiter.ModifyRecruitmentNoticeRequest"
+        | "eve_public.recruitment.recruiter.TerminateRelationshipRequest"
+        | "eve_public.recruitment.task.ClaimRewardRequest"
+        | "eve_public.recruitment.task.ClaimShipSkinRewardRequest"
+        | "eve_public.shipkillbenefit.exchangeshop.ExchangeRequest"
+        | "eve_public.sovereignty.hub.fuel.api.AddRequest"
+        | "eve_public.sovereignty.hub.upgrade.api.ProcessConfigurationRequest"
+        | "eve_public.sovereignty.hub.upgrade.api.UninstallRequest"
+        | "eve_public.sovereignty.hub.workforce.api.ConfigureRequest"
+        | "eve_public.sovereignty.mercenaryden.activity.api.StartRequest"
+        | "eve_public.sovereignty.skyhook.api.ActivateRequest"
+        | "eve_public.sovereignty.skyhook.api.DeactivateRequest"
+        | "eve_public.sovereignty.skyhook.api.admin.ModifyReagentsRequest"
+        | "eve_public.survey.SubmitAnswersRequest" => UnsupportedAction::Bodyless,
+        _ => return None,
+    })
+}
+
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

@@ -166,7 +166,11 @@ async fn run(f: &Fixture) {
         assert_ne!(name, "OnGodmaShipEffect", "unpaid activation emitted effect FX");
     }
     assert!(r.world.after(system, 100).await);
-    while let Ok(batch) = destiny_rx.try_recv() {
+    while let Ok(delivery) = destiny_rx.try_recv() {
+        let batch = match delivery {
+            crate::space::SceneDelivery::Destiny(batch) => batch,
+            crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+        };
         for event in batch {
             let call = event.items().and_then(|envelope| envelope.get(1)).and_then(|call| call.items());
             if let Some(call) = call {
@@ -202,7 +206,10 @@ async fn run(f: &Fixture) {
     }).await.expect("paid activation effect notification");
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let batch = destiny_rx.recv().await.expect("destiny observer channel");
+            let batch = match destiny_rx.recv().await.expect("destiny observer channel") {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             if batch.iter().any(|event| {
                 let Some(call) = event.items().and_then(|envelope| envelope.get(1)).and_then(|call| call.items()) else { return false };
                 if call.first() != Some(&marshal::Value::str("OnSpecialFX")) { return false; }

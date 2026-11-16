@@ -28,7 +28,7 @@ async fn inventory_rpc_projects_display_cap_without_changing_stored_quantities()
         let cargo_type = client.sde.types.iter().find(|t| t.published == Some(true)
             && t.category_id != Some(CATEGORY_SHIP) && t.volume.is_some_and(|v| v.is_finite() && v > 0.0)
             && client.sde.is_tradable(t.type_id)).expect("published cargo type").type_id;
-        crate::dao::characters::ship::dock(&db, actor.character, station_id, system_id).await.unwrap();
+        db.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&actor.character, &station_id, &system_id]).await.unwrap();
         let ship = crate::dao::items::creation::rookie_ship(&db, ship_type, actor.character, station_id, FLAG_HANGAR).await.unwrap();
         crate::dao::characters::selection::set_ship(&db, actor.character, ship).await.unwrap();
         let stack = crate::dao::items::transfers::insert(&db, cargo_type, actor.character, ship, FLAG_CARGO, i64::MAX).await.unwrap();

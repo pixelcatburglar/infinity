@@ -45,6 +45,8 @@ async fn implant_mutation_banks_old_rate_and_retimes_once() {
     use infinity_core::consts::dogma::CHAR_ATTRIBUTES;
     let _market = crate::services::market::lock().await;
     let (db, f, c, _peer) = setup().await;
+    let mut recipient = None;
+    let scenario = crate::tests::catch_scenario(async {
     let (ty, modifying, modified) = c.sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_IMPLANT) && t.group_id != Some(GROUP_BOOSTER)
         && t.attribute(ATTR_IMPLANTNESS).is_some_and(|v| v > 0.0 && v.fract() == 0.0))
         .find_map(|t| t.effects().iter().filter_map(|e| c.sde.dogma.effect(e.effect_id)).filter(|e| e.effect_category.unwrap_or(0) == 0).flat_map(|e| e.modifiers()).find(|m| m.func == "ItemModifier" && m.domain == "charID" && m.op == 2 && CHAR_ATTRIBUTES.contains(&(m.modified as i64)) && m.modified != m.modifying).map(|m| (t.type_id, m.modifying, m.modified))).expect("training attribute implant required");
@@ -57,12 +59,30 @@ async fn implant_mutation_banks_old_rate_and_retimes_once() {
     let start = now - infinity_core::consts::FILETIME_MINUTE;
     let attrs = character_attributes_at(&db, &c.sde, f.character, start).await.unwrap_or_else(|_| panic!("character attributes"));
     let mut row = skill_queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
-    let end = training::schedule(&c.sde, &mut row, &attrs, start).unwrap_or_else(|_| panic!("scheduling training"));
+    let end = training::schedule(&c.sde, &mut row, &attrs, start).unwrap_or_else(|_| panic!("scheduling training")).expect("positive training rate");
     assert!(end > now);
     skill_queue::insert(&db, f.character, &row).await.unwrap();
     let source = item(&db, f.character, ty, STATION, 1).await;
     db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,10)", &[&source, &modifying]).await.unwrap();
-    let (_, effects) = activate(&db, &c.sde, f.character, source, None, now, false, vec![]).await.unwrap_or_else(|_| panic!("training implant activation failed"));
+    let owner_ship = crate::dao::items::creation::rookie_ship(&db, infinity_core::consts::TYPE_CAPSULE, f.character, STATION, infinity_core::consts::FLAG_HANGAR).await.unwrap();
+    crate::dao::characters::selection::set_ship(&db, f.character, owner_ship).await.unwrap();
+    recipient = Some(crate::services::tests::fixture::LiveRecipient::cold(&c.world, f.character, None, &_market).await);
+    let live = recipient.as_ref().unwrap();
+    let base = attrs[&i64::from(modified)];
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
+    let world = &c.world;
+    let (_, effects) = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
+        let sde = c.sde.clone();
+        let fences = fences.clone();
+        Box::pin(async move {
+            activate_tx(tx, outbox, &sde, &fences, f.character, None, source, None, now, &[], false).await
+        })
+    }, |value, outbox| async move {
+        Ok((value, crate::services::tests::fixture::collected_notifications(outbox, world)))
+    }).await.unwrap_or_else(|_| panic!("training implant activation failed"));
+    assert_eq!(live.read(move |fit|
+        (fit.source_type(Key::Implant(source)), fit.value(Key::Char, modified))).await,
+        (Some(ty), base + 10.0));
     let expected = training::points_at(0, row.dest_sp, start, end, now);
     let current = skill_rows::current(&db, f.character).await.unwrap();
     assert_eq!(current.iter().find(|s| s.type_id == skill).unwrap().skill_points, expected);
@@ -74,14 +94,34 @@ async fn implant_mutation_banks_old_rate_and_retimes_once() {
     assert_eq!(notices(&effects, "OnServerImplantsChanged"), 1);
     let later = now + infinity_core::consts::FILETIME_MINUTE;
     let old = after[0].clone();
-    let (_, removal) = destroy(&db, &c.sde, f.character, source, later).await.unwrap_or_else(|_| panic!("training implant removal failed"));
+    let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
+    let world = &c.world;
+    let (_, removal) = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
+        let sde = c.sde.clone();
+        let fences = fences.clone();
+        Box::pin(async move {
+            destroy_tx(tx, outbox, &sde, &fences, f.character, source, later).await
+        })
+    }, |value, outbox| async move {
+        Ok((value, crate::services::tests::fixture::collected_notifications(outbox, world)))
+    }).await.unwrap_or_else(|_| panic!("training implant removal failed"));
+    assert_eq!(live.read(move |fit|
+        (fit.source_type(Key::Implant(source)), fit.value(Key::Char, modified))).await,
+        (None, base));
     let banked = training::points_at(old.start_sp, old.dest_sp, old.start_time.unwrap(), old.end_time.unwrap(), later);
     let current = skill_rows::current(&db, f.character).await.unwrap();
     assert_eq!(current.iter().find(|s| s.type_id == skill).unwrap().skill_points, banked);
     assert_eq!(notices(&removal, crate::client::BRAIN_REFRESH), 1);
     assert_eq!(notices(&removal, "OnNewSkillQueueSaved"), 1);
     assert_eq!(notices(&removal, "OnServerImplantsChanged"), 1);
+    }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     cleanup(&db, f).await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
@@ -104,7 +144,7 @@ async fn booster_activation_banks_and_notifies_training_once() {
     let start = now - infinity_core::consts::FILETIME_MINUTE;
     let attrs = character_attributes_at(&db, &c.sde, f.character, start).await.unwrap_or_else(|_| panic!("character attributes"));
     let mut row = skill_queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
-    let end = training::schedule(&c.sde, &mut row, &attrs, start).unwrap_or_else(|_| panic!("scheduling training"));
+    let end = training::schedule(&c.sde, &mut row, &attrs, start).unwrap_or_else(|_| panic!("scheduling training")).expect("positive training rate");
     assert!(end > now);
     skill_queue::insert(&db, f.character, &row).await.unwrap();
     let source = item(&db, f.character, ty, STATION, 1).await;

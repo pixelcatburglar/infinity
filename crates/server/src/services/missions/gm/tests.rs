@@ -62,3 +62,34 @@ async fn force_complete_merges_missing_courier_and_trade_goods() {
     assert_eq!(fixture::remaining(&db, f).await.unwrap(), 0);
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn force_complete_keeps_existing_singleton_cargo() {
+    use crate::services::tests::{client, fixture};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let (mut c, _peer) = client(test_db.clone(), f.character).await;
+        let step = c.sde.missions.steps().find(|step| super::super::agent(step.agent).is_some()
+            && c.sde.missions.get(step.mission_id).is_some()).expect("mission step with retail agent");
+        let agent = super::super::agent(step.agent).unwrap();
+        fixture::seed_mission(&test_db, &c.sde, f.character, agent.id, agent.station_id, agent.system_id, step.mission_id, step.arc).await.unwrap();
+        test_db.execute("UPDATE game.agent_missions SET state=$3, arc_id=NULL, dest_agent=NULL WHERE character_id=$1 AND agent_id=$2",
+            &[&f.character, &agent.id, &STATE_ACCEPTED]).await.unwrap();
+        let seeded = items::load_items(&test_db, &c.sde, ItemQuery::OwnerLocationFlag(f.character, agent.station_id, FLAG_HANGAR)).await.unwrap();
+        assert_eq!(seeded.len(), 1);
+        // The same cargo unit already present as a singleton must satisfy the requirement.
+        let (cargo, cargo_type) = (seeded[0].item_id, seeded[0].type_id);
+        test_db.execute("UPDATE game.items SET singleton=true, quantity=$2 WHERE item_id=$1", &[&cargo, &-2_i64]).await.unwrap();
+        assert_eq!(force_complete(&mut c, Some(agent.id)).await.unwrap(), 1);
+        let rows = items::load_items(&test_db, &c.sde, ItemQuery::OwnerLocationFlag(f.character, agent.station_id, FLAG_HANGAR)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].item_id, rows[0].type_id, rows[0].singleton, rows[0].quantity), (cargo, cargo_type, true, -2));
+    }).await;
+    fixture::cleanup(&db, f).await.unwrap();
+    assert_eq!(fixture::remaining(&db, f).await.unwrap(), 0);
+    result.unwrap();
+}

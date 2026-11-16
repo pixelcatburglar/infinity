@@ -14,7 +14,7 @@ use crate::{client::filetime_now, dao::jobs, db::{executor::Executor, Db, Error}
 use tokio::sync::Notify;
 
 pub(crate) mod runner;
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Job { pub id: String, pub kind: String, pub due_at: i64, pub payload: String }

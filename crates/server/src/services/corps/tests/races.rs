@@ -16,11 +16,8 @@ async fn blocked(tx: &Transaction<'_>, pid: i32) {
 }
 
 async fn cleanup(client: &Client, corps: &[i64], chars: &[i64]) {
-    client.execute("DELETE FROM game.jobs WHERE job_id IN (SELECT 'corp.vote.close:' || id::text FROM game.corp_vote_cases WHERE corporation_id=ANY($1))", &[&corps]).await.unwrap();
-    for table in ["corp_vote_claims", "corp_vote_ballots", "corp_vote_snapshot", "corp_vote_options"] {
-        client.execute(&format!("DELETE FROM game.{table} WHERE case_id IN (SELECT id FROM game.corp_vote_cases WHERE corporation_id=ANY($1))"), &[&corps]).await.unwrap();
-    }
-    client.execute("DELETE FROM game.corp_vote_cases WHERE corporation_id=ANY($1)", &[&corps]).await.unwrap();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    fixtures::cleanup_votes(&db, corps).await.unwrap();
     client.execute("DELETE FROM game.corp_dividend_recipients WHERE operation_id IN (SELECT operation_id FROM game.corp_dividends WHERE corporation_id=ANY($1))", &[&corps]).await.unwrap();
     client.execute("DELETE FROM game.corp_dividends WHERE corporation_id=ANY($1)", &[&corps]).await.unwrap();
     client.execute("DELETE FROM game.corp_share_transfers WHERE corporation_id=ANY($1)", &[&corps]).await.unwrap();
@@ -144,7 +141,6 @@ async fn waiting_operations_recheck_authority_after_issuer_lock() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
 async fn lost_holder_authority_rolls_back_ballot_and_prior_claims() {
     let mut first = fixtures::connect().await;
-    let mut second = fixtures::connect().await;
     let tx = first.transaction().await.unwrap();
     let ceo = fixtures::character(&tx).await;
     let holder = fixtures::character(&tx).await;
@@ -155,37 +151,41 @@ async fn lost_holder_authority_rolls_back_ballot_and_prior_claims() {
     assert!(shares::transfer(&tx, issuer, issuer, holder, 10).await.unwrap());
     assert!(shares::transfer(&tx, issuer, issuer, foreign, 20).await.unwrap());
     assert!(shares::transfer(&tx, issuer, issuer, replacement, 5).await.unwrap());
-    let mut out = Outbox::<()>::default();
-    let id = votes::create_inner(&tx, &mut out, ceo, "race", "", &["yes".into(), "no".into()], 1, 1).await.unwrap();
+    let start = crate::client::filetime_now();
+    let id = fixtures::general_vote_fixture(&tx, issuer, ceo, start, start + FILETIME_DAY).await.unwrap();
     tx.commit().await.unwrap();
-    // The ballot's option FK waits here, after eligibility was read but before claims.
     let tx = first.transaction().await.unwrap();
-    let eligible = dao::eligible_holders(&tx, id, holder).await.unwrap();
-    assert_eq!(eligible.iter().map(|h| h.holder_id).collect::<Vec<_>>(), vec![holder, foreign]);
-    tx.query_one("SELECT option_id FROM game.corp_vote_options WHERE case_id=$1 AND option_id=0 FOR UPDATE", &[&id]).await.unwrap();
+    assert!(shares::lock_issuer(&tx, foreign).await.unwrap());
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (mut voter, _peer) = crate::services::tests::client(db, holder).await;
     let (send, recv) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let tx = second.transaction().await.unwrap();
-        send.send(tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get::<_, i32>("pid")).unwrap();
-        let mut out = Outbox::<()>::default();
-        assert!(votes::cast_inner(&tx, &mut out, holder, issuer, id, 0, 2).await.is_err());
-        assert!(out.into_entries().is_empty());
-        tx.rollback().await.unwrap();
+        send.send(()).unwrap();
+        fixtures::vote_call(&mut voter, "InsertVote", &[marshal::Value::Int(issuer), marshal::Value::Int(id), marshal::Value::Int(0)]).await
     });
-    blocked(&tx, recv.await.unwrap()).await;
+    recv.await.unwrap();
+    let blocker: i32 = tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))) AS waiting", &[&blocker]).await.unwrap().get("waiting");
+            if waiting { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("vote admission did not wait");
     tx.execute("UPDATE game.corporations SET ceo_id=$2 WHERE corporation_id=$1", &[&foreign, &replacement]).await.unwrap();
     tx.commit().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap().is_err());
     let count: i64 = first.query_one("SELECT count(*) AS count FROM game.corp_vote_claims WHERE case_id=$1", &[&id]).await.unwrap().get("count");
     assert_eq!(count, 0);
     let tx = first.transaction().await.unwrap();
     assert!(dao::ballot(&tx, id, holder).await.unwrap().is_none());
+    assert!(crate::dao::corporations::registry::lock_admission(&tx, &[], &[issuer, foreign], &[holder, replacement]).await.unwrap());
     let mut out = Outbox::<()>::default();
-    votes::cast_inner(&tx, &mut out, replacement, issuer, id, 0, 2).await.unwrap();
+    votes::cast_inner(&tx, &mut out, replacement, issuer, id, 0, start + 1).await.unwrap();
     assert_eq!(dao::ballot(&tx, id, replacement).await.unwrap().unwrap().weight, 25);
     tx.execute("UPDATE game.corporations SET ceo_id=$2 WHERE corporation_id=$1", &[&foreign, &holder]).await.unwrap();
     let mut out = Outbox::<()>::default();
-    votes::cast_inner(&tx, &mut out, holder, issuer, id, 1, 2).await.unwrap();
+    votes::cast_inner(&tx, &mut out, holder, issuer, id, 1, start + 1).await.unwrap();
     assert_eq!(dao::ballot(&tx, id, holder).await.unwrap().unwrap().weight, 10);
     tx.commit().await.unwrap();
     cleanup(&first, &[issuer, foreign], &[ceo, holder, replacement]).await;
@@ -203,22 +203,29 @@ async fn deadline_cast_serializes_with_durable_recovered_close() {
     assert!(shares::initialize(&tx, issuer, 1000).await.unwrap());
     assert!(shares::transfer(&tx, issuer, issuer, holder, 30).await.unwrap());
     assert!(shares::transfer(&tx, issuer, issuer, late, 7).await.unwrap());
-    let mut out = Outbox::<()>::default();
-    let id = votes::create_inner(&tx, &mut out, ceo, "deadline", "", &["yes".into(), "no".into()], 1, 1).await.unwrap();
+    let id = fixtures::general_vote_fixture(&tx, issuer, ceo, 1, 1 + FILETIME_DAY).await.unwrap();
     tx.commit().await.unwrap();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let deadline_tx = first.transaction().await.unwrap();
+    assert!(crate::dao::corporations::registry::lock_admission(&deadline_tx, &[], &[issuer], &[late]).await.unwrap());
     let mut deadline_out = Outbox::<()>::default();
     assert!(votes::cast_inner(&deadline_tx, &mut deadline_out, late, issuer, id, 1, 1 + FILETIME_DAY).await.is_err());
     assert!(deadline_out.into_entries().is_empty());
     deadline_tx.rollback().await.unwrap();
     let job_id = format!("{}:{id}", vote_close::KIND);
+    jobs::cancel(&db, &job_id).await.unwrap();
+    vote_close::seed(&db).await.unwrap();
+    assert_eq!(jobs::lock_job(&db, &job_id).await.unwrap().unwrap().due_at, 1 + FILETIME_DAY);
     // Exclude all unrelated jobs; this test never claims another fixture's work.
     let others: Vec<String> = first.query("SELECT job_id FROM game.jobs WHERE job_id<>$1", &[&job_id]).await.unwrap().iter().map(|r| r.get("job_id")).collect();
     let excluded: Vec<&str> = others.iter().map(String::as_str).collect();
     let mut claims = jobs::claim(&db, 1 + FILETIME_DAY, 2 + FILETIME_DAY, 1, &excluded).await.unwrap();
     assert_eq!(claims.len(), 1);
     let abandoned = claims.pop().unwrap();
+    vote_close::seed(&db).await.unwrap();
+    vote_close::seed(&db).await.unwrap();
+    let lease = db.query_one("SELECT lease_token,lease_until,attempt FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap();
+    assert_eq!((lease.get::<_, Option<i64>>("lease_token"), lease.get::<_, Option<i64>>("lease_until"), lease.get::<_, i32>("attempt")), (Some(abandoned.token), Some(2 + FILETIME_DAY), abandoned.attempt));
     assert_eq!(abandoned.job.id, job_id);
     let mut reclaimed = jobs::claim(&db, 3 + FILETIME_DAY, 4 + FILETIME_DAY, 1, &excluded).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
@@ -231,6 +238,7 @@ async fn deadline_cast_serializes_with_durable_recovered_close() {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(ceo, sender);
     let tx = first.transaction().await.unwrap();
+    assert!(crate::dao::corporations::registry::lock_admission(&tx, &[], &[issuer], &[holder]).await.unwrap());
     let mut out = Outbox::<()>::default();
     votes::cast_inner(&tx, &mut out, holder, issuer, id, 0, FILETIME_DAY).await.unwrap();
     let blocker: i32 = tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
@@ -240,7 +248,7 @@ async fn deadline_cast_serializes_with_durable_recovered_close() {
     let task = tokio::spawn(async move { vote_close::handle(handler_db, handler_world, handler_job).await });
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let waiting: bool = tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE 'SELECT id,corporation_id,creator_id,title,description,starts,ends,closed_at FROM game.corp_vote_cases%FOR UPDATE') AS waiting", &[&blocker]).await.unwrap().get("waiting");
+            let waiting: bool = tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))) AS waiting", &[&blocker]).await.unwrap().get("waiting");
             if waiting { break; }
             tokio::task::yield_now().await;
         }
@@ -248,7 +256,7 @@ async fn deadline_cast_serializes_with_durable_recovered_close() {
     tx.commit().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
     assert!(receiver.try_recv().is_ok());
-    vote_close::handle(db.clone(), world, claim.job).await.unwrap();
+    vote_close::handle(db.clone(), world.clone(), claim.job).await.unwrap();
     assert!(receiver.try_recv().is_err());
     assert_eq!(jobs::ack(&db, &job_id, claim.token).await.unwrap(), 1);
     assert!(dao::case(&db, id).await.unwrap().unwrap().closed_at.is_some());
@@ -256,12 +264,62 @@ async fn deadline_cast_serializes_with_durable_recovered_close() {
     let options = dao::options(&db, id).await.unwrap();
     assert_eq!((options[0].votes_for, options[1].votes_for), (30, 0));
     let tx = first.transaction().await.unwrap();
+    assert!(crate::dao::corporations::registry::lock_admission(&tx, &[], &[issuer], &[late]).await.unwrap());
     let mut late_out = Outbox::<()>::default();
     assert!(votes::cast_inner(&tx, &mut late_out, late, issuer, id, 1, 1 + FILETIME_DAY).await.is_err());
     assert!(late_out.into_entries().is_empty());
     let mut out = Outbox::<()>::default();
-    vote_close::close_inner(&tx, &mut out, id, 1 + FILETIME_DAY).await.unwrap();
+    vote_close::close_inner(&tx, world.sde(), &mut out, id, 1 + FILETIME_DAY).await.unwrap();
     assert!(out.into_entries().is_empty());
     tx.commit().await.unwrap();
     cleanup(&first, &[issuer], &[ceo, holder, late]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
+async fn expiry_seed_recovers_original_deadline_and_is_idempotent() {
+    use crate::services::corps::{sanctions, vote_request};
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let world = crate::space::World::new(db.clone(), Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
+    let mut first = fixtures::connect().await;
+    let tx = first.transaction().await.unwrap();
+    let ceo = fixtures::character(&tx).await;
+    let issuer = fixtures::corporation(&tx, ceo).await;
+    shares::initialize(&tx, issuer, 1000).await.unwrap();
+    shares::transfer(&tx, issuer, issuer, ceo, 100).await.unwrap();
+    let window = crate::config::game().corporations.vote_action_window_secs * infinity_core::consts::FILETIME_SECOND;
+    let end = crate::client::filetime_now() - window - FILETIME_DAY;
+    let id = fixtures::general_vote_fixture(&tx, issuer, ceo, end - FILETIME_DAY, end).await.unwrap();
+    tx.execute("UPDATE game.corp_vote_cases SET vote_type=$2 WHERE id=$1", &[&id, &vote_request::VOTE_SHARES]).await.unwrap();
+    assert!(crate::dao::corporations::registry::lock_admission(&tx, &[], &[issuer], &[ceo]).await.unwrap());
+    let mut out = Outbox::<()>::default();
+    votes::cast_inner(&tx, &mut out, ceo, issuer, id, 0, end - 1).await.unwrap();
+    vote_close::close_inner(&tx, world.sde(), &mut out, id, end + 1).await.unwrap();
+    tx.commit().await.unwrap();
+    let job_id = format!("{}:{id}", sanctions::KIND);
+    assert_eq!(crate::dao::corporations::sanctions::get(&db, id).await.unwrap().unwrap().expires, end + window);
+    jobs::cancel(&db, &job_id).await.unwrap();
+    sanctions::seed(&db).await.unwrap();
+    assert_eq!(jobs::lock_job(&db, &job_id).await.unwrap().unwrap().due_at, end + window);
+    let others: Vec<String> = first.query("SELECT job_id FROM game.jobs WHERE job_id<>$1", &[&job_id]).await.unwrap().iter().map(|r| r.get("job_id")).collect();
+    let excluded: Vec<&str> = others.iter().map(String::as_str).collect();
+    let now = crate::client::filetime_now();
+    let claim = jobs::claim(&db, now, now + FILETIME_DAY, 1, &excluded).await.unwrap().pop().unwrap();
+    assert_eq!(claim.job.id, job_id);
+    sanctions::seed(&db).await.unwrap();
+    sanctions::seed(&db).await.unwrap();
+    let lease = db.query_one("SELECT lease_token,lease_until,attempt FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap();
+    assert_eq!((lease.get::<_, Option<i64>>("lease_token"), lease.get::<_, Option<i64>>("lease_until"), lease.get::<_, i32>("attempt")), (Some(claim.token), Some(now + FILETIME_DAY), claim.attempt));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    world.register_pilot(ceo, sender);
+    sanctions::handle(db.clone(), world.clone(), claim.job.clone()).await.unwrap();
+    assert!(receiver.try_recv().is_ok());
+    let expired = crate::dao::corporations::sanctions::get(&db, id).await.unwrap().unwrap().expired_at;
+    assert!(expired.is_some());
+    sanctions::handle(db.clone(), world.clone(), claim.job).await.unwrap();
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(crate::dao::corporations::sanctions::get(&db, id).await.unwrap().unwrap().expired_at, expired);
+    assert_eq!(jobs::ack(&db, &job_id, claim.token).await.unwrap(), 1);
+    world.unregister_pilot_generation(ceo, None);
+    cleanup(&first, &[issuer], &[ceo]).await;
 }

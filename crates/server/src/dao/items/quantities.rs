@@ -40,4 +40,4 @@ pub(crate) async fn apply(db: &(impl Executor + ?Sized), changes: &BTreeMap<i64,
     Ok(true)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

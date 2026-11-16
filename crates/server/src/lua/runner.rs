@@ -133,5 +133,5 @@ pub async fn run(config: LuaConfig, mut generations: watch::Receiver<Arc<Registr
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

@@ -1,5 +1,6 @@
 //! Share ownership and transfers for `eve/client/script/ui/services/corporation/bco_shares.py`.
-//! Uses the corporation share ledger and transfer receipts; share issuance votes are unsupported.
+//! Uses the corporation share ledger and transfer receipts; share issuance votes apply
+//! through `issue_in`, which grows the issued total and treasury in the caller's transaction.
 use super::*;
 use infinity_core::consts::{ROLE_ACCOUNTANT, ROLE_JUNIOR_ACCOUNTANT};
 use crate::dao::corporations::shares as dao;
@@ -60,7 +61,8 @@ pub(super) async fn transfer_core<X: Send>(tx: &(impl Executor + ?Sized), outbox
     let (corp, _) = membership(tx, actor).await?;
     if bound != corp || (company && !has_role_or_is_ceo(tx, actor, corp, ROLE_DIRECTOR).await?) { return Err(notify_error(text::SHARE_AUTHORITY_REQUIRED)); }
     let from = if company { corp } else { actor };
-    if issuer <= 0 || to <= 0 || quantity <= 0 || from == to || !dao::lock_issuer(tx, issuer).await.map_err(db_err)? { return Err(notify_error(text::INVALID_SHARE_TRANSFER)); }
+    if issuer <= 0 || to <= 0 || quantity <= 0 || from == to { return Err(notify_error(text::INVALID_SHARE_TRANSFER)); }
+    if !registry::lock_admission(tx, &[], &[corp, issuer, to], &[actor, to]).await.map_err(db_err)? || !dao::lock_issuer(tx, issuer).await.map_err(db_err)? { return Err(notify_error(text::INVALID_SHARE_TRANSFER)); }
     let (fresh_corp, _) = membership(tx, actor).await?;
     if fresh_corp != corp || bound != fresh_corp || (company && !has_role_or_is_ceo(tx, actor, fresh_corp, ROLE_DIRECTOR).await?) { return Err(notify_error(text::SHARE_AUTHORITY_REQUIRED)); }
     if !dao::valid_holder(tx, to).await.map_err(db_err)? { return Err(notify_error(text::INVALID_SHARE_TRANSFER)); }
@@ -74,6 +76,30 @@ pub(super) async fn transfer_core<X: Send>(tx: &(impl Executor + ?Sized), outbox
         for observer in dao::observers(tx, holder).await.map_err(db_err)? {
             outbox.notify_pilot(observer, "OnShareChange", vec![Value::Int(holder), Value::Int(issuer), ch.clone()]);
         }
+    }
+    Ok(())
+}
+
+/// Apply a passed share-issuance vote inside the caller's market- and issuer-locked
+/// transaction: the issued total and treasury grow together, then observers and members
+/// get the real share and corporation changes.
+pub(super) async fn issue_in<X: Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corporation: i64, quantity: i64) -> Result<(), CallError> {
+    let before_total = dao::issued_total(tx, corporation).await.map_err(db_err)?
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("corporation share issuance has not been initialized")))?;
+    let old = dao::transfer_holdings(tx, corporation, &[corporation]).await.map_err(db_err)?;
+    if !dao::issue(tx, corporation, quantity).await.map_err(db_err)? {
+        return Err(notify_error(text::SHARES_UNAVAILABLE));
+    }
+    let new = dao::transfer_holdings(tx, corporation, &[corporation]).await.map_err(db_err)?;
+    let after_total = dao::issued_total(tx, corporation).await.map_err(db_err)?
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("corporation share issuance has not been initialized")))?;
+    let ch = change(old.iter().find(|r| r.shareholder_id == corporation), new.iter().find(|r| r.shareholder_id == corporation));
+    for observer in dao::observers(tx, corporation).await.map_err(db_err)? {
+        outbox.notify_pilot(observer, "OnShareChange", vec![Value::Int(corporation), Value::Int(corporation), ch.clone()]);
+    }
+    let corp_change = Value::dict([("shares", Value::tuple([Value::Int(before_total), Value::Int(after_total)]))]);
+    for recipient in crate::dao::characters::members::active_ids(tx, corporation).await.map_err(db_err)? {
+        outbox.notify_pilot(recipient, "OnCorporationChanged", vec![Value::Int(corporation), corp_change.clone()]);
     }
     Ok(())
 }

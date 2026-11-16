@@ -29,7 +29,7 @@ async fn open_trade_ancestry_reserves_direct_and_nested_fuel() {
             let items = load_items(&tx, &sde, ItemQuery::LocationOwnerFlags(ship, owner, &flags)).await.unwrap();
             let reserved = trades::reserved(&tx, &[stack]).await.unwrap();
             assert_eq!(reserved, vec![stack]);
-            assert!(plan(&BTreeMap::from([(fuel, 1)]), &items, &reserved, &sde, owner).is_err());
+            assert!(plan(&[(fuel, 1)], &items, &reserved, &sde, owner).is_err());
             assert_eq!(load_items(&tx, &sde, ItemQuery::Id(stack)).await.unwrap()[0].quantity, 3);
         }
     }).await;

@@ -1,16 +1,21 @@
 use super::*;
-use crate::lua::events::combat::CombatEntity;
-use crate::lua::events::resources::{FactContext, FactOrigin};
-use crate::space::combat_facts::{CombatFacts, CombatSource};
+#[cfg(feature = "tests-space")] use crate::lua::events::combat::CombatEntity;
+#[cfg(feature = "tests-space")] use crate::lua::events::resources::{FactContext, FactOrigin};
+use crate::space::combat_facts::CombatFacts;
+#[cfg(feature = "tests-space")] use crate::space::combat_facts::CombatSource;
+#[cfg(feature = "tests-space")] use crate::space::tests::system_selection::public_static_system;
 
+#[cfg(feature = "tests-effects")]
 pub(crate) fn facts_test_init(system: &mut System, key_capacity: usize, handle_capacity: usize) {
     assert!(system.combat_facts.is_none());
     system.combat_facts = Some(CombatFacts::new(crate::handshake::random_u64(), system.id, key_capacity, handle_capacity));
 }
 
+#[cfg(feature = "tests-space")]
 fn entity(id: i64) -> CombatEntity {
     CombatEntity { item_id: id, type_id: 1, incarnation: [1; 16], character_id: Some(id), corporation_id: None, alliance_id: None, faction_id: None }
 }
+#[cfg(feature = "tests-space")]
 fn source(sequence: u64) -> CombatSource {
     let mut activation = [0; 16]; activation[15] = 1;
     CombatSource { actual_actor_character: Some(1), entity: entity(1),
@@ -18,24 +23,28 @@ fn source(sequence: u64) -> CombatSource {
         source_is_npc: false, controller_incarnation: Some([1; 16]),
         module_id: Some(2), effect_id: Some(3), weapon_type_id: Some(4), activation, sequence }
 }
-fn hit(facts: &mut CombatFacts, sequence: u64, at: i64) {
+#[cfg(feature = "tests-space")]
+fn hit_source(facts: &mut CombatFacts, source: CombatSource, at: i64) {
     let target = entity(2);
-    let source = source(sequence);
     facts.reserve_attempt(&source).unwrap();
     let mut reservation = facts.reserve_damage(source, &target, at).unwrap();
     facts.commit_damage(&mut reservation, &target, [1.0, 0.0, 0.0], false).unwrap();
     facts.release(reservation);
     facts.finish_attempt(&source);
 }
+#[cfg(feature = "tests-space")]
+fn hit(facts: &mut CombatFacts, sequence: u64, at: i64) {
+    hit_source(facts, source(sequence), at);
+}
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn empty_capture_has_no_frame() {
     crate::tests::init_config();
     let mut system = System::default();
     assert!(capture_fact_checkpoint(&mut system).unwrap().is_none());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn sealed_frame_ack_keeps_later_mutations_and_existing_cadence() {
     crate::tests::init_config();
     let mut system = System::default();
@@ -57,7 +66,7 @@ fn sealed_frame_ack_keeps_later_mutations_and_existing_cadence() {
 }
 
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn full_handle_drain_preserves_low_level_reserved_rows() {
     crate::tests::init_config();
     let mut system = System::default();
@@ -86,7 +95,7 @@ fn full_handle_drain_preserves_low_level_reserved_rows() {
     assert!(capture_fact_checkpoint(&mut system).unwrap().is_some());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn invalid_capture_refuses_without_discarding_active_facts() {
     crate::tests::init_config();
     let mut system = System::default();
@@ -100,7 +109,7 @@ fn invalid_capture_refuses_without_discarding_active_facts() {
     assert!(!system.is_cold(false));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn mailbox_fact_capture_uses_actor_clock_before_next_tick() {
     crate::tests::init_config();
     let mut system = System::default();
@@ -121,7 +130,7 @@ fn mailbox_fact_capture_uses_actor_clock_before_next_tick() {
     }
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-space")] #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database"]
 async fn canonical_receipt_rejects_divergent_ordinal_and_rollback_retains_frame() {
     crate::tests::init_config();
@@ -147,7 +156,7 @@ async fn canonical_receipt_rejects_divergent_ordinal_and_rollback_retains_frame(
         context: serde_json::to_string(context).unwrap(), origin: context.origin.as_str().into(),
         ordinal: captured.ordinal, subject_character_id: crate::lua::events::combat::subject(&captured.event),
     };
-    crate::dao::progress::insert_batch(&tx, &[journal]).await.unwrap();
+    crate::dao::progress::insert_batch(&tx, &[journal], &[], &[]).await.unwrap();
     assert!(frame.is_committed(&tx).await.unwrap());
     tx.execute("UPDATE game.progress_events SET ordinal = ordinal + 1 WHERE source_namespace = 'business' AND source_key = $1", &[&key.as_str()]).await.unwrap();
     assert!(matches!(frame.is_committed(&tx).await, Err(crate::db::Error::Progress(_))));
@@ -156,7 +165,7 @@ async fn canonical_receipt_rejects_divergent_ordinal_and_rollback_retains_frame(
     assert!(Arc::ptr_eq(&frame.batches[0], &capture_fact_checkpoint(&mut system).unwrap().unwrap().batches[0]));
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-space")] #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database"]
 async fn fact_and_condition_rollback_together_on_collision() {
     crate::tests::init_config();
@@ -168,9 +177,9 @@ async fn fact_and_condition_rollback_together_on_collision() {
     system.combat_facts = Some(facts);
     let mut frame = capture_fact_checkpoint(&mut system).unwrap().unwrap();
     let cfg = crate::config::tests::test_database();
-    let (mut client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let mut tx = client.transaction().await.unwrap();
+    let (client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let mut tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let item = crate::dao::items::creation::positioned(&tx, 1, 1, 1, [0.0; 3]).await.unwrap();
     Arc::get_mut(&mut frame).unwrap().conditions.push(combat::DirtyConditionCapture {
         item_id: item, generation: 1, revision: 1, shield: 5.0, armor_damage: 2.0, hull_damage: 1.0, sampled_at: 1,
@@ -181,12 +190,13 @@ async fn fact_and_condition_rollback_together_on_collision() {
             stats: crate::services::combat::groups_health::ShipStats { max: [10.0; 3], resonance: [[1.0; 4]; 3], shield_tau_ms: 1.0 },
             now: [9.0, 8.0, 7.0], shield_at: 1,
         },
+        loaded: Vec::new(),
     };
     let savepoint = tx.transaction().await.unwrap();
     let mut outbox = Outbox::<()>::default();
     let ids = crate::services::combat::checkpoint_conditions_in(&savepoint, &mut outbox, 1, &[own], Some(&frame)).await.unwrap();
     assert_eq!(ids, vec![item]);
-    crate::progress::prepare_batch(&mut outbox, &savepoint, 1).await.unwrap();
+    crate::progress::prepare_batch(&mut outbox, &savepoint, 1, &crate::progress::Registry::default()).await.unwrap();
     assert!(frame.is_committed(&savepoint).await.unwrap());
     let values = crate::dao::items::dogma::overrides(&savepoint, item).await.unwrap();
     assert_eq!(values.len(), 3);
@@ -209,18 +219,18 @@ async fn fact_and_condition_rollback_together_on_collision() {
         context: serde_json::to_string(context).unwrap(), origin: context.origin.as_str().into(),
         ordinal: captured.ordinal + 1, subject_character_id: crate::lua::events::combat::subject(&captured.event),
     };
-    crate::dao::progress::insert_batch(&tx, &[conflicting]).await.unwrap();
+    crate::dao::progress::insert_batch(&tx, &[conflicting], &[], &[]).await.unwrap();
     let savepoint = tx.transaction().await.unwrap();
     let mut outbox = Outbox::<()>::default();
     crate::services::combat::checkpoint_conditions_in(&savepoint, &mut outbox, 1, &[], Some(&frame)).await.unwrap();
-    assert!(crate::progress::prepare_batch(&mut outbox, &savepoint, 2).await.is_err());
+    assert!(crate::progress::prepare_batch(&mut outbox, &savepoint, 2, &crate::progress::Registry::default()).await.is_err());
     savepoint.rollback().await.unwrap();
     assert!(crate::dao::items::dogma::overrides(&tx, item).await.unwrap().is_empty());
     assert_eq!(system.combat_facts.as_ref().unwrap().batch_count(), 1);
     tx.rollback().await.unwrap();
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-space")] #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database"]
 async fn busy_gate_retains_frozen_fact_and_uses_existing_deadline() {
     crate::tests::init_config();
@@ -235,7 +245,7 @@ async fn busy_gate_retains_frozen_fact_and_uses_existing_deadline() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.clone().lock_owned().await;
-    system.snapshot_context = Some(Context { tx: tx.downgrade(), gate, written: Arc::new(AtomicU64::new(0)), db });
+    system.snapshot_context = Some(Context { tx: tx.downgrade(), gate, state: Arc::new(actor::lifecycle::ActorState::default()), db });
     system.tick(1);
     let interval = crate::config::game().space.position_snapshot_secs * MILLISECONDS_PER_SECOND;
     let due = system.snapshot_due;
@@ -246,7 +256,7 @@ async fn busy_gate_retains_frozen_fact_and_uses_existing_deadline() {
     drop(guard);
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-space")] #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database"]
 async fn committed_old_frame_reconciliation_does_not_restore_old_hp() {
     crate::tests::init_config();
@@ -258,16 +268,16 @@ async fn committed_old_frame_reconciliation_does_not_restore_old_hp() {
     system.combat_facts = Some(facts);
     let mut frame = capture_fact_checkpoint(&mut system).unwrap().unwrap();
     let cfg = crate::config::tests::test_database();
-    let (mut client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let tx = client.transaction().await.unwrap();
+    let (client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let item = crate::dao::items::creation::positioned(&tx, 1, 1, 1, [0.0; 3]).await.unwrap();
     Arc::get_mut(&mut frame).unwrap().conditions.push(combat::DirtyConditionCapture {
         item_id: item, generation: 1, revision: 1, shield: 5.0, armor_damage: 2.0, hull_damage: 1.0, sampled_at: 1,
     });
     let mut outbox = Outbox::<()>::default();
     let ids = crate::services::combat::checkpoint_conditions_in(&tx, &mut outbox, 1, &[], Some(&frame)).await.unwrap();
-    crate::progress::prepare_batch(&mut outbox, &tx, 1).await.unwrap();
+    crate::progress::prepare_batch(&mut outbox, &tx, 1, &crate::progress::Registry::default()).await.unwrap();
     frame.acknowledge(&mut system, &ids.into_iter().collect());
     let attrs = [infinity_core::consts::dogma::ATTR_SHIELD_CHARGE, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE, infinity_core::consts::dogma::ATTR_HULL_DAMAGE];
     crate::dao::items::dogma::save_conditions(&tx, 1, &attrs, &[(item, [3.0, 4.0, 2.0], 2)]).await.unwrap();
@@ -279,4 +289,45 @@ async fn committed_old_frame_reconciliation_does_not_restore_old_hp() {
     assert_eq!(values.iter().find(|row| row.attribute_id == attrs[0]).unwrap().value, 3.0);
     assert_eq!(values.iter().find(|row| row.attribute_id == attrs[1]).unwrap().value, 4.0);
     tx.rollback().await.unwrap();
+}
+
+#[cfg(feature = "tests-space")] #[tokio::test]
+#[ignore = "requires performance testing enabled and a dedicated database; run this exact test in its own process"]
+async fn refused_fact_flush_retains_actor_until_capture_succeeds() {
+    let cfg = crate::config::Config::load().unwrap();
+    assert!(cfg.gm.performance_testing);
+    crate::config::init_game(cfg.game_config()).unwrap();
+    let db = Db::connect(&cfg.database).await.unwrap();
+    let sde = crate::tests::shared_sde(&db).await;
+    let id = public_static_system(&sde, 0);
+    let world = World::new(db.clone(), sde, 0);
+    world.system(id).await.unwrap();
+    let mut facts = CombatFacts::new(crate::handshake::random_u64(), id, 32, 4);
+    let mut activation = [0; 16]; activation[15] = 1;
+    facts.register_source(activation, 1, 0).unwrap();
+    let mut source = source(0);
+    source.context.system_id = Some(id);
+    let fact_at = crate::client::filetime_now() + infinity_core::consts::FILETIME_HOUR;
+    hit_source(&mut facts, source, fact_at);
+    let old = world.running(id).unwrap();
+    let sender = old.tx.downgrade();
+    drop(old);
+    world.with(id, move |s| s.combat_facts = Some(facts)).await.unwrap();
+    // The unsealed future fact refuses the flush; the actor and its dirty facts stay.
+    let report = world.unload_idle_systems().await.unwrap();
+    assert_eq!(report, crate::space::unload::UnloadReport { total: 1, failed: 1, ..Default::default() });
+    assert!(world.with(id, |s| s.combat_facts.as_ref().is_some_and(|f| f.is_dirty() && f.batch_count() == 0)).await.unwrap());
+    let key = world.with(id, move |s| {
+        s.nativefact_clock = s.nativefact_clock.max(fact_at);
+        let event = capture_fact_checkpoint(s).unwrap().unwrap().batches[0].events().pop().unwrap();
+        SourceKey::canonical(event.event.kind(), event.identity, event.ordinal)
+    }).await.unwrap();
+    let report = world.unload_idle_systems().await.unwrap();
+    assert_eq!(report, crate::space::unload::UnloadReport { total: 1, unloaded: 1, ..Default::default() });
+    assert!(sender.upgrade().is_none());
+    let count = db.query_one("SELECT count(*) AS n FROM game.progress_events WHERE source_namespace = 'business' AND source_key = $1",
+        &[&key.as_str()]).await.unwrap();
+    assert_eq!(count.get::<_, i64>("n"), 1);
+    db.execute("DELETE FROM game.progress_events WHERE source_namespace = 'business' AND source_key = $1",
+        &[&key.as_str()]).await.unwrap();
 }

@@ -2,7 +2,7 @@
 //! Like player repair effects, range attenuates the repair amount. NPCs assist
 //! only their spawn-group or owner allies, never their hostile target. Server
 //! policy applies shield at cycle start and armor and hull at cycle end.
-use super::{range::range_multiplier, registry::{Effect, EffectAttribute}, repair, space_source::{PreparedCombatAttempt, SourceContext, SourceGuard}, EffectKind};
+use super::{parameters::SourceInputs, range::range_multiplier, registry::Effect, repair, space_source::{PreparedCombatAttempt, SourceContext, SourceGuard}, EffectKind};
 use infinity_core::consts::{dogma::EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR, dogma::EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD,
     dogma::EFFECT_NPC_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_NPC_REMOTE_SHIELD_BOOSTER,
     dogma::EFFECT_NPC_REMOTE_HULL_REPAIRER};
@@ -49,9 +49,12 @@ fn apply(s: &mut System, system: i64, source: i64, hostile: i64, target: i64, ge
 
 pub(crate) async fn apply_source(cx: &SourceContext<'_>, attempt: Option<PreparedCombatAttempt>) -> Result<(), CallError> {
     let EffectKind::RemoteRepair { layer } = cx.effect.kind else { unreachable!("not a remote repair") };
-    let optimal = cx.effect.attribute(EffectAttribute::Range).map_or(0.0, |attr| cx.fit.value(cx.key, attr));
-    let falloff = cx.effect.attribute(EffectAttribute::Falloff).map_or(0.0, |attr| cx.fit.value(cx.key, attr));
-    let base = cx.fit.value(cx.key, repair::amount_attribute(layer));
+    let SourceInputs::RemoteRepair(inputs) = cx.inputs else {
+        return Err(CallError::Internal(anyhow::anyhow!("remote repair source captured without repair inputs")));
+    };
+    let optimal = inputs.ranges.optimal;
+    let falloff = inputs.ranges.falloff;
+    let base = inputs.base;
     let sde = cx.world.sde().clone();
     match cx.guard {
         SourceGuard::Npc { source, target: hostile, generation } => {
@@ -106,4 +109,4 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>, attempt: Option<Prepare
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

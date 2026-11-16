@@ -42,12 +42,23 @@ async fn scoped_grant_block_batch_rollback_and_observer() {
         let (client, _peer) = tests::client(test_db.clone(), manager.character).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.world.register_pilot(observer.character, tx);
+        let (member_tx, mut member_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.world.register_pilot(member.character, member_tx);
         let mut line = patch(member.character);
         line[6] = Value::Int(ROLE_HANGAR_CAN_TAKE_1);
         roles::update_member(&test_db, &client.world, &client.sde, manager.character, corp, &line).await.unwrap();
         let authority = permissions::load(&test_db, member.character).await.unwrap().unwrap();
         assert!(permissions::allows_at(&authority, corp, 10, ROLE_HANGAR_CAN_TAKE_1));
         assert!(!permissions::allows_at(&authority, corp, 20, ROLE_HANGAR_CAN_TAKE_1));
+        let (_, session) = std::iter::from_fn(|| member_rx.try_recv().ok()).find(|(name, _)| name == "__session").expect("member role projection");
+        let expected = Value::list([
+            Value::tuple([Value::str("corprole"), Value::Int(authority.roles[0])]),
+            Value::tuple([Value::str("rolesAtAll"), Value::Int(authority.roles[0])]),
+            Value::tuple([Value::str("rolesAtHQ"), Value::Int(authority.roles[1])]),
+            Value::tuple([Value::str("rolesAtBase"), Value::Int(authority.roles[2])]),
+            Value::tuple([Value::str("rolesAtOther"), Value::Int(authority.roles[3])]),
+        ]);
+        assert_eq!(marshal::dumps(&Value::List(session)), marshal::dumps(&expected));
         assert!(rx.try_recv().is_ok_and(|(name, _)| name == "OnCorporationMemberChanged"));
         assert!(roles::update_member(&test_db, &client.world, &client.sde, manager.character, corp + 1, &line).await.is_err());
         let mut clear = patch(member.character);

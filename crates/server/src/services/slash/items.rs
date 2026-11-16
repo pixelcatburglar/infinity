@@ -3,8 +3,10 @@
 //! Ship creation targets a docked character; `/spawn` creates an assembled hull
 //! in the caller's hangar or nearby in space, without boarding it.
 //! Ammunition uses the ordinary reload path.
+//! `/unfit` removes one fitted high/mid/low slot module or all of them; it
+//! refuses rig and subsystem slots while `/unload` keeps accepting them.
 use super::{args::{self, Args}, slash_error, CallError, Client};
-use infinity_core::consts::{FLAG_CARGO, FLAG_HANGAR};
+use infinity_core::consts::{FLAG_CARGO, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR};
 use crate::dao::items::loading::ItemQuery;
 use infinity_core::messages;
 use crate::services::{combat::targeting_charges, dogma, fitting::ship, inventory, items::load_items, db_err};
@@ -47,11 +49,37 @@ pub(super) async fn spawn(c: &mut Client, args: &[String]) -> Result<i64, CallEr
     ship::gm_spawn_ship(c, type_id).await
 }
 
+/// /unfit selector: a numeric argument matches one fitted item ID before a type
+/// ID, a name resolves to a type, and either picks the same-type module on the
+/// lowest slot; `all` selects every ordinary slot module. The DAO returns items
+/// ordered by item ID, so the minimum scans once without sorting or cloning.
+async fn unfit_ids(c: &Client, arg: &str, ship: i64, owner: i64) -> Result<Vec<i64>, CallError> {
+    let items = load_items(&c.db, &c.sde, ItemQuery::LocationOwner(ship, owner)).await.map_err(db_err)?;
+    let fitted = items.iter().filter(|item| inventory::is_fitting_flag(item.flag_id));
+    let ordinary = |item: &&crate::dao::items::loading::Item| (FLAG_FITTING_FIRST..=FLAG_FITTING_LAST).contains(&item.flag_id);
+    if arg.eq_ignore_ascii_case("all") {
+        let selected: Vec<i64> = fitted.filter(ordinary).map(|item| item.item_id).collect();
+        if selected.is_empty() { return Err(slash_error(messages::gm::GM_UNFIT_EMPTY.into())); }
+        return Ok(selected);
+    }
+    let matched = if let Ok(requested) = arg.parse::<i64>() {
+        fitted.clone().find(|item| item.item_id == requested)
+            .or_else(|| fitted.clone().filter(|item| i64::from(item.type_id) == requested).min_by_key(|item| (item.flag_id, item.item_id)))
+    } else {
+        let (type_id, _) = super::resolve_type(c, arg).await?;
+        fitted.clone().filter(|item| item.type_id == type_id).min_by_key(|item| (item.flag_id, item.item_id))
+    };
+    let Some(item) = matched else { return Err(slash_error(messages::gm::GM_ITEM_NOT_FOUND.into())); };
+    if !ordinary(&item) { return Err(slash_error(messages::gm::GM_UNFIT_RESTRICTED.into())); }
+    Ok(vec![item.item_id])
+}
+
 pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> Result<String, CallError> {
     let usage = match command {
         "ship" if args.is_empty() => Some(messages::gm::GM_ITEM_SHIP_USAGE),
         "fit" if args.len() < 2 => Some(messages::gm::GM_ITEM_FIT_USAGE),
         "unload" if args.len() < 2 => Some(messages::gm::GM_ITEM_UNLOAD_USAGE),
+        "unfit" if args.len() != 2 => Some(messages::gm::GM_ITEM_UNFIT_USAGE),
         "load" if args.len() < 3 => Some(messages::gm::GM_ITEM_LOAD_USAGE),
         "online" if args.is_empty() => Some(messages::gm::GM_ITEM_ONLINE_USAGE),
         "iteminfo" if args.is_empty() => Some(messages::gm::GM_ITEM_INFO_USAGE),
@@ -98,6 +126,17 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             let count = inventory::gm::gm_unload(c, ship, owner, selected.into_iter().map(|item| item.item_id).collect(), location, flag).await?;
             Ok(messages::gm::gm_item_unloaded(count))
         }
+        "unfit" => {
+            if !args.first().is_some_and(|s| s.eq_ignore_ascii_case("me")) { return Err(slash_error(messages::gm::GM_ITEM_UNFIT_USAGE.into())); }
+            let (owner, ship) = self_ship(c, args.first().ok_or_else(invalid)?).await?;
+            let ids = unfit_ids(c, parsed.required(1).map_err(|_| slash_error(messages::gm::GM_ITEM_UNFIT_USAGE.into()))?, ship, owner).await?;
+            let (location, flag) = match c.session.int("stationid") {
+                Some(station) => (station, FLAG_HANGAR),
+                None => (ship, FLAG_CARGO),
+            };
+            let count = inventory::gm::gm_unload(c, ship, owner, ids, location, flag).await?;
+            Ok(messages::gm::gm_item_unloaded(count))
+        }
         "load" => {
             parsed.required(0).map_err(|_| slash_error(messages::gm::GM_ITEM_LOAD_USAGE.into()))?;
             parsed.required(1).map_err(|_| slash_error(messages::gm::GM_ITEM_LOAD_USAGE.into()))?;
@@ -134,4 +173,4 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-slash"))] mod tests;

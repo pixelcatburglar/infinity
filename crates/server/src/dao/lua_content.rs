@@ -22,6 +22,12 @@ impl PackageRow {
 pub(crate) async fn load(ex: &(impl Executor + ?Sized), namespace: &str, version: &str) -> Result<Option<PackageRow>, db::Error> {
     Ok(ex.query_opt("SELECT namespace, version, schema_version, compiler_identity, registration, source, data, fingerprint FROM game.lua_content_versions WHERE namespace = $1 AND version = $2", &[&namespace, &version]).await?.map(|row| PackageRow::from_row(&row)))
 }
+
+/// Whole-table read used once by the startup catalogue, ordered by
+/// (namespace, version) so callers may rely on deterministic key order.
+pub(crate) async fn load_all(ex: &(impl Executor + ?Sized)) -> Result<Vec<PackageRow>, db::Error> {
+    Ok(ex.query("SELECT namespace, version, schema_version, compiler_identity, registration, source, data, fingerprint FROM game.lua_content_versions ORDER BY namespace, version", &[]).await?.iter().map(PackageRow::from_row).collect())
+}
 pub(crate) async fn store(ex: &(impl Executor + ?Sized), row: &PackageRow) -> Result<bool, db::Error> {
     ex.execute("INSERT INTO game.lua_content_versions (namespace, version, schema_version, compiler_identity, registration, source, data, fingerprint) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (namespace, version) DO NOTHING", &[&row.namespace, &row.version, &row.schema_version, &row.compiler_identity, &row.registration, &row.source, &row.data, &row.fingerprint]).await?;
     Ok(load(ex, &row.namespace, &row.version).await?.as_ref() == Some(row))

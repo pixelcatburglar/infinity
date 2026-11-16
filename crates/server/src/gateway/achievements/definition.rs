@@ -10,4 +10,4 @@ pub(in crate::gateway) fn handle(ctx: &HandlerContext<'_>, name: &str) -> Result
     checkpoint_from_metadata(ctx, name, "achievements", metadata.version, metadata.crc)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

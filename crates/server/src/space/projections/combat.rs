@@ -119,4 +119,6 @@ impl System {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))]
+#[path = "combat/tests.rs"]
+mod tests;

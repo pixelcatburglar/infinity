@@ -6,8 +6,9 @@
 
 use infinity_core::consts::{CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, GROUP_WRECK, FLAG_SHIP_HANGAR, FLAG_FLEET_HANGAR, MAX_CARGO_CONTAINER_TRANSFER_DISTANCE};
 use infinity_core::consts::dogma::{ATTR_SHIP_MAINTENANCE_BAY_CAPACITY, ATTR_FLEET_HANGAR_CAPACITY};
-use crate::db::executor::Executor;
 use infinity_core::messages;
+use crate::db::executor::Executor;
+use crate::client::filetime_now;
 use crate::sde::Sde;
 use crate::services::{db_err, notify_error, CallError};
 use crate::db::Db;
@@ -154,12 +155,19 @@ impl Reachability {
             if valid { full_lineages.insert(id, rows.clone()); }
             lineages.insert(id, (valid, rows.into_iter().map(|row| (row.ancestor.item_id, row.ancestor)).collect::<HashMap<_, _>>()));
         }
+        let current_corporation = if offices.is_empty() {
+            None
+        } else {
+            super::super::corps::permissions::load(ex, self.character.unwrap_or(0)).await?
+                .filter(|authority| authority.live && Some(authority.corporation) == self.corporation)
+                .map(|authority| authority.corporation)
+        };
         let hulls: Vec<_> = hulls.into_iter().collect();
         let permissions = super::bay_access::permissions_many(ex, self.character.unwrap_or(0), &hulls).await?;
         let mut admitted = Vec::with_capacity(endpoints.len());
         for &endpoint in endpoints {
             let (valid, rows) = &lineages[&endpoint.location];
-            admitted.push(if *valid { self.check_endpoint(sde, endpoint, rows, &offices, &permissions) } else { false });
+            admitted.push(if *valid { self.check_endpoint(sde, endpoint, rows, &offices, &permissions, current_corporation) } else { false });
         }
         Ok(CheckedEndpoints { admitted, lineages, full_lineages })
     }
@@ -172,14 +180,17 @@ impl Reachability {
     fn check_endpoint(&self, sde: &Sde, endpoint: Endpoint,
         rows: &HashMap<i64, crate::dao::items::deliveries::Ancestor>,
         offices: &HashMap<i64, crate::dao::items::deliveries::OfficeMetadata>,
-        permissions: &HashMap<(i64, i64), super::bay_access::Permissions>) -> bool {
+        permissions: &HashMap<(i64, i64), super::bay_access::Permissions>, current_corporation: Option<i64>) -> bool {
         let mut id = endpoint.location;
         let mut flag = endpoint.flag;
         for _ in 0..=rows.len() {
             if self.station == Some(id) && sde.map.station(id).is_some() { return true; }
             if let Some(office) = offices.get(&id) {
-                let (Some(station), Some(corp)) = (self.station, self.corporation) else { return false };
-                return office.corporation_id == corp && office.station_id == station;
+                let (Some(station), Some(corp)) = (self.station, current_corporation) else { return false };
+                // An inactive (impounded, released or expired) lease is still the
+                // recognized custody but grants no ordinary reach.
+                let active = office.is_active(filetime_now());
+                return active && office.corporation_id == corp && office.station_id == station;
             }
             let Some(row) = rows.get(&id) else { return false };
             let Some(ty) = sde.types.get(row.type_id) else { return false };
@@ -206,4 +217,4 @@ impl Reachability {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

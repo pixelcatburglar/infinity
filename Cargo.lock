@@ -731,6 +731,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "infinity-content"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flatbuffers",
+ "flate2",
+ "infinity-core",
+ "marshal",
+ "serde_json",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
+name = "infinity-core"
+version = "0.1.0"
+dependencies = [
+ "marshal",
+]
+
+[[package]]
+name = "infinity-wire"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "infinity-core",
+ "marshal",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "inventory"
 version = "0.3.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1556,13 +1589,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "infinity-core"
-version = "0.1.0"
-dependencies = [
- "marshal",
-]
-
-[[package]]
 name = "server"
 version = "0.1.0"
 dependencies = [
@@ -1571,11 +1597,12 @@ dependencies = [
  "bytes",
  "deadpool-postgres",
  "fancy-regex",
- "flatbuffers",
  "flate2",
  "h2",
  "http",
+ "infinity-content",
  "infinity-core",
+ "infinity-wire",
  "marshal",
  "mlua",
  "prost",

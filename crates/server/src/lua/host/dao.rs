@@ -207,5 +207,5 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, sde: &Arc<Sde>) -> Resul
     env.set("dao", dao)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

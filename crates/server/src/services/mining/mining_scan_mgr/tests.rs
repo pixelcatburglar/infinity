@@ -21,14 +21,6 @@ fn survey_range_uses_largest_valid_fitted_scanner_or_integrated_range() {
     assert_eq!(scanner_range(42.0, [f64::INFINITY, -1.0].into_iter()), 42.0);
 }
 
-async fn fingerprint(db: &crate::db::Db) -> Vec<Vec<String>> {
-    let mut result = Vec::new();
-    for table in ["accounts", "characters", "items", "item_attributes", "asteroids"] {
-        result.push(crate::services::drones::tests::fixture::table_fingerprint(db, table).await.unwrap());
-    }
-    result
-}
-
 #[tokio::test]
 #[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with loaded SDE; run serially"]
 async fn perform_scan_uses_online_survey_range_then_integrated_range() {
@@ -46,7 +38,6 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
     let ore = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ASTEROID)).expect("SDE asteroid").type_id;
     let configured = crate::config::game().mining.scanner_range_m;
     assert!(configured.is_finite() && configured > 0.0);
-    let before = fingerprint(&db).await;
     let (account, character, ship, module): (i64, i64, i64, i64) = db.transaction(
         move |tx, _: &mut ()| Box::pin(async move {
             let account = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('survey-fixture-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
@@ -74,7 +65,7 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
         let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), test_world.clone());
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, test_world, login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, test_world, login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system))]);
         let expected_inner = Value::tuple([Value::Int(inner), Value::Int(ore as i64), Value::Int(17)]);
         let expected_outer = Value::tuple([Value::Int(outer), Value::Int(ore as i64), Value::Int(29)]);
@@ -84,6 +75,7 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&expected_inner) && rows.contains(&expected_outer));
     }).await;
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account, character }], &[ship, module]).await.unwrap();
     let actor = world.asteroid_actor(system);
     for rock in [inner, outer] {
         db.execute("DELETE FROM game.asteroids WHERE asteroid_id=$1 AND system_id=$2 AND field_id=$3", &[&rock, &system, &system]).await.unwrap();
@@ -104,7 +96,8 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
         tx.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await?;
         Ok::<_, crate::db::Error>(())
     }), |(), ()| async move { Ok(()) }).await.unwrap();
-    assert_eq!(fingerprint(&db).await, before);
+    assert!(db.query_opt("SELECT 1 FROM game.asteroids WHERE asteroid_id = ANY($1)", &[&vec![inner, outer]]).await.unwrap().is_none());
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

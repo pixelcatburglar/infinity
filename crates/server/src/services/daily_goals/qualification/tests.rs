@@ -1,9 +1,9 @@
 use super::*;
 use infinity_core::{consts::{FILETIME_DAY, FILETIME_SECOND, GM_ROLES}};
-use crate::{client::filetime_now, dao::{accounts::subscriptions as grades, daily_goals::{instances, periods}, lua_content::{self, activations}}, lua::tests::daily_goals::{environment, identity, reload, source}, services::{daily_goals::queries, subscriptions::{deadlines, management, rules}}};
+use crate::{client::filetime_now, dao::{accounts::subscriptions as grades, daily_goals::{instances, periods}}, lua::tests::daily_goals::{environment, identity, reload, source}, services::{daily_goals::queries, subscriptions::{deadlines, management, rules}}};
 
 #[tokio::test]
-#[ignore = "requires isolated process, dedicated initialized SDE database and externally serialized Lua publication"]
+#[ignore = "requires dedicated initialized SDE database and externally serialized Lua publication; run this exact test in its own process"]
 async fn committed_grade_changes_refresh_current_once() {
     const CHILD: &str = "INFINITY_DAILY_QUALIFICATION_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -18,16 +18,13 @@ async fn committed_grade_changes_refresh_current_once() {
     let b = format!("qualification-{nonce}-b");
     source(&root, &a, false);
     let registry = crate::progress::Registry::new(vec![], vec![crate::services::daily_goals::progress::registration()]).unwrap();
-    let (db, resources) = environment(&root, false, registry).await;
-    let row = lua_content::load(&db, "daily_goals", &a).await.unwrap().unwrap();
+    let (db, resources) = environment(&root, registry).await;
     source(&root, &b, false);
     reload().await;
     let bounds = periods::bounds(&db, filetime_now()).await.unwrap();
     let previous = bounds.month_start - FILETIME_DAY;
-    db.transaction(|tx, _: &mut ()| { let row = row.clone(); Box::pin(async move {
-        assert!(activations::append_if_changed(tx, &row, previous).await?);
-        Ok::<_, crate::db::Error>(())
-    }) }, |(), ()| async { Ok(()) }).await.unwrap();
+    source(&root, &a, false);
+    crate::lua::reload::tests::publish_at(previous).await.unwrap();
     source(&root, &a, false);
     reload().await;
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();

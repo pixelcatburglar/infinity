@@ -1,6 +1,7 @@
-//! Deployment settings and their defaults, including rotating logs and client telemetry mode.
-//! Connection credentials are never formatted in errors. These settings do not mirror
-//! client modules or use tables; logging does not support size-based rotation.
+//! Deployment settings and their defaults, including rotating logs, the client
+//! socket write bound and client telemetry mode. Connection credentials are never
+//! formatted in errors. These settings do not mirror client modules or use
+//! tables; logging does not support size-based rotation.
 
 use std::time::Duration;
 
@@ -9,6 +10,12 @@ use serde::Deserialize;
 
 /// Bytes in a mebibyte, used to bound image uploads.
 const BYTES_PER_MIB: usize = 1024 * 1024;
+
+use infinity_wire::conn::DEFAULT_CLIENT_WRITE_TIMEOUT_SECS;
+/// Server policy: admission time bounds never exceed one day.
+const MAX_ADMISSION_DURATION_SECS: u64 = 86_400;
+/// Server policy: counted credential failures before a cooldown are few.
+const MAX_LOGIN_FAILURE_THRESHOLD: usize = 100;
 
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -25,6 +32,22 @@ pub struct ServerConfig {
     pub login_takeover: bool,
     /// Server policy: bound the position flush at shutdown.
     pub shutdown_flush_timeout_secs: u64,
+    /// Server policy: bound on one client or chat socket write.
+    pub client_write_timeout_secs: u64,
+    /// Server policy: one game handshake's total bound from accept to reply.
+    pub handshake_timeout_secs: u64,
+    /// Server policy: simultaneous handshakes in progress.
+    pub max_pending_handshakes: usize,
+    /// Server policy: simultaneous handshakes from one address.
+    pub max_pending_handshakes_per_address: usize,
+    /// Server policy: counted credential failures inside the window before a cooldown.
+    pub login_failure_threshold: usize,
+    /// Server policy: sliding window for counted credential failures.
+    pub login_failure_window_secs: u64,
+    /// Server policy: refusal period once a source saturates its window.
+    pub login_failure_cooldown_secs: u64,
+    /// Server policy: logins are refused this long before a planned shutdown.
+    pub shutdown_reject_secs: u64,
     /// Infinity build 3653293 handshake macho version.
     pub macho_version: i64,
     /// Infinity build 3653293 handshake boot version.
@@ -42,6 +65,11 @@ impl Default for ServerConfig {
         Self {
             bind: "0.0.0.0:26000".into(), public_host: "127.0.0.1".into(), node_id: 888444,
             system_capacity: 0, login_takeover: true, shutdown_flush_timeout_secs: 10,
+            client_write_timeout_secs: DEFAULT_CLIENT_WRITE_TIMEOUT_SECS,
+            handshake_timeout_secs: 30, max_pending_handshakes: 256,
+            max_pending_handshakes_per_address: 16, login_failure_threshold: 10,
+            login_failure_window_secs: 60, login_failure_cooldown_secs: 60,
+            shutdown_reject_secs: 120,
             macho_version: 496, boot_version: 24.01, boot_build: 3653293,
             boot_codename: "EVE-RELEASE".into(), boot_region: "optic".into(),
         }
@@ -52,6 +80,14 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         if self.node_id <= 0 { bail!("server.node_id must be positive: {}", self.node_id); }
         if self.shutdown_flush_timeout_secs == 0 { bail!("server.shutdown_flush_timeout_secs must be positive: {}", self.shutdown_flush_timeout_secs); }
+        if self.client_write_timeout_secs == 0 { bail!("server.client_write_timeout_secs must be positive: {}", self.client_write_timeout_secs); }
+        if !(1..=MAX_ADMISSION_DURATION_SECS).contains(&self.handshake_timeout_secs) || std::time::Instant::now().checked_add(Duration::from_secs(self.handshake_timeout_secs)).is_none() { bail!("server.handshake_timeout_secs must fit 1..={MAX_ADMISSION_DURATION_SECS} and a deadline: {}", self.handshake_timeout_secs); }
+        if self.max_pending_handshakes == 0 { bail!("server.max_pending_handshakes must be positive: {}", self.max_pending_handshakes); }
+        if self.max_pending_handshakes_per_address == 0 { bail!("server.max_pending_handshakes_per_address must be positive: {}", self.max_pending_handshakes_per_address); }
+        if !(1..=MAX_LOGIN_FAILURE_THRESHOLD).contains(&self.login_failure_threshold) { bail!("server.login_failure_threshold must be in 1..={MAX_LOGIN_FAILURE_THRESHOLD}: {}", self.login_failure_threshold); }
+        for (key, value) in [("server.login_failure_window_secs", self.login_failure_window_secs), ("server.login_failure_cooldown_secs", self.login_failure_cooldown_secs), ("server.shutdown_reject_secs", self.shutdown_reject_secs)] {
+            if !(1..=MAX_ADMISSION_DURATION_SECS).contains(&value) { bail!("{key} must be in 1..={MAX_ADMISSION_DURATION_SECS}: {value}"); }
+        }
         if self.macho_version <= 0 { bail!("server.macho_version must be positive: {}", self.macho_version); }
         if !self.boot_version.is_finite() || self.boot_version <= 0.0 { bail!("server.boot_version must be finite and positive: {}", self.boot_version); }
         if self.boot_build <= 0 { bail!("server.boot_build must be positive: {}", self.boot_build); }
@@ -86,6 +122,10 @@ pub struct DatabaseConfig {
     pub startup_retry_secs: [u64; 2],
     /// Apply the idempotent game schema at startup.
     pub schema_on_start: bool,
+    /// Refuse to apply a game schema whose hash was recorded and later superseded.
+    pub schema_downgrade_guard: bool,
+    /// Permit loss-tolerant transactions to commit without a WAL flush wait.
+    pub loss_tolerant_async_commit: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -94,7 +134,8 @@ impl Default for DatabaseConfig {
             url: String::new(), host: "127.0.0.1".into(), port: 5432, user: "infinity".into(),
             password: String::new(), name: "infinity".into(), application_name: "infinity-server".into(),
             pool_size: 16, connect_timeout_secs: 5, checkout_timeout_secs: 30,
-            startup_retry_secs: [1, 16], schema_on_start: true,
+            startup_retry_secs: [1, 16], schema_on_start: true, schema_downgrade_guard: true,
+            loss_tolerant_async_commit: true,
         }
     }
 }
@@ -285,3 +326,7 @@ impl Default for CdnConfig {
     fn default() -> Self { Self { bind: "0.0.0.0:80".into() } }
 }
 impl CdnConfig { pub fn validate(&self) -> Result<()> { Ok(()) } }
+
+#[cfg(all(test, feature = "tests-runtime"))]
+#[path = "deployment/tests.rs"]
+mod tests;

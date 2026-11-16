@@ -2,7 +2,7 @@
 //! Fixtures are frozen carbonengine output; no native runtime or database is needed.
 
 use super::*;
-use super::destiny_reference::{replay, replay_fractions, ship, STREAM_TICKS};
+use super::destiny_reference::{launch_native, replay, replay_fractions, ship, STREAM_TICKS};
 
 struct Scenario { name: &'static str, fixture: &'static str }
 
@@ -71,7 +71,7 @@ fn commands(system: &mut System, name: &str) {
         "missileflight" => {
             direction(system, 403, [1.0, 0.0, 0.0]);
             let missile = system.ball(402).unwrap().clone();
-            system.launch_missile(missile, 403, 401, 121_000, |_| {});
+            launch_native(system, missile, 403, 401);
         }
         "warp-1au" | "warp-150km" | "warp-50au" => {
             let x = match name { "warp-1au" => 149597870700.0, "warp-150km" => 150000.0, _ => 7479893535000.0 };

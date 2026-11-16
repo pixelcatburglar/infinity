@@ -49,7 +49,7 @@ async fn indexed_drone_repair_uses_actor_health() {
     let stats = ShipStats::from_fit(&fit, Key::Ship);
     let initial = stats.max.map(|v| v * 0.5);
     let condition = prepare_condition_with_fit_key(&db, id, &fit, Key::Ship).await.unwrap();
-    let prepared = crate::space::drone::PreparedDrone { ball, spec, condition, fit, key: Key::Ship };
+    let prepared = crate::space::drone::PreparedDrone { ball, spec, condition, fit, key: Key::Ship, npc_ignored: false };
     system.restore_drone(prepared, Arc::new(|_, _| Some(Box::pin(async {}))));
     assert!(system.set_condition_fraction(id, 0.5));
     assert!(damage::repair_target_in_system(&mut system, id, 1, 25.0, crate::space::combat::RepairSource::Local).unwrap());
@@ -74,12 +74,13 @@ async fn condition_save_and_guarded_death_do_not_resurrect_items() {
     let rows = crate::dao::items::dogma::overrides(&tx, id).await.unwrap();
     let value = |attribute| rows.iter().find(|r| r.attribute_id == attribute).map(|r| r.value);
     assert_eq!([value(ATTR_SHIELD_CHARGE), value(ATTR_ARMOR_DAMAGE), value(ATTR_HULL_DAMAGE)], [Some(80.0), Some(30.0), Some(40.0)]);
-    assert!(crate::dao::items::drones::destroy(&tx, id, owner, system).await.unwrap());
+    assert!(crate::dao::items::drones::claim_lost(&tx, id, 1, owner, system).await.unwrap());
+    crate::dao::items::ship::delete_lost(&tx, id, &[]).await.unwrap();
     assert!(!crate::dao::items::drones::return_to_bay(&tx, id, owner, system, owner, 102).await.unwrap());
     assert!(crate::dao::items::dogma::save_conditions(&tx, system, &ids, &batch).await.unwrap().is_empty());
     assert!(crate::dao::items::dogma::overrides(&tx, id).await.unwrap().is_empty());
     let survivor = crate::dao::items::creation::positioned(&tx, 1, owner, system, [1.0; 3]).await.unwrap();
     assert!(crate::dao::items::drones::return_to_bay(&tx, survivor, owner, system, owner, 102).await.unwrap());
-    assert!(!crate::dao::items::drones::destroy(&tx, survivor, owner, system).await.unwrap());
+    assert!(!crate::dao::items::drones::claim_lost(&tx, survivor, 1, owner, system).await.unwrap());
     tx.rollback().await.unwrap();
 }

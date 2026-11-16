@@ -100,5 +100,5 @@ impl Types {
     pub(crate) fn materials(&self, id: i32) -> &[TypeMaterial] { self.get(id).map(|t| t.materials()).or_else(|| self.orphans.get(&id).map(|c| c.materials.as_slice())).unwrap_or(&[]) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-inventory", feature = "tests-lua", feature = "tests-ships", feature = "tests-space")))]
 pub(crate) mod tests;

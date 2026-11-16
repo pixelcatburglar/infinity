@@ -15,7 +15,7 @@ async fn refusal_preserves_character_and_connection_state() {
     let corporation = services::tests::fixture::create_corporation(&db, fixture.character, 1).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
-        services::tests::fixture::assign_corporation(&test_db, fixture.character, corporation, 0).await.unwrap();
+        services::tests::fixture::assign_corporation(&test_db, fixture.character, corporation, infinity_core::consts::ROLE_DIRECTOR).await.unwrap();
         services::tests::fixture::seed_skill(&test_db, fixture.character).await.unwrap();
         for owner in [fixture.character, foreign.character] {
             crate::dao::items::transfers::insert(&test_db, 1, owner, owner, infinity_core::consts::FLAG_HANGAR, 3).await.unwrap();

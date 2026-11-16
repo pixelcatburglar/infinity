@@ -43,7 +43,9 @@ async fn concurrent_later_stack_change_rolls_back_prefix() {
         let pid: i32 = tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
         tx.query_one("SELECT item_id FROM game.items WHERE item_id=$1 FOR UPDATE", &[&first]).await.unwrap();
         task = Some(tokio::spawn(async move {
-            consume_cycle(&cx, &fit, &[Module { id: module, type_id: module_type, flag }]).await
+            let requirements = super::super::requirements(&fit,
+                &[Module { id: module, type_id: module_type, flag }], Vec::new()).unwrap();
+            consume_cycle(&cx, &requirements).await
         }));
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

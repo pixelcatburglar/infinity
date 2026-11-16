@@ -194,7 +194,13 @@ pub(super) async fn login_info(c: &Client) -> CallResult {
 pub(super) async fn escrow(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let r = crate::dao::contracts::reports::escrow(&c.db, me, TYPE_AUCTION, STATUS_OUTSTANDING, STATUS_IN_PROGRESS).await.map_err(db_err)?;
-    Ok(keyval([("iskEscrow", Value::Float(r.isk)), ("itemsEscrow", Value::Float(r.items))]))
+    Ok(keyval([("iskEscrow", Value::Float(r.isk)), ("itemsEscrow", Value::Float(items_escrow(&c.sde.prices, &r.items)))]))
+}
+
+/// Retail value of the escrowed items: per-type quantity times the snapshot's average
+/// price; a type without a price contributes 0. A float8 display estimate, not an amount.
+fn items_escrow(prices: &crate::sde::prices::Prices, items: &[crate::dao::contracts::reports::EscrowItem]) -> f64 {
+    items.iter().fold(0.0, |total, item| total + item.quantity * prices.get(item.type_id).map_or(0.0, |price| price.average))
 }
 
 /// Resolve the selected station custody without requiring take authority for reads.
@@ -281,10 +287,10 @@ pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quant
                 let new_item = load_items(db, sde, ItemQuery::Id(id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
                 super::super::inventory::notifications::notify_corp_item_change(db, outbox, &new_item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
             } else {
-                outbox.notify_pilot(me, "OnItemChange", vec![left.row(), super::super::inventory::notifications::item_change_dict(change), Value::None]);
+                super::super::inventory::notifications::notify_owner_item_change(outbox, &left, me, change);
                 if crate::dao::items::transfers::docked(db, me).await.map_err(db_err)? == Some(station_id) {
                     let new_item = load_items(db, sde, ItemQuery::Id(id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-                    outbox.notify_pilot(me, "OnItemChange", vec![new_item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(LOCATION_JUNKYARD))]), Value::None]);
+                    super::super::inventory::notifications::notify_owner_item_change(outbox, &new_item, me, [(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]);
                 }
             }
             Ok(Value::Int(id))
@@ -293,5 +299,5 @@ pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quant
     ).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;
 

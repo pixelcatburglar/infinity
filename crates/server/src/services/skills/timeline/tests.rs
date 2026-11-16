@@ -101,8 +101,8 @@ async fn training_booster_expiry_banks_only_until_expiry() {
                     for skill in c.sde.types.iter().filter(|skill| skill.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == skill.type_id)) {
                         let mut old_row = QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut new_row = old_row.clone();
-                        let Ok(old_end) = training::schedule(&c.sde, &mut old_row, &old, start) else { continue };
-                        let Ok(new_end) = training::schedule(&c.sde, &mut new_row, &new, start) else { continue };
+                        let Ok(Some(old_end)) = training::schedule(&c.sde, &mut old_row, &old, start) else { continue };
+                        let Ok(Some(new_end)) = training::schedule(&c.sde, &mut new_row, &new, start) else { continue };
                         if old_end <= expiry || new_end <= old_end { continue; }
                         let banked = training::points_at(0, old_row.dest_sp, start, old_end, expiry);
                         if banked <= 0 || banked + 1 >= old_row.dest_sp { continue; }
@@ -135,6 +135,96 @@ async fn training_booster_expiry_banks_only_until_expiry() {
     }
     fixture::cleanup(&db, f).await.unwrap();
     assert!(exercised, "no training booster and compatible skill found in test SDE");
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn zero_rate_queue_recovers_at_real_booster_expiry_and_completes_after() {
+    use crate::services::tests::{client, fixture};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let (c, _peer) = client(db.clone(), f.character).await;
+    let primary = c.sde.dogma.attributes_by_name("primaryAttribute").next().unwrap().attribute_id;
+    let secondary = c.sde.dogma.attributes_by_name("secondaryAttribute").next().unwrap().attribute_id;
+    let existing = crate::dao::skills::training::current(&db, f.character).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
+        // One real candidate for both phases, chosen in memory before any fixture
+        // row exists: the lowest-type_id passive ItemModifier booster that adds to a
+        // training attribute, and the lowest-type_id untrained skill whose primary
+        // or secondary attribute is the modified one.
+        let (type_id, effect_id, modifying, modified) = c.sde.types.iter().filter(|t| t.attribute(infinity_core::consts::dogma::ATTR_BOOSTERNESS).is_some())
+            .flat_map(|t| t.effects().iter().filter_map(|e| c.sde.dogma.effect(e.effect_id)).filter(|e| e.effect_category.unwrap_or(0) == 0).flat_map(move |e| e.modifiers().iter().map(move |m| (t.type_id, e.effect_id, m))))
+            .filter(|(_, _, m)| CHAR_ATTRIBUTES.contains(&(m.modified as i64)) && m.modified != m.modifying && m.func == "ItemModifier" && m.domain == "charID" && m.op == crate::services::fit::OP_MOD_ADD)
+            .min_by_key(|candidate| candidate.0).map(|(type_id, effect_id, m)| (type_id, effect_id, m.modifying, m.modified))
+            .unwrap_or_else(|| panic!("no passive charID ItemModifier booster on a training attribute in test SDE"));
+        // The fixture must zero the booster's other real training-attribute bonuses.
+        let modifiers = c.sde.types.get(type_id).expect("chosen booster type").effects().iter().filter_map(|e| c.sde.dogma.effect(e.effect_id)).filter(|e| e.effect_category.unwrap_or(0) == 0).flat_map(|e| e.modifiers().iter()).filter(|m| CHAR_ATTRIBUTES.contains(&(m.modified as i64)) && m.modified != m.modifying && m.func == "ItemModifier" && m.domain == "charID" && m.op == crate::services::fit::OP_MOD_ADD).collect::<Vec<_>>();
+        for m in &modifiers { assert!(m.modifying != modifying || m.modified == modified, "type {type_id} attribute {modifying} also modifies training attribute {}", m.modified); }
+        let neutral = modifiers.iter().map(|m| m.modifying).filter(|&a| a != modifying).collect::<std::collections::BTreeSet<_>>();
+        let skill = c.sde.types.iter().filter(|s| s.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == s.type_id)
+                && [primary, secondary].into_iter().any(|a| s.attribute(a) == Some(f64::from(modified))))
+            .min_by_key(|s| s.type_id).map(|s| s.type_id)
+            .unwrap_or_else(|| panic!("no untrained skill on modified attribute {modified} in test SDE"));
+        let expiry = infinity_core::consts::FILETIME_MINUTE * 10;
+        let start = infinity_core::consts::FILETIME_SECOND;
+        for (attr_value, boosted) in [(20.0f64, false), (-20.0, true)].into_iter() {
+            let item: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at,brain_effect_ids) VALUES ($1,$2,$2,$3,true,$4,$5,ARRAY[$6::integer]) RETURNING item_id", &[&type_id, &f.character, &FLAG_BOOSTER, &start, &expiry, &effect_id]).await.unwrap().get("item_id");
+            db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&item, &modifying, &attr_value]).await.unwrap();
+            for attr in &neutral { db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&item, attr, &0.0]).await.unwrap(); }
+            // Only the booster's modified attribute carries a base: for
+            // positive -> zero it is 0 (booster supplies the rate), for
+            // zero -> positive it is 20 (a -20 override cancels it).
+            let mut bases = vec![0i32; CHAR_ATTRIBUTES.len()];
+            bases[CHAR_ATTRIBUTES.iter().position(|&id| id == i64::from(modified)).expect("modified attribute is a training attribute")] = if boosted { 20 } else { 0 };
+            db.execute("INSERT INTO game.character_respec (character_id, bases, free_respecs) VALUES ($1, $2, 0) ON CONFLICT (character_id) DO UPDATE SET bases = EXCLUDED.bases", &[&f.character, &bases]).await.unwrap();
+            let active = Fit::load_character_at(&db, c.sde.clone(), f.character, expiry - 1).await.unwrap_or_else(|_| panic!("loading active booster"));
+            let expired = Fit::load_character_at(&db, c.sde.clone(), f.character, expiry).await.unwrap_or_else(|_| panic!("loading expired booster"));
+            let live: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, active.value(Key::Char, id as i32))).collect();
+            let dead: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, expired.value(Key::Char, id as i32))).collect();
+            let (want_live, want_dead) = if boosted { (0.0, 20.0) } else { (20.0, 0.0) };
+            let want = |value| CHAR_ATTRIBUTES.iter().map(|&id| (id, if id == i64::from(modified) { value } else { 0.0 })).collect::<HashMap<_, _>>();
+            assert_eq!((&live, &dead), (&want(want_live), &want(want_dead)), "live attributes {live:?} dead attributes {dead:?}");
+            let mut row = QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
+            if boosted {
+                // Zero -> positive: starts blocked, resumes at expiry, completes.
+                let Ok(None) = training::schedule(&c.sde, &mut row, &live, start) else { panic!("queue entry must stay blocked under live attributes {live:?}") };
+                let mut resumed = row.clone();
+                let Ok(Some(finite_end)) = training::schedule(&c.sde, &mut resumed, &dead, expiry) else { panic!("expired booster must restore a finite completion under dead attributes {dead:?}") };
+                crate::dao::skills::training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
+                crate::dao::skills::queue::insert(&db, f.character, &row).await.unwrap();
+                let projected = plan(&db, &c.sde, f.character, expiry - 1).await;
+                assert!(!projected.queue_changed && projected.queue == vec![row.clone()]);
+                assert_eq!(projected.skills.iter().find(|s| s.type_id == skill).unwrap().skill_points, 0);
+                let projected = plan(&db, &c.sde, f.character, expiry).await;
+                assert_eq!((projected.queue[0].start_sp, projected.queue[0].start_time, projected.queue[0].end_time), (0, Some(expiry), Some(finite_end)));
+                assert_eq!(projected.skills.iter().find(|s| s.type_id == skill).unwrap().skill_points, 0);
+                let projected = plan(&db, &c.sde, f.character, finite_end).await;
+                assert!(projected.queue.is_empty());
+                assert!(projected.events.iter().any(|event| matches!(event, Event::Completion(done) if done.type_id == skill && done.end_time == finite_end)));
+            } else {
+                // Positive -> zero: banks the finite interval at expiry, then stalls.
+                let Ok(Some(finite_end)) = training::schedule(&c.sde, &mut row, &live, start) else { panic!("live booster must give a finite completion under live attributes {live:?}") };
+                assert!(finite_end > expiry, "queue entry must still be training at booster expiry under live attributes {live:?}");
+                let banked = training::points_at(0, row.dest_sp, start, finite_end, expiry);
+                assert!(banked > 0 && banked < row.dest_sp, "banked points must be a strict partial interval under live attributes {live:?}");
+                crate::dao::skills::training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
+                crate::dao::skills::queue::insert(&db, f.character, &row).await.unwrap();
+                let projected = plan(&db, &c.sde, f.character, expiry).await;
+                assert_eq!((projected.queue[0].start_sp, projected.queue[0].start_time, projected.queue[0].end_time), (banked, Some(expiry), None));
+                assert_eq!(projected.skills.iter().find(|s| s.type_id == skill).unwrap().skill_points, banked);
+                let projected = plan(&db, &c.sde, f.character, expiry + infinity_core::consts::FILETIME_MINUTE).await;
+                assert_eq!((projected.queue[0].start_sp, projected.queue[0].end_time), (banked, None));
+                assert_eq!(projected.skills.iter().find(|s| s.type_id == skill).unwrap().skill_points, banked);
+            }
+            db.execute("DELETE FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
+            crate::dao::skills::queue::clear(&db, f.character).await.unwrap();
+            crate::dao::skills::training::remove(&db, f.character, &[skill]).await.unwrap();
+        }
+    }).await;
+    let cleanup = crate::tests::catch_scenario(async { fixture::cleanup(&db, f).await.unwrap() }).await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]

@@ -39,6 +39,8 @@ pub(crate) struct PreparedDrone {
     pub(crate) condition: crate::services::combat::ConditionSeed,
     pub(crate) fit: crate::services::fit::Fit,
     pub(crate) key: crate::services::fit::Key,
+    /// Real owner's persisted NPC-ignore flag, installed onto the brain at registration.
+    pub(crate) npc_ignored: bool,
 }
 
 #[derive(Clone, Debug)]

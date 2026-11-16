@@ -46,3 +46,12 @@ fn populated_nonexempt_owner_is_rejected_with_context() {
     assert!(error.contains("42"), "{error}");
     assert!(error.contains("7"), "{error}");
 }
+
+#[test]
+fn public_membership_requires_a_real_system_row() {
+    let map = map_with(vec![]);
+    for id in [KNOWN_SPACE_SYSTEM_START, WORMHOLE_SYSTEM_START - 1, WORMHOLE_SYSTEM_START, WORMHOLE_SYSTEM_END, WORMHOLE_SYSTEM_END + 1] {
+        assert!(!map.is_public_system(id));
+    }
+    assert_eq!(map.public_systems().count(), 0);
+}

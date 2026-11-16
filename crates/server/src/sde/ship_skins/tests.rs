@@ -12,6 +12,20 @@ fn visibility_uses_the_selected_region() {
     assert!(other.visible("other"));
 }
 
+#[test]
+fn ordinary_skins_yields_the_unique_region_visible_grant_set() {
+    let skin = |skin_id, is_structure_skin, serenity, tranquility| Skin { skin_id, type_ids: vec![], is_structure_skin, visible_serenity: serenity, visible_tranquility: tranquility };
+    // No license items exist at all: the grant set is the skin definition set, not an item subset.
+    let data = ShipSkins { skins: vec![
+        skin(1, false, true, false), skin(2, true, true, true), skin(3, false, false, true),
+        skin(4, false, true, true), skin(4, false, true, true), skin(5, false, false, false),
+    ], licenses: vec![] };
+    let serenity: Vec<i32> = data.ordinary_skins("optic").map(|skin| skin.skin_id).collect();
+    assert_eq!(serenity, vec![1, 4]);
+    let tranquility: Vec<i32> = data.ordinary_skins("tranquility").map(|skin| skin.skin_id).collect();
+    assert_eq!(tranquility, vec![3, 4]);
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with native SDE"]
 async fn native_rows_load_and_preserve_license_references() {

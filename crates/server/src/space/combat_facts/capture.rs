@@ -115,7 +115,7 @@ impl CombatFacts {
 }
 
 impl CapturedFacts {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tests-space"))]
     pub(crate) fn batch(&self) -> u64 { self.batch }
 
     /// Convert frozen rows only on the checkpoint worker, outside the actor.
@@ -160,4 +160,4 @@ impl CapturedFacts {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

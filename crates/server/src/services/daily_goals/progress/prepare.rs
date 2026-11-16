@@ -3,7 +3,7 @@
 //! delivery receipts remain owned by the shared progress driver.
 use std::{collections::{BTreeMap, HashMap}, future::Future, pin::Pin, sync::Arc};
 use crate::{dao::{accounts::subscriptions::{self, CloneGrade}, characters::persistence, daily_goals::{instances, periods::PeriodRow, rewards}, progress::{self as journal, DeliveryState}}, db::{outbox::Outbox, transaction::TxFuture}, lua::content::PinnedPolicy, progress::{ApplyError, ContentProgressResources, DeliveryKey, EventEnvelope, PrepareOutcome, PreparedDelivery}, sde::Sde, services::CallError};
-use tokio_postgres::Transaction;
+use crate::db::Transaction;
 use super::{apply, source, state::{self, Change, GoalMeta, ReadSet, VirtualGoal, VirtualState}};
 use super::super::{assignment, frozen, Error, Resources};
 
@@ -77,7 +77,7 @@ pub(super) async fn load_state(resources: &Resources, user: i64, character: i64,
     for row in rows {
         let period = periods.get(&(row.kind.clone(), row.period_start)).ok_or(Error::Invalid)?.clone();
         let key = (row.namespace.clone(), row.version.clone());
-        if !pins.contains_key(&key) { pins.insert(key.clone(), resources.policies.resolve(&key.0, &key.1).await?); }
+        if !pins.contains_key(&key) { pins.insert(key.clone(), resources.policies.resolve(&key.0, &key.1)?); }
         let policy = pins.get(&key).ok_or(Error::Unavailable)?.clone();
         let snapshot = frozen::validate(&row)?;
         let id = row.goal_id.clone();
@@ -127,15 +127,16 @@ pub(super) fn prepared(key: DeliveryKey, event: &EventEnvelope, owner: i64, stat
 }
 
 /// Prepare a canonical receipt before entering the shared driver's transaction.
-pub(crate) fn delivery(resources: ContentProgressResources, key: DeliveryKey) -> Pin<Box<dyn Future<Output = Result<PrepareOutcome, CallError>> + Send>> {
+pub(crate) fn delivery(resources: ContentProgressResources, key: DeliveryKey) -> Pin<Box<dyn Future<Output = Result<PrepareOutcome, ApplyError>> + Send>> {
     Box::pin(async move {
         let event = match journal::delivery(&resources.db, &key).await? {
             DeliveryState::Applied => return Ok(PrepareOutcome::AlreadyApplied),
-            DeliveryState::Missing => return Err(CallError::Internal(anyhow::anyhow!("daily delivery missing"))),
+            DeliveryState::Terminal => return Err(ApplyError::Terminal),
+            DeliveryState::Missing => return Err(CallError::Internal(anyhow::anyhow!("daily delivery missing")).into()),
             DeliveryState::Pending(event) => event,
         };
         let identity = Identity::new(&event);
-        let mut fact = source::map(&event, &resources.sde)?;
+        let mut fact = source::map(&event, &resources.sde).map_err(ApplyError::Permanent)?;
         let daily = Resources { db: resources.db, world: resources.world, sde: resources.sde, policies: resources.policies };
         if let Some(fact) = fact.as_mut() {
             if let Some(user) = persistence::user_for_character(&daily.db, fact.character).await? {
@@ -154,4 +155,4 @@ pub(crate) fn delivery(resources: ContentProgressResources, key: DeliveryKey) ->
 }
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

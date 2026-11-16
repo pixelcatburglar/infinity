@@ -1,16 +1,25 @@
 use super::*;
-use crate::services::effects::{projection::Projection, EffectKind, JammingType};
-use crate::space::System;
+#[cfg(feature = "tests-combat")] use crate::services::effects::{projection::Projection, EffectKind, JammingType};
+#[cfg(feature = "tests-combat")] use crate::space::System;
 
-mod auto_reload_db;
-mod charge_sync;
-mod external_completion;
-mod gm_reload;
-mod container_capacity;
-mod container_races;
+#[cfg(feature = "tests-combat")] mod auto_reload_db;
+#[cfg(feature = "tests-combat")] mod charge_sync;
+#[cfg(feature = "tests-combat")] mod external_completion;
+#[cfg(feature = "tests-combat")] mod gm_reload;
+#[cfg(feature = "tests-combat")] mod container_capacity;
+#[cfg(feature = "tests-combat")] mod container_races;
+#[cfg(feature = "tests-combat")] mod nested_loss;
+#[cfg(feature = "tests-combat")] mod probe_launch;
+
+/// Owner item identity used to compare reservation rows before and after completion.
+#[cfg(feature = "tests-combat")]
+async fn rows(db: &Db, owner: i64) -> Vec<(i64, i32, i64, i64, i32, i64, bool)> {
+    crate::dao::items::loading::load_items(db, crate::dao::items::loading::ItemQuery::Owner(owner)).await.unwrap().into_iter()
+        .map(|r| (r.item_id, r.type_id, r.owner_id, r.location_id, r.flag_id, r.quantity, r.singleton)).collect()
+}
 
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn refused_unload_preserves_charge_and_emits_nothing() {
     crate::tests::init_config();
@@ -64,7 +73,7 @@ async fn refused_unload_preserves_charge_and_emits_nothing() {
     tx.rollback().await.unwrap();
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn replacement_reload_refuses_overfilled_cargo_atomically() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -127,21 +136,28 @@ async fn replacement_reload_refuses_overfilled_cargo_atomically() {
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
 }
 
-#[test]
+
+
+#[cfg(feature = "tests-combat")] #[test]
 fn pending_locks_recheck_generation_validity_and_capacity() {
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut st = State::default();
-    st.locking.insert((1, 10), 2);
+    st.locking.insert((1, 10), PendingLock { attempt: 2, ui_owner: Some(ui_tx) });
     assert_eq!(finish_lock(&mut st, 100, 1, 10, 1, 0, true, 1, None), (false, false));
+    assert!(ui_rx.try_recv().is_err());
     assert_eq!(finish_lock(&mut st, 100, 1, 10, 2, 0, false, 1, None), (true, false));
+    assert_eq!(ui_rx.try_recv().unwrap(), crate::client::target_lock_failure(1, 10, 2));
     assert!(st.targets.get(&1).is_none());
-    st.locking.insert((1, 10), 3);
+    st.locking.insert((1, 10), PendingLock { attempt: 3, ui_owner: None });
     assert_eq!(finish_lock(&mut st, 100, 1, 10, 3, 0, true, 1, None), (true, true));
-    st.locking.insert((1, 11), 4);
+    assert!(ui_rx.try_recv().is_err());
+    st.locking.insert((1, 11), PendingLock { attempt: 4, ui_owner: None });
     assert_eq!(finish_lock(&mut st, 100, 1, 11, 4, 0, true, 1, None), (true, false));
     assert_eq!(st.targets[&1], HashSet::from([10]));
+    assert!(ui_rx.try_recv().is_err());
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn cycle_lock_completion_survives_retirement_and_replacement_but_not_stop() {
     for case in 0..5 {
         let mut st = State::default();
@@ -149,7 +165,7 @@ fn cycle_lock_completion_survives_retirement_and_replacement_but_not_stop() {
         let owner = (2, generation.clone());
         st.active.insert(2, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         assert!(lock_owner_valid(&st, Some(&owner)));
-        st.locking.insert((1, 10), 1);
+        st.locking.insert((1, 10), PendingLock { attempt: 1, ui_owner: None });
         match case {
             0 => generation.store(true, Ordering::Relaxed),
             1 => st.active.get_mut(&2).unwrap().stop = Arc::new(AtomicBool::new(false)),
@@ -168,7 +184,7 @@ fn cycle_lock_completion_survives_retirement_and_replacement_but_not_stop() {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn jam_rejects_cycle_lock_completion_after_owner_retirement() {
     crate::tests::init_config();
     let ship = NEXT_LOCK.fetch_add(4, Ordering::Relaxed) as i64;
@@ -190,26 +206,28 @@ fn jam_rejects_cycle_lock_completion_after_owner_retirement() {
     let generation = Arc::new(AtomicBool::new(false));
     let owner = (module, generation);
     jamming::apply(&mut system, target, module, ship, 100.0);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut st = state();
-    st.locking.insert((pilot, target), 1);
+    st.locking.insert((pilot, target), PendingLock { attempt: 1, ui_owner: Some(ui_tx) });
     assert_eq!(finish_lock(&mut st, ship, pilot, target, 1, 1000, true, 1, Some(&owner)), (true, false));
     assert!(!st.targets.contains_key(&pilot));
     drop(st);
+    assert_eq!(ui_rx.try_recv().unwrap(), crate::client::target_lock_failure(pilot, target, 1));
     jamming::clear(&mut system, ship);
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn auto_target_candidates_only_include_pilots_locking_the_ship() {
     let mut st = State::default();
     st.targets.insert(1, HashSet::from([10]));
     st.targets.insert(2, HashSet::from([11]));
-    st.locking.insert((3, 10), 1);
+    st.locking.insert((3, 10), PendingLock { attempt: 1, ui_owner: None });
     assert_eq!(targeters_in(&st, 10), vec![1]);
     assert_eq!(targeters_in(&st, 11), vec![2]);
     assert!(targeters_in(&st, 12).is_empty());
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn passive_lock_notifies_owner_without_yellow_box() {
     for silent in [false, true] {
         let mut owner = Vec::new();
@@ -224,7 +242,7 @@ fn passive_lock_notifies_owner_without_yellow_box() {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn loss_notices_only_consume_announced_locks() {
     let mut st = State::default();
     st.targets.insert(1, HashSet::from([20, 30]));
@@ -234,14 +252,14 @@ fn loss_notices_only_consume_announced_locks() {
     assert!(take_announced(&mut st, |_, _| true).is_empty());
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn cloak_lock_invalidation_preserves_unrelated_locks_and_capacitor() {
     let mut st = State::default();
     st.targets.insert(1, HashSet::from([20, 30]));
     st.targets.insert(2, HashSet::from([10, 40]));
-    st.locking.insert((1, 50), 1);
-    st.locking.insert((2, 10), 2);
-    st.locking.insert((2, 40), 3);
+    st.locking.insert((1, 50), PendingLock { attempt: 1, ui_owner: None });
+    st.locking.insert((2, 10), PendingLock { attempt: 2, ui_owner: None });
+    st.locking.insert((2, 40), PendingLock { attempt: 3, ui_owner: None });
     st.capacitor.insert(10, (42.0, 1));
     let (incoming, outgoing) = clear_lock_state(&mut st, 10, 1);
     assert_eq!(incoming, vec![2]);
@@ -251,7 +269,48 @@ fn cloak_lock_invalidation_preserves_unrelated_locks_and_capacitor() {
     assert_eq!(st.capacitor[&10], (42.0, 1));
 }
 
-#[test]
+/// A queued failure keeps its attempt identity: only a current UI-owned or
+/// same-attempt pending, or a completed lock, suppresses it; a different
+/// internal attempt does not, and a retired successor leaves no history.
+#[cfg(feature = "tests-combat")] #[test]
+fn pending_lock_failure_respects_current_ui_attempt() {
+    let ship = NEXT_LOCK.fetch_add(4, Ordering::Relaxed) as i64;
+    let (pilot, target, other) = (ship + 1, ship + 2, ship + 3);
+    let failure = crate::client::TargetLockFailure { character: pilot, target, attempt: 1 };
+    let emitted = std::cell::Cell::new(0);
+    state().locking.insert((pilot, other), PendingLock { attempt: 9, ui_owner: None });
+    assert!(with_pending_failure_current(failure, || emitted.set(emitted.get() + 1)));
+    state().locking.insert((pilot, target), PendingLock { attempt: 1, ui_owner: None });
+    assert!(!with_pending_failure_current(failure, || emitted.set(emitted.get() + 1)));
+    state().locking.insert((pilot, target), PendingLock { attempt: 2, ui_owner: None });
+    assert!(with_pending_failure_current(failure, || emitted.set(emitted.get() + 1)));
+    assert_eq!(state().locking[&(pilot, target)].attempt, 2);
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    state().locking.get_mut(&(pilot, target)).unwrap().ui_owner = Some(ui_tx);
+    assert!(!with_pending_failure_current(failure, || emitted.set(emitted.get() + 1)));
+    state().locking.remove(&(pilot, target));
+    state().targets.insert(pilot, HashSet::from([target]));
+    assert!(!with_pending_failure_current(failure, || emitted.set(emitted.get() + 1)));
+    state().targets.remove(&pilot);
+    assert!(with_pending_failure_current(failure, || emitted.set(emitted.get() + 1)));
+    assert_eq!(emitted.get(), 3);
+    state().locking.remove(&(pilot, other));
+}
+
+#[cfg(feature = "tests-combat")] #[test]
+fn cancel_target_publishes_one_ui_failure() {
+    let ship = NEXT_LOCK.fetch_add(4, Ordering::Relaxed) as i64;
+    let (pilot, target) = (ship + 1, ship + 2);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    state().locking.insert((pilot, target), PendingLock { attempt: 5, ui_owner: Some(ui_tx) });
+    cancel_target(pilot, target);
+    assert!(!state().locking.contains_key(&(pilot, target)));
+    assert_eq!(ui_rx.try_recv().unwrap(), crate::client::target_lock_failure(pilot, target, 5));
+    cancel_target(pilot, target);
+    assert!(ui_rx.try_recv().is_err());
+}
+
+#[cfg(feature = "tests-combat")] #[test]
 fn reload_groups_use_each_modules_deadline_and_charge_type() {
     let loads = vec![
         PendingLoad { owner: 1, reload_ids: vec![1, 5], external_sources: vec![], external_facts: Vec::new(), load: (1, 1, 10, 5, 0) },
@@ -266,7 +325,7 @@ fn reload_groups_use_each_modules_deadline_and_charge_type() {
     assert_eq!(ids((filetime_ticks_from_ms(1000.0), 11)), vec![4]);
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn exhausted_stock_only_counts_modules_with_reservations() {
     let item = Item { item_id: 1, type_id: 10, owner_id: 1, location_id: 2, flag_id: FLAG_CARGO,
         quantity: 6, singleton: false, group_id: 0, category_id: 0, custom_info: None };
@@ -278,7 +337,7 @@ fn exhausted_stock_only_counts_modules_with_reservations() {
 }
 
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized test database"]
 async fn member_resolution_is_separate_from_master_only_bank() {
 
@@ -328,7 +387,7 @@ async fn member_resolution_is_separate_from_master_only_bank() {
     result.expect("bank assertions");
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn removed_locks_clear_only_matching_outgoing_projections() {
     let mut s = System::new(0, Arc::default(), 1_000);
     let ball = Ball {
@@ -360,7 +419,7 @@ fn removed_locks_clear_only_matching_outgoing_projections() {
     assert!(s.projections_on(3).is_empty());
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn compatible_groups_and_sizes_are_required() {
     assert!(charge_matches([10.0, 20.0].into_iter(), Some(20), Some(2.0), Some(2.0)));
     assert!(!charge_matches([10.0].into_iter(), Some(20), Some(2.0), Some(2.0)));
@@ -370,8 +429,9 @@ fn compatible_groups_and_sizes_are_required() {
     assert!(charge_matches([20.0].into_iter(), Some(20), None, None));
 }
 
-mod shared_bays;
+#[cfg(feature = "tests-combat")] mod shared_bays;
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships"))]
 pub(in crate::services) fn compatible_ammunition(sde: &Sde) -> (i32, i32) {
     let size_id = sde.dogma.attributes_by_name("chargeSize").next().map(|a| a.attribute_id);
     sde.types.iter().filter(|m| m.published == Some(true) && m.category_id == Some(infinity_core::consts::CATEGORY_MODULE) && sde.is_tradable(m.type_id))
@@ -386,6 +446,7 @@ pub(in crate::services) fn compatible_ammunition(sde: &Sde) -> (i32, i32) {
         }).expect("compatible module and charge")
 }
 
+#[cfg(feature = "tests-combat")]
 async fn shared_reload_fixture() -> (crate::services::drones::tests::fixture::Fixture, i64, i64, i32, i64) {
     let mut f = crate::services::drones::tests::fixture::Fixture::with_hold_attributes(&[
         infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY,
@@ -402,7 +463,7 @@ async fn shared_reload_fixture() -> (crate::services::drones::tests::fixture::Fi
     (f, guest, module, charge_type, source)
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
 async fn shared_guest_reload_reservation_refunds_actor_without_changing_guest_remainder() {
     let (mut f, guest, module, charge_type, source) = shared_reload_fixture().await;
@@ -445,63 +506,69 @@ async fn shared_guest_reload_reservation_refunds_actor_without_changing_guest_re
     f.cleanup().await;
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
 async fn selected_unload_capacity_refusal_rolls_back_and_shared_hull_accepts() {
     use crate::services::drones::tests::fixture::Fixture;
     let mut f = Fixture::with_hold_attributes(&[infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY]).await;
-    let (module_type, charge_type) = compatible_ammunition(&f.sde);
-    let charge = f.sde.types.get(charge_type).unwrap();
-    let capacity = (charge.volume.unwrap() * (f64::from(i32::MAX) + 4.0) * 2.0).max(1_000_000.0);
-    assert!(capacity.is_finite());
-    let ship = f.ship;
-    let host_type = f.world.ball(f.system, ship).await.unwrap().type_id;
-    let host = crate::dao::items::creation::positioned(&f.db, host_type, f.owner, f.system, [0.0; 3]).await.unwrap();
-    let mut ball = f.world.ball(f.system, ship).await.unwrap();
-    ball.id = host;
-    ball.type_id = host_type;
-    ball.char_id = None;
-    f.world.add_ship(f.system, ball).await.unwrap();
-    let flag = infinity_core::consts::FLAG_FITTING_FIRST;
-    let module = crate::dao::items::creation::rookie_ship(&f.db, module_type, f.owner, ship, flag).await.unwrap();
-    let second_flag = flag + 1;
-    let second = crate::dao::items::creation::rookie_ship(&f.db, module_type, f.owner, ship, second_flag).await.unwrap();
-    crate::dao::items::combat::apply_loads(&f.db, ship, &[(module, flag, charge_type, 2, 0), (second, second_flag, charge_type, 2, 0)]).await.unwrap();
-    let source = crate::dao::items::transfers::insert(&f.db, charge_type, f.owner, ship, FLAG_CARGO, 5).await.unwrap();
-    let pending_id = crate::dao::items::pending_reloads::insert(&f.db, f.owner, ship, module, flag, charge_type, 1, FLAG_CARGO, ship).await.unwrap();
-    let pending_before = crate::dao::items::pending_reloads::for_ship(&f.db, ship).await.unwrap();
-    assert!(pending_before.len() == 1 && pending_before[0].reload_id == pending_id);
-    assert!(crate::dao::items::pending_reloads::intersecting(&f.db, &[ship]).await.unwrap() == pending_before);
-    let source_before = load_items(&f.db, &f.sde, ItemQuery::Id(source)).await.unwrap().pop().unwrap();
-    let (viewer, _) = f.add_pilot().await;
-    let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-    f.world.register_pilot(viewer, sender);
-    f.set(host, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, 0.0).await;
-    assert_eq!(crate::services::inventory::hold_storage::capacity(&f.db, &f.sde, f.owner, host, FLAG_FLEET_HANGAR).await.unwrap().unwrap().0, 0.0);
-    let args = [Value::Int(ship), Value::list([Value::Int(module), Value::Int(second)]), Value::tuple([Value::Int(host), Value::Int(i64::MAX), Value::Int(i64::from(FLAG_FLEET_HANGAR))])];
-    let kwargs = Value::None;
-    let call = Call { service: "dogmaIM", method: "UnloadAmmo", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
-    let before = f.client.outbox.len();
-    assert!(crate::services::dispatch(&mut f.client, &call).await.is_err());
-    assert_eq!(loaded(&f.db, ship, flag).await.unwrap(), Some((charge_type, 2)));
-    assert_eq!(loaded(&f.db, ship, second_flag).await.unwrap(), Some((charge_type, 2)));
-    assert!(crate::dao::items::pending_reloads::for_ship(&f.db, ship).await.unwrap() == pending_before);
-    assert!(received.try_recv().is_err());
-    assert_eq!(f.client.outbox.len(), before);
-    f.set(host, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, capacity).await;
-    assert_eq!(crate::services::inventory::hold_storage::capacity(&f.db, &f.sde, f.owner, host, FLAG_FLEET_HANGAR).await.unwrap().unwrap().0, capacity);
-    let full = crate::dao::items::transfers::insert(&f.db, charge_type, f.owner, host, FLAG_FLEET_HANGAR, i64::from(i32::MAX) - 2).await.unwrap();
-    crate::services::dispatch(&mut f.client, &call).await.unwrap();
-    assert_eq!(loaded(&f.db, ship, flag).await.unwrap(), None);
-    assert_eq!(loaded(&f.db, ship, second_flag).await.unwrap(), None);
-    let row = load_items(&f.db, &f.sde, ItemQuery::Id(full)).await.unwrap().pop().unwrap();
-    assert_eq!(row.quantity, i64::from(i32::MAX) + 2);
-    assert_eq!(load_items(&f.db, &f.sde, ItemQuery::Id(source)).await.unwrap().pop().unwrap().quantity, source_before.quantity);
-    assert!(crate::dao::items::pending_reloads::for_ship(&f.db, ship).await.unwrap() == pending_before);
+    let result = crate::tests::catch_scenario(async {
+        let (module_type, charge_type) = compatible_ammunition(&f.sde);
+        let charge = f.sde.types.get(charge_type).unwrap();
+        let capacity = (charge.volume.unwrap() * (f64::from(i32::MAX) + 4.0) * 2.0).max(1_000_000.0);
+        assert!(capacity.is_finite());
+        let ship = f.ship;
+        let host_type = f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
+            && t.attribute(infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY).is_some_and(|v| v.is_finite() && v > 0.0)
+            && !t.modifiers(&f.sde.dogma, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY).any(|(_, m)| m.domain == "shipID"))
+            .expect("published ship with finite unmodified fleet hangar capacity").type_id;
+        let host = crate::dao::items::creation::positioned(&f.db, host_type, f.owner, f.system, [0.0; 3]).await.unwrap();
+        let mut ball = f.world.ball(f.system, ship).await.unwrap();
+        ball.id = host;
+        ball.type_id = host_type;
+        ball.char_id = None;
+        f.world.add_ship(f.system, ball).await.unwrap();
+        let flag = infinity_core::consts::FLAG_FITTING_FIRST;
+        let module = crate::dao::items::creation::rookie_ship(&f.db, module_type, f.owner, ship, flag).await.unwrap();
+        let second_flag = flag + 1;
+        let second = crate::dao::items::creation::rookie_ship(&f.db, module_type, f.owner, ship, second_flag).await.unwrap();
+        crate::dao::items::combat::apply_loads(&f.db, ship, &[(module, flag, charge_type, 2, 0), (second, second_flag, charge_type, 2, 0)]).await.unwrap();
+        let source = crate::dao::items::transfers::insert(&f.db, charge_type, f.owner, ship, FLAG_CARGO, 5).await.unwrap();
+        let pending_id = crate::dao::items::pending_reloads::insert(&f.db, f.owner, ship, module, flag, charge_type, 1, FLAG_CARGO, ship).await.unwrap();
+        let pending_before = crate::dao::items::pending_reloads::for_ship(&f.db, ship).await.unwrap();
+        assert!(pending_before.len() == 1 && pending_before[0].reload_id == pending_id);
+        assert!(crate::dao::items::pending_reloads::intersecting(&f.db, &[ship]).await.unwrap() == pending_before);
+        let source_before = load_items(&f.db, &f.sde, ItemQuery::Id(source)).await.unwrap().pop().unwrap();
+        let (viewer, _) = f.add_pilot().await;
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        f.world.register_pilot(viewer, sender);
+        f.set(host, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, 0.0).await;
+        assert_eq!(crate::services::inventory::hold_storage::capacity(&f.db, &f.sde, f.owner, host, FLAG_FLEET_HANGAR).await.unwrap().unwrap().0, crate::services::inventory::holds::CapacityLimit::Finite(0.0));
+        let args = [Value::Int(ship), Value::list([Value::Int(module), Value::Int(second)]), Value::tuple([Value::Int(host), Value::Int(i64::MAX), Value::Int(i64::from(FLAG_FLEET_HANGAR))])];
+        let kwargs = Value::None;
+        let call = Call { service: "dogmaIM", method: "UnloadAmmo", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
+        let before = f.client.outbox.len();
+        assert!(crate::services::dispatch(&mut f.client, &call).await.is_err());
+        assert_eq!(loaded(&f.db, ship, flag).await.unwrap(), Some((charge_type, 2)));
+        assert_eq!(loaded(&f.db, ship, second_flag).await.unwrap(), Some((charge_type, 2)));
+        assert!(crate::dao::items::pending_reloads::for_ship(&f.db, ship).await.unwrap() == pending_before);
+        assert!(received.try_recv().is_err());
+        assert_eq!(f.client.outbox.len(), before);
+        f.set(host, infinity_core::consts::dogma::ATTR_FLEET_HANGAR_CAPACITY, capacity).await;
+        assert_eq!(crate::services::inventory::hold_storage::capacity(&f.db, &f.sde, f.owner, host, FLAG_FLEET_HANGAR).await.unwrap().unwrap().0, crate::services::inventory::holds::CapacityLimit::Finite(capacity));
+        let full = crate::dao::items::transfers::insert(&f.db, charge_type, f.owner, host, FLAG_FLEET_HANGAR, i64::from(i32::MAX) - 2).await.unwrap();
+        crate::services::dispatch(&mut f.client, &call).await.unwrap();
+        assert_eq!(loaded(&f.db, ship, flag).await.unwrap(), None);
+        assert_eq!(loaded(&f.db, ship, second_flag).await.unwrap(), None);
+        let row = load_items(&f.db, &f.sde, ItemQuery::Id(full)).await.unwrap().pop().unwrap();
+        assert_eq!(row.quantity, i64::from(i32::MAX) + 2);
+        assert_eq!(load_items(&f.db, &f.sde, ItemQuery::Id(source)).await.unwrap().pop().unwrap().quantity, source_before.quantity);
+        assert!(crate::dao::items::pending_reloads::for_ship(&f.db, ship).await.unwrap() == pending_before);
+    }).await;
     f.cleanup().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn selected_unload_locks_destination_hull_before_module() {
     use crate::services::drones::tests::fixture::Fixture;

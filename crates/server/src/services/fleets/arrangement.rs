@@ -57,6 +57,6 @@ pub(super) fn publish(world: &World, fleet_id: i64, f: &Fleet, changes: Vec<(i64
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 #[path = "tests/arrangement.rs"]
 mod tests;

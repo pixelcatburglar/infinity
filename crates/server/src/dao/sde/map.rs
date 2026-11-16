@@ -132,5 +132,5 @@ pub(crate) async fn jumps(ex: &(impl Executor + ?Sized)) -> Result<Vec<Jump>, db
     Ok(ex.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps ORDER BY from_solar_system_id, to_solar_system_id", &[]).await?.iter().map(Jump::from_row).collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

@@ -69,5 +69,5 @@ pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, C
     Ok(Value::Dict(entries))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-skills"))]
 mod tests;

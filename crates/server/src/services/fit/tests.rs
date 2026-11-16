@@ -1,5 +1,7 @@
 use super::apply;
 
+mod resistance_floor;
+
 #[test]
 fn operations_and_stacking() {
     // 3 x 5% damage skill bonus (PostPercent, unpenalized) on 2.0
@@ -94,7 +96,7 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
     let node = super::Node {
         type_id: 1, data_position: None, location: super::Location::Char,
         online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
-        charge_type: None, level: Some(level), overrides: vec![(super::ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![],
+        charge_type: None, level: Some(level), overrides: vec![(super::ATTR_SKILL_LEVEL, 99.0)], cargo_unlimited: false, charge_values: vec![],
     };
     assert_eq!(node.base(None, None, super::ATTR_SKILL_LEVEL), 3.0);
 }
@@ -112,7 +114,7 @@ fn supplied_skill_level_comes_from_points_not_stored_level() {
 fn fixture_node(location: super::Location) -> super::Node {
     super::Node { type_id: 1, data_position: None, location, online: true,
         active: false, overloaded: false, projected_effect: None, receiver: None,
-        charge_type: None, level: None, overrides: vec![], charge_values: vec![] }
+        charge_type: None, level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![] }
 }
 
 fn fixture_modifier(func: &str, domain: &str) -> super::Modifier {
@@ -167,7 +169,7 @@ async fn real_sde_prospective_drone_and_projection_receivers() {
             && effect.modifiers().iter().any(|modifier| modifier.modified == ATTR_MAX_VELOCITY)),
         "Drone Navigation must have a passive velocity modifier in the SDE");
     for entry in skill_data.effects() {
-        if entry.effect_id == super::EFFECT_SKILL { continue; }
+        if entry.effect_id == infinity_core::consts::dogma::EFFECT_SKILL { continue; }
         let Some(effect) = sde.dogma.effect(entry.effect_id) else { continue };
         if effect.effect_category.unwrap_or(0) != super::EFFECT_CATEGORY_PASSIVE { continue; }
         for (position, modifier) in effect.modifiers().iter().enumerate() {
@@ -446,7 +448,7 @@ fn drone_physical_base_corrects_only_missing_or_nonpositive_inputs() {
 #[test]
 fn node_override_precedence_and_modifier() {
     use super::{Node, Location, ATTR_SKILL_LEVEL};
-    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, receiver: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![] };
+    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, receiver: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], cargo_unlimited: false, charge_values: vec![] };
     let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
     assert_eq!(node.base(None, Some(&meta), 1), 10.0);
     assert_eq!(node.base(None, None, 2), 0.0);
@@ -554,5 +556,62 @@ async fn expert_fit_projects_virtual_level_and_dogma_sp_without_mutating_trainin
     assert_eq!(after.value(super::Key::Skill(skill_type), ATTR_SKILL_POINTS), crate::services::skills::formulas::sp_for_level(rank, i64::from(virtual_level)).max(trained_points) as f64);
     let stored: i64 = db.query_one("SELECT skill_points FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&f.character, &skill_type]).await.unwrap().get("skill_points");
     assert_eq!(stored, trained_points);
+    fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn expert_only_skills_apply_passives_once_and_expire() {
+    use super::{Fit, Key};
+    use crate::services::tests::fixture;
+    use infinity_core::consts::{SKILL_SOCIAL, dogma::{ATTR_SKILL_LEVEL, ATTR_SKILL_TIME_CONSTANT, ATTR_SOCIAL_MUTATOR}};
+    use std::sync::Arc;
+
+    // SDE: Social/socialMutator and Negotiation/negotiationBonus.
+    const SKILL_ATTRIBUTES: [(i32, i32); 2] = [(SKILL_SOCIAL, ATTR_SOCIAL_MUTATOR), (3356, 437)];
+    // SDE: character negotiationPercentage, modified by effect 404.
+    const NEGOTIATION_PERCENTAGE: i32 = 355;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let definition = sde.expert_systems.iter().find(|definition| {
+        !definition.hidden && !definition.retired && SKILL_ATTRIBUTES.iter().all(|&(skill, _)| {
+            definition.skills.iter().any(|&(kind, level)| kind == skill && level > 1)
+        })
+    }).expect("expert definition granting Social and Negotiation above level one");
+    let granted = |skill| definition.skills.iter().find(|&&(kind, _)| kind == skill).unwrap().1;
+    db.execute("INSERT INTO game.character_expert_systems (character_id,type_id,installed_at,expires_at) VALUES ($1,$2,100,300)", &[&f.character, &definition.type_id]).await.unwrap();
+
+    let virtual_only = Fit::load_character_at(&db, sde.clone(), f.character, 200).await.unwrap();
+    let expired_only = Fit::load_character_at(&db, sde.clone(), f.character, 300).await.unwrap();
+    for &(skill, attribute) in &SKILL_ATTRIBUTES {
+        assert_eq!(virtual_only.value(Key::Skill(skill), ATTR_SKILL_LEVEL), f64::from(granted(skill)));
+        assert_eq!(virtual_only.value(Key::Skill(skill), attribute), 5.0 * f64::from(granted(skill)));
+        assert_eq!(expired_only.value(Key::Skill(skill), attribute), 0.0);
+    }
+    let negotiation = SKILL_ATTRIBUTES[1].0;
+    let expected = 1.0 + 5.0 * f64::from(granted(negotiation)) / 100.0;
+    assert!((virtual_only.value(Key::Char, NEGOTIATION_PERCENTAGE) - expected).abs() < 1e-9);
+    assert_eq!(expired_only.value(Key::Char, NEGOTIATION_PERCENTAGE), 1.0);
+
+    for &(skill, _) in &SKILL_ATTRIBUTES {
+        let rank = sde.types.get(skill).and_then(|data| data.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).expect("skill rank");
+        let points = crate::services::skills::formulas::sp_for_level(rank, 1);
+        db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&f.character, &skill, &points]).await.unwrap();
+    }
+    let mixed = Fit::load_character_at(&db, sde.clone(), f.character, 200).await.unwrap();
+    let fallback = Fit::load_character_at(&db, sde.clone(), f.character, 300).await.unwrap();
+    for &(skill, attribute) in &SKILL_ATTRIBUTES {
+        assert_eq!(mixed.value(Key::Skill(skill), attribute), virtual_only.value(Key::Skill(skill), attribute));
+        assert_eq!(fallback.value(Key::Skill(skill), ATTR_SKILL_LEVEL), 1.0);
+        assert_eq!(fallback.value(Key::Skill(skill), attribute), 5.0);
+        let stored = db.query_one("SELECT level,skill_points FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&f.character, &skill]).await.unwrap();
+        let rank = sde.types.get(skill).and_then(|data| data.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap();
+        assert_eq!(stored.get::<_, i32>("level"), 1);
+        assert_eq!(stored.get::<_, i64>("skill_points"), crate::services::skills::formulas::sp_for_level(rank, 1));
+    }
+    assert!((mixed.value(Key::Char, NEGOTIATION_PERCENTAGE) - expected).abs() < 1e-9);
+    assert!((fallback.value(Key::Char, NEGOTIATION_PERCENTAGE) - 1.05).abs() < 1e-9);
     fixture::cleanup(&db, f).await.unwrap();
 }

@@ -158,4 +158,4 @@ impl Policy {
     pub(super) fn summary(&self) -> Summary { let all = self.entries.iter().chain(self.groups.iter().flat_map(|g| g.entries.iter())); Summary { entries: all.clone().count(), bound_entries: all.filter(|e| e.soulbound).count(), groups: self.groups.len(), draws: self.draws } }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-sde"))] mod tests;

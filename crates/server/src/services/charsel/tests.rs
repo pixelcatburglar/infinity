@@ -169,7 +169,8 @@ const SPACE_SELECTION_FIXTURE_CLEARANCE: f64 = 1_000.0;
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn space_selection_restores_cloak_before_session_and_without_map_telemetry() {
     use std::sync::Arc;
-    use crate::{config::{Config, deployment::DatabaseConfig}, conn::Conn, db::Db, handshake::Login, macho::{self, Address}, sde::Sde, space::{World, CLOAK_RESTORE}};
+    use crate::{config::{Config, deployment::DatabaseConfig}, db::Db, handshake::Login, sde::Sde, space::{World, CLOAK_RESTORE}};
+    use infinity_wire::{conn::Conn, macho::{self, Address}};
     crate::tests::init_config();
     let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());

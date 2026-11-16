@@ -139,8 +139,8 @@ fn cascade_accepts_full_u64_targets_through_pinned_policy() {
         data["monthly_omega"][3]["target"] = target.into();
         let definitions = serde_json::from_value(data).unwrap();
         let package = Package {
-            namespace: "daily_goals".into(), version: "1".into(), fingerprint: [0; 32],
-            registration: vec![], source: POLICY.to_vec(), data: vec![], config: LuaConfig::default(),
+            row: super::super::super::package_row("daily_goals".into(), "1".into(), vec![], POLICY.to_vec(), vec![]).unwrap(),
+            config: LuaConfig::default(),
             domain: PackageDomain::DailyGoals(Arc::new(definitions)),
         };
         let mut content = ContentDefinitions::default();

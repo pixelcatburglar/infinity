@@ -3,6 +3,13 @@
 //! Unresolved scan results use the configured uncertainty floor.
 //! First signature resolutions journal facts atomically with scan records, using locked site
 //! data and session context; partial scans and anomalies do not produce resolution facts.
+//! GM /overlayrefresh resends the already-loaded tracker to the calling
+//! connection only (the third OnSignalTrackerFullState argument tells the
+//! client to drop sites no longer present); it never loads, generates or
+//! expires sites and changes no scan authorization.
+//! Probe recovery admits only a pilot in space aboard the current non-capsule
+//! ship and returns only that pilot's unexpired probes in the current system;
+//! distance to the probes is not checked.
 
 use super::*;
 
@@ -98,6 +105,24 @@ pub(super) fn full_state(system: i64) -> Value {
         Value::Dict(sites.iter().filter(|s| s.kind == kind).map(|s| (Value::Int(s.id), info(s))).collect())
     };
     Value::tuple([of(Kind::Anomaly, anomaly_info), of(Kind::Signature, signature_info), Value::Dict(vec![]), Value::Dict(vec![])])
+}
+
+/// GM /overlayrefresh (services/slash): resend this connection's already-loaded
+/// tracker so the client drops sites no longer there (shouldRemoveOldSites,
+/// sensorSuiteService.py:502-527). Unlike SignalTrackerRegister it never loads,
+/// generates or expires anything and touches no scan state.
+pub(super) fn refresh_overlay(c: &mut Client) -> Result<String, CallError> {
+    if c.session.int("charid").is_none_or(|id| id <= 0) {
+        return Err(gm_error(messages::gm::GM_ARGS_NO_CHARACTER));
+    }
+    let Some(system) = c.session.int("solarsystemid").filter(|id| *id > 0) else {
+        return Err(gm_error(messages::gm::GM_OVERLAY_SPACE_REQUIRED));
+    };
+    if !state().loaded.contains(&system) {
+        return Err(gm_error(messages::gm::GM_OVERLAY_NOT_READY));
+    }
+    c.notify("OnSignalTrackerFullState", vec![Value::Int(system), full_state(system), Value::Bool(true)]);
+    Ok(messages::gm::GM_OVERLAY_REFRESHED.into())
 }
 
 /// Tell every pilot in `system` about sites that came or went.
@@ -325,7 +350,13 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
 /// bound scanMgr.RecoverProbes(probeIDs) -> recovered probe IDs; they return to cargo.
 pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallResult {
     let _lock = crate::services::market::lock().await;
-    let (Some(ship), Some(char_id)) = (c.session.int("shipid"), c.session.int("charid")) else { return Ok(Value::list([])) };
+    let (ship, char_id, system) = (c.session.int("shipid"), c.session.int("charid"), c.session.int("solarsystemid"));
+    // Recovery requires the pilot in space aboard its current ship: an explicit
+    // solarsystemid (docked sessions keep solarsystemid2) and no station.
+    if !destroy && (ship.is_none() || char_id.is_none() || system.is_none() || c.session.int("stationid").is_some()) {
+        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+    }
+    let (Some(ship), Some(char_id)) = (ship, char_id) else { return Ok(Value::list([])) };
     let ids = value_ids(call.args.first());
     let mut back: HashMap<i32, i64> = HashMap::new();
     let mut done = vec![];
@@ -334,7 +365,7 @@ pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: boo
         let st = state();
         let snapshot_now = filetime_now();
         for id in ids {
-            if let Some(p) = st.probes.get(&id).filter(|p| p.char_id == char_id && p.expiry > snapshot_now) {
+            if let Some(p) = st.probes.get(&id).filter(|p| p.char_id == char_id && p.expiry > snapshot_now && (destroy || Some(p.system) == system)) {
                 if done.contains(&id) { continue; }
                 *back.entry(p.type_id).or_default() += 1;
                 recovered_by_system.entry(p.system).or_default().push(id);
@@ -348,15 +379,21 @@ pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: boo
         let db = c.db.clone();
         let sde = c.sde.clone();
         let committed_ids = done.clone();
+        let identity = crate::services::identity::Identity { station_id: None, system_id: system, ..crate::services::identity::Identity::of_client(c) };
         let dispatch_client_ref = &mut *c;
         db.transaction(
             |tx, outbox| {
                 let sde = sde.clone();
                 let back = back.clone();
                 Box::pin(async move {
+                    let hull = crate::services::ship::transport::station::lock_hull(tx, &sde, &identity, None).await
+                        .map_err(|e| match e { CallError::User { .. } => notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION), e => e })?;
+                    if crate::services::ship::loss::medical::is_capsule(&sde, hull.type_id) {
+                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
                     let destination = crate::services::inventory::destination::Destination::owned(char_id, ship, FLAG_CARGO);
                     for (type_id, n) in back {
-                        crate::services::items::deposit_held(tx, &sde, outbox, &destination, type_id, n, ship, None, None).await?;
+                        crate::services::items::deposit_held(tx, &sde, outbox, &destination, type_id, n, ship, None, crate::services::inventory::hold_storage::CapacitySource::Current).await?;
                     }
                     Ok(())
                 })
@@ -428,4 +465,4 @@ pub(super) async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     ))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

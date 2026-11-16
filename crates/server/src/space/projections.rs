@@ -2,18 +2,20 @@
 //! Client dogma consumes OnEwarStart/End for projected effect kinds; SDE effect
 //! rows supply notification classification and modifiers. Persistent free hull
 //! refreshes include their fitted items and overrides. Projections do not survive system shutdown.
-//! Receiver projections update cached defenses in the actor before asynchronous kinematic refreshes.
-//! Incoming remote assistance is suppressed for capital hulls with a paid Entosis link.
-//! Effective warp disruption cancels queued or aligning warp through a membership-fenced action.
+//! Receiver projections update the resident combat fit in place; defenses, motion,
+//! signature, NPC targeting and drone specs rebase synchronously inside the actor.
+//! A resident ship or drone's refreshed attribute rows publish through the
+//! shared fit receipt and the single fit-delta emitter.
 use super::*;
 use crate::services::{effects::{notify, projection::Projection, propulsion, registry, EffectKind}, fit::Fit};
 use infinity_core::consts::{dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, dogma::ATTR_WARP_SCRAMBLE_STATUS};
 use crate::services::fit::Key;
+use super::combat::inputs::FitDeltaSources;
 #[path = "projections/combat.rs"] mod combat_facts_bridge;
 impl World {
     /// Capture live persistent hull memberships for cold fitting transactions.
     pub(crate) async fn online_fences(&self, owners: &[i64]) -> Vec<(i64, i64, u64)> {
-        let handles: Vec<_> = self.systems.lock().unwrap().iter()
+        let handles: Vec<_> = crate::poison::lock_or_exit(self.systems.lock()).iter()
             .filter(|(_, handle)| !handle.is_closed()).map(|(&id, handle)| (id, handle.clone())).collect();
         let owners: Arc<[i64]> = Arc::from(owners);
         let mut fences = Vec::new();
@@ -34,31 +36,6 @@ impl World {
 
 
 impl System {
-    /// Replace a cached fit only for the actor membership and projection revision
-    /// that produced it. The actor re-anchors condition state before publishing
-    /// new defense scalars; it never restores raw HP from the fit.
-    pub(crate) fn replace_fitted_cache(
-        &mut self, ship: i64, generation: u64, fit_revision: u64, fit: Fit, key: Key, revision: Option<u64>,
-    ) -> bool {
-        let Some(record_generation) = self.combat_membership_generation(ship) else { return false };
-        if record_generation != generation || !self.contains(ship) { return false; }
-        let expected_revision = match key {
-            Key::Ship => fit.projection_revision(),
-            Key::Drone(id) if id == ship => fit.drone_projection_revision(),
-            _ => return false,
-        };
-        if expected_revision.is_some() && expected_revision != revision { return false; }
-        if let Some(revision) = revision {
-            let current = self.projection_revision(ship);
-            if current != revision { return false; }
-        }
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if record.fit_key != key || record.fit_revision != fit_revision || !matches!(record.phase, combat::CombatPhase::Live) { return false; }
-        record.fit = fit;
-        record.fit_revision = record.fit_revision.saturating_add(1);
-        self.refresh_fitted_stats(ship);
-        true
-    }
     /// Snapshot the current incoming sources for one target.
     pub(crate) fn projections_on(&self, target: i64) -> Vec<Projection> {
         let blocked = crate::space::sovereignty::links::assistance_blocked(self, target);
@@ -75,11 +52,19 @@ impl System {
     }
 
     /// Replace the snapshot for one source module, moving it between targets if needed.
+    ///
+    /// A renewal of the same source, effect and operands only extends the
+    /// stored deadline: the effective inputs are unchanged, so the resident
+    /// fit and outputs are not rebuilt.
     pub(crate) fn upsert_projection(&mut self, target: i64, projection: Projection) {
         if !self.contains(target) || !self.contains(projection.source_ship) { return; }
         let previous = self.take_projection(projection.source_module);
         let changed_identity = previous.as_ref().is_none_or(|(old_target, old)|
             *old_target != target || old.effect_id != projection.effect_id || old.source_ship != projection.source_ship || old.kind != projection.kind);
+        let renew_only = previous.as_ref().is_some_and(|(old_target, old)|
+            !changed_identity && *old_target == target && old.source_type == projection.source_type
+            && old.values == projection.values && old.charge_values == projection.charge_values
+            && old.charge_type == projection.charge_type && old.scramble == projection.scramble);
         if let Some((old_target, old)) = previous {
             if old.scramble != projection.scramble {
                 self.close_projection_scramble(old.scramble);
@@ -94,7 +79,15 @@ impl System {
         let entries = self.projections.entry(target).or_default();
         let index = entries.binary_search_by_key(&projection.source_module, |p| p.source_module).unwrap_or_else(|i| i);
         entries.insert(index, projection);
-        self.refresh_projection_target(target);
+        if !renew_only {
+            self.refresh_projection_target(target);
+        } else if let Some((expired, _, receipt)) = self.prepare_fit_publication(target, None) {
+            // Renewal itself is not dirty, but a real character deadline may
+            // have elapsed while its timer was unrun; only that rewrites the
+            // resident fit and its outputs.
+            if expired { self.rebase_fitted_outputs(target); }
+            if let Some(before) = receipt { self.finish_fit_delta(before, None); }
+        }
     }
 
     fn take_projection(&mut self, source_module: i64) -> Option<(i64, Projection)> {
@@ -156,151 +149,71 @@ impl System {
         let revision = self.projection_revisions.entry(target).or_default();
         *revision = revision.checked_add(1).expect("projection revision exhausted");
         let revision = *revision;
-        let drone = self.drone(target);
-        let incarnation = self.persistent_generation(target);
         let generation = self.combat_membership_generation(target);
         let Some(ball) = self.ball(target) else { return };
-        let character = ball.char_id;
         let type_id = ball.type_id;
         let projections = self.projections_on(target);
-        if self.replace_fitted_projections(target, projections.clone(), Some(revision))
-            && self.actor_combat.get(&target).is_some_and(|record|
-                record.fit.value(record.fit_key, ATTR_WARP_SCRAMBLE_STATUS) > 0.0)
-        {
-            if let Some(generation) = generation {
-                self.command(target, move |ball, stamp, system| {
-                    if system.combat_membership_generation(target) == Some(generation)
-                        && ball.mode == MODE_WARP && ball.effect_stamp < 0
-                    {
-                        ball.stop();
-                        vec![event(stamp, "Stop", vec![Value::Int(target)])]
-                    } else {
-                        Vec::new()
-                    }
-                });
+        if self.actor_combat.contains_key(&target) {
+            // The shared expiry gate runs first, then the projection write;
+            // both merge into one output rebase and the scramble check reads
+            // the effective post-expiry fit.
+            let prepared = self.prepare_fit_publication(target, Some(FitDeltaSources::Projections(&projections)));
+            let replaced = prepared.is_some()
+                && self.set_fitted_projections(target, projections.clone(), Some(revision));
+            if matches!(prepared, Some((true, _, _))) || replaced {
+                self.rebase_fitted_outputs(target);
             }
-        }
-        let fit_revision = self.actor_combat.get(&target).map(|record| record.fit_revision);
-        let Some(sde) = self.projection_sde.clone() else { return };
-        let Some(context) = self.snapshot_context.clone() else { return };
-        let has_target_range = sde.types.attribute(type_id, ATTR_MAX_TARGET_RANGE).is_some()
-            || sde.dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).is_some_and(|value| value > 0.0);
-        if let Some(drone) = drone.as_ref().filter(|d| d.owner != infinity_core::consts::OWNER_UNOWNED) {
-            self.defer(refresh_owned_drone(context, sde, drone.clone(), revision, incarnation, generation, fit_revision));
-            return;
-        }
-        self.defer(async move {
-            let fit = if let Some(character) = character {
-                match Fit::load_projected(&context.db, sde, character, target, projections).await {
-                    Ok(fit) => fit,
-                    Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected fit refresh failed"); return; }
-                    Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected fit refresh failed"); return; }
+            if let Some((_, _, Some(before))) = prepared { self.finish_fit_delta(before, None); }
+            if replaced && self.actor_combat.get(&target).is_some_and(|record|
+                record.fit.value(record.fit_key, ATTR_WARP_SCRAMBLE_STATUS) > 0.0)
+            {
+                if let Some(generation) = generation {
+                    self.command(target, move |ball, stamp, system| {
+                        if system.combat_membership_generation(target) == Some(generation)
+                            && ball.mode == MODE_WARP && ball.effect_stamp < 0
+                        {
+                            ball.stop();
+                            vec![event(stamp, "Stop", vec![Value::Int(target)])]
+                        } else {
+                            Vec::new()
+                        }
+                    });
                 }
-            } else if incarnation.is_some() && drone.is_none()
-                && sde.types.get(type_id).and_then(|t| t.category_id) == Some(infinity_core::consts::CATEGORY_SHIP) {
-                match Fit::load_unpiloted_projected(&context.db, sde, target, projections).await {
-                    Ok(fit) => fit,
-                    Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected fit refresh failed"); return; }
-                    Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected fit refresh failed"); return; }
-                }
-            } else { Fit::for_space_type(sde, type_id, projections) };
+            }
+        } else {
+            // No resident fit: the type-only snapshot keeps NPC and free-ball
+            // outputs current without loading anything.
+            let Some(sde) = self.projection_sde.clone() else { return };
+            let fit = Fit::for_space_type(sde.clone(), type_id, projections.clone());
             let values = propulsion::kinematics(&fit, Key::Ship);
+            let has_target_range = sde.types.attribute(type_id, ATTR_MAX_TARGET_RANGE).is_some()
+                || sde.dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).is_some_and(|value| value > 0.0);
             let targeting = (fit.value(Key::Ship, ATTR_SCAN_RESOLUTION),
                 has_target_range.then(|| fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE)));
-            let drone_spec = if drone.is_some() {
-                match crate::services::drones::worker::spec(&fit, Key::Ship, type_id) {
-                    Ok(spec) => Some(spec),
-                    Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected drone spec refresh failed"); return; }
-                    Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone spec refresh failed"); return; }
+            if let Some(drone) = self.drone(target) {
+                match crate::services::drones::worker::spec(&fit, Key::Drone(target), type_id) {
+                    Ok(spec) => { self.drone_refresh(target, drone.generation, spec, values, None); }
+                    Err(crate::services::CallError::Internal(error)) => tracing::warn!(%error, target, "projected drone spec refresh failed"),
+                    Err(crate::services::CallError::User { msg, .. }) => tracing::warn!(%msg, target, "projected drone spec refresh failed"),
                 }
-            } else { None };
-            if let Some(tx) = context.tx.upgrade() {
-                let fit_for_cache = fit;
-                let _ = tx.send(Box::new(move |system| {
-                    if !system.contains(target) || system.projection_revisions.get(&target) != Some(&revision)
-                        || system.persistent_generation(target) != incarnation { return; }
-                    if let Some(old) = &drone {
-                        if !system.drone(target).is_some_and(|d| d.generation == old.generation && d.owner == old.owner) {
-                            if system.drone(target).is_some() { system.refresh_projection_target(target); }
-                            return;
-                        }
-                    } else if system.drone(target).is_some() { return; }
-                    if let (Some(generation), Some(fit_revision)) = (generation, fit_revision) {
-                        if !system.replace_fitted_cache(target, generation, fit_revision, fit_for_cache, Key::Ship, Some(revision)) {
-                            if system.combat_membership_generation(target) == Some(generation) && system.combat_phase(target) == Some(combat::CombatPhase::Live)
-                                && system.combat_fit_revision(target) != Some(fit_revision) { system.refresh_projection_target(target); }
-                            return;
-                        }
-                    }
-                    if let (Some(drone), Some(spec)) = (drone, drone_spec) {
-                        system.drone_refresh(target, drone.generation, spec, values, None);
-                    } else {
-                        system.queue_projection_kinematics(target, revision, values);
-                        system.refresh_npc_targeting(target, targeting.0, targeting.1);
-                    }
-                }));
+            } else {
+                self.queue_projection_kinematics(target, revision, values);
+                self.refresh_npc_targeting(target, targeting.0, targeting.1);
             }
-        });
+        }
+        // The owner's ship snapshot also lives in each controlled drone's Ship
+        // domain; the copy gates on it before the domain write and finishes once.
+        for drone in self.drones().filter(|drone| drone.controller == Some(target)).map(|drone| drone.id).collect::<Vec<_>>() {
+            let Some((expired, _, receipt)) = self.prepare_fit_publication(drone, Some(FitDeltaSources::Projections(&projections))) else { continue };
+            let changed = self.actor_combat.get_mut(&drone).is_some_and(|record| {
+                record.fit.replace_projections_for(Key::Ship, projections.clone(), Some(revision));
+                record.fit_revision = record.fit_revision.saturating_add(1);
+                true
+            });
+            if expired || changed { self.rebase_fitted_outputs(drone); }
+            if let Some(before) = receipt { self.finish_fit_delta(before, None); }
+        }
     }
 }
 
-async fn refresh_owned_drone(context: snapshot::Context, sde: Arc<Sde>, drone: drone::DroneRecord, revision: u64, incarnation: Option<u64>, actor_generation: Option<u64>, fit_revision: Option<u64>) {
-    let target = drone.id;
-    let owner = drone.owner;
-    let generation = drone.generation;
-    let ship = match crate::dao::characters::selection::ship_id(&context.db, owner).await {
-        Ok(Some(ship)) => ship,
-        Ok(None) => { tracing::warn!(target, owner, "drone owner has no selected ship"); return; }
-        Err(error) => { tracing::warn!(%error, target, "drone owner ship lookup failed"); return; }
-    };
-    let Some(tx) = context.tx.upgrade() else { return };
-    let handle = actor::SystemHandle { tx, gate: context.gate.clone(), written: context.written.clone() };
-    let Some(snapshot) = handle.with(move |system| {
-        let current = system.drone(target)?;
-        if system.persistent_generation(target) != incarnation || system.projection_revision(target) != revision { return None; }
-        if current.owner != owner || current.generation != generation {
-            system.refresh_projection_target(target);
-            return None;
-        }
-        Some((system.projections_on(ship), system.projection_revision(ship), system.projections_on(target),
-            system.combat_membership_generation(ship), system.combat_fit_revision(ship)))
-    }).await.flatten() else { return };
-    let (ship_projections, ship_revision, drone_projections, ship_generation, ship_fit_revision) = snapshot;
-    let fit = match Fit::load_drone(&context.db, sde, owner, ship, target, ship_projections, drone_projections).await {
-        Ok(fit) => fit,
-        Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected drone fit refresh failed"); return; }
-        Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone fit refresh failed"); return; }
-    };
-    let selected = match crate::dao::characters::selection::ship_id(&context.db, owner).await {
-        Ok(selected) => selected,
-        Err(error) => { tracing::warn!(%error, target, "drone owner ship lookup failed"); return; }
-    };
-    let values = propulsion::kinematics(&fit, Key::Drone(target));
-    let spec = match crate::services::drones::worker::spec(&fit, Key::Drone(target), drone.spec.type_id) {
-        Ok(spec) => spec,
-        Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected drone spec refresh failed"); return; }
-        Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone spec refresh failed"); return; }
-    };
-    let _ = handle.send(Box::new(move |system| {
-        if system.persistent_generation(target) != incarnation || system.projection_revision(target) != revision { return; }
-        if !system.drone(target).is_some_and(|d| d.owner == owner && d.generation == generation) {
-            if system.drone(target).is_some() { system.refresh_projection_target(target); }
-            return;
-        }
-        if selected != Some(ship) || system.projection_revision(ship) != ship_revision
-            || system.combat_membership_generation(ship) != ship_generation || system.combat_fit_revision(ship) != ship_fit_revision {
-            system.refresh_projection_target(target);
-            return;
-        }
-        if let (Some(actor_generation), Some(fit_revision)) = (actor_generation, fit_revision) {
-            if !system.replace_fitted_cache(target, actor_generation, fit_revision, fit, Key::Drone(target), Some(revision)) {
-                if system.combat_membership_generation(target) == Some(actor_generation) && system.combat_phase(target) == Some(combat::CombatPhase::Live)
-                    && system.combat_fit_revision(target) != Some(fit_revision) { system.refresh_projection_target(target); }
-                return;
-            }
-        }
-        system.drone_refresh(target, generation, spec, values, Some((ship, ship_revision)));
-    }));
-}
-
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

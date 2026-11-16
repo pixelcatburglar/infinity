@@ -79,7 +79,7 @@ async fn exercise(scenario: Scenario) {
         let nonship = crate::dao::items::creation::rookie_ship(&test_db, nonship_type, owner.character, station_id, FLAG_HANGAR).await.unwrap();
         let invisible = crate::dao::items::creation::positioned(&test_db, hull, owner.character, system, [0.0; 3]).await.unwrap();
         crate::dao::characters::selection::set_ship(&test_db, owner.character, current).await.unwrap();
-        crate::dao::characters::ship::dock(&test_db, owner.character, station_id, system).await.unwrap();
+        test_db.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&owner.character, &station_id, &system]).await.unwrap();
         c.session.apply(vec![("shipid", Value::Int(current)), ("stationid", Value::Int(station_id)), ("solarsystemid2", Value::Int(system)), ("solarsystemid", Value::None)]);
         match scenario {
             Scenario::Get => {
@@ -118,7 +118,7 @@ async fn exercise(scenario: Scenario) {
                 transfer(&test_db, &c.sde, current, foreign.character).await;
                 assert_readable(rpc(&mut c, "ConfigureShip", &args, current).await);
                 crate::dao::characters::selection::set_ship(&test_db, foreign.character, current).await.unwrap();
-                crate::dao::characters::ship::dock(&test_db, foreign.character, station_id, system).await.unwrap();
+                test_db.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&foreign.character, &station_id, &system]).await.unwrap();
                 c.login.user_id = foreign.account;
                 c.session.apply(vec![("charid", Value::Int(foreign.character))]);
                 assert_off(rpc(&mut c, "GetShipConfiguration", &[Value::Int(current)], current).await.unwrap());

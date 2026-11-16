@@ -41,5 +41,5 @@ pub(super) async fn run(c: &mut Client, args: &[String]) -> Result<String, CallE
     Ok(messages::gm::clone_grade_changed(target, name))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-slash"))]
 mod tests;

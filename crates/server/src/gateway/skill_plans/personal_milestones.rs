@@ -4,16 +4,11 @@
 use anyhow::Result;
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, ReflectMessage, Value as PV};
-use infinity_core::consts::UUID_LEN;
 use crate::{dao::skills::plan_milestones as dao, services::skill_plans::milestones};
-use super::super::{context::HandlerContext, error::{FailureCode, GatewayError}, message::{child, identifier, msg_field, new_uuid, response_for, set, str_field}};
+use super::super::{context::HandlerContext, error::{FailureCode, GatewayError}, message::{child, msg_field, new_uuid, response_for, set, str_field}};
+use super::wire;
 
-fn invalid() -> GatewayError { GatewayError::refusal(FailureCode::BadRequest, infinity_core::messages::skill_plans::INVALID) }
-fn uuid(message: &DynamicMessage, field: &str) -> Option<Vec<u8>> {
-    if !message.has_field_by_name(field) { return None; }
-    let id = msg_field(message, field)?.get_field_by_name("uuid")?.as_bytes()?.to_vec();
-    (id.len() == UUID_LEN && id.iter().any(|b| *b != 0)).then_some(id)
-}
+fn invalid() -> GatewayError { GatewayError::refusal(FailureCode::BadRequest) }
 fn numeric_id(message: &DynamicMessage, field: &str) -> Option<i32> {
     if !message.has_field_by_name(field) { return None; }
     let id = msg_field(message, field)?.get_field_by_name("sequential")?.as_u64()?;
@@ -21,24 +16,9 @@ fn numeric_id(message: &DynamicMessage, field: &str) -> Option<i32> {
 }
 fn encode(row: &dao::Milestone, response: &prost_reflect::MessageDescriptor) -> Result<DynamicMessage> {
     let mut entry = child(response, "milestones")?;
-    let mut id = child(&entry.descriptor(), "identifier")?;
-    set(&mut id, "uuid", PV::Bytes(Bytes::copy_from_slice(&row.milestone_id)))?;
+    let id = wire::uuid_message(&entry.descriptor(), "identifier", row.milestone_id.clone())?;
     set(&mut entry, "identifier", PV::Message(id))?;
-    let mut data = child(&entry.descriptor(), "data")?;
-    let mut plan = child(&data.descriptor(), "skill_plan")?;
-    set(&mut plan, "uuid", PV::Bytes(Bytes::copy_from_slice(&row.plan_id)))?;
-    set(&mut data, "skill_plan", PV::Message(plan))?;
-    if let Some(level) = row.level {
-        let mut skill = child(&data.descriptor(), "skill")?;
-        let id = identifier(&skill.descriptor(), "skill_type", PV::U64(row.type_id as u64))?;
-        set(&mut skill, "skill_type", PV::Message(id))?;
-        set(&mut skill, "level", PV::U32(level as u32))?;
-        set(&mut data, "skill", PV::Message(skill))?;
-    } else {
-        let id = identifier(&data.descriptor(), "train_to_type", PV::U64(row.type_id as u64))?;
-        set(&mut data, "train_to_type", PV::Message(id))?;
-    }
-    set(&mut data, "description", PV::String(row.description.clone()))?;
+    let data = wire::milestone_attributes(&entry.descriptor(), "data", row)?;
     set(&mut entry, "data", PV::Message(data))?;
     Ok(entry)
 }
@@ -48,7 +28,7 @@ pub(in crate::gateway) async fn handle(ctx: &HandlerContext<'_>, name: &str, req
     let mut rsp = response_for(name).map_err(GatewayError::Internal)?;
     match name.rsplit('.').next().unwrap_or_default() {
         "GetAllRequest" => {
-            let parent = uuid(req, "skill_plan").ok_or_else(invalid)?;
+            let parent = wire::uuid(req, "skill_plan").ok_or_else(invalid)?;
             let rows = milestones::list(identity, db, ctx.world, &parent).await.map_err(super::error)?;
             let list = rows.iter().map(|row| encode(row, &rsp.descriptor()).map(PV::Message)).collect::<Result<Vec<_>>>().map_err(GatewayError::Internal)?;
             set(&mut rsp, "milestones", PV::List(list)).map_err(GatewayError::Internal)?;
@@ -56,7 +36,7 @@ pub(in crate::gateway) async fn handle(ctx: &HandlerContext<'_>, name: &str, req
         "CreateRequest" => {
             if !req.has_field_by_name("milestone") { return Err(invalid()); }
             let data = msg_field(req, "milestone").ok_or_else(invalid)?;
-            let parent = uuid(&data, "skill_plan").ok_or_else(invalid)?;
+            let parent = wire::uuid(&data, "skill_plan").ok_or_else(invalid)?;
             let has_type = data.has_field_by_name("train_to_type");
             let has_skill = data.has_field_by_name("skill");
             if has_type == has_skill { return Err(invalid()); }
@@ -74,7 +54,7 @@ pub(in crate::gateway) async fn handle(ctx: &HandlerContext<'_>, name: &str, req
             set(&mut rsp, "milestone", PV::Message(identifier)).map_err(GatewayError::Internal)?;
         }
         method @ ("DeleteRequest" | "SetDescriptionRequest") => {
-            let id = uuid(req, if method == "DeleteRequest" { "milestone" } else { "identifier" }).ok_or_else(invalid)?;
+            let id = wire::uuid(req, if method == "DeleteRequest" { "milestone" } else { "identifier" }).ok_or_else(invalid)?;
             if method == "DeleteRequest" { milestones::delete(identity, db, &id).await.map_err(super::error)?; }
             else { milestones::set_description(identity, db, &id, &str_field(req, "description")).await.map_err(super::error)?; }
         }
@@ -83,4 +63,4 @@ pub(in crate::gateway) async fn handle(ctx: &HandlerContext<'_>, name: &str, req
     Ok(rsp)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

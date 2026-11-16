@@ -6,6 +6,7 @@
 //! Mining-site chances and missing wormhole attributes use operator policy.
 
 use super::*;
+use infinity_core::consts::{FACTION_BLOOD_RAIDER_COVENANT, FACTION_SANSHAS_NATION, FACTION_SERPENTIS};
 
 /// SDE inventory group for wormhole types.
 const GROUP_WORMHOLE: i32 = 988;
@@ -21,11 +22,11 @@ pub(super) fn pirate_faction(faction: Option<i64>, region: i64) -> i64 {
     match faction {
         Some(FACTION_CALDARI) => FACTION_GURISTAS,                  // Caldari: Guristas
         Some(FACTION_MINMATAR) => FACTION_ANGEL_CARTEL,             // Minmatar: Angel Cartel
-        Some(FACTION_AMARR) if region % 2 == 0 => 500019,           // Amarr: Sansha's Nation
-        Some(FACTION_AMARR | 500007 | 500008) => 500012,            // Amarr, Ammatar, Khanid: Blood Raiders
-        Some(FACTION_GALLENTE) => 500020,                           // Gallente: Serpentis
-        Some(f @ (FACTION_GURISTAS | FACTION_ANGEL_CARTEL | 500012 | 500019 | 500020)) => f,
-        _ => [FACTION_GURISTAS, FACTION_ANGEL_CARTEL, 500012, 500019, 500020][(region % 5) as usize],
+        Some(FACTION_AMARR) if region % 2 == 0 => FACTION_SANSHAS_NATION,           // Amarr: Sansha's Nation
+        Some(FACTION_AMARR | 500007 | 500008) => FACTION_BLOOD_RAIDER_COVENANT,            // Amarr, Ammatar, Khanid: Blood Raiders
+        Some(FACTION_GALLENTE) => FACTION_SERPENTIS,                           // Gallente: Serpentis
+        Some(f @ (FACTION_GURISTAS | FACTION_ANGEL_CARTEL | FACTION_BLOOD_RAIDER_COVENANT | FACTION_SANSHAS_NATION | FACTION_SERPENTIS)) => f,
+        _ => [FACTION_GURISTAS, FACTION_ANGEL_CARTEL, FACTION_BLOOD_RAIDER_COVENANT, FACTION_SANSHAS_NATION, FACTION_SERPENTIS][(region % 5) as usize],
     }
 }
 
@@ -247,7 +248,7 @@ pub(super) async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> R
             // A mined field's rocks come back with the system's (services/mining); its
             // watch resumes.
             (Some(rocks), Some(_)) => {
-                track_site_clearance(db.clone(), world.clone(), s.id, system, rocks.clone());
+                track_site_clearance(db.clone(), world.clone(), s.id, system, rocks.clone(), None);
             }
             (Some(containers), None) => restore_containers(db, world, s, containers).await?,
             _ => {}
@@ -434,5 +435,5 @@ pub(super) fn hack_site(sde: &Sde, system: i64, info: &SystemInfo, relic: bool, 
     Ok(Some(site))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

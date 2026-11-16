@@ -133,12 +133,13 @@ fn grouped(items: &[Module], rows: &[charges::Bank]) -> Result<Vec<(i64, Vec<i64
     }).collect())
 }
 
-async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<BankStop>, ship: i64, owner: i64, method: Operation, first: i64, second: i64) -> CallResult {
+async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<BankStop>, ship: i64, owner: i64, method: Operation, first: i64, second: i64, settle: &[crate::dao::items::charges::LoadedWrite]) -> CallResult {
     if !ship_dao::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(notify_error(messages::combat::NOT_YOUR_SHIP)); }
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next();
     if !hull.is_some_and(|h| h.owner_id == owner && h.category_id == i64::from(CATEGORY_SHIP)) {
         return Err(notify_error(messages::combat::NOT_YOUR_SHIP));
     }
+    crate::services::combat::loaded::settle_in(ex, settle).await?;
     if method == Operation::GetWeaponBankInfoForShip { return banks(ex, ship).await; }
     let extra: Vec<_> = if method == Operation::LinkAllWeapons {
         load_items(ex, sde, ItemQuery::LocationOwner(ship, owner)).await.map_err(db_err)?.into_iter().map(|i| i.item_id).collect()
@@ -203,12 +204,22 @@ pub(in crate::services) async fn weapon_groups(c: &mut Client, call: &Call<'_>, 
     let owner = c.session.int("charid").ok_or_else(|| notify_error(messages::combat::NOT_YOUR_SHIP))?;
     let first = call.args.get(1).and_then(|v| v.as_int()).unwrap_or_default();
     let second = call.args.get(2).and_then(|v| v.as_int()).unwrap_or_default();
+    let reads_loaded = matches!(method, Operation::LinkWeapons | Operation::LinkAllWeapons | Operation::MergeModuleGroups | Operation::PeelAndLink);
+    let engaged = if reads_loaded {
+        crate::services::combat::loaded::LoadedHolds::arm(&c.world, &c.session.int("solarsystemid").map(|system| (system, ship)).into_iter().collect::<Vec<_>>(), notify_error(messages::fitting::CHARGES_SETTLING)).await?
+    } else { Vec::new() };
+    let _market = if reads_loaded { Some(crate::services::market::lock().await) } else { None };
+    let mut holds = crate::services::combat::loaded::LoadedHolds::lock(&c.world, engaged, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
     let sde = c.sde.clone();
     let db = c.db.clone();
-    db.transaction(|tx, outbox: &mut Outbox<BankStop>| {
+    holds.may_execute();
+    let result = db.transaction(|tx, outbox: &mut Outbox<BankStop>| {
         let sde = sde.clone();
-        Box::pin(async move { operation(tx, &sde, outbox, ship, owner, method, first, second).await })
-    }, |value, outbox| async move { dispatch(value, outbox, c) }).await
+        let settle = settle.clone();
+        Box::pin(async move { operation(tx, &sde, outbox, ship, owner, method, first, second, &settle).await })
+    }, |value, outbox| { let c = &mut *c; async move { dispatch(value, outbox, c) } }).await;
+    holds.finish(&db, &c.world, result, &[]).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

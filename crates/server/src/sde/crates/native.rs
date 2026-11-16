@@ -235,5 +235,5 @@ fn array_field<'a>(data: &'a Value, field: &str) -> Option<&'a [Value]> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

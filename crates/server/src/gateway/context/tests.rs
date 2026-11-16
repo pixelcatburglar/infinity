@@ -11,6 +11,7 @@ async fn ownership_and_offline_identity() {
     assert_eq!(ctx.require_user().unwrap(), account);
     assert_eq!(ctx.require_character().unwrap().char_id, character);
     assert_eq!(ctx.identity.ship_id, None);
+    assert!(ctx.application_instance_uuid.is_none());
     assert_eq!(ctx.identity.station_id, None);
     assert_eq!(ctx.identity.system_id, None);
     assert!(matches!(HandlerContext::for_request(&gw, Caller { user_id: None, ..caller.clone() }).await, Err(GatewayError::Refused { code: FailureCode::Unauthorized, .. })));
@@ -26,6 +27,7 @@ async fn ownership_and_offline_identity() {
 async fn anonymous_context_requires_user_and_character() {
     let gw = super::super::tests::gateway().await;
     let ctx = HandlerContext::for_request(&gw, Caller::default()).await.unwrap();
+    assert!(ctx.application_instance_uuid.is_none());
     assert!(matches!(ctx.require_user(), Err(GatewayError::Refused { code: FailureCode::Unauthorized, .. })));
     assert!(matches!(ctx.require_character(), Err(GatewayError::Refused { code: FailureCode::Unauthorized, .. })));
 }
@@ -45,6 +47,7 @@ async fn online_identity_and_generation_safe_unregister() {
     }));
     let caller = Caller { user_id: Some(account), character_id: Some(character), ..Default::default() };
     let ctx = HandlerContext::for_request(&gw, caller.clone()).await.unwrap();
+    assert!(ctx.application_instance_uuid.is_none());
     let identity = ctx.require_character().unwrap();
     assert_eq!(identity.ship_id, Some(20));
     assert_eq!(identity.station_id, Some(30));

@@ -1,17 +1,19 @@
 //! LPStoreMgr mirrors `eve/client/script/ui/station/loyaltyPointStore/lpStoreSvc.py`.
-//! Imported `game.lp_offers` are authoritative; a globally empty catalogue uses
-//! retail-derived faction offers. Purchases use `game.lp_balances`, wallets and the
-//! character's station hangar even when a corporation pays. Analysis Kredits cannot
-//! be spent, so offers requiring them remain visible but cannot be purchased.
+//! Imported `game.lp_offers`, loaded once at startup into the SDE snapshot, are
+//! authoritative; a globally empty catalogue uses retail-derived faction offers.
+//! Purchases use `game.lp_balances`, wallets and the character's station hangar
+//! even when a corporation pays. Analysis Kredits cannot be spent, so offers
+//! requiring them remain visible but cannot be purchased.
 use super::change_lp;
-use crate::services::{db_err, keyval, notify_error, Call, CallError, CallResult};
+use crate::services::{db_err, keyval, notify_error, Call, CallResult};
 use crate::client::Client;
-use crate::dao::lp_offers::Offer;
+use crate::sde::lp_offers::Offer;
 use crate::dao::items::{loading::Item, quantities::{self, QuantityChange}};
 use crate::db::outbox::dispatch_client;
 use infinity_core::messages;
 use infinity_core::consts::IX_STACK_SIZE;
 use marshal::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tracing::info;
 
@@ -28,13 +30,13 @@ const MIN_LP_PRICE: i64 = 100;
 /// Server policy: maximum quantity per purchase.
 const MAX_OFFER_COUNT: i64 = 1000;
 
-async fn fallback(ex: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, corp: i64) -> Result<Vec<Offer>, CallError> {
-    let Some(race) = sde.npc_corporations.get(corp).and_then(|c| c.race_id) else { return Ok(Vec::new()) };
-    let prices = crate::dao::store::catalogue::prices(ex).await.map_err(db_err)?;
+fn fallback(sde: &crate::sde::Sde, corp: i64) -> Vec<Offer> {
+    let Some(race) = sde.npc_corporations.get(corp).and_then(|c| c.race_id) else { return Vec::new() };
+    let prices = &sde.prices;
     let mut offers = Vec::new();
     for t in sde.types.iter() {
         if t.race_id.map(i64::from) != Some(race) || t.published != Some(true) || t.market_group_id.is_none() { continue; }
-        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let Some(average) = prices.get(t.type_id).map(|p| p.average).filter(|p| crate::sde::prices::positive_price(*p)) else { continue };
         for attr in sde.dogma.attributes_by_name("metaGroupID") {
             if t.attribute(attr.attribute_id) != Some(META_GROUP_FACTION) { continue; }
             let units = ((average / ISK_VALUE_PER_LP) / LP_PRICE_INCREMENT as f64).round() as i64;
@@ -43,22 +45,22 @@ async fn fallback(ex: &(impl crate::db::executor::Executor + ?Sized), sde: &crat
             offers.push(Offer { corporation_id: corp, offer_id: i64::from(t.type_id), type_id: t.type_id, quantity: 1, lp_cost: lp, isk_cost: isk, ak_cost: 0, required_items: Vec::new() });
         }
     }
-    Ok(offers)
+    offers
 }
 
-async fn offers(c: &Client, corp: i64) -> Result<Vec<Offer>, CallError> {
-    if c.sde.npc_corporations.get(corp).is_none() { return Ok(Vec::new()); }
-    if crate::dao::lp_offers::is_empty(&c.db).await.map_err(db_err)? { fallback(&c.db, &c.sde, corp).await }
-    else { crate::dao::lp_offers::list(&c.db, corp).await.map_err(db_err) }
+fn offers(sde: &crate::sde::Sde, corp: i64) -> Cow<'_, [Offer]> {
+    if sde.npc_corporations.get(corp).is_none() { return Cow::Borrowed(&[]); }
+    if sde.lp_offers.is_empty() { Cow::Owned(fallback(sde, corp)) }
+    else { Cow::Borrowed(sde.lp_offers.list(corp)) }
 }
 
-fn wire(offer: Offer) -> Value {
+fn wire(offer: &Offer) -> Value {
     keyval([
         ("offerID", Value::Int(offer.offer_id)), ("corpID", Value::Int(offer.corporation_id)),
         ("typeID", Value::Int(i64::from(offer.type_id))), ("qty", Value::Int(i64::from(offer.quantity))),
         ("lpCost", Value::Int(offer.lp_cost)), ("iskCost", Value::Int(offer.isk_cost)),
         ("akCost", Value::Int(offer.ak_cost)),
-        ("reqItems", Value::list(offer.required_items.into_iter().map(|r| Value::tuple([Value::Int(i64::from(r.type_id)), Value::Int(i64::from(r.quantity))])))),
+        ("reqItems", Value::list(offer.required_items.iter().map(|r| Value::tuple([Value::Int(i64::from(r.type_id)), Value::Int(i64::from(r.quantity))])))),
         ("requiredStandings", Value::None),
     ])
 }
@@ -111,13 +113,13 @@ async fn take_offer(c: &mut Client, corp: i64, offer_id: i64, count: i64, corpor
     db.transaction(|tx, outbox| {
         let sde = sde.clone();
         Box::pin(async move {
-            let offer = if crate::dao::lp_offers::is_empty(tx).await.map_err(db_err)? {
-                fallback(tx, &sde, corp).await?.into_iter().find(|o| o.offer_id == offer_id)
-            } else {
-                crate::dao::lp_offers::get(tx, corp, offer_id).await.map_err(db_err)?
+            let fallback_offers = sde.lp_offers.is_empty().then(|| fallback(&sde, corp));
+            let offer = match &fallback_offers {
+                Some(offers) => offers.iter().find(|o| o.offer_id == offer_id),
+                None => sde.lp_offers.get(corp, offer_id),
             };
             let Some(offer) = offer else { return Err(notify_error(messages::LP_OFFER_UNAVAILABLE)); };
-            let Some(cost) = scale(&offer, count) else { return Err(notify_error(messages::LP_OFFER_UNAVAILABLE)); };
+            let Some(cost) = scale(offer, count) else { return Err(notify_error(messages::LP_OFFER_UNAVAILABLE)); };
             if offer.ak_cost != 0 { return Err(notify_error(messages::loyalty::ANALYSIS_KREDITS_UNAVAILABLE)); }
             let types: Vec<i32> = cost.items.keys().copied().collect();
             let items = crate::dao::items::loyalty::requirement_stacks(tx, &sde, me, station, &types).await.map_err(db_err)?;
@@ -148,12 +150,12 @@ async fn take_offer(c: &mut Client, corp: i64, offer_id: i64, count: i64, corpor
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     Some(match call.method {
-        "GetAvailableOffersFromCorp" => offers(c, int(0)).await.map(|list| Value::list(list.into_iter().map(wire))),
+        "GetAvailableOffersFromCorp" => Ok(Value::list(offers(&c.sde, int(0)).iter().map(wire))),
         "TakeOfferForCharacter" => take_offer(c, int(0), int(1), call.args.get(2).and_then(|v| v.as_int()).unwrap_or(1), false).await,
         "TakeOfferForCorporation" => take_offer(c, int(0), int(1), call.args.get(2).and_then(|v| v.as_int()).unwrap_or(1), true).await,
         _ => return None,
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

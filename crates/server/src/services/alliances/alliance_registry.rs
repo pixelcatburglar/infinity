@@ -3,7 +3,9 @@
 //! Shared mechanics in `services::alliances` use the alliance DAO and
 //! `game.alliances`, `game.corporations`, `game.alliance_applications` and
 //! `game.alliance_history`.
-//! Mutual wars are supported separately; bills, ordinary capital changes and prime time are not.
+//! Mutual wars are supported separately; the alliance's bills are read and paid
+//! by the executor's accountants through services/bills. Ordinary capital
+//! changes and prime time are not.
 use super::*;
 use super::super::corps::{is_player_corp, permissions};
 /// A member corporation backs `candidate` as executor; one backed by corporations holding
@@ -226,21 +228,33 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             ).await
         }
         "DeclareWarAgainst" => Err(notify_error(messages::wars::AGGRESSIVE_UNAVAILABLE)),
-        // The alliance's bills (services/bills), paid by the executor's accountants.
-        "GetBills" => super::super::bills::bills(db, alliance, false).await,
-        "GetBillsReceivable" => super::super::bills::bills(db, alliance, true).await,
-        "GetBillBalance" => match dao::bill_amount(db, int(0), alliance).await {
-            Ok(r) => Ok(Value::Float(r.unwrap_or(0.0))),
-            Err(e) => Err(db_err(e)),
+        // Alliance bills use a client-selected division for manual payment;
+        // automatic payment uses the alliance's configured division.
+        "GetBills" => super::super::bills::bills(db, me, alliance, false).await,
+        "GetBillsReceivable" => super::super::bills::bills(db, me, alliance, true).await,
+        "GetBillBalance" => {
+            if let Err(error) = super::super::bills::authorize_read(db, me, alliance).await {
+                return Some(Err(error));
+            }
+            match crate::dao::bills::get(db, int(0)).await {
+                Ok(Some(bill)) if bill.debtor_id == alliance => Ok(Value::Float(bill.amount.wire_isk())),
+                Ok(_) => Ok(Value::Float(0.0)),
+                Err(e) => Err(db_err(e)),
+            }
         },
-        // PayBill(billID, fromAccountKey): from the executor corporation's wallet.
+        // PayBill(billID, fromAccountKey): the client's selected division on the
+        // current executor corporation's wallet.
         "PayBill" => {
-            let (bill, key) = (int(0), call.kwargs.get("fromAccountKey").and_then(|v| v.as_int()).unwrap_or(int(1)) as i32);
+            let key = match call.kwargs.get("fromAccountKey").or_else(|| call.args.get(1))
+                .and_then(|value| value.as_int()).and_then(|key| i32::try_from(key).ok()) {
+                Some(key) => key,
+                None => return Some(Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED))),
+            };
             let corp = c.session.int("corpid").unwrap_or(0);
-            super::super::bills::pay(db, world, bill, alliance, Some(corp), key, Some(me)).await.map(|_| Value::None)
+            super::super::bills::settlement::pay(db, world, int(0), super::super::bills::settlement::Payer::Alliance { actor: me, alliance, executor: corp, key }).await.map(|_| Value::None)
         }
         _ => return None,
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-social"))] mod tests;

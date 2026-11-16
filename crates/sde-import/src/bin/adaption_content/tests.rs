@@ -71,62 +71,75 @@ fn contained_dataset_alias_is_rejected() {
 #[test]
 fn publication_is_stable_and_failure_preserves_current() {
     let (_temp, source, constants, output) = fixture();
-    let first = publish(&source, &constants, &output, true).unwrap();
-    assert_eq!(first, publish(&source, &constants, &output, true).unwrap());
+    let adaption = || Some((source.as_path(), constants.as_path()));
+    let first = publish(adaption(), None, &output, true).unwrap();
+    assert_eq!(first, publish(adaption(), None, &output, true).unwrap());
     let current = fs::read(output.join("current")).unwrap();
     let manifest: Value = serde_json::from_slice(&fs::read(output.join(&first).join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["chip_types"], json!([19, 23]));
-    assert_eq!(manifest["validation"]["scope"], "chip-ledger");
-    assert_eq!(manifest["provenance"]["source_validation"]["incomplete_for_gameplay"], true);
+    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["adaption"]["chip_types"], json!([19, 23]));
+    assert_eq!(manifest["adaption"]["validation"]["scope"], "chip-ledger");
+    assert_eq!(manifest["adaption"]["provenance"]["source_validation"]["incomplete_for_gameplay"], true);
     fs::write(&constants, "TypeAdaptionChips = (Unknown,)\n").unwrap();
-    assert!(publish(&source, &constants, &output, true).is_err());
+    assert!(publish(adaption(), None, &output, true).is_err());
     assert_eq!(fs::read(output.join("current")).unwrap(), current);
 }
 
 #[test]
 fn malformed_and_changed_bundle_is_rejected() {
     let (_temp, source, constants, output) = fixture();
+    let adaption = Some((source.as_path(), constants.as_path()));
     let path = source.join("manifest.json");
     let original = fs::read(&path).unwrap();
     let mut manifest: Value = serde_json::from_slice(&original).unwrap();
     manifest["datasets"].as_object_mut().unwrap().remove(input::FAMILIES[0]);
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(publish(&source, &constants, &output, false).is_err());
+    assert!(publish(adaption, None, &output, false).is_err());
     manifest = serde_json::from_slice(&original).unwrap();
     manifest["datasets"][input::FAMILIES[0]]["path"] = json!("../escape");
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(publish(&source, &constants, &output, false).is_err());
+    assert!(publish(adaption, None, &output, false).is_err());
     fs::write(&path, original).unwrap();
     fs::write(source.join(format!("datasets/{}.json", input::FAMILIES[0])), b"{}").unwrap();
-    assert!(publish(&source, &constants, &output, false).is_err());
+    assert!(publish(adaption, None, &output, false).is_err());
 }
 
 #[test]
 fn count_build_and_null_are_checked_before_publication() {
     let (_temp, source, constants, output) = fixture();
+    let adaption = Some((source.as_path(), constants.as_path()));
     let path = source.join("manifest.json");
     let original = fs::read(&path).unwrap();
     let mut manifest: Value = serde_json::from_slice(&original).unwrap();
     manifest["datasets"][input::FAMILIES[0]]["records"] = json!(2);
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(publish(&source, &constants, &output, false).is_err());
+    assert!(publish(adaption, None, &output, false).is_err());
     manifest = serde_json::from_slice(&original).unwrap();
     manifest["client_build"] = json!("other-build");
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(publish(&source, &constants, &output, false).is_err());
+    assert!(publish(adaption, None, &output, false).is_err());
     manifest = serde_json::from_slice(&original).unwrap();
     manifest["validation"]["invalid"] = Value::Null;
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(publish(&source, &constants, &output, false).is_err());
+    assert!(publish(adaption, None, &output, false).is_err());
+}
+
+#[test]
+fn mixed_domains_require_equal_build_and_a_domain() {
+    let (_temp, source, constants, output) = fixture();
+    assert!(publish(None, None, &output, false).is_err());
+    assert!(publish(Some((source.as_path(), constants.as_path())), Some((source.as_path(), "other-build")), &output, false).is_err());
+    assert!(!output.join("current").exists());
 }
 
 #[test]
 fn damaged_existing_package_does_not_switch_current() {
     let (_temp, source, constants, output) = fixture();
-    let package = publish(&source, &constants, &output, true).unwrap();
+    let adaption = Some((source.as_path(), constants.as_path()));
+    let package = publish(adaption, None, &output, true).unwrap();
     let before = fs::read(output.join("current")).unwrap();
     fs::write(output.join(package).join("manifest.json"), b"damaged").unwrap();
-    assert!(publish(&source, &constants, &output, true).is_err());
+    assert!(publish(adaption, None, &output, true).is_err());
     assert_eq!(fs::read(output.join("current")).unwrap(), before);
 }
 
@@ -151,6 +164,6 @@ fn schema_singleton_and_key_identity_are_checked() {
         let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest["datasets"][family]["sha256"] = json!(input::hash(&data));
         fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(publish(&source, &constants, &output, false).is_err());
+        assert!(publish(Some((source.as_path(), constants.as_path())), None, &output, false).is_err());
     }
 }

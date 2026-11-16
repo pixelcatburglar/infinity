@@ -2,6 +2,7 @@
 //! Run ignored tests serially; runner tests require a database without scheduled or running jobs.
 use super::*;
 use crate::{client::filetime_now, dao::jobs};
+use crate::db::executor::Executor;
 
 async fn test_db() -> Db {
     Db::connect(&crate::config::tests::test_database()).await.unwrap()
@@ -31,12 +32,33 @@ fn duplicate_registry_is_rejected() {
     assert!(runner::registry(vec![register("first", unused_handler), register("second", unused_handler)]).is_ok());
 }
 
-struct FailedWrite<'a, E: crate::db::executor::Executor>(&'a E);
-impl<E: crate::db::executor::Executor> crate::db::executor::Executor for FailedWrite<'_, E> {
-    async fn query<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, sql: &T, args: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<tokio_postgres::Row>, Error> { self.0.query(sql, args).await }
-    async fn query_one<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, sql: &T, args: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<tokio_postgres::Row, Error> { self.0.query_one(sql, args).await }
-    async fn query_opt<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, sql: &T, args: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Option<tokio_postgres::Row>, Error> { self.0.query_opt(sql, args).await }
-    async fn execute<T: ?Sized + tokio_postgres::ToStatement + Sync>(&self, _: &T, _: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<u64, Error> { self.0.execute("SELECT 1 / 0", &[]).await }
+struct FailedWrite<E: crate::db::executor::Executor>(E);
+impl<E: crate::db::executor::Executor> crate::db::executor::Executor for FailedWrite<E> {
+    #[track_caller]
+    fn query<'a, 'b, 'c, 'd>(&'a self, sql: &'b str, args: &'c [&'d (dyn tokio_postgres::types::ToSql + Sync)])
+        -> impl Future<Output = Result<Vec<tokio_postgres::Row>, Error>> + Send + use<'a, 'b, 'c, 'd, E>
+    {
+        self.0.query(sql, args)
+    }
+    #[track_caller]
+    fn query_one<'a, 'b, 'c, 'd>(&'a self, sql: &'b str, args: &'c [&'d (dyn tokio_postgres::types::ToSql + Sync)])
+        -> impl Future<Output = Result<tokio_postgres::Row, Error>> + Send + use<'a, 'b, 'c, 'd, E>
+    {
+        self.0.query_one(sql, args)
+    }
+    #[track_caller]
+    fn query_opt<'a, 'b, 'c, 'd>(&'a self, sql: &'b str, args: &'c [&'d (dyn tokio_postgres::types::ToSql + Sync)])
+        -> impl Future<Output = Result<Option<tokio_postgres::Row>, Error>> + Send + use<'a, 'b, 'c, 'd, E>
+    {
+        self.0.query_opt(sql, args)
+    }
+    #[track_caller]
+    fn execute<'a, 'b, 'c, 'd>(&'a self, _: &'b str, _: &'c [&'d (dyn tokio_postgres::types::ToSql + Sync)])
+        -> impl Future<Output = Result<u64, Error>> + Send + use<'a, 'b, 'c, 'd, E>
+    {
+        self.0.execute("SELECT 1 / 0", &[])
+    }
+    fn uncached(&self) -> impl crate::db::executor::Executor + Send + '_ { FailedWrite(self.0.uncached()) }
 }
 
 #[tokio::test]
@@ -53,7 +75,7 @@ async fn failed_periodic_completion_leaves_expired_claim_reclaimable() {
     schedule(&tx, &job).await.unwrap();
     let claim = jobs::claim(&tx, now, now + 1, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     let save = tx.savepoint("failed_completion").await.unwrap();
-    assert!(jobs::complete_periodic(&FailedWrite(&save), &id, claim.token, now + 100, now).await.is_err());
+    assert!(jobs::complete_periodic(&FailedWrite(save.uncached()), &id, claim.token, now + 100, now).await.is_err());
     save.rollback().await.unwrap();
     let reclaimed = jobs::claim(&tx, now + 2, now + 3, 100, &excluded).await.unwrap().into_iter().find(|c| c.job.id == id).unwrap();
     assert_ne!(claim.token, reclaimed.token);
@@ -362,4 +384,59 @@ async fn shutdown_prevents_new_due_jobs_during_unrelated_teardown() {
     let _ = runner.await;
     cancel(&db, &running_id).await.unwrap();
     cancel(&db, &due_id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL without scheduled or running jobs and with SDE; run serially"]
+async fn shutdown_drains_entire_inflight_claim_batch() {
+    let db = test_db().await;
+    jobs::tests::require_job_free_database(&db).await;
+    let world = World::new(db.clone(), Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
+    let mut runner_cfg = crate::config::tests::test_database();
+    runner_cfg.pool_size = 1;
+    runner_cfg.schema_on_start = false;
+    let runner_db = Db::connect(&runner_cfg).await.unwrap();
+    let runner_pid: i32 = runner_db.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
+    let mut gate = test_client().await;
+    let gate_pid: i32 = gate.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
+    let mut gate_tx = Some(gate.transaction().await.unwrap());
+    let now = filetime_now();
+    let ids = [format!("shutdown-once:{now}"), format!("shutdown-periodic:{now}")];
+    let mut runner_handle = None;
+    let rows: anyhow::Result<Vec<tokio_postgres::Row>> = async {
+        for (id, kind) in ids.iter().zip(["test-shutdown-once", "test-shutdown-periodic"]) {
+            schedule(&db, &Job { id: id.clone(), kind: kind.into(), due_at: now, payload: "{}".into() }).await?;
+        }
+        gate_tx.as_ref().unwrap().batch_execute("LOCK TABLE game.jobs IN SHARE MODE").await?;
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let settings = crate::config::scheduler::SchedulerConfig { max_concurrent: 2, ..Default::default() };
+        runner_handle = runner::start(runner_db, world, vec![register("test-shutdown-once", unused_handler), periodic("test-shutdown-periodic", unused_handler, 600)], settings, shutdown).map(Some)?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let blocked: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND state='active' AND wait_event_type='Lock' AND $2=ANY(pg_blocking_pids(pid)) AND query LIKE 'WITH due AS%') AS blocked", &[&runner_pid, &gate_pid]).await?.get("blocked");
+                if blocked { break; }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await.map_err(|_| anyhow::anyhow!("claim did not block on job table"))??;
+        stop.send(true).map_err(|_| anyhow::anyhow!("shutdown receiver gone"))?;
+        gate_tx.take().unwrap().commit().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), runner_handle.as_mut().unwrap()).await.map_err(|_| anyhow::anyhow!("runner did not drain"))??;
+        Ok(db.query("SELECT job_id,state,attempt,due_at,lease_token,lease_until FROM game.jobs WHERE job_id=ANY($1)", &[&ids.as_slice()]).await?)
+    }.await;
+    if let Some(tx) = gate_tx.take() { let _ = tx.rollback().await; }
+    if let Some(handle) = runner_handle.take().filter(|handle| !handle.is_finished()) {
+        handle.abort();
+        let _ = handle.await;
+    }
+    for id in &ids { cancel(&db, id).await.unwrap(); }
+    let rows = rows.unwrap();
+    let summary: Vec<String> = rows.iter().map(|row| format!("{}:{}:{}", row.get::<_, String>("job_id"), row.get::<_, String>("state"), row.get::<_, i32>("attempt"))).collect();
+    assert!(rows.iter().all(|row| row.get::<_, String>("job_id") != ids[0]), "one-shot job was not acked: {summary:?}");
+    let periodic = rows.iter().find(|row| row.get::<_, String>("job_id") == ids[1]).unwrap_or_else(|| panic!("periodic job missing: {summary:?}"));
+    assert_eq!(periodic.get::<_, String>("state"), "scheduled", "{summary:?}");
+    assert_eq!(periodic.get::<_, i32>("attempt"), 0, "{summary:?}");
+    assert!(periodic.get::<_, Option<i64>>("lease_token").is_none(), "{summary:?}");
+    assert!(periodic.get::<_, Option<i64>>("lease_until").is_none(), "{summary:?}");
+    assert!(periodic.get::<_, i64>("due_at") > now, "due_at was not advanced: {summary:?}");
 }

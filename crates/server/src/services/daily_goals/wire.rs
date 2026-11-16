@@ -1,46 +1,21 @@
 //! Daily-goal protobuf projections from frozen snapshots and persisted reward rows.
 //! Mirrors dailygoals/client/goalMessenger.py and utils.py; no queries or delivery.
 mod contribution;
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;
 
 use anyhow::{bail, ensure, Context, Result};
 use prost_reflect::{DynamicMessage, Kind, ReflectMessage, Value};
 use infinity_core::consts::PLEX_HUNDREDTHS;
-use crate::{client, dao::daily_goals::rewards::RewardRow, gateway::{message::{child, identifier, message, response_for, set}, notices::GatewayNotice, protocol::target_group::Target}, lua::content::daily_goals::model::Career};
+use crate::{dao::daily_goals::rewards::RewardRow, gateway::{message::{child, named, nested, response_for, sequential, set, timestamp}, notices::GatewayNotice, protocol::target_group::Target}, lua::content::daily_goals::model::Career};
 use super::{Error, GoalView, HistoryPage};
 
 const API: &str = "eve_public.dailygoal.api.";
-/// Inclusive seconds bounds of google.protobuf.Timestamp (years 0001 through 9999).
-const TIMESTAMP_MIN: i64 = -62_135_596_800;
-const TIMESTAMP_MAX: i64 = 253_402_300_799;
-fn nested(m: &mut DynamicMessage, name: &str, value: DynamicMessage) -> Result<()> { set(m, name, Value::Message(value)) }
-fn named(name: &str) -> Result<DynamicMessage> { Ok(DynamicMessage::new(message(name).with_context(|| format!("missing {name}"))?)) }
 fn request(name: &str) -> Result<DynamicMessage> { response_for(&format!("{API}{name}Request")) }
 fn uuid(parent: &DynamicMessage, field: &str, text: &str) -> Result<DynamicMessage> {
-    let bytes = crate::uuid_text::parse(text, crate::uuid_text::Case::Lowercase).context("invalid persisted UUID")?;
+    let bytes = infinity_content::uuid_text::parse(text, infinity_content::uuid_text::Case::Lowercase).context("invalid persisted UUID")?;
     let mut id = child(&parent.descriptor(), field)?;
     set(&mut id, "uuid", Value::Bytes(bytes.to_vec().into()))?;
     Ok(id)
-}
-fn sequential(parent: &mut DynamicMessage, field: &str, id: u64) -> Result<()> {
-    let descriptor = child(&parent.descriptor(), field)?.descriptor();
-    let kind = descriptor.get_field_by_name("sequential").context("missing sequential identifier")?.kind();
-    let value = match kind {
-        Kind::Uint32 => Value::U32(u32::try_from(id)?),
-        Kind::Int32 => Value::I32(i32::try_from(id)?),
-        Kind::Uint64 => Value::U64(id),
-        _ => bail!("unsupported identifier wire type"),
-    };
-    let value = identifier(&parent.descriptor(), field, value)?;
-    nested(parent, field, value)
-}
-fn timestamp(parent: &mut DynamicMessage, field: &str, time: i64) -> Result<()> {
-    let (seconds, nanos) = client::unix_parts_from_filetime(time);
-    ensure!((TIMESTAMP_MIN..=TIMESTAMP_MAX).contains(&seconds), "timestamp out of range");
-    let mut value = child(&parent.descriptor(), field)?;
-    set(&mut value, "seconds", Value::I64(seconds))?;
-    set(&mut value, "nanos", Value::I32(nanos))?;
-    nested(parent, field, value)
 }
 fn unit(parent: &DynamicMessage, row: &RewardRow) -> Result<DynamicMessage> {
     let mut unit = child(&parent.descriptor(), "unit")?;

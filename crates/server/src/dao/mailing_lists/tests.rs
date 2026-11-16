@@ -1,6 +1,10 @@
 //! Test-only cleanup for isolated mailing-list fixtures.
-use crate::db::{Db, Error};
+#[cfg(any(feature = "tests-storage", feature = "tests-social"))]
+use crate::db::Db;
+#[cfg(feature = "tests-social")]
+use crate::db::Error;
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn cleanup(db: &Db, owner: i64, characters: &[i64]) -> Result<(), Error> {
     let lists: Vec<i64> = db.query("SELECT list_id FROM game.mailing_lists WHERE owner_id = $1", &[&owner]).await?.iter().map(|r| r.get("list_id")).collect();
     let messages: Vec<i64> = db.query("SELECT message_id FROM game.mail_messages WHERE to_list_id = ANY($1) OR sender_id = ANY($2)", &[&lists, &characters]).await?.iter().map(|r| r.get("message_id")).collect();
@@ -12,6 +16,7 @@ pub(crate) async fn cleanup(db: &Db, owner: i64, characters: &[i64]) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 /// Reject only new messages for a fixture-owned list; existing rows are not validated.
 pub(crate) async fn reject_list_messages(db: &Db, list: i64) -> Result<(), Error> {
     let sql = format!("ALTER TABLE game.mail_messages ADD CONSTRAINT \"mailing_list_fixture_reject_{list}\" CHECK (to_list_id IS DISTINCT FROM {list}) NOT VALID");
@@ -19,12 +24,14 @@ pub(crate) async fn reject_list_messages(db: &Db, list: i64) -> Result<(), Error
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn allow_list_messages(db: &Db, list: i64) -> Result<(), Error> {
     let sql = format!("ALTER TABLE game.mail_messages DROP CONSTRAINT IF EXISTS \"mailing_list_fixture_reject_{list}\"");
     db.execute(&sql, &[]).await?;
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn allow_owned_list_messages(db: &Db, owner: i64) -> Result<(), Error> {
     for row in db.query("SELECT list_id FROM game.mailing_lists WHERE owner_id = $1", &[&owner]).await? {
         allow_list_messages(db, row.get("list_id")).await?;
@@ -32,6 +39,7 @@ pub(crate) async fn allow_owned_list_messages(db: &Db, owner: i64) -> Result<(),
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 /// Exact, ordered JSON rows for one list and all messages addressed to it.
 pub(crate) async fn snapshot(db: &Db, list: i64) -> Result<Vec<Vec<String>>, Error> {
     let queries = [
@@ -48,21 +56,25 @@ pub(crate) async fn snapshot(db: &Db, list: i64) -> Result<Vec<Vec<String>>, Err
     Ok(result)
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn dummy_characters(db: &Db, account: i64, count: i64) -> Result<Vec<i64>, Error> {
     let rows = db.query("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) SELECT $1, 'mail-capacity-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1 FROM generate_series(1::bigint, $2::bigint) RETURNING character_id", &[&account, &count]).await?;
     Ok(rows.iter().map(|r| r.get("character_id")).collect())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn seed_members(db: &Db, list: i64, characters: &[i64]) -> Result<(), Error> {
     db.execute("INSERT INTO game.mailing_list_members (list_id, character_id, member_access, joined_at) SELECT $1, id, 1, 0 FROM unnest($2::bigint[]) AS id ORDER BY id", &[&list, &characters]).await?;
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn delete_dummy_characters(db: &Db, characters: &[i64]) -> Result<(), Error> {
     db.execute("DELETE FROM game.characters WHERE character_id = ANY($1)", &[&characters]).await?;
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn organizations(db: &Db, creator: i64) -> Result<(i64, i64, i64), Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let first: i64 = tx.query_one("INSERT INTO game.corporations (name, ticker, creator_id, ceo_id, station_id, created) VALUES ('mail corp ' || ($1::bigint)::text, 'MC' || ($1::bigint)::text, $1, $1, 1, 0) RETURNING corporation_id", &[&creator]).await?.get("corporation_id");
@@ -73,22 +85,26 @@ pub(crate) async fn organizations(db: &Db, creator: i64) -> Result<(i64, i64, i6
     }), |value, ()| async move { Ok(value) }).await
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn set_corporation(db: &Db, character: i64, corporation: i64) -> Result<(), Error> {
     db.execute("UPDATE game.characters SET corporation_id = $2 WHERE character_id = $1", &[&character, &corporation]).await?;
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn set_deleted(db: &Db, character: i64, deleted: bool) -> Result<(), Error> {
     db.execute("UPDATE game.characters SET deleted = $2 WHERE character_id = $1", &[&character, &deleted]).await?;
     Ok(())
 }
 
+#[cfg(feature = "tests-social")]
 pub(crate) async fn delete_organizations(db: &Db, first: i64, second: i64, alliance: i64) -> Result<(), Error> {
     db.execute("DELETE FROM game.alliances WHERE alliance_id = $1", &[&alliance]).await?;
     db.execute("DELETE FROM game.corporations WHERE corporation_id = ANY($1)", &[&vec![first, second]]).await?;
     Ok(())
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
 async fn normalization_uses_postgresql_case_mapping_and_python_whitespace() {

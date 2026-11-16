@@ -71,7 +71,7 @@ fn client_watchlist_deltas_reconcile_subscription_atomically() {
 
 #[test]
 fn damage_ballpark_update_requires_live_observer_and_uses_destination_stamp() {
-    use crate::space::{Ball, Pilots, WarpState, MODE_STOP, event};
+    use crate::space::{Ball, Pilots, WarpState, MODE_STOP, SPECIAL_FX_UNSPECIFIED_DURATION, event, special_fx};
     use crate::space::system::System;
     use std::sync::Arc;
     crate::tests::init_config();
@@ -79,7 +79,7 @@ fn damage_ballpark_update_requires_live_observer_and_uses_destination_stamp() {
     let (notify, mut notifications) = tokio::sync::mpsc::unbounded_channel();
     pilots.register_pilot(1, notify);
     let mut system = System::new(20, pilots, 42_000);
-    system.insert(Ball {
+    let fixture = Ball {
         id: 100, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1, char_id: Some(1),
         signature_radius: Some(1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6, max_vel: 100.0,
         agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3],
@@ -87,33 +87,64 @@ fn damage_ballpark_update_requires_live_observer_and_uses_destination_stamp() {
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: true,
         massive: true, warp: WarpState::default(), last_ms: 0,
         interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0, cloak_until: 0,
-        health: [1.0; 3], launcher: 0, slim: Vec::new(),
-    });
+        health: [1.0; 3], launcher: 0, slim: Vec::new() };
+    system.insert(Ball { id: 200, char_id: None, ..fixture.clone() });
+    system.insert(fixture);
     let health = Value::tuple([Value::Int(1), Value::Int(2)]);
-    system.fleet_damage_update(1, 10, 200, 0, health.clone());
+    system.fleet_damage_update(1, 10, 200, health.clone());
     assert!(notifications.try_recv().is_err());
     let connection = 1_000_000_000_001;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(connection, 999, tx);
-    system.fleet_damage_update(1, 10, 200, 0, health.clone());
-    assert!(notifications.try_recv().is_err());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (completed_1, mut done_1) = tokio::sync::oneshot::channel();
+    assert!(system.observe(connection, 999, tx, completed_1));
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(done_1.try_recv(), Ok(true));
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
+    system.fleet_damage_update(1, 10, 200, health.clone());
+    assert!(rx.try_recv().is_err());
     system.unobserve(connection);
     drop(rx);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(connection, 100, tx);
-    system.fleet_damage_update(1, 20, 200, 0, health.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (completed_2, mut done_2) = tokio::sync::oneshot::channel();
+    assert!(system.observe(connection, 100, tx, completed_2));
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(done_2.try_recv(), Ok(true));
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
+    system.fleet_damage_update(1, 20, 200, health.clone());
+    assert!(rx.try_recv().is_err());
+    system.fleet_damage_update(1, 10, 200, health.clone());
+    assert_eq!(crate::space::system::tests::events::destiny(rx.try_recv().unwrap()), vec![event(42, "OnFleetDamageStateChange", vec![Value::Int(200), health])]);
+    // Ball 200 takes the same real module-cloak entry as the own-ego ball;
+    // the foreign ball's scene clients remove it themselves, so its FX, one
+    // CloakBall and the fleet clear arrive and nothing follows them.
+    assert!(system.begin_module_cloak(200, -2, Arc::new(std::sync::atomic::AtomicBool::new(false)), 0, 0, |_| true, None));
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(crate::space::system::tests::events::destiny(rx.try_recv().unwrap()), vec![
+        special_fx(42, 200, None, None, None, "effects.Cloak", false, 1, 0,
+            Value::Int(SPECIAL_FX_UNSPECIFIED_DURATION), 0, None, 0, Value::None),
+        event(42, "CloakBall", vec![Value::Int(200)])]);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
+    assert!(rx.try_recv().is_err());
+    // The own-ego ball cloaks through the real module-cloak entry; its
+    // scene CloakBall is drained as itself before the covered-ego update.
+    assert!(system.begin_module_cloak(100, -1, Arc::new(std::sync::atomic::AtomicBool::new(false)), 0, 0, |_| true, None));
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(crate::space::system::tests::events::destiny(rx.try_recv().unwrap()), vec![
+        special_fx(42, 100, None, None, None, "effects.Cloak", false, 1, 0,
+            Value::Int(SPECIAL_FX_UNSPECIFIED_DURATION), 0, None, 0, Value::None),
+        event(42, "CloakBall", vec![Value::Int(100)])]);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
+    system.fleet_damage_update(1, 20, 100, Value::None);
+    assert!(rx.try_recv().is_err());
+    system.fleet_damage_update(1, 20, 200, Value::None);
+    assert!(rx.try_recv().is_ok());
     assert!(notifications.try_recv().is_err());
-    system.fleet_damage_update(1, 10, 200, 0, health.clone());
-    assert_eq!(notifications.try_recv().unwrap(), ("DoDestinyUpdate".to_string(),
-        vec![Value::list([event(42, "OnFleetDamageStateChange", vec![Value::Int(200), health])]), Value::Bool(false)]));
-    system.fleet_damage_update(1, 20, 100, 1, Value::None);
-    assert!(notifications.try_recv().is_err());
-    system.fleet_damage_update(1, 20, 200, 1, Value::None);
-    assert!(notifications.try_recv().is_ok());
     drop(rx);
-    system.fleet_damage_update(1, 10, 200, 0, Value::None);
+    system.fleet_damage_update(1, 10, 200, Value::None);
     assert!(notifications.try_recv().is_err());
     system.unobserve(connection);
-    system.fleet_damage_update(1, 10, 200, 0, Value::None);
+    system.fleet_damage_update(1, 10, 200, Value::None);
     assert!(notifications.try_recv().is_err());
 }

@@ -3,6 +3,8 @@
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Session policy, transactions, refusals, notifications and World are caller concerns.
 //! Stored ISK is exact numeric; the selection balance is a lossy clamped client projection.
+//! Location columns stay nullable, but selecting a character for the world requires
+//! solar system, constellation and region; a missing coordinate is a database decode error.
 
 use crate::isk::{IskAmount, personal_client_cap};
 use crate::dao::wallets::WalletError;
@@ -37,9 +39,9 @@ pub(crate) struct SelectedCharacter {
     pub authority: Authority,
 }
 impl SelectedCharacter {
-    fn from_row(r: &Row) -> Self { Self { corporation_id: r.get("corporation_id"), station_id: r.get("station_id"), solar_system_id: r.get("solar_system_id"),
-        constellation_id: r.get("constellation_id"), region_id: r.get("region_id"), gender_id: r.get("gender_id"), bloodline_id: r.get("bloodline_id"),
-        race_id: r.get("race_id"), name: r.get("name"), roles: r.get("roles"), alliance_id: r.get("alliance_id"), authority: Authority::from_row(r) } }
+    fn from_row(r: &Row) -> Result<Self, db::Error> { Ok(Self { corporation_id: r.get("corporation_id"), station_id: r.get("station_id"), solar_system_id: r.try_get("solar_system_id")?,
+        constellation_id: r.try_get("constellation_id")?, region_id: r.try_get("region_id")?, gender_id: r.get("gender_id"), bloodline_id: r.get("bloodline_id"),
+        race_id: r.get("race_id"), name: r.get("name"), roles: r.get("roles"), alliance_id: r.get("alliance_id"), authority: Authority::from_row(r) }) }
 }
 pub(crate) async fn selected(ex: &(impl Executor + ?Sized), character_id: i64, user_id: i64) -> Result<Option<SelectedCharacter>, db::Error> {
     static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -50,7 +52,7 @@ pub(crate) async fn selected(ex: &(impl Executor + ?Sized), character_id: i64, u
         FROM game.characters ch JOIN authority ON authority.character_id=ch.character_id
         WHERE ch.character_id=$1 AND ch.user_id=$2 AND NOT ch.deleted")
     });
-    Ok(ex.query_opt(SQL.as_str(), &[&character_id, &user_id]).await?.as_ref().map(SelectedCharacter::from_row))
+    ex.query_opt(SQL.as_str(), &[&character_id, &user_id]).await?.as_ref().map(SelectedCharacter::from_row).transpose()
 }
 pub(crate) struct SpaceShip { pub item_id: i64, pub x: Option<f64>, pub y: Option<f64>, pub z: Option<f64> }
 impl SpaceShip { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), x: r.get("x"), y: r.get("y"), z: r.get("z") } } }
@@ -63,10 +65,8 @@ pub(crate) async fn lock_character(ex: &(impl Executor + ?Sized), character_id: 
     ex.query_one("SELECT character_id FROM game.characters WHERE character_id = $1 FOR UPDATE", &[&character_id]).await?;
     Ok(())
 }
-struct ShipId { ship_id: i64 }
-impl ShipId { fn from_row(r: &Row) -> Self { Self { ship_id: r.get("ship_id") } } }
 pub(crate) async fn ship_id(ex: &(impl Executor + ?Sized), character_id: i64) -> Result<Option<i64>, db::Error> {
-    Ok(ex.query_opt("SELECT ship_id FROM game.characters ch JOIN game.items i ON i.item_id = ch.ship_id WHERE ch.character_id = $1", &[&character_id]).await?.as_ref().map(|r| ShipId::from_row(r).ship_id))
+    Ok(ex.query_opt("SELECT ship_id FROM game.characters ch JOIN game.items i ON i.item_id = ch.ship_id WHERE ch.character_id = $1", &[&character_id]).await?.as_ref().map(|r| r.get::<_, i64>("ship_id")))
 }
 pub(crate) async fn set_ship(ex: &(impl Executor + ?Sized), character_id: i64, ship_id: i64) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&character_id, &ship_id]).await
@@ -86,10 +86,8 @@ pub(crate) async fn logout_timestamps(ex: &(impl Executor + ?Sized), character_i
 pub(crate) async fn owns(ex: &(impl Executor + ?Sized), character_id: i64, user_id: i64) -> Result<bool, db::Error> {
     Ok(ex.query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND user_id = $2 AND NOT deleted", &[&character_id, &user_id]).await?.is_some())
 }
-struct Count { count: i64 }
-impl Count { fn from_row(r: &Row) -> Self { Self { count: r.get("count") } } }
 pub(crate) async fn count(ex: &(impl Executor + ?Sized), user_id: i64) -> Result<i64, db::Error> {
-    Ok(Count::from_row(&ex.query_one("SELECT count(*) FROM game.characters WHERE user_id = $1 AND NOT deleted", &[&user_id]).await?).count)
+    Ok(ex.query_one("SELECT count(*) FROM game.characters WHERE user_id = $1 AND NOT deleted", &[&user_id]).await?.get::<_, i64>("count"))
 }
 pub(crate) async fn prepare_delete(ex: &(impl Executor + ?Sized), character_id: i64, when: i64) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.characters SET delete_prepare_at = $2 WHERE character_id = $1", &[&character_id, &when]).await
@@ -100,3 +98,6 @@ pub(crate) async fn cancel_delete(ex: &(impl Executor + ?Sized), character_id: i
 pub(crate) async fn delete(ex: &(impl Executor + ?Sized), character_id: i64, now: i64) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.characters SET deleted = true WHERE character_id = $1 AND delete_prepare_at IS NOT NULL AND delete_prepare_at <= $2", &[&character_id, &now]).await
 }
+
+#[cfg(all(test, feature = "tests-storage"))]
+mod tests;

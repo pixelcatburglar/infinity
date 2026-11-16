@@ -95,5 +95,5 @@ impl BoundaryQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

@@ -13,7 +13,8 @@ use crate::isk::IskAmount;
 use super::{amount, mutation, WalletError, WalletMutation, MAX_BALANCE};
 
 static READ_PERMISSION_PREDICATE: LazyLock<String> = LazyLock::new(|| format!(
-    "co.corporation_id IS NOT NULL AND NOT ch.deleted AND ch.corporation_id = $1 AND ({EFFECTIVE_ROLES_SQL} & $2) <> 0"
+    "co.corporation_id IS NOT NULL AND NOT ch.deleted AND ch.corporation_id = $1 AND ({} & $2) <> 0",
+    EFFECTIVE_ROLES_SQL.as_str()
 ));
 static READ_ALLOWED_SQL: LazyLock<String> = LazyLock::new(|| format!(
     "SELECT ({}) AS allowed

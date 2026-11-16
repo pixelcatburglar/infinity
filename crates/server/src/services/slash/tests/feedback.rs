@@ -42,7 +42,7 @@ async fn receive_text(stream: &mut TcpStream, expected: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE, external listener flock, and an isolated test process for Lua HOST"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external listener flock; run this exact test in its own process for Lua HOST"]
 async fn slash_rpc_feedback_preserves_wire_and_autocomplete_is_silent() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -66,7 +66,7 @@ async fn slash_rpc_feedback_preserves_wire_and_autocomplete_is_silent() {
     drop(reservation);
     let hub = client.chat.clone();
     let token = hub.token_for(id);
-    let _server = Server(tokio::spawn(async move { crate::chat::serve(address.to_string(), hub).await.unwrap() }));
+    let _server = Server(tokio::spawn(async move { crate::chat::serve(address.to_string(), hub, Duration::from_secs(infinity_wire::conn::DEFAULT_CLIENT_WRITE_TIMEOUT_SECS)).await.unwrap() }));
     let mut socket = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match TcpStream::connect(address).await {
@@ -108,6 +108,10 @@ async fn slash_rpc_feedback_preserves_wire_and_autocomplete_is_silent() {
         assert_eq!(support::wire(dispatch(&mut client, &call).await.unwrap()), before);
         assert!(tokio::time::timeout(Duration::from_millis(100), socket.read_u8()).await.is_err());
     }
+    let shutdown_status = Call { service: "slash", method: "SlashCmd", args: &[Value::unicode("/shutdown status")], kwargs: &kwargs, bound: false, bind_params: None };
+    assert!(matches!(execute(&mut client, &shutdown_status).await.unwrap(), Ok(Value::Unicode(text)) if text == messages::gm::GM_SHUTDOWN_NOT_SCHEDULED));
+    client.login.role = 0;
+    assert!(matches!(execute(&mut client, &shutdown_status).await.unwrap(), Err(CallError::User { msg, dict }) if msg == messages::MSG_SLASH_ERROR && dict.iter().any(|(k, v)| k == "reason" && matches!(v, Value::Unicode(text) if text.as_str() == messages::gm::GM_ROLE_REQUIRED))));
     client.login.role = GM_ROLES;
     let line = format!("/spawn {type_id}");
     let args = [Value::unicode(line)];
@@ -138,6 +142,7 @@ async fn slash_rpc_feedback_preserves_wire_and_autocomplete_is_silent() {
     let mut config = crate::config::Config::default();
     config.lua.enabled = true;
     config.lua.scripts_dir = directory.0.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&config.lua, &client.db, &client.sde).await.unwrap();
     crate::lua::start(&config, &client.db, &client.sde, &client.world, &client.chat).await.unwrap();
     for (line, expected) in [("/feedbackok", "Lua 输出"), ("/feedbackfail", messages::gm::GM_FEEDBACK_ERROR)] {
         let args = [Value::unicode(line)];

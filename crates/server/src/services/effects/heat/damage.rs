@@ -2,7 +2,8 @@
 //! Damage probability follows EVE University's published overheating research;
 //! effective attributes come from Fit and condition is stored in game.item_attributes.
 //! Burnout publishes one final fitting after all damage writes and offlines.
-//! Rack heat itself is transient; paste repair and structure repair are unsupported.
+//! Rack heat itself is transient; reset epochs discard already-covered captures.
+//! Paste repair and structure repair are unsupported.
 
 use std::sync::Arc;
 use infinity_core::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MED_SLOTS, dogma::ATTR_HI_SLOTS, dogma::ATTR_RIG_SLOTS, CATEGORY_MODULE, CATEGORY_SHIP};
@@ -28,7 +29,7 @@ fn injury(damage: f64, hp: f64, amount: f64, chance: f64, roll: f64) -> f64 {
 
 fn accumulate(
     sources: &[super::SourceSnapshot],
-    damage: &mut [(i64, i32, Option<f64>, f64, f64)],
+    damage: &mut [(i64, i32, Option<crate::dao::items::dogma::OverrideState>, f64, f64)],
     rolls: &[(i64, i64, f64)],
     total: usize,
 ) -> Result<(), CallError> {
@@ -60,9 +61,19 @@ pub(in crate::services::effects) async fn apply(cx: &Ctx, membership: Option<u64
     if sources.is_empty() { return Ok(()); }
     sources.sort_unstable_by_key(|source| source.module);
     let _lock = market::lock().await;
-    for source in &sources {
-        if !super::generation_valid(&cx.world, cx.system_id, cx.ship_id, cx.char_id, source).await { return Err(stale()); }
+    let mut write = 0;
+    for read in 0..sources.len() {
+        match super::damage_disposition(&cx.world, cx.system_id, cx.ship_id, cx.char_id, &sources[read]).await {
+            super::DamageDisposition::Apply => {
+                if write != read { sources.swap(write, read); }
+                write += 1;
+            }
+            super::DamageDisposition::ResetCovered => {}
+            super::DamageDisposition::Stale => return Err(stale()),
+        }
     }
+    sources.truncate(write);
+    if sources.is_empty() { return Ok(()); }
     let ship = cx.ship_id;
     let owner = cx.char_id;
     let system = cx.system_id;
@@ -102,28 +113,42 @@ pub(in crate::services::effects) async fn apply(cx: &Ctx, membership: Option<u64
                 let total = if slots.is_finite() && slots > 0.0 { slots as usize } else { 0 };
                 let overrides = dogma::overrides_for(tx, &ids).await.map_err(db_err)?;
                 let mut damage: Vec<_> = current.iter().map(|&(id, flag)| {
-                    let old = overrides.iter().find(|v| v.item_id == id && v.attribute_id == ATTR_HULL_DAMAGE).map(|v| v.value);
-                    (id, flag, old, old.unwrap_or(0.0), fit.value(Key::Module(id), ATTR_STRUCTURE_HP))
+                    let old = overrides.iter().find(|v| v.item_id == id && v.attribute_id == ATTR_HULL_DAMAGE).map(|v| v.state());
+                    (id, flag, old, old.map(|state| state.value).unwrap_or(0.0), fit.value(Key::Module(id), ATTR_STRUCTURE_HP))
                 }).collect();
                 accumulate(&sources, &mut damage, &rolls, total)?;
+                let fences = online::OnlineFences::single(system, ship, membership);
+                // A burnout publishes one final fit measured against the state
+                // before any damage write, so the already-loaded fit moves into
+                // the before boundary now instead of being captured too late.
+                let mut before = None;
+                if damage.iter().any(|&(_, _, old, new, hp)| old.map(|state| state.value).unwrap_or(0.0) != new && exhausted(hp, new)) {
+                    before = Some(online::fitting::capture_from_fit(tx, &sde, &fences, owner, ship, fit).await?);
+                }
+                let mut damaged = Vec::new();
                 for &(id, _, old, new, _) in &damage {
-                    if old.unwrap_or(0.0) == new { continue; }
+                    if old.map(|state| state.value).unwrap_or(0.0) == new { continue; }
                     if !dogma::set_override_if(tx, id, ATTR_HULL_DAMAGE, old, new).await.map_err(db_err)? { return Err(stale()); }
-                    let attr = super::super::notify::attribute_change(owner, Value::Int(id), ATTR_HULL_DAMAGE, Value::Float(new), Value::Float(old.unwrap_or(0.0)));
+                    damaged.push((Key::Module(id), ATTR_HULL_DAMAGE, Some(new)));
+                    let attr = super::super::notify::attribute_change(owner, Value::Int(id), ATTR_HULL_DAMAGE, Value::Float(new), Value::Float(old.map(|state| state.value).unwrap_or(0.0)));
                     outbox.notify_sender(policy.notify.clone(), "OnModuleAttributeChanges", vec![Value::list([attr])]);
                 }
-                let fences = online::OnlineFences::single(system, ship, membership);
-                let mut before = None;
                 let mut final_fit = None;
                 for &(id, _, old, new, hp) in &damage {
-                    if old.unwrap_or(0.0) != new && exhausted(hp, new) {
-                        if before.is_none() { before = Some(online::fitting::capture(tx, &sde, &fences, owner, ship).await?); }
+                    if old.map(|state| state.value).unwrap_or(0.0) != new && exhausted(hp, new) {
                         let (_, fit) = online::set_online_core(tx, &sde, &policy, outbox, &fences, ship, id, false).await?;
                         final_fit = Some(fit);
                     }
                 }
                 if let (Some(before), Some(fit)) = (before, final_fit) {
                     online::fitting::finish(tx, before, fit, outbox).await?;
+                } else if !damaged.is_empty() {
+                    // Without a burnout the committed damage values publish as a
+                    // single field-delta patch; nothing reloads or rewrites them.
+                    if let Some((system, generation)) = fences.membership(ship) {
+                        let patch = crate::services::fit::attributes::CommittedFitting::overridden_attributes(damaged);
+                        outbox.operation(OnlineChanged::Fitting { system, ship, owner, generation, patch }.into());
+                    }
                 }
                 {
                     let state = combat::state();
@@ -136,4 +161,4 @@ pub(in crate::services::effects) async fn apply(cx: &Ctx, membership: Option<u64
     ).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

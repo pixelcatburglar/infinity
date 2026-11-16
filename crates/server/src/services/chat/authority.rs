@@ -7,14 +7,12 @@
 //! and use the durable scheduler. Passwords, corporation/alliance ACL grants,
 //! proxy-room ownership and client-preference nullsec blackout are unsupported.
 use std::sync::Arc;
-use infinity_core::{consts::{ROLE_DIRECTOR, WORMHOLE_SYSTEM_START}, messages::chat as text, session::OnlineSession};
+use infinity_core::{consts::{ROLE_DIRECTOR, WORMHOLE_SYSTEM_END, WORMHOLE_SYSTEM_START}, messages::chat as text, session::OnlineSession};
 use crate::{chat::{console, Hub}, client::filetime_now, dao::{alliances, chat_channels as dao, characters::lookup}, db::{self, Db, executor::Executor, outbox::{Effect, Outbox}}, sde::Sde};
 use super::super::{CallError, notify_error, has_role_or_is_ceo};
 
 /// `inventorycommon/const.py:48-59`: suppressed solar-system ranges.
 const SUPPRESSED_SYSTEM_RANGES: [(i64, i64); 4] = [(32_000_000, 32_999_999), (34_000_000, 34_999_999), (35_000_000, 35_000_100), (36_000_000, 36_999_999)];
-/// `inventorycommon/const.py:48-59`: last wormhole system ID.
-const WORMHOLE_SYSTEM_END: i64 = 31_999_999;
 /// `appConst.py:1569`: Zarzakh uses wormhole local.
 const ZARZAKH_SYSTEM_ID: i64 = 30_100_000;
 /// `appConst.py:608`: factionTriglavian.

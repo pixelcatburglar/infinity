@@ -1,7 +1,7 @@
 //! Immutable startup character creation and NPC identity data.
 //! This dataset has no direct client mirror; character selection and skill services consume it.
 //! Sources are typed races, bloodlines and NPC characters and native schools.
-//! Other character and school fields are not retained.
+//! NPC rows keep their agent marker and deletion flag; the corporation IDs of live agents are indexed once at load. Other character and school fields are not retained.
 
 use std::collections::HashMap;
 
@@ -15,7 +15,7 @@ pub(crate) struct Bloodline {
 }
 pub(crate) struct NpcCharacter {
     pub character_id: i64, pub corporation_id: Option<i64>, pub name: Option<String>,
-    pub gender: Option<i32>, pub name_id: Option<i64>,
+    pub gender: Option<i32>, pub name_id: Option<i64>, pub is_agent: bool, pub deleted: bool,
 }
 pub(crate) struct School {
     pub school_id: i64, pub race_id: Option<i32>, pub corporation_id: Option<i64>,
@@ -25,7 +25,7 @@ pub(crate) struct School {
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct Characters {
     races: Vec<Race>, bloodlines: Vec<Bloodline>, npc_characters: Vec<NpcCharacter>, schools: Vec<School>,
-    schools_by_race: HashMap<i32, Vec<usize>>,
+    schools_by_race: HashMap<i32, Vec<usize>>, agent_corporation_ids: Vec<i64>,
 }
 
 impl Characters {
@@ -46,7 +46,18 @@ impl Characters {
                 schools_by_race.entry(race_id).or_default().push(index);
             }
         }
-        Ok(Self { races, bloodlines, npc_characters, schools, schools_by_race })
+        Ok(Self::from_rows(races, bloodlines, npc_characters, schools, schools_by_race))
+    }
+
+    fn from_rows(races: Vec<Race>, bloodlines: Vec<Bloodline>, npc_characters: Vec<NpcCharacter>, schools: Vec<School>, schools_by_race: HashMap<i32, Vec<usize>>) -> Self {
+        let mut agent_corporation_ids: Vec<i64> = npc_characters.iter()
+            .filter(|row| row.is_agent && !row.deleted)
+            .filter_map(|row| row.corporation_id)
+            .filter(|&id| id > 0)
+            .collect();
+        agent_corporation_ids.sort_unstable();
+        agent_corporation_ids.dedup();
+        Self { races, bloodlines, npc_characters, schools, schools_by_race, agent_corporation_ids }
     }
 
     pub(crate) fn race(&self, id: i64) -> Option<&Race> {
@@ -66,4 +77,7 @@ impl Characters {
         self.schools_by_race.get(&race).into_iter().flatten().map(|&index| &self.schools[index])
     }
     pub(crate) fn npc_characters(&self) -> impl Iterator<Item = &NpcCharacter> { self.npc_characters.iter() }
+    pub(crate) fn agent_corporation_ids(&self) -> &[i64] { &self.agent_corporation_ids }
 }
+
+#[cfg(all(test, feature = "tests-sde"))] mod tests;

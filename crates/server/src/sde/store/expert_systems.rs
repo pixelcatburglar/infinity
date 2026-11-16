@@ -35,5 +35,5 @@ pub(super) fn parse(content: &str, valid_type: impl Fn(i32) -> bool, valid_exper
     Ok(offers)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

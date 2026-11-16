@@ -149,5 +149,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

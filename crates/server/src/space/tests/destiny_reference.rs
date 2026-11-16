@@ -38,6 +38,19 @@ pub(in crate::space) fn ship(id: i64, pos: V3, velocity: V3) -> Ball {
         launcher: 0, slim: vec![],
     }
 }
+/// Replay native missile steering without the server's flight lifecycle.
+pub(in crate::space) fn launch_native(system: &mut System, ball: Ball, target: i64, launcher: i64) {
+    let id = ball.id;
+    system.insert(ball);
+    system.command(id, move |m, stamp, s| {
+        let owner = launcher.checked_abs().and_then(|o| if o == id { Some(m.clone()) } else { s.ball(o).cloned() }).map(|b| (b.pos, b.vel, b.max_vel));
+        let target = owner.filter(|_| target >= 0).and_then(|_| if target == launcher { None } else if target == id { Some(m.clone()) } else { s.ball(target).cloned() });
+        if let Some(owner) = owner {
+            m.launch_native_missile(owner, target.map(|b| (b.id, b.pos, b.radius, b.cloak)), launcher, stamp);
+        }
+        vec![]
+    });
+}
 
 fn fixture(name: &str, fixture: &str, ids: &BTreeSet<i64>, stream_ticks: &[i64]) -> BTreeMap<(i64, i64), serde_json::Value> {
     let mut lines = fixture.lines();

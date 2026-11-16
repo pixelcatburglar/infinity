@@ -1,9 +1,9 @@
 use super::*;
 
 fn observe_evermarks<'a, 'tx>(
-    _: &'a tokio_postgres::Transaction<'tx>, _: &'a mut Outbox, _: &'a crate::sde::Sde,
+    _: &'a crate::db::Transaction<'tx>, _: &'a mut Outbox, _: &'a crate::sde::Sde,
     event: &'a crate::progress::EventEnvelope,
-) -> crate::db::transaction::TxFuture<'a, (), crate::services::CallError> {
+) -> crate::db::transaction::TxFuture<'a, (), crate::progress::ApplyError> {
     Box::pin(async move {
         assert!(matches!(&event.event, crate::lua::events::GameEvent::EverMarksEarned { .. }));
         Ok(())
@@ -11,7 +11,7 @@ fn observe_evermarks<'a, 'tx>(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated test process, dedicated INFINITY_TEST_DATABASE_URL with SDE, and external flock"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn real_rewards_replay_and_home_retry() {
     const CHILD: &str = "INFINITY_DAILY_REDEEM_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -24,10 +24,9 @@ async fn real_rewards_replay_and_home_retry() {
     use std::sync::Arc;
     crate::tests::init_config();
     let registration = crate::progress::DurableRegistration { consumer_key: "daily-redeem-test-evermarks", kinds: &["EverMarksEarned"], mode: crate::progress::DeliveryMode::Direct(observe_evermarks) };
-    let registry = crate::progress::Registry::new(vec![], vec![registration]).unwrap();
-    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap().with_progress_registry(registry);
-    db.execute("INSERT INTO game.progress_subscriptions (consumer_key,generation,activated_at,version,enabled) VALUES ('daily-redeem-test-evermarks',1,1,1,true)", &[]).await.unwrap();
-    db.execute("INSERT INTO game.progress_subscription_kinds (consumer_key,kind) VALUES ('daily-redeem-test-evermarks','EverMarksEarned')", &[]).await.unwrap();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let registry = crate::progress::tests::fixture_registry(&db, crate::progress::Registry::new(vec![], vec![registration]).unwrap()).await;
+    let db = db.with_progress_registry(registry);
     let sde = Arc::new(crate::sde::Sde::load(&db).await.expect("daily rewards require real SDE"));
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
@@ -53,6 +52,7 @@ async fn real_rewards_replay_and_home_retry() {
     let mut config = crate::config::Config::default();
     config.lua.enabled = true;
     config.lua.scripts_dir = root.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
     crate::lua::start(&config, &db, &sde, &world, &hub).await.expect("daily Host starts");
     let resources = Resources::from_world(&world).unwrap();
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -109,13 +109,19 @@ async fn real_rewards_replay_and_home_retry() {
     let mut events = Vec::new();
     while let Ok((name, _)) = pilot.try_recv() { events.push(name); }
     for expected in ["OnAccountChange", "OnLPChange", "OnFreeSkillPointsChanged", "OnItemChange", "OnAurumChangeFromVgs"] { assert!(events.iter().any(|name| name == expected)); }
-    assert!(notices.rx.try_recv().is_ok());
+    for expected in ["eve_public.plex.vault.api.BalanceChangedNotice", "eve_public.dailygoal.api.RedeemedNotice"] {
+        let (_, payload) = crate::gateway::tests::decode_notice(&notices.rx.try_recv().unwrap());
+        assert_eq!(prost_reflect::ReflectMessage::descriptor(&payload).full_name(), expected);
+    }
+    assert!(notices.rx.try_recv().is_err());
     redeem(&resources, &identity, fixture.account, id, true, at + 2 * infinity_core::consts::FILETIME_DAY).await.unwrap();
     assert_eq!(rewards::list(&db, fixture.character, id, false).await.unwrap(), claimed);
     assert!(pilot.try_recv().is_err());
     assert_eq!(fact_count("EverMarksEarned").await, 1);
     assert_eq!(wallets::balance(&db, fixture.character).await.unwrap(), wallet);
-    let _ = notices.rx.try_recv();
+    let (_, payload) = crate::gateway::tests::decode_notice(&notices.rx.try_recv().unwrap());
+    assert_eq!(prost_reflect::ReflectMessage::descriptor(&payload).full_name(), "eve_public.dailygoal.api.RedeemedNotice");
+    assert!(notices.rx.try_recv().is_err());
     let second = views.iter().filter(|v| v.goal.category == "ordinary").nth(1).unwrap();
     assert!(instances::update_progress(&db, fixture.character, &second.goal.goal_id, second.goal.revision, &instances::ProgressUpdate {
         progress: second.goal.target, remainder: crate::lua::events::combat::BinaryAmount { coefficient: "0".into(), exponent: 0 },

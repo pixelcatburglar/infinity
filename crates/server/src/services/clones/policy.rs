@@ -143,4 +143,4 @@ pub(super) async fn ensure_install_tx(ex: &(impl Executor + ?Sized), sde: &Arc<S
     if let Some(issue) = issues(ex, sde, id, now).await?.into_iter().next() { Err(issue.error()) } else { Ok(()) }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;

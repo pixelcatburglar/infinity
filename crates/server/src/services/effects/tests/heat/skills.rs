@@ -1,7 +1,7 @@
 //! Real Thermodynamics skill modifiers and overload eligibility.
 use super::*;
-use infinity_core::{consts::{dogma::ATTR_SKILL_LEVEL, dogma::ATTR_SKILL_TIME_CONSTANT}};
-use crate::{dao::skills::training, services::skills::formulas};
+use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
+use crate::dao::skills::training;
 
 /// SDE Thermodynamics skill type.
 const THERMODYNAMICS: i32 = 28164;
@@ -22,16 +22,16 @@ async fn thermodynamics_reduces_heat_damage_once_and_gates_overload() {
         && services::skills::requirements::requirements(&sde, t.type_id).all(|(skill, _)| skill != THERMODYNAMICS)
         && t.effects().iter().any(|e| e.effect_id == EFFECT_MICROWARPDRIVE)
         && t.effects().iter().any(|e| e.effect_id == OVERLOAD_SPEED)).expect("overloadable propulsion module requiring Thermodynamics").type_id;
-    let rank = sde.types.get(THERMODYNAMICS).and_then(|t| t.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).expect("Thermodynamics rank");
-    let before = fixture::fingerprint(&db).await.unwrap();
-    let f = fixture::create(&db, hull, module, FLAG_MED_SLOT_FIRST).await.unwrap();
+
+    let f = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[ShipItemSpec { type_id: module, flag_id: FLAG_MED_SLOT_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] }]).await.unwrap();
+    let module_id = f.module();
     let world = World::new(db.clone(), sde.clone(), 1);
     let d = db.clone();
     let w = world.clone();
     let result = tokio::spawn(async move {
         fixture::position(&d, f.ship, SYSTEM, [0.0; 3]).await.unwrap();
         seed_module_prerequisites(&d, &sde, f.character, module).await;
-        dogma::set_override(&d, f.module, HEAT_DAMAGE, 100.0).await.unwrap();
+        dogma::set_override(&d, module_id, HEAT_DAMAGE, 100.0).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
@@ -57,11 +57,9 @@ async fn thermodynamics_reduces_heat_damage_once_and_gates_overload() {
         let mut changed = false;
         for skill in candidates {
             services::skills::gm::apply(&mut c, f.character, services::skills::gm::Change::Set(vec![(skill, 1)])).await.ok().expect("set defensive skill");
-            services::dogma::brain::update(&mut c).await.ok().expect("publish low-skill brain");
             let low = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap();
             let low_stats = combat::groups_health::ShipStats::from_fit(&low, Key::Ship);
             services::skills::gm::apply(&mut c, f.character, services::skills::gm::Change::Set(vec![(skill, 5)])).await.ok().expect("raise defensive skill");
-            services::dogma::brain::update(&mut c).await.ok().expect("publish high-skill brain");
             let high = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap();
             let high_stats = combat::groups_health::ShipStats::from_fit(&high, Key::Ship);
             if low_stats.max != high_stats.max || low_stats.resonance != high_stats.resonance || low_stats.shield_tau_ms != high_stats.shield_tau_ms {
@@ -80,31 +78,36 @@ async fn thermodynamics_reduces_heat_damage_once_and_gates_overload() {
             }
         }
         assert!(changed, "SDE defensive skill must change fitted defenses");
-        assert!(dogma::online(&d, f.ship).await.unwrap().iter().any(|m| m.item_id == f.module), "module remains online after defensive skill changes");
-        let overload = [Value::Int(f.module), Value::Int(i64::from(OVERLOAD_SPEED))];
+        assert!(dogma::online(&d, f.ship).await.unwrap().iter().any(|m| m.item_id == module_id), "module remains online after defensive skill changes");
+        let overload = [Value::Int(module_id), Value::Int(i64::from(OVERLOAD_SPEED))];
         let fit = Fit::load(&d, sde.clone(), f.character, f.ship).await.ok().unwrap();
-        assert_eq!(fit.value(Key::Module(f.module), HEAT_DAMAGE), 100.0);
+        assert_eq!(fit.value(Key::Module(module_id), HEAT_DAMAGE), 100.0);
         assert_eq!(fit.value(Key::Skill(THERMODYNAMICS), ATTR_SKILL_LEVEL), 0.0);
         let refusal = call(&mut c, "dogmaIM", "Overload", &overload, None).await;
         assert!(matches!(&refusal, Err(services::CallError::User { msg, dict }) if msg == infinity_core::messages::MSG_CUSTOM_NOTIFY
                 && *dict == vec![("notify".into(), Value::unicode(infinity_core::messages::heat::THERMODYNAMICS_REQUIRED))]), "unexpected refusal: {refusal:?}");
-        assert!(!heat::overloaded_modules().contains(&f.module));
+        assert!(!heat::overloaded_modules().contains(&module_id));
         for (level, expected) in [(1, 95.0), (5, 75.0)] {
-            // Invert the existing level calculation instead of duplicating its skill-point formula.
-            let (mut low, mut high) = (0_i64, 1_i64 << 40);
-            while low < high {
-                let mid = low + (high - low) / 2;
-                if formulas::level_from_points(mid, rank) < level { low = mid + 1; } else { high = mid; }
-            }
-            assert_eq!(formulas::level_from_points(low, rank), level);
-            training::set_level(&d, f.character, THERMODYNAMICS, level, low).await.unwrap();
-            services::dogma::brain::update(&mut c).await.expect("publish Thermodynamics brain");
+            services::skills::gm::apply(&mut c, f.character, services::skills::gm::Change::Set(vec![(THERMODYNAMICS, level)])).await.ok().expect("set Thermodynamics level");
+            // The committed character publish itself must reach the resident
+            // fit before anything reads the next value; no manual brain update
+            // stands in for it.
+            let seen = w.with(SYSTEM, move |s| s.with_combat_fit(f.ship, |fit, _, _|
+                fit.value(Key::Skill(THERMODYNAMICS), ATTR_SKILL_LEVEL))).await.flatten();
+            assert_eq!(seen, Some(f64::from(level)), "actor rejected the committed character publish");
             let fit = Fit::load(&d, sde.clone(), f.character, f.ship).await.ok().unwrap();
             assert_eq!(fit.value(Key::Skill(THERMODYNAMICS), ATTR_SKILL_LEVEL), f64::from(level));
-            assert_eq!(fit.value(Key::Module(f.module), HEAT_DAMAGE), expected);
+            assert_eq!(fit.value(Key::Module(module_id), HEAT_DAMAGE), expected);
+            // The actor-gated compile and the cold compile of the same state
+            // must marshal to identical brainData payload bytes; nothing sorts
+            // or normalizes either side.
+            let actor = w.with(SYSTEM, move |s| s.with_combat_fit(f.ship, move |fit, _, _| services::dogma::brain::compile(fit, f.character, f.ship))).await.flatten().expect("actor fit");
+            let cold = services::dogma::brain::compile(&fit, f.character, f.ship);
+            assert_eq!(marshal::dumps(&Value::tuple([actor.0, actor.1, actor.2])),
+                marshal::dumps(&Value::tuple([cold.0, cold.1, cold.2])), "actor and cold brain payloads differ");
         }
         call(&mut c, "dogmaIM", "Overload", &overload, None).await.ok().expect("trained Thermodynamics permits overload");
-        assert!(heat::overloaded_modules().contains(&f.module));
+        assert!(heat::overloaded_modules().contains(&module_id));
     }).await;
     heat::clear_character(f.character);
     world.remove_ball(SYSTEM, f.ship).await;
@@ -112,9 +115,10 @@ async fn thermodynamics_reduces_heat_damage_once_and_gates_overload() {
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, module_id]).await.unwrap();
     training::remove(&db, f.character, &[THERMODYNAMICS]).await.unwrap();
-    fixture::cleanup(&db, f).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }
@@ -147,8 +151,8 @@ async fn hardener_cycle_and_overload_publish_fitted_defenses() {
             })?;
             Some((t.type_id, active.0, overload, active.1))
         }).expect("overloadable defensive module with an active resonance modifier");
-    let before = fixture::fingerprint(&db).await.unwrap();
-    let f = fixture::create(&db, hull, module, FLAG_MED_SLOT_FIRST).await.unwrap();
+    let f = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[ShipItemSpec { type_id: module, flag_id: FLAG_MED_SLOT_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] }]).await.unwrap();
+    let module_id = f.module();
     let world = World::new(db.clone(), sde.clone(), 1);
     let d = db.clone();
     let w = world.clone();
@@ -157,10 +161,13 @@ async fn hardener_cycle_and_overload_publish_fitted_defenses() {
         for (item, attr, value) in [
             (f.ship, ATTR_MED_SLOTS, 1.0), (f.ship, ATTR_CPU_OUTPUT, 1_000_000.0),
             (f.ship, ATTR_POWER_OUTPUT, 1_000_000.0), (f.ship, ATTR_CAPACITOR_CAPACITY, 1_000_000.0),
-            (f.module, ATTR_CPU, 0.0), (f.module, ATTR_POWER, 0.0), (f.module, ATTR_CAPACITOR_NEED, 0.0),
-            (f.module, REQUIRED_THERMODYNAMICS, 0.0), (f.module, HEAT_DAMAGE, 0.0), (f.module, duration, 2000.0),
+            (module_id, ATTR_CPU, 0.0), (module_id, ATTR_POWER, 0.0), (module_id, ATTR_CAPACITOR_NEED, 0.0),
+            (module_id, REQUIRED_THERMODYNAMICS, 0.0), (module_id, HEAT_DAMAGE, 1.0), (module_id, duration, 2000.0),
+            (f.ship, ATTR_LOW_SLOTS, 0.0), (f.ship, ATTR_HI_SLOTS, 0.0), (f.ship, ATTR_RIG_SLOTS, 0.0),
+            (f.ship, HEAT_GENERATION, 1000.0), (module_id, HEAT_ABSORPTION, 1000.0),
+            (module_id, ATTR_STRUCTURE_HP, 1000.0),
         ] { dogma::set_override(&d, item, attr, value).await.unwrap(); }
-        for attr in ATTR_REQUIRED_SKILL_LEVELS { dogma::set_override(&d, f.module, attr, 0.0).await.unwrap(); }
+        for attr in ATTR_REQUIRED_SKILL_LEVELS { dogma::set_override(&d, module_id, attr, 0.0).await.unwrap(); }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
@@ -180,7 +187,7 @@ async fn hardener_cycle_and_overload_publish_fitted_defenses() {
         let raw = assert_cached_defenses(&d, &w, f.character, f.ship).await;
         let baseline = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap();
         let baseline_stats = combat::groups_health::ShipStats::from_fit(&baseline, Key::Ship);
-        let activation = [Value::Int(f.module), Value::str(&active_name), Value::None, Value::Int(10)];
+        let activation = [Value::Int(module_id), Value::str(&active_name), Value::None, Value::Int(10)];
         call(&mut c, "dogmaIM", "Activate", &activation, None).await.ok().expect("activate hardener");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -192,10 +199,10 @@ async fn hardener_cycle_and_overload_publish_fitted_defenses() {
         let active_fit = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap();
         let active_stats = combat::groups_health::ShipStats::from_fit(&active_fit, Key::Ship);
         assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw);
-        let overload_args = [Value::Int(f.module), Value::Int(i64::from(overload))];
+        let overload_args = [Value::Int(module_id), Value::Int(i64::from(overload))];
         call(&mut c, "dogmaIM", "Overload", &overload_args, None).await.ok().expect("overload hardener");
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !heat::overloaded_modules().contains(&f.module) { assert!(w.after(SYSTEM, 100).await); }
+            while !heat::overloaded_modules().contains(&module_id) { assert!(w.after(SYSTEM, 100).await); }
         }).await.expect("hardener overload boundary");
         let hot_fit = Fit::load_in_space(&d, &w, SYSTEM, f.character, f.ship).await.ok().unwrap();
         let hot_stats = combat::groups_health::ShipStats::from_fit(&hot_fit, Key::Ship);
@@ -203,24 +210,42 @@ async fn hardener_cycle_and_overload_publish_fitted_defenses() {
         assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw);
         call(&mut c, "dogmaIM", "StopOverload", &overload_args, None).await.ok().unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while heat::overloaded_modules().contains(&f.module) { assert!(w.after(SYSTEM, 100).await); }
+            while heat::overloaded_modules().contains(&module_id) { assert!(w.after(SYSTEM, 100).await); }
         }).await.expect("hardener overload stop boundary");
-        assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw);
-        call(&mut c, "dogmaIM", "Deactivate", &[Value::Int(f.module), Value::str(&active_name)], None).await.ok().unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while combat::state().active.contains_key(&f.module) { assert!(w.after(SYSTEM, 100).await); }
+            loop {
+                let stored = dogma::overrides(&d, module_id).await.unwrap().into_iter()
+                    .find(|row| row.attribute_id == ATTR_HULL_DAMAGE).map_or(0.0, |row| row.value);
+                let live = w.with(SYSTEM, move |s| s.with_combat_fit(f.ship, move |fit, _, _|
+                    (fit.value(Key::Module(module_id), ATTR_HULL_DAMAGE), fit.module_state(module_id)))).await.flatten().unwrap();
+                if stored > 0.0 {
+                    assert!(stored < 1000.0, "fixture reached burnout instead of the damage-only branch");
+                    if live.0 == stored {
+                        assert_eq!(live.1, Some((true, true)));
+                        break;
+                    }
+                }
+                assert!(w.after(SYSTEM, 100).await);
+            }
+        }).await.expect("committed non-burnout damage did not reach the resident fit");
+        assert!(dogma::online(&d, f.ship).await.unwrap().iter().any(|row| row.item_id == module_id));
+        assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw);
+        call(&mut c, "dogmaIM", "Deactivate", &[Value::Int(module_id), Value::str(&active_name)], None).await.ok().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while combat::state().active.contains_key(&module_id) { assert!(w.after(SYSTEM, 100).await); }
         }).await.expect("hardener retired");
         assert_eq!(assert_cached_defenses(&d, &w, f.character, f.ship).await, raw);
     }).await;
-    { let mut st = combat::state(); if let Some(active) = st.active.remove(&f.module) { active.stop.store(true, std::sync::atomic::Ordering::Relaxed); } st.activation_generation.remove(&f.module); }
+    { let mut st = combat::state(); if let Some(active) = st.active.remove(&module_id) { active.stop.store(true, std::sync::atomic::Ordering::Relaxed); } st.activation_generation.remove(&module_id); }
     heat::clear_character(f.character);
     world.remove_ball(SYSTEM, f.ship).await;
     world.unregister_pilot_generation(f.character, None);
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);
-    fixture::cleanup(&db, f).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, module_id]).await.unwrap();
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

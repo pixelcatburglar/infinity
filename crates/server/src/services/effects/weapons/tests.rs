@@ -1,9 +1,9 @@
 use super::*;
 use crate::space::System;
 use crate::dao::items::creation;
+use infinity_core::consts::dogma::{ATTR_AOE_CLOUD_SIZE, ATTR_AOE_VELOCITY};
 
-#[path = "../../combat/groups_health/tests/fixture.rs"]
-mod fixture;
+use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipLocation};
 
 fn ball() -> Ball {
     Ball {
@@ -37,6 +37,21 @@ async fn attempt(world: &Arc<World>, system: i64, source: i64, module: Option<i6
     }).await.unwrap()
 }
 
+async fn retire(world: Arc<World>, db: &Db, f: crate::services::combat::tests::remote_repair_db::Fixture) {
+    world.unregister_pilot_generation(f.source, None);
+    world.remove_ball(1, f.ship).await;
+    world.remove_ball(1, f.victim).await;
+    world.flush_positions().await.unwrap();
+    crate::services::combat::forget_ship(f.ship);
+    crate::services::combat::forget_ship(f.victim);
+    drop(world);
+    db.execute("DELETE FROM game.item_attributes WHERE item_id = ANY($1)", &[&&[f.module, f.ship, f.victim][..]]).await.unwrap();
+    db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        crate::services::tests::fixture::cleanup_progress(tx, &[f.account, f.source, f.target], &[f.source, f.target]).await
+    }), |(), ()| async { Ok(()) }).await.unwrap();
+    crate::services::combat::tests::remote_repair_db::cleanup(db, f).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn missile_impact_capacity_notifies_and_fences_activation_generation() {
@@ -59,7 +74,7 @@ async fn missile_impact_capacity_notifies_and_fences_activation_generation() {
         }).unwrap();
     let charge = missile_charge(&sde);
     let system = -31_004;
-    let fixture = fixture::create(&db, ship_type, system).await.unwrap();
+    let fixture = create_ship(&db, ship_type, ShipLocation::Space { system }, &[]).await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(fixture.character, tx);
@@ -119,7 +134,7 @@ async fn missile_impact_capacity_notifies_and_fences_activation_generation() {
         state.activation_generation.insert(master, old.clone());
     }
     let projectile = || Missile { charge, raw: [raw, 0.0, 0.0, 0.0], aoe_cloud: 1.0,
-        aoe_velocity: 10_000.0, drf: 1.0, velocity: 4_000.0, flight_range: 10_000.0,
+        aoe_velocity: 10_000.0, drf: 1.0, velocity: 4_000.0, flight_time_ms: 5_000.0,
         weapon: charge, illegal: false };
     launch_missile(db.clone(), world.clone(), system, source.clone(), target.clone(), character, Some(master),
         projectile(), None, first.with_activation(master, old.clone())).await.unwrap();
@@ -153,11 +168,12 @@ async fn missile_impact_capacity_notifies_and_fences_activation_generation() {
     world.remove_ball(system, fixture.ship).await;
     world.remove_ball(system, target_id).await;
     drop(world);
-    fixture::cleanup(&db, fixture).await.unwrap();
+    cleanup_ship(&db, None, fixture).await.unwrap();
 }
 
 #[test]
 fn missile_lifecycle_preserves_exploration_site() {
+    crate::tests::init_config();
     let mut system = System::new(0, Arc::default(), 12_345);
     let site = ball();
     let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
@@ -167,7 +183,7 @@ fn missile_lifecycle_preserves_exploration_site() {
         ..site.clone()
     };
     system.insert(site);
-    system.launch_missile(missile, site_id, site_id, 500, move |s| { s.destroy_ball(missile_id); });
+    system.launch_missile(missile, site_id, site_id, 500.0, |_, _| {});
 
     let retained_site = system.ball(site_id).unwrap();
     assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
@@ -322,7 +338,7 @@ async fn missile_uses_signature_and_speed_at_impact() {
     }).await.unwrap();
     let stale = Missile {
         charge, raw: [shield, 0.0, 0.0, 0.0], aoe_cloud: 40.0, aoe_velocity: 170.0,
-        drf: 0.604, velocity: 1_000.0, flight_range: 10_000.0, weapon: charge, illegal: false,
+        drf: 0.604, velocity: 1_000.0, flight_time_ms: 5_000.0, weapon: charge, illegal: false,
     };
     let before = test_world.with(system, |s| s.balls().count()).await.unwrap();
     let guard = crate::services::effects::space_source::SourceGuard::Npc {
@@ -345,7 +361,7 @@ async fn missile_uses_signature_and_speed_at_impact() {
     let missile = Missile {
         charge, raw: [shield * 0.25 / resonance, 0.0, 0.0, 0.0],
         aoe_cloud: 40.0, aoe_velocity: 170.0, drf: 0.604,
-        velocity: 1_000.0, flight_range: 10_000.0, weapon: charge, illegal: false,
+        velocity: 1_000.0, flight_time_ms: 5_000.0, weapon: charge, illegal: false,
     };
     let impact_attempt = attempt(&test_world, system, source.id, None, charge).await;
     launch_missile(test_db.clone(), test_world.clone(), system, source.clone(), target.clone(), 1, None, missile, None, impact_attempt).await.ok().unwrap();
@@ -398,8 +414,17 @@ async fn missile_uses_signature_and_speed_at_impact() {
     let projectile = |velocity| Missile {
         charge, raw: [shield * 0.05 / resonance, 0.0, 0.0, 0.0],
         aoe_cloud: 1.0, aoe_velocity: 10_000.0, drf: 1.0,
-        velocity, flight_range: 10_000.0, weapon: charge, illegal: false,
+        velocity, flight_time_ms: 20_000.0, weapon: charge, illegal: false,
     };
+    // Restore the rigid target's consistent stationary state: the 400 m/s
+    // sideways velocity only served the application check above, and native
+    // steering would chase a phantom intercept the slow shot cannot reach.
+    test_world.with(system, move |s| s.command(target_id, |ball, _, _| {
+        ball.vel = [0.0; 3];
+        ball.old_vel = ball.vel;
+        ball.segment_acceleration = None;
+        vec![]
+    })).await.unwrap();
     let before = after_duplicate[0];
     launch_missile(test_db.clone(), test_world.clone(), system, source.clone(), target.clone(), 1, Some(124),
         projectile(200.0), None, first).await.unwrap();
@@ -424,8 +449,15 @@ async fn missile_uses_signature_and_speed_at_impact() {
     assert!(test_world.after(system, 2_000).await);
     let after_replay = test_world.with(system, move |s| s.combat_condition_snapshot(target_id).unwrap().condition.now[0]).await.unwrap();
     assert_eq!(after_replay, after_second);
-    assert!(test_world.after(system, 8_000).await);
-    let after_first = test_world.with(system, move |s| s.combat_condition_snapshot(target_id).unwrap().condition.now[0]).await.unwrap();
+    // The slow shot needs about ten seconds of real flight; wait on the actual
+    // condition terminal instead of a fixed arrival estimate.
+    let after_first = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let now = test_world.with(system, move |s| s.combat_condition_snapshot(target_id).unwrap().condition.now[0]).await.unwrap();
+            if now < after_replay { break now; }
+            assert!(test_world.after(system, 500).await, "actor stopped awaiting slow impact");
+        }
+    }).await.expect("slow missile impact timed out");
     assert!((after_replay - after_first - shield * 0.05).abs() < 1e-7 * shield);
     let weak = Arc::downgrade(&test_world);
     let (miss, cancelled) = test_world.with(system, move |s| {
@@ -438,7 +470,7 @@ async fn missile_uses_signature_and_speed_at_impact() {
     let miss_facts = miss.facts();
     let cancelled_facts = cancelled.facts();
     let mut missed_projectile = projectile(4_000.0);
-    missed_projectile.flight_range = 0.0;
+    missed_projectile.flight_time_ms = 100.0;
     let mut miss_source = source.clone();
     miss_source.pos = [-1_000.0, 0.0, 0.0];
     launch_missile(test_db.clone(), test_world.clone(), system, miss_source, target.clone(), 1, Some(124),
@@ -471,9 +503,8 @@ async fn npc_miss_reports_physical_source_to_drone_owner() {
         .expect("SDE drone type").type_id;
     let hull = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP))
         .expect("SDE hull").type_id;
-    let before = fixture::fingerprint(&db).await.unwrap();
     let system = -31_002;
-    let f = fixture::create(&db, hull, system).await.unwrap();
+    let f = create_ship(&db, hull, ShipLocation::Space { system }, &[]).await.unwrap();
     let drone_id = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let world = World::new(db.clone(), sde.clone(), 1);
     let w = world.clone();
@@ -509,22 +540,179 @@ async fn npc_miss_reports_physical_source_to_drone_owner() {
             s.install_condition(source_id, crate::services::combat::groups_health::Condition {
                 now: source_stats.max, stats: source_stats, shield_at: crate::client::filetime_now(),
             }, source_fit);
-            s.restore_drone(PreparedDrone { ball: b, spec, condition, fit, key },
+            s.restore_drone(PreparedDrone { ball: b, spec, condition, fit, key, npc_ignored: false },
                 Arc::new(|_, _| Some(Box::pin(async {}))));
         }).await.unwrap();
         assert_eq!(target.char_id, None);
         let shot = attempt(&w, system, source.id, None, 42).await;
-        turret_shot(&d, &w, system, &source, &target, None, 42, false, (1.0, 1.0, 1.0, 1.0), [1.0; 4], None, shot).await.ok().unwrap();
+        turret_shot(&d, &w, system, &source, &target, None, 42, false, (1.0, 1.0, 1.0, 1.0), [1.0; 4], None, None, shot).await.ok().unwrap();
         let (event, args) = rx.try_recv().expect("drone owner receives NPC hit log");
         assert_eq!(event, "OnDamageMessage");
-        assert_eq!(args[0], damage_message("source", source.id, 42, 0.0, HIT_MISS));
+        assert_eq!(args[0], damage_message("source", source.id, 42, 0.0, HIT_MISS, false));
     }).await;
     world.unregister_pilot_generation(f.character, None);
     world.remove_ball(system, drone_id.load(Ordering::Relaxed)).await;
     // The temporary source belongs to this isolated actor and disappears with it.
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, drone_id.load(Ordering::Relaxed)]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&drone_id.load(Ordering::Relaxed), &f.character]).await.unwrap();
     db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&f.character]).await.unwrap();
-    fixture::cleanup(&db, f).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn lethal_missile_contact_recovers_the_persistent_target_once() {
+    let mut f = crate::services::drones::tests::fixture::Fixture::real_system().await;
+    let (victim, target) = f.add_pilot().await;
+    let result = crate::tests::catch_scenario(async {
+        let system = f.system;
+        f.world.with(system, move |s| s.command(target, |ball, _, _| {
+            ball.pos = [1_000.0, 0.0, 0.0];
+            ball.old_pos = ball.pos;
+            vec![]
+        })).await.unwrap();
+        assert!(f.world.after(system, 1_000).await);
+        let (sender, mut notices) = tokio::sync::mpsc::unbounded_channel();
+        f.world.register_pilot(f.owner, sender);
+        let source = f.world.ball(system, f.ship).await.unwrap();
+        let target_ball = f.world.ball(system, target).await.unwrap();
+        let charge = missile_charge(&f.sde);
+        let projectile = || Missile { charge, raw: [1e30; 4], aoe_cloud: 1.0, aoe_velocity: 10_000.0,
+            drf: 1.0, velocity: 100.0, flight_time_ms: 20_000.0, weapon: charge, illegal: false };
+        let shot = attempt(&f.world, system, source.id, None, charge).await;
+        let facts = shot.facts();
+        launch_missile(f.db.clone(), f.world.clone(), system, source.clone(), target_ball.clone(), f.owner, None, projectile(), None, shot).await.unwrap();
+        assert!(f.world.with(system, move |s| matches!(s.combat_phase(target), Some(crate::space::combat::CombatPhase::Live))).await.unwrap());
+        assert!(f.db.query("SELECT 1 FROM game.repairable_recovery_groups WHERE source_item_id=$1", &[&target]).await.unwrap().is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if notices.try_recv().is_ok_and(|(event, _)| event == "OnDamageMessage") { break; }
+                assert!(f.world.after(system, 100).await);
+            }
+        }).await.expect("missile contact and settlement receipt");
+        assert!(f.world.ball(system, target).await.is_none());
+        let selections = crate::dao::repairable_ship::list_owned(&f.db, victim).await.unwrap();
+        assert_eq!(selections.len(), 1);
+        let selected = &selections[0];
+        assert_eq!(selected.group.shape.item.get(), target);
+        assert_eq!(selected.items.iter().map(|m| m.item.get()).collect::<Vec<_>>(), [target]);
+        let physical = crate::dao::items::repairable_ship::capture_many(&f.db, &[selected.group.shape.item]).await.unwrap().remove(0);
+        assert_eq!((physical.owner, physical.location, physical.type_id, physical.flag, physical.quantity, physical.singleton),
+            (infinity_core::consts::NPC_CORP_INTERBUS, selected.group.id.get(), target_ball.type_id, 0, 1, true));
+        launch_missile(f.db.clone(), f.world.clone(), system, source, target_ball, f.owner, None, projectile(), None, PreparedCombatAttempt::new(facts, Arc::downgrade(&f.world), system)).await.unwrap();
+        assert_eq!(f.db.query("SELECT kill_id FROM game.killmails WHERE victim_item_id=$1", &[&target]).await.unwrap().len(), 1);
+    }).await;
+    f.cleanup().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn singleton_turret_rolls_once_and_reports_unbanked() {
+    use crate::services::combat::groups_health::{Condition, ShipStats};
+    use crate::services::combat::tests::remote_repair_db as fixture;
+    use infinity_core::consts::dogma::{ATTR_ARMOR_HP, ATTR_SHIELD_CAPACITY, ATTR_STRUCTURE_HP};
+
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
+        && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 0.0))).unwrap().type_id;
+    let f = fixture::create(&db, ship_type, ship_type, 1).await.unwrap();
+    let world = World::new(db.clone(), sde, 1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    world.register_pilot(f.source, tx);
+    world.add_ship(1, fixture::ball(f.ship, ship_type, f.source)).await.unwrap();
+    let mut target = fixture::ball(f.victim, ship_type, f.target);
+    target.pos = [1_000.0, 0.0, 0.0];
+    world.add_ship(1, target.clone()).await.unwrap();
+    for (ship, owner) in [(f.ship, f.source), (f.victim, f.target)] {
+        let fit = Fit::load_in_space(&db, &world, 1, owner, ship).await.unwrap();
+        let stats = ShipStats::from_fit(&fit, Key::Ship);
+        world.with(1, move |s| s.install_condition(ship, Condition { now: stats.max, stats,
+            shield_at: crate::client::filetime_now() + 60 * infinity_core::consts::FILETIME_SECOND }, fit)).await.unwrap();
+    }
+    let before = fixture::condition(&world, 1, f.victim).await;
+    let raw = [10.0; 4];
+    let expected: f64 = (0..4).map(|i| raw[i] * before.stats.resonance[0][i]).sum();
+    let rolls = Arc::new(AtomicI64::new(0));
+    let counter = rolls.clone();
+    let source = world.ball(1, f.ship).await.unwrap();
+    let shot = attempt(&world, 1, f.ship, None, 42).await;
+    turret_shot_with_roll(&db, &world, 1, &source, &target, Some(f.source), 42, false,
+        (30_000.0, 10_000.0, 1.0, 400.0), raw, None, None, shot,
+        move |_| { counter.fetch_add(1, Ordering::Relaxed); 1.0 }).await.unwrap();
+    assert_eq!(rolls.load(Ordering::Relaxed), 1, "one roll for one singleton shot");
+    let dealt: f64 = before.now.iter().zip(fixture::condition(&world, 1, f.victim).await.now).map(|(old, new)| old - new).sum();
+    assert!(dealt > 0.0 && (dealt - expected).abs() <= 1e-6, "real condition absorbed the expected damage");
+    let (event, args) = rx.try_recv().expect("shooter receives the hit log");
+    assert_eq!((event.as_str(), args[0].clone()), ("OnDamageMessage", damage_message("target", f.victim, 42, expected, hit_quality(1.0), false)));
+    assert!(rx.try_recv().is_err(), "singleton reports once per applicable observer");
+    retire(world, &db, f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn singleton_spool_returns_the_committed_ramp_and_applied_bonus() {
+    use crate::services::combat::groups_health::{Condition, ShipStats};
+    use crate::services::combat::tests::remote_repair_db as fixture;
+    use crate::services::combat::tests::remote_repair_db::set_locked_target;
+    use crate::services::combat::ActiveModule;
+    use infinity_core::consts::dogma::{ATTR_ARMOR_HP, ATTR_SHIELD_CAPACITY, ATTR_STRUCTURE_HP};
+
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
+        && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 0.0))).unwrap().type_id;
+    let f = fixture::create(&db, ship_type, ship_type, 1).await.unwrap();
+    let world = World::new(db.clone(), sde, 1);
+    world.add_ship(1, fixture::ball(f.ship, ship_type, f.source)).await.unwrap();
+    let mut target = fixture::ball(f.victim, ship_type, f.target);
+    target.pos = [1_000.0, 0.0, 0.0];
+    world.add_ship(1, target.clone()).await.unwrap();
+    for (ship, owner) in [(f.ship, f.source), (f.victim, f.target)] {
+        let fit = Fit::load_in_space(&db, &world, 1, owner, ship).await.unwrap();
+        let stats = ShipStats::from_fit(&fit, Key::Ship);
+        world.with(1, move |s| s.install_condition(ship, Condition { now: stats.max, stats,
+            shield_at: crate::client::filetime_now() + 60 * infinity_core::consts::FILETIME_SECOND }, fit)).await.unwrap();
+    }
+    set_locked_target(f.source, f.victim, true);
+    let stop = Arc::new(AtomicBool::new(false));
+    state().active.insert(f.module, ActiveModule { char_id: f.source, stop: stop.clone(), forced_inactive: false });
+    let binding = world.with(1, move |s| SpoolBinding {
+        source_membership: s.combat_membership_generation(f.ship).unwrap(),
+        activation_generation: 7, target: f.victim,
+        target_membership: s.combat_membership_generation(f.victim).unwrap() }).await.unwrap();
+    let parameters = SpoolParameters { step: 0.5, maximum: 0.5 };
+    let mut state_spool = SpoolState::default();
+    state_spool.bind(binding);
+    let source = fixture::ball(f.ship, ship_type, f.source);
+    let fire = |state_spool, range: (f64, f64, f64, f64), roll: f64| {
+        let (db, world, stop, source, target) = (db.clone(), world.clone(), stop.clone(), source.clone(), target.clone());
+        async move {
+            turret_shot_with_roll(&db, &world, 1, &source, &target, Some(f.source), 42, false, range, [10.0; 4], None,
+                Some(TurretSpool::Fitted { binding, module: f.module, master: f.module, pilot: f.source, stop, parameters, state: state_spool }),
+                attempt(&world, 1, f.ship, None, 42).await, move |_| roll).await.unwrap()
+        }
+    };
+    for shot in 0..2 {
+        let TurretResolution::Fired { fitted_spool: Some(result) } = fire(state_spool, (30_000.0, 10_000.0, 1.0, 400.0), 1.0).await
+            else { panic!("shot {shot} must fire") };
+        assert_eq!(result.applied_bonus, 0.5 * shot as f64);
+        state_spool = result.state;
+    }
+    assert_eq!(state_spool.current(parameters), parameters.maximum);
+    assert!(matches!(fire(state_spool, (500.0, 100.0, 1.0, 400.0), 1.0).await, TurretResolution::NotFired)
+        && state_spool.current(parameters) == parameters.maximum);
+    let before = world.with(1, move |s| s.combat_condition_snapshot(f.victim).unwrap().condition.now).await.unwrap();
+    let TurretResolution::Fired { fitted_spool: Some(missed) } = fire(state_spool, (30_000.0, 10_000.0, 1.0, 400.0), 0.0).await
+        else { panic!("a genuine miss still fires") };
+    let after = world.with(1, move |s| s.combat_condition_snapshot(f.victim).unwrap().condition.now).await.unwrap();
+    assert_eq!((missed.applied_bonus, missed.state.current(parameters), after), (parameters.maximum, parameters.maximum, before));
+    set_locked_target(f.source, f.victim, false);
+    state().active.remove(&f.module);
+    retire(world, &db, f).await;
 }

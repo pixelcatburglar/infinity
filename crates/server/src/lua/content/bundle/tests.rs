@@ -1,18 +1,62 @@
 use super::*;
-use serde_json::json;
+use serde_json::{json, Value};
 
-fn bundle() -> Bundle {
+/// The declared adaptation datasets and their file bytes for one build.
+fn adaption_datasets() -> (BTreeMap<String, Value>, BTreeMap<String, Vec<u8>>) {
     let mut files = BTreeMap::new();
     let mut datasets = BTreeMap::new();
     for family in FAMILIES {
         let singleton = family == "shipadaptionconfig" || family == "shipadaptionchipexchangeconfig";
         let record = if singleton { json!({"key":"", "data":{}}) } else { json!({"key":"1", "data":{"_key":1}}) };
         let bytes = serde_json::to_vec(&json!({"schema":"cfsd-adaptation-dataset", "schema_version":1, "client_build":"test", "source_resource":"test", "records":[record]})).unwrap();
-        datasets.insert(family, json!({"path":format!("datasets/{family}.json"), "records":1, "sha256":sha256_hex(&bytes)}));
+        datasets.insert(family.to_owned(), json!({"path":format!("datasets/{family}.json"), "records":1, "sha256":sha256_hex(&bytes)}));
         files.insert(family.to_owned(), bytes);
     }
+    (datasets, files)
+}
+
+fn adaption_section() -> Value {
+    json!({"source_manifest_sha256":"0".repeat(64), "constants_sha256":"0".repeat(64), "chip_types":[1],
+        "provenance":{"source_validation":{}, "chip_type_symbols":["test"]},
+        "validation":{"scope":"chip-ledger", "node_task_effect_gameplay_enabled":false}})
+}
+
+/// A synthetic indices singleton; values are fixtures, not client data.
+fn indices_dataset() -> Vec<u8> {
+    let band = |level: i64, modifier: f64| json!({"level":level, "min_points":level as f64 * 100.0, "max_points":(level + 1) as f64 * 100.0, "modifier":modifier});
+    let bands: Vec<Value> = (0..6).map(|i| band(i, 1.5)).collect();
+    let bonus = |level: i64| json!({"level":level, "bonus":0.5});
+    serde_json::to_vec(&json!({
+        "schema":"infinity-content-dataset", "schema_version":1, "client_build":"test", "source_resource":"test",
+        "records":[{"key":"", "data":{
+            "attribute_ids":{"military":11, "industrial":12, "strategic":13},
+            "military_levels":bands, "industrial_levels":bands,
+            "strategic_seconds":[10, 20, 30, 40, 50],
+            "occupancy":{"base":1.0, "min":1.0, "max":6.0, "capital":2.0,
+                "military":[bonus(1)], "industrial":[bonus(2)], "strategic":[bonus(3)]},
+        }}],
+    })).unwrap()
+}
+
+/// An original v1 package; kept byte-shaped like an unrepublished root.
+fn bundle() -> Bundle {
+    let (datasets, files) = adaption_datasets();
     let manifest = serde_json::to_vec(&json!({"schema":"infinity-adaption-content", "schema_version":1, "client_build":"test", "source_manifest_sha256":"0".repeat(64), "constants_sha256":"0".repeat(64), "chip_types":[1], "datasets":datasets, "provenance":{"source_validation":{}, "chip_type_symbols":["test"]}, "validation":{"scope":"chip-ledger", "node_task_effect_gameplay_enabled":false}})).unwrap();
     Bundle { manifest, files, parsed: BTreeMap::new(), chip_types: Vec::new() }
+}
+
+fn bundle_v2(indices: bool, adaption: bool) -> Bundle {
+    let (mut datasets, mut files) = adaption_datasets();
+    if indices {
+        let bytes = indices_dataset();
+        datasets.insert(INDICES_FAMILY.to_owned(), json!({"path":format!("datasets/{INDICES_FAMILY}.json"), "records":1, "sha256":sha256_hex(&bytes)}));
+        files.insert(INDICES_FAMILY.to_owned(), bytes);
+    }
+    if !adaption { datasets.retain(|family, _| family == INDICES_FAMILY); files.retain(|family, _| family == INDICES_FAMILY); }
+    let mut manifest = json!({"schema":"infinity-content", "schema_version":2, "client_build":"test",
+        "sources":{"a/b.py":{"sha256":"0".repeat(64), "bytes":10}}, "datasets":datasets});
+    if adaption { manifest["adaption"] = adaption_section(); }
+    Bundle { manifest: serde_json::to_vec(&manifest).unwrap(), files, parsed: BTreeMap::new(), chip_types: Vec::new() }
 }
 
 #[test]
@@ -55,6 +99,42 @@ fn malformed_envelopes_and_manifest_members_are_rejected() {
         let bytes = serde_json::to_vec(&dataset).unwrap();
         manifest["datasets"][FAMILIES[0]]["sha256"] = json!(sha256_hex(&bytes));
         candidate.files.insert(FAMILIES[0].to_owned(), bytes);
+        candidate.manifest = serde_json::to_vec(&manifest).unwrap();
+        assert!(candidate.validate(1_000_000).is_err(), "{mutation}");
+    }
+}
+
+#[test]
+fn indices_only_and_mixed_bundles_validate() {
+    let mut standalone = bundle_v2(true, false);
+    standalone.validate(1_000_000).unwrap();
+    assert!(standalone.has_family(INDICES_FAMILY) && !standalone.has_family(FAMILIES[0]) && !standalone.has_family("unknownfamily"));
+    assert!(standalone.chip_types().is_empty());
+    assert_eq!(standalone.records(INDICES_FAMILY).unwrap().len(), 1);
+    assert!(known_family(INDICES_FAMILY) && known_family(FAMILIES[0]) && !known_family("unknownfamily"));
+    let mut mixed = bundle_v2(true, true);
+    mixed.validate(1_000_000).unwrap();
+    assert!(mixed.has_family(FAMILIES[0]) && mixed.has_family(INDICES_FAMILY) && mixed.chip_types() == [1]);
+}
+
+#[test]
+fn declared_or_corrupt_v2_families_are_rejected() {
+    for mutation in ["missing_file", "bad_data", "adaption_without_datasets", "datasets_without_adaption"] {
+        let mut candidate = bundle_v2(true, true);
+        let mut manifest: Value = serde_json::from_slice(&candidate.manifest).unwrap();
+        match mutation {
+            "missing_file" => { candidate.files.remove(INDICES_FAMILY); }
+            "bad_data" => {
+                let mut envelope: Value = serde_json::from_slice(&candidate.files[INDICES_FAMILY]).unwrap();
+                envelope["records"][0]["data"]["military_levels"] = json!([]);
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                manifest["datasets"][INDICES_FAMILY]["sha256"] = json!(sha256_hex(&bytes));
+                candidate.files.insert(INDICES_FAMILY.to_owned(), bytes);
+            }
+            "adaption_without_datasets" => { manifest["datasets"].as_object_mut().unwrap().remove(FAMILIES[0]); }
+            "datasets_without_adaption" => manifest["adaption"] = Value::Null,
+            _ => unreachable!(),
+        }
         candidate.manifest = serde_json::to_vec(&manifest).unwrap();
         assert!(candidate.validate(1_000_000).is_err(), "{mutation}");
     }

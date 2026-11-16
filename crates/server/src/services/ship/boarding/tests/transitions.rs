@@ -17,7 +17,6 @@ async fn capsule_and_ship_transitions_preserve_independent_hulls() {
         .filter(|t| balls::radius(&sde, t.type_id).is_ok()).map(|t| t.type_id).min().expect("published capsule");
     let kind = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_SHIP) && t.group_id != Some(capsule_group) && t.published == Some(true))
         .filter(|t| balls::radius(&sde, t.type_id).is_ok()).map(|t| t.type_id).min().expect("published ship");
-    let before = fingerprint(&db).await;
     let (account, owner) = fixture(&db, &sde, system, None).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -68,6 +67,7 @@ async fn capsule_and_ship_transitions_preserve_independent_hulls() {
         world.register_pilot(owner, c.notify_tx.clone());
         world.set_online_session(owner, infinity_core::session::OnlineSession::from_session(&c.session));
         world.observe(system, c.login.client_id, old, c.destiny_tx.clone()).await.unwrap();
+        let ids = [old, first, second, cargo[0], cargo[1], cargo[2]];
         for (from, target) in [(old, first), (first, second)] {
             fourtuple(board_call(&mut c, target, Value::Int(from)).await.ok().expect("space Board"));
             assert_eq!(c.session.int("shipid"), Some(target));
@@ -85,9 +85,9 @@ async fn capsule_and_ship_transitions_preserve_independent_hulls() {
                 assert!(s.persistent_generation(from).is_some());
                 assert_eq!(s.ball(target).unwrap().char_id, Some(owner));
             }).await.unwrap();
-            let state = fingerprint(&test_db).await;
+            let state = board_state(&test_db, &[owner], &ids).await;
             fourtuple(board_call(&mut c, target, Value::Int(target)).await.ok().expect("current ship refresh"));
-            assert_eq!(fingerprint(&test_db).await, state);
+            assert_eq!(board_state(&test_db, &[owner], &ids).await, state);
         }
         for (ship, item) in [old, first, second].into_iter().zip(cargo) {
             let row = test_db.query_one("SELECT owner_id, location_id FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
@@ -105,7 +105,8 @@ async fn capsule_and_ship_transitions_preserve_independent_hulls() {
             assert_eq!(restored.with(system, move |s| s.persistent_balls().filter(|b| b.id == ship).count()).await, Some(1));
         }
     }).await;
+    let captured = capture_fixture_rows(&db, &[Fixture { account, character: owner }], &[]).await.unwrap();
     cleanup(&db, account, owner).await;
-    assert_eq!(fingerprint(&db).await, before);
+    assert_fixture_removed(&db, &captured).await.unwrap();
     result.unwrap();
 }

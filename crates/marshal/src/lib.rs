@@ -17,6 +17,8 @@
 //! `Marshal.cpp` / `Marshal.h`; they are codec-specific, not general constants.
 //! The long representation here is limited to little-endian two's complement;
 //! a different wire format requires changing both encoder and decoder.
+//! `Debug` output decodes embedded streams at most `DEBUG_STREAM_DEPTH`
+//! levels along one path and prints `Stream(N bytes)` beyond that.
 
 mod dbrow;
 mod decode;
@@ -28,6 +30,11 @@ pub use decode::loads;
 pub use encode::dumps;
 
 use std::fmt;
+
+/// Server codec design: embedded streams are decoded for display only this
+/// many levels deep along one path, which keeps repeated decoding of nested
+/// streams linear in the input size.
+const DEBUG_STREAM_DEPTH: usize = 4;
 
 /// `Marshal::WriteLong` / `_PyLong_FromByteArray`: redundant sign extension.
 fn redundant_sign_byte(last: u8, prev: u8) -> bool {
@@ -178,6 +185,7 @@ pub enum Error {
     BadUtf8 { at: usize },
     BadRle,
     TooDeep,
+    TooLarge,
     Unsupported(&'static str),
 }
 
@@ -193,6 +201,7 @@ impl fmt::Display for Error {
             Error::BadUtf8 { at } => write!(f, "invalid UTF-8 at offset {at}"),
             Error::BadRle => write!(f, "invalid DBRow RLE data"),
             Error::TooDeep => write!(f, "recursion limit exceeded"),
+            Error::TooLarge => write!(f, "decoded size limit exceeded"),
             Error::Unsupported(what) => write!(f, "unsupported marshal feature: {what}"),
         }
     }
@@ -292,32 +301,37 @@ impl Value {
 }
 
 // ---------------------------------------------------------------- repr
-impl fmt::Debug for Value {
+/// `fmt::Debug` for `Value` with the embedded-stream depth still available:
+/// containers pass the remaining depth through, each decoded stream spends one.
+struct Repr<'a>(&'a Value, usize);
+
+impl fmt::Debug for Repr<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn seq(f: &mut fmt::Formatter<'_>, open: &str, items: &[Value], close: &str) -> fmt::Result {
+        fn seq(f: &mut fmt::Formatter<'_>, open: &str, items: &[Value], close: &str, depth: usize) -> fmt::Result {
             f.write_str(open)?;
             for (i, v) in items.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{v:?}")?;
+                write!(f, "{:?}", Repr(v, depth))?;
             }
             if open == "(" && items.len() == 1 {
                 f.write_str(",")?;
             }
             f.write_str(close)
         }
-        fn pairs(f: &mut fmt::Formatter<'_>, items: &[(Value, Value)]) -> fmt::Result {
+        fn pairs(f: &mut fmt::Formatter<'_>, items: &[(Value, Value)], depth: usize) -> fmt::Result {
             f.write_str("{")?;
             for (i, (k, v)) in items.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{k:?}: {v:?}")?;
+                write!(f, "{:?}: {:?}", Repr(k, depth), Repr(v, depth))?;
             }
             f.write_str("}")
         }
-        match self {
+        let depth = self.1;
+        match self.0 {
             Value::None => f.write_str("None"),
             Value::Bool(true) => f.write_str("True"),
             Value::Bool(false) => f.write_str("False"),
@@ -329,33 +343,39 @@ impl fmt::Debug for Value {
                 _ => write!(f, "'{}'", b.escape_ascii()),
             },
             Value::Unicode(s) => write!(f, "u{s:?}"),
-            Value::Tuple(v) => seq(f, "(", v, ")"),
-            Value::List(v) => seq(f, "[", v, "]"),
-            Value::Dict(p) => pairs(f, p),
+            Value::Tuple(v) => seq(f, "(", v, ")", depth),
+            Value::List(v) => seq(f, "[", v, "]", depth),
+            Value::Dict(p) => pairs(f, p, depth),
             Value::Global(g) => write!(f, "<{g}>"),
-            Value::Instance(c, s) => write!(f, "Instance({c:?}, {s:?})"),
+            Value::Instance(c, s) => write!(f, "Instance({:?}, {:?})", Repr(c, depth), Repr(s, depth)),
             Value::Reduce { data, list, dict } | Value::NewObj { data, list, dict } => {
-                let kind = if matches!(self, Value::Reduce { .. }) { "Reduce" } else { "NewObj" };
-                write!(f, "{kind}{data:?}")?;
+                let kind = if matches!(self.0, Value::Reduce { .. }) { "Reduce" } else { "NewObj" };
+                write!(f, "{kind}{:?}", Repr(data, depth))?;
                 if !list.is_empty() {
-                    seq(f, "+", list, "")?;
+                    seq(f, "+", list, "", depth)?;
                 }
                 if !dict.is_empty() {
                     f.write_str("+")?;
-                    pairs(f, dict)?;
+                    pairs(f, dict, depth)?;
                 }
                 Ok(())
             }
             Value::DbRow { descriptor, data, objects } => {
-                write!(f, "DBRow({descriptor:?}, {} bytes, ", data.len())?;
-                seq(f, "[", objects, "])")
+                write!(f, "DBRow({:?}, {} bytes, ", Repr(descriptor, depth), data.len())?;
+                seq(f, "[", objects, "])", depth)
             }
-            Value::Callback(v) => write!(f, "Callback({v:?})"),
-            Value::SubStream(b) => match loads(b) {
-                Ok(v) => write!(f, "Stream({v:?})"),
-                Err(_) => write!(f, "Stream({} bytes)", b.len()),
+            Value::Callback(v) => write!(f, "Callback({:?})", Repr(v, depth)),
+            Value::SubStream(b) => match depth.checked_sub(1).and_then(|d| loads(b).ok().map(|v| (v, d))) {
+                Some((v, d)) => write!(f, "Stream({:?})", Repr(&v, d)),
+                None => write!(f, "Stream({} bytes)", b.len()),
             },
         }
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Repr(self, DEBUG_STREAM_DEPTH).fmt(f)
     }
 }
 

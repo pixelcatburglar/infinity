@@ -62,5 +62,5 @@ pub(crate) async fn list(ex:&(impl Executor + ?Sized), owner_id:i64, key:Option<
     };
     rows.iter().map(Row::from_row).collect()
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

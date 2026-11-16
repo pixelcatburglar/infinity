@@ -186,12 +186,20 @@ impl Definitions {
             monthly_omega: authored.monthly_omega.into_iter().map(|t| t.classify(Category::Month, true)).collect::<anyhow::Result<_>>()?,
         };
         ensure!(value.version == version && !value.source.is_empty(), "invalid daily identity");
-        ensure!(!value.ordinary.is_empty() && value.ordinary.len() <= MAX_ENTRIES && value.slot_pools.len() == 3, "invalid ordinary pools");
-        ensure!(value.monthly_base.len() == 4 && value.monthly_omega.len() == 4, "invalid monthly tracks");
-        ensure!(value.monthly_base.iter().zip(&value.monthly_omega).all(|(a, b)| a.target == b.target) && value.monthly_base.windows(2).all(|w| w[0].target < w[1].target), "invalid monthly targets");
-        ensure!(matches!(value.bonus.rewards.first(), Some(Reward::SkillPoints { .. })), "invalid bonus reward");
+        value.validate(context)?;
+        Ok(value)
+    }
+
+    /// The structural and reference checks for an already parsed model.
+    /// `Activation` re-verifies producer and SDE references; a canonical build
+    /// reused for a new current generation reruns it instead of reparsing.
+    pub(in crate::lua::content) fn validate(&self, context: ValidationContext<'_>) -> anyhow::Result<()> {
+        ensure!(!self.ordinary.is_empty() && self.ordinary.len() <= MAX_ENTRIES && self.slot_pools.len() == 3, "invalid ordinary pools");
+        ensure!(self.monthly_base.len() == 4 && self.monthly_omega.len() == 4, "invalid monthly tracks");
+        ensure!(self.monthly_base.iter().zip(&self.monthly_omega).all(|(a, b)| a.target == b.target) && self.monthly_base.windows(2).all(|w| w[0].target < w[1].target), "invalid monthly targets");
+        ensure!(matches!(self.bonus.rewards.first(), Some(Reward::SkillPoints { .. })), "invalid bonus reward");
         let mut keys = HashSet::new();
-        for t in value.ordinary.iter().chain(std::iter::once(&value.bonus)).chain(&value.monthly_base).chain(&value.monthly_omega) {
+        for t in self.ordinary.iter().chain(std::iter::once(&self.bonus)).chain(&self.monthly_base).chain(&self.monthly_omega) {
             ensure!(!t.key.is_empty() && t.key.len() <= MAX_ENTRIES && keys.insert(&t.key) && t.target > 0, "invalid daily template identity");
             ensure!(!t.rewards.is_empty() && t.rewards.len() <= MAX_ENTRIES, "invalid reward list");
             for reward in &t.rewards {
@@ -213,13 +221,13 @@ impl Definitions {
             }
             validate_method(&t.method, context)?;
         }
-        let ordinary: HashSet<_> = value.ordinary.iter().map(|t| t.key.as_str()).collect();
+        let ordinary: HashSet<_> = self.ordinary.iter().map(|t| t.key.as_str()).collect();
         let mut pooled = HashSet::new();
-        for pool in &value.slot_pools {
+        for pool in &self.slot_pools {
             ensure!(!pool.is_empty() && pool.len() <= MAX_ENTRIES && pool.iter().all(|key| ordinary.contains(key.as_str()) && pooled.insert(key)), "invalid or overlapping slot pool");
         }
-        ensure!(value.ordinary.len() >= 4, "not enough distinct daily templates");
-        Ok(value)
+        ensure!(self.ordinary.len() >= 4, "not enough distinct daily templates");
+        Ok(())
     }
 }
 
@@ -249,12 +257,12 @@ fn validate_method(method: &Method, context: ValidationContext<'_>) -> anyhow::R
         Method::ScanSignature { entries } => bounded(entries.len()) && entries.iter().all(|e| system(&e.system) && id_match_u32(&e.signature)),
         Method::ManufactureItem { entries } => bounded(entries.len()) && entries.iter().all(|e| (match &e.facility { Matcher::Any => true, Matcher::Station { id } => i64::try_from(*id).ok().is_some_and(|id| match context { ValidationContext::Activation(sde) => sde.map.station(id).is_some(), ValidationContext::Retained => id > 0 }), Matcher::Structure { id } => *id > 0 && *id <= i64::MAX as u64, _ => false }) && type_match(&e.item)),
         Method::EarnLoyaltyPoints { entries } => bounded(entries.len()) && entries.iter().all(|e| id_match_u32(&e.corporation)),
-        Method::CompleteGoal { entries } => bounded(entries.len()) && entries.iter().all(|e| (matches!(&e.goal, Matcher::Any) || matches!(&e.goal, Matcher::Goal { uuid } if crate::uuid_text::parse(uuid, crate::uuid_text::Case::Either).is_some())) && matches!(&e.category, Matcher::Any | Matcher::Ordinary | Matcher::Bonus | Matcher::Month)),
+        Method::CompleteGoal { entries } => bounded(entries.len()) && entries.iter().all(|e| (matches!(&e.goal, Matcher::Any) || matches!(&e.goal, Matcher::Goal { uuid } if infinity_content::uuid_text::parse(uuid, infinity_content::uuid_text::Case::Either).is_some())) && matches!(&e.category, Matcher::Any | Matcher::Ordinary | Matcher::Bonus | Matcher::Month)),
         Method::SpaceJump => true,
     };
     ensure!(valid, "invalid contribution matcher");
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

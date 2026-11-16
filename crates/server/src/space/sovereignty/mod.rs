@@ -1,15 +1,18 @@
-//! Actor-owned physical Hub projection and recovery readiness.
-//! Persisted snapshots are read through the sovereignty DAO before publishing a system actor.
-//! Capture links and score evolution are owned by the links engine.
+//! Actor-owned physical Hub projection, development-index notices and recovery
+//! readiness. Persisted snapshots are read through the sovereignty DAO before
+//! publishing a system actor. Capture links and score evolution are owned by
+//! the links engine; index points ride the same committed publication and are
+//! projected in the actor from cached rows, never from actor-side SQL or Lua.
 mod entity;
 pub(crate) mod links;
+pub(crate) mod indices;
 
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use crate::{dao::sovereignty::{capture, policy::{self, PolicyRow}, sources::SourceChange, structures, systems},
-    services::sovereignty::{CommittedPublication, HubPublication}, space::{System, World}};
+use crate::{dao::sovereignty::{capture, development, policy::{self, PolicyRow}, sources::SourceChange, structures, systems},
+    services::sovereignty::{CommittedPublication, HubPublication, indices::model::{DevelopmentPublication, DevelopmentView, IndexCapability, IndexUnavailable}},
+    space::{System, World, actor::Job}};
 use anyhow::{ensure, Context};
 
-#[derive(Default)]
 pub(super) struct State {
     pub(super) version: Option<(i64, i64)>,
     pub(super) hub: Option<i64>,
@@ -18,23 +21,57 @@ pub(super) struct State {
     links: links::State,
     pub(super) policies: Vec<PolicyRow>,
     pub(super) readiness: Option<Arc<AtomicBool>>,
+    /// Latest committed Hub/system snapshot used for index projections.
+    pub(super) committed: Option<HubPublication>,
+    /// Installed development-index capability clone.
+    pub(super) capability: IndexCapability,
+    /// Newest committed development row and its policy history.
+    pub(super) development: Option<crate::services::sovereignty::indices::model::DevelopmentPublication>,
+    /// Last projected development view announced to this system's pilots.
+    pub(super) development_view: Option<DevelopmentView>,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self { version: None, hub: None, alliance: None, corporation: None, links: Default::default(),
+            policies: Vec::new(), readiness: None, committed: None,
+            capability: IndexCapability::Unavailable(IndexUnavailable::NeverActivated),
+            development: None, development_view: None }
+    }
 }
 
 pub(crate) fn is_ready(world: &World) -> bool { world.sovereignty_ready.load(Ordering::Acquire) }
 pub(crate) fn open(world: &World) { world.sovereignty_ready.store(true, Ordering::Release); }
 pub(crate) fn close(world: &World) {
     world.sovereignty_ready.store(false, Ordering::Release);
-    let handles: Vec<_> = world.systems.lock().unwrap().values().cloned().collect();
-    for handle in handles { let _ = handle.send(Box::new(links::close)); }
+    let handles: Vec<_> = crate::poison::lock_or_exit(world.systems.lock()).values().cloned().collect();
+    for handle in handles { let _ = handle.send(Job::new(links::close)); }
 }
 
-pub(super) async fn cold(world: &World, id: i64) -> anyhow::Result<(Option<HubPublication>, Vec<PolicyRow>)> {
+pub(super) async fn cold(world: &World, id: i64) -> anyhow::Result<(Option<HubPublication>, Vec<PolicyRow>, indices::Cold)> {
+    // The installed capability is cloned under the world slot only; cold never
+    // resolves retained packages or runs Lua inside the market guard.
+    let mut capability = indices::policy(world);
+    let mut indices_development = None;
+    if let IndexCapability::Ready(history) = &capability {
+        match development::read(&world.db, id).await {
+            Ok(row) => {
+                indices_development = Some(DevelopmentPublication {
+                    system_id: id, row, policies: history.clone(),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(system = id, %error, "development state unavailable for cold projection");
+                capability = IndexCapability::Invalid(format!("invalid development state for system {id}: {error:#}").into());
+            }
+        }
+    }
+    let cold = indices::Cold { capability, development: indices_development };
     let system = systems::read(&world.db, id).await?;
     let structure = structures::for_system(&world.db, id).await?;
     let target = capture::for_system(&world.db, id).await?;
     let Some(system) = system else {
         ensure!(structure.is_none() && target.is_none(), "orphan sovereignty Hub state");
-        return Ok((None, Vec::new()));
+        return Ok((None, Vec::new(), cold));
     };
     ensure!(system.system_id == id && system.ownership_epoch >= 0 && system.revision >= 0, "invalid sovereignty system version");
     let hub = if let Some(item) = system.hub_item_id {
@@ -55,13 +92,20 @@ pub(super) async fn cold(world: &World, id: i64) -> anyhow::Result<(Option<HubPu
         ensure!(hub.system == system, "inconsistent sovereignty system snapshot");
         entity::ball(&world.sde, hub, target.as_ref().context("missing Hub capture target")?, crate::space::now_ms())?;
     }
-    Ok((Some(HubPublication { system, hub, capture: target }), policies))
+    Ok((Some(HubPublication { system, hub, capture: target }), policies, cold))
 }
 
-pub(super) fn initialize(system: &mut System, snapshot: Option<HubPublication>, policies: Vec<PolicyRow>, ready: Arc<AtomicBool>) -> anyhow::Result<()> {
+pub(super) fn initialize(system: &mut System, snapshot: Option<HubPublication>, policies: Vec<PolicyRow>, ready: Arc<AtomicBool>, indices: indices::Cold) -> anyhow::Result<()> {
     system.sovereignty.readiness = Some(ready);
     system.sovereignty.policies = policies;
+    system.sovereignty.capability = indices.capability;
+    system.sovereignty.development = indices.development;
     if let Some(snapshot) = snapshot { apply(system, snapshot, true, &[])?; }
+    if system.sovereignty.development_view.is_none() {
+        if let Ok(indices::Projection::Ready(view)) = indices::projected(system, crate::client::filetime_now()) {
+            system.sovereignty.development_view = Some(view);
+        }
+    }
     Ok(())
 }
 
@@ -104,18 +148,50 @@ fn apply(system: &mut System, snapshot: HubPublication, cold: bool, policies: &[
         system.sovereignty.policies.clear();
         system.sovereignty.policies.push(policy.clone());
     }
-    if !cold { notify(&system.registry, &snapshot, &system.sovereignty.policies, ownership_changed, alliance_changed); }
+    system.sovereignty.committed = Some(snapshot.clone());
+    let projection = indices::projected(system, crate::client::filetime_now());
+    if let Ok(indices::Projection::Ready(view)) = &projection {
+        system.sovereignty.development_view = Some(view.clone());
+    }
+    if !cold { notify(&system.registry, &snapshot, structure_rows(&snapshot, &system.sovereignty.policies, projection), ownership_changed, alliance_changed); }
     system.sovereignty.version = Some(version);
     system.sovereignty.hub = next;
     links::install(system, snapshot.capture);
     Ok(())
 }
-fn notify(registry: &crate::space::Pilots, snapshot: &HubPublication, policies: &[PolicyRow], ownership_changed: bool, alliance_changed: bool) {
+
+/// Encode the structure rows for one publication. A whole-unavailable
+/// capability sends the real base fields without a multiplier; a pending
+/// refresh or broken projection sends no fabricated rows.
+fn structure_rows(snapshot: &HubPublication, policies: &[PolicyRow], projection: Result<indices::Projection, crate::services::CallError>) -> Option<Vec<marshal::Value>> {
+    let hubs = snapshot.hub.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
+    let encoded = match projection {
+        Ok(indices::Projection::Ready(view)) => crate::services::sovereignty::wire::structures(hubs, policies, Some(std::slice::from_ref(&view))),
+        Ok(indices::Projection::Unavailable) => crate::services::sovereignty::wire::structures(hubs, policies, None),
+        Ok(indices::Projection::Pending) => {
+            tracing::debug!(system = snapshot.system.system_id, "development structure update awaits policy replay");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(system = snapshot.system.system_id, ?error, "development projection failed");
+            return None;
+        }
+    };
+    match encoded {
+        Ok(rows) => Some(rows),
+        Err(error) => {
+            tracing::warn!(system = snapshot.system.system_id, ?error, "sovereignty structure projection failed");
+            None
+        }
+    }
+}
+fn notify(registry: &crate::space::Pilots, snapshot: &HubPublication, rows: Option<Vec<marshal::Value>>, ownership_changed: bool, alliance_changed: bool) {
     let id = snapshot.system.system_id;
-    let rows = crate::services::sovereignty::wire::structures(snapshot.hub.as_ref().map(std::slice::from_ref).unwrap_or(&[]), policies);
     let claim = crate::services::sovereignty::wire::system_claim(&snapshot.system);
     for pilot in registry.online_pilots() {
-        registry.notify_pilot(pilot, "OnSolarSystemSovStructuresUpdated", vec![marshal::Value::Int(id), marshal::Value::List(rows.clone())]);
+        if let Some(rows) = &rows {
+            registry.notify_pilot(pilot, "OnSolarSystemSovStructuresUpdated", vec![marshal::Value::Int(id), marshal::Value::List(rows.clone())]);
+        }
         if ownership_changed {
             registry.notify_pilot(pilot, "ProcessSovStatusChanged", vec![marshal::Value::Int(id), claim.clone()]);
         }
@@ -125,14 +201,66 @@ fn notify(registry: &crate::space::Pilots, snapshot: &HubPublication, policies: 
     }
 }
 
+/// Verify the joined state around the separate Hub and index reads. A concurrent
+/// ownership, capital or points revision suppresses only the structure update.
+async fn broadcast_unloaded(world: Arc<World>, committed: HubPublication) {
+    let id = committed.system.system_id;
+    let before = development::observations(&world.db, &[id]).await;
+    let latest = async {
+        let system = systems::read(&world.db, id).await?;
+        let hub = structures::snapshots(&world.db, Some(id), None).await?.into_iter().next();
+        let capital = match system.as_ref().and_then(|system| system.alliance_id) {
+            Some(alliance) => policy::read(&world.db, alliance).await?,
+            None => None,
+        };
+        Ok::<_, crate::db::Error>((system.map(|system| HubPublication { system, hub, capture: None }), capital))
+    }.await;
+    let (snapshot, policies) = match latest {
+        Ok((Some(snapshot), capital)) => (snapshot, capital.into_iter().collect::<Vec<_>>()),
+        Ok((None, _)) => {
+            tracing::warn!(system = id, "sovereignty broadcast lost its system row");
+            (committed, Vec::new())
+        }
+        Err(error) => {
+            tracing::warn!(system = id, %error, "sovereignty broadcast read failed");
+            (committed, Vec::new())
+        }
+    };
+    let hubs = snapshot.hub.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
+    let projected = crate::services::sovereignty::queries::development_views(&world.db, &world.sde, std::slice::from_ref(&id), crate::client::filetime_now()).await;
+    let after = development::observations(&world.db, &[id]).await;
+    let coherent = match (&before, &after) {
+        (Ok(before), Ok(after)) if before.len() == 1 && before == after => {
+            let observation = &before[0];
+            observation.system.as_ref() == Some(&snapshot.system)
+                && observation.capital.as_ref() == policies.first()
+                && snapshot.hub.as_ref().is_none_or(|hub| hub.system == snapshot.system)
+                && snapshot.system.hub_item_id == snapshot.hub.as_ref().map(|hub| hub.structure.item_id)
+        }
+        _ => false,
+    };
+    let rows = if !coherent {
+        tracing::warn!(system = id, "sovereignty broadcast snapshot changed during projection");
+        None
+    } else {
+        match projected.and_then(|development| crate::services::sovereignty::wire::structures(hubs, &policies, development.as_deref())) {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                tracing::warn!(system = id, ?error, "sovereignty structure projection failed");
+                None
+            }
+        }
+    };
+    notify(&world.pilots, &snapshot, rows, true, true);
+}
 
 pub(crate) fn publish(world: &World, publication: CommittedPublication) {
     if !publication.sources.is_empty() {
         let changes: Arc<[SourceChange]> = publication.sources.into();
-        let handles: Vec<_> = world.systems.lock().unwrap().values().cloned().collect();
+        let handles: Vec<_> = crate::poison::lock_or_exit(world.systems.lock()).values().cloned().collect();
         for handle in handles {
             let changes = changes.clone();
-            let _ = handle.send(Box::new(move |system| links::invalidate(system, &changes)));
+            let _ = handle.send(Job::new(move |system| links::invalidate(system, &changes)));
         }
     }
     if publication.capitals.iter().any(|capital| capital.changed) {
@@ -145,22 +273,26 @@ pub(crate) fn publish(world: &World, publication: CommittedPublication) {
     }
     let policies: Arc<[PolicyRow]> = publication.capitals.into_iter().map(|capital| capital.policy).collect::<Vec<_>>().into();
     if !policies.is_empty() {
-        let handles: Vec<_> = world.systems.lock().unwrap().values().cloned().collect();
+        let handles: Vec<_> = crate::poison::lock_or_exit(world.systems.lock()).values().cloned().collect();
         for handle in handles {
             let policies = policies.clone();
-            let _ = handle.send(Box::new(move |system| {
+            let _ = handle.send(Job::new(move |system| {
                 let alliance = system.sovereignty.alliance;
                 for policy in policies.iter().filter(|policy| Some(policy.alliance_id) == alliance) {
                     if system.sovereignty.policies.iter().any(|old| old.revision >= policy.revision) { continue; }
                     system.sovereignty.policies.clear();
                     system.sovereignty.policies.push(policy.clone());
                 }
+                // A capital change moves the defense multiplier without touching points.
+                indices::refresh(system);
             }));
         }
     }
     for snapshot in publication.hubs {
         if world.running(snapshot.system.system_id).is_none() {
-            notify(&world.pilots, &snapshot, &policies, true, true);
+            if let Some(world) = world.shared() {
+                tokio::spawn(async move { broadcast_unloaded(world, snapshot).await });
+            }
             continue;
         }
         let policies = policies.clone();
@@ -168,6 +300,10 @@ pub(crate) fn publish(world: &World, publication: CommittedPublication) {
             if let Err(error) = apply(system, snapshot, false, &policies) { tracing::error!(%error, "invalid committed sovereignty publication"); }
         });
     }
+    // Committed index facts never load an actor; they project inside the loop.
+    for publication in publication.development {
+        world.post(publication.system_id, move |system| indices::apply_development(system, publication));
+    }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

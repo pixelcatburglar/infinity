@@ -135,6 +135,10 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         let initial = quantities(&f, rock, ore).await?;
         let baseline = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
         f.set(id, MINING_AMOUNT, 0.0).await;
+        let owner = f.owner;
+        let (generation, membership) = f.world.with(f.system, move |s| s.drone(id).map(|d| d.generation).zip(s.combat_membership_generation(id))).await.context("system stopped")?.context("drone publication identity missing")?;
+        let patch = crate::services::fit::attributes::CommittedFitting::overridden_attributes(vec![(Key::Drone(id), MINING_AMOUNT, Some(0.0))]);
+        ensure!(f.world.with(f.system, move |s| s.publish_drone_fitting(id, owner, generation, membership, patch)).await.context("system stopped")?, "zero-yield drone fitting publication failed");
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let zero = pending(&f, id, rock, "zero-yield intent").await?;
         ensure!(expected(&zero, initial.0)? == 0, "zero-yield intent was not zero");
@@ -148,6 +152,10 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == baseline, "zero-yield contact recorded a fact");
         while let Ok((event, _)) = rx.try_recv() { ensure!(event != "OnOreMined", "zero-yield contact emitted ore notice"); }
         f.set(id, MINING_AMOUNT, volume * 2.0).await;
+        let owner = f.owner;
+        let (generation, membership) = f.world.with(f.system, move |s| s.drone(id).map(|d| d.generation).zip(s.combat_membership_generation(id))).await.context("system stopped")?.context("drone publication identity missing")?;
+        let patch = crate::services::fit::attributes::CommittedFitting::overridden_attributes(vec![(Key::Drone(id), MINING_AMOUNT, Some(volume * 2.0))]);
+        ensure!(f.world.with(f.system, move |s| s.publish_drone_fitting(id, owner, generation, membership, patch)).await.context("system stopped")?, "restored drone fitting publication failed");
         let first = pending(&f, id, rock, "full-hold intent").await?;
         ensure!(first.rock == rock && expected(&first, initial.0)? > 0, "unexpected mining intent");
         let travelled = f.world.with(f.system, move |s| s.sample_position(id).zip(s.sample_position(ship))

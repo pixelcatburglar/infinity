@@ -40,10 +40,43 @@ impl OnlineFences {
             None => Arc::from([]),
         })
     }
+    /// Membership systems in capture order; callers sort and dedup for gates.
+    pub(in crate::services) fn systems(&self) -> impl Iterator<Item = i64> + '_ {
+        self.0.iter().map(|&(system, _, _)| system)
+    }
 }
 
 pub(crate) async fn capture_online_fences(world: &crate::space::World, owners: &[i64]) -> OnlineFences {
     OnlineFences(world.online_fences(owners).await.into())
+}
+
+/// Owned in-space drone instances captured before a cold ship-change boundary.
+///
+/// Each tuple is (system, drone, owner, drone generation, membership): the
+/// membership is the same online-fence value hulls use, while the drone record
+/// generation pins the exact instance so a relaunched replacement refuses the
+/// publish. No new world enumeration is added; the actor records are rechecked
+/// inside their own systems.
+pub(in crate::services) async fn capture_owned_drone_fences(
+    world: &crate::space::World, owner: i64,
+) -> Vec<(i64, i64, i64, u64, u64)> {
+    let mut by_system: std::collections::BTreeMap<i64, Vec<(i64, u64)>> = std::collections::BTreeMap::new();
+    for (system, item, membership) in world.online_fences(&[owner]).await {
+        by_system.entry(system).or_default().push((item, membership));
+    }
+    let mut captured = Vec::new();
+    for (system, items) in by_system {
+        let Some(rows) = world.with(system, move |s| {
+            items.iter().filter_map(|&(id, membership)| {
+                let drone = s.drone(id)?;
+                (drone.owner == owner && owner != infinity_core::consts::OWNER_UNOWNED
+                    && s.combat_membership_generation(id) == Some(membership))
+                    .then_some((system, id, owner, drone.generation, membership))
+            }).collect::<Vec<_>>()
+        }).await else { continue };
+        captured.extend(rows);
+    }
+    captured
 }
 
 
@@ -64,7 +97,14 @@ pub(crate) enum OnlineChanged {
         generation: u64,
         patch: crate::services::fit::attributes::CommittedFitting,
     },
-    StoredFitting { owner: i64, changes: Vec<Value> },
+    StoredFitting { owner: i64, changes: Vec<Value>, brain: Option<(Value, Value, Value)> },
+    /// A committed full replacement of the owner's character domain, delivered
+    /// to the recipients the pre-transaction fences captured.
+    Character {
+        owner: i64,
+        fences: OnlineFences,
+        inputs: crate::services::fit::character::CharacterInputs,
+    },
 }
 crate::progress::leaf_effect!(OnlineChanged);
 
@@ -142,6 +182,36 @@ async fn mutate_online<E: From<OnlineChanged> + Send>(
     Ok(changed)
 }
 
+/// Offline a fitted module whose item is about to be deleted with its hull.
+/// The shared inventory lifecycle already proved the complete locked closure and
+/// caller authorization; this entry only rechecks the two locked rows and the
+/// same-owner fitted child relationship, then delegates to the shared mutation.
+pub(in crate::services) async fn offline_for_destruction<E: From<OnlineChanged> + Send>(
+    ex: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, fences: &OnlineFences,
+    hull: &crate::dao::items::loading::Item, module: &crate::dao::items::loading::Item,
+    locks: &crate::dao::items::parent_locks::LockedItems<'_>, notify: Option<&NotifyTx>,
+) -> Result<(), CallError> {
+    let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
+    for (item, expected) in [(hull.item_id, hull), (module.item_id, module)] {
+        let row = locks.row(item).ok_or_else(refuse)?;
+        if !locks.is_write_locked(item) || row.jump_clone_id.is_some()
+            || row.type_id != expected.type_id || row.owner_id != expected.owner_id
+            || row.location_id != expected.location_id || row.flag_id != expected.flag_id
+            || row.quantity != expected.quantity || row.singleton != expected.singleton {
+            return Err(refuse());
+        }
+    }
+    if module.owner_id != hull.owner_id || module.location_id != hull.item_id
+        || !module.singleton || module.category_id != i64::from(infinity_core::consts::CATEGORY_MODULE)
+        || !crate::services::inventory::is_fitting_flag(module.flag_id) {
+        return Err(refuse());
+    }
+    let was_online = crate::dao::items::dogma::online(ex, hull.item_id).await.map_err(db_err)?
+        .iter().any(|entry| entry.item_id == module.item_id);
+    mutate_online(ex, outbox, fences, hull, module, false, was_online, notify).await?;
+    Ok(())
+}
+
 fn queue_notification<E>(outbox: &mut Outbox<E>, sender: Option<&NotifyTx>, owner: i64, event: &str, args: Vec<Value>) {
     if let Some(sender) = sender { outbox.notify_sender(sender.clone(), event, args); }
     else { outbox.notify_pilot(owner, event, args); }
@@ -157,7 +227,7 @@ pub(crate) fn dispatch_notification(notification: crate::db::outbox::Notificatio
             let _ = sender.send((event, args));
             Ok(())
         }
-        notification => notification.dispatch_sender(world, sender),
+        notification => notification.dispatch_sender(world, Some(sender)),
     }
 }
 
@@ -168,7 +238,19 @@ pub(in crate::services) fn dispatch_mixed_entries<T, E>(
     mut notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError>,
 ) -> Result<T, CallError> {
     use std::collections::{HashMap, HashSet};
-    let entries: Vec<_> = outbox.into_entries().into_iter().map(|entry| match entry {
+    let entries = outbox.into_entries();
+    // A notification-only outbox consumes its entries once in the original
+    // order and allocates none of the mixed-dispatch collections.
+    if !entries.iter().any(|entry| matches!(entry, OutboxEffect::Operation(_))) {
+        for entry in entries {
+            match entry {
+                OutboxEffect::Notification(notification) => notify(notification)?,
+                OutboxEffect::Operation(_) => unreachable!("notification-only entries checked"),
+            }
+        }
+        return Ok(value);
+    }
+    let entries: Vec<_> = entries.into_iter().map(|entry| match entry {
         OutboxEffect::Operation(effect) => match split_online(effect) {
             Ok(change) => Ok(change),
             Err(other) => Err(OutboxEffect::Operation(other)),
@@ -202,12 +284,43 @@ pub(in crate::services) fn dispatch_mixed_entries<T, E>(
                 let cleanup = cleanups.remove(&(system, ship, generation)).unwrap_or_default();
                 world.post(system, move |s| { s.publish_fitting(ship, owner, generation, patch, cleanup); });
             }
-            Ok(OnlineChanged::StoredFitting { owner, changes }) => {
+            Ok(OnlineChanged::StoredFitting { owner, changes, brain }) => {
                 if !changes.is_empty() {
                     let notification = crate::db::outbox::Notification::Pilot {
                         char_id: owner, event: "OnModuleAttributeChanges".into(), args: vec![Value::list(changes)],
                     };
                     notify(notification)?;
+                }
+                if let Some((character, ship, structure)) = brain {
+                    let notification = crate::db::outbox::Notification::Pilot {
+                        char_id: owner, event: crate::services::dogma::brain::UPDATED_EVENT.into(),
+                        args: crate::services::dogma::brain::update_args(owner, character, ship, structure),
+                    };
+                    notify(notification)?;
+                }
+            }
+            Ok(OnlineChanged::Character { owner, fences, inputs }) => {
+                // One package shared by every recipient in a system. A piloted
+                // hull publish already fans the same inputs out to that
+                // system's owned drones, so the per-item fallback only reaches
+                // captured members the hull publish did not cover.
+                let inputs = Arc::new(inputs);
+                let mut systems: HashMap<i64, Vec<(i64, u64)>> = HashMap::new();
+                for &(system, item, membership) in fences.0.iter() {
+                    systems.entry(system).or_default().push((item, membership));
+                }
+                for (system, items) in systems {
+                    let inputs = inputs.clone();
+                    world.post(system, move |s| {
+                        if let Some(ball) = s.pilot_ball(owner) {
+                            if let Some(&(_, membership)) = items.iter().find(|&&(item, _)| item == ball.id) {
+                                if s.publish_character_inputs(ball.id, owner, membership, inputs.as_ref()) { return; }
+                            }
+                        }
+                        for &(item, membership) in &items {
+                            s.publish_character_inputs(item, owner, membership, inputs.as_ref());
+                        }
+                    });
                 }
             }
             Err(OutboxEffect::Operation(other)) => apply_other(other)?,
@@ -233,9 +346,14 @@ pub(crate) fn dispatch_changed_world<T>(value: T, outbox: Outbox<OnlineChanged>,
 }
 
 /// Reconcile all owned online hulls while the caller holds the market lock.
+///
+/// The shared character domain is extracted once from the first reconciled
+/// final fit before `finish` consumes it, without another character read. With
+/// no online hull candidates a single character-only cold load supplies it;
+/// the recipient set comes from the pre-transaction fences, not the candidates.
 pub(in crate::services) async fn reconcile_owner<E: From<OnlineChanged> + Send>(
-    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<E>, fences: &OnlineFences, owner: i64,
-) -> Result<(), CallError> {
+    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<E>, fences: &OnlineFences, owner: i64, at: i64,
+) -> Result<crate::services::fit::character::CharacterInputs, CallError> {
     let candidates = crate::dao::items::fit::owner_online_ships(ex, owner).await.map_err(db_err)?;
     let mut ships: Vec<_> = crate::services::items::load_items(ex, sde, crate::dao::items::loading::ItemQuery::Ids(&candidates)).await.map_err(db_err)?
         .into_iter().filter(|item| item.owner_id == owner && item.singleton && item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP))
@@ -246,12 +364,17 @@ pub(in crate::services) async fn reconcile_owner<E: From<OnlineChanged> + Send>(
             return Err(CallError::Internal(anyhow::anyhow!("ship disappeared")));
         }
     }
+    let mut inputs = None;
     for ship in ships {
         let before = fitting::capture(ex, sde, fences, owner, ship).await?;
         let final_fit = reconcile_core(ex, sde, outbox, fences, owner, ship).await?;
+        if inputs.is_none() { inputs = Some(final_fit.character_inputs()); }
         fitting::finish(ex, before, final_fit, outbox).await?;
     }
-    Ok(())
+    match inputs {
+        Some(inputs) => Ok(inputs),
+        None => Ok(crate::services::fit::Fit::load_character_at(ex, sde.clone(), owner, at).await?.character_inputs()),
+    }
 }
 
 
@@ -300,13 +423,18 @@ pub(in crate::services) async fn reconcile_ship(
     db: &crate::db::Db, world: &crate::space::World, sde: &Arc<Sde>, owner: i64, ship: i64,
     notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError> + Send,
 ) -> Result<(), CallError> {
-    let _lock = crate::services::market::lock().await;
     let fences = capture_online_fences(world, &[owner]).await;
+    let armed = crate::services::combat::loaded::LoadedHolds::arm(world, &fences.membership(ship).map(|(system, _)| (system, ship)).into_iter().collect::<Vec<_>>(), notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _lock = crate::services::market::lock().await;
+    let mut holds = crate::services::combat::loaded::LoadedHolds::lock(world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
     let sde = sde.clone();
-    db.transaction(
+    holds.may_execute();
+    let result = db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
             let fences = fences.clone();
+            let settle = settle.clone();
             Box::pin(async move {
                 if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
                 let hull = crate::services::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?
@@ -314,13 +442,15 @@ pub(in crate::services) async fn reconcile_ship(
                 if hull.owner_id != owner || hull.category_id != i64::from(infinity_core::consts::CATEGORY_SHIP) || !hull.singleton {
                     return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
                 }
+                crate::services::combat::loaded::settle_in(tx, &settle).await?;
                 let before = fitting::capture(tx, &sde, &fences, owner, ship).await?;
                 let final_fit = reconcile_core(tx, &sde, outbox, &fences, owner, ship).await?;
                 fitting::finish(tx, before, final_fit, outbox).await
             })
         },
         |value, outbox| async move { dispatch_entries(value, outbox, world, notify) },
-    ).await
+    ).await;
+    holds.finish(db, world, result, &[]).await
 }
 
 /// Change online state for an authorized fitted module; login_user comes from the owning account and is read only by the module-online/offline info log.
@@ -329,19 +459,25 @@ pub(crate) async fn set_online(
     ship: i64, item_id: i64, online: bool,
     notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError> + Send,
 ) -> CallResult {
-    let _lock = crate::services::market::lock().await;
-    let fences = capture_online_fences(world, &[identity.char_id]).await;
     let policy = OnlinePolicy::from_identity(identity, sender)?;
+    let fences = capture_online_fences(world, &[identity.char_id]).await;
+    let armed = crate::services::combat::loaded::LoadedHolds::arm(world, &fences.membership(ship).map(|(system, _)| (system, ship)).into_iter().collect::<Vec<_>>(), notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _lock = crate::services::market::lock().await;
+    let mut holds = crate::services::combat::loaded::LoadedHolds::lock(world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
     let sde = sde.clone();
-    db.transaction(
+    holds.may_execute();
+    let result = db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let policy = policy.clone();
             let sde = sde.clone();
             let fences = fences.clone();
+            let settle = settle.clone();
             Box::pin(async move {
                 if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
                 subject_core(tx, &sde, &policy, ship, item_id, EFFECT_ONLINE as i32, false).await?;
                 let before = fitting::capture(tx, &sde, &fences, policy.owner, ship).await?;
+                crate::services::combat::loaded::settle_in(tx, &settle).await?;
                 let (changed, final_fit) = set_online_core(tx, &sde, &policy, outbox, &fences, ship, item_id, online).await?;
                 fitting::finish(tx, before, final_fit, outbox).await?;
                 Ok(changed)
@@ -352,5 +488,6 @@ pub(crate) async fn set_online(
             if changed { info!(user = login_user, "module {item_id} {}", if online { "online" } else { "offline" }); }
             Ok(Value::None)
         },
-    ).await
+    ).await;
+    holds.finish(db, world, result, &[]).await
 }

@@ -22,4 +22,4 @@ pub(crate) async fn changed(world: &Arc<World>, user: i64, at: i64) -> Result<()
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

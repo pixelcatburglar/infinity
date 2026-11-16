@@ -23,4 +23,4 @@ fn stage_thresholds(request: &str) -> Result<DynamicMessage> {
     Ok(rsp)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

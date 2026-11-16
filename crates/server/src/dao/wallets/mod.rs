@@ -44,5 +44,5 @@ fn mutation(row: &tokio_postgres::Row) -> Result<WalletMutation, WalletError> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

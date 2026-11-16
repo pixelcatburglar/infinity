@@ -12,41 +12,38 @@ use marshal::Value;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let identity = Identity::of_client(c);
-    let id = || match call.args.first() {
-        Some(Value::Int(id)) if *id > 0 => Some(*id),
-        _ => None,
-    };
+    let id = || crate::services::value_positive_id(call.args.first());
     Some(match call.method {
         "GetCrate" => match id().and_then(|id| i32::try_from(id).ok()) {
             Some(_) => Ok(Value::list([])),
-            None => Err(notify_error(messages::INVALID_SOURCE)),
+            None => Err(super::invalid_source()),
         },
         "PeekInsideCrate" => match id().and_then(|id| i32::try_from(id).ok()) {
             Some(type_id) => catalogue::directory(c, type_id, false, &identity).await,
-            None => Err(notify_error(messages::INVALID_SOURCE)),
+            None => Err(super::invalid_source()),
         },
         "CustomGetLootFromFixedCrate" | "PeekInsideFixedCrate" => match id() {
             Some(item_id) => catalogue::instance(c, item_id, call.method == "CustomGetLootFromFixedCrate").await,
-            None => Err(notify_error(messages::INVALID_SOURCE)),
+            None => Err(super::invalid_source()),
         },
         "GetCrateLocation" => match id() {
             Some(source) => super::opening::location(c, source).await,
-            None => Err(notify_error(messages::INVALID_SOURCE)),
+            None => Err(super::invalid_source()),
         },
         "OpenCrate" => match id() {
             Some(source) => super::opening::open(c, source, 1, false).await,
-            None => Err(notify_error(messages::INVALID_SOURCE)),
+            None => Err(super::invalid_source()),
         },
         "ClaimLootFromCrateStack" => match (id(), call.args.get(1)) {
             (Some(source), Some(Value::Int(amount))) => match i32::try_from(*amount) {
                 Ok(amount) => super::opening::open(c, source, amount, true).await,
-                Err(_) => Err(notify_error(messages::INVALID_SOURCE)),
+                Err(_) => Err(super::invalid_source()),
             },
-            _ => Err(notify_error(messages::INVALID_SOURCE)),
+            _ => Err(super::invalid_source()),
         },
         "ClaimLoot" => match super::claims::arguments(call) {
             Some((item, destination, flag)) => super::claims::claim_loot(c, item, destination, flag).await,
-            None => Err(notify_error(messages::INVALID_SOURCE)),
+            None => Err(super::invalid_source()),
         },
         "CustomOpenCrate" | "ClaimSkillBundle" | "ClaimFitting" => Err(notify_error(messages::OPENING_UNAVAILABLE)),
         _ => return None,

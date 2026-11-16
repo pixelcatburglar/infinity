@@ -62,9 +62,9 @@ async fn adaptation_dispatch_is_local_and_preserves_state() {
             assert_eq!(marshal::loads(&marshal::dumps(&value)).unwrap(), Value::None);
             assert_eq!(client.outbox.len(), 1);
             let packet = client.outbox.pop().unwrap();
-            let packet = crate::macho::Packet::from_value(&marshal::loads(&marshal::dumps(&packet.to_value())).unwrap()).unwrap();
-            assert_eq!(packet.command, crate::macho::cmd::NOTIFICATION);
-            assert!(matches!(packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id == Value::str(event)));
+            let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&marshal::dumps(&packet.to_value())).unwrap()).unwrap();
+            assert_eq!(packet.command, infinity_wire::macho::cmd::NOTIFICATION);
+            assert!(matches!(packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id == Value::str(event)));
             let envelope = packet.body[0].items().unwrap();
             let payload = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();
             let text = payload.items().unwrap()[1].items().unwrap()[0].as_bytes().unwrap();

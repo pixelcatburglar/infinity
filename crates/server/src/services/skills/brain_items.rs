@@ -153,4 +153,4 @@ pub(crate) async fn destroy_implant(c: &mut Client, args: &[Value]) -> CallResul
     db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { destroy_tx(tx, outbox, &sde, &fences, char_id, item_id, now).await }) }, |value, outbox| async move { let result = online::dispatch_changed(value, outbox, c); crate::scheduler::wake(); result }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

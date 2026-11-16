@@ -86,14 +86,6 @@ fn closed_settings_satisfy_client_tooltips_and_payout_arithmetic() {
     }
 }
 
-async fn snapshot(db: &crate::db::Db) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for table in ["characters", "items", "wallet_accounts", "wallet_journal", "jobs"] {
-        rows.push(services::drones::tests::fixture::table_fingerprint(db, table).await.unwrap());
-    }
-    rows
-}
-
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
 async fn real_dispatch_refusals_preserve_owner_other_and_connection() {
@@ -119,12 +111,12 @@ async fn real_dispatch_refusals_preserve_owner_other_and_connection() {
             for method in WRITES {
                 let authentic_args: &[Value] = if method == "RequestUnlockReserveBank" { &valid_unlock_args } else { &[] };
                 for (arguments, kw, bound) in [(authentic_args, &empty, false), (&malformed_args[..], &kwargs, true)] {
-                    let before = snapshot(&test_db).await;
+                    let before = (crate::dao::tests::structure_snapshot(&test_db, owner.character).await.unwrap(), crate::dao::tests::structure_snapshot(&test_db, other.character).await.unwrap());
                     let session: Vec<_> = client.session.attributes().map(|(k, v)| (k.to_owned(), v.clone())).collect();
                     let outbox = client.outbox.len();
                     let c = Call { service: "essMgr", method, args: arguments, kwargs: kw, bound, bind_params: None };
                     refusal(services::dispatch(&mut client, &c).await.unwrap_err());
-                    assert_eq!(snapshot(&test_db).await, before);
+                    assert_eq!((crate::dao::tests::structure_snapshot(&test_db, owner.character).await.unwrap(), crate::dao::tests::structure_snapshot(&test_db, other.character).await.unwrap()), before);
                     assert_eq!(client.session.attributes().map(|(k, v)| (k.to_owned(), v.clone())).collect::<Vec<_>>(), session);
                     assert_eq!(client.outbox.len(), outbox);
                     let mut byte = [0];

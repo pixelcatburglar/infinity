@@ -64,16 +64,19 @@ fn resolve<'a>(c: &Client, root: &Item, rows: &'a [LineageRow]) -> Option<(i64, 
         if !visited.insert(id) { return None; }
         let row = *by_id.get(&id)?;
         let a = &row.ancestor;
+        let ty = c.sde.types.get(a.type_id)?;
         if chain.is_empty() && (a.type_id != root.type_id || a.owner_id != root.owner_id || a.location_id != root.location_id || a.flag_id != root.flag_id || a.quantity != root.quantity || a.singleton != root.singleton) { return None; }
         chain.push(row);
         if let Some(office) = &row.office {
             let child = chain.get(chain.len().checked_sub(2)?)?;
             if c.sde.map.station(office.station_id).is_none() { return None; }
+            // An inactive lease retains office identity but grants no ordinary
+            // read; impound management views resolve elsewhere.
+            if !office.is_active(crate::client::filetime_now()) { return None; }
             custody = Some((office.corporation_id, office.station_id, child.ancestor.flag_id));
             let station = c.sde.map.station(office.station_id)?;
             return Some((office.station_id, station.solar_system_id, custody, chain));
         }
-        let ty = c.sde.types.get(a.type_id)?;
         let ship = ty.category_id == Some(CATEGORY_SHIP);
         if !a.singleton || (ship && a.quantity != 1)
             || !(ship || ty.group_id.is_some_and(|g| g == GROUP_WRECK || CARGO_CONTAINER_GROUPS.contains(&g))) { return None; }
@@ -132,7 +135,7 @@ pub(super) async fn contents(c: &Client, call: &Call<'_>) -> CallResult {
             else { flags.iter().position(|flag| *flag == item.flag_id).is_some_and(|index| allowed.is_some_and(|a| a[index])) }
     }).map(|item| item.row()).collect();
     if full && ship {
-        for charge in charges::positive(&c.db, id).await.map_err(db_err)? {
+        for charge in super::super::combat::loaded::rows(&c.db, &c.world, c.session.int("solarsystemid"), id).await?.into_iter().filter(|r| r.quantity > 0) {
             let ty = c.sde.types.get(charge.type_id).ok_or_else(refusal)?;
             result.push(charge_row(&root, &charge, i64::from(ty.group_id.ok_or_else(refusal)?), i64::from(ty.category_id.ok_or_else(refusal)?))?);
         }

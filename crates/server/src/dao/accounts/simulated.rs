@@ -31,4 +31,4 @@ pub(crate) async fn ensure(ex: &(impl Executor + ?Sized)) -> Result<bool, db::Er
     Ok(Ownership::from_row(&row).valid)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

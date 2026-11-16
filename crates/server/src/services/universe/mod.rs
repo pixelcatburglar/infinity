@@ -121,6 +121,7 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
 mod map;
 mod corp_registry;
 mod corpmgr;
+pub(in crate::services) mod assets;
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if let Some(reply) = super::fixed::universe(call) { return Some(reply); }

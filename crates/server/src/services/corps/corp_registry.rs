@@ -3,6 +3,7 @@
 //! Uses the shared corporation mechanics in `services::corps` and its DAOs,
 //! including `game.corporations`, `game.characters`, `game.corp_applications` and startup SDE corporations.
 //! Founding uses effective management skill and persists the supplied ISK and LP tax rates.
+//! Founding when the closed player-corporation ID range is exhausted is refused without charging.
 //! Share ownership and dividends use the corporation ledger; alliance calls have separate handlers.
 
 use super::*;
@@ -324,6 +325,12 @@ struct FoundInput {
     shapes: [Option<i32>; 7],
 }
 
+/// The one insert that allocates a corporation ID maps sequence exhaustion to the
+/// player refusal; every other creation failure stays an internal error.
+fn create_error(error: crate::db::Error) -> CallError {
+    if matches!(&error, crate::db::Error::Postgres(e) if e.code() == Some(&tokio_postgres::error::SqlState::SEQUENCE_GENERATOR_LIMIT_EXCEEDED)) { notify_error(messages::corporations::CORPORATION_IDS_EXHAUSTED) } else { db_err(error) }
+}
+
 async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, CallError> {
     let (db, world) = (&c.db, &*c.world);
     let sde = c.sde.clone();
@@ -383,7 +390,7 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
                 let id = registry::create(tx, &registry::NewCorporation {
                     name: &name, ticker: &ticker, description: &description, url: &url,
                     tax, lp_tax, ceo: me, station, recruiting, friendly, shapes, now, member_limit: Some(member_limit),
-                }).await.map_err(db_err)?;
+                }).await.map_err(create_error)?;
                 if !crate::dao::corporations::shares::initialize(tx, id, crate::config::game().corporations.initial_shares).await.map_err(db_err)? {
                     return Err(CallError::Internal(anyhow::anyhow!("new corporation share issuance could not be initialized")));
                 }

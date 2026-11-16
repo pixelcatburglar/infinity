@@ -42,20 +42,19 @@ impl Drop for ForeignCaller<'_> {
     }
 }
 
-pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, sde: &Arc<Sde>, events: &mut UnboundedReceiver<(String, Vec<Value>)>) {
-    let f = *f;
+pub(super) async fn exercise(client: &mut Client, f: &crate::services::tests::fixture::ShipFixture, sde: &Arc<Sde>, events: &mut UnboundedReceiver<(String, Vec<Value>)>) {
     let db = client.db.clone();
-    let ship_type: i32 = db.query_one("SELECT type_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.ship, &f.owner]).await.unwrap().get("type_id");
-    let module_type: i32 = db.query_one("SELECT type_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.modules[0], &f.owner]).await.unwrap().get("type_id");
-    let station: i64 = db.query_one("SELECT location_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.ship, &f.owner]).await.unwrap().get("location_id");
-    let other_ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,0,1,true) RETURNING item_id", &[&ship_type, &f.owner, &station]).await.unwrap().get("item_id");
-    let other_module: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,false) RETURNING item_id", &[&module_type, &f.owner, &other_ship, &FLAG_HI_SLOT_FIRST]).await.unwrap().get("item_id");
-    db.execute("UPDATE game.items SET online=false WHERE item_id=ANY($1) AND owner_id=$2", &[&&f.modules[..], &f.owner]).await.unwrap();
+    let ship_type: i32 = db.query_one("SELECT type_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.ship, &f.character]).await.unwrap().get("type_id");
+    let module_type: i32 = db.query_one("SELECT type_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.items[0], &f.character]).await.unwrap().get("type_id");
+    let station: i64 = db.query_one("SELECT location_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.ship, &f.character]).await.unwrap().get("location_id");
+    let other_ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,0,1,true) RETURNING item_id", &[&ship_type, &f.character, &station]).await.unwrap().get("item_id");
+    let other_module: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,false) RETURNING item_id", &[&module_type, &f.character, &other_ship, &FLAG_HI_SLOT_FIRST]).await.unwrap().get("item_id");
+    db.execute("UPDATE game.items SET online=false WHERE item_id=ANY($1) AND owner_id=$2", &[&&f.items[..], &f.character]).await.unwrap();
     for ship in [f.ship, other_ship] {
         assert!(dogma::set_override(&db, ship, ATTR_CPU_OUTPUT, 1000.0).await.unwrap());
         assert!(dogma::set_override(&db, ship, ATTR_POWER_OUTPUT, 1000.0).await.unwrap());
     }
-    for module in [f.modules[0], other_module] {
+    for module in [f.items[0], other_module] {
         assert!(dogma::set_override(&db, module, ATTR_CPU, 0.0).await.unwrap());
         assert!(dogma::set_override(&db, module, ATTR_POWER, 0.0).await.unwrap());
     }
@@ -68,27 +67,27 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
         .map(|t| t.type_id).collect();
     let mut selected = None;
     for skill in candidates {
-        gm::apply(client, f.owner, Change::Set(vec![(skill, 1)])).await.ok().expect("seed fitting skill");
-        let low = Fit::load(&db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
+        gm::apply(client, f.character, Change::Set(vec![(skill, 1)])).await.ok().expect("seed fitting skill");
+        let low = Fit::load(&db, sde.clone(), f.character, f.ship).await.ok().unwrap();
         let low_values = [low.value(Key::Ship, ATTR_CPU_OUTPUT), low.value(Key::Ship, ATTR_POWER_OUTPUT)];
-        gm::apply(client, f.owner, Change::Set(vec![(skill, 5)])).await.ok().expect("raise fitting skill");
-        let high = Fit::load(&db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
+        gm::apply(client, f.character, Change::Set(vec![(skill, 5)])).await.ok().expect("raise fitting skill");
+        let high = Fit::load(&db, sde.clone(), f.character, f.ship).await.ok().unwrap();
         let high_values = [high.value(Key::Ship, ATTR_CPU_OUTPUT), high.value(Key::Ship, ATTR_POWER_OUTPUT)];
         if let Some(index) = (0..2).find(|&i| high_values[i] > low_values[i] + 1e-4) {
             selected = Some((skill, [ATTR_CPU, ATTR_POWER][index], (high_values[index] + low_values[index]) / 2.0));
             break;
         }
-        gm::apply(client, f.owner, Change::Remove(vec![skill])).await.ok().expect("remove nonmatching skill");
+        gm::apply(client, f.character, Change::Remove(vec![skill])).await.ok().expect("remove nonmatching skill");
     }
     let (skill, resource, usage) = selected.expect("published SDE fitting skill that increases hull CPU or power output");
-    for module in [f.modules[0], other_module] {
+    for module in [f.items[0], other_module] {
         assert!(dogma::set_override(&db, module, resource, usage).await.unwrap());
     }
-    let modules = [f.modules[0], other_module];
-    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=ANY($1) AND owner_id=$2", &[&&modules[..], &f.owner]).await.unwrap(), 2);
+    let modules = [f.items[0], other_module];
+    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=ANY($1) AND owner_id=$2", &[&&modules[..], &f.character]).await.unwrap(), 2);
     let (load_attr, output_attr) = if resource == ATTR_CPU { (ATTR_CPU_LOAD, ATTR_CPU_OUTPUT) } else { (ATTR_POWER_LOAD, ATTR_POWER_OUTPUT) };
     for ship in [f.ship, other_ship] {
-        let fit = Fit::load(&db, sde.clone(), f.owner, ship).await.ok().unwrap();
+        let fit = Fit::load(&db, sde.clone(), f.character, ship).await.ok().unwrap();
         assert!(fit.value(Key::Ship, load_attr) <= fit.value(Key::Ship, output_attr), "initial fit must be legal at level five");
     }
     while events.try_recv().is_ok() {}
@@ -96,11 +95,11 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     let (gm_tx, mut gm_events) = tokio::sync::mpsc::unbounded_channel();
     let char_id = client.session.get("charid").clone();
     let sender = client.notify_tx.clone();
-    let caller = ForeignCaller { client, owner: f.owner, char_id, sender };
-    caller.client.world.register_pilot(f.owner, owner_tx);
+    let caller = ForeignCaller { client, owner: f.character, char_id, sender };
+    caller.client.world.register_pilot(f.character, owner_tx);
     caller.client.session.apply(vec![("charid", Value::None)]);
     caller.client.notify_tx = gm_tx;
-    gm::apply(caller.client, f.owner, Change::Set(vec![(skill, 1)])).await.ok().expect("lower fitting skill");
+    gm::apply(caller.client, f.character, Change::Set(vec![(skill, 1)])).await.ok().expect("lower fitting skill");
     for ship in [f.ship, other_ship] { assert!(dogma::online(&db, ship).await.unwrap().is_empty()); }
     let mut stopped = Vec::new();
     let mut attributes = Vec::new();
@@ -109,7 +108,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
             if let Some(id) = payload.first().and_then(Value::as_int) { stopped.push(id); }
         }
         if name == "OnModuleAttributeChanges" {
-            for id in modules { if super::offline_attribute(&payload, f.owner, id) { attributes.push(id); } }
+            for id in modules { if super::offline_attribute(&payload, f.character, id) { attributes.push(id); } }
         }
     }
     for id in modules {
@@ -118,11 +117,11 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     }
     assert!(gm_events.try_recv().is_err(), "owner notifications reached the foreign GM");
 
-    gm::apply(caller.client, f.owner, Change::Set(vec![(skill, 5)])).await.ok().expect("restore fitting skill");
-    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=ANY($1) AND owner_id=$2", &[&&modules[..], &f.owner]).await.unwrap(), 2);
+    gm::apply(caller.client, f.character, Change::Set(vec![(skill, 5)])).await.ok().expect("restore fitting skill");
+    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=ANY($1) AND owner_id=$2", &[&&modules[..], &f.character]).await.unwrap(), 2);
     while owner_events.try_recv().is_ok() {}
     assert!(gm_events.try_recv().is_err(), "owner skill notifications reached the foreign GM");
-    gm::apply(caller.client, f.owner, Change::Remove(vec![skill])).await.ok().expect("remove fitting skill");
+    gm::apply(caller.client, f.character, Change::Remove(vec![skill])).await.ok().expect("remove fitting skill");
     for ship in [f.ship, other_ship] { assert!(dogma::online(&db, ship).await.unwrap().is_empty()); }
     let mut stopped = Vec::new();
     let mut attributes = Vec::new();
@@ -131,7 +130,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
             if let Some(id) = payload.first().and_then(Value::as_int) { stopped.push(id); }
         }
         if name == "OnModuleAttributeChanges" {
-            for id in modules { if super::offline_attribute(&payload, f.owner, id) { attributes.push(id); } }
+            for id in modules { if super::offline_attribute(&payload, f.character, id) { attributes.push(id); } }
         }
     }
     for id in modules {
@@ -143,21 +142,22 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
 
     // A bank is destroyed in the same transaction as a forced offline. Rollback
     // must retain both membership and online state and dispatch nothing.
-    assert_eq!(db.execute("UPDATE game.items SET flag_id=$1, online=true WHERE item_id=$2 AND owner_id=$3 AND location_id=$4", &[&(FLAG_HI_SLOT_FIRST + 1), &f.modules[1], &f.owner, &f.ship]).await.unwrap(), 1);
-    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=$1 AND owner_id=$2 AND location_id=$3", &[&f.modules[0], &f.owner, &f.ship]).await.unwrap(), 1);
-    for (id, attr, value) in [(f.ship, ATTR_CPU_OUTPUT, 1.0), (f.ship, ATTR_POWER_OUTPUT, 1000.0), (f.modules[0], ATTR_CPU, 20.0), (f.modules[1], ATTR_CPU, 10.0), (f.modules[0], ATTR_POWER, 0.0), (f.modules[1], ATTR_POWER, 0.0)] {
+    assert_eq!(db.execute("UPDATE game.items SET flag_id=$1, online=true WHERE item_id=$2 AND owner_id=$3 AND location_id=$4", &[&(FLAG_HI_SLOT_FIRST + 1), &f.items[1], &f.character, &f.ship]).await.unwrap(), 1);
+    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=$1 AND owner_id=$2 AND location_id=$3", &[&f.items[0], &f.character, &f.ship]).await.unwrap(), 1);
+    for (id, attr, value) in [(f.ship, ATTR_CPU_OUTPUT, 1.0), (f.ship, ATTR_POWER_OUTPUT, 1000.0), (f.items[0], ATTR_CPU, 20.0), (f.items[1], ATTR_CPU, 10.0), (f.items[0], ATTR_POWER, 0.0), (f.items[1], ATTR_POWER, 0.0)] {
         assert!(dogma::set_override(&db, id, attr, value).await.unwrap());
     }
-    item_combat::move_bank(&db, f.ship, f.modules[0], f.modules[1]).await.unwrap();
+    item_combat::move_bank(&db, f.ship, f.items[0], f.items[1]).await.unwrap();
     while events.try_recv().is_ok() {}
     let scenario_sde = sde.clone();
-    let fences = online::capture_online_fences(&client.world, &[f.owner]).await;
+    let fences = online::capture_online_fences(&client.world, &[f.character]).await;
+    let (owner, ship) = (f.character, f.ship);
     let rolled_back: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<OnlineChanged>| {
         let sde = scenario_sde.clone();
         let fences = fences.clone();
         Box::pin(async move {
-            online::reconcile_core(tx, &sde, outbox, &fences, f.owner, f.ship).await?;
-            assert!(crate::dao::items::charges::banks(tx, f.ship).await.map_err(services::db_err)?.is_empty());
+            online::reconcile_core(tx, &sde, outbox, &fences, owner, ship).await?;
+            assert!(crate::dao::items::charges::banks(tx, ship).await.map_err(services::db_err)?.is_empty());
             Err(CallError::Internal(anyhow::anyhow!("intentional fixture rollback")))
         })
     }, |(), _| async move { panic!("rolled-back bank change dispatched") }).await;
@@ -165,7 +165,7 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     assert_eq!(dogma::online(&db, f.ship).await.unwrap().len(), 2);
     assert_eq!(crate::dao::items::charges::banks(&db, f.ship).await.unwrap().len(), 1);
     assert!(events.try_recv().is_err());
-    online::reconcile_ship(&client.db, &client.world, &client.sde, f.owner, f.ship, |n| online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("committed overload reconciliation");
+    online::reconcile_ship(&client.db, &client.world, &client.sde, f.character, f.ship, |n| online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("committed overload reconciliation");
     assert!(dogma::online(&db, f.ship).await.unwrap().is_empty());
     assert!(crate::dao::items::charges::banks(&db, f.ship).await.unwrap().is_empty());
     assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|(name, _)| name == "OnWeaponBanksChanged"));
@@ -174,46 +174,47 @@ pub(super) async fn exercise(client: &mut Client, f: &super::fixture::Fixture, s
     // only after the move commits; rollback must leave the generation untouched.
     assert!(dogma::set_override(&db, f.ship, ATTR_CPU_OUTPUT, 1000.0).await.unwrap());
     assert!(dogma::set_override(&db, f.ship, ATTR_POWER_OUTPUT, 1000.0).await.unwrap());
-    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=$1 AND owner_id=$2 AND location_id=$3", &[&f.modules[0], &f.owner, &f.ship]).await.unwrap(), 1);
+    assert_eq!(db.execute("UPDATE game.items SET online=true WHERE item_id=$1 AND owner_id=$2 AND location_id=$3", &[&f.items[0], &f.character, &f.ship]).await.unwrap(), 1);
     let stop = Arc::new(AtomicBool::new(false));
-    let _marker = ActiveMarker(f.modules[0]);
+    let _marker = ActiveMarker(f.items[0]);
     {
         let mut state = services::combat::state();
-        state.active.insert(f.modules[0], services::combat::ActiveModule { char_id: f.owner, stop: stop.clone(), forced_inactive: false });
-        state.activation_generation.insert(f.modules[0], stop.clone());
+        state.active.insert(f.items[0], services::combat::ActiveModule { char_id: f.character, stop: stop.clone(), forced_inactive: false });
+        state.activation_generation.insert(f.items[0], stop.clone());
     }
     let policy = online::OnlinePolicy::from_identity(&services::identity::Identity::of_client(client), client.notify_tx.clone()).ok().unwrap();
     let scenario_sde = sde.clone();
     while events.try_recv().is_ok() {}
-    let fences = online::capture_online_fences(&client.world, &[f.owner]).await;
+    let fences = online::capture_online_fences(&client.world, &[f.character]).await;
+    let (ship, module) = (f.ship, f.items[0]);
     let rollback: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<OnlineChanged>| {
         let policy = policy.clone();
         let sde = scenario_sde.clone();
         let fences = fences.clone();
         Box::pin(async move {
-            assert!(online::set_online_core(tx, &sde, &policy, outbox, &fences, f.ship, f.modules[0], false).await?.0);
+            assert!(online::set_online_core(tx, &sde, &policy, outbox, &fences, ship, module, false).await?.0);
             Err(CallError::Internal(anyhow::anyhow!("intentional unfit rollback")))
         })
     }, |(), _| async move { panic!("rolled-back unfit dispatched") }).await;
     assert!(rollback.is_err());
     assert!(!stop.load(Ordering::Relaxed));
-    assert!(dogma::online(&db, f.ship).await.unwrap().iter().any(|m| m.item_id == f.modules[0]));
+    assert!(dogma::online(&db, f.ship).await.unwrap().iter().any(|m| m.item_id == f.items[0]));
     assert!(events.try_recv().is_err());
 
-    let moved = services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &services::inventory::access::Container::Item(f.ship), f.modules[0], Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("unfit running module");
-    assert_eq!(moved, Some(f.modules[0]));
+    let moved = services::inventory::movement::move_item(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &services::inventory::access::Container::Item(f.ship), f.items[0], Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.ok().expect("unfit running module");
+    assert_eq!(moved, Some(f.items[0]));
     assert!(stop.load(Ordering::Relaxed));
-    let row = db.query_one("SELECT location_id,flag_id,online FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.modules[0], &f.owner]).await.unwrap();
+    let row = db.query_one("SELECT location_id,flag_id,online FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&f.items[0], &f.character]).await.unwrap();
     assert_eq!(row.get::<_, i64>("location_id"), f.ship);
     assert_eq!(row.get::<_, i32>("flag_id"), FLAG_CARGO);
     assert!(!row.get::<_, bool>("online"));
     let mut effect = false;
     let mut attribute = false;
     while let Ok((name, payload)) = events.try_recv() {
-        if name == "OnGodmaShipEffect" && payload.first() == Some(&Value::Int(f.modules[0]))
+        if name == "OnGodmaShipEffect" && payload.first() == Some(&Value::Int(f.items[0]))
             && payload.get(1).and_then(Value::as_int) == Some(EFFECT_ONLINE)
             && payload.get(3).and_then(Value::as_int) == Some(0) { effect = true; }
-        if name == "OnModuleAttributeChanges" && super::offline_attribute(&payload, f.owner, f.modules[0]) { attribute = true; }
+        if name == "OnModuleAttributeChanges" && super::offline_attribute(&payload, f.character, f.items[0]) { attribute = true; }
     }
     assert!(effect && attribute, "unfit must publish online-effect and isOnline stops");
 }

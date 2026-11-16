@@ -1,16 +1,30 @@
 //! One logged-in client's machoNet packet loop and ordered cleanup.
-//! `carbon/common/script/net/machoNet.py` defines transport usurp behavior.
-//! Session state uses the game database and in-memory world; account ownership
-//! is process-local and does not coordinate separate server processes.
+//! `Client::run` hands the session to the owned `lifecycle` boundary: a request
+//! child runs the packet loop and a supervisor performs ordinary cleanup
+//! exactly once, whether the loop ends normally, the caller is dropped, or a
+//! request panics. Only a replacement emits the usurp close defined by
+//! `carbon/common/script/net/machoNet.py`; a dropped caller is an ordinary
+//! disconnect whose in-flight request finishes first. Session state uses the
+//! game database and in-memory world; account ownership is process-local and
+//! does not coordinate separate server processes.
 //! A successful disconnect cleanup commits the selected character's logoff event.
 //! Actor-timed transitions flush queued notifications and forward destiny batches while waiting.
-//! Each destiny notification contains one logical stamp, retaining action order within that stamp.
+//! `Client::leave_space` runs once per committed transition out of space: it severs the old
+//! system's destiny channel and drops its unsent scene-bound packets while keeping other
+//! notifications. A committed ship loss instead waits for the old system's actor and writes
+//! the pending destruction batches to the transport before the session switch
+//! (`Client::flush_destiny_actions`). Each destiny notification contains one logical stamp,
+//! retaining action order within that stamp.
+//! Initial state and incremental updates share an ordered channel; rebinding replaces it.
+//! Narrow skill-queue diagnostics observe selected RPCs and notification writes.
+//! The internal pending-lock failure request keeps the failed attempt's
+//! identity through dequeue; the `target` service wire stays unchanged.
 
-use crate::conn::{Conn, Writer};
+use infinity_wire::conn::{Conn, Writer};
 use infinity_core::consts::{FILETIME_DAY, FILETIME_HOUR, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::Db;
 use crate::handshake::Login;
-use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
+use infinity_wire::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
 use crate::services::{self, identity::Identity, presence, Call, CallError};
 use infinity_core::session::Session;
 use crate::config::Config;
@@ -18,7 +32,11 @@ use anyhow::{anyhow, Result};
 use marshal::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
 use tracing::{debug, info, warn};
+
+pub(crate) mod lifecycle;
+mod skill_queue_diagnostics;
 
 /// Windows FILETIME uses 100 ns ticks, hence 10,000 ticks per millisecond.
 const FILETIME_TICKS_PER_MS: i64 = 10_000;
@@ -26,6 +44,41 @@ const FILETIME_TICKS_PER_MS: i64 = 10_000;
 const FILETIME_TICK_NS: u32 = 100;
 /// Internal pilot-channel request to recompile a brain.
 pub(crate) const BRAIN_REFRESH: &str = "__brain";
+/// Internal pilot-channel request to answer a discarded pending lock with the
+/// client's `target` service `FailLockTarget`; never a broadcast name.
+pub(crate) const TARGET_LOCK_FAILED: &str = "__target_lock_failed";
+/// Identity of one discarded pending lock attempt. The internal request
+/// carries it so a queued failure stays bound to the attempt that actually
+/// failed; the client wire itself only carries the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetLockFailure {
+    pub(crate) character: i64,
+    pub(crate) target: i64,
+    pub(crate) attempt: u64,
+}
+
+impl TargetLockFailure {
+    /// Decode the request's `[character, target, low, high]` payload; the two
+    /// u32 words carry `attempt` losslessly, and any other shape is refused.
+    fn from_args(args: &[Value]) -> Option<Self> {
+        let [Value::Int(character), Value::Int(target), Value::Int(low), Value::Int(high)] = args else {
+            return None;
+        };
+        let attempt = u64::from(u32::try_from(*low).ok()?) | (u64::from(u32::try_from(*high).ok()?) << u32::BITS);
+        Some(Self { character: *character, target: *target, attempt })
+    }
+}
+
+/// The internal pending-lock failure request the combat publisher sends to the
+/// originating connection: `(channel name, [character, target, low, high])`.
+pub(crate) fn target_lock_failure(character: i64, target: i64, attempt: u64) -> (String, Vec<Value>) {
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = attempt.to_le_bytes();
+    (TARGET_LOCK_FAILED.into(), vec![
+        Value::Int(character), Value::Int(target),
+        Value::Int(i64::from(u32::from_le_bytes([b0, b1, b2, b3]))),
+        Value::Int(i64::from(u32::from_le_bytes([b4, b5, b6, b7]))),
+    ])
+}
 
 pub struct Client {
     pub conn: Writer,
@@ -33,9 +86,11 @@ pub struct Client {
     pub world: Arc<crate::space::World>,
     /// Destiny events pushed by the solar system this client observes.
     pub destiny_tx: crate::space::DestinyTx,
-    destiny_rx: mpsc::UnboundedReceiver<Vec<Value>>,
+    destiny_rx: mpsc::UnboundedReceiver<crate::space::SceneDelivery>,
     /// Notifications other tasks address to this client's character (crate::space::World::register_pilot).
     pub notify_tx: crate::space::NotifyTx,
+    pub(crate) failure: Option<crate::live_sessions::FailureTarget>,
+    pub(crate) binding: Option<std::sync::Arc<crate::space::containment::PilotBinding>>,
     notify_rx: mpsc::UnboundedReceiver<(String, Vec<Value>)>,
     pub cfg: Arc<Config>,
     pub db: Db,
@@ -43,7 +98,7 @@ pub struct Client {
     pub chat: std::sync::Arc<crate::chat::Hub>,
     pub login: Login,
     pub session: Session,
-    /// Packets queued by handlers (session changes, notifications) to send after the response.
+    /// Packets queued by handlers for delivery at existing flush points.
     pub outbox: Vec<Packet>,
     /// Bound objects handed to this client: OID -> (service, bindParams).
     pub bound: std::collections::HashMap<String, (String, Value)>,
@@ -60,7 +115,7 @@ impl crate::services::ship::observer::DockObserver for Client {
     }
 
     fn unobserve(&mut self) {
-        self.world.unobserve(self.login.client_id);
+        self.leave_space();
     }
 }
 
@@ -87,6 +142,8 @@ impl Client {
             destiny_tx,
             destiny_rx,
             notify_tx,
+            failure: None,
+            binding: None,
             notify_rx,
             cfg,
             db,
@@ -146,16 +203,21 @@ impl Client {
 
     /// Queue a broadcast notification (`sm.ScatterEvent(event, *args)` on the client).
     pub fn notify(&mut self, event: &str, args: Vec<Value>) {
-        if event == "DoDestinyUpdate" && matches!(args.as_slice(), [Value::List(_), Value::Bool(_)]) {
-            let mut args = args.into_iter();
-            let Value::List(events) = args.next().unwrap() else { unreachable!() };
-            let Value::Bool(wait) = args.next().unwrap() else { unreachable!() };
-            self.queue_destiny_updates(events, wait);
-        } else {
-            self.queue_notification(event, args);
-        }
+        self.queue_notification(event, args);
     }
 
+    /// The one receiver entry for the ballpark channel: a Destiny batch keeps
+    /// the original stamp-grouped encoding, a scene-bound notification keeps
+    /// its position in the channel's order. Only packets appended here are
+    /// marked scene-bound so a ballpark reset drops exactly this stream.
+    fn queue_scene_delivery(&mut self, delivery: crate::space::SceneDelivery, wait_for_bubble: bool) {
+        let before = self.outbox.len();
+        match delivery {
+            crate::space::SceneDelivery::Destiny(events) => self.queue_destiny_updates(events, wait_for_bubble),
+            crate::space::SceneDelivery::Notify { event, args } => self.queue_notification(event, args),
+        }
+        for packet in &mut self.outbox[before..] { packet.scene_bound = true; }
+    }
     fn queue_destiny_updates(&mut self, mut events: Vec<Value>, wait_for_bubble: bool) {
         let stamp = |event: &Value| match event {
             Value::Tuple(fields) => match fields.as_slice() {
@@ -207,8 +269,31 @@ impl Client {
         self.outbox.push(packet);
     }
 
+    /// `target.FailLockTarget` as a service-destination notification: the body
+    /// wraps `(1, method, (targetID,))`, which machoNet routes to the `target`
+    /// service's method instead of a broadcast listener. The packet is built
+    /// before the State check so no marshal or allocation work happens under
+    /// the combat lock.
+    fn queue_target_lock_failure(&mut self, args: &[Value]) {
+        let Some(failure) = TargetLockFailure::from_args(args) else { return };
+        if self.session.int("charid") != Some(failure.character) { return; }
+        let payload = Value::tuple([Value::Int(1), Value::str("FailLockTarget"), Value::tuple([Value::Int(failure.target)])]);
+        let packet = Packet::new(
+            cmd::NOTIFICATION,
+            self.proxy_address(),
+            Address::Any { service: Some("target".into()), call_id: Value::None },
+            Value::Int(self.login.user_id),
+            vec![Value::tuple([Value::Int(0), Value::str(marshal::dumps(&payload))])],
+        );
+        self.outbox.reserve(1);
+        let outbox = &mut self.outbox;
+        services::combat::targeting_charges::with_pending_failure_current(failure, move || outbox.push(packet));
+    }
+
     async fn send(&mut self, p: &Packet) -> Result<()> {
-        self.conn.send(&p.to_value()).await
+        let result = self.conn.send(&p.to_value()).await;
+        skill_queue_diagnostics::notification_write(self, p, result.is_ok());
+        result
     }
 
     async fn flush(&mut self) -> Result<()> {
@@ -216,6 +301,46 @@ impl Client {
             self.send(&p).await?;
         }
         Ok(())
+    }
+
+    /// Leave the currently observed solar system after a committed transition:
+    /// unobserve, replace the destiny channel so the old system's sender can no
+    /// longer reach this client, and drop queued but unsent DoDestinyUpdate
+    /// packets from the old ballpark. Other notifications stay queued. Callers
+    /// that stay in space re-observe with the new `destiny_tx`.
+    pub(crate) fn leave_space(&mut self) {
+        self.world.unobserve(self.login.client_id);
+        self.reset_destiny();
+    }
+
+    /// Replace the ballpark stream and discard its unsent scene-bound packets.
+    pub(crate) fn reset_destiny(&mut self) {
+        let (destiny_tx, destiny_rx) = mpsc::unbounded_channel();
+        self.destiny_tx = destiny_tx;
+        self.destiny_rx = destiny_rx;
+        self.outbox.retain(|packet| !packet.scene_bound);
+    }
+
+    /// Consume only the batches present at entry, preserving channel order.
+    pub(crate) fn drain_destiny(&mut self) {
+        for _ in 0..self.destiny_rx.len() {
+            let Ok(delivery) = self.destiny_rx.try_recv() else { break };
+            self.queue_scene_delivery(delivery, false);
+        }
+    }
+
+    /// Wait until `system`'s actor has pushed every destiny action queued so far
+    /// to this client's destiny channel, forward the pending batches as
+    /// DoDestinyUpdate notifications through the usual path, then flush the
+    /// outbox. A committed ship loss calls this before its session switch so the
+    /// old ball's destruction reaches the transport first.
+    pub(crate) async fn flush_destiny_actions(&mut self, system: i64) -> Result<()> {
+        let (ack, receipt) = tokio::sync::oneshot::channel();
+        self.world.with(system, move |s| s.queue_destiny_flush(ack)).await
+            .ok_or_else(|| anyhow!("system actor stopped"))?;
+        receipt.await.map_err(|_| anyhow!("destiny flush acknowledgement dropped"))?;
+        self.drain_destiny();
+        self.flush().await
     }
 
     /// Wait on the system actor while forwarding destiny updates and queued packets.
@@ -229,82 +354,96 @@ impl Client {
             tokio::select! {
                 result = &mut timer => return Ok(result),
                 Some(events) = self.destiny_rx.recv() => {
-                    self.notify("DoDestinyUpdate", vec![Value::List(events), Value::Bool(false)]);
+                    self.queue_scene_delivery(events, false);
                     self.flush().await?;
                 }
             }
         }
     }
 
-    pub async fn run(mut self, registration: &mut crate::live_sessions::Registration) -> Result<()> {
-        let _sender_guard = registration.attach_sender(self.notify_tx.clone());
-        let result: Result<()> = async {
-            if registration.is_cancelled() {
-                return Ok(());
-            }
-            let l = &self.login;
-            let (uid, role, lang, addr) = (l.user_id, l.role, l.language_id.clone(), self.conn.peer.ip().to_string());
-            self.change_session(vec![
-                ("userid", Value::Int(uid)),
-                ("role", Value::Int(role)),
-                ("languageID", Value::str(lang)),
-                ("address", Value::str(addr)),
-                ("userType", Value::Int(20)),
-            ]);
-            self.flush().await?;
+    /// Hand this connection's session to its owned lifecycle: construction is
+    /// synchronous and the returned `SessionRun` is the supervisor's future.
+    pub(crate) fn run(self, registration: crate::live_sessions::Registration) -> lifecycle::SessionRun {
+        lifecycle::SessionRun::new(self, registration)
+    }
 
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = registration.cancelled() => break,
-                    incoming = self.inbox.recv() => {
-                        let Some(v) = incoming.transpose()?.flatten() else { break };
-                        let packet = match Packet::from_value(&v) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("unparseable packet ({e}): {}", short(&v));
-                                continue;
-                            }
-                        };
-                        self.handle(packet).await?;
-                    }
-                    Some(events) = self.destiny_rx.recv() => {
-                        self.notify("DoDestinyUpdate", vec![Value::List(events), Value::Bool(false)]);
-                    }
-                    Some((event, args)) = self.notify_rx.recv() => {
-                        if event == "__ship_destroyed" {
-                            services::ship_destroyed(&mut self, &args).await;
-                        } else if event == BRAIN_REFRESH {
-                            if let Err(error) = services::dogma::brain::update(&mut self).await {
-                                match error {
-                                    CallError::Internal(error) => warn!("skill brain refresh failed: {error:#}"),
-                                    CallError::User { msg, .. } => warn!("skill brain refresh failed: {msg}"),
-                                }
-                            }
-                        } else if event == services::chat::PERMISSIONS_REFRESH {
-                            if let Some(room) = args.first().and_then(|value| value.as_text()) {
-                                if let Err(error) = self.chat.refresh_permissions(&room).await {
-                                    warn!("chat permission refresh failed: {error:?}");
-                                }
-                            }
-                        } else if event == "__session" {
-                            // Another task changed this pilot's session (corporation membership): [(key, value)].
-                            let pairs = infinity_core::session::decode_pairs(&args);
-                            self.change_session(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
-                        } else {
-                            self.notify(&event, args);
-                        }
-                    }
-                }
-                if registration.is_cancelled() {
-                    break;
-                }
-                self.flush().await?;
-            }
-            Ok(())
-        }.await;
+    /// The request child's whole packet loop, run once under the session lock.
+    async fn run_loop(&mut self, registration: &mut crate::live_sessions::Registration) -> Result<()> {
         if registration.is_cancelled() {
-            if let Err(e) = self.conn.send(&crate::conn::usurped_close()).await {
+            return Ok(());
+        }
+        let l = &self.login;
+        let (uid, role, lang, addr) = (l.user_id, l.role, l.language_id.clone(), self.conn.peer.ip().to_string());
+        self.change_session(vec![
+            ("userid", Value::Int(uid)),
+            ("role", Value::Int(role)),
+            ("languageID", Value::str(lang)),
+            ("address", Value::str(addr)),
+            ("userType", Value::Int(20)),
+        ]);
+        self.flush().await?;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = registration.cancelled() => break,
+                incoming = self.inbox.recv() => {
+                    let Some(v) = incoming.transpose()?.flatten() else { break };
+                    let packet = match Packet::from_value(&v) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("unparseable packet ({e}): {}", short(&v));
+                            continue;
+                        }
+                    };
+                    self.handle(packet).await?;
+                }
+                Some(events) = self.destiny_rx.recv() => {
+                    self.queue_scene_delivery(events, false);
+                }
+                Some((event, args)) = self.notify_rx.recv() => {
+                    if event == "__ship_destroyed" {
+                        services::ship_destroyed(self, &args).await?;
+                    } else if event == BRAIN_REFRESH {
+                        if let Err(error) = services::dogma::brain::update(self).await {
+                            match error {
+                                CallError::Internal(error) => warn!("skill brain refresh failed: {error:#}"),
+                                CallError::User { msg, .. } => warn!("skill brain refresh failed: {msg}"),
+                            }
+                        }
+                    } else if event == services::chat::PERMISSIONS_REFRESH {
+                        if let Some(room) = args.first().and_then(|value| value.as_text()) {
+                            if let Err(error) = self.chat.refresh_permissions(&room).await {
+                                warn!("chat permission refresh failed: {error:?}");
+                            }
+                        }
+                    } else if event == "__session" {
+                        // Another task changed this pilot's session (corporation membership): [(key, value)].
+                        let pairs = infinity_core::session::decode_pairs(&args);
+                        self.change_session(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
+                    } else if event == TARGET_LOCK_FAILED {
+                        crate::runtime_watchdog::watch("notification", "target_lock_failure", async {
+                            self.queue_target_lock_failure(&args);
+                        }).await;
+                    } else {
+                        self.notify(&event, args);
+                    }
+                }
+            }
+            if registration.is_cancelled() {
+                break;
+            }
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// The supervisor's one ordinary cleanup, after the request loop ended or
+    /// its child panicked: usurp close only when a replacement took over, then
+    /// leave and close exactly once, keeping the result's error priority.
+    async fn finish(&mut self, registration: &crate::live_sessions::Registration, result: Result<()>) -> Result<()> {
+        if registration.is_replaced() {
+            if let Err(e) = self.conn.send(&infinity_wire::conn::usurped_close()).await {
                 warn!(user = self.login.user_id, "usurp close failed: {e:#}");
             }
         }
@@ -317,6 +456,7 @@ impl Client {
             warn!(user = self.login.user_id, "connection close failed: {e:#}");
         }
         info!(user = self.login.user_id, "client disconnected");
+        registration.record_cleanup(cleanup.is_ok(), close.is_ok());
         result.and(cleanup).and(close)
     }
 
@@ -336,6 +476,8 @@ impl Client {
     }
 
     async fn handle(&mut self, p: Packet) -> Result<()> {
+        #[cfg(all(test, feature = "tests-runtime"))]
+        tests::panic_containment::inject(&p);
         match p.command {
             cmd::CALL_REQ => self.handle_call(p).await,
             cmd::PING_REQ => {
@@ -369,6 +511,13 @@ impl Client {
     }
 
     async fn handle_call(&mut self, p: Packet) -> Result<()> {
+        let mut key = (String::new(), String::new());
+        let (result, timing) = crate::runtime_watchdog::measure(self.handle_call_inner(p, &mut key)).await;
+        crate::runtime_watchdog::rpc(key, timing);
+        result
+    }
+
+    async fn handle_call_inner(&mut self, p: Packet, key: &mut (String, String)) -> Result<()> {
         let outer = p.body.first().ok_or_else(|| anyhow!("CallReq without payload"))?;
         let parts = outer.items().ok_or_else(|| anyhow!("CallReq payload is not a tuple"))?;
         let is_object_call = parts.first().and_then(|v| v.as_int()) == Some(1);
@@ -394,6 +543,8 @@ impl Client {
         } else {
             (target.clone(), None)
         };
+        *key = (service, method);
+        let (service, method) = (&key.0, &key.1);
         let call = Call {
             service: &service,
             method: &method,
@@ -402,9 +553,10 @@ impl Client {
             bound: is_object_call,
             bind_params: bind_params.as_ref(),
         };
+        let mut diagnostic = skill_queue_diagnostics::begin(self, &p, &call);
         // The client asks these on every inventory listing (several a second in space).
         const UNLOGGED: [&str; 2] = ["ListSoulBound", "ListServiceLifeDamage"];
-        if !UNLOGGED.contains(&method.as_str()) {
+        if diagnostic.is_none() && !UNLOGGED.contains(&method.as_str()) {
             debug!(
                 user = self.login.user_id,
                 "call {}{service}::{method}{}",
@@ -413,8 +565,12 @@ impl Client {
             );
         }
         let result = services::dispatch(self, &call).await;
+        if let Some(diagnostic) = diagnostic.as_mut() {
+            diagnostic.observe_result(&result);
+        }
         // Session changes caused by the call reach the client before its response.
-        self.flush().await?;
+        // A retiring system is the one exception: the connection ends before the
+        // queued messages of that call are flushed or answered.
         let rsp = match result {
             Ok(ret) => p.response(cmd::CALL_RSP, vec![Value::str(marshal::dumps(&ret))]),
             Err(CallError::User { msg, dict }) => {
@@ -423,6 +579,12 @@ impl Client {
                 p.error_response(ERR_WRAPPEDEXCEPTION, Value::tuple([Value::str(marshal::dumps(&exc))]))
             }
             Err(CallError::Internal(e)) => {
+                if e.downcast_ref::<crate::space::containment::ActorRetiring>().is_some() {
+                    if let Some(diagnostic) = diagnostic {
+                        diagnostic.finish(None, skill_queue_diagnostics::RpcWrite::NotAttempted);
+                    }
+                    return Err(e);
+                }
                 warn!(user = self.login.user_id, "{target}::{method} failed: {e:#}");
                 let exc = Value::Reduce {
                     data: Box::new(Value::tuple([Value::global("exceptions.RuntimeError"), Value::tuple([Value::str(format!("{e:#}"))])])),
@@ -432,7 +594,22 @@ impl Client {
                 p.error_response(ERR_WRAPPEDEXCEPTION, Value::tuple([Value::str(marshal::dumps(&exc))]))
             }
         };
-        self.send(&rsp).await
+        if let Err(error) = self.flush().await {
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(None, skill_queue_diagnostics::RpcWrite::NotAttempted);
+            }
+            return Err(error);
+        }
+        let result = self.send(&rsp).await;
+        if let Some(diagnostic) = diagnostic {
+            let write = if result.is_ok() {
+                skill_queue_diagnostics::RpcWrite::Ok
+            } else {
+                skill_queue_diagnostics::RpcWrite::Failed
+            };
+            diagnostic.finish(Some(&rsp), write);
+        }
+        result
     }
 }
 
@@ -495,6 +672,16 @@ pub(crate) fn unix_ns_from_filetime(ticks: i64) -> Option<i64> {
 pub fn filetime_ticks_from_seconds(seconds: i64) -> i64 {
     seconds * FILETIME_SECOND
 }
+
+/// Start of `at`'s client day in FILETIME ticks, truncating toward zero.
+pub(crate) fn filetime_day_start(at: i64) -> i64 {
+    at / FILETIME_DAY * FILETIME_DAY
+}
+
+/// Add whole seconds, saturating the tick duration before the deadline.
+pub(crate) fn filetime_deadline_from_seconds_saturating(now: i64, seconds: i64) -> i64 {
+    now.saturating_add(seconds.saturating_mul(FILETIME_SECOND))
+}
 /// Convert the SDE datetime unit (days since Unix epoch) as
 /// `dogma/attributes/datetime.py::float_as_time`, rounded to whole seconds.
 pub fn filetime_from_dogma_days(days: f64) -> Option<i64> {
@@ -529,4 +716,4 @@ pub fn filetime_now() -> i64 {
     FILETIME_UNIX_EPOCH + (unix.as_nanos() / u128::from(FILETIME_TICK_NS)) as i64
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-runtime"))] mod tests;

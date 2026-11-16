@@ -1,15 +1,14 @@
 //! Physical mining intents use system-owned asteroid identity and post-contact extraction.
 use std::sync::Arc;
 use crate::db::Db;
-use crate::services::{CallError, fit::{Fit, Key}, mining};
+use crate::services::{CallError, mining};
 use crate::space::{dist, drone::{DroneOrder, DroneRecord}, World};
 
-pub(crate) async fn finish_cycle(_db: &Db, world: &Arc<World>, system: i64, drone: DroneRecord, target: i64, fit: &Fit) -> Result<(), CallError> {
+pub(crate) async fn finish_cycle(_db: &Db, world: &Arc<World>, system: i64, drone: DroneRecord, target: i64, values: [f64; 5]) -> Result<(), CallError> {
     let sde = world.sde().clone();
     let range = drone.spec.optimal_range.max(0.0);
     let id = drone.id;
     let generation = drone.generation;
-    let values = mining::yield_values(fit, Key::Drone(id));
     world.with(system, move |s| {
         let Some(type_id) = s.rock_type(target) else {
             s.drone_idle(id, generation);

@@ -6,19 +6,18 @@ mod transitions;
 use std::sync::Arc;
 use infinity_core::{consts::{CATEGORY_SHIP, FLAG_HANGAR}};
 use crate::{client::Client, db::Db, sde::Sde, space::World};
+use crate::services::tests::fixture::{assert_fixture_removed, capture_fixture_rows, Fixture};
 use infinity_core::consts::dogma::{ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT};
 use marshal::Value;
 
-async fn fingerprint(db: &Db) -> Vec<(String, Vec<(String, String)>)> {
-    let mut result = Vec::new();
-    for (table, key) in [("accounts", "user_id::text"), ("characters", "character_id::text"),
-        ("items", "item_id::text"), ("item_attributes", "item_id::text || ':' || attribute_id::text"),
-        ("skills", "character_id::text || ':' || type_id::text")] {
-        let rows = db.query(&format!("SELECT {key} AS key, md5(row_to_json(t)::text) AS hash FROM game.{table} t ORDER BY key"), &[]).await.unwrap()
-            .iter().map(|row| (row.get("key"), row.get("hash"))).collect();
-        result.push((table.to_owned(), rows));
-    }
-    result
+/// The affected hulls and contents plus the pilots' selection and trained skills.
+async fn board_state(db: &Db, owners: &[i64], ids: &[i64])
+    -> (crate::dao::tests::ItemState, Vec<Option<i64>>, Vec<(i64, i32, i32, i64)>) {
+    let mut selected = Vec::new();
+    for &owner in owners { selected.push(crate::dao::characters::selection::ship_id(db, owner).await.unwrap()); }
+    let skills = crate::dao::skills::training::current_many(db, owners).await.unwrap();
+    (crate::dao::tests::item_state(db, ids).await.unwrap(), selected,
+        skills.iter().map(|(character, skill)| (*character, skill.type_id, skill.level, skill.skill_points)).collect())
 }
 
 async fn client(db: Db, sde: Arc<Sde>, world: Arc<World>, account: i64) -> Client {
@@ -26,7 +25,7 @@ async fn client(db: Db, sde: Arc<Sde>, world: Arc<World>, account: i64) -> Clien
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
     let chat = crate::chat::Hub::new("localhost", db.clone(), world.clone());
-    Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), db, sde,
+    Client::new(infinity_wire::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), db, sde,
         chat, world, crate::handshake::Login {
             user_id: account, user_name: "boarding-fixture".into(), role: 0, client_id: account, session_id: account, language_id: "EN".into(),
         })
@@ -91,7 +90,6 @@ async fn station_board_switch_refresh_and_refusals() {
     let station = sde.map.stations().find(|s| s.solar_system_id.is_some()).expect("SDE station");
     let (station, system) = (station.station_id, station.solar_system_id.unwrap());
     let kind = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_SHIP) && t.published == Some(true)).map(|t| t.type_id).min().expect("SDE ship");
-    let before = fingerprint(&db).await;
     let (account, owner) = fixture(&db, &sde, system, Some(station)).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -104,11 +102,12 @@ async fn station_board_switch_refresh_and_refusals() {
         c.session.apply(vec![("userid", Value::Int(account)), ("charid", Value::Int(owner)), ("shipid", Value::Int(old)), ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system))]);
         c.world.register_pilot(owner, c.notify_tx.clone());
         c.world.set_online_session(owner, infinity_core::session::OnlineSession::from_session(&c.session));
-        let snapshot = fingerprint(&test_db).await;
+        let scope = [old, target, i64::MAX];
+        let snapshot = board_state(&test_db, &[owner], &scope).await;
         let queued = c.outbox.len();
         for (target, context) in [(target, Value::Int(station)), (target, Value::None), (i64::MAX, Value::Int(old))] {
             assert!(board_call(&mut c, target, context).await.is_err());
-            assert_eq!(fingerprint(&test_db).await, snapshot);
+            assert_eq!(board_state(&test_db, &[owner], &scope).await, snapshot);
             assert_eq!(c.outbox.len(), queued);
             assert_eq!(c.session.int("shipid"), Some(old));
             assert_eq!(crate::dao::characters::selection::ship_id(&test_db, owner).await.unwrap(), Some(old));
@@ -116,13 +115,14 @@ async fn station_board_switch_refresh_and_refusals() {
         fourtuple(board_call(&mut c, target, Value::Int(old)).await.ok().expect("station Board"));
         assert_eq!(c.session.int("shipid"), Some(target));
         assert_eq!(crate::dao::characters::selection::ship_id(&test_db, owner).await.unwrap(), Some(target));
-        let switched = fingerprint(&test_db).await;
+        let switched = board_state(&test_db, &[owner], &scope).await;
         fourtuple(board_call(&mut c, target, Value::Int(target)).await.ok().expect("current target refresh"));
-        assert_eq!(fingerprint(&test_db).await, switched);
+        assert_eq!(board_state(&test_db, &[owner], &scope).await, switched);
         assert_eq!(c.session.int("shipid"), Some(target));
     }).await;
+    let captured = capture_fixture_rows(&db, &[Fixture { account, character: owner }], &[]).await.unwrap();
     cleanup(&db, account, owner).await;
-    assert_eq!(fingerprint(&db).await, before);
+    assert_fixture_removed(&db, &captured).await.unwrap();
     result.unwrap();
 }
 
@@ -135,7 +135,6 @@ async fn gm_spawn_then_board_preserves_old_hull_across_restart() {
     let system = sde.map.systems().next().expect("SDE system").solar_system_id;
     let kind = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_SHIP) && t.published == Some(true))
         .filter(|t| crate::services::ship::balls::radius(&sde, t.type_id).is_ok()).map(|t| t.type_id).min().expect("SDE ship");
-    let before = fingerprint(&db).await;
     let (account, owner) = fixture(&db, &sde, system, None).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -157,11 +156,11 @@ async fn gm_spawn_then_board_preserves_old_hull_across_restart() {
         assert_eq!(c.session.int("shipid"), Some(old));
         assert_eq!(crate::dao::characters::selection::ship_id(&test_db, owner).await.unwrap(), Some(old));
         assert_eq!(world.ball(system, target).await.unwrap().char_id, None);
-        let snapshot = fingerprint(&test_db).await;
+        let snapshot = board_state(&test_db, &[owner], &[old, target]).await;
         let queued = c.outbox.len();
         assert!(super::board(&mut c, target, Some(target)).await.is_err());
         assert!(super::board(&mut c, i64::MAX, Some(old)).await.is_err());
-        assert_eq!(fingerprint(&test_db).await, snapshot);
+        assert_eq!(board_state(&test_db, &[owner], &[old, target]).await, snapshot);
         assert_eq!(c.outbox.len(), queued);
         assert_eq!(world.with(system, move |s| s.pilot_ball(owner).map(|b| b.id)).await.unwrap(), Some(old));
         fourtuple(super::board(&mut c, target, Some(old)).await.ok().expect("space Board"));
@@ -175,7 +174,8 @@ async fn gm_spawn_then_board_preserves_old_hull_across_restart() {
         assert_eq!(restored.ball(system, old).await.unwrap().char_id, None);
         assert_eq!(restored.with(system, move |s| s.persistent_balls().filter(|b| b.id == old).count()).await, Some(1));
     }).await;
+    let captured = capture_fixture_rows(&db, &[Fixture { account, character: owner }], &[]).await.unwrap();
     cleanup(&db, account, owner).await;
-    assert_eq!(fingerprint(&db).await, before);
+    assert_fixture_removed(&db, &captured).await.unwrap();
     result.unwrap();
 }

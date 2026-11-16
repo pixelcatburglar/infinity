@@ -360,8 +360,12 @@ NPC station and solar-system data comes from static data; alliance-system rows c
 | sovMgr | GetSovStructuresInfoForLocalSolarSystem | Lua claim | `crates/server/lua/sovereignty_rpc.lua` |
 | allianceRegistry | GetAllianceSovereigntyStructuresInfo | Lua claim | `crates/server/lua/sovereignty_rpc.lua` |
 | allianceRegistry | GetCapitalSystemInfo | Lua claim | `crates/server/lua/sovereignty_rpc.lua` |
+| devIndexManager | GetDevelopmentIndicesForSystem | Lua claim | `crates/server/lua/dev_index_manager.lua` |
+| devIndexManager | GetAllDevelopmentIndices | Lua claim | `crates/server/lua/dev_index_manager.lua` |
 
-These exact claims use the typed sovereignty snapshot and shared Rust wire encoder. The legacy Hub info describes a claim, so a neutral physical Hub returns `None` there while remaining in the structure list. Alliance structure results contain the two legacy projections of the same physical Hub, not two structures. Map and station reads compose committed sovereignty; unsupported indices and campaigns are not fabricated.
+These exact claims use the typed sovereignty snapshot and shared Rust wire encoder. The legacy Hub info describes a claim, so a neutral physical Hub returns `None` there while remaining in the structure list. Alliance structure results contain the two legacy projections of the same physical Hub, not two structures. Map and station ownership reads compose committed sovereignty; campaign data is not fabricated.
+
+The two development calls require an authenticated character, no binding and no keyword arguments. The single-system call accepts one positive integer identifying a static-data solar system and returns all three attribute-keyed point and trend records even when zero; strategic points are claim-age seconds. The all-system call accepts no arguments and returns candidates with positive points or trend baselines, or a live claim, in ascending system order; inactive systems are omitted. Its records contain military and industrial points and fractional claim-age days. Index notices are sent on level or trend changes; point details otherwise follow the client's 120-second memoize. An unavailable policy or invalid request fails rather than returning fabricated zeroes.
 
 ## Structure compatibility
 
@@ -547,6 +551,7 @@ Fleet location queries include online, visible fleet members in the caller's cur
 | dogmaIM | CreateNewbieShip, CreateNewbieBonusItems | handled | `crates/server/src/services/fitting/newbie.rs` |
 | ship | CheckEnoughSubSystemToUndock | fixed | `crates/server/src/services/ship/ship.rs` |
 | ship | GetDirtTimestamp, ResetDirtTimestamp | handled | `crates/server/src/services/ship/cleaning.rs` |
+| shipKillCounter | GetItemKillCountPlayer | handled | `crates/server/src/services/ship/ship_kill_counter.rs` |
 | ship | LeaveShip, SetShipPassword | refused | `crates/server/src/services/ship/ship.rs` |
 | dogmaIM | AddTargetOBO, RemoveTargetOBO | refused | `crates/server/src/services/dogma/dogma_im.rs` |
 | ship | GetShipFittingInfo | fixed refusal | `crates/server/src/services/ship/ship.rs` |
@@ -557,7 +562,9 @@ Fleet location queries include online, visible fleet members in the caller's cur
 
 The rookie ship request boards a newly created racial rookie ship when the current ship is not already a rookie ship, preserving the previous hull and its contents. Independently, the bonus request grants the six entries of the server-selected racial rookie fit once per character as loose items in the current NPC station hangar. Both use the same embedded catalogue as character provisioning, refuse structure and in-space requests, and return `None` after commit. Actual-client button and hangar-refresh behavior is NOT VERIFIED.
 
-The dirt RPCs take exactly one positive ship ID and require the current location binding. Reads initialize a persistent timestamp for a local physical hull, including visible foreign hulls in space without a fleet or corporation affiliation. Reset applies to an owned singleton ship in the current NPC station hangar, active or inactive, or the current piloted ship in space. It returns the committed FILETIME without a separate notification. This describes the service protocol; the real client clean-button UI has not been verified.
+The dirt RPCs take exactly one positive ship ID and require the current location binding. Reads initialize a persistent timestamp for a local physical hull, including visible foreign hulls in space without a fleet or corporation affiliation. Reset applies to an owned singleton ship in the current NPC station hangar, active or inactive, or the current piloted ship in space, and returns the committed FILETIME as a Python long. When the reset hull is live in a loaded system, the commit is followed by the existing `OnSlimItemChange` slim update rather than a dedicated cleaning event; a hull whose incarnation changed after commit keeps the stored timestamp and recovers on its next real load. This describes the service protocol; the real client clean-button UI has not been verified.
+
+The kill-counter call is unbound: the client issues it without a location moniker. It takes exactly one positive ship ID and answers with the hull's real persisted player-kill count as an integer. A caller reads the real count only for a hull its selected character owns, wherever that hull currently rests, or for a foreign hull the shared configuration visibility check authorizes. Every other well-formed query (a foreign hull outside that visibility, a non-ship, a packaged or a missing item) answers `0` rather than a refusal, and only a malformed argument shape is an error. The read never creates a row and grants no GM reach; the GM `/killmark` command is the global view. The stored and returned value is exact; the client's hangar model clamps its own display at 999.
 
 `ConfigureShip` accepts a dictionary patch of the four boolean keys `FleetHangar_AllowFleetAccess`, `FleetHangar_AllowCorpAccess`, `SMB_AllowFleetAccess` and `SMB_AllowCorpAccess` for the account's currently selected owned ship. It requires the current location-bound ship moniker, in station or space; an unknown key or non-boolean value refuses the entire patch. Settings are owner-bound, default to false and do not carry a previous owner's grants to a new owner. `GetShipConfiguration(shipID)` returns all four keys for an owned ship in the current station hangar or a visible owned ship in space, and for a currently fleet- or corporation-affiliated observer of a visible ship in space. This metadata is available before any switch grants bay contents and without an operational-range check. Foreign docked, unaffiliated or invisible ships are refused. The client's 15-second metadata cache is not an authorization grant.
 
@@ -582,7 +589,9 @@ For a real-client walkthrough, exercise all four switches, store, board and laun
 
 `CmdGotoPoint` flies the ship towards finite coordinates. `CmdGotoBookmark`, `CmdAlignTo` with `bookmarkID` and `CmdWarpToStuff('bookmark', ...)` use the coordinates stored with the bookmark: the pilot's own bookmark, or one in a shared folder with use, manage or admin access. A view-only, expired, missing or other-system bookmark is refused without movement, and coordinates sent by the client are never used. A bookmark warp can be a fleet warp. `CmdWarpToStuffAutopilot` takes only a celestial or object ID and never reads it as a bookmark. `CmdWarpToStuff` refuses a kind of destination it has no handler for instead of reading its ID as an object. `CmdFleetRegroup` sends the commander's subordinates in the same system who allow regrouping towards the commander's position, without warping; the client does not define the movement, so this is the server's own rule. `AdminGetBubbleID` returns the current solar system ID to a GM, because the server keeps one ballpark per system. `GetRelativity` returns the distance from the ship to a point, the ship's position, the system's current destiny tick and the server's current FILETIME.
 
-Each outgoing destiny notification contains events for one logical stamp, preserving their original order within that stamp.
+For fleet requests, `CmdWarpToStuff` reads the existing `fleetFormationSettings` dictionary with integer `formationType`, `formationSpacing` and `formationSize` fields. Types are Point (0), Sphere (1), Plane (2), Wall (3), Arrow (4) and Relative (5). Spacing choices are 1, 2, 3, 4, 5 and 10 km; size choices are 10, 20, 30, 40, 50 and 100 km, and the two distance choices are independent. Missing settings select Point; explicit malformed or untrained choices are refused rather than downgraded. Non-fleet requests ignore this dictionary. Arrival positions use the existing destiny warp actions and fleet message, with no additional formation message.
+
+Initial space state and subsequent updates are submitted through the same ordered scene channel; rebinding isolates batches from the previous connection. Each outgoing destiny notification contains events for one logical stamp, preserving their original order within that stamp.
 
 ## External phone binding
 
@@ -641,8 +650,30 @@ QA-role accounts can select exploration targets for full-certainty results. Sign
 | epicArcStatus | AgentHasEpicMissionsForCharacter | handled | `crates/server/src/services/missions/epic_arc_status.rs` |
 | agentMgr | GetPlausibleMissionIDs | fixed | `crates/server/src/services/fixed.rs` |
 | agentMgr | GetMessagesForEpicArcMissions | handled | `crates/server/src/services/missions/agent_mgr.rs` |
+| agentMgr | WarpToLocation | handled | `crates/server/src/services/missions/agent_mgr.rs` |
+
+An agent above level 1 offers work only when the pilot's effective standing meets the
+level's requirement. The effective standing is the best of the pilot's standings with
+the agent, its corporation and its faction, after the standing skills: Diplomacy
+applies to negative standings, Connections to non-negative ones, and Criminal
+Connections to non-negative standings with the pirate factions (Angel Cartel,
+Guristas Pirates, the Blood Raider Covenant, Sansha's Nation, Serpentis and the
+Deathless Circle). Standings with the Drifters, Rogue Drones, the Triglavian
+Collective and EDENCOM never take a skill bonus, and any adjusted standing of -2 or
+worse refuses the request regardless of the best. The bonuses read the pilot's
+effective skills, including active expert systems.
+
+Ordinary missions and existing epic-arc offers price their rewards once, when
+the offer is written: Negotiation raises the ISK amount, and the issuing agent's
+division skill raises the LP amount. Both are floored and saved as whole gross
+amounts. Accepting or completing never re-prices the offer; existing offers keep
+their saved amounts. Corporation taxes are deducted from the saved gross rewards
+at completion under the existing terms. Social and effective boosters are read
+when completion is prepared and multiply only positive standing gains; standing
+penalties and item rewards are unchanged.
 
 Epic-arc availability follows the selected character's active missions and unlocked progress; replay support is unchanged. The QA mission-selection tool is unavailable and receives no candidates.
+Bound `WarpToLocation(locationType, locationNumber, warpRange, fleet, referringAgentID, formation)` consumes the sixth positional argument as the same formation settings only when `fleet` is true. Accepted kill-mission sites and the agent's home station keep their existing destination rules.
 
 ## Mailing lists
 
@@ -782,6 +813,19 @@ The installed expert systems are returned by type ID with their install and expi
 
 The expert system category carries the `expert system` tag. A paid offer delivers consumable items through the redeeming queue; renewing an expert system means buying the same item again and consuming it. The server checks the price and quantity of every paid purchase and saves all of its changes together; the queue and PLEX balance notifications follow the commit, and an offline gift recipient finds the token at the next login. `get_offer_groups` returns an empty list. `set_offer_purchased`, which marks a period offer as bought before an external payment, is refused with a message and changes nothing.
 
+## PLEX vault
+
+The account's own PLEX vault history is served through the public gateway by `crates/server/src/gateway/plex.rs`. Every request acts on the authenticated account only; there is no account selection and no corporation vault.
+
+| service | method | status | handler file |
+|---|---|---|---|
+| `eve_public.plex.vault.api` | `BalanceRequest` | handled | `crates/server/src/gateway/plex.rs` |
+| `eve_public.plex.vault.transaction.api` | `GetAllLoggedForUserRequest` | handled | `crates/server/src/gateway/plex.rs` |
+| `eve_public.plex.vault.transaction.api` | `GetLogRequest` | handled | `crates/server/src/gateway/plex.rs` |
+| `eve_public.plex.vault.transaction.api` | `GetStatisticsRequest` | handled | `crates/server/src/gateway/plex.rs` |
+
+The internal opening baseline is never reported: `GetLogRequest` answers 404 for a missing, foreign or opening identifier, and a transaction's invoice is always reported unavailable rather than fabricated. `GetStatisticsRequest` returns one unclassified entry with positive income, negative expenses and a count that includes zero-amount rows, or an empty list and the Unix epoch when the account has no logged transactions. Each committed vault change also emits `BalanceChangedNotice` to the account's user target, best-effort after commit with no durable replay; the existing Macho `OnAurumChangeFromVgs` remains the actual balance refresh. This registers only these four requests and that notice; every other call keeps its existing answer or unclaimed handling.
+
 ## Clone grade
 
 | service | method | status | handler file |
@@ -841,6 +885,7 @@ Player structures are unavailable. Directory and profile reads expose empty comp
 
 | service | method | status | handler file |
 |---|---|---|---|
+| home_station | self_destruct_clone | handled | `crates/server/src/services/character/home_station.rs` |
 | jumpCloneSvc | GetCloneState | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
 | jumpCloneSvc | GetStationCloneState | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
 | jumpCloneSvc | GetPriceForClone | handled | `crates/server/src/services/clones/jump_clone_svc.rs` |
@@ -854,7 +899,7 @@ Player structures are unavailable. Directory and profile reads expose empty comp
 | jumpCloneSvc | GetNumClonesInPilotsStructure | fixed | `crates/server/src/services/clones/jump_clone_svc.rs` |
 | jumpCloneSvc | InstallCloneInStructure | fixed | `crates/server/src/services/clones/jump_clone_svc.rs` |
 
-Station clones keep their own implants. Ship clone bays and player structures are not implemented yet: the ship clone state is empty, the structure clone count is zero, and installing a clone in a structure is refused with a message.
+Station clones keep their own implants. `home_station.self_destruct_clone` takes no positional arguments and no business keyword arguments, answers `None`, and reports refusals through ordinary notification text. Ship clone bays and player structures are not implemented yet: the ship clone state is empty, the structure clone count is zero, and installing a clone in a structure is refused with a message.
 
 ## Inventory
 
@@ -887,6 +932,31 @@ refusal leaves no partial batch. No `SingleSave` method is added.
 
 PLEX can be withdrawn to, and returned from, the selected character's personal hangar at the current NPC station. Direct-trade withdrawal, structures and other conversion scopes are refused. The completion event follows the response; a withdrawn stack remains in the hangar if a later sale fails.
 
+## Repairable ships and service life
+
+These calls require a selected character. Recovery selections use `{groupID: [memberID]}`: duplicate members are collapsed, every group and member is authorized as a batch, and empty member lists are legal. Successful recovery writes return `None` and send the corresponding notification after commit.
+
+| service | method and arguments | result |
+|---|---|---|
+| repairableShipMgr | `CallRequested()` | `None`; `OnRepairableShipResponsed` contains one owned active snapshot, including an empty snapshot |
+| repairableShipMgr | `CallDeliveryPurchased(selection)` | `None`; `OnDeliveryStarted` with persisted delivery and withdrawal deadlines |
+| repairableShipMgr | `CallAbortRequested(selection)` | `None`; `OnAbortStarted` names selected abandoned members |
+| repairableShipMgr | `CallItemsWithdrawalRequested(selection)` | `None`; `OnItemsWithdrawn` maps members to new inventory IDs |
+| repairableShipMgr | `GetBatchDestinationSolarSystem({groupID: (stationID, structureID)})` | `{groupID: (solarSystemID, destinationID)}`; empty input returns `{}`, structures are refused |
+| repairableShipMgr | `OnDisassemble(itemIDs, sourceID, outputOwnerID, outputLocationID, outputFlagID)` | list of consumed inventory IDs |
+| repairableShipMgr | `OnRefurbishment(itemRows, {componentTypeID: count})` | `{originalRow: newDamage}` |
+| repairableShipMgr | `GetServiceLifeDamage(itemID)` | damage for an owned, escrow-beneficiary or otherwise authorized item |
+| invInventory | `ListServiceLifeDamage([flag])` | item-ID-to-damage map for the authorized bound inventory listing |
+| charMgr | `ListServiceLifeDamage([flag=None])` | item-ID-to-damage map for the caller's assets; requires the caller's `(characterID, 10002)` binding and a missing or `None` flag |
+
+Loss produces `OnAddRecoveryGroup`; together with the four recovery notifications above these carry descriptor-backed protobuf text. First withdrawal also sends `OnItemChange`; service-life changes use `OnItemServiceLifeDamageChanged` with integer item IDs. `ListSoulBound` is unchanged.
+
+Purchase calculates each member's whole-ISK charge using the `last_service_life` value sent to the client: `share = abs(last_service_life - (maxLife - currentDamage)) / maxLife`, then `trunc(max(base, average) * quantity * estPricePercentage * share)`, the client's own order of operations, so the charge equals the window amount when both hold the same prices, and checked-adds the results. Dynamic items use their source type for price and components. Prices come from the startup-loaded server retail dataset, not a quote, cache or token supplied by the client. A client process can retain an older displayed price after the server capture changes; restart the client to refresh it. Logout or character switching does not guarantee refresh, and the server does not charge according to the stale display.
+
+Payment, debit and journal, member transitions and member jobs commit atomically; replay preserves deadlines without another charge. Abort is atomic, unpaid and before expiry only; it cannot refund paid members. Withdrawal uses the frozen home station and the persisted half-open delivery window, including a delivering member whose delivery time has passed. Its first success creates a new inventory ID and retains eligible metadata; replay sends only the withdrawal notification without inventory, sequence, wallet or job writes. Payment, delivery and withdrawal deadlines survive restart and concurrent or late execution has one winner.
+
+Disassembly requires a docked reachable source and personal or corporate take and output authority. Duplicate IDs, assembled or active items, service-life damage, exclusions, reservations and industry occupation are refused. Component yield is `floor(maxLife / restore) * quantity` with checked arithmetic, deposited as real quantities, not ore reprocessing. Refurbishment reloads native rows by ID, rejects duplicate IDs and negative or excessive counts, and allocates in damage-then-ID order; partial use is allowed and only actually used components are consumed.
+
 ## Crates
 
 | service | method | status | handler file |
@@ -917,10 +987,10 @@ The three preview calls return the crate's contents as `(typeID, quantity, None)
 | service | method | status | handler file |
 |---|---|---|---|
 | encodedItems | DecodeItem | fixed | `crates/server/src/services/fixed.rs` |
-| itemLocking | GetItemsByLocation | fixed | `crates/server/src/services/fixed.rs` |
-| itemLocking | GetLockedItemLocations | fixed | `crates/server/src/services/fixed.rs` |
+| itemLocking | GetItemsByLocation | handled | `crates/server/src/services/corps/item_locking.rs` |
+| itemLocking | GetLockedItemLocations | handled | `crates/server/src/services/corps/item_locking.rs` |
 
-Encoded-item decoding is deferred and currently returns an explicit refusal without consuming or changing the item. Corporation lockdown management and voting are deferred; locked-item queries retain an empty mapping and a mutable empty set of locations.
+Encoded-item decoding is deferred and currently returns an explicit refusal without consuming or changing the item. Locked-item queries return actual corporation locks, not temporary vote reservations.
 
 ## Single-track login campaigns
 
@@ -993,6 +1063,16 @@ These boundaries do not implement paid services. The inactive NES state is neith
 
 | service | method | status | handler file |
 |---|---|---|---|
+| voteManager | CanViewVotes | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | CanRunForCEO | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | GetVoteCasesByCorporation | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | GetVoteCase | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | GetVoteCaseOptions | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | GetVotes | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | InsertVoteCase | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | InsertVote | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | GetCorpSanctionedActions | handled | `crates/server/src/services/corps/votes.rs` |
+| voteManager | ActivateSanctionedAction | handled | `crates/server/src/services/corps/votes.rs` |
 | corpRegistry | InsertApplication | handled | `crates/server/src/services/corps/corp_registry.rs` |
 | corpRegistry | InsertInvitation | handled | `crates/server/src/services/corps/corp_registry.rs` |
 | corpRegistry | GetMyApplications | handled | `crates/server/src/services/corps/corp_registry.rs` |
@@ -1035,6 +1115,33 @@ These boundaries do not implement paid services. The inactive NES state is neith
 | corpRegistry | ApplyToJoinAlliance | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
 | corpRegistry | GetAllianceApplications | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
 | corpRegistry | DeleteAllianceApplication | handled | `crates/server/src/services/corps/alliance_corp_registry.rs` |
+| officeManager | GetMyCorporationsOffices | handled | `crates/server/src/services/offices.rs` |
+| officeManager | GetCorporationsWithOffices | handled | `crates/server/src/services/offices.rs` |
+| officeManager | GetEmptyOfficeCount | handled | `crates/server/src/services/offices.rs` |
+| officeManager | GetPriceQuote | handled | `crates/server/src/services/offices.rs` |
+| officeManager | RentOffice | handled | `crates/server/src/services/offices.rs` |
+| officeManager | UnrentOffice | handled | `crates/server/src/services/offices.rs` |
+| officeManager | PrimeOfficeItem | handled | `crates/server/src/services/offices.rs` |
+| officeManager | HasCorpImpoundedItems | handled | `crates/server/src/services/offices.rs` |
+| officeManager | GetImpoundReleasePrice | handled | `crates/server/src/services/offices.rs` |
+| officeManager | GetItemsFromImpound | handled | `crates/server/src/services/offices.rs` |
+| officeManager | TrashImpoundedOffice | handled | `crates/server/src/services/offices.rs` |
+| billMgr | GetCorporationBills | handled | `crates/server/src/services/bills.rs` |
+| billMgr | GetCorporationBillsReceivable | handled | `crates/server/src/services/bills.rs` |
+| billMgr | PayCorporationBill | handled | `crates/server/src/services/bills.rs` |
+| billMgr | CharPayBill | handled | `crates/server/src/services/bills.rs` |
+| billMgr | GetAutomaticPaySettings | handled | `crates/server/src/services/bills.rs` |
+| billMgr | SendAutomaticPaySettings | handled | `crates/server/src/services/bills.rs` |
+| corpmgr | GetAssetInventory | handled | `crates/server/src/services/universe/corpmgr.rs` |
+| corpmgr | GetAssetInventoryForLocation | handled | `crates/server/src/services/universe/corpmgr.rs` |
+| corpmgr | SearchAssets | handled | `crates/server/src/services/universe/corpmgr.rs` |
+| blueprintManager | GetLimits | handled | `crates/server/src/services/fitting/blueprint_manager.rs` |
+| blueprintManager | GetBlueprintDataByOwner | handled | `crates/server/src/services/fitting/blueprint_manager.rs` |
+| blueprintManager | GetBlueprintData | handled | `crates/server/src/services/fitting/blueprint_manager.rs` |
+| allianceRegistry | GetBills | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetBillsReceivable | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | GetBillBalance | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
+| allianceRegistry | PayBill | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
 | corpmgr | AuditMember | handled | `crates/server/src/services/universe/corpmgr.rs` |
 | allianceRegistry | GetApplications | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
 | allianceRegistry | UpdateApplication | handled | `crates/server/src/services/alliances/alliance_registry.rs` |
@@ -1109,6 +1216,30 @@ Get returns 200 with explicit `no_skin` for a valid unskinned ship, 404 with no 
 | `eve_public.character.skill.plan.milestone.SetDescriptionRequest` | `gateway/skill_plans/personal_milestones.rs` |
 
 Shared plan lookup returns an absent plan when the definition is missing. The active response always contains a UUID, including sixteen zero bytes when tracking is cancelled. Certified tracking uses a static numeric plan ID encoded as a UUID. Milestone `SetDescription` is supported by the protocol; the current client has no known UI sender.
+
+## Corporation skill plans
+
+Current members of a live player corporation read its plans. Writes also require the global skill-plan manager role bit, including for a CEO or Director; a title grant counts only when titles are not blocked, and grantable or location-scoped bits do not. An NPC corporation is ordinary membership and has no plans, so its reads are empty and its writes are refused. A malformed request is 400, an absent or invisible plan is 404, and a failed permission, content or quota check is 412.
+
+| Gateway request | Handler |
+|---|---|
+| `eve_public.corporation.skill.plan.GetAllRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.GetRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.GetSharedRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.CreateRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.DeleteRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.SetNameRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.SetDescriptionRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.SetSkillRequirementsRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.SetCategoryRequest` | `gateway/skill_plans/corporation.rs` |
+| `eve_public.corporation.skill.plan.milestone.GetAllRequest` | `gateway/skill_plans/corporation_milestones.rs` |
+| `eve_public.corporation.skill.plan.milestone.CreateRequest` | `gateway/skill_plans/corporation_milestones.rs` |
+| `eve_public.corporation.skill.plan.milestone.DeleteRequest` | `gateway/skill_plans/corporation_milestones.rs` |
+| `eve_public.corporation.skill.plan.milestone.SetDescriptionRequest` | `gateway/skill_plans/corporation_milestones.rs` |
+
+The list returns summaries without skill requirements. Get returns the full attributes, and GetShared returns them only while the caller is a current member. A personal shared lookup never returns a corporation plan. A member copies one by creating a new personal plan and personal milestones; later corporation edits do not change that copy.
+
+Each committed write publishes one corporation-targeted notice: `CreatedNotice`, `DeletedNotice`, `NameUpdatedNotice`, `DescriptionUpdatedNotice`, `SkillRequirementsUpdatedNotice`, `CategoryUpdatedNotice`, and milestone `CreatedNotice`, `DeletedNotice` and `DescriptionSetNotice`. Deleting a plan does not repeat a notice for each milestone. The writing application is excluded. The audience is the member set committed with the write, and one gate per corporation orders that write with its dispatch. Notices are not replayed. Login and a session corporation change reload the current corporation from the database; rebuilding the notice stream alone does not clear a client's cached plans.
 
 ## Gateway transport
 

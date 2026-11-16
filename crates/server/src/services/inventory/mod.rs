@@ -21,6 +21,8 @@ pub(in crate::services) mod reachability;
 pub(in crate::services) mod bay_access;
 pub(crate) mod access;
 pub(in crate::services) mod notifications;
+pub(in crate::services) mod lifecycle;
+pub(in crate::services) mod debris;
 pub(crate) mod stacks;
 pub(crate) mod labels;
 pub(crate) mod trashing;
@@ -31,7 +33,7 @@ mod plex;
 mod inv_inventory;
 
 /// const.containerHangar: "my hangar in the current station".
-const CONTAINER_HANGAR: i64 = 10004;
+pub(in crate::services) const CONTAINER_HANGAR: i64 = 10004;
 /// inventorycommon.const.containerCorpMarket: corporation station deliveries.
 const CONTAINER_CORP_MARKET: i64 = 10012;
 /// Internal bound-object name for a single inventory.
@@ -50,4 +52,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

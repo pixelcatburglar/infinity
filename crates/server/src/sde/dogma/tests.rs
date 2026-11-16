@@ -1,9 +1,13 @@
 //! Server-authored synthetic dogma effects for database-free fitting tests.
+#[cfg(any(feature = "tests-effects", feature = "tests-space"))]
 use super::*;
 
+#[cfg(any(feature = "tests-effects", feature = "tests-space"))]
 pub(crate) const OVERLOAD_EFFECT: i32 = 900_001;
+#[cfg(any(feature = "tests-effects", feature = "tests-space"))]
 pub(crate) const BONUS_ATTRIBUTE: i32 = 900_002;
 
+#[cfg(any(feature = "tests-effects", feature = "tests-space"))]
 pub(crate) fn overload_fixture() -> Dogma {
     let effect = Effect {
         effect_id: OVERLOAD_EFFECT, name: None, guid: None, effect_category: Some(5),

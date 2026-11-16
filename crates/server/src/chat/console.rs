@@ -66,14 +66,14 @@ impl Hub {
     pub(crate) fn send_system_private(&self, char_id: i64, text: &str) {
         if char_id <= 0 || text.is_empty() { return; }
         let char_id_string = char_id.to_string();
-        if !self.tokens.lock().unwrap().contains_key(&char_id_string)
+        if !crate::poison::lock_or_exit(self.tokens.lock()).contains_key(&char_id_string)
             || !self.world.online_session(char_id).is_some_and(|s| s.character_id == char_id) { return; }
         let channel = room(char_id);
         let key = format!("{char_id_string}@{}", self.host);
-        let Some((jid, tx)) = self.users.lock().unwrap().get(&key).cloned() else { return };
+        let Some((jid, tx)) = crate::poison::lock_or_exit(self.users.lock()).get(&key).cloned() else { return };
         let room_jid = format!("{channel}@{}", self.conference());
         let (invite, announce_marker) = {
-            let mut rooms = self.rooms.lock().unwrap();
+            let mut rooms = crate::poison::lock_or_exit(self.rooms.lock());
             let occupants = rooms.entries.entry(room_jid.clone()).or_default();
             let occupied = occupants.get(&char_id_string).is_some_and(|o| o.tx.as_ref().is_some_and(|current| current.same_channel(&tx)));
             let marker = occupants.contains_key(SYSTEM_NICK);
@@ -106,5 +106,5 @@ impl Hub {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-runtime"))]
 mod tests;

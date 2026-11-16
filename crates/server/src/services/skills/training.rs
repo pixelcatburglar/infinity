@@ -4,11 +4,21 @@
 //! Finished levels are committed by the durable completion scheduler or mutations;
 //! training rates use effective character attributes computed by Fit, and timeline
 //! mutations reconcile fitted resources before their effects are dispatched.
+//! Queue state lives only in start_time/end_time: an all-None head is paused by
+//! the user; a Some(start)/None head keeps the active intent while its rate is
+//! zero (a blocked interval accrues no SP and schedules no completion job), and
+//! once a Some cursor stops the trailing rows carry no times. State changes that
+//! restore a positive rate re-derive ends from that moment; the blocked interval
+//! is never backfilled.
 //! SaveNewQueue validates whole queues against skillQueueSvc.py:186-234,259-263.
 //! Malformed maps use QueueInvalidPosition; levels must be consecutive (server
 //! policy preventing skipped levels). For a dependency found later in the saved
 //! queue, the whole-queue check reports QueueCannotPlaceSkillAfterDependentSkills.
 //! Clone-grade restrictions and the client queue time limit are not enforced.
+//! Queue rebuilds split in two: save_queue_tx settles training (lock, advance,
+//! banking) and delegates to save_settled_queue_tx, which mutations that
+//! already settled training (attribute remaps, the /setattr GM command) call
+//! directly so the finish, job and notifications still run exactly once.
 use super::*;
 use super::attributes::character_attributes_at;
 use super::formulas::sp_for_level;
@@ -148,17 +158,51 @@ pub(in crate::services) fn points_at(start_sp: i64, dest_sp: i64, start: i64, en
 }
 
 /// Schedule one queue interval using the effective character attributes.
-pub(super) fn schedule(sde: &crate::sde::Sde, row: &mut queue_dao::QueueEntry, attrs: &HashMap<i64, f64>, at: i64) -> Result<i64, CallError> {
+/// start_time is written on every call; end_time is Some for a finite duration.
+/// A zero rate keeps the entry active (Some(at), None); a fully trained entry
+/// completes at `at` even at zero rate; a negative or non-finite rate is a data
+/// or computation fault, not a valid duration.
+pub(super) fn schedule(sde: &crate::sde::Sde, row: &mut queue_dao::QueueEntry, attrs: &HashMap<i64, f64>, at: i64) -> Result<Option<i64>, CallError> {
     let st = skill_type(sde, row.type_id);
     let rate = attrs.get(&st.primary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) + attrs.get(&st.secondary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) / SECONDARY_ATTRIBUTE_DIVISOR;
-    let ticks = ((row.dest_sp as i128 - row.start_sp as i128).max(0) as f64 / rate) * FILETIME_MINUTE as f64;
+    if !rate.is_finite() || rate < 0.0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid skill training rate")));
+    }
+    let remaining = (row.dest_sp as i128 - row.start_sp as i128).max(0);
+    row.start_time = Some(at);
+    if remaining == 0 {
+        row.end_time = Some(at);
+        return Ok(Some(at));
+    }
+    if rate == 0.0 {
+        row.end_time = None;
+        return Ok(None);
+    }
+    let ticks = (remaining as f64 / rate) * FILETIME_MINUTE as f64;
     if !ticks.is_finite() || ticks < 0.0 || ticks >= i64::MAX as f64 {
         return Err(CallError::Internal(anyhow::anyhow!("invalid skill training duration")));
     }
     let end = at.checked_add(ticks as i64).ok_or_else(|| CallError::Internal(anyhow::anyhow!("skill training time overflow")))?;
-    row.start_time = Some(at);
     row.end_time = Some(end);
-    Ok(end)
+    Ok(Some(end))
+}
+
+/// Retime every entry in place from an optional start cursor. Entries scheduled
+/// while the cursor is Some keep their training intent; a blocked interval ends
+/// the cursor, and an absent cursor (a user-paused queue) leaves all rows without
+/// times. Rows carry their own start_sp/dest_sp; only the times are rewritten.
+pub(super) fn schedule_queue(sde: &crate::sde::Sde, rows: &mut [queue_dao::QueueEntry], attrs: &HashMap<i64, f64>, start: Option<i64>) -> Result<(), CallError> {
+    let mut cursor = start;
+    for row in rows.iter_mut() {
+        match cursor {
+            Some(at) => cursor = schedule(sde, row, attrs, at)?,
+            None => {
+                row.start_time = None;
+                row.end_time = None;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Bank the old interval and retime only when effective training attributes changed.
@@ -167,13 +211,17 @@ pub(super) async fn retime_after_change_tx(tx: &(impl Executor + ?Sized), sde: &
     if CHAR_ATTRIBUTES.iter().all(|id| before.get(id) == after.get(id)) { return Ok(()); }
     let mut rows = queue_dao::list(tx, char_id).await.map_err(db_err)?;
     let Some(first) = rows.first_mut() else { return Ok(()) };
-    let (Some(start), Some(end)) = (first.start_time, first.end_time) else { return Ok(()) };
-    let points = points_at(first.start_sp, first.dest_sp, start, end, now);
-    training_dao::write_skills(tx, char_id, &plan_skills(&[], Some((first.type_id, points)))).await.map_err(db_err)?;
-    let banked = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().find(|skill| skill.type_id == first.type_id).map_or(points, |skill| skill.skill_points.max(points));
+    let Some(start) = first.start_time else { return Ok(()) };
+    // A blocked head has no interval to interpolate or write; it still merges
+    // the persisted skill points so the retime never regresses banked SP.
+    let interpolated = first.end_time.map(|end| points_at(first.start_sp, first.dest_sp, start, end, now));
+    if let Some(points) = interpolated {
+        training_dao::write_skills(tx, char_id, &plan_skills(&[], Some((first.type_id, points)))).await.map_err(db_err)?;
+    }
+    let fallback = interpolated.unwrap_or(first.start_sp);
+    let banked = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().find(|skill| skill.type_id == first.type_id).map_or(fallback, |skill| skill.skill_points.max(fallback));
     first.start_sp = banked.min(first.dest_sp);
-    let mut time = now;
-    for row in &mut rows { time = schedule(sde, row, &after, time)?; }
+    schedule_queue(sde, &mut rows, &after, Some(now))?;
     queue_dao::clear(tx, char_id).await.map_err(db_err)?;
     for row in &rows { queue_dao::insert(tx, char_id, row).await.map_err(db_err)?; }
     progress.queue_changed = true;
@@ -194,24 +242,24 @@ pub(crate) async fn queue_list(identity: &Identity, db: &(impl Executor + ?Sized
     queue_dao::list(db, identity.char_id).await.map_err(db_err)
 }
 
-pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<crate::sde::Sde>, fences: &online::OnlineFences, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut progress: super::completion::AdvanceResult, additional: &[i32]) -> Result<super::completion::AdvanceResult, CallError> {
-    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-    progress.merge(super::completion::advance_tx(tx, outbox, sde, char_id, now).await?);
-    let training = in_training_sp(tx, char_id, now).await?;
-    training_dao::write_skills(tx, char_id, &plan_skills(&[], training)).await.map_err(db_err)?;
+/// Rebuild an already-settled queue from its entries with the current
+/// attributes, then run the shared completion aftermath exactly once.
+/// Callers settle training first (character lock, advance, banking); this
+/// function performs none of those itself.
+pub(super) async fn save_settled_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<crate::sde::Sde>, fences: &online::OnlineFences, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut progress: super::completion::AdvanceResult, additional: &[i32]) -> Result<super::completion::AdvanceResult, CallError> {
     let current: HashMap<i32, (i32, i64)> = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, (r.level, r.skill_points))).collect();
     validate_queue(sde, &entries, &current)?;
     let attrs = character_attributes_at(tx, sde, char_id, now).await?;
     let old_queue = queue_dao::list(tx, char_id).await.map_err(db_err)?;
     queue_dao::clear(tx, char_id).await.map_err(db_err)?;
-    let mut t = now;
+    let mut cursor = activate.then_some(now);
     for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
         let st = skill_type(&sde, type_id as i32);
         let (cur_level, cur_sp) = current.get(&(type_id as i32)).copied().unwrap_or((0, 0));
         let start_sp = if cur_level as i64 == to_level - 1 { cur_sp.max(sp_for_level(st.rank, to_level - 1)) } else { sp_for_level(st.rank, to_level - 1) };
         let dest_sp = sp_for_level(st.rank, to_level);
         let mut row = queue_dao::QueueEntry { position: pos as i32, type_id: type_id as i32, to_level: to_level as i32, start_sp, dest_sp, start_time: None, end_time: None };
-        if activate { t = schedule(sde, &mut row, &attrs, t)?; }
+        if let Some(at) = cursor { cursor = schedule(sde, &mut row, &attrs, at)?; }
         queue_dao::insert(tx, char_id, &row).await.map_err(db_err)?;
     }
     let changed = queue_dao::list(tx, char_id).await.map_err(db_err)? != old_queue;
@@ -224,6 +272,13 @@ pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Exec
     }
     progress.queue_changed |= changed;
     Ok(progress)
+}
+pub(super) async fn save_queue_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &std::sync::Arc<crate::sde::Sde>, fences: &online::OnlineFences, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut progress: super::completion::AdvanceResult, additional: &[i32]) -> Result<super::completion::AdvanceResult, CallError> {
+    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
+    progress.merge(super::completion::advance_tx(tx, outbox, sde, char_id, now).await?);
+    let training = in_training_sp(tx, char_id, now).await?;
+    training_dao::write_skills(tx, char_id, &plan_skills(&[], training)).await.map_err(db_err)?;
+    save_settled_queue_tx(tx, outbox, sde, fences, char_id, entries, activate, notify, now, progress, additional).await
 }
 /// `SaveNewQueue({idx: (typeID, toLevel)}, activate=bool)`: rebuild the queue with timings.
 pub(crate) async fn save_queue(identity: &Identity, db: &crate::db::Db, world: &crate::space::World, sde: &Arc<crate::sde::Sde>, queue: &Value, activate: bool, notify: bool, dispatch: impl FnMut(Notification) -> Result<(), CallError> + Send) -> Result<(), CallError> {
@@ -252,4 +307,4 @@ pub(crate) async fn save_queue(identity: &Identity, db: &crate::db::Db, world: &
     ).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

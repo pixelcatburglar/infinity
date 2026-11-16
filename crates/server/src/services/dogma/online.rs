@@ -13,15 +13,20 @@ use infinity_core::consts::dogma::EFFECT_ONLINE;
 pub(in crate::services) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallError> {
     use crate::services::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
     use crate::db::outbox::Outbox;
-    let _lock = crate::services::market::lock().await;
     let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     let fences = crate::services::effects::online::capture_online_fences(&c.world, &[policy.owner]).await;
+    let armed = crate::services::combat::loaded::LoadedHolds::arm(&c.world, &fences.membership(ship).map(|(system, _)| (system, ship)).into_iter().collect::<Vec<_>>(), crate::services::notify_error(infinity_core::messages::fitting::CHARGES_SETTLING)).await?;
+    let _lock = crate::services::market::lock().await;
+    let mut holds = crate::services::combat::loaded::LoadedHolds::lock(&c.world, armed, crate::services::notify_error(infinity_core::messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
     let db = c.db.clone();
     let sde = c.sde.clone();
-    db.transaction(
+    holds.may_execute();
+    let result = db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
             let policy = policy.clone();
+            let settle = settle.clone();
             let fences = fences.clone();
             Box::pin(async move {
                 if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? {
@@ -30,6 +35,7 @@ pub(in crate::services) async fn gm_online(c: &mut Client, ship: i64) -> Result<
                 load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next()
                     .filter(|item| item.owner_id == policy.owner && item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP))
                     .ok_or_else(|| crate::services::notify_error(infinity_core::messages::gm::GM_ITEM_NOT_FOUND))?;
+                crate::services::combat::loaded::settle_in(tx, &settle).await?;
                 let mut fitted = load_items(tx, &sde, ItemQuery::LocationOwner(ship, policy.owner)).await.map_err(db_err)?;
                 fitted.sort_unstable_by_key(|item| item.item_id);
                 let mut count = 0;
@@ -49,6 +55,7 @@ pub(in crate::services) async fn gm_online(c: &mut Client, ship: i64) -> Result<
                 Ok(count)
             })
         },
-        |count, outbox| async move { dispatch_changed(count, outbox, c) },
-    ).await
+        |count, outbox| { let c = &*c; async move { dispatch_changed(count, outbox, c) } },
+    ).await;
+    holds.finish(&db, &c.world, result, &[]).await
 }

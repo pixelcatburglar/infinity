@@ -96,6 +96,8 @@ pub const ATTR_MAX_JUMP_CLONES: i32 = 979;
 pub const ATTR_CLONE_JUMP_COOLDOWN: i32 = 1921;
 /// Client dogma/const.py attributeFollowsJumpClones.
 pub const ATTR_FOLLOWS_JUMP_CLONES: i32 = 1916;
+/// Client dogma/const.py attributeNonDestructible.
+pub const ATTR_NON_DESTRUCTIBLE: i32 = 1890;
 // SDE dogma attribute and effect IDs.
 /// SDE dgmAttributeTypes: maxActiveDrones.
 pub const ATTR_MAX_ACTIVE_DRONES: i32 = 352;
@@ -121,6 +123,10 @@ pub const ATTR_SKILL_TIME_CONSTANT: i32 = 275;
 pub const ATTR_SKILL_POINTS: i32 = 276;
 /// SDE dgmAttributeTypes: skillLevel.
 pub const ATTR_SKILL_LEVEL: i32 = 280;
+/// SDE attributeID `socialMutator`: Social's per-level standing gain percent.
+pub const ATTR_SOCIAL_MUTATOR: i32 = 438;
+/// SDE attributeID `socialBonus`: the character's standing gain multiplier.
+pub const ATTR_SOCIAL_BONUS: i32 = 362;
 /// Client dogma/const.py: requiredSkill1 through requiredSkill6.
 pub const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
 /// Client dogma/const.py: requiredSkill1Level through requiredSkill6Level.
@@ -157,6 +163,12 @@ pub const EFFECT_TURRET_FITTED: i32 = 42;
 pub const EFFECT_LAUNCHER_FITTED: i32 = 40;
 /// Client dogma/const.py: effectRigSlot.
 pub const EFFECT_RIG_SLOT: i32 = 2663;
+/// Client dogma/const.py `effectLoPower`.
+pub const EFFECT_LO_POWER: i32 = 11;
+/// Client dogma/const.py `effectHiPower`.
+pub const EFFECT_HI_POWER: i32 = 12;
+/// Client dogma/const.py `effectMedPower`.
+pub const EFFECT_MED_POWER: i32 = 13;
 
 /// SDE dgmAttributeTypes: damageMultiplier.
 pub const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
@@ -182,6 +194,14 @@ pub const ATTR_VOLUME: i32 = 161;
 pub const ATTR_RADIUS: i32 = 162;
 /// SDE dgmAttributeTypes: maxVelocity (also used for missiles).
 pub const ATTR_MAX_VELOCITY: i32 = 37;
+/// Client dogma/const.py: attributeDamageMultiplierBonusPerCycle.
+pub const ATTR_DAMAGE_MULTIPLIER_BONUS_PER_CYCLE: i32 = 2733;
+/// Client dogma/const.py: attributeDamageMultiplierBonusMax.
+pub const ATTR_DAMAGE_MULTIPLIER_BONUS_MAX: i32 = 2734;
+/// Client dogma/const.py: attributeDamageMultiplierBonusCurrent.
+pub const ATTR_DAMAGE_MULTIPLIER_BONUS_CURRENT: i32 = 5804;
+/// Client dogma/const.py: attributeDamageMultiplierBonusMaxTimestamp.
+pub const ATTR_DAMAGE_MULTIPLIER_BONUS_MAX_TIMESTAMP: i32 = 5818;
 /// SDE dgmAttributeTypes: speedFactor.
 pub const ATTR_SPEED_FACTOR: i32 = 20;
 /// Client dogma/const.py: attributeSpeedFactorInterim.
@@ -202,6 +222,12 @@ pub const ATTR_MAX_RANGE: i32 = 54;
 pub const ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST: i32 = 3255;
 /// SDE dgmAttributeTypes: maxTractorVelocity.
 pub const ATTR_MAX_TRACTOR_VELOCITY: i32 = 1045;
+/// SDE dgmAttributeTypes: accessDifficultyBonus.
+pub const ATTR_ACCESS_DIFFICULTY_BONUS: i32 = 902;
+/// SDE dgmAttributeTypes: moduleReactivationDelay.
+pub const ATTR_REACTIVATION_DELAY: i32 = 669;
+/// SDE dgmAttributeTypes: cloakingTargetingDelay.
+pub const ATTR_TARGETING_DELAY: i32 = 560;
 /// SDE dgmAttributeTypes: quantity.
 pub const ATTR_QUANTITY: i32 = 805;
 /// SDE dgmAttributeTypes: isOnline.
@@ -249,6 +275,8 @@ pub const EFFECT_TARGET_ATTACK: i32 = 10;
 pub const EFFECT_PROJECTILE_FIRED: i32 = 34;
 /// SDE dgmEffects: targetDisintegratorAttack.
 pub const EFFECT_TARGET_DISINTEGRATOR_ATTACK: i32 = 6995;
+/// SDE dgmEffects: gunneryMaxRangeFalloffTrackingSpeedBonus.
+pub const EFFECT_GUNNERY_MAX_RANGE_FALLOFF_TRACKING_SPEED_BONUS: i32 = 4559;
 /// SDE dgmEffects: useMissiles.
 pub const EFFECT_USE_MISSILES: i32 = 101;
 /// SDE dgmEffects: shieldBoosting.
@@ -271,6 +299,8 @@ pub const EFFECT_PROBE_LAUNCHING: i32 = 3793;
 pub const EFFECT_EMP_WAVE: i32 = 38;
 /// SDE dgmEffects: ChainLightning.
 pub const EFFECT_CHAIN_LIGHTNING: i32 = 8037;
+/// SDE dgmEffects: entityChainLightning.
+pub const EFFECT_ENTITY_CHAIN_LIGHTNING: i32 = 8088;
 /// SDE dgmEffects: fueledArmorRepair.
 pub const EFFECT_FUELED_ARMOR_REPAIR: i32 = 5275;
 /// SDE dgmEffects: fueledShieldBoosting.

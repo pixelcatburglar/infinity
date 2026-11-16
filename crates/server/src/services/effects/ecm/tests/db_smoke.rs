@@ -58,8 +58,9 @@ async fn npc_ecm_requires_current_target_generation() {
     }).await.expect("NPC shot generation");
     assert!(world.with(1, move |s| s.npc_projection_valid(-101, -102, generation)).await.unwrap());
     let fit = Fit::for_space_type(world.sde().clone(), source.type_id, Vec::new());
+    let inputs = crate::services::effects::parameters::capture_source(&fit, Key::Ship, &effect, 5000.0).expect("real ECM source capture");
     let cx = SourceContext { db: &db, world: &world, system: 1, source: &source, target: &victim,
-        module: -103, effect: &effect, duration_ms: 5000.0, fit: &fit, key: Key::Ship,
+        module: -103, effect: &effect, duration_ms: 5000.0, inputs: &inputs,
         guard: SourceGuard::Npc { source: -101, target: -102, generation }, attacker: None,
         drone: None, phase: DronePhase::End };
     apply_source(&cx).await.ok().unwrap();

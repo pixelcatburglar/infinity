@@ -24,5 +24,5 @@ impl Accounting {
     }
     pub(crate) fn iter(&self)->impl Iterator<Item=&EntryType> { self.entries.values() }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

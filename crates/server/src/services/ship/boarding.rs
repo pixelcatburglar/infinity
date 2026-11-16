@@ -36,7 +36,14 @@ pub(super) async fn board(c: &mut Client, ship_id: i64, context: Option<i64>) ->
         || expected.station_id != station || (station.is_none() && expected.system_id != system) {
         return Err(refusal());
     }
+    let space_admission = system.filter(|_| station.is_none()).map(|system| c.world.admission(system)).transpose().map_err(db_err)?;
+    // A space boarding boundary owns both hulls' loaded slots: refuse new use
+    // and wait out admitted finite work before the market guard.
+    let held_loaded = if let Some(system) = system.filter(|_| station.is_none()) {
+        Some(crate::space::system::boarding::quiesce_ship_loaded(&c.world, system, &[old, ship_id]).await.map_err(|held| held.into_call_error(refusal()))?)
+    } else { None };
     let market = crate::services::market::lock().await;
+    if let Some(admission) = &space_admission { admission.check().map_err(db_err)?; }
     let selected = selection::selected(&c.db, char_id, c.login.user_id).await.map_err(db_err)?.ok_or_else(refusal)?;
     if selected.station_id != station || (station.is_none() && Some(selected.solar_system_id) != system)
         || selection::ship_id(&c.db, char_id).await.map_err(db_err)? != Some(old) {
@@ -77,7 +84,8 @@ pub(super) async fn board(c: &mut Client, ship_id: i64, context: Option<i64>) ->
                 return Err(crate::space::system::boarding::BoardRefusal::StalePilot);
             }
             let snapshot = s.authorize_board(char_id, old, ship_id, MAX_BOARDING_DISTANCE)?;
-            let transition = s.begin_condition_transitions(&[old, ship_id]).ok_or(crate::space::system::boarding::BoardRefusal::Unsafe)?;
+            let mut transition = s.begin_condition_transitions(&[old, ship_id]).ok_or(crate::space::system::boarding::BoardRefusal::Unsafe)?;
+            transition.held_loaded = held_loaded;
             if transition.entries[0].1.generation != snapshot.old_generation
                 || transition.entries[1].1.generation != snapshot.target_generation {
                 return Err(crate::space::system::boarding::BoardRefusal::Unsafe);
@@ -87,7 +95,7 @@ pub(super) async fn board(c: &mut Client, ship_id: i64, context: Option<i64>) ->
         let security = crate::services::crimewatch::security_status(&db, char_id).await?;
         let client = c.login.client_id;
         let selected = settle_space(c.world.clone(), db, c.sde.clone(), system, char_id, client,
-            expected.clone(), transition, market, gate, boarding::RecoveryPlan::Board {
+            expected.clone(), transition, market, gate, space_admission.expect("space boarding admission"), boarding::RecoveryPlan::Board {
                 character: char_id, user: c.login.user_id, system, old, old_type, target: ship_id, target_type,
             },
             move |tx, outbox, states, facts| {
@@ -163,4 +171,4 @@ pub(in crate::services) async fn finish(c: &mut Client, selected: Option<i64>, s
     ship_state_core(c, ship_id).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;

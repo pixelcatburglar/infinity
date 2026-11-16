@@ -152,4 +152,4 @@ pub(crate) async fn take(ex: &(impl Executor + ?Sized), id: i64, old: i64, taken
     Ok(ex.execute("UPDATE game.asteroids SET quantity = quantity - $3 WHERE asteroid_id = $1 AND quantity = $2 AND quantity >= $3", &[&id, &old, &taken]).await? == 1)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

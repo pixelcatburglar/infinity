@@ -1,6 +1,7 @@
 //! Inventory stack merges, splits and trashing for
 //! `eve/client/script/environment/invCache.py`. Uses `game.items`, trade
-//! reservations, corporate custody and SDE data; staged trade items are not mutable.
+//! reservations, corporate custody and SDE data; staged trade items and
+//! corporation vote-locked blueprint originals are not mutable.
 
 use super::access::{custody_allowed, may_take_corp_hangar, Container};
 use super::notifications::{notify_corp_item_change, notify_item_change, notify_item_removed};
@@ -118,7 +119,7 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, ch
         let capacity_owner = load_items(db, sde, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter()
             .next().map_or(me, |row| row.owner_id);
         super::hold_storage::check_destination(db, sde, capacity_owner, location, flag, &additions,
-            super::hold_storage::Replaced { items: &excluded, reloads: &[] }, None).await?;
+            super::hold_storage::Replaced { items: &excluded, reloads: &[] }, super::hold_storage::CapacitySource::Current).await?;
     }
     if !quantities::apply(db, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
     for item in items {
@@ -226,6 +227,10 @@ pub(super) async fn stack_all(c: &mut Client, container: &Container, flag: Optio
         if super::super::offices::office_owner(&c.db, *id).await?.is_some_and(|corp| c.session.int("corpid") != Some(corp)) {
             return Ok(());
         }
+        // Stacking inside a corporation office requires a currently active lease.
+        if let Some(lease) = crate::dao::offices::get(&c.db, *id).await.map_err(db_err)? {
+            if !lease.is_active(crate::client::filetime_now()) { return Ok(()); }
+        }
     }
     let endpoint = match container {
         Container::Hangar { station_id, .. } => Endpoint { location: *station_id, flag: flag.map(|f| f as i32).unwrap_or(FLAG_HANGAR) },
@@ -305,6 +310,13 @@ pub(super) async fn stack_all(c: &mut Client, container: &Container, flag: Optio
 pub(in crate::services) async fn split_stack(db: &(impl Executor + ?Sized), item: &Item, quantity: i64, owner: i64, location: i64, flag: i32, singleton: bool) -> Result<i64, CallError> {
     if !crate::dao::trades::reserved(db, &[item.item_id]).await.map_err(db_err)?.is_empty() {
         return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+    }
+    // Locks and case reservations exist only on singleton blueprint originals,
+    // and the split DAO already refuses singletons outright; the guard sharpens
+    // that refusal for lockable inputs while stackable copies keep the old path
+    // with no added query.
+    if item.singleton && item.category_id == i64::from(infinity_core::consts::CATEGORY_BLUEPRINT) {
+        super::super::corps::item_locks::ensure_mutable(db, &[item.item_id]).await?;
     }
     inventory_dao::split(db, item, quantity, owner, location, flag, singleton).await.map_err(db_err)?
         .ok_or_else(|| notify_error(messages::STACK_CANNOT_BE_SPLIT))

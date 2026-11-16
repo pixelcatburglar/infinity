@@ -21,7 +21,7 @@ fn bank_pushes(rx: &mut UnboundedReceiver<(String, Vec<Value>)>) -> Vec<Vec<Valu
 
 fn direct_bank_pushes(client: &mut Client) -> Vec<Vec<Value>> {
     std::mem::take(&mut client.outbox).into_iter().filter_map(|packet| {
-        let crate::macho::Address::Broadcast { broadcast_id, .. } = packet.destination else { return None };
+        let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = packet.destination else { return None };
         if broadcast_id.as_text().as_deref() != Some("OnWeaponBanksChanged") { return None; }
         let envelope = packet.body[0].items().unwrap();
         let decoded = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();

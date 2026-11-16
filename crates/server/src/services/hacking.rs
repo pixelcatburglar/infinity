@@ -449,7 +449,7 @@ fn board(tier: i64, mut next_id: impl FnMut() -> i64) -> (HashMap<Coord, Tile>, 
 
 fn games() -> MutexGuard<'static, HashMap<i64, Game>> {
     static GAMES: OnceLock<Mutex<HashMap<i64, Game>>> = OnceLock::new();
-    GAMES.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(GAMES.get_or_init(Default::default).lock())
 }
 
 /// Activate(analyzerID, 'doHacking', containerID): open a game on the container.
@@ -723,5 +723,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(Ok(Value::None))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;
 

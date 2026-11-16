@@ -1,5 +1,7 @@
 //! Skill trading boundaries and database settlement regressions.
 use super::*;
+use crate::services::fit::Key;
+use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
 mod reconciliation;
 mod alpha_injections;
 
@@ -8,13 +10,17 @@ async fn fingerprint(db: &crate::db::Db, character: i64) -> String {
     db.query_one("SELECT (SELECT row_to_json(c)::text FROM game.characters c WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(i)::text, '' ORDER BY item_id), '') FROM game.items i WHERE owner_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(a)::text, '' ORDER BY a.item_id,a.attribute_id), '') FROM game.item_attributes a JOIN game.items i ON i.item_id=a.item_id WHERE i.owner_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') FROM game.skill_history h WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(j)::text, '' ORDER BY job_id), '') FROM game.jobs j WHERE job_id=$2) AS fingerprint", &[&character, &job]).await.unwrap().get("fingerprint")
 }
 
-fn notification_events(outbox: Outbox<OnlineChanged>) -> Vec<String> {
+fn notification_events(outbox: Outbox<OnlineChanged>, owner: i64) -> Vec<String> {
     use crate::db::outbox::{Effect, Notification};
-    outbox.into_entries().into_iter().filter_map(|entry| match entry {
+    let mut operations = 0;
+    let events = outbox.into_entries().into_iter().filter_map(|entry| match entry {
         Effect::Notification(Notification::DirectClient { event, .. } | Notification::Pilot { event, .. }) => Some(event),
-        Effect::Notification(Notification::Sender { .. } | Notification::Gateway(..) | Notification::Sovereignty(..)) => None,
+        Effect::Notification(Notification::Sender { .. } | Notification::Gateway(..) | Notification::Sovereignty(..) | Notification::ShipCosmetics(..)) => None,
+        Effect::Operation(OnlineChanged::Character { owner: published, .. }) if published == owner => { operations += 1; None }
         Effect::Operation(_) => panic!("unexpected online reconciliation operation"),
-    }).collect()
+    }).collect();
+    assert_eq!(operations, 1);
+    events
 }
 
 #[tokio::test]
@@ -51,6 +57,7 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let mut recipient = None;
     let scenario = crate::tests::catch_scenario(async {
     let (mut c, peer) = client(db.clone(), f.character).await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -63,6 +70,14 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
     let item = transfers::insert(&db, EXTRACTOR, f.character, station, FLAG_HANGAR, 1).await.unwrap();
     let args = vec![Value::Dict(vec![(Value::Int(i64::from(skill)), Value::Int(BUCKET))]), Value::Int(item), Value::Int(1)];
     let invalid = vec![Value::Dict(vec![(Value::Int(i64::from(skill)), Value::Int(BUCKET - 1))]), Value::Int(item), Value::Int(1)];
+    let owner_ship = crate::dao::items::creation::rookie_ship(&db, infinity_core::consts::TYPE_CAPSULE, f.character, station, FLAG_HANGAR).await.unwrap();
+    crate::dao::characters::selection::set_ship(&db, f.character, owner_ship).await.unwrap();
+    recipient = Some({
+        let market = crate::services::market::lock().await;
+        crate::services::tests::fixture::LiveRecipient::cold(&c.world, f.character, None, &market).await
+    });
+    let live = recipient.as_ref().unwrap();
+    let live_before = live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await;
     let before_invalid = fingerprint(&db, f.character).await;
     assert!(extract(&mut c, f.character, &invalid).await.is_err());
     assert_eq!(fingerprint(&db, f.character).await, before_invalid);
@@ -91,6 +106,7 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
     }, |(), _| async move { panic!("rolled-back extraction dispatched") }).await;
     drop(market_guard);
     fixture::assert_division_by_zero(failed);
+    assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, live_before);
     assert_eq!(fingerprint(&db, f.character).await, before);
     assert!(receiver.try_recv().is_err());
     assert_eq!(db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&item]).await.unwrap().get::<_, i64>("quantity"), 1);
@@ -115,12 +131,16 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
         online::dispatch_entries((), outbox, &world, |notification| {
             match &notification {
                 Notification::DirectClient { event, .. } | Notification::Pilot { event, .. } => events.push(event.clone()),
-                Notification::Sender { .. } | Notification::Gateway(..) | Notification::Sovereignty(..) => {}
+                Notification::Sender { .. } | Notification::Gateway(..) | Notification::Sovereignty(..) | Notification::ShipCosmetics(..) => {}
             }
             notification.dispatch(&world, Some(&mut *c))
         })?;
         Ok(events)
     }}).await.unwrap_or_else(|_| panic!("extraction failed"));
+    let trained = crate::dao::skills::training::current(&db, f.character).await.unwrap().into_iter().find(|row| row.type_id == skill).unwrap();
+    assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, f64::from(trained.level));
+    assert_eq!(live.read(move |fit| fit.character_inputs().trained.into_iter()
+        .find(|row| row.type_id == skill).unwrap().skill_points).await, trained.skill_points);
     assert!(crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.is_empty());
     assert_eq!(crate::db::outbox::tests::events(&db, "SkillStateChanged", f.character).await.len(), 1);
     drop(market_guard);
@@ -134,6 +154,9 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
     assert_eq!(output, 1);
     assert_eq!(crate::dao::skills::history::list(&db, f.character, 50).await.unwrap().len(), 1);
     }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     crate::scheduler::cancel(&db, &format!("{}:{}", super::super::completion::KIND, f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
@@ -147,6 +170,8 @@ async fn conversion_and_injection_conserve_items_and_refuse_wrong_sources() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let mut recipient = None;
+    let scenario = crate::tests::catch_scenario(async {
     let (mut c, _peer) = client(db.clone(), f.character).await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     c.notify_tx = sender.clone();
@@ -183,9 +208,22 @@ async fn conversion_and_injection_conserve_items_and_refuse_wrong_sources() {
     convert(&mut c, f.character, &[Value::Int(small), Value::Int(5)], false).await.unwrap_or_else(|_| panic!("combine failed"));
     let quantity: i128 = db.query_one("SELECT sum(quantity)::text AS quantity FROM game.items WHERE owner_id=$1 AND type_id=$2", &[&f.character, &FULL_INJECTOR]).await.unwrap().get::<_, String>("quantity").parse().unwrap();
     assert_eq!(quantity, 2);
+    let owner_ship = crate::dao::items::creation::rookie_ship(&db, infinity_core::consts::TYPE_CAPSULE, f.character, station, FLAG_HANGAR).await.unwrap();
+    crate::dao::characters::selection::set_ship(&db, f.character, owner_ship).await.unwrap();
+    recipient = Some({
+        let market = crate::services::market::lock().await;
+        crate::services::tests::fixture::LiveRecipient::cold(&c.world, f.character, None, &market).await
+    });
+    let live = recipient.as_ref().unwrap();
+    let skills = |fit: &crate::services::fit::Fit| fit.character_inputs().trained.into_iter()
+        .map(|row| (row.type_id, row.level, row.skill_points, fit.value(Key::Skill(row.type_id), ATTR_SKILL_LEVEL))).collect::<Vec<_>>();
+    let old_skills = live.read(skills).await;
+    let old_capacity = live.read(|fit| fit.value(Key::Ship, infinity_core::consts::dogma::ATTR_CAPACITY)).await;
     let quote = quote(&c, f.character, &[Value::Int(i64::from(FULL_INJECTOR)), Value::Int(1), Value::Int(999)]).await.unwrap_or_else(|_| panic!("quote failed"));
     inject(&mut c, f.character, &args, true).await.unwrap_or_else(|_| panic!("constraint check failed"));
     inject(&mut c, f.character, &args, false).await.unwrap_or_else(|_| panic!("injection failed"));
+    assert_eq!(live.read(skills).await, old_skills);
+    assert_eq!(live.read(|fit| fit.value(Key::Ship, infinity_core::consts::dogma::ATTR_CAPACITY)).await, old_capacity);
     assert_eq!(crate::dao::characters::attributes::free_points(&db, f.character).await.unwrap(), quote.as_int().unwrap());
     assert!(inject(&mut c, f.character, &args, false).await.is_err());
     let remote = transfers::insert(&db, FULL_INJECTOR, f.character, station + 1, FLAG_HANGAR, 1).await.unwrap();
@@ -195,7 +233,14 @@ async fn conversion_and_injection_conserve_items_and_refuse_wrong_sources() {
     assert_eq!(db.query_one("SELECT quantity FROM game.items WHERE item_id=$1", &[&seven]).await.unwrap().get::<_, i64>("quantity"), 2);
     let quantity: i128 = db.query_one("SELECT sum(quantity)::text AS quantity FROM game.items WHERE owner_id=$1 AND type_id=$2 AND location_id=$3", &[&f.character, &FULL_INJECTOR, &station]).await.unwrap().get::<_, String>("quantity").parse().unwrap();
     assert_eq!(quantity, 2);
+    }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
@@ -382,14 +427,14 @@ async fn injection_and_conversion_outboxes_are_exact() {
     let events = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone(); let fences = fences.clone();
         Box::pin(async move { inject_tx(tx, outbox, &sde, &fences, f.character, None, item, 1, now, false).await })
-    }, |_, outbox| async move { Ok(notification_events(outbox)) }).await.unwrap_or_else(|_| panic!("injection failed"));
+    }, |_, outbox| async move { Ok(notification_events(outbox, f.character)) }).await.unwrap_or_else(|_| panic!("injection failed"));
     assert_eq!(events.iter().filter(|event| event.as_str() == "OnItemChange").count(), 1);
     assert_eq!(events.iter().filter(|event| event.as_str() == "OnFreeSkillPointsChanged").count(), 1);
     assert_eq!(events.len(), 2);
     let events = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone(); let fences = fences.clone();
         Box::pin(async move { convert_tx(tx, outbox, &sde, &fences, f.character, None, item, 1, now, true).await })
-    }, |_, outbox| async move { Ok(notification_events(outbox)) }).await.unwrap_or_else(|_| panic!("conversion failed"));
+    }, |_, outbox| async move { Ok(notification_events(outbox, f.character)) }).await.unwrap_or_else(|_| panic!("conversion failed"));
     assert!(crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.is_empty());
     assert!(crate::db::outbox::tests::events(&db, "SkillStateChanged", f.character).await.is_empty());
     assert_eq!(events.iter().filter(|event| event.as_str() == "OnItemChange").count(), 2);
@@ -440,8 +485,8 @@ async fn overdue_training_booster_quote_check_and_settlement_agree() {
                     for skill in c.sde.types.iter().filter(|skill| skill.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == skill.type_id)) {
                         let mut row = QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut slower = row.clone();
-                        let Ok(old_end) = training::schedule(&c.sde, &mut row, &old, start) else { continue };
-                        let Ok(new_end) = training::schedule(&c.sde, &mut slower, &new, start) else { continue };
+                        let Ok(Some(old_end)) = training::schedule(&c.sde, &mut row, &old, start) else { continue };
+                        let Ok(Some(new_end)) = training::schedule(&c.sde, &mut slower, &new, start) else { continue };
                         if old_end <= now || new_end <= old_end { continue; }
                         crate::dao::skills::training::starting_skill(&db, f.character, skill.type_id, 0, 0).await.unwrap();
                         crate::dao::skills::queue::insert(&db, f.character, &row).await.unwrap();
@@ -470,7 +515,7 @@ async fn overdue_training_booster_quote_check_and_settlement_agree() {
                         let events = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
                             let sde = sde.clone(); let fences = fences.clone();
                             Box::pin(async move { inject_tx(tx, outbox, &sde, &fences, f.character, None, injector, 1, now, false).await })
-                        }, |_, outbox| async move { Ok(notification_events(outbox)) }).await.unwrap_or_else(|_| panic!("settling injector"));
+                        }, |_, outbox| async move { Ok(notification_events(outbox, f.character)) }).await.unwrap_or_else(|_| panic!("settling injector"));
                         assert!(crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.is_empty());
                         drop(guard);
                         assert_eq!(crate::dao::characters::attributes::free_points(&db, f.character).await.unwrap(), free + quote);
@@ -540,7 +585,7 @@ async fn expiry_resets_cache_before_consumption_and_spent_credit_survives_replay
     let events = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone(); let fences = fences.clone();
         Box::pin(async move { inject_tx(tx, outbox, &sde, &fences, f.character, None, injector, 1, now, false).await })
-    }, |_, outbox| async move { Ok({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("injecting with credits"));
+    }, |_, outbox| async move { Ok({ let entries = outbox.into_entries(); let owners: Vec<i64> = entries.iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); entries }) }).await.unwrap_or_else(|_| panic!("injecting with credits"));
     drop(guard);
     let credit_events: Vec<_> = events.into_iter().filter_map(|entry| match entry {
         Effect::Notification(Notification::Pilot { char_id, event, args }) if char_id == f.character && event.starts_with("OnNonDiminishingInjections") => Some((event, args)),

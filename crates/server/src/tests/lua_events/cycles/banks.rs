@@ -100,7 +100,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
         let cfg = Arc::new(crate::config::Config::default());
         let hub = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), r.world.clone());
         let login = crate::handshake::Login { user_id: account, user_name: "event-bank".into(), role: 0, client_id: character, session_id: 1, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde.clone(), hub, r.world.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db.clone(), sde.clone(), hub, r.world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(1))]);
         r.world.register_pilot(character, client.notify_tx.clone());
         let row = crate::dao::items::space_ships::FreeShip { item_id: ship, type_id: ship_type, owner_id: character, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
@@ -122,7 +122,7 @@ pub(super) async fn run(ctx: &super::super::Context) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut ready = true;
-                for i in 0..3 { ready &= combat::targeting_charges::loaded(db, ship, FLAG_HI_SLOT_FIRST + i).await.unwrap() == Some((ammo, 2)); }
+                for i in 0..3 { let module = guns[i]; ready &= r.world.with(1, move |s| s.loaded_effective(ship, module)).await.flatten().map(|v| (v.1, v.2)) == Some((ammo, 2)); }
                 if ready { break; }
                 assert!(r.world.after(1, 100).await);
             }
@@ -133,15 +133,13 @@ pub(super) async fn run(ctx: &super::super::Context) {
         call(&mut client, "UnlinkAllModules", &[Value::Int(ship)]).await;
         call(&mut client, "Overload", &[Value::Int(guns[0]), Value::Int(i64::from(overload))]).await;
         assert!(crate::services::effects::heat::overloaded_modules().contains(&guns[0]));
-        // The keyed trigger changes only this fixture hull in the real charge transaction.
-        // Begin has already loaded Fit; end captures the real heat source before apply.
-        let name = format!("event_bank_fault_{ship}");
-        db.execute(&format!("CREATE FUNCTION game.{name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.ship_id = {ship} AND NEW.flag_id = {} THEN UPDATE game.items SET location_id = 0 WHERE item_id = {ship}; END IF; RETURN NEW; END $$", FLAG_HI_SLOT_FIRST), &[]).await.unwrap();
-        db.execute(&format!("CREATE TRIGGER {name} AFTER UPDATE OF quantity ON game.module_charges FOR EACH ROW EXECUTE FUNCTION game.{name}()"), &[]).await.unwrap();
+        // Consumption is actor-side now; the real debit reaches durable rows
+        // only through the snapshot batch. The original heat refusal still
+        // keeps the four completed cycle events.
         call(&mut client, "Activate", &[Value::Int(guns[0]), Value::str(&effect_name), Value::Int(target), Value::Int(2)]).await;
         super::idle(&r.world, 1, guns[0], duration * 2 + 15_000).await;
-        assert_eq!(db.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap().get::<_, i64>("location_id"), 0);
-        assert_eq!(combat::targeting_charges::loaded(db, ship, FLAG_HI_SLOT_FIRST).await.unwrap(), Some((ammo, 1)));
+        r.world.flush_positions().await.unwrap();
+        assert_eq!(combat::targeting_charges::loaded(db, ship, FLAG_HI_SLOT_FIRST).await.unwrap(), None, "the real debit emptied the slot and the snapshot deleted it");
         (character, guns, effect_id)
     }).await;
     let (account, character, ship, target, guns) = { let k = keys.lock().unwrap(); (k.account, k.character, k.ship, k.target, k.guns.clone()) };
@@ -154,10 +152,6 @@ pub(super) async fn run(ctx: &super::super::Context) {
         }, |(), ()| async move { Ok(()) }).await.unwrap();
     }
     if let Some(ship) = ship {
-        let name = format!("event_bank_fault_{ship}");
-        db.execute(&format!("DROP TRIGGER IF EXISTS {name} ON game.module_charges"), &[]).await.unwrap();
-        db.execute(&format!("DROP FUNCTION IF EXISTS game.{name}()"), &[]).await.unwrap();
-        db.execute("UPDATE game.items SET location_id=1 WHERE item_id=$1", &[&ship]).await.unwrap();
         if let Some(character) = character {
             combat::reset_pilot(&ctx.resources.world, character, Some((1, ship)));
             ctx.resources.world.unobserve(character);

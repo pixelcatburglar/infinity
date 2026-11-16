@@ -92,5 +92,5 @@ pub(super) fn encode(value: &Value, limit: usize, depth: usize) -> Result<(Strin
     Ok((String::from_utf8(writer.bytes).map_err(|_| ())?, hash))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

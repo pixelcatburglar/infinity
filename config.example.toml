@@ -8,6 +8,14 @@ node_id = 888444                    # env: NODE_ID; node ID the client sees
 system_capacity = 0                 # env: SYSTEM_CAPACITY; pilots per system before gate jumps queue, 0 = unlimited
 login_takeover = true               # replace the live session; false refuses duplicates with the client's generic not-accepting-connections message (no duplicate-specific localization)
 shutdown_flush_timeout_secs = 10    # server policy: bound on the position flush at shutdown
+client_write_timeout_secs = 30      # server policy: bound on one client or chat socket write; a stalled write ends the connection
+handshake_timeout_secs = 30       # server policy: total bound on one game handshake, accept to reply; 1..=86400
+max_pending_handshakes = 256      # server policy: simultaneous in-progress handshakes
+max_pending_handshakes_per_address = 16 # server policy: simultaneous handshakes from one source address
+login_failure_threshold = 10      # server policy: counted credential failures inside the window; 1..=100
+login_failure_window_secs = 60    # server policy: sliding credential-failure window; 1..=86400
+login_failure_cooldown_secs = 60  # server policy: refusal period for a saturated source; 1..=86400
+shutdown_reject_secs = 120       # server policy: refuse new logins this long before a planned shutdown; 1..=86400
 # Values checked by the client handshake; change only for another client build.
 macho_version = 496                 # env: MACHO_VERSION
 boot_version = 24.01                # env: BOOT_VERSION
@@ -39,6 +47,8 @@ connect_timeout_secs = 5            # server policy: timeout per connection atte
 checkout_timeout_secs = 30          # server policy: pooled connection wait timeout; 0 = wait forever
 startup_retry_secs = [1, 16]        # existing startup reconnect backoff: first and maximum delays, doubling
 schema_on_start = true              # existing behavior: apply the idempotent game schema on every start
+schema_downgrade_guard = true       # env: DATABASE_SCHEMA_DOWNGRADE_GUARD; refuse a recorded-then-superseded schema; false still records successful applies
+loss_tolerant_async_commit = true   # env: DATABASE_LOSS_TOLERANT_ASYNC_COMMIT; allow explicit loss-tolerant transactions only; false disables after restart
 
 [chat]
 bind = "0.0.0.0:5222"               # env: CHAT_BIND; existing XMPP listener
@@ -97,6 +107,7 @@ maintenance_secs = 3600             # server event history cleanup interval
 spawn_distance_m = 5000.0          # GM NPC and debris default distance, server policy
 clear_radius_m = 100000.0          # default GM NPC clear radius, server policy
 max_spawn_count = 100              # per-command NPC spawn limit, server policy
+performance_testing = false        # env: GM_PERFORMANCE_TESTING; authorize explicit full-system performance-testing commands
 
 
 [accounts]
@@ -125,6 +136,11 @@ price_history_days = 365            # server market price-history retention
 
 [repair]
 cost_multiplier = 1.0               # station repair: multiplier on computed base price per hitpoint; finite and positive
+
+[repairable_ship]
+payment_retention_days = 30          # recovery payment window after a ship loss; positive days
+delivery_seconds = 3600              # fixed delivery leg after the later of payment and repair completion; positive seconds
+withdrawal_retention_days = 30       # withdrawal window after delivery completes; positive days
 
 [trade]
 idle_timeout_secs = 1800            # durable idle trade cancellation, in seconds
@@ -155,6 +171,7 @@ decline_loss = -0.01                # existing decline or quit penalty; 0 disabl
 
 [combat]
 bounty_multiplier = 1.0             # existing behavior: NPC bounty payout unchanged
+bounty_payout_interval_secs = 1200  # seconds from a character's first unpaid NPC bounty kill to its durable payout
 lock_time_factor = 40000            # existing player targeting formula factor
 lock_time_min_secs = 0.5            # existing player targeting minimum
 lock_time_max_secs = 60             # existing player targeting maximum
@@ -164,6 +181,9 @@ npc_target_loss_range_factor = 2.0  # existing server target-loss policy
 progress_key_capacity = 4096        # env: COMBAT_PROGRESS_KEY_CAPACITY
 # In-flight batch handles share that key capacity; they do not each add another 4096 keys.
 progress_pending_batches = 4        # env: COMBAT_PROGRESS_PENDING_BATCHES
+# Server policy: minimum final shield, armor and structure damage resonance after
+# all dogma modifiers; finite, above 0 and at most 1. Restart required.
+resonance_floor = 0.05
 
 [npc]
 belt_rats = true                    # existing behavior: region pirates spawn when a pilot warps to a belt
@@ -178,6 +198,8 @@ concord_enabled = true              # existing behavior: CONCORD responds to cri
 weapons_timer_secs = 60             # existing weapons timer duration
 pvp_timer_secs = 900                # existing PvP timer duration
 criminal_timer_secs = 900           # existing criminal timer duration
+npc_timer_secs = 300                # crimewatch.const npcTimerTimeout
+disapproval_timer_secs = 300        # crimewatch.const disapprovalTimerTimeout
 engagement_secs = 300               # existing engagement duration
 outlaw_threshold = -5.0             # existing security status threshold for outlaws
 highsec_threshold = 0.45            # existing high-sec threshold for CONCORD response
@@ -240,9 +262,11 @@ max_bulletins = 10                  # existing corporation/alliance bulletin lim
 office_slots_per_station = 24       # server office capacity policy; capacity was not shipped
 office_rent_base_isk = 100000       # server minimum office rent
 office_rent_per_security_isk = 900000 # server additional rent at security 1
+office_impound_release_fraction = 0.5  # server impound release price as a fraction of current period rent
 bills_maintenance_secs = 600        # server billing maintenance cadence
 advance_billing_days = 7            # server advance-billing policy
 role_removal_cooldown_secs = 86400     # server delay after all corporation rights are removed
+vote_action_window_secs = 604800    # server window after vote close during which the active CEO may execute a sanctioned action
 
 [contracts]
 maintenance_secs = 60               # existing auction settlement cadence
@@ -272,6 +296,13 @@ position_snapshot_secs = 30         # server position persistence interval; boun
 mailbox_budget = 10000              # server space actor mailbox depth budget
 # Restart required. Shape data is unavailable; enabled collisions use one sphere per ball.
 collisions = false
+# Seconds without pilots or observers before an automatic unload. Default 1800;
+# 0 disables; nonzero minimum 60. env: SPACE_IDLE_UNLOAD_SECS. Restart required.
+idle_unload_secs = 1800
+# Consecutive unfinished loaded snapshot periods before new loaded use pauses.
+# Positive; default 3. Period is position_snapshot_secs. Restart required.
+# env: SPACE_LOADED_SNAPSHOT_FAILURE_PERIODS
+loaded_snapshot_failure_periods = 3
 
 [bounty]
 kill_right_lifetime_days = 30       # server kill-right lifetime policy
@@ -284,3 +315,7 @@ client_error_log_mode = "B"
 [shared_settings]
 max_payload_bytes = 262144          # Maximum encoded UTF-8 bytes per permanent link.
 max_nesting_depth = 64              # Server resource policy; implementation ceiling is 64.
+
+[progress]
+# env: PROGRESS_PERMANENT_RETRY_LIMIT; 1..100; the next explicit permanent rejection turns a durable receipt terminal.
+permanent_retry_limit = 5

@@ -50,7 +50,7 @@ fn invalid_log_and_interval_never_produce_selection() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated test process, dedicated INFINITY_TEST_DATABASE_URL with SDE, and external flock"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn real_host_reuses_retained_pin_for_day_and_month() {
     const CHILD: &str = "INFINITY_DAILY_ACTIVATION_PIN_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -78,22 +78,23 @@ async fn real_host_reuses_retained_pin_for_day_and_month() {
     let mut config = crate::config::Config::default();
     config.lua.enabled = true;
     config.lua.scripts_dir = root.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
     crate::lua::start(&config, &db, &sde, &world, &hub).await.unwrap();
     let resources = Resources::from_world(&world).unwrap();
     let now = crate::client::filetime_now();
     let bounds = crate::dao::daily_goals::periods::bounds(&db, now).await.unwrap();
     let next = crate::dao::daily_goals::periods::bounds(&db, bounds.month_end + 1).await.unwrap();
-    let mut history = load(&resources).await.unwrap();
-    let day = resolve(&resources, &mut history, "day", next.day_start, next.day_end).await.unwrap().unwrap();
-    let month = resolve(&resources, &mut history, "month", next.month_start, next.month_end).await.unwrap().unwrap();
+    let mut history = load(&resources).unwrap();
+    let day = resolve(&resources, &mut history, "day", next.day_start, next.day_end).unwrap().unwrap();
+    let month = resolve(&resources, &mut history, "month", next.month_start, next.month_end).unwrap().unwrap();
     assert_eq!(day.policy().version(), version);
     assert_eq!(month.policy().version(), version);
     assert!(day.policy().same_package(month.policy()));
-    let mut separate = load(&resources).await.unwrap();
-    let reopened = resolve(&resources, &mut separate, "day", next.day_start, next.day_end).await.unwrap().unwrap();
-    assert!(!day.policy().same_package(reopened.policy()));
-    let selected = history.rows.iter_mut().find(|row| row.version == version).unwrap();
+    let mut separate = load(&resources).unwrap();
+    let reopened = resolve(&resources, &mut separate, "day", next.day_start, next.day_end).unwrap().unwrap();
+    assert!(day.policy().same_package(reopened.policy()));
+    let selected = Arc::make_mut(&mut history.rows).iter_mut().find(|row| row.version == version).unwrap();
     selected.fingerprint[0] ^= 1;
-    assert!(resolve(&resources, &mut history, "month", next.month_start, next.month_end).await.is_err());
+    assert!(resolve(&resources, &mut history, "month", next.month_start, next.month_end).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }

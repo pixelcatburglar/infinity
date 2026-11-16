@@ -69,4 +69,4 @@ pub(super) async fn apply(cx: &Ctx, cycle: &super::lifecycle::Cycle, layer: usiz
     }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

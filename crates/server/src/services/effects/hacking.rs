@@ -34,4 +34,4 @@ pub(in crate::services) async fn start_effect(cx: combat::Ctx, sde: &Sde, policy
     Ok(Value::None)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

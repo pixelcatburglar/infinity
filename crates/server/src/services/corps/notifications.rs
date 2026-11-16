@@ -1,5 +1,5 @@
-//! Persistent corporation application and governance notices, using the existing
-//! mail notification producer and notificationUtil.py/notificationconst.py types.
+//! Persistent corporation application and governance notices, plus the role-only
+//! session projection, using the existing mail notification producer and notificationUtil.py/notificationconst.py types.
 //! Rows are written in the caller's transaction and roll back with its business change.
 use super::*;
 
@@ -24,6 +24,9 @@ const CUSTOM_REJECT: i32 = 142;
 /// notificationconst CharLeftCorpMsg, CorpNewCEOMsg, CorpLiquidationMsg and CorpKicked.
 const LEFT: i32 = 21;
 const NEW_CEO: i32 = 22;
+/// notificationconst.py type 26, read by notificationUtil.py as {corpID}: the sitting
+/// CEO's active authority was revoked.
+const CEO_REVOKED: i32 = 26;
 const LIQUIDATION: i32 = 85;
 const KICKED: i32 = 92;
 
@@ -46,6 +49,12 @@ pub(super) async fn ceo<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Out
         super::super::mail::notify(db, outbox, receiver, NEW_CEO, GROUP_CORP, corporation, &payload).await?;
     }
     Ok(())
+}
+
+/// Sent to the sitting CEO whose active authority a CEO election froze.
+pub(super) async fn ceo_revoked<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receiver: i64, corporation: i64) -> Result<(), CallError> {
+    let payload = serde_json::json!({"corpID": corporation}).to_string();
+    super::super::mail::notify(db, outbox, receiver, CEO_REVOKED, GROUP_CORP, corporation, &payload).await
 }
 
 pub(super) async fn liquidation<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receivers: &[i64], corporation: i64) -> Result<(), CallError> {
@@ -83,4 +92,11 @@ pub(super) async fn application<X: Send>(db: &(impl Executor + ?Sized), outbox: 
         super::super::mail::notify(db, outbox, receiver, kind, GROUP_CORP, sender, &payload).await?;
     }
     Ok(())
+}
+
+/// Queue the role-only session projection in its existing field order.
+pub(super) fn role_projection<X>(outbox: &mut Outbox<X>, character: i64, roles: [i64; 4]) {
+    let names = ["corprole", "rolesAtAll", "rolesAtHQ", "rolesAtBase", "rolesAtOther"];
+    let masks = [roles[0], roles[0], roles[1], roles[2], roles[3]];
+    outbox.notify_pilot(character, "__session", names.into_iter().zip(masks).map(|(name, value)| Value::tuple([Value::str(name), Value::Int(value)])).collect());
 }

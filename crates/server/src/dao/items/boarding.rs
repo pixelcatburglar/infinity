@@ -133,4 +133,4 @@ async fn board(ex: &(impl Executor + ?Sized), character: i64, old: i64, target: 
     Ok(ex.execute("UPDATE game.characters SET ship_id=$3 WHERE character_id=$1 AND ship_id=$2 AND NOT deleted AND (($4 AND station_id IS NULL AND solar_system_id=$5) OR (NOT $4 AND station_id=$5)) AND NOT EXISTS (SELECT 1 FROM game.characters selected WHERE selected.ship_id=$3)", &[&character, &old, &target, &space, &location]).await? == 1)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

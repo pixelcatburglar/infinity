@@ -24,4 +24,4 @@ pub(crate) fn encode(message: &DynamicMessage, expected: &MessageDescriptor) -> 
 }
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

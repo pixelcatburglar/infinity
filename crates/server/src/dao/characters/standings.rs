@@ -1,7 +1,10 @@
 //! Character NPC standings persistence, used by standingsvc and mission mechanics.
-//! Reads and writes game.standings; corporation standings are not modelled here.
+//! Reads and writes game.standings; `history` persists game.standing_history
+//! journal rows. Corporation standings are not modelled here.
 
 use crate::db::{executor::Executor, Error};
+
+pub(crate) mod history;
 
 pub(crate) struct StandingRow { pub from_id: i64, pub standing: f64 }
 impl StandingRow {

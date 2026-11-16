@@ -6,14 +6,12 @@ pub(crate) mod generation;
 use generation::generation_inputs;
 use super::*;
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil};
-use infinity_core::consts::GROUP_ASTEROID_BELT;
+use infinity_core::consts::{GROUP_ASTEROID_BELT, WORMHOLE_SYSTEM_END, WORMHOLE_SYSTEM_START};
 use crate::dao::asteroids as dao;
 use crate::db::executor::Executor;
 use crate::services::{db_err, CallError};
 use std::collections::{HashMap, HashSet};
 
-/// `inventorycommon/const.py` wormhole-space upper bound (exclusive).
-const WORMHOLE_SYSTEM_END: i64 = 32_000_000;
 /// Inherited server fallback for a stored rock without a radius.
 const STORED_RADIUS_FALLBACK: f32 = 2_000.0;
 /// Inherited server rigid asteroid ball mass.
@@ -56,7 +54,7 @@ fn center(sde: &Sde, field: i64) -> Option<V3> {
 }
 fn band(sde: &Sde, system: i64) -> Result<(f64, bool), CallError> {
     let row = sde.map.system(system as i32 as i64).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing solar system {system}")))?;
-    Ok((row.security.unwrap_or(0.0), (infinity_core::consts::WORMHOLE_SYSTEM_START..WORMHOLE_SYSTEM_END).contains(&system)))
+    Ok((row.security.unwrap_or(0.0), (WORMHOLE_SYSTEM_START..=WORMHOLE_SYSTEM_END).contains(&system)))
 }
 /// Freeze candidate generation for every belt before entering the transaction.
 pub(super) fn cold_inputs(sde: &Sde, system: i64) -> Result<Vec<(i64, V3, GenerationInputs)>, CallError> {
@@ -238,7 +236,7 @@ impl ActorIdentity {
     pub(crate) async fn rock_field(&self, id: i64) -> Option<i64> {
         let sender = self.0.upgrade()?;
         let (reply, receipt) = tokio::sync::oneshot::channel();
-        sender.send(Box::new(move |s| { let _ = reply.send(s.rock_field(id)); })).ok()?;
+        sender.send(actor::Job::new(move |s| { let _ = reply.send(s.rock_field(id)); })).ok()?;
         receipt.await.ok().flatten()
     }
 }
@@ -246,11 +244,12 @@ impl ActorIdentity {
 async fn publish_action(world: &World, system: i64, actor: &ActorIdentity,
     action: impl FnOnce(&mut System) + Send + 'static) -> bool {
     let Some(sender) = actor.0.upgrade() else { return false };
+    let name = std::any::type_name_of_val(&action);
     let (ack, receipt) = tokio::sync::oneshot::channel();
     {
-        let systems = world.systems.lock().unwrap();
+        let systems = crate::poison::lock_or_exit(world.systems.lock());
         if !systems.get(&system).is_some_and(|h| sender.same_channel(&h.tx)) { return false; }
-        if sender.send(Box::new(move |s| s.asteroid_action(move |s| {
+        if sender.send(actor::Job::named(name, move |s| s.asteroid_action(move |s| {
             action(s);
             let _ = ack.send(());
         }))).is_err() { return false; }
@@ -287,4 +286,4 @@ async fn regrow(db: &Db, world: &World, system: i64, field: i64, pos: V3,
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

@@ -3,22 +3,33 @@
 //! Completion is reversible and no client completion notification is produced.
 //! Cyclic targets produce invalid, incomplete snapshots without blocking delivery.
 use std::collections::BTreeMap;
-use crate::{dao::skills::{plan_milestones, plan_progress, plans, queue, training as skills}, db::{executor::Executor, outbox::Outbox, transaction::TxFuture}, lua::events::GameEvent, progress::{DurableRegistration, EventEnvelope}, sde::Sde, services::{db_err, skills::{formulas, training}, CallError}};
+use crate::{dao::{characters::members, skills::{plan_milestones, plan_progress, plans::{self, Owner}, queue, training as skills}}, db::{executor::Executor, outbox::Outbox, transaction::TxFuture}, lua::events::GameEvent, progress::{ApplyError, DurableRegistration, EventEnvelope}, sde::Sde, services::{db_err, skills::{formulas, training}, CallError}};
 
 pub(crate) fn registration() -> DurableRegistration {
     DurableRegistration { consumer_key: "personal-skill-plan-milestones", kinds: &["SkillTrained", "SkillStateChanged"], mode: crate::progress::DeliveryMode::Direct(handler) }
 }
-fn handler<'a, 'tx>(tx: &'a tokio_postgres::Transaction<'tx>, _: &'a mut Outbox, sde: &'a Sde, event: &'a EventEnvelope) -> TxFuture<'a, (), CallError> {
+fn handler<'a, 'tx>(tx: &'a crate::db::Transaction<'tx>, _: &'a mut Outbox, sde: &'a Sde, event: &'a EventEnvelope) -> TxFuture<'a, (), ApplyError> {
     Box::pin(async move {
-        let character = match &event.event { GameEvent::SkillTrained { char_id, .. } | GameEvent::SkillStateChanged { char_id } => *char_id, _ => return Err(CallError::Internal(anyhow::anyhow!("unexpected skill plan event"))) };
-        reconcile_tx(tx, sde, character, None).await
+        let character = match &event.event { GameEvent::SkillTrained { char_id, .. } | GameEvent::SkillStateChanged { char_id } => *char_id, _ => return Err(ApplyError::Permanent(CallError::Internal(anyhow::anyhow!("unexpected skill plan event")))) };
+        reconcile_tx(tx, sde, character, None).await.map_err(ApplyError::Call)
     })
 }
 pub(crate) async fn reconcile_tx(tx: &(impl Executor + ?Sized), sde: &Sde, character: i64, parent: Option<&[u8]>) -> Result<(), CallError> {
     crate::dao::characters::selection::lock_character(tx, character).await.map_err(db_err)?;
     let milestones = if let Some(parent) = parent {
         plans::lock(tx, parent).await.map_err(db_err)?;
-        plan_milestones::list(tx, parent).await.map_err(db_err)?
+        // A corporation plan yields snapshots only to a current live member; a
+        // personal plan keeps its first-view bootstrap semantics. Either way the
+        // scope decision happens under the parent lock, before definition reads.
+        let owner = plans::get(tx, parent, None).await.map_err(db_err)?.map(|plan| plan.owner);
+        match owner {
+            Some(Owner::Corporation(corporation)) => {
+                if members::organization(tx, character).await.map_err(db_err)?.is_some_and(|org| org.corporation_id == corporation) {
+                    plan_milestones::list(tx, parent).await.map_err(db_err)?
+                } else { return Ok(()); }
+            }
+            _ => plan_milestones::list(tx, parent).await.map_err(db_err)?,
+        }
     } else {
         let initial = plan_milestones::for_viewer(tx, character).await.map_err(db_err)?;
         if initial.is_empty() { return Ok(()); }

@@ -63,4 +63,4 @@ pub(super) fn career_goal_states() -> Result<DynamicMessage> {
     Ok(rsp)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

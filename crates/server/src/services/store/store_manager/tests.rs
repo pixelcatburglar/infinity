@@ -14,7 +14,7 @@ fn service_prices_use_only_positive_retail_prices() {
 
 #[test]
 fn retail_price_filter_matches_postgres_float_ordering() {
-    use crate::dao::store::catalogue::positive_price;
+    use crate::sde::prices::positive_price;
     assert!(positive_price(f64::NAN));
     assert!(positive_price(f64::INFINITY));
     assert!(positive_price(1.0));
@@ -73,7 +73,7 @@ async fn unavailable_crates_are_not_listed_or_purchasable() {
         assert_eq!(reply, expected);
         assert_eq!(marshal::loads(&marshal::dumps(&reply)).unwrap(), expected);
     }
-    let cat = catalogue(&client).await.unwrap();
+    let cat = catalogue(&client).unwrap();
     let ordinary = cat.offers.iter().find(|o| !o.daily && client.sde.crates.get(o.type_id).is_none()).unwrap();
     for (method, id, expected) in [
         ("can_purchase_offer", Value::str(format!("VEVC-{}", ordinary.id)), Value::dict([("canPurchase", Value::Bool(true))])),

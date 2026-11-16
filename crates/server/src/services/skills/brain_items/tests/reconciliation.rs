@@ -1,7 +1,7 @@
 //! Implant destruction must reconcile every owned online hull atomically.
 use super::super::*;
 use super::fixtures::*;
-use infinity_core::{consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST}};
+use infinity_core::{consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_HI_POWER, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST}};
 use crate::{db::outbox::{Effect, Notification}, services::skills::{formulas, training}};
 
 #[tokio::test]
@@ -14,7 +14,7 @@ async fn implant_destruction_reconciles_owned_hulls_and_rolls_back() {
     let receiver = Arc::new(std::sync::Mutex::new(receiver));
     c.world.register_pilot(f.character, sender);
     let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP) && t.attribute(14).is_some_and(|v| v >= 1.0)).unwrap().type_id;
-    let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == 12) && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)).unwrap().type_id;
+    let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| e.effect_id == EFFECT_HI_POWER) && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)).unwrap().type_id;
     let mut ships = Vec::new();
     let mut modules = Vec::new();
     for _ in 0..2 {

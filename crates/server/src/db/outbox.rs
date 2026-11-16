@@ -53,6 +53,7 @@ pub(crate) enum Notification {
     Sender { sender: NotifyTx, event: String, args: Vec<Value> },
     Gateway(crate::gateway::notices::GatewayNotice),
     Sovereignty(crate::services::sovereignty::CommittedPublication),
+    ShipCosmetics(crate::space::ship_cosmetics::CommittedSkin),
 }
 
 impl<E> Outbox<E> {
@@ -68,9 +69,10 @@ impl<E> Outbox<E> {
     pub(crate) fn notify_gateway(&mut self, notice: crate::gateway::notices::GatewayNotice) {
         self.entries.push(Entry::Notification(Notification::Gateway(notice)));
     }
-    pub(crate) fn sovereignty(&mut self, publication: crate::services::sovereignty::CommittedPublication) {
-        self.entries.push(Entry::Notification(Notification::Sovereignty(publication)));
+    pub(crate) fn ship_cosmetics(&mut self, change: crate::space::ship_cosmetics::CommittedSkin) {
+        self.entries.push(Entry::Notification(Notification::ShipCosmetics(change)));
     }
+    pub(crate) fn sovereignty(&mut self, publication: crate::services::sovereignty::CommittedPublication) { self.entries.push(Entry::Notification(Notification::Sovereignty(publication))); }
     pub fn event(&mut self, event: GameEvent) {
         self.entries.push(Entry::Event { event, occurred_at: crate::client::filetime_now(), source_key: None, source_ordinal: None });
     }
@@ -123,7 +125,7 @@ fn subject(event: &GameEvent) -> Option<i64> {
 }
 
 impl<E: Prepare> Prepare for Outbox<E> {
-    fn prepare<'a, 'tx>(&'a mut self, tx: &'a tokio_postgres::Transaction<'tx>, context: &'a mut PrepareCx) -> crate::db::transaction::TxFuture<'a, (), PrepareError> {
+    fn prepare<'a, 'tx>(&'a mut self, tx: &'a crate::db::Transaction<'tx>, context: &'a mut PrepareCx) -> crate::db::transaction::TxFuture<'a, (), PrepareError> {
         Box::pin(async move {
             for entry in &mut self.entries {
                 match entry {
@@ -190,15 +192,17 @@ impl Notification {
             Self::Sender { sender, event, args } => { if sender.send((event, args)).is_err() { tracing::warn!("postcommit notification sender closed"); } }
             Self::Gateway(notice) => world.notice_hub().dispatch(notice, |id| world.online_session(id)),
             Self::Sovereignty(publication) => crate::space::sovereignty::publish(world, publication),
+            Self::ShipCosmetics(change) => crate::space::ship_cosmetics::publish(world, change),
         }
         Ok(())
     }
 
     /// Dispatch a direct client notification through `sender`, preserving other targets.
     /// A closed sender is logged and does not prevent later notifications.
-    pub fn dispatch_sender(self, world: &World, sender: &NotifyTx) -> Result<(), CallError> {
+    pub fn dispatch_sender(self, world: &World, sender: Option<&NotifyTx>) -> Result<(), CallError> {
         match self {
             Self::DirectClient { event, args } => {
+                let Some(sender) = sender else { tracing::warn!("postcommit scene notification dropped"); return Ok(()) };
                 if sender.send((event, args)).is_err() { tracing::warn!("postcommit notification sender closed"); }
                 Ok(())
             }
@@ -217,7 +221,7 @@ pub fn dispatch_world<T>(value: T, outbox: Outbox, world: &World) -> Result<T, C
     Ok(value)
 }
 /// Deliver direct client notifications through a sender after commit.
-pub fn dispatch_sender<T>(value: T, outbox: Outbox, world: &World, sender: &NotifyTx) -> Result<T, CallError> {
+pub fn dispatch_sender<T>(value: T, outbox: Outbox, world: &World, sender: Option<&NotifyTx>) -> Result<T, CallError> {
     for entry in outbox.into_entries() {
         match entry {
             Effect::Notification(notification) => if let Err(error) = notification.dispatch_sender(world, sender) { tracing::warn!("postcommit notification failed: {error:?}"); },
@@ -239,4 +243,4 @@ pub fn dispatch_client<T>(value: T, outbox: Outbox, client: &mut Client) -> Resu
     Ok(value)
 }
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-content", feature = "tests-economy", feature = "tests-effects", feature = "tests-lua", feature = "tests-runtime", feature = "tests-services", feature = "tests-ships", feature = "tests-skills", feature = "tests-slash", feature = "tests-social", feature = "tests-space", feature = "tests-storage")))] pub(crate) mod tests;

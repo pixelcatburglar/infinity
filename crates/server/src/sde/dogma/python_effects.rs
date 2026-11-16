@@ -365,4 +365,4 @@ pub(super) fn supplement(effect: &mut Effect) {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-sde"))] mod tests;

@@ -14,7 +14,8 @@ async fn insertion_refusals_report_exact_errors_without_rows() {
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut client, _peer) = tests::client(test_db.clone(), applicant.character).await;
-        let missing: i64 = test_db.query_one("SELECT GREATEST(COALESCE(max(corporation_id), 98000000), 98000000) + 1000000 AS id FROM game.corporations", &[]).await.unwrap().get("id");
+        let missing: i64 = test_db.query_one("SELECT GREATEST(COALESCE(max(corporation_id), $1), $1) + 1 AS id FROM game.corporations", &[&infinity_core::consts::MIN_PLAYER_CORPORATION_ID]).await.unwrap().get("id");
+        assert!(missing <= infinity_core::consts::MAX_PLAYER_CORPORATION_ID);
         let cases = [
             (missing, infinity_core::messages::CORP_NOT_FOUND),
             (deleted, infinity_core::messages::CORP_NOT_FOUND),

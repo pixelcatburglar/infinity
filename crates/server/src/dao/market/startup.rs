@@ -18,7 +18,7 @@ pub(crate) async fn seeded(ex: &(impl Executor + ?Sized)) -> Result<bool, db::Er
 }
 pub(crate) async fn seed(ex: &(impl Executor + ?Sized)) -> Result<u64, db::Error> {
     let now=crate::client::filetime_now();
-    let today=now / infinity_core::consts::FILETIME_DAY * infinity_core::consts::FILETIME_DAY;
+    let today=crate::client::filetime_day_start(now);
     let seed=MARKET_SEED.trim_end().strip_suffix("SELECT * FROM changed").ok_or_else(||db::Error::Progress(anyhow::anyhow!("invalid market seed query")))?;
     let sql=format!("{seed}, {} SELECT count(*)::bigint AS count FROM changed",super::versions::bump_cte("$3"));
     let count:i64=ex.query_one(&sql,&[&infinity_core::consts::TYPE_PLEX,&today,&now]).await?.try_get("count")?;
@@ -29,7 +29,7 @@ pub(crate) async fn bids_seeded(ex: &(impl Executor + ?Sized)) -> Result<bool, d
 }
 pub(crate) async fn seed_bids(ex: &(impl Executor + ?Sized)) -> Result<u64, db::Error> {
     let now=crate::client::filetime_now();
-    let today=now / infinity_core::consts::FILETIME_DAY * infinity_core::consts::FILETIME_DAY;
+    let today=crate::client::filetime_day_start(now);
     let sql=format!("WITH changed AS (INSERT INTO game.market_orders (type_id, station_id, solar_system_id, constellation_id, region_id,
                                                      price, vol_entered, vol_remaining, bid, range, duration, issued)
                      SELECT type_id, station_id, solar_system_id, constellation_id, region_id,

@@ -35,7 +35,7 @@ pub(super) async fn start_gate(f: &Fixture) -> tokio::task::JoinHandle<(Result<(
     let config = Arc::new(crate::config::Config::default());
     let chat = crate::chat::Hub::new(&config.chat.domain, r.db.clone(), r.world.clone());
     let login = crate::handshake::Login { user_id: ids.account, user_name: ids.account.to_string(), role: 0, client_id: ids.characters[2], session_id: ids.characters[2], language_id: "EN".into() };
-    let mut client = crate::client::Client::new(crate::conn::Conn::new(stream, address), config, r.db.clone(), r.sde.clone(), chat, r.world.clone(), login);
+    let mut client = crate::client::Client::new(infinity_wire::conn::Conn::new(stream, address), config, r.db.clone(), r.sde.clone(), chat, r.world.clone(), login);
     client.session.apply(vec![("charid", Value::Int(ids.characters[2])), ("corpid", Value::Int(ids.corps[2])), ("shipid", Value::Int(ids.ships[2])), ("solarsystemid", Value::Int(ids.systems[0])), ("solarsystemid2", Value::Int(ids.systems[0]))]);
     let task = tokio::spawn(async move {
         let _peer = peer;
@@ -45,7 +45,10 @@ pub(super) async fn start_gate(f: &Fixture) -> tokio::task::JoinHandle<(Result<(
     });
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let batch = destiny_rx.recv().await.expect("gate destiny channel");
+            let batch = match destiny_rx.recv().await.expect("gate destiny channel") {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             if batch.iter().any(|event| {
                 let Some(call) = event.items().and_then(|v| v.get(1)).and_then(|v| v.items()) else { return false };
                 if call.first() != Some(&Value::str("OnSpecialFX")) { return false; }

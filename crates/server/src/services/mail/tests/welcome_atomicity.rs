@@ -101,7 +101,7 @@ async fn muted_welcome_atomicity_and_owned_history_survive_schema_replay() {
         assert!(history[3].len() >= 4);
         assert!(!history[4].is_empty());
         for _ in 0..2 {
-            let fresh = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+            let fresh = Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: true, ..crate::config::tests::test_database() }).await.unwrap();
             assert_eq!(history, crate::dao::mailing_lists::tests::snapshot(&fresh, id).await.unwrap());
         }
     }).await;

@@ -160,5 +160,5 @@ async fn rename_fitting(c: &Client, call: &Call<'_>) -> CallResult {
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match call.method { "UpdateNameAndDescription" => rename_fitting(c, call).await, _ => fittings(c, call).await })
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

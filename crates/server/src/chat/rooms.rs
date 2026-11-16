@@ -13,14 +13,14 @@ pub(super) enum JoinError { Forbidden, Conflict, Domain(CallError) }
 
 impl Hub {
     pub(super) async fn join_room(&self, session: &infinity_core::session::OnlineSession, name: &str, full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
-        let epoch = self.rooms.lock().unwrap().epoch;
+        let epoch = crate::poison::lock_or_exit(self.rooms.lock()).epoch;
         let admission = authority::admit(&self.db, self.world.sde(), session, name).await.map_err(JoinError::Domain)?.ok_or(JoinError::Forbidden)?;
         self.commit_admissions(session, epoch, &[(name.to_owned(), admission)], full, real)
     }
 
     pub(super) fn commit_admissions(&self, session: &infinity_core::session::OnlineSession, epoch: u64, admissions: &[(String, authority::Admission)], full: &str, real: Option<(&Tx, &str)>) -> Result<(), JoinError> {
         let nick = session.character_id.to_string();
-        let mut rooms = self.rooms.lock().unwrap();
+        let mut rooms = crate::poison::lock_or_exit(self.rooms.lock());
         if rooms.epoch != epoch || self.world.online_session(session.character_id).as_ref() != Some(session) { return Err(JoinError::Forbidden); }
         for (name, _) in admissions {
             let room = format!("{name}@{}", self.conference());
@@ -55,7 +55,7 @@ impl Hub {
     pub(crate) async fn join_virtual(&self, character_id: i64) -> Result<(), CallError> {
         let denied = || crate::services::notify_error(infinity_core::messages::chat::FORBIDDEN);
         let session = self.world.online_session(character_id).filter(|s| s.character_id == character_id).ok_or_else(denied)?;
-        let epoch = self.rooms.lock().unwrap().epoch;
+        let epoch = crate::poison::lock_or_exit(self.rooms.lock()).epoch;
         let full = format!("{character_id}@{}/{VIRTUAL_RESOURCE}", self.host);
         let mut admissions = Vec::new();
         for name in authority::system_channels(self.world.sde(), &session) {
@@ -75,7 +75,7 @@ fn unavailable(room: &str, nick: &str, destroy: bool) -> String {
 
 impl Hub {
     fn remove_matching(&self, predicate: impl Fn(&str, &str, &Occupant) -> bool, destroy: bool) {
-        let mut rooms = self.rooms.lock().unwrap();
+        let mut rooms = crate::poison::lock_or_exit(self.rooms.lock());
         rooms.epoch = rooms.epoch.wrapping_add(1);
         let mut console_rooms = Vec::new();
         for (room, occupants) in &mut rooms.entries {
@@ -97,7 +97,7 @@ impl Hub {
     }
 
     pub(super) fn leave_all(&self, full_jid: &str, tx: &Tx) {
-        let users = self.users.lock().unwrap();
+        let users = crate::poison::lock_or_exit(self.users.lock());
         let pending_room = full_jid.split_once('/').and_then(|(bare, _)| {
             users.get(bare).is_some_and(|(current, current_tx)| current == full_jid && current_tx.same_channel(tx))
                 .then(|| bare.split_once('@').and_then(|(id, _)| id.parse::<i64>().ok()))
@@ -116,11 +116,11 @@ impl Hub {
 
     pub(crate) fn disconnect_character(&self, id: i64) {
         let character = id.to_string();
-        self.tokens.lock().unwrap().remove(&character);
-        self.users.lock().unwrap().remove(&format!("{character}@{}", self.host));
+        crate::poison::lock_or_exit(self.tokens.lock()).remove(&character);
+        crate::poison::lock_or_exit(self.users.lock()).remove(&format!("{character}@{}", self.host));
         self.remove_matching(|_, nick, _| nick.parse::<i64>().ok() == Some(id), false);
         let room = format!("{}@{}", console::room(id), self.conference());
-        self.rooms.lock().unwrap().entries.remove(&room);
+        crate::poison::lock_or_exit(self.rooms.lock()).entries.remove(&room);
     }
 
     pub(crate) fn session_changed(&self, id: i64) {
@@ -134,7 +134,7 @@ impl Hub {
     pub(crate) fn refresh_profile(&self, session: &infinity_core::session::OnlineSession) {
         let nick = session.character_id.to_string();
         let xml = {
-            let mut profiles = self.profiles.lock().unwrap();
+            let mut profiles = crate::poison::lock_or_exit(self.profiles.lock());
             let Some(profile) = profiles.get_mut(&nick) else { return };
             profile.corp = session.corporation_id.unwrap_or(0);
             profile.alliance = session.alliance_id;
@@ -142,7 +142,7 @@ impl Hub {
             profile.role = session.role;
             profile.xml()
         };
-        let rooms = self.rooms.lock().unwrap();
+        let rooms = crate::poison::lock_or_exit(self.rooms.lock());
         for (room, occupants) in &rooms.entries {
             let Some(occupant) = occupants.get(&nick) else { continue };
             let stanza = format!("<presence from='{}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{}' role='{}' jid='{}'/></x>{xml}</presence>",
@@ -163,7 +163,7 @@ impl Hub {
 
     pub(crate) fn broadcast_subject(&self, channel: &str, subject: &str) {
         let room = format!("{channel}@{}", self.conference());
-        let rooms = self.rooms.lock().unwrap();
+        let rooms = crate::poison::lock_or_exit(self.rooms.lock());
         if let Some(occupants) = rooms.entries.get(&room) {
             for o in occupants.values() { o.send(format!("<message from='{}' to='{}' type='groupchat'><subject>{}</subject></message>", esc(&room), esc(&o.full_jid), esc(subject))); }
         }
@@ -172,14 +172,14 @@ impl Hub {
     pub(crate) async fn refresh_permissions(&self, channel: &str) -> Result<(), CallError> {
         let room = format!("{channel}@{}", self.conference());
         let occupants = {
-            let mut rooms = self.rooms.lock().unwrap();
+            let mut rooms = crate::poison::lock_or_exit(self.rooms.lock());
             rooms.epoch = rooms.epoch.wrapping_add(1);
             rooms.entries.get(&room).cloned().unwrap_or_default()
         };
         for (nick, old) in occupants {
             let id = match nick.parse::<i64>() { Ok(id) => id, Err(_) => continue };
           loop {
-            let epoch = self.rooms.lock().unwrap().epoch;
+            let epoch = crate::poison::lock_or_exit(self.rooms.lock()).epoch;
             let session = self.world.online_session(id);
             let admission = match &session {
                 Some(s) => match authority::admit(&self.db, self.world.sde(), s, channel).await {
@@ -188,7 +188,7 @@ impl Hub {
                 },
                 None => None,
             };
-            let mut rooms = self.rooms.lock().unwrap();
+            let mut rooms = crate::poison::lock_or_exit(self.rooms.lock());
             if rooms.epoch != epoch || self.world.online_session(id) != session { continue; }
             let Some(occupants) = rooms.entries.get_mut(&room) else { break };
             if !occupants.get(&nick).is_some_and(|o| o.same_identity(&old)) { break; }

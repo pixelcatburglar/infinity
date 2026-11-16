@@ -91,6 +91,10 @@ async fn open_nested_in_space(overfull: bool) {
         assert!(source > inner && inner > outer, "crate stack is the highest requested non-hull id");
         let (hull_capacity, hull_used, held) = hold_storage::capacity(&db, &client.sde, actor.character, ship, FLAG_CARGO).await.unwrap().expect("active ship cargo capacity");
         drop(held);
+        let hull_capacity = match hull_capacity {
+            crate::services::inventory::holds::CapacityLimit::Finite(value) => value,
+            crate::services::inventory::holds::CapacityLimit::Unlimited => panic!("fixture cargo must be finite"),
+        };
         assert!(hull_capacity - hull_used >= reward_volume, "active hull cargo must hold the reward volume");
         let rows_before: Vec<String> = db.query("SELECT row_to_json(i)::text AS value FROM game.items i WHERE item_id = ANY($1) ORDER BY item_id", &[&vec![outer, inner, child]]).await.unwrap().into_iter().map(|row| row.get("value")).collect();
         let owned = vec![outer, inner, child, source];

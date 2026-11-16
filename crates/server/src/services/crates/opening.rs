@@ -12,8 +12,6 @@ use marshal::Value;
 /// Client crate controller's multi-open limit.
 const MAX_OPEN: i32 = 30;
 
-fn invalid() -> CallError { notify_error(messages::INVALID_SOURCE) }
-
 pub(super) fn reward_quantity(per_open: i64, amount: i32) -> Option<i64> {
     per_open.checked_mul(i64::from(amount))
 }
@@ -30,15 +28,15 @@ struct Preparation {
 
 async fn prepare(c: &Client, source_id: i64, amount: i32) -> Result<Preparation, CallError> {
     let identity = Identity { system_id: c.session.int("solarsystemid"), ..Identity::of_client(c) };
-    if identity.char_id == 0 || !(1..=MAX_OPEN).contains(&amount) { return Err(invalid()); }
-    let item = load_items(&c.db, &c.sde, ItemQuery::Id(source_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(invalid)?;
-    if item.singleton || item.quantity < i64::from(amount) { return Err(invalid()); }
-    let definition = c.sde.crates.get(item.type_id).ok_or_else(invalid)?;
+    if identity.char_id == 0 || !(1..=MAX_OPEN).contains(&amount) { return Err(super::invalid_source()); }
+    let item = load_items(&c.db, &c.sde, ItemQuery::Id(source_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(super::invalid_source)?;
+    if item.singleton || item.quantity < i64::from(amount) { return Err(super::invalid_source()); }
+    let definition = c.sde.crates.get(item.type_id).ok_or_else(super::invalid_source)?;
     let rewards = definition.preview(false, None).map_err(|_| notify_error(messages::METADATA_UNAVAILABLE))?;
     if rewards.is_empty() { return Err(notify_error(messages::OPENING_UNAVAILABLE)); }
     let (destination_location, destination_flag) = match identity.station_id {
         Some(station) => (station, FLAG_HANGAR),
-        None => (identity.ship_id.ok_or_else(invalid)?, FLAG_CARGO),
+        None => (identity.ship_id.ok_or_else(super::invalid_source)?, FLAG_CARGO),
     };
     let endpoint = Endpoint { location: item.location_id, flag: item.flag_id };
     let destination_endpoint = Endpoint { location: destination_location, flag: destination_flag };
@@ -47,8 +45,8 @@ async fn prepare(c: &Client, source_id: i64, amount: i32) -> Result<Preparation,
     let container = if identity.station_id == Some(destination_location) {
         Container::Hangar { station_id: destination_location, owner_id: identity.char_id }
     } else { Container::Item(destination_location) };
-    let (allowed, _) = inventory::movement::authorize_move(&c.db, &c.sde, &identity, &reach, &item, Some(item.location_id), &container, Some(destination_flag)).await?.ok_or_else(invalid)?;
-    if allowed.location != destination_location || allowed.flag != destination_flag || allowed.item_owner != identity.char_id { return Err(invalid()); }
+    let (allowed, _) = inventory::movement::authorize_move(&c.db, &c.sde, &identity, &reach, &item, Some(item.location_id), &container, Some(destination_flag)).await?.ok_or_else(super::invalid_source)?;
+    if allowed.location != destination_location || allowed.flag != destination_flag || allowed.item_owner != identity.char_id { return Err(super::invalid_source()); }
     Ok(Preparation { identity, item, rewards, destination_location, destination_flag, reach, container })
 }
 
@@ -102,21 +100,21 @@ pub(super) async fn open(c: &mut Client, source_id: i64, amount: i32, stack_resp
                     && crate::dao::items::deliveries::ancestry(tx, source.location_id).await.map_err(db_err)? != source_lineage)
                     || (destination_location != source.location_id && !crate::services::items::is_static_location(&sde, destination_location)
                         && crate::dao::items::deliveries::ancestry(tx, destination_location).await.map_err(db_err)? != destination_lineage) {
-                    return Err(invalid());
+                    return Err(super::invalid_source());
                 }
-                let current = load_items(tx, &sde, ItemQuery::Id(source_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(invalid)?;
+                let current = load_items(tx, &sde, ItemQuery::Id(source_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(super::invalid_source)?;
                 if current.owner_id != source.owner_id || current.location_id != source.location_id || current.flag_id != source.flag_id
                     || current.type_id != source.type_id || current.quantity != source.quantity || current.singleton != source.singleton {
-                    return Err(invalid());
+                    return Err(super::invalid_source());
                 }
-                let (allowed, _) = inventory::movement::authorize_move(tx, &sde, &identity, &reach, &current, Some(current.location_id), &container, Some(destination_flag)).await?.ok_or_else(invalid)?;
-                if allowed.location != destination_location || allowed.flag != destination_flag || allowed.item_owner != recipient { return Err(invalid()); }
+                let (allowed, _) = inventory::movement::authorize_move(tx, &sde, &identity, &reach, &current, Some(current.location_id), &container, Some(destination_flag)).await?.ok_or_else(super::invalid_source)?;
+                if allowed.location != destination_location || allowed.flag != destination_flag || allowed.item_owner != recipient { return Err(super::invalid_source()); }
                 if !crate::dao::trades::reserved(tx, &[source_id, source.location_id]).await.map_err(db_err)?.is_empty()
-                    || crate::dao::industry::has_active_blueprint_job(tx, &[source_id]).await.map_err(db_err)? { return Err(invalid()); }
+                    || crate::dao::industry::has_active_blueprint_job(tx, &[source_id]).await.map_err(db_err)? { return Err(super::invalid_source()); }
                 let viewers = audience.resolve(tx, &sde).await?;
                 let mut quantities = Vec::with_capacity(rewards.len());
                 for (type_id, per_open) in rewards {
-                    let quantity = reward_quantity(per_open, amount).ok_or_else(invalid)?;
+                    let quantity = reward_quantity(per_open, amount).ok_or_else(super::invalid_source)?;
                     quantities.push((type_id, quantity));
                 }
                 let same_hold = source.location_id == destination.0 && source.flag_id == destination.1;
@@ -129,11 +127,11 @@ pub(super) async fn open(c: &mut Client, source_id: i64, amount: i32, stack_resp
                     });
                 }
                 let exclude = if same_hold { std::slice::from_ref(&source_id) } else { &[] };
-                inventory::hold_storage::check_destination(tx, &sde, allowed.capacity_owner, destination.0, destination.1, &additions, inventory::hold_storage::Replaced { items: exclude, reloads: &[] }, None).await?;
-                let remaining = source.quantity.checked_sub(i64::from(amount)).ok_or_else(invalid)?;
+                inventory::hold_storage::check_destination(tx, &sde, allowed.capacity_owner, destination.0, destination.1, &additions, inventory::hold_storage::Replaced { items: exclude, reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await?;
+                let remaining = source.quantity.checked_sub(i64::from(amount)).ok_or_else(super::invalid_source)?;
                 let mut changes = std::collections::BTreeMap::new();
                 changes.insert(source_id, QuantityChange::new(&source, (remaining > 0).then_some(remaining)));
-                if !quantities::apply(tx, &changes).await.map_err(db_err)? { return Err(invalid()); }
+                if !quantities::apply(tx, &changes).await.map_err(db_err)? { return Err(super::invalid_source()); }
                 let new_source = if remaining == 0 {
                     crate::dao::items::loading::Item { location_id: LOCATION_JUNKYARD, ..source.clone() }
                 } else {

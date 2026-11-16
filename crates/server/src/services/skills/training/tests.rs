@@ -25,10 +25,12 @@ fn queue_wire_preserves_optional_filetimes() {
     let rows = [
         queue_dao::QueueEntry { position: 0, type_id: 42, to_level: 1, start_sp: 10, dest_sp: 20, start_time: None, end_time: None },
         queue_dao::QueueEntry { position: 1, type_id: 43, to_level: 2, start_sp: 20, dest_sp: 30, start_time: Some(132_000_000_000_000_000), end_time: Some(132_000_000_600_000_000) },
+        queue_dao::QueueEntry { position: 2, type_id: 44, to_level: 3, start_sp: 30, dest_sp: 40, start_time: Some(132_000_000_600_000_000), end_time: None },
     ];
     let expected = Value::List(vec![
         keyval([("queuePosition", Value::Int(0)), ("trainingTypeID", Value::Int(42)), ("trainingToLevel", Value::Int(1)), ("trainingStartSP", Value::Int(10)), ("trainingDestinationSP", Value::Int(20)), ("trainingStartTime", Value::None), ("trainingEndTime", Value::None)]),
         keyval([("queuePosition", Value::Int(1)), ("trainingTypeID", Value::Int(43)), ("trainingToLevel", Value::Int(2)), ("trainingStartSP", Value::Int(20)), ("trainingDestinationSP", Value::Int(30)), ("trainingStartTime", Value::Int(132_000_000_000_000_000)), ("trainingEndTime", Value::Int(132_000_000_600_000_000))]),
+        keyval([("queuePosition", Value::Int(2)), ("trainingTypeID", Value::Int(44)), ("trainingToLevel", Value::Int(3)), ("trainingStartSP", Value::Int(30)), ("trainingDestinationSP", Value::Int(40)), ("trainingStartTime", Value::Int(132_000_000_600_000_000)), ("trainingEndTime", Value::None)]),
     ]);
     assert_eq!(super::super::skill_handler::queue_value(&rows), expected);
 }
@@ -74,6 +76,22 @@ async fn queue_validation_checks_real_skills_and_capacity() {
     assert!(matches!(validate_queue(&c.sde, &[dependent_entry], &prerequisite_state), Err(CallError::User { msg, .. }) if msg == m::MSG_QUEUE_BEFORE_REQUIREMENTS));
     let later = [(0, i64::from(dependent), 1), (1, i64::from(required), i64::from(required_level))];
     assert!(matches!(validate_queue(&c.sde, &later, &prerequisite_state), Err(CallError::User { msg, .. }) if msg == m::MSG_QUEUE_AFTER_DEPENDENTS));
+    let zero: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, 0.0)).collect();
+    let positive: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, 20.0)).collect();
+    let mut rows = [
+        queue_dao::QueueEntry { position: 0, type_id: ids[0], to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: Some(1), end_time: Some(2) },
+        queue_dao::QueueEntry { position: 1, type_id: ids[1], to_level: 1, start_sp: 100_000, dest_sp: 200_000, start_time: Some(2), end_time: Some(3) },
+    ];
+    schedule_queue(&c.sde, &mut rows, &zero, Some(0)).unwrap();
+    assert_eq!((rows[0].start_time, rows[0].end_time), (Some(0), None));
+    assert_eq!((rows[1].start_time, rows[1].end_time), (None, None));
+    schedule_queue(&c.sde, &mut rows, &positive, Some(0)).unwrap();
+    let ticks = (100_000.0 / (20.0 + 20.0 / SECONDARY_ATTRIBUTE_DIVISOR) * infinity_core::consts::FILETIME_MINUTE as f64) as i64;
+    assert_eq!((rows[0].start_time, rows[0].end_time), (Some(0), Some(ticks)));
+    assert_eq!((rows[1].start_time, rows[1].end_time), (Some(ticks), Some(2 * ticks)));
+    rows[1].start_sp = 200_000;
+    schedule_queue(&c.sde, &mut rows[1..], &zero, Some(0)).unwrap();
+    assert_eq!((rows[1].start_time, rows[1].end_time), (Some(0), Some(0)));
     fixture::cleanup(&db, f).await.unwrap();
 }
 
@@ -149,7 +167,7 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
                 save_queue_tx(tx, outbox, &sde, &fences, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
                 Ok(())
             })
-        }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("failed to save skill queue and collect effects"));
+        }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); let owners: Vec<i64> = entries.iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(crate::services::effects::online::OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); entries }) }).await.unwrap_or_else(|_| panic!("failed to save skill queue and collect effects"));
         let mut changed = 0;
         let trained = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.into_iter().filter(|event| matches!(event, GameEvent::SkillTrained { char_id, type_id: 1, level: 1 } if *char_id == f.character)).count();
         let mut brains = 0;

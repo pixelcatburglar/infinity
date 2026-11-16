@@ -1,14 +1,26 @@
 //! Real Host publication, frozen daily assignments and process restart.
 //! Uses server-authored Lua and dedicated initialized game/SDE tables; no client fixture.
+#[cfg(any(feature = "tests-lua", feature = "tests-gateway", feature = "tests-content"))]
 use std::{path::Path, sync::Arc};
+#[cfg(feature = "tests-lua")]
 use infinity_core::{consts::{FILETIME_DAY, FILETIME_UNIX_EPOCH}};
-use crate::{dao::{daily_goals::periods, lua_content::{self, activations}}, services::{daily_goals::{assignment, queries, Resources}, identity::Identity}};
+#[cfg(feature = "tests-lua")]
+use crate::{dao::{daily_goals::periods, lua_content::{self, activations}}, services::daily_goals::{assignment, queries}};
+#[cfg(any(feature = "tests-lua", feature = "tests-gateway", feature = "tests-content"))]
+use crate::services::daily_goals::Resources;
+#[cfg(any(feature = "tests-lua", feature = "tests-content"))]
+use crate::services::identity::Identity;
+#[cfg(feature = "tests-lua")]
 pub(crate) mod payments;
 
+#[cfg(feature = "tests-lua")]
 const CHILD: &str = "INFINITY_DAILY_HOST_RESTART_CHILD";
+#[cfg(feature = "tests-lua")]
 const ROOT: &str = "INFINITY_DAILY_HOST_RESTART_ROOT";
+#[cfg(feature = "tests-lua")]
 const NAME: &str = "lua::tests::daily_goals::retained_assignment_survives_reload_restart_and_metadata_loss";
 
+#[cfg(any(feature = "tests-lua", feature = "tests-gateway", feature = "tests-content"))]
 pub(crate) fn source(root: &Path, version: &str, changed: bool) {
     let content = root.join("content/daily_goals");
     std::fs::create_dir_all(content.join("data")).unwrap();
@@ -24,29 +36,37 @@ pub(crate) fn source(root: &Path, version: &str, changed: bool) {
     std::fs::write(content.join("data/daily_goals.json"), data).unwrap();
 }
 
+#[cfg(any(feature = "tests-lua", feature = "tests-content"))]
 pub(crate) fn identity(character: i64) -> Identity {
     Identity { char_id: character, ship_id: None, corp_id: 0, station_id: None, system_id: None }
 }
 
+#[cfg(feature = "tests-lua")]
 fn fingerprint(views: &[crate::services::daily_goals::GoalView]) -> Vec<String> {
     views.iter().map(|v| format!("{:?}|{:?}", v.goal, v.rewards)).collect()
 }
 
-pub(crate) async fn environment(root: &Path, missing: bool, registry: crate::progress::Registry) -> (crate::db::Db, Resources) {
+#[cfg(any(feature = "tests-lua", feature = "tests-gateway", feature = "tests-content"))]
+pub(crate) async fn environment(root: &Path, registry: crate::progress::Registry) -> (crate::db::Db, Resources) {
     crate::tests::init_config();
-    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap().with_progress_registry(registry);
-    let sde = Arc::new(if missing { crate::sde::Sde::default() } else { crate::sde::Sde::load(&db).await.expect("initialized SDE required") });
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let registry = crate::progress::tests::fixture_registry(&db, registry).await;
+    let db = db.with_progress_registry(registry);
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.expect("initialized SDE required"));
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
     let mut config = crate::config::Config::default();
     config.lua.enabled = true;
     config.lua.scripts_dir = root.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
     crate::lua::start(&config, &db, &sde, &world, &hub).await.unwrap();
     (db, Resources::from_world(&world).unwrap())
 }
+#[cfg(any(feature = "tests-gateway", feature = "tests-content"))]
 pub(crate) async fn reload() {
     crate::lua::HOST.get().unwrap().reload().await.unwrap();
 }
+#[cfg(feature = "tests-lua")]
 async fn cleanup(db: &crate::db::Db, fixture: crate::services::tests::fixture::Fixture) -> Vec<String> {
     let mut errors = Vec::new();
     for sql in [
@@ -60,6 +80,7 @@ async fn cleanup(db: &crate::db::Db, fixture: crate::services::tests::fixture::F
     errors
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 #[ignore = "requires dedicated initialized SDE database and externally serialized Lua publication"]
 async fn retained_assignment_survives_reload_restart_and_metadata_loss() {
@@ -92,13 +113,14 @@ async fn retained_assignment_survives_reload_restart_and_metadata_loss() {
     removed.unwrap();
 }
 
+#[cfg(feature = "tests-lua")]
 async fn seed(root: &Path) {
     let id = crate::handshake::random_u64();
     let a = format!("daily-host-{id}-a");
     let b = format!("daily-host-{id}-b");
     let scripts = root.join("scripts");
     source(&scripts, &a, false);
-    let (db, resources) = environment(&scripts, false, crate::progress::Registry::default()).await;
+    let (db, resources) = environment(&scripts, crate::progress::Registry::default()).await;
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
     std::fs::write(root.join("owner.json"), serde_json::to_vec(&(fixture.account, fixture.character)).unwrap()).unwrap();
     let host = crate::lua::HOST.get().unwrap();
@@ -115,15 +137,12 @@ async fn seed(root: &Path) {
         let at = bounds.month_start + 7 * FILETIME_DAY;
         let mixed = periods::bounds(&db, at).await.unwrap();
         assert!(mixed.day_start > b_at && mixed.month_start > a_at && mixed.month_start <= b_at);
-        db.transaction(|tx, _: &mut ()| {
-            let a = row_a.clone(); let b = row_b.clone();
-            Box::pin(async move {
-                assert!(activations::append_if_changed(tx, &a, a_at).await?);
-                assert!(activations::append_if_changed(tx, &b, b_at).await?);
-                Ok::<_, crate::db::Error>(())
-            })
-        }, |(), ()| async { Ok(()) }).await.unwrap();
-        let log = activations::list(&db, "daily_goals").await.unwrap();
+        source(&scripts, &a, false);
+        crate::lua::reload::tests::publish_at(a_at).await.unwrap();
+        source(&scripts, &b, true);
+        crate::lua::reload::tests::publish_at(b_at).await.unwrap();
+        let mut log = activations::load_all(&db).await.unwrap().into_iter().filter(|row| row.namespace == "daily_goals").collect::<Vec<_>>();
+        log.sort_by_key(|row| row.ordinal);
         let tail = &log[log.len()-2..];
         assert_eq!((&tail[0].version, &tail[0].fingerprint, tail[0].published_at), (&a, &row_a.fingerprint, a_at));
         assert_eq!((&tail[1].version, &tail[1].fingerprint, tail[1].published_at), (&b, &row_b.fingerprint, b_at));
@@ -151,8 +170,8 @@ async fn seed(root: &Path) {
         assert_eq!(asset_ids.len(), views.iter().map(|v| v.rewards.len()).sum::<usize>());
         assert_eq!(views.iter().find(|v| v.goal.kind == "day" && v.goal.category == "bonus").unwrap().goal.target, 3);
         let before = fingerprint(&views);
-        let pin_a = resources.policies.resolve("daily_goals", &a).await.unwrap();
-        let pin_b = resources.policies.resolve("daily_goals", &b).await.unwrap();
+        let pin_a = resources.policies.resolve("daily_goals", &a).unwrap();
+        let pin_b = resources.policies.resolve("daily_goals", &b).unwrap();
         use crate::lua::content::daily_goals::plans::{self, ProjectInput, Projection};
         let input = ProjectInput { entries: vec![Projection { key: "one".into(), selected: true }, Projection { key: "two".into(), selected: true }] };
         assert_eq!(plans::project(&pin_a, &input, None).unwrap().keys, ["one", "two"]);
@@ -160,7 +179,8 @@ async fn seed(root: &Path) {
         source(&scripts, &a, false);
         host.reload().await.unwrap();
         assert_eq!(crate::lua::content_policy("daily_goals").unwrap().version(), a);
-        let publications = activations::list(&db, "daily_goals").await.unwrap();
+        let mut publications = activations::load_all(&db).await.unwrap().into_iter().filter(|row| row.namespace == "daily_goals").collect::<Vec<_>>();
+        publications.sort_by_key(|row| row.ordinal);
         assert_eq!(publications.last().unwrap().version, a);
         assert_eq!(publications[publications.len()-2].version, b);
         assert_eq!(fingerprint(&queries::current(&resources, &identity(fixture.character), fixture.account, at).await.unwrap()), before);
@@ -180,18 +200,21 @@ async fn seed(root: &Path) {
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
+#[cfg(feature = "tests-lua")]
 async fn reopen(root: &Path, missing: bool) {
     let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("marker.json")).unwrap()).unwrap();
     let owner: (i64, i64) = serde_json::from_slice(&std::fs::read(root.join("owner.json")).unwrap()).unwrap();
     let scripts = if missing { let p = root.join("empty"); std::fs::create_dir_all(&p).unwrap(); p } else { root.join("scripts") };
-    let (db, resources) = environment(&scripts, missing, crate::progress::Registry::default()).await;
+    let (db, resources) = environment(&scripts, crate::progress::Registry::default()).await;
     if !missing {
-        assert_eq!(activations::list(&db, "daily_goals").await.unwrap().len(), marker["publications"].as_u64().unwrap() as usize);
+        let mut publications = activations::load_all(&db).await.unwrap().into_iter().filter(|row| row.namespace == "daily_goals").collect::<Vec<_>>();
+        publications.sort_by_key(|row| row.ordinal);
+        assert_eq!(publications.len(), marker["publications"].as_u64().unwrap() as usize);
     }
     let at = marker["at"].as_i64().unwrap();
     for version in [marker["a"].as_str().unwrap(), marker["b"].as_str().unwrap()] {
         assert!(lua_content::load(&db, "daily_goals", version).await.unwrap().is_some());
-        resources.policies.resolve("daily_goals", version).await.unwrap();
+        resources.policies.resolve("daily_goals", version).unwrap();
     }
     let views = queries::current(&resources, &identity(owner.1), owner.0, at).await.unwrap();
     let expected: Vec<String> = serde_json::from_value(marker["fingerprint"].clone()).unwrap();

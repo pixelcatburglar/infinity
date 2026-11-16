@@ -19,5 +19,5 @@ pub(super) fn wrap(inner: Value, snapshot: &BookSnapshot, regional_session: bool
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

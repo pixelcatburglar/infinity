@@ -20,4 +20,4 @@ pub(crate) fn registration() -> crate::progress::DurableRegistration {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

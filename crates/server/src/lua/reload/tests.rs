@@ -1,9 +1,22 @@
+#[cfg(feature = "tests-lua")]
 mod retention;
 
+#[cfg(feature = "tests-lua")]
 use super::*;
+#[cfg(feature = "tests-lua")]
 use crate::{lua::host::Resources, sde::Sde, space::World};
+#[cfg(feature = "tests-lua")]
 use std::future::Future;
 
+/// The shared publication step at a chosen instant for tests that must place
+/// authored content into specific UTC periods: real build, transaction,
+/// catalogue install and generation swap on the running global test host.
+#[cfg(any(feature = "tests-lua", feature = "tests-content", feature = "tests-gateway"))]
+pub(crate) async fn publish_at(published_at: i64) -> anyhow::Result<()> {
+    super::super::HOST.get().expect("running Lua host").publish_at(published_at).await
+}
+
+#[cfg(feature = "tests-lua")]
 async fn wait_for_ticks(ticks: &mlua::Function, expected: i64) {
     for _ in 0..10_000 {
         if ticks.call::<i64>(()).unwrap() == expected { return; }
@@ -12,6 +25,7 @@ async fn wait_for_ticks(ticks: &mlua::Function, expected: i64) {
     panic!("runner did not reach tick count {expected}; actual {}, paused time {:?}", ticks.call::<i64>(()).unwrap(), tokio::time::Instant::now());
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn reload_preserves_old_generation_on_failure_and_in_flight_call() {
@@ -30,7 +44,8 @@ async fn reload_preserves_old_generation_on_failure_and_in_flight_call() {
     std::fs::write(extra.join("other.lua"), "register.rpc('other','m',function() return 7 end)").unwrap();
     std::fs::write(&script, "local n=0; local ticks=0; register.tick{name='pulse', interval_ms=100, fn=function() ticks=ticks+1 end}; register.rpc('svc','ticks',function() return ticks end); register.rpc('svc','m',function() n=n+1; return n end)").unwrap();
     let config = LuaConfig { scripts_dir: dir.to_string_lossy().into_owned(), mod_dirs: vec![extra.to_string_lossy().into_owned()], ..LuaConfig::default() };
-    let host = Host::new(config, resources).await.unwrap();
+    let catalogue = crate::lua::catalogue::Catalogue::load(&resources.db, &config, &resources.sde).await.unwrap();
+    let host = Host::new(config, resources, catalogue).await.unwrap();
     let mut generations = host.subscribe();
     let old = host.snapshot();
     assert_eq!(old.claims.scripts, ["test", "other"]);

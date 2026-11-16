@@ -6,11 +6,11 @@ use infinity_core::consts::{dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE}, BLUEP
 use marshal::Value;
 use std::collections::BTreeMap;
 
-#[path = "../combat/groups_health/tests/fixture.rs"]
-mod fixture;
 mod capacitor_priming_db;
 mod boarding;
-
+mod unlimited_cargo;
+mod resistance_floor;
+mod spool;
 #[test]
 fn item_attribute_union_overlays_and_adds() {
     let mut attrs = BTreeMap::from([(1, 10.0), (2, 20.0)]);

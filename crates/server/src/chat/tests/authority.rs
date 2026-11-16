@@ -3,8 +3,8 @@ use super::{fixture, socket::{Tasks, open, presence, read_until, iq_request}};
 use crate::{chat::{connection, Hub}, dao::chat_channels as dao, db::Db, sde::Sde, services::chat::authority::{self, RoomConfig}, space::World};
 use base64::Engine;
 use marshal::Value;
-use std::sync::Arc;
-use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream}};
+use std::{sync::Arc, time::Duration};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
 async fn stanza_containing(stream: &mut TcpStream, end: &str, needle: &str) -> String {
     for _ in 0..32 {
@@ -65,7 +65,7 @@ async fn session_categories_and_unbound_connections() {
         }
         let mut raw = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (accepted, _) = listener.accept().await.unwrap();
-        let raw_hub = hub.clone(); tasks.0.push(tokio::spawn(async move { let _ = connection(accepted, raw_hub).await; }));
+        let raw_hub = hub.clone(); tasks.0.push(tokio::spawn(async move { let _ = connection(accepted, raw_hub, Duration::from_secs(infinity_wire::conn::DEFAULT_CLIENT_WRITE_TIMEOUT_SECS), std::time::Instant::now() + Duration::from_secs(2)).await; }));
         raw.write_all(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams'>").await.unwrap();
         read_until(&mut raw, "</stream:features>").await;
         let room = format!("alliance_{}@conference.chat.test", other.id);
@@ -84,6 +84,18 @@ async fn session_categories_and_unbound_connections() {
         raw.write_all(format!("<message id='before-bind-message' to='{room}' type='groupchat'><body>x</body></message>").as_bytes()).await.unwrap();
         assert!(read_until(&mut raw, "</message>").await.contains("not-authorized"));
         assert!(!hub.rooms.lock().unwrap().entries.contains_key(&room));
+        // The pre-auth deadline is fixed at accept: a silent socket dies at it
+        // while the authenticated connection ignores it.
+        let mut silent = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let silent_hub = hub.clone();
+        tasks.0.push(tokio::spawn(async move { let _ = connection(accepted, silent_hub, Duration::from_secs(infinity_wire::conn::DEFAULT_CLIENT_WRITE_TIMEOUT_SECS), std::time::Instant::now() + Duration::from_secs(1)).await; }));
+        silent.write_all(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams'>").await.unwrap();
+        read_until(&mut silent, "</stream:features>").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        raw.write_all(format!("<presence id='post-deadline' to='{room}/{}'/>", actor.id).as_bytes()).await.unwrap();
+        assert!(read_until(&mut raw, "</presence>").await.contains("not-authorized"), "authenticated connection died at the deadline");
+        tokio::time::timeout(Duration::from_secs(10), async { let mut b = [0u8; 128]; while silent.read(&mut b).await.unwrap() != 0 {} }).await.expect("silent socket stayed past the auth deadline");
         let mut duplicate = open(&listener, &hub, &mut tasks, actor.id).await;
         let first = format!("{}@conference.chat.test", channels[0]);
         assert!(presence(&mut duplicate, &first, actor.id, "duplicate").await.contains("conflict"));
@@ -257,7 +269,7 @@ async fn corporation_and_alliance_motd_require_real_owning_authority() {
     let alliance: i64 = db.query_one("INSERT INTO game.alliances (name,short_name,executor_corp_id,creator_corp_id,creator_char_id,created) VALUES ('chat-motd-' || nextval('game.alliances_alliance_id_seq')::text, 'CM' || currval('game.alliances_alliance_id_seq')::text, $1,$1,$2,1) RETURNING alliance_id", &[&corp, &ceo.id]).await.unwrap().get("alliance_id");
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id = ANY($2)", &[&corp, &vec![ceo.id, director.id, ordinary.id]]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&other_corp, &foreign.id]).await.unwrap();
-    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&infinity_core::consts::ROLE_DIRECTOR, &director.id]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id = ANY($2)", &[&infinity_core::consts::ROLE_DIRECTOR, &vec![ceo.id, director.id]]).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let sde = Arc::new(Sde::load(&test_db).await.unwrap()); let world = World::new(test_db.clone(), sde.clone(), 1); let hub = Hub::new("chat.test", test_db.clone(), world.clone());

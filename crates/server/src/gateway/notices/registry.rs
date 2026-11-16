@@ -1,5 +1,5 @@
 //! Generation-guarded ephemeral application stream registry.
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{collections::HashMap, sync::{Arc, Mutex, Weak}};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use infinity_core::session::OnlineSession;
@@ -10,16 +10,16 @@ type Application = [u8; 16];
 struct Binding { user: i64, character: i64, session: i64 }
 #[derive(Clone)]
 pub(crate) struct NoticeHub(Arc<Mutex<State>>);
-struct State { next: u64, applications: HashMap<Application, Entry> }
+struct State { next: u64, applications: HashMap<Application, Entry>, publications: HashMap<i64, Weak<tokio::sync::Mutex<()>>> }
 struct Entry { epoch: u64, leases: usize, binding: Option<Binding>, writer: Option<Writer> }
 struct Writer { generation: u64, tx: mpsc::Sender<Bytes>, cancel: oneshot::Sender<()> }
 pub(crate) struct Lease { hub: NoticeHub, application: Application, epoch: u64 }
 pub(crate) struct Registration { lease: Lease, generation: u64, pub(crate) rx: mpsc::Receiver<Bytes>, pub(crate) cancelled: oneshot::Receiver<()> }
 impl Default for NoticeHub { fn default() -> Self { Self::new() } }
 impl NoticeHub {
-    pub(crate) fn new() -> Self { Self(Arc::new(Mutex::new(State { next: 0, applications: HashMap::new() }))) }
+    pub(crate) fn new() -> Self { Self(Arc::new(Mutex::new(State { next: 0, applications: HashMap::new(), publications: HashMap::new() }))) }
     pub(in crate::gateway) fn lease(&self, application: Application) -> Lease {
-        let mut state = self.0.lock().unwrap();
+        let mut state = crate::poison::lock_or_exit(self.0.lock());
         if !state.applications.contains_key(&application) {
             state.next = state.next.wrapping_add(1);
             let epoch = state.next;
@@ -32,7 +32,7 @@ impl NoticeHub {
     pub(crate) fn register(&self, application: Application, capacity: usize) -> Registration {
         let (tx, rx) = mpsc::channel(capacity);
         let (cancel, cancelled) = oneshot::channel();
-        let mut state = self.0.lock().unwrap();
+        let mut state = crate::poison::lock_or_exit(self.0.lock());
         state.next = state.next.wrapping_add(1);
         let generation = state.next;
         if !state.applications.contains_key(&application) {
@@ -47,28 +47,58 @@ impl NoticeHub {
     pub(crate) fn dispatch(&self, notice: GatewayNotice, resolver: impl Fn(i64) -> Option<OnlineSession>) {
         let mut frame: Option<Bytes> = None;
         let candidates: Vec<_> = {
-            let state = self.0.lock().unwrap();
+            let state = crate::poison::lock_or_exit(self.0.lock());
             state.applications.iter().filter_map(|(&application, entry)| entry.writer.as_ref().map(|writer| (application, entry.epoch, entry.binding, writer.generation, writer.tx.clone()))).collect()
         };
         for (application, epoch, binding, generation, tx) in candidates {
             let current = binding.and_then(|b| resolver(b.character).filter(|s| s.character_id == b.character && s.user_id == Some(b.user) && s.session_id == b.session));
             if binding.is_some() && current.is_none() {
-                let mut state = self.0.lock().unwrap();
+                let mut state = crate::poison::lock_or_exit(self.0.lock());
                 if let Some(entry) = state.applications.get_mut(&application) {
                     if entry.epoch == epoch && entry.binding == binding { entry.binding = None; }
                 }
             }
+            if !notice.delivers_to(&application, current.as_ref()) { continue; }
             if !matches_target(&notice.target, current.as_ref(), &application) { continue; }
             if tx.try_send(frame.get_or_insert_with(|| notice.frame()).clone()).is_err() { self.remove_writer(application, epoch, generation); }
         }
     }
     fn remove_writer(&self, application: Application, epoch: u64, generation: u64) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = crate::poison::lock_or_exit(self.0.lock());
         if let Some(entry) = state.applications.get_mut(&application) {
             if entry.epoch == epoch && entry.writer.as_ref().is_some_and(|w| w.generation == generation) {
                 if let Some(writer) = entry.writer.take() { let _ = writer.cancel.send(()); }
             }
         }
+    }
+
+    /// The corporation's publication gate, held across its write and the
+    /// post-commit dispatch. A later write for the same corporation waits; other
+    /// corporations do not. Dead entries are dropped on the next acquire.
+    pub(crate) async fn corporation_publication(&self, corporation: i64) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut state = crate::poison::lock_or_exit(self.0.lock());
+            state.publications.retain(|_, weak| weak.strong_count() != 0);
+            match state.publications.get(&corporation).and_then(Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(tokio::sync::Mutex::new(()));
+                    state.publications.insert(corporation, Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+        gate.lock_owned().await
+    }
+
+    /// Corporations that still have a publication gate. The next acquire drops
+    /// entries whose guard is gone; this read does not.
+    #[cfg(all(test, feature = "tests-gateway"))]
+    pub(super) fn publication_corporations(&self) -> Vec<i64> {
+        let state = crate::poison::lock_or_exit(self.0.lock());
+        let mut ids: Vec<i64> = state.publications.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 }
 impl Lease {
@@ -76,13 +106,13 @@ impl Lease {
         let Some(user) = session.user_id else { return };
         let binding = Binding { user, character: session.character_id, session: session.session_id };
         let previous = {
-            let state = self.hub.0.lock().unwrap();
+            let state = crate::poison::lock_or_exit(self.hub.0.lock());
             let Some(entry) = state.applications.get(&self.application).filter(|entry| entry.epoch == self.epoch) else { return };
             entry.binding
         };
         let is_current = |b: Binding| resolver(b.character).is_some_and(|s| s.character_id == b.character && s.user_id == Some(b.user) && s.session_id == b.session);
         if !is_current(binding) || previous.is_some_and(|old| old != binding && is_current(old)) { return; }
-        let mut state = self.hub.0.lock().unwrap();
+        let mut state = crate::poison::lock_or_exit(self.hub.0.lock());
         if let Some(entry) = state.applications.get_mut(&self.application) {
             if entry.epoch == self.epoch && entry.binding == previous { entry.binding = Some(binding); }
         }
@@ -90,7 +120,7 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        let mut state = self.hub.0.lock().unwrap();
+        let mut state = crate::poison::lock_or_exit(self.hub.0.lock());
         if let Some(entry) = state.applications.get_mut(&self.application) {
             if entry.epoch == self.epoch {
                 entry.leases -= 1;

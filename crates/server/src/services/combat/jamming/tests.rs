@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::HashSet;
+use super::super::PendingLock;
 use crate::space::{Ball, System, WarpState, MODE_STOP};
 use std::sync::Arc;
 
@@ -18,8 +20,11 @@ fn jam_clears_locks_and_overlaps_expire_independently() {
     let registry = Arc::new(crate::space::Pilots::default());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (silent_tx, mut silent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pilot_tx, mut pilot_rx) = tokio::sync::mpsc::unbounded_channel();
     registry.register_pilot(recipient, tx);
     registry.register_pilot(silent_recipient, silent_tx);
+    registry.register_pilot(pilot, pilot_tx);
     let mut system = System::new(ship, registry, 1000);
     system.insert(Ball {
         id: ship, type_id: 1, owner_id: pilot, corp_id: 1, alliance_id: 1,
@@ -36,7 +41,7 @@ fn jam_clears_locks_and_overlaps_expire_independently() {
         st.targets.entry(pilot).or_default().insert(locked);
         st.targets.entry(pilot).or_default().insert(silent);
         st.announced_locks.insert((pilot, locked), (ship, recipient));
-        st.locking.insert((pilot, pending), 1);
+        st.locking.insert((pilot, pending), PendingLock { attempt: 1, ui_owner: Some(ui_tx) });
     }
     apply(&mut system, source, module, ship, 100.0);
     assert!(is_jammed(ship, 1000));
@@ -48,14 +53,20 @@ fn jam_clears_locks_and_overlaps_expire_independently() {
     assert!(rx.try_recv().is_err());
     assert!(silent_rx.try_recv().is_err());
     assert!(!state().announced_locks.contains_key(&(pilot, locked)));
+    assert_eq!(ui_rx.try_recv().unwrap(), crate::client::target_lock_failure(pilot, pending, 1));
+    assert!(ui_rx.try_recv().is_err());
+    let lost: HashSet<i64> = std::iter::from_fn(|| pilot_rx.try_recv().ok())
+        .filter(|(event, _)| event == "OnTarget").map(|(_, args)| args[1].as_int().unwrap()).collect();
+    assert_eq!(lost, HashSet::from([locked, silent]));
     {
         let mut st = state();
-        assert!(!st.begin_lock(ship, pilot, pending, 2, 1000));
+        assert!(!st.begin_lock(ship, pilot, pending, 2, 1000, None));
         assert_eq!(st.complete_lock(ship, pilot, pending, 1, 1000, true), (false, false));
-        st.locking.insert((pilot, pending), 3);
+        st.locking.insert((pilot, pending), PendingLock { attempt: 3, ui_owner: None });
         assert_eq!(st.complete_lock(ship, pilot, pending, 3, 1000, true), (true, false));
         assert!(!st.targets.contains_key(&pilot));
     }
+    assert!(ui_rx.try_recv().is_err());
     assert!(!state().locking.contains_key(&(pilot, pending)));
     apply(&mut system, other, module, ship, 300.0);
     apply(&mut system, source, module, ship, 200.0);

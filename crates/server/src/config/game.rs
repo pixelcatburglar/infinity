@@ -16,12 +16,19 @@ pub mod expert_systems;
 pub mod gm;
 #[path = "daily_goals.rs"]
 pub mod daily_goals;
+#[path = "repairable_ship.rs"]
+pub mod repairable_ship;
 
 pub(super) fn duration(key: &str, value: i64, unit: i64, future: bool) -> Result<()> {
     let ticks = value.checked_mul(unit);
     anyhow::ensure!(ticks.is_some_and(|ticks| !future || crate::client::filetime_now().checked_add(ticks).is_some()),
         "{key}={value} exceeds the representable duration or deadline");
     Ok(())
+}
+
+fn positive_duration(key: &str, value: i64, unit: i64) -> Result<()> {
+    anyhow::ensure!(value > 0, "{key} must be positive");
+    duration(key, value, unit, true)
 }
 
 fn milliseconds(key: &str, seconds: i64) -> Result<()> {
@@ -118,6 +125,10 @@ pub struct GameConfig {
     pub gm: gm::GmConfig,
     /// Daily goals runtime policy.
     pub daily_goals: daily_goals::DailyGoalsConfig,
+    /// Repairable-ship recovery payment, delivery and withdrawal policy.
+    pub repairable_ship: repairable_ship::RepairableShipConfig,
+    /// Durable progress receipt retry policy.
+    pub progress: super::progress::ProgressConfig,
 }
 
 impl GameConfig {
@@ -148,7 +159,9 @@ impl GameConfig {
         self.calendar.validate()?;
         self.space.validate()?;
         self.daily_goals.validate()?;
+        self.repairable_ship.validate()?;
         self.gm.validate()?;
+        self.progress.validate()?;
         Ok(())
     }
 }

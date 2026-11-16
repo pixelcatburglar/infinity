@@ -110,14 +110,19 @@ fn launch_state_waits_for_add_balls_boundary() {
     let mut s = System::new(1, registry, 1000);
     s.insert(ball(10, Some(20), 0.0));
     let (destiny, mut updates) = mpsc::unbounded_channel();
-    s.observe(1, 10, destiny);
+    let (completed_1, mut completion_1) = tokio::sync::oneshot::channel();
+    s.observe(1, 10, destiny, completed_1);
+    s.apply_scene_prefix(crate::space::collision::enabled());
+    assert_eq!(completion_1.try_recv(), Ok(true));
+    super::events::initial_state(&mut updates);
+    super::events::fleet_snapshot(&mut updates);
     let token = s.reserve_drone_launch(20, 10, &[5.0], 1.0, 5.0).unwrap();
     assert!(s.complete_drone_launch_reservation(token, 20, 10));
     s.add_ship(drone_ball(30));
     s.register_drone(30, spec(), effects(), Some(10), Some(20), false);
     s.queue_drone_announcement(30);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    s.queue_drone_launch_ack(ack_tx);
+    s.queue_destiny_flush(ack_tx);
     let mut ack = ack_rx;
     assert!(notices.try_recv().is_err());
     assert!(updates.try_recv().is_err());
@@ -126,6 +131,21 @@ fn launch_state_waits_for_add_balls_boundary() {
     assert!(updates.try_recv().is_ok());
     assert_eq!(notices.try_recv().unwrap().0, "OnDroneStateChange");
     assert!(ack.try_recv().is_ok());
+}
+
+#[test]
+fn destiny_flush_completes_for_empty_and_retired_ballparks() {
+    crate::tests::init_config();
+    let mut s = System::new(1, Arc::default(), 1000);
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    s.queue_destiny_flush(tx);
+    assert!(rx.try_recv().is_ok());
+    s.insert(ball(10, None, 0.0)); s.destroy_ball(10);
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    s.queue_destiny_flush(tx);
+    assert!(rx.try_recv().is_err());
+    s.tick(2000);
+    assert!(rx.try_recv().is_ok());
 }
 
 #[test]
@@ -154,10 +174,17 @@ fn observer_bootstrap_only_registers_local_owned_drones() {
     s.insert(ball(11, Some(21), 0.0));
     s.insert(drone_ball(30));
     s.register_drone(30, spec(), effects(), None, Some(20), false);
-    let (tx1, _rx1) = mpsc::unbounded_channel();
-    let (tx2, _rx2) = mpsc::unbounded_channel();
-    let owner = s.observe(1, 10, tx1);
-    let other = s.observe(2, 11, tx2);
+    let (tx1, mut rx1) = mpsc::unbounded_channel();
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let (completed_2, mut completion_2) = tokio::sync::oneshot::channel();
+    assert!(s.observe(1, 10, tx1, completed_2));
+    let (completed_3, mut completion_3) = tokio::sync::oneshot::channel();
+    assert!(s.observe(2, 11, tx2, completed_3));
+    s.apply_scene_prefix(crate::space::collision::enabled());
+    assert_eq!(completion_2.try_recv(), Ok(true));
+    assert_eq!(completion_3.try_recv(), Ok(true));
+    let owner = super::events::initial_state(&mut rx1);
+    let other = super::events::initial_state(&mut rx2);
     let rows = |event: &Value| {
         let call = &event.items().unwrap()[1];
         let args = &call.items().unwrap()[1];

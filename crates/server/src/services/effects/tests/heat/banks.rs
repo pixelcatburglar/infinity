@@ -37,9 +37,12 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
                 && c.volume.is_some_and(|v| v > 0.0 && capacity >= 3.0 * v))?;
             Some((m.type_id, ammo.type_id, overload, name, effect.attribute(EffectAttribute::Duration)?))
         }).expect("groupable overloadable turret and compatible ammunition");
-    let before = fixture::fingerprint(&db).await.unwrap();
-    let f = fixture::create(&db, hull, gun, FLAG_HI_SLOT_FIRST).await.unwrap();
-    let slave = fixture::item(&db, gun, f.character, f.ship, FLAG_HI_SLOT_FIRST + 1, 1, true, true).await.unwrap();
+    let f = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[
+        ShipItemSpec { type_id: gun, flag_id: FLAG_HI_SLOT_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] },
+        ShipItemSpec { type_id: gun, flag_id: FLAG_HI_SLOT_FIRST + 1, quantity: 1, singleton: true, online: true, attributes: &[] },
+    ]).await.unwrap();
+    let module_id = f.module();
+    let slave = f.items[1];
     let world = World::new(db.clone(), sde.clone(), 1);
     let w = world.clone();
     let d = db.clone();
@@ -52,10 +55,10 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
             (f.ship, ATTR_CPU_OUTPUT, 1_000_000.0), (f.ship, ATTR_POWER_OUTPUT, 1_000_000.0), (f.ship, ATTR_CAPACITOR_CAPACITY, 1_000_000.0),
             (f.ship, ATTR_MAX_TARGET_RANGE, 100_000.0), (f.ship, ATTR_MAX_LOCKED_TARGETS, 1.0), (f.ship, ATTR_SCAN_RESOLUTION, 1_000_000.0),
             (f.ship, HEAT_GENERATION, 1000.0), (f.ship, HIGH_ATTENUATION, 0.0),
-            (f.module, ATTR_STRUCTURE_HP, 1.0), (slave, ATTR_STRUCTURE_HP, 1.0),
-            (f.module, HEAT_DAMAGE, 10.0), (slave, HEAT_DAMAGE, 0.0),
+            (module_id, ATTR_STRUCTURE_HP, 1.0), (slave, ATTR_STRUCTURE_HP, 1.0),
+            (module_id, HEAT_DAMAGE, 10.0), (slave, HEAT_DAMAGE, 0.0),
         ] { dogma::set_override(&d, item, attr, value).await.unwrap(); }
-        for id in [f.module, slave] {
+        for id in [module_id, slave] {
             for (attr, value) in [(ATTR_CPU, 0.0), (ATTR_POWER, 0.0), (ATTR_CAPACITOR_NEED, 0.0),
                 (REQUIRED_THERMODYNAMICS, 0.0), (HEAT_ABSORPTION, 1000.0), (duration, 2000.0)] {
                 dogma::set_override(&d, id, attr, value).await.unwrap();
@@ -65,7 +68,7 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
         for flag in [FLAG_HI_SLOT_FIRST, FLAG_HI_SLOT_FIRST + 1] {
             d.execute("INSERT INTO game.module_charges (ship_id,flag_id,type_id,quantity) VALUES ($1,$2,$3,3)", &[&f.ship, &flag, &ammo]).await.unwrap();
         }
-        item_combat::move_bank(&d, f.ship, f.module, slave).await.unwrap();
+        item_combat::move_bank(&d, f.ship, module_id, slave).await.unwrap();
         assert_eq!(charges::banks(&d, f.ship).await.unwrap().len(), 1);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -86,47 +89,48 @@ async fn slave_overload_burns_one_weapon_and_stops_entire_bank() {
         let args = [Value::Int(slave), Value::Int(i64::from(overload))];
         call(&mut c, "dogmaIM", "Overload", &args, None).await.ok().expect("slave overload");
         let primed = heat::overloaded_modules();
-        assert!(primed.contains(&f.module) && primed.contains(&slave));
+        assert!(primed.contains(&module_id) && primed.contains(&slave));
         let activation = [Value::Int(slave), Value::str(&effect_name), Value::Int(target), Value::Int(10)];
         call(&mut c, "dogmaIM", "Activate", &activation, None).await.ok().expect("activate bank");
         tokio::time::timeout(Duration::from_secs(10), async {
             while !heat::ship_state(&w, SYSTEM, f.ship).await.is_some_and(|r| r.iter().any(|r| r.incoming >= 2000.0)) { assert!(w.after(SYSTEM, 100).await); }
         }).await.expect("both heat sources connected");
-        let stop = combat::state().active.get(&f.module).expect("master owns activation").stop.clone();
+        let stop = combat::state().active.get(&module_id).expect("master owns activation").stop.clone();
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if charges::banks(&d, f.ship).await.unwrap().is_empty() && !heat::overloaded_modules().contains(&f.module)
+                if charges::banks(&d, f.ship).await.unwrap().is_empty() && !heat::overloaded_modules().contains(&module_id)
                     && !heat::overloaded_modules().contains(&slave) && stop.load(std::sync::atomic::Ordering::Relaxed) { break; }
                 assert!(w.after(SYSTEM, 100).await);
             }
         }).await.expect("burnout terminates bank");
         let fit = Fit::load(&d, sde, f.character, f.ship).await.ok().unwrap();
-        assert_eq!(fit.value(Key::Module(f.module), ATTR_HULL_DAMAGE), fit.value(Key::Module(f.module), ATTR_STRUCTURE_HP));
+        assert_eq!(fit.value(Key::Module(module_id), ATTR_HULL_DAMAGE), fit.value(Key::Module(module_id), ATTR_STRUCTURE_HP));
         assert_eq!(fit.value(Key::Module(slave), ATTR_HULL_DAMAGE), 0.0);
         let online = dogma::online(&d, f.ship).await.unwrap();
-        assert!(!online.iter().any(|m| m.item_id == f.module));
+        assert!(!online.iter().any(|m| m.item_id == module_id));
         assert!(online.iter().any(|m| m.item_id == slave), "slave unexpectedly offline; online ids={:?}", online.iter().map(|m| m.item_id).collect::<Vec<_>>());
         assert!(w.after(SYSTEM, 2500).await);
+        w.flush_positions().await.unwrap();
         for flag in [FLAG_HI_SLOT_FIRST, FLAG_HI_SLOT_FIRST + 1] { assert_eq!(loaded(&d, f.ship, flag).await.ok().unwrap(), Some((ammo, 2))); }
         let mut counts = [(0, 0); 2];
         while let Ok((name, payload)) = rx.try_recv() {
-            if let Some(index) = [f.module, slave].iter().position(|id| payload.get(1).and_then(Value::as_int) == Some(*id)) {
+            if let Some(index) = [module_id, slave].iter().position(|id| payload.get(1).and_then(Value::as_int) == Some(*id)) {
                 if name == "OnHeatAdded" { counts[index].0 += 1; }
                 if name == "OnHeatRemoved" { counts[index].1 += 1; }
             }
         }
         assert_eq!(counts, [(1, 1), (1, 1)]);
     }).await;
-    { let mut st = combat::state(); if let Some(active) = st.active.remove(&f.module) { active.stop.store(true, std::sync::atomic::Ordering::Relaxed); } st.activation_generation.remove(&f.module); }
+    { let mut st = combat::state(); if let Some(active) = st.active.remove(&module_id) { active.stop.store(true, std::sync::atomic::Ordering::Relaxed); } st.activation_generation.remove(&module_id); }
     heat::clear_character(f.character);
     clear_locks_on(&world, SYSTEM, f.ship, f.character);
     for id in [f.ship, target] { world.remove_ball(SYSTEM, id).await; combat::forget_ship(id); }
     world.unregister_pilot_generation(f.character, None);
     let flush = world.flush_positions().await;
     drop(world);
-    db.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1", &[&f.ship]).await.unwrap();
-    fixture::cleanup(&db, f).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, module_id, slave]).await.unwrap();
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

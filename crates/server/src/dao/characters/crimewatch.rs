@@ -1,4 +1,5 @@
-//! Crimewatch security, location and attacker corporation persistence in `game.characters`.
+//! Crimewatch security, location, safety level and attacker corporation
+//! persistence in `game.characters`.
 //! This DAO has no direct client mirror or wire contract; the owning service handles those.
 //! Policy, transactions and notifications are not handled here.
 
@@ -35,6 +36,16 @@ impl Location {
     }
 }
 
+struct Safety {
+    safety_level: i64,
+}
+
+impl Safety {
+    fn from_row(r: &Row) -> Self {
+        Self { safety_level: r.get("safety_level") }
+    }
+}
+
 pub(crate) async fn security(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<f64>, db::Error> {
     let row = ex.query_opt("SELECT security_status FROM game.characters WHERE character_id = $1", &[&char_id]).await?;
     Ok(row.as_ref().map(|r| Security::from_row(r).security_status))
@@ -66,4 +77,22 @@ pub(crate) async fn corporation(ex: &(impl Executor + ?Sized), char_id: i64) -> 
 pub(crate) async fn solar_system(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<i64>, db::Error> {
     let row = ex.query_opt("SELECT solar_system_id FROM game.characters WHERE character_id = $1", &[&char_id]).await?;
     Ok(row.as_ref().and_then(|r| Location::from_row(r).solar_system_id))
+}
+
+/// Persisted safety level of one live character; `None` when the row is
+/// missing or deleted.
+pub(crate) async fn safety(ex: &(impl Executor + ?Sized), character: i64) -> Result<Option<i64>, db::Error> {
+    let row = ex.query_opt("SELECT safety_level FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&character]).await?;
+    Ok(row.as_ref().map(|r| Safety::from_row(r).safety_level))
+}
+
+/// Replace the safety level in one guarded write, returning the stored
+/// value; `None` when no live row matches. The 0..2 enum domain is the
+/// column's CHECK constraint.
+pub(crate) async fn set_safety(ex: &(impl Executor + ?Sized), character: i64, level: i64) -> Result<Option<i64>, db::Error> {
+    let row = ex.query_opt(
+        "UPDATE game.characters SET safety_level = $2 WHERE character_id = $1 AND NOT deleted RETURNING safety_level",
+        &[&character, &level],
+    ).await?;
+    Ok(row.as_ref().map(|r| Safety::from_row(r).safety_level))
 }

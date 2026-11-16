@@ -212,7 +212,7 @@ impl State {
 
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(STATE.get_or_init(Default::default).lock())
 }
 
 pub(crate) fn same_fleet(a: i64, b: i64) -> bool {
@@ -329,5 +329,5 @@ fn set_own_session(c: &mut Client, pairs: &[Value]) {
     c.change_session(owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

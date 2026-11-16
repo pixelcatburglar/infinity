@@ -74,8 +74,8 @@ async fn migration_preserves_receipts_and_rolls_back_invalid_rows() {
     let event_id: String = tx.query_one("SELECT event_id::text AS id FROM game.progress_events WHERE source_namespace=$1 AND source_key='wallet'", &[&namespace]).await.unwrap().get("id");
     let applied_key = crate::progress::DeliveryKey { consumer_key: applied.clone(), event_id: event_id.clone() };
     let pending_key = crate::progress::DeliveryKey { consumer_key: pending.clone(), event_id };
-    assert!(crate::dao::progress::lock_pending(&tx, &applied_key).await.unwrap().is_none());
-    assert!(crate::dao::progress::lock_pending(&tx, &pending_key).await.unwrap().is_some());
+    assert!(matches!(crate::dao::progress::lock_delivery(&tx, &applied_key).await.unwrap(), crate::dao::progress::DeliveryState::Applied));
+    assert!(matches!(crate::dao::progress::lock_delivery(&tx, &pending_key).await.unwrap(), crate::dao::progress::DeliveryState::Pending(_)));
     let rows = tx.query("SELECT schema_version,kind,payload::text AS payload FROM game.progress_events WHERE source_namespace=$1 ORDER BY source_key", &[&namespace]).await.unwrap();
     for row in rows {
         let kind: String = row.get("kind");

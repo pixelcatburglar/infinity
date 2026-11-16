@@ -95,4 +95,4 @@ pub(super) fn prepare(ball: &mut Ball, locators: &[DirectionalLocator], group: O
     ball.segment_acceleration = None;
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;

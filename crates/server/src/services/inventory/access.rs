@@ -1,7 +1,9 @@
 //! Inventory container binding and corporate custody authorization for
 //! `eve/client/script/environment/invCache.py`. Uses `game.items` ancestry and
-//! corporate membership and role records; foreign shared-bay permissions are not modelled.
-
+//! corporate membership and role records; foreign shared-bay permissions are not
+//! modelled. Office custody is state-independent identity, but access also
+//! requires a currently active lease: an impounded or released office denies
+//! instead of falling through to a personal container.
 use super::{CONTAINER_CORP_MARKET, CONTAINER_HANGAR};
 use infinity_core::consts::{CORP_HANGAR_DIVISIONS, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
 use crate::db::executor::Executor;
@@ -59,14 +61,22 @@ pub(in crate::services) async fn may_take_corp_hangar(ex: &(impl Executor + ?Siz
 }
 
 /// Resolve the office division or station Deliveries governing an item's ancestry.
+/// Office custody is state-independent identity: an inactive lease still returns
+/// the recognized (corporation, office, flag) so callers can deny rather than
+/// fall through to a personal-container rule.
 pub(in crate::services) async fn corporate_custody(ex: &(impl Executor + ?Sized), sde: Option<&Sde>, id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
-    for row in crate::dao::items::deliveries::ancestry(ex, id).await.map_err(db_err)? {
-        if let Some(corp) = super::super::offices::office_owner(ex, row.location_id).await? {
-            return Ok(Some((corp, row.location_id, row.flag_id)));
+    let rows = crate::dao::items::deliveries::ancestry_many(ex, &[id]).await.map_err(db_err)?;
+    for row in &rows {
+        if let Some(office) = &row.office {
+            // Custody binds the office item and the division flag of its direct
+            // child on this chain.
+            let flag = rows.iter().find(|child| child.ancestor.location_id == row.ancestor.item_id)
+                .map(|child| child.ancestor.flag_id).unwrap_or(row.ancestor.flag_id);
+            return Ok(Some((office.corporation_id, row.ancestor.item_id, flag)));
         }
-        if row.flag_id == FLAG_CORP_DELIVERIES && sde.is_none_or(|sde| sde.map.station(row.location_id).is_some())
-            && super::super::corps::is_player_corp(row.owner_id) {
-            return Ok(Some((row.owner_id, row.location_id, row.flag_id)));
+        if row.ancestor.flag_id == FLAG_CORP_DELIVERIES && sde.is_none_or(|sde| sde.map.station(row.ancestor.location_id).is_some())
+            && super::super::corps::is_player_corp(row.ancestor.owner_id) {
+            return Ok(Some((row.ancestor.owner_id, row.ancestor.location_id, row.ancestor.flag_id)));
         }
     }
     Ok(None)
@@ -82,5 +92,13 @@ pub(in crate::services) async fn custody_allowed(ex: &(impl Executor + ?Sized), 
     let Some((corp, location, flag)) = corporate_custody(ex, Some(sde), id).await? else { return Ok(None) };
     let Some(target_station) = custody_station(ex, location, flag).await? else { return Ok(Some(false)) };
     let role = if take { may_take_corp_hangar(ex, me, corp, target_station, flag).await? } else { may_view_corp_hangar(ex, me, corp, target_station, flag).await? };
-    Ok(Some(role && (flag != FLAG_CORP_DELIVERIES || station == Some(location))))
+    if flag == FLAG_CORP_DELIVERIES {
+        return Ok(Some(role && station == Some(location)));
+    }
+    // An office division also requires a currently active lease.
+    let now = crate::client::filetime_now();
+    match crate::dao::offices::get(ex, location).await.map_err(db_err)? {
+        Some(lease) => Ok(Some(role && lease.is_active(now))),
+        None => Ok(Some(false)),
+    }
 }

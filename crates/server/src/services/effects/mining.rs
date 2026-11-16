@@ -1,13 +1,14 @@
 //! Mining effect validation, animations and yield phase.
 //! Client dogma mining effects use the cycle-start fit when extracting ore.
 //! Rock identity is system-owned; storage and depletion are owned by services/mining.
+//! Effect animations are published through the system's ordered scene channel.
 use super::lifecycle::{Cycle, CycleOutcome, Module};
-use super::notify::fire_fx;
+use super::parameters::MasterPacket;
 use super::registry::EffectFlag;
 use infinity_core::consts::{dogma::ATTR_MAX_RANGE, dogma::EFFECT_MINING_CLOUDS};
 use infinity_core::messages;
 use crate::services::{combat::{Ctx, targeting_charges::targets_of}, fit::{Fit, Key}, user_error, CallError};
-use crate::space::{dist, metres_to_km, System};
+use crate::space::{dist, metres_to_km, FxModule, System, system::presentation::{FxRetention, ModuleFx}};
 use marshal::Value;
 use tracing::warn;
 
@@ -40,9 +41,19 @@ pub(super) fn start(cx: &Ctx, cycle: &Cycle) -> CycleOutcome {
         if !targets_of(cx.char_id).contains(&rock) { return CycleOutcome::Stop("target lost"); }
         if cycle.cycles == 0 {
             let modules = cycle.modules.clone();
-            let (ship, duration, repeat, guid, is_offensive) = (cx.ship_id, cycle.duration_ms, cycle.repeat, guid(cycle.effect.id), cycle.effect.has(EffectFlag::Offensive));
-            cx.world.broadcast(cx.system_id, ship, move |stamp| {
-                modules.iter().map(|m| fire_fx(stamp, ship, Some((m.id, m.type_id)), guid, Some(rock), None, is_offensive, true, duration, repeat)).collect()
+            let (master, generation, duration, repeat, guid, is_offensive) = (cycle.modules[0].id, cycle.stop.clone(), cycle.duration_ms, cycle.repeat, guid(cycle.effect.id).to_owned(), cycle.effect.has(EffectFlag::Offensive));
+            cx.world.post(cx.system_id, move |s| {
+                for m in &modules {
+                    s.publish_module_fx(master, &generation, ModuleFx {
+                        module: FxModule { item: Some(m.id), type_id: m.type_id },
+                        guid: guid.clone(),
+                        charge: None,
+                        offensive: is_offensive,
+                        duration_ms: duration,
+                        repeat,
+                        graphic_info: Value::None,
+                    }, true, FxRetention::Current);
+                }
             });
         }
     }
@@ -56,10 +67,15 @@ fn extraction_outcome(extraction: crate::services::mining::Extraction) -> CycleO
     else { CycleOutcome::Stop(reason) }
 }
 
-pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> CycleOutcome {
+pub(super) async fn end(cx: &Ctx, cycle: &mut Cycle) -> CycleOutcome {
     let Some(rock) = cycle.target else { return CycleOutcome::Continue };
     let master = cycle.modules[0].id;
-    match crate::services::mining::extract(&cx.db, &cx.world, &cx.notify, cx.char_id, cx.ship_id, cx.system_id, fit, master, cycle.modules[0].type_id, cycle.modules[0].flag, rock).await {
+    let packet = cycle.inputs.frame.as_mut().map(|frame| std::mem::replace(&mut frame.packet, MasterPacket::None));
+    let Some(MasterPacket::Mining(inputs)) = packet else {
+        warn!("mining {master}: end without captured mining inputs");
+        return CycleOutcome::Stop("mining failed");
+    };
+    match crate::services::mining::extract(&cx.db, &cx.world, &cx.notify, cx.char_id, cx.ship_id, cx.system_id, inputs, master, cycle.modules[0].type_id, cycle.modules[0].flag, rock).await {
         Ok(extraction) => {
             if let Some(e) = &extraction.error {
                 warn!("mining {master}: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg.clone() });
@@ -73,9 +89,8 @@ pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> CycleOutcome {
     }
 }
 
-pub(super) fn stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
-    let events = cycle.modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid(cycle.effect.id), cycle.target, None, cycle.effect.has(EffectFlag::Offensive), false, cycle.duration_ms, cycle.repeat)).collect();
-    s.broadcast(cx.ship_id, events);
+pub(super) fn stop(s: &mut System, _cx: &Ctx, cycle: &Cycle) {
+    s.retire_fx_activation(cycle.modules[0].id, &cycle.stop);
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

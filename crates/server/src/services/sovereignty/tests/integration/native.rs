@@ -13,7 +13,7 @@ async fn client(f: &Fixture, pilot: usize, system: i64) -> (Client, tokio::net::
     let login = crate::handshake::Login { user_id: f.ids.account, user_name: "fixture".into(), role: 0, client_id: f.ids.characters[pilot], session_id: f.ids.characters[pilot], language_id: "EN".into() };
     let r = &f.resources;
     let chat = crate::chat::Hub::new(&config.chat.domain, r.db.clone(), r.world.clone());
-    let mut c = Client::new(crate::conn::Conn::new(stream, address), config, r.db.clone(), r.sde.clone(), chat, r.world.clone(), login);
+    let mut c = Client::new(infinity_wire::conn::Conn::new(stream, address), config, r.db.clone(), r.sde.clone(), chat, r.world.clone(), login);
     c.change_session(vec![("userid", Value::Int(f.ids.account)), ("charid", Value::Int(f.ids.characters[pilot])), ("shipid", Value::Int(f.ids.ships[pilot])), ("corpid", Value::Int(f.ids.corps[pilot])), ("allianceid", Value::Int(f.ids.alliances[usize::from(pilot == 2)])), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
     (c, peer)
 }

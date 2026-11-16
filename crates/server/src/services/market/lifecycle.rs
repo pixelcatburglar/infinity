@@ -22,11 +22,6 @@ async fn refund<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<crate::sde::Sd
         Ok(())
     }
 }
-fn owned_order_active(o: &Order, now: i64) -> bool {
-    o.expires_at.map(i128::from).or_else(|| o.issued.map(|issued|
-        i128::from(issued) + i128::from(o.duration) * i128::from(FILETIME_DAY)))
-        .is_some_and(|deadline| deadline > i128::from(now))
-}
 
 /// `ModifyCharOrder`: reprice an open order, paying the modification fee (and topping up or
 /// releasing a buy order's escrow). A price that crosses the book trades at once.
@@ -47,10 +42,10 @@ pub(crate) async fn modify_order(identity: &Identity, db: &Db, world: &World, sd
     let party = authorization::authorize_order(db, &identity, &o).await?;
     if o.bid != request.bid || o.at.id != request.station_id || o.at.system != request.system_id
         || o.price != old_price || o.range != request.range || o.vol_remaining != request.remaining
-        || o.issued.unwrap_or(now / FILETIME_DAY * FILETIME_DAY) != request.issued {
+        || o.issued.unwrap_or(filetime_day_start(now)) != request.issued {
         return Err(notify_error(messages::MARKET_ORDER_CLOSED));
     }
-    if !owned_order_active(&o, now) {
+    if !o.owned_active_at(now) {
         return Err(notify_error(messages::MARKET_ORDER_CLOSED));
     }
     if o.price == new_price {
@@ -152,5 +147,5 @@ async fn expire(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World) -> Result<()
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

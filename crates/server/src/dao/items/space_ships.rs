@@ -31,4 +31,4 @@ pub(crate) async fn claim_unpiloted(ex: &(impl Executor + ?Sized), id: i64, type
     Ok(ex.query_opt("SELECT i.item_id FROM game.items i WHERE i.item_id = $1 AND i.type_id = $2 AND i.owner_id = $3 AND i.location_id = $4 AND i.flag_id = 0 AND i.singleton AND i.quantity = 1 AND i.x > '-Infinity'::float8 AND i.x < 'Infinity'::float8 AND i.y > '-Infinity'::float8 AND i.y < 'Infinity'::float8 AND i.z > '-Infinity'::float8 AND i.z < 'Infinity'::float8 AND NOT EXISTS (SELECT 1 FROM game.characters c WHERE c.ship_id = i.item_id) FOR UPDATE OF i", &[&id, &type_id, &owner, &system]).await?.is_some())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

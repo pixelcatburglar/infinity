@@ -31,7 +31,7 @@ pub(super) async fn orders(db: &Db, region: i64, type_id: i32, regional_session:
 
 fn book_rows(rows: &[Order]) -> Value {
     // Seeded NPC dates are persisted for stable snapshots; legacy NULLs retain the baseline UTC-day fallback.
-    let fallback = today();
+    let fallback = filetime_day_start(filetime_now());
     let header = order_header();
     let (mut asks, mut bids) = (vec![], vec![]);
     for r in rows {
@@ -90,7 +90,7 @@ pub(super) async fn corporation_orders(c: &Client) -> CallResult {
 
 fn order_rows(c: &Client, rows: &[Order]) -> Value {
     let here = c.session.int("solarsystemid2").unwrap_or(0);
-    let fallback = today();
+    let fallback = filetime_day_start(filetime_now());
     let header = DbRowDescriptor::new([
         ("orderID", DbType::I8),
         ("typeID", DbType::I4),
@@ -271,7 +271,7 @@ pub(super) fn history_header() -> DbRowDescriptor {
 /// typeID -> (days before today, today) as `dbutil.CRowset`s (marketsvc.GetHistoryRowList).
 pub(super) async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Value, Value)>, CallError> {
     let region = c.session.int("regionid").unwrap_or(0);
-    let today = today();
+    let today = filetime_day_start(filetime_now());
     let rows = listings::price_history(&c.db, region, type_ids, FILETIME_DAY, today.saturating_sub(crate::config::game().market.price_history_days.saturating_mul(FILETIME_DAY))).await.map_err(db_err)?;
     history_rows(type_ids, today, &rows)
 }
@@ -289,5 +289,5 @@ fn history_rows(type_ids: &[i32], today: i64, rows: &[listings::PriceHistory]) -
     Ok(days.into_iter().map(|(t, (old, new))| (t, (crowset(&header, old), crowset(&header, new)))).collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

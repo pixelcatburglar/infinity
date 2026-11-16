@@ -29,8 +29,8 @@ mod learning;
 mod purchase;
 pub(crate) mod expert_systems;
 mod trading;
-mod respec;
-#[cfg(test)]
+pub(crate) mod respec;
+#[cfg(all(test, feature = "tests-skills"))]
 mod tests;
 
 /// Internal bound-object name for skillMgr2.GetMySkillHandler.

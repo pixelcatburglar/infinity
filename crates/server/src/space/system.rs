@@ -1,15 +1,19 @@
 //! Actor-owned ballpark membership, visibility, actions, motion and timers,
 //! serving destiny updates consumed by `eve/client/script/remote/michelle.py`.
+//! Initial snapshots and incremental Destiny events share ordered observer channels.
 //! Celestials are supplied from the SDE; dynamic state and timers are in memory.
 //! Changed pilot positions are saved to `game.items` by the snapshot worker.
-//!
 //! One FIFO holds captured AddBalls updates and mode, propulsion, cloak and
-//! missile-launch actions. Membership changes immediately, while AddBalls
-//! captures its wire state at enqueue. An action enqueued at logical time C is
-//! stamped C and applied at the next boundary before evolution to C+1.
+//! missile-launch actions. Ball scene membership is partitioned into coarse
+//! fixed-edge grid bubbles (`interest`); each observed bubble shares one
+//! committed token roster and one boundary delta (`membership`). An action
+//! enqueued at logical time C is stamped C and applied at the next boundary
+//! before evolution to C+1.
 //! `current_time` starts at load-time Unix seconds and advances once per fixed
 //! one-second evolution, independently of the wall clock. Timers and NPC
 //! decisions run on 100 ms housekeeping ticks; snapshots follow motion.
+//! A `queue_destiny_flush` marker signals once every earlier action has been
+//! delivered; an idle ballpark completes the ack immediately.
 //! Explicit pilot actions cancel jump cloak once; expiry uses the raw uncloak queue.
 //! Uncloak batches restore the ball and clear its client shader for every observer.
 //! Fleet target tags are cleared on target removal or cloaking and synchronized on observation.
@@ -27,31 +31,43 @@
 //! Live compressor ranges use actor-owned module generations and static type lists.
 //! Taking a ball also ends its in-memory ECM lockout before its pilot leaves.
 //! Rack heat and overload membership are transient and are cleared when a ship leaves.
+//! Committed item renames project the new name onto the live ball's slim and
+//! the `evelocations` cache of pilots whose live observer can see the ball
+//! now; that audience is the observer's own scene bubble plus globals.
+//! GM `/effect` previews are bounded sent handles recorded per real source
+//! ship (one-shot pulses keep no handle), delivered only to the issuing
+//! observer and dropped on take or rebind.
+
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 #[path = "effects.rs"] mod effects;
 #[path = "boarding.rs"] pub(crate) mod boarding;
+pub(crate) mod appearance;
 mod affiliation;
+mod npc_control;
 mod sovereignty_placement;
+pub(crate) mod gm_effects;
+pub(crate) mod missiles;
 mod tick;
+mod unload;
+pub(crate) mod npc_sleep;
 pub(crate) mod warp;
 pub(crate) mod warp_arrival;
 mod warp_capacitor;
+pub(crate) mod observers;
+pub(crate) mod presentation;
+mod interest;
+mod membership;
+use presentation::SceneExit;
+use observers::{DestinyAudience, Observer};
 use effects::Tractor;
 
 /// carbonengine destiny Ballpark.cpp tick catchup policy.
 const MAX_CATCHUP_STEPS: i64 = 5;
 /// Destiny destruction effect EXPLOSION.
 const DESTRUCTION_EFFECT_EXPLOSION: i64 = 3;
-/// Server policy for targeted missiles: destiny/src/Thunkers.cpp LaunchMissile
-/// uses aimed launches to initialize direction toward an uncloaked target.
-const MISSILE_AIMED_LAUNCH: bool = true;
-/// Server policy for ordinary missiles; destiny/src/Thunkers.cpp sets ball massiveness from this flag.
-const MISSILE_MASSIVE: bool = false;
-/// brawl/client/war_fog_svc.py:58 uncloak effect duration in milliseconds.
-const UNCLOAK_FX_DURATION_MS: i64 = 5;
-pub(crate) type Timer = Box<dyn FnOnce(&mut System) + Send>;
+struct Timer(actor::Job);
 type Action = Box<dyn FnOnce(&mut System, i64) + Send>;
 
 struct Compressor {
@@ -67,16 +83,26 @@ struct ModuleCloak {
     targeting_ms: i64,
 }
 
+/// Live pilot membership: the piloted ball plus the persisted GM NPC-ignore
+/// flag seeded by ship preparation or `set_npc_ignored` publication.
+struct PilotState { ship_id: i64, npc_ignored: bool, binding: Option<std::sync::Arc<super::containment::PilotBinding>> }
+
 #[derive(Default)]
 pub struct System {
     pub(super) id: i64,
     pub(super) sovereignty: sovereignty::State,
     balls: HashMap<i64, Ball>,
+    /// Serials issued to live balls for incarnation-fenced scene tokens.
+    ball_tokens: HashMap<i64, u64>,
+    ball_token_serial: u64,
     pub(super) rocks: HashMap<i64, super::asteroids::Rock>,
     pub(super) asteroid_timers: HashMap<i64, (i64, u64)>,
     pub(super) asteroid_timer_sequence: u64,
-    pilots: HashMap<i64, i64>,
-    observers: HashMap<i64, (i64, DestinyTx)>,
+    pilots: HashMap<i64, PilotState>,
+    observers: HashMap<i64, Observer>,
+    observer_epoch: u64,
+    interest: interest::Interest,
+    membership: membership::Membership,
     pub(super) registry: Arc<Pilots>,
     pub(super) progress_registry: Arc<crate::progress::Registry>,
     pub(super) world: std::sync::Weak<World>,
@@ -85,10 +111,24 @@ pub struct System {
     collision_scratch: Vec<collision::Snapshot>,
     exited_ids: Vec<i64>,
     warp_corrections: Vec<i64>,
+    /// Reused scratch for the per-tick completed player-lock sweep; never authoritative state.
+    pub(crate) player_lock_candidates: Vec<(i64, i64, i64)>,
+    missile_flights: HashMap<i64, missiles::Flight>,
+    missile_scratch: Vec<i64>,
+    /// Live damageable projectile profiles, one per launched missile or bomb
+    /// incarnation; cleared by the same terminals that end its flight.
+    damageable_projectiles: HashMap<i64, damageable::DamageableProjectile>,
+    /// The one bomb terminal registry: each entry owns its impact callback
+    /// until the delay resolver or a removal consumes it exactly once.
+    bomb_flights: HashMap<i64, effects::BombFlight>,
     /// Celestial warp-in points (warpin.rs), by celestial ID.
     warp_ins: HashMap<i64, V3>,
-    pending: Option<HashMap<i64, Vec<Value>>>,
+    delivery_batching: bool,
+    presentation: presentation::Presentation,
+    pub(in crate::space) skins: ship_cosmetics::Skins,
+    pub(in crate::space) notice_hub: Option<crate::gateway::notices::NoticeHub>,
     timers: BTreeMap<(i64, u64), Timer>,
+    pub(in crate::space) attribution: attribution::Local,
     warp_exits: HashMap<i64, warp::WarpIntent>,
     warp_arrivals: HashMap<warp_arrival::WarpArrivalId, warp_arrival::ArrivalEntry>,
     timer_sequence: u64,
@@ -120,7 +160,7 @@ pub struct System {
     pub(super) automatic_drones: Vec<i64>,
     pub(super) automatic_targets: Vec<i64>,
     pub(super) drone_announcements: Vec<i64>,
-    pub(super) drone_launch_acks: Vec<tokio::sync::oneshot::Sender<()>>,
+    pub(super) destiny_flush_acks: Vec<tokio::sync::oneshot::Sender<()>>,
     pub(super) snapshot_context: Option<snapshot::Context>,
     pub(super) projection_sde: Option<Arc<Sde>>,
     pub(crate) heat: crate::services::effects::heat::HeatState,
@@ -130,6 +170,11 @@ pub struct System {
     pub(super) snapshot_positions: HashMap<i64, (u64, V3)>,
     pub(super) snapshot_generation: u64,
     pub(super) snapshot_due: i64,
+    pub(super) loaded_quiescing: bool,
+    pub(super) loaded_failed_periods: i64,
+    gm_previews: HashMap<i64, gm_effects::SentPreviews>,
+    /// NPC bounty pools owned by this actor; the shared coordinator is World-side.
+    pub(super) bounties: bounties::State,
 }
 impl System {
     pub(crate) fn sde(&self) -> Option<&crate::sde::Sde> { self.projection_sde.as_deref() }
@@ -144,19 +189,31 @@ impl System {
     /// run only on ticks, ordered by deadline and then insertion order (also for
     /// zero delays). Closures run inside the actor: no await, DB access or calls back into World.
     pub fn schedule(&mut self, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
-        self.schedule_at(self.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)), f);
+        self.schedule_named(delay_ms, std::any::type_name_of_val(&f), f);
     }
     /// Queue an absolute Unix-millisecond deadline, ordered by insertion on ties.
     pub fn schedule_at(&mut self, due: i64, f: impl FnOnce(&mut System) + Send + 'static) {
+        self.schedule_at_named(due, std::any::type_name_of_val(&f), f);
+    }
+    /// `schedule` under a caller-preserved static name.
+    pub(in crate::space) fn schedule_named(&mut self, delay_ms: u64, name: &'static str, f: impl FnOnce(&mut System) + Send + 'static) {
+        self.schedule_at_named(self.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)), name, f);
+    }
+    pub(in crate::space) fn schedule_at_named(&mut self, due: i64, name: &'static str, f: impl FnOnce(&mut System) + Send + 'static) {
         let sequence = self.timer_sequence;
         self.timer_sequence = sequence.checked_add(1).expect("space timer sequence exhausted");
-        self.timers.insert((due, sequence), Box::new(f));
+        self.timers.insert((due, sequence), Timer(actor::Job::named(name, f)));
+    }
+    /// Container lengths for diagnostics; never iterates or locks.
+    pub(in crate::space) fn attribution_counts(&self) -> (u64, u64, u64) {
+        (self.balls.len() as u64, self.observers.len() as u64, self.pilots.len() as u64)
     }
     /// Actor simulation time in Unix milliseconds.
     pub fn now_ms(&self) -> i64 { self.ms }
     /// Submit owned async work to the concurrent worker outside the actor.
     pub fn defer(&self, job: impl Future<Output = ()> + Send + 'static) {
-        if !self.try_defer(job) {
+        let name = std::any::type_name_of_val(&job);
+        if !self.try_defer(crate::runtime_watchdog::watch("defer", name, job)) {
             tracing::warn!(system = self.id, "space effects worker unavailable");
         }
     }
@@ -191,41 +248,43 @@ impl System {
     }
 
     pub fn pilots(&self) -> impl Iterator<Item = &Ball> {
-        self.pilots.values().filter_map(|id| self.ball(*id))
+        self.pilots.values().filter_map(|p| self.ball(p.ship_id))
     }
     pub(crate) fn persistent_balls(&self) -> impl Iterator<Item = &Ball> {
         self.snapshot_positions.keys().filter_map(|id| self.ball(*id))
     }
 
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
-        self.pilots.get(&char_id).and_then(|id| self.ball(*id))
+        self.pilots.get(&char_id).and_then(|p| self.ball(p.ship_id))
     }
-    /// Actor-owned visibility, independent of client ballpark delivery.
+    /// Actor-owned scene admission, independent of client ballpark delivery:
+    /// the pilot's own ball, a non-cloaked always-present member, or a
+    /// non-cloaked member of the ego's current bubble.
     pub(crate) fn visible_to(&self, character: i64, ball: i64) -> bool {
         let Some(ego) = self.pilot_ball(character) else { return false };
-        self.ball(ball).is_some_and(|target| target.cloak == 0 || target.id == ego.id)
-    }
-    fn pilot_observer(&self, character: i64) -> Option<&(i64, DestinyTx)> {
-        let ego = self.pilot_ball(character)?.id;
-        self.observers.values().find(|(observer_ego, tx)| *observer_ego == ego && !tx.is_closed())
+        let Some(target) = self.ball(ball) else { return false };
+        self.local_pair_from(ego, target)
     }
     /// Current ballpark visibility for a pilot with a live matching observer.
     pub(crate) fn fleet_broadcast_visible(&self, character: i64, ball: i64) -> bool {
         self.pilot_observer(character).is_some() && self.visible_to(character, ball)
     }
-    /// Snapshot a pilot's real actor-owned damage state and visibility.
-    pub(crate) fn fleet_damage_snapshot(&self, character: i64) -> Option<(i64, u8, Value)> {
+    /// Snapshot a pilot's real actor-owned damage state; every receiving
+    /// actor evaluates live scene visibility of the ball.
+    pub(crate) fn fleet_damage_snapshot(&self, character: i64) -> Option<(i64, Value)> {
         let ball = self.pilot_ball(character)?;
-        Some((ball.id, ball.cloak, ball.damage_state()))
+        Some((ball.id, ball.damage_state()))
     }
 
     /// Targeted ballpark function, only while the destination observer owns its ego.
-    pub(crate) fn fleet_damage_update(&self, watcher: i64, source_system: i64, ship: i64, cloak: u8, damage: Value) {
-        let Some((ego, _)) = self.pilot_observer(watcher) else { return };
-        if self.id == source_system && (cloak == 0 || ship == *ego) { return; }
+    /// A same-system watcher outside the ball's scene still gets it: fleet
+    /// watchlists deliberately reach across scene boundaries.
+    pub(crate) fn fleet_damage_update(&mut self, watcher: i64, source_system: i64, ship: i64, damage: Value) {
+        let Some((_ego, token)) = self.pilot_observer(watcher) else { return };
+        if self.id == source_system && self.scene_ball_covered(token, ship) { return; }
         // michelle.py:875-879,1594-1599: a ballpark function, not a service event.
         let update = event(self.current_time, "OnFleetDamageStateChange", vec![Value::Int(ship), damage]);
-        self.registry.notify_pilot(watcher, "DoDestinyUpdate", vec![Value::list([update]), Value::Bool(false)]);
+        self.emit_destiny(DestinyAudience::Observer(token), vec![update]);
     }
     /// Identity of persistent ball membership, invalidated on replacement.
     pub(crate) fn persistent_generation(&self, ship: i64) -> Option<u64> {
@@ -244,7 +303,8 @@ impl System {
         ball.segment_acceleration = None;
         self.take(ball.id);
         if let Some(char_id) = ball.char_id {
-            self.pilots.insert(char_id, ball.id);
+            let binding = self.world.upgrade().and_then(|world| world.bindings.binding(char_id));
+            self.pilots.insert(char_id, PilotState { ship_id: ball.id, npc_ignored: false, binding });
             self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
             self.snapshot_positions.insert(ball.id, (self.snapshot_generation, ball.pos));
             if self.snapshot_due == 0 {
@@ -253,11 +313,44 @@ impl System {
         }
         let id = ball.id;
         self.balls.insert(ball.id, ball);
-        if self.actor_combat.get(&id).is_some_and(|record| matches!(record.phase, combat::CombatPhase::Dying { .. } | combat::CombatPhase::Transition { .. })) {
+        self.scene_insert(id);
+        if self.actor_combat.get(&id).is_some_and(|record| matches!(record.phase, combat::CombatPhase::Dying { .. } | combat::CombatPhase::Transition { .. })
+            && !record.has_loaded_obligations()) {
             self.actor_combat.remove(&id);
         }
     }
-    pub fn take(&mut self, id: i64) -> Option<Ball> {
+    /// Register one inserted ball: grid placement, the always-present layer
+    /// decision, and either the cold baseline or a queued birth entry.
+    pub(super) fn scene_insert(&mut self, id: i64) {
+        let (pos, global) = { let ball = &self.balls[&id]; (ball.pos, self.roster_global(ball)) };
+        self.interest.place(id, pos);
+        if global { self.membership.globals.insert(id); }
+        let token = self.capture_ball(id).expect("inserted ball");
+        self.admit_scene_ball(token);
+    }
+    /// Release current topology immediately; the queued exit retires the
+    /// token's last delivered scene at its own FIFO position.
+    pub(super) fn scene_remove(&mut self, id: i64) {
+        self.interest.remove(id);
+        self.membership.globals.remove(&id);
+    }
+    /// Missile flights and projectile state end with their ball: the
+    /// damageable profile first, so a cancellation callback can no longer hit
+    /// the departing incarnation, then the ball's own terminal, every flight
+    /// that targets or was launched by it, and its bomb registration.
+    fn missile_departure(&mut self, id: i64) {
+        self.damageable_projectiles.remove(&id);
+        self.remove_missile_flight(id);
+        self.invalidate_missile_target(id);
+        self.invalidate_missile_launcher(id);
+        self.remove_bomb_flight(id);
+    }
+    /// Remove a ball and capture its presentation exit: old observer tickets and
+    /// clear IDs for the fleet boundary, the sustained effects to stop, and the
+    /// ball's last visibility. The world-side removal is complete here; the
+    /// client clear happens only in the queued exit action.
+    pub(in crate::space) fn take_for_scene_exit(&mut self, id: i64) -> Option<(Ball, SceneExit)> {
+        self.missile_departure(id);
         if (self.is_npc(id) || self.drone(id).is_some()) && self.contains(id) {
             if let Some(generation) = self.combat_membership_generation(id) {
                 let _ = self.retire_combat_source(generation);
@@ -270,11 +363,14 @@ impl System {
         if self.balls.contains_key(&id) {
             crate::services::combat::jamming::clear(self, id);
         }
-        if let Some(ball) = self.balls.get(&id) {
-            crate::services::fleets::space_state::ball_removed(self, self.id, id, ball.char_id);
-        }
+        let exit = if self.balls.contains_key(&id) {
+            let fleet = crate::services::fleets::space_state::remove_ball_tags(self, self.id, id, self.balls[&id].char_id);
+            Some(self.capture_scene_exit(id, fleet))
+        } else { None };
         self.remove_combat_state(id);
         if !self.balls.contains_key(&id) { return None; }
+        self.ball_tokens.remove(&id);
+        self.pending_uncloak.remove(&id);
         sovereignty::links::removed(self, id);
         crate::services::effects::heat::remove_ship(self, id);
         self.compressors.remove(&id);
@@ -282,11 +378,13 @@ impl System {
         self.cloak_targeting.remove(&id);
         self.remove_projections_from(id);
         self.remove_projections_on_departure(id);
+        self.gm_effect_ball_leaving(id);
         self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
         let ball = self.balls.remove(&id)?;
+        self.scene_remove(id);
         if let Some(char_id) = ball.char_id {
-            if self.pilots.get(&char_id) == Some(&id) {
+            if self.pilots.get(&char_id).is_some_and(|p| p.ship_id == id) {
                 self.pilots.remove(&char_id);
                 if let Some(facts) = self.combat_facts.as_mut() { facts.mark_character_scopes_dirty(); }
             }
@@ -295,6 +393,14 @@ impl System {
             crate::services::combat::forget_ship(id);
         }
         self.npc_removed(id);
+        Some((ball, exit?))
+    }
+
+    /// Remove the current ball and queue its native scene departure.
+    pub fn take(&mut self, id: i64) -> Option<Ball> {
+        let (ball, exit) = self.take_for_scene_exit(id)?;
+        self.queue_scene_exit(exit, move |stamp|
+            vec![event(stamp, "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
         Some(ball)
     }
 
@@ -311,6 +417,30 @@ impl System {
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) {
         self.registry.notify_pilot(char_id, name, args);
     }
+
+    /// The sender captured with this pilot's membership, not the current registry sender.
+    pub(crate) fn pilot_sender(&self, character: i64) -> Option<super::NotifyTx> {
+        self.pilots.get(&character).and_then(|pilot| pilot.binding.as_ref()).map(|binding| binding.sender().clone())
+    }
+    pub(crate) fn pilot_bindings(&self) -> impl Iterator<Item = (i64, Option<std::sync::Arc<super::containment::PilotBinding>>)> + '_ {
+        self.pilots.iter().map(|(&character, pilot)| (character, pilot.binding.clone()))
+    }
+
+    /// Apply a committed item rename to the live ball and eligible pilots.
+    ///
+    /// `game.items.name` remains the authority; this refreshes the slim and the
+    /// location cache of every pilot whose live observer can see the ball now.
+    /// The caller is excluded: its own reply already carries the same row.
+    pub(crate) fn set_item_name(&mut self, item_id: i64, name: String, row: &Value, caller: i64) {
+        let Some(ball) = self.balls.get_mut(&item_id) else { return };
+        ball.slim.retain(|(key, _)| *key != "name");
+        ball.slim.push(("name", Value::unicode(name)));
+        for char_id in self.pilots.keys().copied() {
+            if char_id != caller && self.fleet_broadcast_visible(char_id, item_id) {
+                self.notify_pilot(char_id, "OnCfgDataChanged", vec![Value::str("evelocations"), row.clone()]);
+            }
+        }
+    }
     fn population(&self) -> usize {
         self.balls.values().filter(|b| b.char_id.is_some()).count()
     }
@@ -318,7 +448,7 @@ impl System {
         self.registry.request_entry(self.id, char_id, self.population())
     }
     pub(super) fn is_cold(&self, collisions: bool) -> bool {
-        self.actions.is_empty()
+        self.actions.is_empty() && self.destiny_flush_acks.is_empty()
             && !self.combat_facts.as_ref().is_some_and(|facts| facts.is_dirty() || facts.batch_count() != 0)
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
             && self.module_cloaks.is_empty() && self.brains.is_empty() && self.drones.is_empty() && self.observers.is_empty()
@@ -327,85 +457,43 @@ impl System {
             || (b.cloak != 0 && b.cloak_until > 0))
             && !collision::stationary_contact(&self.balls, collisions)
     }
-    fn deliver(&mut self, about: Option<(i64, u8)>, events: Vec<Value>) {
-        self.observers.retain(|&client, (ego, tx)| {
-            if tx.is_closed() { return false; }
-            if about.is_some_and(|(id, cloak)| cloak != 0 && id != *ego) { return true; }
-            if let Some(pending) = &mut self.pending {
-                pending.entry(client).or_default().extend(events.iter().cloned());
-                true
-            } else { tx.send(events.clone()).is_ok() }
-        });
-    }
-    pub fn broadcast(&mut self, about: i64, events: Vec<Value>) {
-        let visibility = self.ball(about).map(|b| (b.id, b.cloak));
-        self.deliver(visibility, events);
-    }
     pub(super) fn queue_drone_announcement(&mut self, id: i64) {
         self.actions.push_back((self.current_time, Box::new(move |s, _| s.drone_announcements.push(id))));
     }
-    pub(super) fn queue_drone_launch_ack(&mut self, ack: tokio::sync::oneshot::Sender<()>) {
-        self.actions.push_back((self.current_time, Box::new(move |s, _| s.drone_launch_acks.push(ack))));
-    }
-    pub fn add_ship(&mut self, mut ball: Ball) {
-        let ship = ball.id;
-        ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
-        if ball.cloak == 0 {
-            let update = add_balls_event(self.current_time, &ball, collision::enabled());
-            self.actions.push_back((self.current_time, Box::new(move |s, _| s.deliver(None, vec![update]))));
+    /// Signal once every action queued so far has been delivered. An idle
+    /// ballpark (empty action queue, no in-flight pending flush, no owed
+    /// scene initial) fires the ack at once; otherwise a FIFO marker moves it
+    /// into `destiny_flush_acks`, which the tick drains after batches,
+    /// initials and announcements — it confirms only its own prefix.
+    pub(crate) fn queue_destiny_flush(&mut self, ack: tokio::sync::oneshot::Sender<()>) {
+        if self.actions.is_empty() && !self.delivery_batching && !self.scene_work_pending() {
+            let _ = ack.send(());
+        } else {
+            self.actions.push_back((self.current_time, Box::new(move |s, _| s.destiny_flush_acks.push(ack))));
         }
-        self.insert(ball);
-        super::ship_cosmetics::announce(self, ship);
     }
-    /// Insert a neutral missile now, then launch and start its impact timer at the next destiny boundary.
-    pub fn launch_missile(&mut self, ball: Ball, target: i64, launcher: i64, delay_ms: u64,
-        impact: impl FnOnce(&mut System) + Send + 'static) {
-        let id = ball.id;
-        self.add_ship(ball);
-        self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
-            let Some(mut ball) = s.balls.remove(&id) else { return };
-            ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
-            ball.interpolation_anchor_ms = s.ms;
-            let owner = launcher.checked_abs().and_then(|owner_id| {
-                if owner_id == id { Some(&ball) } else { s.balls.get(&owner_id) }
-            }).map(|b| (b.pos, b.vel, b.max_vel));
-            if let Some(owner) = owner.filter(|_| target >= 0) {
-                let target_ball = if target == launcher { None } else if target == id {
-                    Some(&ball)
-                } else { s.balls.get(&target) };
-                let target_ball = target_ball.map(|b| (b.id, b.pos, b.radius, b.cloak));
-                ball.launch_native_missile(owner, target_ball, launcher, stamp);
-            }
-            let visibility = (id, ball.cloak);
-            s.balls.insert(id, ball);
-            let update = event(stamp, "LaunchMissile", vec![
-                Value::Int(id), Value::Int(target), Value::Int(launcher),
-                Value::Bool(MISSILE_AIMED_LAUNCH), Value::Bool(MISSILE_MASSIVE),
-            ]);
-            s.deliver(Some(visibility), vec![update]);
-            s.schedule(delay_ms, impact);
-        })));
+    /// Insert the ball first so a replaced incarnation's exit cleanup precedes
+    /// the new Add and entry in the same ordered stream. The birth rides the
+    /// same FIFO: its entry marks readiness before the boundary delta Adds it.
+    pub fn add_ship(&mut self, mut ball: Ball) {
+        ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
+        self.insert(ball);
     }
     pub fn remove_ball(&mut self, id: i64) -> Option<Ball> {
-        let b = self.take(id)?;
-        self.observers.retain(|_, (ego, _)| *ego != id);
-        if b.cloak == 0 {
-            let update = event(self.current_time, "RemoveBalls", vec![Value::list([Value::Int(id)])]);
-            self.actions.push_back((self.current_time, Box::new(move |s, _| s.deliver(None, vec![update]))));
-        }
+        let (b, exit) = self.take_for_scene_exit(id)?;
+        self.remove_ego_observers(id);
+        self.queue_scene_exit(exit, move |stamp|
+            vec![event(stamp, "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
         if b.char_id.is_some() { self.registry.pump_queue(self.id, self.population()); }
         Some(b)
     }
     pub fn destroy_ball(&mut self, id: i64) -> Option<Ball> {
-        let mut b = self.take(id)?;
+        let (mut b, exit) = self.take_for_scene_exit(id)?;
         b.pos = b.position_at(self.ms);
-        let stamp = self.current_time;
-        let visibility = (b.id, b.cloak);
-        let events = vec![
+        self.queue_scene_exit(exit, move |stamp| vec![
             event(stamp, "TerminalPlayDestructionEffect", vec![Value::Int(id), Value::Int(DESTRUCTION_EFFECT_EXPLOSION)]),
             event(stamp, "RemoveBalls", vec![Value::list([Value::Int(id)])]),
-        ];
-        self.actions.push_back((stamp, Box::new(move |s, _| s.deliver(Some(visibility), events))));
+        ]);
         if b.char_id.is_some() { self.registry.pump_queue(self.id, self.population()); }
         Some(b)
     }
@@ -414,14 +502,13 @@ impl System {
         b.health = health;
         let damage = b.damage_state();
         let character = b.char_id;
-        let cloak = b.cloak;
-        let update = event(self.current_time, "OnDamageStateChange", vec![Value::Int(id), damage.clone()]);
-        self.broadcast(id, vec![update]);
-        // The actor captures visibility; fleet ownership is consulted only by the deferred worker.
+        self.publish_destiny(id, |stamp| vec![event(stamp, "OnDamageStateChange", vec![Value::Int(id), damage.clone()])]);
+        // Every receiving actor evaluates live scene visibility; fleet
+        // ownership is consulted only by the deferred worker.
         if let (Some(character), Some(world)) = (character, self.world.upgrade()) {
             let system = self.id;
             self.defer(async move {
-                crate::services::fleets::damage::route(world, character, system, id, cloak, damage, None).await;
+                crate::services::fleets::damage::route(world, character, system, id, damage, None).await;
             });
         }
     }
@@ -463,7 +550,7 @@ impl System {
             ball.slim.push(("compression_facility_typelists", Value::Dict(ranges.into_iter().map(|(list, range)| (Value::Int(list), Value::Float(range))).collect())));
         }
         let slim = ball.slim_item();
-        self.broadcast(ship, vec![event(self.current_time, "OnSlimItemChange", vec![Value::Int(ship), slim])]);
+        self.publish_destiny(ship, |stamp| vec![event(stamp, "OnSlimItemChange", vec![Value::Int(ship), slim])]);
     }
     pub(crate) fn cloak_reactivation_ready(&self, module: i64) -> bool {
         self.cloak_reactivation.get(&module).is_none_or(|&until| until <= self.ms)
@@ -482,8 +569,10 @@ impl System {
     pub(crate) fn begin_module_cloak(&mut self, ship: i64, module: i64, generation: Arc<std::sync::atomic::AtomicBool>, reactivation_ms: i64, targeting_ms: i64, guard: impl FnOnce(&System) -> bool + Send + 'static, on_success: Option<Box<dyn FnOnce(&mut System) + Send>>) -> bool {
         if self.module_cloaks.contains_key(&ship) || !self.cloak_reactivation_ready(module)
             || self.ball(ship).is_none_or(|b| b.cloak != 0) { return false; }
+        let token = self.capture_ball(ship).expect("cloak ship exists");
         self.module_cloaks.insert(ship, ModuleCloak { module, generation: generation.clone(), reactivation_ms, targeting_ms });
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
+            if !s.ball_token_current(token) { return; }
             let current = s.module_cloaks.get(&ship).is_some_and(|cloak| Arc::ptr_eq(&cloak.generation, &generation));
             if !current || !guard(s) || s.ball(ship).is_none_or(|b| b.cloak != 0) {
                 if current {
@@ -496,13 +585,14 @@ impl System {
                 }
                 return;
             }
-            crate::services::fleets::space_state::ball_removed(s, s.id, ship, None);
-            s.deliver(None, vec![event(stamp, "CloakBall", vec![Value::Int(ship)])]);
+            s.present_cloak(token, stamp);
             if let Some(ball) = s.balls.get_mut(&ship) {
                 ball.cloak = 1;
                 ball.cloak_until = 0;
             }
             s.detach_warp_arrival(ship);
+            s.invalidate_missile_target(ship);
+            s.invalidate_missile_launcher(ship);
             if let Some(on_success) = on_success { on_success(s); }
         })));
         true
@@ -534,6 +624,7 @@ impl System {
     }
     pub fn uncloak(&mut self, ship: i64) -> bool {
         if self.balls.get(&ship).is_none() || (self.balls[&ship].cloak == 0 && !self.module_cloaks.contains_key(&ship)) || !self.pending_uncloak.insert(ship) { return false; }
+        let token = self.capture_ball(ship).expect("uncloak ship exists");
         if let Some(cloak) = self.module_cloaks.remove(&ship) {
             cloak.generation.store(true, std::sync::atomic::Ordering::Relaxed);
             if crate::services::effects::lifecycle::force_inactive(cloak.module, &cloak.generation) {
@@ -545,7 +636,9 @@ impl System {
                 self.cloak_targeting.insert(ship, self.ms.saturating_add(cloak.targeting_ms));
             }
         }
-        self.actions.push_back((self.current_time, Box::new(move |s, stamp| s.apply_uncloak(ship, stamp))));
+        self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
+            if s.ball_token_current(token) { s.apply_uncloak_with_collisions(ship, stamp, s.scene_action_collisions()); }
+        })));
         true
     }
     pub(crate) fn drop_jump_cloak(&mut self, ship: i64) -> bool {
@@ -556,81 +649,15 @@ impl System {
         }
         true
     }
-    fn apply_uncloak(&mut self, ship: i64, stamp: i64) {
-        self.apply_uncloak_with_collisions(ship, stamp, collision::enabled());
-    }
     pub(super) fn apply_uncloak_with_collisions(&mut self, ship: i64, stamp: i64, collisions: bool) {
         self.pending_uncloak.remove(&ship);
         let Some(ball) = self.balls.get_mut(&ship) else { return };
         if ball.cloak == 0 { return; }
         ball.cloak = 0;
         ball.cloak_until = 0;
-        let add = add_balls_event(stamp, ball, collisions);
-        let own = event(stamp, "UncloakBall", vec![Value::Int(ship)]);
-        let fx = special_fx(stamp, ship, None, None, "effects.Uncloak", 1, 0, UNCLOAK_FX_DURATION_MS, None);
-        // Native UncloakBall restores massiveness (Ballpark.cpp:5257-5287).
-        let reset = collision::reset_event(ship, stamp, collisions);
-        self.observers.retain(|&client, (ego, tx)| {
-            if tx.is_closed() { return false; }
-            let update = if *ego == ship { own.clone() } else { add.clone() };
-            let owner_reset = if *ego == ship { reset.as_ref() } else { None };
-            if let Some(pending) = &mut self.pending {
-                let updates = pending.entry(client).or_default();
-                updates.push(update);
-                if let Some(reset) = owner_reset { updates.push(reset.clone()); }
-                updates.push(fx.clone());
-                true
-            } else {
-                let mut updates = Vec::with_capacity(2 + usize::from(owner_reset.is_some()));
-                updates.push(update);
-                if let Some(reset) = owner_reset { updates.push(reset.clone()); }
-                updates.push(fx.clone());
-                tx.send(updates).is_ok()
-            }
-        });
-        super::ship_cosmetics::announce(self, ship);
+        let token = self.capture_ball(ship).expect("uncloak ball exists");
+        self.present_uncloak(token, stamp, collisions);
     }
-    pub fn observe(&mut self, client_id: i64, ego: i64, tx: DestinyTx) -> Value {
-        let system_id = self.id;
-        let tick = self.current_time;
-        let collisions = collision::enabled();
-        self.observers.insert(client_id, (ego, tx));
-        super::ship_cosmetics::observe(self, ego);
-        let mut state = vec![DESTINY_FULLSTATE];
-        state.extend_from_slice(&(tick as i32).to_le_bytes());
-        let mut slims = Vec::new();
-        let mut damage = Vec::new();
-        for b in self.balls.values().filter(|b| b.cloak == 0 || b.id == ego) {
-            b.write(&mut state, collisions);
-            slims.push(b.slim_item());
-            if b.free {
-                damage.push((Value::Int(b.id), b.damage_state()));
-            }
-        }
-        let sol = Value::instance(
-            "eve.common.script.util.slimItem.SlimItem",
-            [("itemID", Value::Int(system_id)), ("typeID", Value::Int(infinity_core::consts::TYPE_SOLAR_SYSTEM.into())), ("ownerID", Value::Int(1))],
-        );
-        let bag = Value::instance(
-            "utillib.KeyVal",
-            [
-                ("state", Value::str(state)),
-                ("ego", Value::Int(ego)),
-                ("slims", Value::List(slims)),
-                ("damageState", Value::Dict(damage)),
-                ("effectStates", Value::list([])),
-                ("allianceBridges", Value::list([])),
-                ("droneState", Value::list(self.drone_state_rows(ego))),
-                ("solItem", sol),
-                ("industryLevel", Value::Int(0)),
-                ("researchLevel", Value::Int(0)),
-                ("dbuffState", Value::list([])),
-            ],
-        );
-
-        event(tick, "SetState", vec![bag])
-    }
-    pub fn unobserve(&mut self, client_id: i64) { self.observers.remove(&client_id); }
     /// Enqueue fitted motion only while the projection snapshot remains current.
     pub(crate) fn queue_projection_kinematics(&mut self, target: i64, revision: u64, values: crate::services::effects::propulsion::Kinematics) {
         crate::services::effects::propulsion::queue_kinematics(self, target, values);
@@ -659,12 +686,26 @@ impl System {
     }
     /// Queue a command for the next destiny boundary, retaining its enqueue stamp.
     pub fn command(&mut self, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
+        let token = self.capture_ball(ship);
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
-            s.apply_command(ship, stamp, f);
+            if token.is_some_and(|token| s.ball_token_current(token)) {
+                let collisions = s.scene_action_collisions();
+                s.apply_command(ship, stamp, collisions, f);
+            }
         })));
     }
 
-    fn apply_command(&mut self, ship: i64, stamp: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value>) {
+    /// Apply one stamped command inside the ordered stream. The earlier
+    /// prefix's ready work settles first and the source's old published home
+    /// is captured; the ball is changed, returned and its ready position
+    /// refreshed, then the shared delta settles so new holders arrive only
+    /// through the result-state Add. The command's own events go only to
+    /// bindings that held the exact token before and still hold it.
+    fn apply_command(&mut self, ship: i64, stamp: i64, collisions: bool,
+        f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value>) {
+        self.settle_scene(stamp, collisions, false);
+        let token = self.ball_token(ship);
+        let (home, global) = token.map_or((None, false), |token| self.scene_home(token));
         let Some(mut ball) = self.balls.remove(&ship) else { return };
         ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
         let old_warp = (ball.mode == MODE_WARP).then_some(
@@ -678,9 +719,14 @@ impl System {
         ball.old_pos = ball.pos;
         ball.old_vel = ball.vel;
         ball.segment_acceleration = None;
-        let visibility = (ball.id, ball.cloak);
         self.balls.insert(ship, ball);
-        if !events.is_empty() { self.deliver(Some(visibility), events); }
+        self.refresh_scene_location(ship);
+        self.settle_scene(stamp, collisions, false);
+        if !events.is_empty() {
+            if let Some(token) = token {
+                self.emit_destiny(DestinyAudience::Retained { token, bubble: home, global }, events);
+            }
+        }
     }
 }
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-lua", feature = "tests-runtime", feature = "tests-ships", feature = "tests-slash", feature = "tests-social", feature = "tests-space")))] pub(crate) mod tests;

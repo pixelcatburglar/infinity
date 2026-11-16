@@ -2,12 +2,15 @@
 use super::*;
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run alone"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run this exact test in its own process"]
 async fn completed_dock_respects_pending_deadline_and_executes_due_once() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let system = -1;
-    let station_id = -2;
+    let sde = std::sync::Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let station_row = sde.map.stations().find(|s| s.solar_system_id.is_some() && s.constellation_id.is_some() && s.region_id.is_some()
+        && sde.map.celestial(s.station_id).is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some()))
+        .expect("dedicated SDE must contain a station with full ancestry");
+    let (station_id, system) = (station_row.station_id, station_row.solar_system_id.unwrap());
     let ceo: i64 = db.query_one("INSERT INTO game.accounts(user_name,password_hash,role) VALUES(nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
     let ceo_char: i64 = db.query_one("INSERT INTO game.characters(user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id) VALUES($1,nextval('game.characters_character_id_seq')::text,1,1,1,$2,60000001) RETURNING character_id", &[&ceo, &1_i64]).await.unwrap().get("character_id");
     let corp: i64 = db.query_one("INSERT INTO game.corporations(name,ticker,ceo_id,creator_id,station_id,created) VALUES ('dock-kick-'||nextval('game.corporations_corporation_id_seq')::text,'DK'||currval('game.corporations_corporation_id_seq')::text,$1,$1,60000001,1) RETURNING corporation_id", &[&ceo_char]).await.unwrap().get("corporation_id");
@@ -20,11 +23,6 @@ async fn completed_dock_respects_pending_deadline_and_executes_due_once() {
     let (mut manager, _) = crate::services::tests::client(db.clone(), ceo_char).await;
     let world = manager.world.clone();
     admit_fixture_ship(&db, &world, system, target_char, hull, true).await;
-    let mut station = ship();
-    station.id = station_id; station.char_id = None; station.mode = MODE_STOP;
-    station.vel = [0.0; 3]; station.old_vel = [0.0; 3]; station.segment_acceleration = None;
-    station.radius = 1000.0; station.pos = [3550.0, 0.0, 0.0]; station.old_pos = station.pos;
-    world.with(system, move |s| s.insert(station)).await.unwrap();
     let marker_first: i64 = db.query_one("SELECT COALESCE(MAX(notification_id),0) AS marker FROM game.notifications WHERE receiver_id=ANY($1)", &[&[ceo_char,target_char].as_slice()]).await.unwrap().get("marker");
     manager.session.apply(vec![("charid", Value::Int(ceo_char)), ("corpid", Value::Int(corp)), ("stationid", Value::Int(60000001))]);
     let identity = crate::services::identity::Identity { char_id: target_char, ship_id: Some(hull), corp_id: corp, station_id: None, system_id: Some(system) };
@@ -40,6 +38,7 @@ async fn completed_dock_respects_pending_deadline_and_executes_due_once() {
     let deadline: i64 = db.query_one("SELECT eligible_at FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &target_char]).await.unwrap().get("eligible_at");
     assert_eq!(deadline, crate::services::corps::exit::deadline(removed).unwrap());
     assert!(deadline > crate::client::filetime_now());
+    approach_station(&world, system, station_id, hull, APPROACH_CLEARANCE).await;
     let change = dock(&identity, &db, &world, Some(system), station_id, None::<&mut crate::client::Client>).await.unwrap();
     assert_eq!(change.updates, vec![("solarsystemid", Value::None), ("stationid", Value::Int(station_id))]);
     assert_eq!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&target_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
@@ -62,6 +61,7 @@ async fn completed_dock_respects_pending_deadline_and_executes_due_once() {
     assert_eq!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&due_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
     let eligible: i64 = db.query_one("SELECT eligible_at FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &due_char]).await.unwrap().get("eligible_at");
     assert!(eligible <= crate::client::filetime_now());
+    approach_station(&world, system, station_id, due_hull, APPROACH_CLEARANCE).await;
     dock(&due_identity, &db, &world, Some(system), station_id, None::<&mut crate::client::Client>).await.unwrap();
     assert_ne!(db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&due_char]).await.unwrap().get::<_, i64>("corporation_id"), corp);
     assert!(db.query_opt("SELECT character_id FROM game.corp_pending_kicks WHERE corporation_id=$1 AND character_id=$2", &[&corp, &due_char]).await.unwrap().is_none());

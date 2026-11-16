@@ -41,22 +41,26 @@ fn apply_kinematics(b: &mut Ball, stamp: i64, values: Kinematics) -> Vec<Value> 
     events
 }
 
-/// The ship's current fitted kinematics for everyone's destiny.
-pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
-    let Ok(fit) = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await else { return };
-    let Some(revision) = fit.projection_revision() else { return };
-    let values = kinematics(&fit, Key::Ship);
+/// Restore the ship's current fitted kinematics for everyone's destiny once
+/// the activation retired; also releases its activation-generation record.
+pub(super) async fn stop_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>) {
     let ship = cx.ship_id;
     cx.world.post(cx.system_id, move |s| {
         let mut st = combat::state();
         if !st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &generation))
-            || st.active.contains_key(&master) != active { return; }
+            || st.active.contains_key(&master) { return; }
+        // The resident fit supplies kinematics and its projection snapshot in
+        // the same actor turn; a projection write since the record's snapshot
+        // rebuilds the record instead of queuing stale motion.
+        let fitted = s.with_combat_fit(ship, |fit, _key, _stamp|
+            fit.projection_revision().map(|revision| (revision, kinematics(fit, Key::Ship))));
+        let Some(Some((revision, values))) = fitted else { return };
         if s.projection_revision(ship) == revision {
             s.queue_projection_kinematics(ship, revision, values);
         } else {
             s.refresh_projection_target(ship);
         }
-        if !active { st.activation_generation.remove(&master); }
+        st.activation_generation.remove(&master);
     });
 }
 
@@ -74,4 +78,4 @@ fn propulsion_transition(b: &mut Ball, stamp: i64, speed: f64, mass: f64, signat
     events
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

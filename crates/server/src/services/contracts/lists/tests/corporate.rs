@@ -117,9 +117,46 @@ async fn corporate_lists_counts_search_and_wire() {
         let attention = DbRowDescriptor::new([("contractID", DbType::I8), ("forCorp", DbType::Bool)]);
         assert!(attr(&login, "needsAttention").items().unwrap().iter().any(|row| attention.get(row, "contractID") == Some(Value::Int(expired)) && attention.get(row, "forCorp") == Some(Value::Bool(true))));
         assert!(!ids(attr(&login, "assignedToMe")).contains(&personal_internal));
+        // Escrow values items with the in-memory snapshot; an SQL aggregate over the same
+        // rows and the stored price table is the independent expectation. Exact fixtures
+        // compare bit-equal; the i64::MAX rows only admit an ULP bound because float8
+        // summation is not bit-stable.
+        let priced = sde.prices.iter().find(|p| p.average.is_finite() && p.average > 0.0).unwrap().type_id;
+        let missing = i32::MAX;
+        assert!(sde.prices.get(missing).is_none());
+        let missing_rows: i64 = db.query_one("SELECT count(*) FROM game.retail_prices WHERE type_id = $1", &[&missing]).await.unwrap().get("count");
+        assert_eq!(missing_rows, 0);
+        db.execute("UPDATE game.contracts SET reward = 10.0 WHERE contract_id = $1", &[&personal]).await.unwrap();
+        db.execute("UPDATE game.contracts SET reward = 3.0 WHERE contract_id = $1", &[&accepted]).await.unwrap();
+        db.execute("UPDATE game.contracts SET status = $2 WHERE contract_id = $1", &[&personal_internal, &STATUS_REJECTED]).await.unwrap();
+        for date in [at, at + 1] {
+            crate::dao::contracts::lifecycle::insert_bid(&db, bid, actor.character, ACCOUNT_CASH, 7.0, date).await.unwrap();
+        }
+        let empty_wire = success(escrow(&client).await);
+        assert_eq!(attr(&empty_wire, "itemsEscrow").as_float(), Some(0.0));
+        for (contract, type_id, quantity, in_crate) in [(personal, priced, i64::MAX, true), (personal, priced, i64::MAX, true), (personal, missing, 5, true), (personal, priced, 100, false), (personal_internal, priced, 7, true), (corporate, priced, 9, true)] {
+            db.execute("INSERT INTO game.contract_items (contract_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, $4)", &[&contract, &type_id, &quantity, &in_crate]).await.unwrap();
+        }
+        let expected = db.query_one("SELECT (SELECT COALESCE(sum(reward), 0) FROM game.contracts WHERE (CASE WHEN for_corp THEN issuer_corp_id ELSE issuer_id END) = $1 AND type <> $2 AND status IN ($3, $4))
+                  + (SELECT COALESCE(sum(b.amount), 0) FROM game.contract_bids b JOIN game.contracts k USING (contract_id)
+                     WHERE b.bidder_id = $1 AND k.status = $3
+                       AND b.amount = (SELECT max(amount) FROM game.contract_bids WHERE contract_id = b.contract_id)) AS isk_escrow,
+                    (SELECT COALESCE(sum(ci.quantity * COALESCE(r.average, 0)), 0) FROM game.contract_items ci
+                     JOIN game.contracts k USING (contract_id) LEFT JOIN game.retail_prices r USING (type_id)
+                     WHERE (CASE WHEN k.for_corp THEN k.issuer_corp_id ELSE k.issuer_id END) = $1 AND ci.in_crate AND k.status IN ($3, $4)) AS items_escrow", &[&actor.character, &TYPE_AUCTION, &STATUS_OUTSTANDING, &STATUS_IN_PROGRESS]).await.unwrap();
+        let wire = success(escrow(&client).await);
+        assert_eq!(attr(&wire, "iskEscrow").as_float(), Some(expected.get::<_, f64>("isk_escrow")));
+        let items_escrow: f64 = expected.get("items_escrow");
+        let wire_items = attr(&wire, "itemsEscrow").as_float().unwrap();
+        assert!((wire_items - items_escrow).abs() <= 16.0 * f64::EPSILON * items_escrow.abs().max(1.0), "{wire_items} vs {items_escrow}");
+        let corp_items = crate::dao::contracts::reports::escrow(&db, corp, TYPE_AUCTION, STATUS_OUTSTANDING, STATUS_IN_PROGRESS).await.unwrap().items;
+        assert_eq!(corp_items.iter().map(|i| (i.type_id, i.quantity)).collect::<Vec<_>>(), vec![(priced, 9.0)]);
+        let empty = crate::dao::contracts::reports::escrow(&db, ceo.character, TYPE_AUCTION, STATUS_OUTSTANDING, STATUS_IN_PROGRESS).await.unwrap();
+        assert_eq!((empty.isk, empty.items.len()), (3.0, 0));
     });
     let result = task.await;
     db.execute("DELETE FROM game.contract_bids WHERE contract_id IN (SELECT contract_id FROM game.contracts WHERE issuer_id = ANY($1))", &[&vec![actor.character, ceo.character]]).await.unwrap();
+    db.execute("DELETE FROM game.contract_items WHERE contract_id IN (SELECT contract_id FROM game.contracts WHERE issuer_id = ANY($1))", &[&vec![actor.character, ceo.character]]).await.unwrap();
     db.execute("DELETE FROM game.contracts WHERE issuer_id = ANY($1)", &[&vec![actor.character, ceo.character]]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id = 1 WHERE character_id = ANY($1)", &[&vec![actor.character, ceo.character]]).await.unwrap();
     db.execute("DELETE FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.unwrap();
@@ -152,7 +189,7 @@ async fn corporate_picker_roles_nested_custody_and_split_notifications() {
     let task = tokio::spawn(async move {
         let db = task_db;
         let office = transfers::insert(&db, type_id, corp, station, 0, 1).await.unwrap();
-        crate::dao::offices::insert(&db, office, corp, station, filetime_now() + FILETIME_DAY).await.unwrap();
+        crate::dao::offices::insert(&db, office, corp, station, filetime_now() + FILETIME_DAY, 0).await.unwrap();
         let mut divisions = Vec::new();
         for n in 0..CORP_HANGAR_DIVISIONS {
             divisions.push(transfers::insert(&db, type_id, corp, office, FLAG_CORP_SAG1 + n, 10).await.unwrap());

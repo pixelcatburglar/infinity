@@ -1,7 +1,12 @@
-//! Player and NPC smartbomb radius damage from fitted dogma attributes.
+//! Player and NPC smartbomb radius damage from fitted dogma attributes, plus
+//! the shared area settlement Vorton chain strikes use.
 //! Mirrors EMPWave.py's empFieldRange; candidates use actor-sampled positions and
-//! damage uses the shared combat pipeline. Effects and damage are transient.
+//! damage uses the shared combat pipeline. Damageable projectiles in range take
+//! the shared projectile capability after the pulse's source admission and never
+//! enter ship plans, combat facts or loss. Effects and damage are transient.
+//! Vorton victims apply the shared missile formula per target, never a turret roll.
 use super::lifecycle::{self, Cycle, CycleOutcome, Module};
+use super::parameters::MemberPacket;
 use super::registry::Effect;
 use super::space_source::PreparedCombatAttempt;
 use infinity_core::consts::dogma::ATTR_EMP_FIELD_RANGE;
@@ -35,11 +40,24 @@ pub(super) enum DamageGuard {
     Npc(i64, i64, u64),
 }
 
+/// How each accepted victim's raw damage vector is derived inside the actor
+/// settlement. Vorton application samples every target's signature and
+/// absolute sampled velocity independently through the shared missile
+/// formula; there is no turret chance, miss or wrecking roll.
+#[derive(Clone, Copy)]
+pub(super) enum DamageApplication {
+    /// One fixed typed damage vector applied to every victim.
+    Fixed([f64; 4]),
+    /// Vorton packet: charge-raw damage scaled per target by missile
+    /// application on that target's own signature and absolute speed.
+    Vorton(super::parameters::VortonInputs),
+}
+
 pub(super) async fn apply_damage_guarded(
     db: &Db, world: &Arc<World>, system: i64, weapon: i32,
-    mut victims: Vec<(i64, Option<i64>, Option<u64>, bool, Option<(i64, f64)>)>, raw: [f64; 4],
+    mut victims: Vec<(i64, Option<i64>, Option<u64>, bool, Option<(i64, f64)>)>,
+    application: DamageApplication,
     guard: Option<DamageGuard>, mut attempt: PreparedCombatAttempt,
-    turret: Option<(f64, f64, f64, f64)>,
 ) -> Result<(), CallError> {
     let facts = attempt.facts();
     let ship = facts.entity.item_id;
@@ -69,23 +87,32 @@ pub(super) async fn apply_damage_guarded(
         let at = s.combat_observed_time();
         victims.sort_unstable_by_key(|entry| entry.0);
         let mut targets = Vec::with_capacity(victims.len());
+        let mut projectiles = Vec::new();
         for (target, pilot, membership, illegal, report) in &mut victims {
             let (target, pilot, membership, illegal) = (*target, *pilot, *membership, *illegal);
+            if s.projectile_damageable(target) {
+                let base = match application {
+                    DamageApplication::Fixed(raw) => raw,
+                    DamageApplication::Vorton(inputs) => inputs.raw,
+                };
+                projectiles.push((target, base));
+                continue;
+            }
             if !s.ball(target).is_some_and(|ball| ball.char_id == pilot)
                 || s.combat_membership_generation(target) != membership { continue; }
             if s.is_damage_immune(target) { continue; }
-            let raw = if let Some((optimal, falloff, tracking, signature)) = turret {
-                let Some(source) = s.sampled_ball(ship) else { continue };
-                let Some(victim) = s.sampled_ball(target) else { continue };
-                let chance = super::weapons::turret_chance(&source, &victim, optimal, falloff, tracking,
-                    signature, super::weapons::target_signature(&sde, &victim));
-                let multiplier = super::weapons::turret_roll(chance);
-                *report = Some((super::weapons::hit_quality(multiplier), 0.0));
-                if multiplier <= 0.0 { continue; }
-                raw.map(|value| value * multiplier)
-            } else {
-                *report = Some((super::weapons::hit_quality(1.0), 0.0));
-                raw
+            let raw = match application {
+                DamageApplication::Fixed(raw) => {
+                    *report = Some((super::weapons::hit_quality(1.0), 0.0));
+                    raw
+                }
+                DamageApplication::Vorton(inputs) => {
+                    let Some(victim) = s.sampled_ball(target) else { continue };
+                    *report = Some((super::weapons::hit_quality(1.0), 0.0));
+                    super::vorton::vorton_application(inputs.raw,
+                        super::weapons::target_signature(&sde, &victim),
+                        dist(victim.vel, [0.0; 3]), inputs.aoe_cloud, inputs.aoe_velocity, inputs.drf)
+                }
             };
             let source = DamageSource { attacker_id: attacker, attacker_ball_id: Some(ship),
                 source_ship_id: Some(ship), source_ship_type: Some(facts.entity.type_id),
@@ -98,7 +125,8 @@ pub(super) async fn apply_damage_guarded(
             }
         }
         targets.sort_unstable_by_key(|target| (target.target.item_id, target.target.incarnation));
-        let applied = s.apply_area_damage(facts, &mut targets, at, |_| valid_source);
+        let applied = if targets.is_empty() { s.admit_area_source(facts, &mut [], at, |_| valid_source) }
+            else { s.apply_area_damage(facts, &mut targets, at, |_| valid_source) };
         attempt.disarm();
         match applied {
             Ok(false) => return Ok((Vec::new(), None, victims)),
@@ -107,6 +135,7 @@ pub(super) async fn apply_damage_guarded(
             Err(error) => return Err(CallError::Internal(anyhow::anyhow!("area combat refusal: {error:?}"))),
             Ok(true) => {}
         }
+        for (target, projectile_raw) in projectiles { s.apply_projectile_damage(target, projectile_raw); }
         let mut receipts = Vec::new();
         let mut first_error = None;
         for target in &mut targets {
@@ -137,7 +166,7 @@ pub(super) async fn apply_damage_guarded(
     }
     for (target, pilot, _, _, report) in victims {
         if let Some((quality, dealt)) = report {
-            super::weapons::report_hit(world, ship, target, attacker, pilot, weapon, dealt, quality);
+            super::weapons::report_hit(world, ship, target, attacker, pilot, weapon, dealt, quality, false);
         }
     }
     match first_error { Some(error) => Err(error), None => Ok(()) }
@@ -159,8 +188,8 @@ pub(crate) async fn apply_npc(
         let raw = ATTR_DAMAGE.map(|attr| fit.value(Key::Ship, attr).max(0.0));
         Some((victims(s, source, me.pos, radius), raw, me.type_id))
     }).await.flatten() else { return Ok(()) };
-    apply_damage_guarded(db, world, system, weapon, targets, raw,
-        Some(DamageGuard::Npc(source, hostile, generation)), attempt, None).await
+    apply_damage_guarded(db, world, system, weapon, targets, DamageApplication::Fixed(raw),
+        Some(DamageGuard::Npc(source, hostile, generation)), attempt).await
 }
 
 pub(super) async fn validate(cx: &Ctx, _fit: &Fit, _module: &Module, _effect: &Effect, _target: Option<i64>) -> Result<(), CallError> {
@@ -171,17 +200,21 @@ pub(super) async fn validate(cx: &Ctx, _fit: &Fit, _module: &Module, _effect: &E
     Ok(())
 }
 
-pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let master = cycle.modules[0].id;
     let generation = cycle.stop.clone();
     for index in 0..cycle.modules.len() {
         let module = cycle.modules[index].clone();
-        let Some(attempt) = lifecycle::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
+        let Some(attempt) = lifecycle::combat_source::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
             return Ok(CycleOutcome::Stop("source lost or activation replaced"));
         };
-        let key = Key::Module(module.id);
-        let raw = ATTR_DAMAGE.map(|attr| fit.value(key, attr).max(0.0));
-        let radius = fit.value(key, ATTR_EMP_FIELD_RANGE);
+        let Some(member) = cycle.inputs.members.get(index) else {
+            return Err(CallError::Internal(anyhow::anyhow!("smartbomb cycle captured without member inputs")));
+        };
+        let MemberPacket::Smartbomb(inputs) = &member.packet else {
+            return Err(CallError::Internal(anyhow::anyhow!("smartbomb cycle captured without smartbomb inputs")));
+        };
+        let (radius, raw) = (inputs.radius, inputs.raw);
         let ship = cx.ship_id;
         let check = generation.clone();
         let Some(targets) = cx.world.with(cx.system_id, move |s| {
@@ -190,11 +223,11 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
             if source.mode == MODE_WARP { return None; }
             Some(victims(s, ship, source.pos, radius))
         }).await.flatten() else { return Ok(CycleOutcome::Stop("source lost or in warp")); };
-        apply_damage_guarded(&cx.db, &cx.world, cx.system_id, module.type_id, targets, raw,
-            Some(DamageGuard::Player(master, generation.clone())), attempt, None).await?;
+        apply_damage_guarded(&cx.db, &cx.world, cx.system_id, module.type_id, targets, DamageApplication::Fixed(raw),
+            Some(DamageGuard::Player(master, generation.clone())), attempt).await?;
         if !generation_valid(master, &generation) { return Ok(CycleOutcome::Stop("activation replaced")); }
     }
     Ok(CycleOutcome::Continue)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

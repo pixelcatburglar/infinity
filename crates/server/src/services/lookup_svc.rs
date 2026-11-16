@@ -77,4 +77,4 @@ async fn owner_lookup(c: &Client, call: &Call<'_>) -> CallResult {
     })))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-services"))] mod tests;

@@ -42,7 +42,9 @@ leaves that corporation's prior rows unchanged; other corporations can succeed.
 Repeating the import is safe. Upsert deliberately does not remove older offers
 that are no longer present in a response; catalogue retirement requires a
 separate operator decision. Run when the server's catalogue is not being
-actively changed by another importer.
+actively changed by another importer. The server reads `game.lp_offers` into
+memory once at startup and never reloads it while running; restart the server
+for an imported or adjusted catalogue to take effect.
 
 Focused tests run with `cargo test --release -p lp-import`. The ignored
 database test uses the real upsert transaction against a disposable empty

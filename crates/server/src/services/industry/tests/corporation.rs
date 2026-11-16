@@ -3,6 +3,7 @@ use infinity_core::consts::{ACCOUNT_CASH, CARGO_CONTAINER_GROUPS, FLAG_CARGO, FL
 use crate::db::Db;
 
 mod readiness;
+mod locks;
 
 #[derive(Clone, Copy)]
 struct Fixture { account: i64, actor: i64, ceo: i64, corp: i64, office: i64, station: i64, system: i64, bp: i32 }
@@ -104,31 +105,8 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     crate::dao::jobs::tests::require_job_free_database(&db).await;
     require_no_installed_industry_jobs(&db).await;
-    let baseline = super::database_fingerprint(&db).await;
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let facility = sde.map.stations().filter(|s| s.type_id.is_some() && s.solar_system_id.is_some()).filter_map(|s| Facility::from_station(&sde, s)).find(|f| f.factory && f.laboratory).expect("factory and laboratory station");
-    let prices: HashMap<i32, f64> = db.query("SELECT type_id, adjusted FROM game.retail_prices", &[]).await.unwrap().into_iter().map(|r| (r.get("type_id"), r.get("adjusted"))).collect();
-    let bp = sde.types.iter().find_map(|t| {
-        let m = sde.industry.activity(t.type_id, MANUFACTURING)?;
-        let c = sde.industry.activity(t.type_id, COPYING)?;
-        for activity in [RESEARCH_TIME, RESEARCH_MATERIAL] {
-            let research = sde.industry.activity(t.type_id, activity)?;
-            if research.time <= 0.0 || research.time >= 1_000_000.0 || research.materials.iter().any(|(_, q)| *q <= 0 || *q >= 1_000_000) { return None; }
-        }
-        let price = m.materials.iter().map(|(t, q)| prices.get(t).copied().unwrap_or(0.0) * *q as f64).sum::<f64>();
-        (t.published == Some(true) && t.market_group_id.is_some() && sde.is_tradable(t.type_id) && m.time > 0.0 && m.time < 1_000_000.0 && c.time > 0.0 && c.time < 1_000_000.0 && !m.materials.is_empty() && m.products.len() == 1 && m.products[0].1 > 0 && c.max_production_limit >= 1 && m.materials.iter().chain(&c.materials).all(|(_, q)| *q > 0 && *q < 1_000_000) && (10_000.0..100_000_000.0).contains(&price)).then_some(t.type_id)
-    }).expect("manufacturing and copying blueprint in SDE");
-    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('industry-corp-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
-    let actor: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,balance) VALUES ($1,'industry-corp-' || nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,1000000000) RETURNING character_id", &[&account, &facility.id]).await.unwrap().get("character_id");
-    let ceo: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,'industry-corp-' || nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
-    let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('industry-corp-' || nextval('game.corporations_corporation_id_seq')::text,'IC' || nextval('game.corporations_corporation_id_seq')::text,$1,$1,$2,0) RETURNING corporation_id", &[&ceo, &facility.id]).await.unwrap().get("corporation_id");
-    let roles = ROLE_FACTORY_MANAGER | ROLE_FACTORY_MANUFACTURING | ROLE_FACTORY_SCIENCE | ROLE_HANGAR_CAN_TAKE_1 | (134_217_728_i64 << 1);
-    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2::bigint & ~$4::bigint,corp_roles_hq=$2::bigint & $4::bigint WHERE character_id=$3", &[&corp, &roles, &actor, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
-    db.execute("UPDATE game.characters SET corporation_id=$1,station_id=$3,corp_roles=$4 WHERE character_id=$2", &[&corp, &ceo, &facility.id, &infinity_core::consts::ROLE_DIRECTOR]).await.unwrap();
-    db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,1000000000)", &[&corp, &(ACCOUNT_CASH + 1)]).await.unwrap();
-    let office = item(&db, i32::try_from(facility.type_id).unwrap(), corp, facility.id, FLAG_HANGAR, 1, true).await;
-    crate::dao::offices::insert(&db, office, corp, facility.id, 1).await.unwrap();
-    let f = Fixture { account, actor, ceo, corp, office, station: facility.id, system: facility.system, bp };
+    let (f, facility, prices, roles) = fixture(&db, &sde).await;
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let db = test_db;
@@ -144,7 +122,7 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: f.account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
         let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde.clone(), chat, world, login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db.clone(), sde.clone(), chat, world, login);
         client.session.apply(vec![("charid", Value::Int(f.actor)), ("corpid", Value::Int(f.corp)), ("stationid", Value::Int(f.station)), ("solarsystemid2", Value::Int(f.system))]);
         let personal = authorization::locations(&db, &sde, f.actor, f.actor, &facility).await.ok().unwrap().remove(0);
         let divisions = authorization::locations(&db, &sde, f.actor, f.corp, &facility).await.ok().unwrap();
@@ -532,12 +510,15 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
             fields.iter_mut().find(|(key, _)| *key == Value::str("runs")).unwrap().1 = Value::Int(2);
         }
         let id = mechanics::install(&mut client, &req).await.ok().unwrap().as_int().unwrap();
+        db.execute("UPDATE game.offices SET lease_state=2 WHERE office_id=$1", &[&f.office]).await.unwrap();
+        assert!(authorization::locations(&db, &sde, f.actor, f.corp, &facility).await.unwrap().is_empty());
         db.execute("UPDATE game.industry_jobs SET end_date=0 WHERE job_id=$1", &[&id]).await.unwrap();
         mechanics::complete(&mut client, id).await.ok().unwrap();
         let stacks = crate::services::items::load_items(&db, &sde, crate::dao::items::loading::ItemQuery::OwnerLocationFlagTypeStackAscending(f.corp, output.item_id, output.flag_id, product)).await.unwrap();
         assert_eq!(stacks.len(), 2);
         assert!(stacks.iter().any(|row| row.item_id == existing && row.quantity == i64::MAX));
         assert!(stacks.iter().any(|row| row.item_id != existing && row.quantity == quantity - 1));
+        db.execute("UPDATE game.offices SET lease_state=0 WHERE office_id=$1", &[&f.office]).await.unwrap();
         let missing = i64::MAX;
         assert!(industry_dao::job(&db, missing).await.unwrap().is_none());
         let before = fingerprint(&db, f).await;
@@ -655,6 +636,54 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
         assert_eq!(fingerprint(&db, f).await, state);
         assert!(client.outbox.is_empty());
     }).await;
+    let owned: Vec<i64> = db.query("SELECT item_id FROM game.items WHERE owner_id = ANY($1)", &[&vec![f.actor, f.ceo, f.corp]]).await.unwrap().iter().map(|row| row.get("item_id")).collect();
+    let trade_ids: Vec<i64> = db.query("SELECT trade_id FROM game.trades WHERE char_a=$1 OR char_b=$1", &[&f.actor]).await.unwrap().iter().map(|row| row.get("trade_id")).collect();
+    let job_ids: Vec<String> = db.query("SELECT 'industry.ready:' || job_id::text AS job_id FROM game.industry_jobs WHERE installer_id=$1 UNION SELECT 'trade-timeout:' || trade_id::text FROM game.trades WHERE char_a=$1 OR char_b=$1", &[&f.actor]).await.unwrap().iter().map(|row| row.get("job_id")).collect();
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.actor }, crate::services::tests::fixture::Fixture { account: f.account, character: f.ceo }], &owned).await.unwrap();
+    cleanup(&db, f).await;
+    assert!(db.query_opt("SELECT 1 FROM game.industry_jobs WHERE installer_id=$1", &[&f.actor]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.blueprints WHERE item_id = ANY($1)", &[&owned]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.trades WHERE char_a=$1 OR char_b=$1", &[&f.actor]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.trade_items WHERE trade_id = ANY($1)", &[&trade_ids]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.market_orders WHERE char_id=$1", &[&f.actor]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.market_transactions WHERE buyer_id=$1 OR seller_id=$1", &[&f.actor]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.market_order_history WHERE char_id=$1", &[&f.actor]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.jobs WHERE job_id = ANY($1)", &[&job_ids]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.offices WHERE office_id=$1", &[&f.office]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.corp_wallets WHERE corporation_id=$1", &[&f.corp]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.corporations WHERE corporation_id=$1", &[&f.corp]).await.unwrap().is_none());
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
+    result.unwrap();
+}
+
+async fn fixture(db: &Db, sde: &crate::sde::Sde) -> (Fixture, Facility, HashMap<i32, f64>, i64) {
+    let facility = sde.map.stations().filter(|s| s.type_id.is_some() && s.solar_system_id.is_some()).filter_map(|s| Facility::from_station(&sde, s)).find(|f| f.factory && f.laboratory).expect("factory and laboratory station");
+    let prices: HashMap<i32, f64> = db.query("SELECT type_id, adjusted FROM game.retail_prices", &[]).await.unwrap().into_iter().map(|r| (r.get("type_id"), r.get("adjusted"))).collect();
+    let bp = sde.types.iter().find_map(|t| {
+        let m = sde.industry.activity(t.type_id, MANUFACTURING)?;
+        let c = sde.industry.activity(t.type_id, COPYING)?;
+        for activity in [RESEARCH_TIME, RESEARCH_MATERIAL] {
+            let research = sde.industry.activity(t.type_id, activity)?;
+            if research.time <= 0.0 || research.time >= 1_000_000.0 || research.materials.iter().any(|(_, q)| *q <= 0 || *q >= 1_000_000) { return None; }
+        }
+        let price = m.materials.iter().map(|(t, q)| prices.get(t).copied().unwrap_or(0.0) * *q as f64).sum::<f64>();
+        (t.published == Some(true) && t.market_group_id.is_some() && sde.is_tradable(t.type_id) && m.time > 0.0 && m.time < 1_000_000.0 && c.time > 0.0 && c.time < 1_000_000.0 && !m.materials.is_empty() && m.products.len() == 1 && m.products[0].1 > 0 && c.max_production_limit >= 1 && m.materials.iter().chain(&c.materials).all(|(_, q)| *q > 0 && *q < 1_000_000) && (10_000.0..100_000_000.0).contains(&price)).then_some(t.type_id)
+    }).expect("manufacturing and copying blueprint in SDE");
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('industry-corp-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
+    let actor: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,balance) VALUES ($1,'industry-corp-' || nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,1000000000) RETURNING character_id", &[&account, &facility.id]).await.unwrap().get("character_id");
+    let ceo: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,'industry-corp-' || nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
+    let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('industry-corp-' || nextval('game.corporations_corporation_id_seq')::text,'IC' || nextval('game.corporations_corporation_id_seq')::text,$1,$1,$2,0) RETURNING corporation_id", &[&ceo, &facility.id]).await.unwrap().get("corporation_id");
+    let roles = ROLE_FACTORY_MANAGER | ROLE_FACTORY_MANUFACTURING | ROLE_FACTORY_SCIENCE | ROLE_HANGAR_CAN_TAKE_1 | (134_217_728_i64 << 1);
+    db.execute("UPDATE game.characters SET corporation_id=$1,corp_roles=$2::bigint & ~$4::bigint,corp_roles_hq=$2::bigint & $4::bigint WHERE character_id=$3", &[&corp, &roles, &actor, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=$1,station_id=$3,corp_roles=$4 WHERE character_id=$2", &[&corp, &ceo, &facility.id, &infinity_core::consts::ROLE_DIRECTOR]).await.unwrap();
+    db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,1000000000)", &[&corp, &(ACCOUNT_CASH + 1)]).await.unwrap();
+    let office = item(db, i32::try_from(facility.type_id).unwrap(), corp, facility.id, FLAG_HANGAR, 1, true).await;
+    crate::dao::offices::insert(db, office, corp, facility.id, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
+    let f = Fixture { account, actor, ceo, corp, office, station: facility.id, system: facility.system, bp };
+    (f, facility, prices, roles)
+}
+
+async fn cleanup(db: &Db, f: Fixture) {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         crate::services::tests::fixture::cleanup_progress(tx, &[f.actor, f.ceo, f.corp], &[f.actor, f.ceo]).await
     }), |(), ()| async { Ok(()) }).await.unwrap();
@@ -674,6 +703,4 @@ async fn install_delivery_and_refusals_use_real_custody_and_wallets() {
     db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&f.corp]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE user_id=$1", &[&f.account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&f.account]).await.unwrap();
-    assert_eq!(super::database_fingerprint(&db).await, baseline);
-    result.unwrap();
 }

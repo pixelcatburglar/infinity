@@ -1,6 +1,9 @@
 //! Atomic GM fitting using the same item move and slot selection as invInventory.
 //! The slash command supplies a resolved type and optional item ID; game.items
 //! supplies the target's ship and inventory. Modules are not brought online.
+//! Unloads destined for space cargo must still fit the final fit's capacity:
+//! removing a passive cargo-capacity source can invalidate earlier per-item
+//! admission, so a full occupancy check runs after the final reconcile.
 
 use super::is_fitting_flag;
 use super::destination::{Custody, Destination};
@@ -23,17 +26,26 @@ pub(super) fn available(item: &Item, target: i64, type_id: i32, ship: i64, stati
 
 /// Fit onto the target's active ship, taking owned cargo/hangar items before creating stock.
 pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i32, item_id: Option<i64>, quantity: i32) -> Result<usize, CallError> {
-    let _lock = super::super::market::lock().await;
     let refuse = || notify_error(messages::gm::GM_FIT_REFUSED);
     if quantity <= 0 { return Err(refuse()); }
     let ship = crate::dao::characters::selection::ship_id(&c.db, target).await.map_err(db_err)?.ok_or_else(refuse)?;
     let station = crate::dao::items::transfers::docked(&c.db, target).await.map_err(db_err)?;
+    let fences = super::super::effects::online::capture_online_fences(&c.world, &[target]).await;
+    let engaged = fences.membership(ship).map(|(system, _)| (system, ship)).into_iter().collect::<Vec<_>>();
+    let armed = super::super::combat::loaded::LoadedHolds::arm(&c.world, &engaged, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _lock = super::super::market::lock().await;
+    let mut holds = super::super::combat::loaded::LoadedHolds::lock(&c.world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
     let db = c.db.clone();
     let sde = c.sde.clone();
-    let fences = super::super::effects::online::capture_online_fences(&c.world, &[target]).await;
-    db.transaction(
+    let world = c.world.clone();
+    let notify_tx = c.notify_tx.clone();
+    let char_id = c.session.int("charid");
+    holds.may_execute();
+    let result = db.transaction(
         move |tx, outbox: &mut Outbox<MoveEffect>| {
             let sde = sde.clone();
+            let settle = settle.clone();
             let fences = fences.clone();
             Box::pin(async move {
                 let refuse = || notify_error(messages::gm::GM_FIT_REFUSED);
@@ -63,6 +75,7 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                     remaining -= source.quantity.min(remaining);
                 }
                 let locks = super::destination::lock_items(tx, &sde, &requests, &[]).await?;
+                super::super::combat::loaded::settle_in(tx, &settle).await?;
                 if !locks.row(ship).is_some_and(|row| row.jump_clone_id.is_none() && row.type_id == hull.type_id
                     && row.owner_id == hull.owner_id && row.location_id == hull.location_id && row.flag_id == hull.flag_id
                     && row.quantity == hull.quantity && row.singleton == hull.singleton)
@@ -75,6 +88,7 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                 if item_id.is_some() && sources.iter().map(|item| i128::from(item.quantity)).sum::<i128>() < i128::from(quantity) { return Err(refuse()); }
                 let before = super::super::effects::online::fitting::capture(tx, &sde, &fences, target, ship).await?;
                 let mut final_fit = None;
+                let mut touched = Vec::new();
                 for _ in 0..quantity {
                     let item = if let Some(item) = sources.first().cloned() {
                         item
@@ -88,17 +102,21 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
                     let moved = move_core(tx, &sde, outbox, &item, &Destination::owned(target, ship, flag), take, Custody::Preserve, &locks, None, None, target).await?
                         .ok_or_else(refuse)?;
                     super::super::effects::fitting::validate_fit(tx, sde.clone(), target, ship, moved).await?;
+                    touched.push((moved, flag));
                     final_fit = Some(super::super::effects::online::reconcile_core(tx, &sde, outbox, &fences, target, ship).await?);
                     if !sources.is_empty() {
                         if take.is_some() { sources[0].quantity -= 1; } else { sources.remove(0); }
                     }
                 }
                 if let Some(final_fit) = final_fit { super::super::effects::online::fitting::finish(tx, before, final_fit, outbox).await?; }
-                Ok(quantity as usize)
+                let seeds = super::super::combat::loaded::seed_entries(tx, ship, &touched).await?;
+                Ok((quantity as usize, seeds))
             })
         },
-        |value, outbox| async move { dispatch_move(value, outbox, &c.world, |n| super::super::effects::online::dispatch_notification(route_target(n, target, c.session.int("charid")), &c.world, &c.notify_tx, c.session.int("charid"))) },
-    ).await
+        |value, outbox| async move { dispatch_move(value, outbox, &world, |n| super::super::effects::online::dispatch_notification(route_target(n, target, char_id), &world, &notify_tx, char_id)) },
+    ).await;
+    let seeds = match &result { Ok((_, seeds)) => vec![(ship, seeds.clone())], _ => Vec::new() };
+    holds.finish(&db, &c.world, result, &seeds).await.map(|(count, _)| count)
 }
 
 
@@ -106,7 +124,6 @@ pub(in crate::services) async fn gm_fit(c: &mut Client, target: i64, type_id: i3
 /// Unload selected modules and their bank's charges in one transaction.
 pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64, mut ids: Vec<i64>, destination: i64, flag: i32) -> Result<usize, CallError> {
     use super::super::effects::online::{dispatch_changed, set_online_core, OnlineChanged, OnlinePolicy};
-    let _lock = super::super::market::lock().await;
     let policy = OnlinePolicy::from_identity(&Identity::of_client(c), c.notify_tx.clone())?;
     if policy.owner != owner { return Err(notify_error(messages::gm::GM_FIT_REFUSED)); }
     ids.sort_unstable();
@@ -114,10 +131,19 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
     let db = c.db.clone();
     let sde = c.sde.clone();
     let fences = super::super::effects::online::capture_online_fences(&c.world, &[owner]).await;
-    db.transaction(
+    let armed = super::super::combat::loaded::LoadedHolds::arm(&c.world, &fences.membership(ship).map(|(system, _)| (system, ship)).into_iter().collect::<Vec<_>>(), notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _lock = super::super::market::lock().await;
+    let mut holds = super::super::combat::loaded::LoadedHolds::lock(&c.world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
+    let engaged_ship = holds.held(ship);
+    let charge_view = holds.view(ship);
+    holds.may_execute();
+    let result = db.transaction(
         move |tx, outbox: &mut Outbox<OnlineChanged>| {
             let sde = sde.clone();
             let ids = ids.clone();
+            let settle = settle.clone();
+            let charge_view = charge_view.clone();
             let policy = policy.clone();
             let fences = fences.clone();
             Box::pin(async move {
@@ -156,7 +182,7 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
                 let mut preparations = Vec::new();
                 let deposit_destination = Destination::owned(owner, destination, flag);
                 for module in &charge_modules {
-                    let loaded = super::super::combat::targeting_charges::loaded(tx, ship, module.flag_id).await?;
+                    let loaded = if engaged_ship { charge_view.get(&module.flag_id).copied() } else { super::super::combat::targeting_charges::loaded(tx, ship, module.flag_id).await? };
                     let (preparation, canonical) = match loaded {
                         Some((type_id, _)) => {
                             if let Some(index) = preparations.iter().position(|(_, prep, _): &(_, Option<super::super::items::DepositPreparation>, _)| prep.as_ref().is_some_and(|prep| prep.destination == deposit_destination && prep.type_id == type_id)) {
@@ -173,6 +199,7 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
                     .filter(|id| !strict.contains(id)).collect();
                 requests.extend(preparations.iter().filter_map(|(_, prep, _)| prep.as_ref()?.candidate_request()));
                 let locks = super::destination::lock_items(tx, &sde, &requests, &optional).await?;
+                super::super::combat::loaded::settle_in(tx, &settle).await?;
                 for item in std::iter::once(&hull).chain(&modules).chain(&charge_modules) {
                     if !locks.row(item.item_id).is_some_and(|row| row.jump_clone_id.is_none() && row.type_id == item.type_id
                         && row.owner_id == item.owner_id && row.location_id == item.location_id && row.flag_id == item.flag_id
@@ -208,10 +235,34 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
                     move_core(tx, &sde, outbox, module, &Destination::owned(owner, destination, flag), None, Custody::Preserve, &locks, None, None, owner).await?;
                 }
                 let final_fit = super::super::effects::online::reconcile_core(tx, &sde, outbox, &fences, owner, ship).await?;
+                if station.is_none() {
+                    let snapshot = super::hold_storage::HoldCapacity::capture(&final_fit, FLAG_CARGO)?;
+                    let room = super::hold_storage::room(tx, &sde, owner, &snapshot).await?;
+                    if !room.used.is_finite() || room.used < 0.0 {
+                        return Err(crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
+                    }
+                    if let super::holds::CapacityLimit::Finite(capacity) = room.capacity {
+                        if !capacity.is_finite() || capacity < 0.0 {
+                            return Err(crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
+                        }
+                        if room.used > capacity {
+                            let Some(module) = modules.last() else {
+                                return Err(crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
+                            };
+                            return Err(super::holds::full_error(FLAG_CARGO, module.type_id, 0.0, room.used - capacity));
+                        }
+                    }
+                }
                 super::super::effects::online::fitting::finish(tx, before, final_fit, outbox).await?;
-                Ok(modules.len())
+                let touched: Vec<_> = charge_modules.iter().map(|module| (module.item_id, module.flag_id)).collect();
+                let seeds = super::super::combat::loaded::seed_entries(tx, ship, &touched).await?;
+                Ok((modules.len(), seeds))
             })
         },
-        |value, outbox| async move { dispatch_changed(value, outbox, c) },
-    ).await
+        |value, outbox| { let c = &*c; async move { dispatch_changed(value, outbox, c) } },
+    ).await;
+    let seeds = match &result { Ok((_, seeds)) => vec![(ship, seeds.clone())], _ => Vec::new() };
+    holds.finish(&db, &c.world, result, &seeds).await.map(|(count, _)| count)
 }
+
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

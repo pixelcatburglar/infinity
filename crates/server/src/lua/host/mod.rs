@@ -61,5 +61,5 @@ pub fn register(lua: &Lua, env: &Table, script: &str, config: &toml::Table, reso
     store::register(lua, env, &resources.db, script, resources.store_value_limit_bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

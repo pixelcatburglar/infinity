@@ -117,5 +117,5 @@ fn parse_row(key: &Option<String>, data: &str, category_of: &impl Fn(i32) -> Opt
     let retired = object.get("esRetired").and_then(flag).ok_or_else(|| anyhow!("expert-system {type_id} esRetired must be bool or 0/1"))?;
     Ok(ExpertSystem { type_id, duration_days, duration_filetime, skills, associated_ship_types, hidden, retired })
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

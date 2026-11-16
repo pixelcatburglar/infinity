@@ -10,11 +10,11 @@ async fn ship_stat_roundtrip(attribute: i32) {
     let f = MovementFixture::create_stat(attribute).await;
     let db = f.client.db.clone();
     let world = f.client.world.clone();
-    let rows = f.rows;
+    let rows = crate::services::tests::fixture::ShipFixture { items: f.rows.items.clone(), ..f.rows };
     let result = tokio::spawn(async move {
         let mut f = f;
-        let ship = rows.ship;
-        let module = rows.modules[0];
+        let ship = f.rows.ship;
+        let module = f.rows.module();
         let base = f.value(ship, attribute).await;
         let mut previous_effective = None;
         for _ in 0..2 {
@@ -23,7 +23,7 @@ async fn ship_stat_roundtrip(attribute: i32) {
             let events = f.drain();
             if f.requires_online {
                 assert_eq!(installed, base);
-                assert!(fixture::attribute_rows(&events, rows.owner, ship, attribute).is_empty());
+                assert!(fixture::attribute_rows(&events, f.rows.character, ship, attribute).is_empty());
                 f.set_online(ship, module, true).await.unwrap();
             }
             let effective = f.value(ship, attribute).await;
@@ -31,14 +31,15 @@ async fn ship_stat_roundtrip(attribute: i32) {
             if let Some(previous) = previous_effective { assert_eq!(effective, previous); }
             previous_effective = Some(effective);
             let events = if f.requires_online { f.drain() } else { events };
-            assert_eq!(fixture::attribute_rows(&events, rows.owner, ship, attribute), vec![(base, effective)]);
+            assert_eq!(fixture::attribute_rows(&events, f.rows.character, ship, attribute), vec![(base, effective)]);
             assert_eq!(f.move_to(ship, ship, fixture::CARGO).await.ok().flatten(), Some(module));
             let restored = f.value(ship, attribute).await;
             assert_eq!(restored, base);
-            assert_eq!(fixture::attribute_rows(&f.drain(), rows.owner, ship, attribute), vec![(effective, restored)]);
+            assert_eq!(fixture::attribute_rows(&f.drain(), f.rows.character, ship, attribute), vec![(effective, restored)]);
         }
     }).await;
-    super::super::fixture::cleanup(&db, &world, rows).await.unwrap();
+    world.unobserve(rows.character);
+    crate::services::tests::fixture::cleanup_ship(&db, Some(world.as_ref()), rows).await.unwrap();
     result.unwrap();
 }
 
@@ -68,7 +69,7 @@ async fn module_group_modifier_updates_surviving_receiver() {
     let f = MovementFixture::create(ATTR_ARMOR_HP).await;
     let db = f.client.db.clone();
     let world = f.client.world.clone();
-    let rows = f.rows;
+    let rows = crate::services::tests::fixture::ShipFixture { items: f.rows.items.clone(), ..f.rows };
     let result = tokio::spawn(async move {
         let mut f = f;
         let sde = &f.client.sde;
@@ -110,7 +111,8 @@ async fn module_group_modifier_updates_surviving_receiver() {
         }
         let (source_type, receiver_type, hull_type, source_slot, receiver_slot, attribute, online) =
             selected.expect("SDE must contain a published compatible ship, source, and receiver for a supported location group modifier");
-        for (item, ty) in [(rows.ship, hull_type), (rows.modules[0], source_type), (rows.modules[1], receiver_type)] {
+        let modules = f.modules();
+        for (item, ty) in [(f.rows.ship, hull_type), (modules[0], source_type), (modules[1], receiver_type)] {
             f.client.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&item, &ty]).await.unwrap();
         }
         let mut required = Vec::new();
@@ -125,33 +127,35 @@ async fn module_group_modifier_updates_surviving_receiver() {
                 }
             }
         }
-        skills::gm::apply(&mut f.client, rows.owner, skills::gm::Change::Set(required)).await.ok().expect("seed module skills");
-        let [source, receiver] = rows.modules;
-        assert_eq!(f.move_module(rows.ship, rows.ship, receiver_slot, receiver).await.ok().flatten(), Some(receiver));
-        let base = f.fit(rows.ship).await.value(Key::Module(receiver), attribute);
+        skills::gm::apply(&mut f.client, f.rows.character, skills::gm::Change::Set(required)).await.ok().expect("seed module skills");
+        let modules = f.modules();
+        let [source, receiver] = modules;
+        assert_eq!(f.move_module(f.rows.ship, f.rows.ship, receiver_slot, receiver).await.ok().flatten(), Some(receiver));
+        let base = f.fit(f.rows.ship).await.value(Key::Module(receiver), attribute);
         f.drain();
         let mut previous = None;
         for _ in 0..2 {
-            assert_eq!(f.move_module(rows.ship, rows.ship, source_slot, source).await.ok().flatten(), Some(source));
-            let installed = f.fit(rows.ship).await.value(Key::Module(receiver), attribute);
+            assert_eq!(f.move_module(f.rows.ship, f.rows.ship, source_slot, source).await.ok().flatten(), Some(source));
+            let installed = f.fit(f.rows.ship).await.value(Key::Module(receiver), attribute);
             let events = f.drain();
             if online {
                 assert_eq!(installed, base);
-                assert!(fixture::attribute_rows(&events, rows.owner, receiver, attribute).is_empty());
-                f.set_online(rows.ship, source, true).await.unwrap();
+                assert!(fixture::attribute_rows(&events, f.rows.character, receiver, attribute).is_empty());
+                f.set_online(f.rows.ship, source, true).await.unwrap();
             }
-            let effective = f.fit(rows.ship).await.value(Key::Module(receiver), attribute);
+            let effective = f.fit(f.rows.ship).await.value(Key::Module(receiver), attribute);
             assert_ne!(effective, base, "real supported modifier must affect the fitted receiver");
             if let Some(value) = previous { assert_eq!(effective, value); }
             previous = Some(effective);
             let events = if online { f.drain() } else { events };
-            assert_eq!(fixture::attribute_rows(&events, rows.owner, receiver, attribute), vec![(base, effective)]);
-            assert_eq!(f.move_module(rows.ship, rows.ship, fixture::CARGO, source).await.ok().flatten(), Some(source));
-            let restored = f.fit(rows.ship).await.value(Key::Module(receiver), attribute);
+            assert_eq!(fixture::attribute_rows(&events, f.rows.character, receiver, attribute), vec![(base, effective)]);
+            assert_eq!(f.move_module(f.rows.ship, f.rows.ship, fixture::CARGO, source).await.ok().flatten(), Some(source));
+            let restored = f.fit(f.rows.ship).await.value(Key::Module(receiver), attribute);
             assert_eq!(restored, base);
-            assert_eq!(fixture::attribute_rows(&f.drain(), rows.owner, receiver, attribute), vec![(effective, restored)]);
+            assert_eq!(fixture::attribute_rows(&f.drain(), f.rows.character, receiver, attribute), vec![(effective, restored)]);
         }
     }).await;
-    super::super::fixture::cleanup(&db, &world, rows).await.unwrap();
+    world.unobserve(rows.character);
+    crate::services::tests::fixture::cleanup_ship(&db, Some(world.as_ref()), rows).await.unwrap();
     result.unwrap();
 }

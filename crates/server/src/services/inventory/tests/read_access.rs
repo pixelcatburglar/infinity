@@ -60,7 +60,7 @@ async fn corporate_query_not_take_and_revocation_rechecks_personal_descendant() 
     client.session.apply(vec![("stationid", Value::Int(station)), ("corpid", Value::Int(corp))]);
     let ty = client.sde.types.iter().find(|t| t.group_id == Some(GROUP_CARGO_CONTAINER)).unwrap().type_id;
     let office = transfers::insert(&db, ty, corp, station, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::offices::insert(&db, office, corp, station, 1).await.unwrap();
+    crate::dao::offices::insert(&db, office, corp, station, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
     let root = transfers::insert(&db, ty, corp, office, FLAG_CORP_SAG1, 1).await.unwrap();
     let personal = transfers::insert(&db, ty, actor.character, root, FLAG_CARGO, 1).await.unwrap();
     db.execute("UPDATE game.items SET singleton=true WHERE item_id=ANY($1)", &[&vec![office, root, personal]]).await.unwrap();
@@ -78,7 +78,17 @@ async fn corporate_query_not_take_and_revocation_rechecks_personal_descendant() 
         let result = services::dispatch(&mut client, &check).await.unwrap();
         assert_eq!(result, if allowed { Value::list([]) } else { Value::list([Value::Int(personal)]) });
     }
-    crate::dao::offices::delete(&db, office).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles_hq=$2 WHERE character_id=$1", &[&actor.character, &ROLE_HANGAR_CAN_QUERY_1]).await.unwrap();
+    assert_eq!(services::dispatch(&mut client, &call).await.unwrap(), Value::list([]));
+    let office_bind = Value::tuple([Value::Int(office)]);
+    let office_call = Call { service: "invInventory", method: "GetSelfInvItem", args: &[], kwargs: &kwargs, bound: true, bind_params: Some(&office_bind) };
+    let office_row = services::dispatch(&mut client, &office_call).await.unwrap();
+    assert_eq!(services::item_descriptor().get(&office_row, "itemID"), Some(Value::Int(office)));
+    db.execute("UPDATE game.offices SET rented_until=$2 WHERE office_id=$1", &[&office, &crate::client::filetime_now()]).await.unwrap();
+    assert!(matches!(services::dispatch(&mut client, &call).await, Err(CallError::User { .. })));
+    assert!(matches!(services::dispatch(&mut client, &office_call).await, Err(CallError::User { .. })));
+    assert_eq!(services::dispatch(&mut client, &check).await.unwrap(), Value::list([Value::Int(personal)]));
+    db.execute("DELETE FROM game.offices WHERE office_id = $1", &[&office]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&corp]).await.unwrap();
     services::tests::fixture::cleanup_corporation(&db, corp, &[actor.character], 0).await.unwrap();
     services::tests::fixture::cleanup(&db, actor).await.unwrap();

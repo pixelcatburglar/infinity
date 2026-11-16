@@ -1,6 +1,8 @@
 //! Durable NPC death journal, fenced by the actor's existing dying transition.
 //! Temporary NPCs have no persistent domain row; their journal source is the tombstone.
 //! Bounty and wreck processing remain separate from the authoritative death transaction.
+//! The system snapshot gate covers death-context capture, checkpoint commit and actor
+//! finalization, then releases before map statistics, bounty, wreck and loot processing.
 use super::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use crate::db::outbox::SourceKey;
@@ -16,7 +18,7 @@ pub(crate) struct NpcDeathContext {
 
 struct DeathEffect { key: String, fresh: bool }
 impl crate::progress::Prepare for DeathEffect {
-    fn prepare<'a, 'tx>(&'a mut self, _: &'a tokio_postgres::Transaction<'tx>, _: &'a mut crate::progress::PrepareCx) -> crate::db::transaction::TxFuture<'a, (), crate::progress::PrepareError> {
+    fn prepare<'a, 'tx>(&'a mut self, _: &'a crate::db::Transaction<'tx>, _: &'a mut crate::progress::PrepareCx) -> crate::db::transaction::TxFuture<'a, (), crate::progress::PrepareError> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -63,7 +65,7 @@ async fn finalize(world: &World, system: i64, snapshot: &FirstLethalSnapshot, fr
 
 pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snapshot: Arc<FirstLethalSnapshot>, _new: [f64; 3]) -> Result<(), CallError> {
     let gate = world.lock_condition_snapshot(system).await.map_err(db_err);
-    let _gate = match gate { Ok(gate) => gate, Err(error) => { release(&world, system, &snapshot).await; return Err(error); } };
+    let mut gate = match gate { Ok(gate) => Some(gate), Err(error) => { release(&world, system, &snapshot).await; return Err(error); } };
     let item = snapshot.item_id;
     let token = snapshot.token;
     let generation = snapshot.generation;
@@ -144,6 +146,8 @@ pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snap
         },
         |written, outbox| async {
             let removed = finalize(&world, system, &snapshot, context.frame.clone(), written.into_iter().collect()).await?;
+            // Actor finalization no longer needs the snapshot gate; rewards may take the economy lock.
+            drop(gate.take());
             let mut fresh = false;
             for effect in outbox.into_entries() {
                 match effect {
@@ -175,4 +179,4 @@ pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snap
     result
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

@@ -2,6 +2,9 @@
 //! `pvptradesvc.py`, `pvptradewnd.py` and the PlayerTrade inventory controller.
 //! Uses `game.trades`, `game.trade_items`, character wallets and station hangars.
 //! Fitted items, corporation hangars and PLEX vault transfers are unsupported.
+//! Corporation blueprint locks and pending vote-case reservations freeze originals:
+//! staging collects the complete tree before taking item locks and refuses frozen
+//! blueprints under them.
 //! `OnItemChange` stack quantities are projected to the client display limit;
 //! staged and stored quantities stay exact.
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,9 +76,29 @@ async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<Tra
     if !invalid.is_empty() {
         return Err(user_error(messages::trade::MSG_CANNOT_TRADE_NON_TRADABLE, vec![("itemList".into(), Value::tuple([Value::Int(UE_TYPEIDL), Value::list(invalid.into_iter().map(Value::Int))]))]));
     }
+    // Stage the complete tree under real item locks: capture before locking, take
+    // the final set at once, then revalidate the closure and metadata. The busy
+    // job check and the corporation-lock screen below run under those locks.
+    let captured = crate::dao::items::parent_locks::capture(ex, &tree_ids).await.map_err(db_err)?;
+    let requests: Vec<_> = tree_ids.iter().map(|&item_id| crate::dao::items::parent_locks::LockRequest {
+        item_id, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }).collect();
+    let locks = crate::services::inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
+    if captured.len() != tree_ids.len() || captured.iter().any(|old| old.owner_id != me)
+        || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row| row.same_metadata(old)))
+        || items.iter().any(|item| !captured.iter().any(|old| old.item_id == item.item_id
+            && old.type_id == item.type_id && old.owner_id == item.owner_id && old.location_id == item.location_id
+            && old.flag_id == item.flag_id && old.quantity == item.quantity && old.singleton == item.singleton))
+        || trades::descendants(ex, ids).await.map_err(db_err)? != tree_ids {
+        return Err(notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR));
+    }
     if crate::dao::industry::has_active_blueprint_job(ex, &tree_ids).await.map_err(db_err)? {
         return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
     }
+    // Enacted corporation locks and pending vote-case reservations freeze
+    // blueprint originals anywhere in the staged tree.
+    let blueprints = crate::services::corps::item_locks::locked_blueprints(sde, &locks, &tree_ids)?;
+    crate::services::corps::item_locks::ensure_mutable(ex, &blueprints).await?;
     let mut staged = Vec::new();
     for item in &items {
         let q = quantity.unwrap_or(crate::services::item_volume::stack_size(item.singleton, i64::from(item.quantity)));
@@ -190,3 +213,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         })
     }, |value, outbox| async move { dispatch_outbox(value, outbox, &world) }).await
 }
+
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

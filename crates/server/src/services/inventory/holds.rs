@@ -1,6 +1,8 @@
 //! Ship hold capacity and item admission, mirroring `inventoryFlagsCommon.py`
 //! and `invCache.py:1310-1318`. Rules use SDE type classifications and fitted
 //! dogma; structure-only bays, permissions and persistence are outside this module.
+//! Ordinary ship cargo may be unlimited under a persisted GM mode; every other
+//! hold keeps its real finite capacity.
 
 use infinity_core::{consts::*, consts::dogma::*, messages};
 use crate::sde::Sde;
@@ -110,12 +112,24 @@ pub(crate) fn accepts(sde: &Sde, flag: i32, type_id: i32) -> bool {
     accepts_class(hold, ty.category_id, ty.group_id, type_id)
 }
 
-pub(crate) fn effective_capacity(fit: &Fit, flag: i32) -> f64 {
-    let Some(hold) = descriptor(flag) else { return 0.0 };
-    if !fit.type_has_attribute(Key::Ship, hold.attribute) { return 0.0; }
+/// A hold's admission capacity: a real finite value, or the hull's persisted
+/// unlimited cargo mode. Ordinary containers, special bays and stations are
+/// always `Finite`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CapacityLimit {
+    Finite(f64),
+    Unlimited,
+}
+
+/// The hold's effective admission limit. `Unlimited` is returned only for the
+/// ordinary cargo flag of a real ship whose capacity override carries the mode.
+pub(crate) fn effective_capacity(fit: &Fit, flag: i32) -> CapacityLimit {
+    let Some(hold) = descriptor(flag) else { return CapacityLimit::Finite(0.0) };
+    if !fit.type_has_attribute(Key::Ship, hold.attribute) { return CapacityLimit::Finite(0.0); }
+    if flag == FLAG_CARGO && fit.cargo_unlimited() { return CapacityLimit::Unlimited; }
     let value = fit.value(Key::Ship, hold.attribute);
-    if !value.is_finite() || value <= 0.0 { return 0.0; }
-    if flag == FLAG_FRIGATE_ESCAPE_BAY && value > 0.0 { 1.0 } else { value }
+    if !value.is_finite() || value <= 0.0 { return CapacityLimit::Finite(0.0); }
+    if flag == FLAG_FRIGATE_ESCAPE_BAY && value > 0.0 { CapacityLimit::Finite(1.0) } else { CapacityLimit::Finite(value) }
 }
 
 pub(super) fn admission(sde: &Sde, flag: i32, type_id: i32, singleton: bool, quantity: i64) -> Result<f64, CallError> {
@@ -147,9 +161,17 @@ pub(super) fn full_error(flag: i32, type_id: i32, free: f64, volume: f64) -> Cal
     user_error(hold.full, dict)
 }
 
-pub(crate) fn check(sde: &Sde, flag: i32, type_id: i32, singleton: bool, quantity: i64, capacity: f64, used: f64) -> Result<(), CallError> {
+pub(crate) fn check(sde: &Sde, flag: i32, type_id: i32, singleton: bool, quantity: i64, capacity: CapacityLimit, used: f64) -> Result<(), CallError> {
     let volume = admission(sde, flag, type_id, singleton, quantity)?;
-    if !capacity.is_finite() || capacity < 0.0 || !used.is_finite() || used < 0.0 {
+    if !used.is_finite() || used < 0.0 {
+        return Err(user_error(messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
+    }
+    let capacity = match capacity {
+        CapacityLimit::Unlimited if flag == FLAG_CARGO => return Ok(()),
+        CapacityLimit::Unlimited => return Err(user_error(messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![])),
+        CapacityLimit::Finite(value) => value,
+    };
+    if !capacity.is_finite() || capacity < 0.0 {
         return Err(user_error(messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
     }
     let free = (capacity - used).max(0.0);
@@ -168,7 +190,7 @@ pub(crate) fn mining_flag(sde: &Sde, fit: &Fit, type_id: i32) -> i32 {
     } else {
         &[FLAG_GENERAL_MINING_HOLD, FLAG_SPECIAL_ASTEROID_HOLD]
     };
-    candidates.iter().copied().find(|&flag| effective_capacity(fit, flag) > 0.0 && accepts(sde, flag, type_id)).unwrap_or(FLAG_CARGO)
+    candidates.iter().copied().find(|&flag| matches!(effective_capacity(fit, flag), CapacityLimit::Finite(value) if value > 0.0) && accepts(sde, flag, type_id)).unwrap_or(FLAG_CARGO)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

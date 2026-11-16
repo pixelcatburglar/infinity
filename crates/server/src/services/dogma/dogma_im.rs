@@ -129,8 +129,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             match items.into_iter().next() {
                 Some(item) => {
                     let mut attrs = type_attributes(&c.sde, item.type_id);
-                    overlay_overrides(&mut attrs, dogma_dao::overrides(&c.db, item.item_id).await.map_err(db_err)?
-                        .into_iter().map(|row| (row.attribute_id, row.value)));
+                    let overrides = dogma_dao::overrides(&c.db, item.item_id).await.map_err(db_err)?;
+                    overlay_overrides(&mut attrs, overrides.iter().map(|row| (row.attribute_id, row.value)));
+                    if item.category_id == i64::from(infinity_core::consts::CATEGORY_SHIP) && item.singleton && item.quantity == 1
+                        && overrides.iter().any(|row| row.attribute_id == infinity_core::consts::dogma::ATTR_CAPACITY && row.cargo_unlimited) {
+                        attrs.insert(i64::from(infinity_core::consts::dogma::ATTR_CAPACITY), crate::services::fit::cargo::UNLIMITED_CARGO_WIRE_CAPACITY);
+                    }
                     let online = online_modules(c, item.location_id).await?.contains(&item.item_id);
                     let char_id = c.session.int("charid").unwrap_or(0);
                     let active = if online { online_effect(item.item_id, char_id, item.location_id) } else { vec![] };

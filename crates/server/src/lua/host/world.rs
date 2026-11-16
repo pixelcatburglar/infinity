@@ -215,5 +215,5 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> Result<
     env.set("world", table)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

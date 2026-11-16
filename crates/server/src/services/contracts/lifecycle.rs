@@ -184,7 +184,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
                     if for_corp {
                         super::super::inventory::notifications::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
                     } else {
-                        outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), super::super::inventory::notifications::item_change_dict([(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]), Value::None]);
+                        super::super::inventory::notifications::notify_owner_item_change(outbox, &remaining, me, [(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]);
                     }
                     root
                 } else {
@@ -310,8 +310,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                         }
                     }
                     if takes.iter().any(|(item, _)| !preparation.locks.row(item.item_id).is_some_and(|row|
-                        row.type_id == item.type_id && row.owner_id == item.owner_id && row.location_id == item.location_id
-                        && row.flag_id == item.flag_id && row.quantity == item.quantity && row.singleton == item.singleton && row.jump_clone_id.is_none())) {
+                        row.matches_item_metadata(item) && row.jump_clone_id.is_none())) {
                         return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
                     }
                     let tree = crate::dao::trades::descendants(db, &ids).await.map_err(db_err)?;
@@ -333,7 +332,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                             if for_corp {
                                 super::super::inventory::notifications::notify_corp_item_change(db, outbox, &remaining, vec![(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]).await?;
                             } else {
-                                outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), super::super::inventory::notifications::item_change_dict([(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]), Value::None]);
+                                super::super::inventory::notifications::notify_owner_item_change(outbox, &remaining, me, [(IX_STACK_SIZE, Value::Int(i64::from(item.quantity)))]);
                             }
                             id
                         } else {
@@ -370,7 +369,7 @@ pub(super) async fn accept(c: &Client, id: i64, for_corp: bool) -> CallResult {
                         super::super::inventory::notifications::notify_corp_item_change(db, outbox, &item, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
                     } else {
                         if transfers::docked(db, me).await.map_err(db_err)? == Some(k.start) {
-                            outbox.notify_pilot(me, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(LOCATION_JUNKYARD))]), Value::None]);
+                            super::super::inventory::notifications::notify_owner_item_change(outbox, &item, me, [(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]);
                         }
                     }
                     if !contract_dao::accept_courier(db, id, STATUS_OUTSTANDING, owner.id, wallet_key, now, STATUS_IN_PROGRESS, wrap).await.map_err(db_err)? {
@@ -428,9 +427,8 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                     };
                     let roots = escrowed_ids(db, id).await?;
                     let preparation = custody::prepare(db, sde, &roots, &[wrap.item_id]).await?;
-                    if !preparation.locks.row(wrap.item_id).is_some_and(|row| row.type_id == wrap.type_id
-                        && row.owner_id == wrap.owner_id && row.location_id == wrap.location_id && row.flag_id == wrap.flag_id
-                        && row.quantity == wrap.quantity && row.singleton == wrap.singleton && row.jump_clone_id.is_none()) {
+                    if !preparation.locks.row(wrap.item_id).is_some_and(|row|
+                        row.matches_item_metadata(&wrap) && row.jump_clone_id.is_none()) {
                         return Err(notify_error(messages::COURIER_PACKAGE_MUST_BE_AT_DESTINATION));
                     }
                     custody::remove_package(db, outbox, &wrap).await?;
@@ -457,9 +455,8 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                             let destination = custody::Custody { owner: w.owner_id, location: w.location_id, flag: w.flag_id };
                             let roots = escrowed_ids(db, id).await?;
                             let preparation = custody::prepare(db, sde, &roots, &[w.item_id]).await?;
-                            if !preparation.locks.row(w.item_id).is_some_and(|row| row.type_id == w.type_id
-                                && row.owner_id == w.owner_id && row.location_id == w.location_id && row.flag_id == w.flag_id
-                                && row.quantity == w.quantity && row.singleton == w.singleton && row.jump_clone_id.is_none()) {
+                            if !preparation.locks.row(w.item_id).is_some_and(|row|
+                                row.matches_item_metadata(&w) && row.jump_clone_id.is_none()) {
                                 return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
                             }
                             custody::remove_package(db, outbox, &w).await?;
@@ -669,4 +666,4 @@ async fn settle_expired_candidate(db: &Db, sde: &Arc<crate::sde::Sde>, world: &W
     ).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

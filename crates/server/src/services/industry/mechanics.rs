@@ -6,6 +6,10 @@
 //! Structures and reactions are unsupported; legacy displaced blueprints require repair.
 //! Manufacturing install and explicit delivery journal facts with their job mutations;
 //! product quantities come from SDE activities, and ready jobs await delivery.
+//! The original, its custody ancestry and every material source are locked once
+//! before install and before delivery; a pending vote-case reservation refuses
+//! install, while an enacted corporation lock admits only the owner's in-place
+//! manufacturing, research and copying.
 
 use super::*;
 use crate::sde::{Sde, industry::Activity};
@@ -32,11 +36,9 @@ fn manufacturing_quantity(per_run: i64, runs: i32) -> Result<i64, CallError> {
 
 /// industryCommon.GetBlueprintPrice: the adjusted value of what the blueprint's manufacturing
 /// takes, at base quantities (the estimated item value of one run).
-async fn blueprint_price(db: &(impl Executor + ?Sized), sde: &Sde, bp_type: i32) -> Result<f64, CallError> {
-    let Some(m) = sde.industry.activity(bp_type, MANUFACTURING) else { return Ok(0.0) };
-    let ids: Vec<i32> = m.materials.iter().map(|(t, _)| *t).collect();
-    let price = industry_dao::prices(db, &ids).await.map_err(db_err)?;
-    Ok(m.materials.iter().map(|(t, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum())
+fn blueprint_price(sde: &Sde, bp_type: i32) -> f64 {
+    let Some(m) = sde.industry.activity(bp_type, MANUFACTURING) else { return 0.0 };
+    m.materials.iter().map(|(t, q)| sde.prices.get(*t).map(|p| p.adjusted).unwrap_or(0.0) * *q as f64).sum()
 }
 
 async fn blueprint(db: &(impl Executor + ?Sized), sde: &Sde, item_id: i64) -> Result<Blueprint, CallError> {
@@ -48,6 +50,15 @@ async fn blueprint(db: &(impl Executor + ?Sized), sde: &Sde, item_id: i64) -> Re
 
 async fn set_blueprint(db: &(impl Executor + ?Sized), item_id: i64, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
     industry_dao::set_blueprint(db, item_id, me, te, runs).await.map_err(db_err)
+}
+
+/// Whether two reads of the same blueprint row still describe it identically,
+/// including its blueprint-table research and run state.
+fn same_blueprint(a: &Blueprint, b: &Blueprint) -> bool {
+    a.item_id == b.item_id && a.type_id == b.type_id && a.owner == b.owner
+        && a.station == b.station && a.location == b.location && a.flag == b.flag
+        && a.singleton == b.singleton && a.copy == b.copy
+        && a.me == b.me && a.te == b.te && a.runs == b.runs
 }
 
 /// Decryptor bonuses from explicitly present type attributes.
@@ -124,8 +135,7 @@ fn job_deadline(now: i64, seconds: i64) -> Result<i64, CallError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn plan(
-    db: &(impl Executor + ?Sized),
+fn plan(
     sde: &Sde,
     fit: &Fit,
     skills: &crate::services::skills::effective::SkillSnapshot,
@@ -217,11 +227,11 @@ async fn plan(
         _ => None,
     };
     let job_cost = match activity_id {
-        MANUFACTURING => blueprint_price(db, sde, bp.type_id).await? * runs as f64,
-        COPYING => blueprint_price(db, sde, bp.type_id).await? * policy.job_cost_rate * licensed_runs as f64 * runs as f64,
-        RESEARCH_TIME | RESEARCH_MATERIAL if act.time > 0.0 => blueprint_price(db, sde, bp.type_id).await? * policy.job_cost_rate * base_seconds / act.time,
+        MANUFACTURING => blueprint_price(sde, bp.type_id) * runs as f64,
+        COPYING => blueprint_price(sde, bp.type_id) * policy.job_cost_rate * licensed_runs as f64 * runs as f64,
+        RESEARCH_TIME | RESEARCH_MATERIAL if act.time > 0.0 => blueprint_price(sde, bp.type_id) * policy.job_cost_rate * base_seconds / act.time,
         INVENTION => match product {
-            Some(p) => blueprint_price(db, sde, p).await? * policy.job_cost_rate * runs as f64,
+            Some(p) => blueprint_price(sde, p) * policy.job_cost_rate * runs as f64,
             None => 0.0,
         },
         _ => 0.0,
@@ -254,6 +264,8 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
     let quoted_cost = request.get("cost").cloned();
     let quoted_tax = request.get("tax").cloned();
     let _trading = lock().await;
+    let locked_corp = crate::dao::corporations::registry::character_corp(&db, me).await.map_err(db_err)?
+        .ok_or_else(|| user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]))?;
     let blueprint_id = int("blueprintID").unwrap_or(0);
     let facility_id = int("facilityID").unwrap_or(0);
     let product_request = int("productTypeID").and_then(|p| i32::try_from(p).ok());
@@ -277,6 +289,10 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
             let quoted_tax = quoted_tax.clone();
             let request = request.clone();
             Box::pin(async move {
+                if !crate::dao::corporations::registry::lock_admission(tx, &[], &[locked_corp], &[me]).await.map_err(db_err)?
+                    || crate::dao::corporations::registry::character_corp(tx, me).await.map_err(db_err)? != Some(locked_corp) {
+                    return Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]));
+                }
                 let mut bp = blueprint(tx, &sde, blueprint_id).await?;
                 authorization::owner(tx, me, bp.owner, Some(activity_id)).await?;
                 if request.get("characterID").and_then(Value::as_int).is_some_and(|id| id != me) {
@@ -359,7 +375,7 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                 } else {
                     None
                 };
-                let p = plan(tx, &sde, &fit, &skills, &bp, act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
+                let p = plan(&sde, &fit, &skills, &bp, act, activity_id, runs, licensed_runs, product_request, optional, &fac)?;
                 validate_quote(quoted_cost.as_ref(), quoted_tax.as_ref(), &p.fees)?;
                 let end = job_deadline(now, p.seconds)?;
 
@@ -381,6 +397,43 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                     }
                     if left != 0 { return Err(notify_error(&messages::required_materials_message(quantity, type_id))); }
                 }
+                // The original, its office or container ancestry and every material
+                // source are collected before the first item lock, taken once at
+                // final strength, then revalidated; a pending vote-case reservation
+                // always refuses, while an enacted corporation lock admits only this
+                // owner's in-place manufacturing, research or copying.
+                let mut lock_ids: Vec<i64> = Vec::with_capacity(originals.len() + 1);
+                lock_ids.push(bp.item_id);
+                lock_ids.extend(originals.keys().copied());
+                let lineage = crate::dao::items::deliveries::ancestry_many(tx, &lock_ids).await.map_err(db_err)?;
+                let requests = inventory::destination::custody_requests(&sde, &lock_ids, &lineage)?;
+                let locks = inventory::destination::lock_items(tx, &sde, &requests, &[]).await?;
+                let current = blueprint(tx, &sde, blueprint_id).await?;
+                if !same_blueprint(&current, &bp)
+                    || originals.iter().any(|(id, old)| !locks.row(*id).is_some_and(|row|
+                        row.type_id == old.type_id && row.owner_id == old.owner_id && row.location_id == old.location_id
+                        && row.flag_id == old.flag_id && row.quantity == old.quantity && row.singleton == old.singleton
+                        && row.jump_clone_id.is_none()))
+                    || crate::dao::items::deliveries::ancestry_many(tx, &lock_ids).await.map_err(db_err)? != lineage {
+                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                }
+                if industry_dao::has_active_blueprint_job(tx, &[bp.item_id]).await.map_err(db_err)? {
+                    return Err(notify_error(messages::BLUEPRINT_IN_USE));
+                }
+                if crate::dao::items::corporation_locks::reserved(tx, &[bp.item_id], None).await.map_err(db_err)? {
+                    return Err(notify_error(infinity_core::messages::corporations::ITEM_LOCKED_OR_RESERVED));
+                }
+                if let Some(enacted) = crate::dao::items::corporation_locks::get(tx, bp.item_id).await.map_err(db_err)? {
+                    if enacted.corporation_id != bp.owner
+                        || !matches!(activity_id, MANUFACTURING | RESEARCH_TIME | RESEARCH_MATERIAL | COPYING) {
+                        return Err(notify_error(infinity_core::messages::corporations::ITEM_LOCKED_OR_RESERVED));
+                    }
+                }
+                // A locked or reserved blueprint among the consumed material sources
+                // is a mutation, never in-place use.
+                let material_ids: Vec<i64> = originals.keys().copied().collect();
+                let frozen = crate::services::corps::item_locks::locked_blueprints(&sde, &locks, &material_ids)?;
+                crate::services::corps::item_locks::ensure_mutable(tx, &frozen).await?;
                 if !quantities::apply(tx, &changes).await.map_err(db_err)? {
                     return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
                 }
@@ -460,6 +513,12 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
 /// Remove a used-up blueprint copy.
 async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
     if let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop() {
+        // Only a real spent copy is consumed here. Corporation locks and
+        // vote-case reservations bind originals only, so a genuine copy can
+        // never be frozen and needs no lock query.
+        if !(item.singleton && item.quantity == BLUEPRINT_COPY_QUANTITY) {
+            return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+        }
         industry_dao::delete_blueprint_item(db, item_id).await.map_err(db_err)?;
         inventory::notifications::notify_item_removed(outbox, item);
     }
@@ -470,7 +529,7 @@ async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::
 #[allow(clippy::too_many_arguments)]
 async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &std::sync::Arc<Sde>, outbox: &mut Outbox<X>, j: &Job, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
     let additions: Vec<_> = (0..count).map(|_| inventory::hold_storage::Addition { type_id, singleton: true, quantity: 1 }).collect();
-    inventory::hold_storage::check_destination(db, sde, j.owner, j.output_location, j.output_flag, &additions, Default::default(), None).await?;
+    inventory::hold_storage::check_destination(db, sde, j.owner, j.output_location, j.output_flag, &additions, Default::default(), inventory::hold_storage::CapacitySource::Current).await?;
     for _ in 0..count {
         let id = industry_dao::insert_copy(db, type_id, j.owner, j.output_location, j.output_flag, BLUEPRINT_COPY_QUANTITY).await.map_err(db_err)?;
         set_blueprint(db, id, me, te, runs).await?;
@@ -483,12 +542,28 @@ async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &std::sync::Ar
 /// Legacy jobs whose blueprint was already moved or lost before custody prevention are
 /// refused at delivery; an operator may need to repair their blueprint custody.
 async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &std::sync::Arc<Sde>, outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64, fact_source: (Option<i64>, Option<i64>, Option<i64>)) -> Result<(), CallError> {
+    // Lock the original and its office or container ancestry once, before any
+    // job or output write, then revalidate the persisted custody under those
+    // locks. Delivery only produces new items or updates research state; the
+    // original's own custody fields never change.
+    let lineage = crate::dao::items::deliveries::ancestry_many(db, &[j.blueprint_id]).await.map_err(db_err)?;
+    let requests = inventory::destination::custody_requests(sde, &[j.blueprint_id], &lineage)?;
+    let locks = inventory::destination::lock_items(db, sde, &requests, &[]).await?;
+    if crate::dao::items::deliveries::ancestry_many(db, &[j.blueprint_id]).await.map_err(db_err)? != lineage {
+        return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+    }
     let bp = blueprint(db, sde, j.blueprint_id).await?;
     if bp.item_id != j.blueprint_id || bp.type_id != j.blueprint_type || bp.owner != j.owner
         || bp.location != j.blueprint_location || bp.flag != j.blueprint_flag
         || bp.copy != j.blueprint_copy || bp.station != Some(j.facility)
     {
         return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+    }
+    if j.owner != j.installer {
+        let office = crate::dao::offices::identity(db, j.owner, j.facility).await.map_err(db_err)?;
+        if !office.is_some_and(|lease| lease.office_id == j.output_location) {
+            return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+        }
     }
     let successful = if j.activity == INVENTION { invention_successful } else { j.runs };
     j.status = STATUS_DELIVERED;
@@ -503,13 +578,12 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &std::sync::Ar
         (MANUFACTURING, Some(act)) => {
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
                 let quantity = manufacturing_quantity(per_run, j.runs)?;
-                use crate::dao::items::parent_locks::{LockRequest, LockStrength};
                 use crate::services::inventory::destination::Destination;
                 let destination = Destination::owned(j.owner, j.output_location, j.output_flag);
-                let preparation = items::DepositPreparation::capture(db, sde, &destination, product).await?;
-                let blueprint_write = LockRequest { item_id: bp.item_id, strength: LockStrength::Update };
-                let extra = if bp.copy && bp.runs - j.runs <= 0 { std::slice::from_ref(&blueprint_write) } else { &[] };
-                items::deposit_planned(db, sde, outbox, &preparation, quantity, LOCATION_JUNKYARD, Default::default(), None, extra).await?;
+                let mut preparation = items::DepositPreparation::capture(db, sde, &destination, product).await?;
+                // The job's item set is already locked at final strength above;
+                // the deposit runs against it instead of growing locks afterwards.
+                items::deposit_prepared(db, sde, outbox, &mut preparation, quantity, LOCATION_JUNKYARD, Some(&locks), None, Default::default(), inventory::hold_storage::CapacitySource::Current).await?;
                 let context = fact_context(db, by, fact_source.0, fact_source.1, fact_source.2).await?;
                 outbox.event_from(SourceKey::new("ManufacturingDelivered", j.id), GameEvent::ManufacturingDelivered {
                     char_id: by, installer_id: j.installer, job_id: j.id, owner_id: j.owner,
@@ -564,6 +638,8 @@ pub(super) async fn complete(c: &mut Client, id: i64) -> Result<(), CallError> {
     let db = c.db.clone();
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
+    let locked_corp = crate::dao::corporations::registry::character_corp(&db, me).await.map_err(db_err)?
+        .ok_or_else(|| user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]))?;
     let j = job(&db, id).await?;
     authorization::owner(&db, me, j.owner, None).await?;
     if j.status != INDUSTRY_JOB_STATUS_INSTALLED && j.status != INDUSTRY_JOB_STATUS_READY {
@@ -583,6 +659,10 @@ pub(super) async fn complete(c: &mut Client, id: i64) -> Result<(), CallError> {
             let expected = j.clone();
             let sde = Arc::clone(&sde);
             Box::pin(async move {
+                if !crate::dao::corporations::registry::lock_admission(tx, &[], &[locked_corp], &[me]).await.map_err(db_err)?
+                    || crate::dao::corporations::registry::character_corp(tx, me).await.map_err(db_err)? != Some(locked_corp) {
+                    return Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]));
+                }
                 let mut j = job(tx, id).await?;
                 authorization::owner(tx, me, j.owner, None).await?;
                 if (j.status != INDUSTRY_JOB_STATUS_INSTALLED && j.status != INDUSTRY_JOB_STATUS_READY) || j.activity != expected.activity || j.runs != expected.runs || j.probability != expected.probability {
@@ -607,5 +687,5 @@ pub(super) async fn complete(c: &mut Client, id: i64) -> Result<(), CallError> {
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

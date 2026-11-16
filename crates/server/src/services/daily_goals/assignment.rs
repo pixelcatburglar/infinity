@@ -46,11 +46,11 @@ pub(crate) async fn ensure_at(resources: &Resources, user: i64, character: i64, 
         let current = lua::content_policy(DAILY_GOALS_NAMESPACE)?;
         Some(lua::admit_content(&current)?)
     } else { None };
-    let mut history = activation::load(resources).await?;
+    let mut history = activation::load(resources)?;
     let mut prepared = Vec::new();
     for (missing, kind, start, end) in [(day.is_none(), "day", bounds.day_start, bounds.day_end), (month.is_none(), "month", bounds.month_start, bounds.month_end)] {
         if missing {
-            if let Some(token) = activation::resolve(resources, &mut history, kind, start, end).await? { prepared.push(prepare(resources, &token, character, at)?); }
+            if let Some(token) = activation::resolve(resources, &mut history, kind, start, end)? { prepared.push(prepare(resources, &token, character, at)?); }
         }
     }
     prepared.sort_by(|a,b| (a.period.character_id, &a.period.kind, a.period.period_start).cmp(&(b.period.character_id, &b.period.kind, b.period.period_start)));
@@ -97,4 +97,4 @@ pub(crate) async fn ensure_at(resources: &Resources, user: i64, character: i64, 
     }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

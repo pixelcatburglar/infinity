@@ -1,7 +1,13 @@
 //! Character public information, assets, private notes and personal contacts for `charMgr`.
 //! Mirrors `addressbookService.py`; uses character, item, contact and block DAOs and SDE.
-//! Contact labels and other unmodelled answers are not managed here.
+//! The bound global inventory also reads owned service-life damage. Contact labels
+//! and other unmodelled answers are not managed here.
 use super::*;
+use crate::services::notify_error;
+use infinity_core::messages;
+
+/// `inventorycommon.const.containerGlobal` in the character inventory bind.
+const CONTAINER_GLOBAL: i64 = 10002;
 
 async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
     let r = crate::dao::characters::social::public_info(&c.db, id, FILETIME_SECOND, FILETIME_UNIX_EPOCH).await.map_err(db_err)?;
@@ -73,6 +79,18 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             public_info(c, id).await.map(|info| if info.is_none() { info } else { Value::list([info]) })
         }
         ("charMgr", "GetAssetWorth") => asset_worth(c).await,
+        ("charMgr", "ListServiceLifeDamage") => {
+            let params = call.bind_params.and_then(|v| v.items());
+            let valid = call.bound && params.is_some_and(|p| {
+                p.len() == 2 && p[0].as_int() == Some(me) && p[1].as_int() == Some(CONTAINER_GLOBAL)
+            });
+            let flag = call.kwargs.get("flag").or_else(|| call.args.first());
+            if me <= 0 || !valid || flag.is_some_and(|v| !v.is_none()) {
+                Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))
+            } else {
+                crate::services::repairable_ship::service_life::global(&c.db, &c.sde, me).await
+            }
+        }
 
         ("charMgr", "GetHomeStationRow") => home_station_row(c, me).await,
         // Assets window (invCache global inventory): stations holding the character's items...

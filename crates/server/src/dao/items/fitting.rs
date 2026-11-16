@@ -11,8 +11,8 @@ struct FittingId { fitting_id: i64 }
 impl FittingId { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id") } } }
 pub(crate) struct Fitting { pub fitting_id: i64, pub owner_id: i64, pub name: String, pub description: String, pub ship_type_id: i32, pub fit_types: Vec<i32>, pub fit_flags: Vec<i32>, pub fit_qty: Vec<i64> }
 impl Fitting { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id"), owner_id: r.get("owner_id"), name: r.get("name"), description: r.get("description"), ship_type_id: r.get("ship_type_id"), fit_types: r.get("fit_types"), fit_flags: r.get("fit_flags"), fit_qty: r.get("fit_qty") } } }
-pub(crate) struct Blueprint { pub item_id: i64, pub type_id: i32, pub owner_id: i64, pub location_id: i64, pub flag_id: i32, pub quantity: i64, pub singleton: bool, pub location_type_id: Option<i32>, pub location_parent_id: Option<i64>, pub character_system_id: Option<i64>, pub material_efficiency: i64, pub time_efficiency: i64, pub runs: i64, pub job_id: Option<i64> }
-impl Blueprint { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), owner_id: r.get("owner_id"), location_id: r.get("location_id"), flag_id: r.get("flag_id"), quantity: r.get("quantity"), singleton: r.get("singleton"), location_type_id: r.get("location_type_id"), location_parent_id: r.get("location_parent_id"), character_system_id: r.get("character_system_id"), material_efficiency: r.get("material_efficiency"), time_efficiency: r.get("time_efficiency"), runs: r.get("runs"), job_id: r.get("job_id") } } }
+pub(crate) struct Blueprint { pub item_id: i64, pub type_id: i32, pub owner_id: i64, pub location_id: i64, pub flag_id: i32, pub quantity: i64, pub singleton: bool, pub material_efficiency: i64, pub time_efficiency: i64, pub runs: i64, pub job_id: Option<i64> }
+impl Blueprint { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), owner_id: r.get("owner_id"), location_id: r.get("location_id"), flag_id: r.get("flag_id"), quantity: r.get("quantity"), singleton: r.get("singleton"), material_efficiency: r.get("material_efficiency"), time_efficiency: r.get("time_efficiency"), runs: r.get("runs"), job_id: r.get("job_id") } } }
 
 pub(crate) async fn assemble_sources(ex: &(impl Executor + ?Sized), sources: &BTreeMap<i64, (Item, Option<i64>)>, owner: i64, name: &Option<String>) -> Result<bool, Error> {
     for (id, (item, remaining)) in sources {
@@ -36,7 +36,7 @@ pub(crate) async fn children(ex: &(impl Executor + ?Sized), parent: i64) -> Resu
         .iter().map(|row| ItemId::from_row(row).item_id).collect())
 }
 pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), item: &Item) -> Result<u64, Error> {
-    let row = ex.query_one("WITH changed AS (UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND singleton = $7 AND singleton AND flag_id = $8 RETURNING item_id, owner_id, singleton), removed AS (DELETE FROM game.ship_skin_applications a USING changed c WHERE a.ship_item_id = c.item_id AND (a.character_id <> c.owner_id OR NOT c.singleton)) SELECT EXISTS (SELECT 1 FROM changed) AS matched", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton, &FLAG_HANGAR]).await?;
+    let row = ex.query_one("WITH changed AS (UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND singleton = $7 AND singleton AND flag_id = $8 RETURNING item_id, owner_id, singleton), removed AS (DELETE FROM game.ship_skin_applications a USING changed c WHERE a.ship_item_id = c.item_id AND (a.character_id <> c.owner_id OR NOT c.singleton)), cleared AS (DELETE FROM game.ship_kill_counts k USING changed c WHERE k.ship_item_id = c.item_id) SELECT EXISTS (SELECT 1 FROM changed) AS matched", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton, &FLAG_HANGAR]).await?;
     Ok(u64::from(Matched::from_row(&row).matched))
 }
 pub(crate) async fn destroy_upgrade(ex: &(impl Executor + ?Sized), item: &Item) -> Result<bool, Error> {
@@ -56,13 +56,10 @@ pub(crate) async fn rename(ex: &(impl Executor + ?Sized), id: i64, owner: i64, n
 pub(crate) async fn blueprints(ex: &(impl Executor + ?Sized), owner: i64, item: Option<i64>) -> Result<Vec<Blueprint>, Error> {
     let statuses = [INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY];
     Ok(ex.query("SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
-                    loc.type_id AS location_type_id, loc.location_id AS location_parent_id, ch.solar_system_id AS character_system_id,
                     COALESCE(b.material_efficiency, 0)::bigint AS material_efficiency, COALESCE(b.time_efficiency, 0)::bigint AS time_efficiency,
                     COALESCE(b.runs, $3::int)::bigint AS runs,
                     (SELECT j.job_id FROM game.industry_jobs j WHERE j.blueprint_id = i.item_id AND j.status = ANY($4::int[]) LIMIT 1) AS job_id
              FROM game.items i
-             LEFT JOIN game.items loc ON loc.item_id = i.location_id
-             LEFT JOIN game.characters ch ON ch.character_id = i.owner_id
              LEFT JOIN game.blueprints b ON b.item_id = i.item_id
              WHERE i.owner_id = $1 AND ($2::bigint IS NULL OR i.item_id = $2) AND i.location_id > 0", &[&owner, &item, &BLUEPRINT_INFINITE_RUNS, &statuses.as_slice()]).await?.iter().map(Blueprint::from_row).collect())
 }

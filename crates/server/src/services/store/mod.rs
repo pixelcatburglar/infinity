@@ -4,7 +4,7 @@
 //!   dicts vgs/common/utils.py parses. The live catalogue was server-side only, so
 //!   it is rebuilt from this build's data: Serenity-visible SKINs, apparel and
 //!   crates that traded on the retail market, priced in PLEX at the retail
-//!   ISK/PLEX ratio (crate::retail), plus skill services, a free daily gift and
+//!   ISK/PLEX ratio (infinity_content::retail), plus skill services, a free daily gift and
 //!   server-authored expert consumables priced from historical retail observations.
 //!   Expert purchases use the ordinary token claim flow to deliver physical items.
 //!   Root category IDs have client icons (nes_constants.py); 202 is a server-selected child.
@@ -95,4 +95,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

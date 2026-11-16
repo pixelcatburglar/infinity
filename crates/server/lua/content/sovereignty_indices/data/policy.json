@@ -1,0 +1,8 @@
+{
+  "version": "1",
+  "source": "Server-authored sovereignty development-index policy",
+  "military_points_per_death": 100000,
+  "industrial_points_per_m3": 1,
+  "decay_points": 100000,
+  "decay_interval_seconds": 900
+}

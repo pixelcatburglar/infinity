@@ -1,14 +1,23 @@
 //! Dedicated market database test support.
+#[cfg(any(feature = "tests-storage", feature = "tests-economy"))]
 use infinity_core::{consts::{FILETIME_DAY, FILETIME_SECOND}};
+#[cfg(any(feature = "tests-storage", feature = "tests-economy"))]
 use crate::{client::filetime_now, db::{Db, Error}};
+#[cfg(feature = "tests-storage")]
 use infinity_core::{consts::{FLAG_HANGAR, TYPE_PLEX}};
+#[cfg(feature = "tests-storage")]
 use crate::{dao::market::orders::Station, sde::Sde, services::tests::fixture::{self, Fixture}};
 
+#[cfg(feature = "tests-storage")]
 mod plex_settlement;
+#[cfg(feature = "tests-storage")]
 mod lifecycle;
+#[cfg(feature = "tests-storage")]
 mod books;
+#[cfg(feature = "tests-storage")]
 mod stack_quantities;
 
+#[cfg(feature = "tests-storage")]
 pub(super) async fn isolated_stations(db: &Db, sde: &Sde) -> (Station, Station) {
     let occupied: i64 = db.query_one("SELECT count(*) AS n FROM game.market_orders WHERE type_id=$1", &[&TYPE_PLEX]).await.unwrap().get("n");
     assert_eq!(occupied, 0, "dedicated database must have an empty global PLEX book");
@@ -26,14 +35,17 @@ pub(super) async fn isolated_stations(db: &Db, sde: &Sde) -> (Station, Station) 
     (first, second)
 }
 
+#[cfg(feature = "tests-storage")]
 pub(super) async fn fund(db: &Db, person: Fixture, amount: &str) {
     db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&person.character, &amount]).await.unwrap();
 }
 
+#[cfg(feature = "tests-storage")]
 pub(super) async fn physical_plex(db: &Db, owner: i64, station: i64, quantity: i64) -> i64 {
     db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,$5,false) RETURNING item_id", &[&TYPE_PLEX, &owner, &station, &FLAG_HANGAR, &quantity]).await.unwrap().get("item_id")
 }
 
+#[cfg(feature = "tests-storage")]
 pub(super) async fn cleanup(db: &Db, people: &[Fixture]) {
     let characters: Vec<i64> = people.iter().map(|f| f.character).collect();
     let accounts: Vec<i64> = people.iter().map(|f| f.account).collect();
@@ -47,6 +59,7 @@ pub(super) async fn cleanup(db: &Db, people: &[Fixture]) {
     for person in people { fixture::cleanup(db, *person).await.unwrap(); }
 }
 
+#[cfg(any(feature = "tests-storage", feature = "tests-economy"))]
 pub(crate) async fn age_order_for_modification(db: &Db, order_id: i64) -> Result<(), Error> {
     let issued = crate::config::game().market.modification_delay_seconds.checked_add(1)
         .and_then(|seconds| seconds.checked_mul(FILETIME_SECOND))

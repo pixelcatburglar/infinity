@@ -1,4 +1,4 @@
-//! Player bounty pools, kill rights and durable payout/expiry jobs.
+//! Player bounty pools, kill rights and their shared optional-ID wire encoding.
 //! Mirrors eve/client/script/ui/shared/bountySvc.py and killRights.py.
 //! Uses game.bounties, game.bounty_contributions, game.bounty_payouts and game.kill_rights.
 //! GM cache/reimbursement calls and type-14 notifications are unsupported. Active
@@ -9,7 +9,8 @@ mod bounties;
 mod kill_right_mgr;
 pub(super) mod kill_rights;
 pub(super) mod payout;
-#[cfg(test)] mod tests;
+pub(crate) mod npc;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;
 
 use super::{Call, CallResult};
 use crate::client::Client;
@@ -40,6 +41,8 @@ const MAX_BOUNTY: f64 = 100_000_000_000.0;
 const TOP_LIST_PAGE: i64 = 50;
 /// Server policy for search results on either side of the matching rank.
 const SEARCH_CONTEXT: i64 = 5;
+
+fn optional(id: Option<i64>) -> marshal::Value { id.map(marshal::Value::Int).unwrap_or(marshal::Value::None) }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {

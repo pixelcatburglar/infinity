@@ -201,21 +201,22 @@ async fn retained_package_reopens_after_publication_and_rejects_tampering() {
         let mut data: serde_json::Value = serde_json::from_str(DATA).unwrap();
         data["version"] = version.into();
         data["ordinary"][0]["rewards"] = serde_json::json!([{"kind":"item","type_id":item,"amount":1}]);
-        content::build_package(&mlua::Lua::new(), "daily_goals".into(), version.into(), b"registration".to_vec(), source.to_vec(), serde_json::to_vec(&data).unwrap(), &config, &sde, ValidationContext::Activation(&sde)).unwrap()
+        content::build_package(&mlua::Lua::new(), content::package_row("daily_goals".into(), version.into(), b"registration".to_vec(), source.to_vec(), serde_json::to_vec(&data).unwrap()).unwrap(), &config, &sde, ValidationContext::Activation(&sde), None).unwrap()
     };
     let old = Arc::new(build(&a, include_bytes!("../../../../lua/content/daily_goals/policy.lua")));
     let content::PackageDomain::DailyGoals(old_definitions) = &old.domain else { panic!("daily package expected") };
     let snapshot = crate::services::daily_goals::frozen::snapshot(&sde, &old_definitions.ordinary()[0]).unwrap();
     let frozen_json = serde_json::to_string(&snapshot).unwrap();
     let new = Arc::new(build(&b, b"return {Assign=function() end, Match=function() end, Cascade=function() end, Project=function() return {keys={}} end}"));
-    let row_a = old.row();
-    let row_b = new.row();
+    let row_a = (*old.row).clone();
+    let row_b = (*new.row).clone();
     assert!(crate::dao::lua_content::store(&db, &row_a).await.unwrap());
     assert!(crate::dao::lua_content::store(&db, &row_b).await.unwrap());
     for (row, time) in [(&row_a, 1), (&row_b, 2), (&row_a, 3)] {
-        assert!(crate::dao::lua_content::activations::append_if_changed(&db, row, time).await.unwrap());
+        crate::dao::lua_content::activations::publish(&db, std::slice::from_ref(row), time).await.unwrap();
     }
-    let history = crate::dao::lua_content::activations::list(&db, "daily_goals").await.unwrap();
+    let mut history = crate::dao::lua_content::activations::load_all(&db).await.unwrap();
+    history.sort_by_key(|row| row.ordinal);
     let own: Vec<_> = history.iter().filter(|r| r.version == a || r.version == b).map(|r| r.version.as_str()).collect();
     assert_eq!(own, [a.as_str(), b.as_str(), a.as_str()]);
     let mut content = ContentDefinitions::default();
@@ -224,7 +225,7 @@ async fn retained_package_reopens_after_publication_and_rejects_tampering() {
     let current = PinnedPolicy::pin(registry.clone(), "daily_goals").unwrap();
     let retained_row = crate::dao::lua_content::load(&db, "daily_goals", &a).await.unwrap().unwrap();
     let post_update_sde = crate::sde::Sde::default();
-    let retained = PinnedPolicy::reopen(registry.clone(), retained_row.clone(), &config, &post_update_sde).unwrap();
+    let retained = PinnedPolicy::reopen(registry.clone(), std::sync::Arc::new(retained_row.clone()), None, &config, &post_update_sde).unwrap();
     assert_eq!(retained.daily_goals().unwrap().ordinary(), old_definitions.ordinary());
     let restored: crate::services::daily_goals::GoalSnapshot = serde_json::from_str(&frozen_json).unwrap();
     assert_eq!(restored.template, snapshot.template);
@@ -242,6 +243,6 @@ async fn retained_package_reopens_after_publication_and_rejects_tampering() {
             2 => damaged.version.push('x'),
             _ => damaged.fingerprint[0] ^= 1,
         }
-        assert!(PinnedPolicy::reopen(registry.clone(), damaged, &config, &sde).is_err());
+        assert!(PinnedPolicy::reopen(registry.clone(), std::sync::Arc::new(damaged), None, &config, &sde).is_err());
     }
 }

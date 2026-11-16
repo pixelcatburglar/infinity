@@ -116,7 +116,7 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         let script = dir.join("pilot.lua");
         std::fs::write(&script, "register.rpc('pilot','online',function(id) return pilots.online(id) end); register.rpc('pilot','identity',function(id) return pilots.identity(id) end)")?;
         let config = crate::config::lua::LuaConfig { scripts_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
-        let host = crate::lua::reload::Host::new(config, r.clone()).await?;
+        let host = crate::lua::reload::Host::new(config.clone(), r.clone(), crate::lua::catalogue::Catalogue::load(&r.db, &config, &r.sde).await?).await?;
         host.reload().await?;
         let generation = host.snapshot();
         let online = &generation.claims.rpc[&("pilot".into(), "online".into())].function;
@@ -130,6 +130,30 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
         assert!(r.world.is_online(id));
         std::fs::remove_dir_all(dir)?;
         lua.load("pilots.offline(id); pilots.offline(id)").exec_async().await?;
+        assert_eq!(crate::db::outbox::tests::events(&r.db, "CharacterLoggedOff", id).await.len(), 1, "repeat offline wrote a second logoff");
+        let (rebound, _rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(r.world.bind_pilot(id, rebound, None, None).map_err(|e| format!("{e:?}"))?);
+        assert!(lua.load("return pilots.online(id)").eval_async::<bool>().await?);
+        lua.load("pilots.undock(id)").exec_async().await?;
+        let system: i64 = lua.load("return pilots.identity(id)").eval_async::<Table>().await?.get("system_id")?;
+        assert!(r.world.with(system, move |s| s.pilot_ball(id).is_some()).await.unwrap_or(false), "undocked pilot never joined the actor");
+        let old_sender = r.pilots.state(id).lock().await.as_ref().unwrap().notify.clone();
+        r.world.post(system, |_| panic!("injected actor panic"));
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if r.world.admission(system).is_ok() && r.world.with(system, |_| ()).await.is_none() { return; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("failed actor was not retired");
+        assert!(r.pilots.state(id).lock().await.is_none(), "retired slot was not finished");
+        assert!(!r.world.is_online(id) && old_sender.is_closed(), "retired generation receiver must be gone");
+        assert!(lua.load("return pilots.online(id)").eval_async::<bool>().await?);
+        r.pilots.retire_generation(&r.world, id, &old_sender).await?;
+        assert!(r.pilots.state(id).lock().await.is_some() && r.world.is_online(id), "stale generation cleared the new slot");
+        let new_sender = r.pilots.state(id).lock().await.as_ref().unwrap().notify.clone();
+        r.pilots.retire_generation(&r.world, id, &new_sender).await?;
+        assert!(r.pilots.state(id).lock().await.is_none() && !r.world.is_online(id));
+
         assert!(!r.world.is_online(id));
         assert!(r.world.online_session(id).is_none());
         let after: Table = lua.load("return pilots.identity(id)").eval_async().await?;
@@ -160,3 +184,5 @@ async fn lua_lifecycle_authorizes_and_survives_reload() {
     fixture::cleanup(&r.db, id).await;
     result.unwrap();
 }
+
+

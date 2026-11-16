@@ -72,8 +72,16 @@ async fn validation_uses_visible_system_owned_rock() -> anyhow::Result<()> {
         ensure!(format!("{error:?}").contains(messages::MINING_MODULE_TARGET_INVALID), "other world accepted rock: {error:?}");
         f.set(module_id, ATTR_MAX_RANGE, 0.0).await;
         let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.map_err(|e| anyhow!("fit: {e:?}"))?;
-        f.world.with(f.system, move |s| s.set_ball_position(ship, [1_000_000.0; 3], |_, _| true)).await.ok_or_else(|| anyhow!("system stopped"))?;
-        ensure!(f.world.after(f.system, 100).await, "position action failed");
+        let requested = [1_000_000.0; 3];
+        f.world.with(f.system, move |s| s.set_ball_position(ship, requested, |_, _| true)).await.ok_or_else(|| anyhow!("system stopped"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if f.world.with(f.system, move |s| s.sampled_ball(ship).is_some_and(|b| b.pos == requested)).await.ok_or_else(|| anyhow!("system stopped"))? {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                ensure!(f.world.after(f.system, 100).await, "position action failed");
+            }
+        }).await.map_err(|_| anyhow!("ship position was not applied: expected {requested:?}"))??;
         let error = validate(&cx, &fit, &module, Some(rock)).await.unwrap_err();
         ensure!(format!("{error:?}").contains(&messages::mining_range(0.0)), "out-of-range rock did not report range: {error:?}");
         Ok(())

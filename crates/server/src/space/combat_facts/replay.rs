@@ -80,6 +80,10 @@ impl Replay {
     pub(super) fn subjects(&self) -> impl Iterator<Item = i64> + '_ {
         self.sources.values().filter_map(|source| source.subject.flatten())
     }
+    /// Any attempt node still outstanding (reserved or claimed). A clean
+    /// journal can still hold in-flight native work; the NPC sleep admission
+    /// refuses it. Read-only, sharing the existing `attempts` authority.
+    pub(super) fn has_pending_attempts(&self) -> bool { !self.attempts.is_empty() }
 
     pub(super) fn retire(&mut self, activation: [u8; 16], generation: u64) -> Result<(), Refusal> {
         let source = self.sources.get_mut(&activation).ok_or(Refusal::Invalid)?;
@@ -154,4 +158,4 @@ impl Replay {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

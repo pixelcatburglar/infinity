@@ -1,8 +1,13 @@
 //! Actor-owned combat state: fitted defenses, live condition, contributions and
 //! lifecycle tokens. Damage and repair are synchronous actor operations; database,
-//! client and market work stay in their existing asynchronous callers.
+//! client and market work stay in their existing asynchronous callers. Cycles
+//! borrow the resident fit through the single mutable input gate in `inputs`.
 mod facts;
 mod fitting;
+pub(crate) mod inputs;
+pub(crate) mod loaded;
+pub(crate) mod spool;
+use spool::SpoolReadout;
 use super::System;
 use crate::services::combat::damage::DamageSource;
 use crate::services::combat::groups_health::{recharge, Condition, ShipStats};
@@ -48,6 +53,8 @@ pub(crate) struct ActorConditionSnapshot {
     pub saved_revision: u64,
     pub condition: Condition,
     pub contributions: Vec<ContributionEntry>,
+    /// Dirty loaded rows captured under the same gate as this snapshot.
+    pub loaded: Vec<crate::dao::items::charges::LoadedWrite>,
 }
 
 impl ActorConditionSnapshot {
@@ -157,12 +164,20 @@ pub(crate) struct ActorCombatRecord {
     pub(crate) source_sequence: u64,
     pub(crate) revision: u64,
     pub(crate) saved_revision: u64,
+    /// Armed character-deadline timer: (deadline FILETIME, token).
+    pub(crate) character_timer: Option<(i64, u64)>,
     pub(crate) contributions: HashMap<i64, ContributionEntry>,
     pub(crate) phase: CombatPhase,
     pub(crate) pending: Option<PendingCombat>,
+    /// Resident loaded charge slots keyed by module item id.
+    pub(crate) loaded: HashMap<i64, loaded::LoadedSlot>,
+    /// Presentation-only precursor-turret ramp readouts: notification and
+    /// `ship_info` prime values only — damage never reads them, they are never
+    /// persisted, and each entry dies with its activation generation.
+    pub(crate) spool_readouts: Vec<SpoolReadout>,
 }
 
-fn valid_raw(raw: [f64; 4]) -> bool {
+pub(crate) fn valid_raw(raw: [f64; 4]) -> bool {
     raw.iter().all(|amount| amount.is_finite() && *amount >= 0.0)
 }
 
@@ -211,7 +226,7 @@ impl ActorCombatRecord {
     }
 }
 
-fn absorb_preserving_overdamage(condition: &mut Condition, raw: [f64; 4]) -> [f64; 3] {
+pub(crate) fn absorb_preserving_overdamage(condition: &mut Condition, raw: [f64; 4]) -> [f64; 3] {
     let mut left = raw;
     let mut dealt = [0.0; 3];
     for layer in 0..3 {
@@ -280,15 +295,18 @@ impl System {
             .or_else(|| self.actor_combat.get(&ship).map(|record| record.membership_generation))
             .unwrap_or_else(crate::space::targeting::next_generation);
         if !valid_condition(&condition) { return; }
+        if self.actor_combat.get(&ship).is_some_and(|record| record.has_loaded_obligations()) { return; }
         self.nativefact_clock = self.nativefact_clock.max(condition.shield_at);
         let source_sequence = self.actor_combat.get(&ship)
             .filter(|record| record.membership_generation == generation).map_or(0, |record| record.source_sequence);
+        let loaded = loaded::seed_map(fit.loaded_seeds());
         let record = ActorCombatRecord {
             condition, fit, fit_key, fit_revision: 0, membership_generation: generation, source_sequence,
-            revision: 1, saved_revision: 1, contributions: HashMap::new(),
-            phase: CombatPhase::Live, pending: None,
+            revision: 1, saved_revision: 1, character_timer: None, contributions: HashMap::new(),
+            phase: CombatPhase::Live, pending: None, loaded, spool_readouts: Vec::new(),
         };
         self.actor_combat.insert(ship, record);
+        self.arm_character_expiry(ship);
     }
 
     /// Mark a just-installed cold seed whose fitted rebase has not been checkpointed.
@@ -300,63 +318,10 @@ impl System {
         true
     }
 
-    pub(crate) fn refresh_fitted_stats(&mut self, ship: i64) -> bool {
-        let at = self.combat_fact_time();
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if !matches!(record.phase, CombatPhase::Live) { return false; }
-        let Some(next) = record.revision.checked_add(1) else { return false };
-        let stats = ShipStats::from_fit(&record.fit, record.fit_key);
-        if !rebase_condition_at(&mut record.condition, stats, at) { return false; }
-        record.fit_revision = record.fit_revision.saturating_add(1);
-        record.revision = next;
-        let health = [0, 1, 2].map(|i| if record.condition.stats.max[i] > 0.0 {
-            (record.condition.now[i] / record.condition.stats.max[i]).clamp(0.0, 1.0)
-        } else { 0.0 });
-        if self.ball(ship).is_some_and(|ball| ball.health != health) { self.set_health(ship, health); }
-        true
-    }
-
-    /// Returns whether projections were replaced; false for missing, non-live or revision-exhausted records.
-    pub(crate) fn replace_fitted_projections(&mut self, ship: i64,
-        projections: Vec<crate::services::effects::projection::Projection>, revision: Option<u64>) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if !matches!(record.phase, CombatPhase::Live) || record.revision == u64::MAX { return false; }
-        let key = record.fit_key;
-        record.fit.replace_projections_for(key, projections, revision);
-        record.fit_revision = record.fit_revision.saturating_add(1);
-        self.refresh_fitted_stats(ship);
-        true
-    }
-
-    pub(crate) fn fitted_module_online(&mut self, ship: i64, module: i64, online: bool) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if !matches!(record.phase, CombatPhase::Live) || record.revision == u64::MAX || !record.fit.set_module_online(module, online) { return false; }
-        record.fit_revision = record.fit_revision.saturating_add(1);
-        self.refresh_fitted_stats(ship)
-    }
-
-    pub(crate) fn fitted_module_active(&mut self, ship: i64, module: i64, active: bool) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if !matches!(record.phase, CombatPhase::Live) || record.revision == u64::MAX || !record.fit.set_module_active(module, active) { return false; }
-        record.fit_revision = record.fit_revision.saturating_add(1);
-        self.refresh_fitted_stats(ship)
-    }
-
-    pub(crate) fn fitted_module_overloaded(&mut self, ship: i64, module: i64, overloaded: bool) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if !matches!(record.phase, CombatPhase::Live) || record.revision == u64::MAX || !record.fit.set_module_overloaded(module, overloaded) { return false; }
-        record.fit_revision = record.fit_revision.saturating_add(1);
-        self.refresh_fitted_stats(ship)
-    }
-
-    pub(crate) fn combat_fit_revision(&self, ship: i64) -> Option<u64> {
-        self.actor_combat.get(&ship).map(|record| record.fit_revision)
-    }
-
-
     pub(crate) fn remove_combat_state(&mut self, ship: i64) {
         if !matches!(self.actor_combat.get(&ship).map(|r| r.phase),
-            Some(CombatPhase::Dying { .. } | CombatPhase::Transition { .. })) {
+            Some(CombatPhase::Dying { .. } | CombatPhase::Transition { .. }))
+            && !self.actor_combat.get(&ship).is_some_and(|r| r.has_loaded_obligations()) {
             self.actor_combat.remove(&ship);
         }
     }
@@ -392,6 +357,8 @@ impl System {
             saved_revision: record.saved_revision,
             condition: record.condition.clone(),
             contributions: record.contribution_vec(at),
+            loaded: record.loaded.values().filter(|slot| slot.dirty)
+                .map(|slot| slot.write(ship)).collect(),
         })
     }
     pub(crate) fn is_damage_immune(&self, target: i64) -> bool { self.sovereignty.hub == Some(target) }
@@ -430,7 +397,23 @@ impl System {
     pub(crate) fn apply_area_damage(&mut self, source: crate::space::combat_facts::CombatSource,
         targets: &mut [crate::space::combat_facts::reservation::ReservedTarget<DamageBatchEntry>],
         at: i64, guard: impl FnOnce(&System) -> bool) -> Result<bool, crate::space::combat_facts::Refusal> {
-        if targets.is_empty() || at != self.nativefact_clock || !guard(self) || targets.iter().any(|target| target.payload.plan.as_ref().is_none_or(|plan|
+        if targets.is_empty() {
+            self.finish_combat_attempt(&source);
+            return Ok(false);
+        }
+        self.admit_area_source(source, targets, at, guard)
+    }
+
+    /// Shared source admission of one area pulse: observed clock and guard must
+    /// still hold and every carried ship plan must match its live record. Ship
+    /// unions claim through `reserve_damage_union`; a pulse carrying no ship
+    /// plan performs the same subject and replay claim through a zero-damage
+    /// reservation on the source entity, released at once. A refused, replayed
+    /// or full pulse finishes the attempt and mutates nothing.
+    pub(crate) fn admit_area_source(&mut self, source: crate::space::combat_facts::CombatSource,
+        targets: &mut [crate::space::combat_facts::reservation::ReservedTarget<DamageBatchEntry>],
+        at: i64, guard: impl FnOnce(&System) -> bool) -> Result<bool, crate::space::combat_facts::Refusal> {
+        if at != self.nativefact_clock || !guard(self) || targets.iter().any(|target| target.payload.plan.as_ref().is_none_or(|plan|
             plan.at != at || plan.source.facts != Some(source) || plan.victim != target.target
                 || plan.layers.map(f64::to_bits) != target.amounts.map(f64::to_bits) || self.actor_combat.get(&plan.target)
                 .is_none_or(|record| record.revision != plan.revision || record.membership_generation != plan.generation
@@ -440,7 +423,12 @@ impl System {
         }
         let count = targets.len();
         let Some(mut facts) = self.combat_facts.take() else { self.finish_combat_attempt(&source); return Err(crate::space::combat_facts::Refusal::Invalid) };
-        let result = match facts.reserve_damage_union(source, targets, at) {
+        let result = if count == 0 {
+            match facts.reserve_damage(source, &source.entity, at) {
+                Ok(reservation) => { facts.release(reservation); Ok(true) }
+                Err(error) => Err(error),
+            }
+        } else { match facts.reserve_damage_union(source, targets, at) {
           Ok(mut reservation) => {
             for index in 0..count {
                 let plan = reservation.payload_mut(index).and_then(|entry| entry.plan.take()).expect("validated plan");
@@ -453,7 +441,7 @@ impl System {
             Ok(true)
           }
           Err(error) => Err(error),
-        };
+        } };
         facts.finish_attempt(&source);
         self.combat_facts = Some(facts);
         result
@@ -707,16 +695,20 @@ impl System {
     pub(crate) fn transfer_combat_state(&mut self, ship: i64, destination_generation: u64,
         snapshot: ActorConditionSnapshot, fit: Fit, fit_key: Key) -> bool {
         if self.persistent_generation(ship) != Some(destination_generation)
-            || snapshot.item_id != ship || !valid_condition(&snapshot.condition) { return false; }
+            || snapshot.item_id != ship || !valid_condition(&snapshot.condition)
+            || self.actor_combat.get(&ship).is_some_and(|record| record.has_loaded_obligations()) { return false; }
         let condition = snapshot.condition;
         self.nativefact_clock = self.nativefact_clock.max(condition.shield_at);
+        let loaded = loaded::seed_map(fit.loaded_seeds());
         self.actor_combat.insert(ship, ActorCombatRecord {
             condition, fit, fit_key, fit_revision: 0, membership_generation: destination_generation,
             source_sequence: 0,
             revision: snapshot.revision, saved_revision: snapshot.saved_revision,
+            character_timer: None,
             contributions: snapshot.contributions.into_iter().map(|e| (e.attacker_id, e)).collect(),
-            phase: CombatPhase::Live, pending: None,
+            phase: CombatPhase::Live, pending: None, loaded, spool_readouts: Vec::new(),
         });
+        self.arm_character_expiry(ship);
         self.refresh_fitted_stats(ship);
         true
     }
@@ -797,4 +789,4 @@ impl System {
 
 }
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-services", feature = "tests-ships", feature = "tests-slash", feature = "tests-space")))] pub(crate) mod tests;

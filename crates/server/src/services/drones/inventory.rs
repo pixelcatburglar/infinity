@@ -1,17 +1,28 @@
-//! Persistent drone inventory identities back client space balls and item notices.
+//! Drone inventory identities, shared hull admission, space balls and item notices.
 //! Restoration prepares positioned drones before the system actor starts; orders
 //! and controller state are transient, and unsupported drone work is refused.
+//! Restoration also carries each real owner's persistent GM NPC-ignore flag
+//! from the positioned join into the prepared drone.
 
 use std::sync::Arc;
 
-use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, CATEGORY_DRONE, OWNER_UNOWNED};
-use crate::dao::items::drones;
-use crate::db::Db;
+use infinity_core::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, CATEGORY_DRONE, CATEGORY_SHIP, OWNER_UNOWNED};
+use crate::dao::items::{drones, loading::ItemQuery, ship as ship_dao};
+use crate::db::{Db, executor::Executor};
 use crate::sde::Sde;
-use crate::services::{db_err, CallError, fit::{Fit, Key}};
+use crate::services::{db_err, notify_error, CallError, fit::{Fit, Key}, items::load_items};
 use crate::space::{Ball, MODE_STOP, WarpState, drone::PreparedDrone};
 pub(crate) mod launch;
 pub(crate) mod returning;
+
+/// Lock and validate the currently selected hull before drone inventory changes.
+async fn prepare_ship(ex: &(impl Executor + ?Sized), sde: &Sde, owner: i64, ship: i64, system: i64) -> Result<(), CallError> {
+    let unavailable = || notify_error(infinity_core::messages::drones::NOT_AVAILABLE);
+    if !ship_dao::lock_reload_ship(ex, ship).await.map_err(db_err)? || crate::dao::characters::selection::ship_id(ex, owner).await.map_err(db_err)? != Some(ship) { return Err(unavailable()); }
+    let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;
+    if hull.owner_id != owner || hull.location_id != system || hull.category_id != i64::from(CATEGORY_SHIP) || !hull.singleton { return Err(unavailable()); }
+    Ok(())
+}
 
 fn drone_ball(fit: &Fit, key: Key, id: i64, type_id: i32, owner: i64, affiliation: (i64, i64), pos: [f64; 3], health: [f64; 3]) -> Result<Ball, CallError> {
     let data = fit.sde().types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("drone type missing from SDE")))?;
@@ -34,9 +45,7 @@ fn drone_ball(fit: &Fit, key: Key, id: i64, type_id: i32, owner: i64, affiliatio
 
 /// Transfer a live owned drone to neutral ownership without removing its ball.
 pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<(), CallError> {
-    use crate::dao::items::loading::ItemQuery;
     use crate::db::outbox::{dispatch_client, Outbox};
-    use crate::services::{items::load_items, notify_error};
     use marshal::Value;
 
     let refuse = || notify_error(infinity_core::messages::drones::NOT_AVAILABLE);
@@ -45,7 +54,9 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
     let valid = c.world.with(system, move |s| s.drone(id).is_some_and(|d|
         d.owner == owner && s.ball(id).is_some())).await.unwrap_or(false);
     if !valid { return Err(refuse()); }
+    let admission = c.world.admission(system).map_err(db_err)?;
     let market = crate::services::market::lock().await;
+    admission.check().map_err(db_err)?;
     let db = c.db.clone();
     let sde = c.sde.clone();
     let world = c.world.clone();
@@ -72,6 +83,7 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
                     if s.drone(id).is_some_and(|d| d.owner == owner) { s.drone_abandoned(id); }
                 }).await.is_none() {
                     match world.system_locked(system, &market).await {
+                        Err(error) if error.downcast_ref::<crate::space::containment::ActorRetiring>().is_some() => return Err(CallError::Internal(error)),
                         Ok(()) => {
                             if world.with(system, move |s| {
                                 if s.drone(id).is_some_and(|d| d.owner == owner) { s.drone_abandoned(id); }
@@ -82,15 +94,19 @@ pub(crate) async fn abandon(c: &mut crate::client::Client, id: i64) -> Result<()
                         Err(error) => tracing::warn!(system, %error, "failed to restore committed abandoned drone"),
                     }
                 }
+                Ok(())
             });
             Ok((outbox, task))
         },
     ).await?;
-    if let Err(error) = task.await { tracing::warn!(system, %error, "committed drone abandon completion failed"); }
+    let task = match task.await {
+        Ok(result) => result,
+        Err(error) => { tracing::warn!(system, %error, "committed drone abandon completion failed"); Ok(()) }
+    };
     if let Err(error) = dispatch_client((), outbox, c) {
         tracing::warn!(system, ?error, "committed drone abandon notification failed");
     }
-    Ok(())
+    task
 }
 
 /// Load positioned singleton identities without entering or constructing a world.
@@ -111,9 +127,9 @@ pub(crate) async fn restore_specs(db: &Db, sde: Arc<Sde>, system: i64) -> Result
                 .ok_or_else(|| CallError::Internal(anyhow::anyhow!("drone owner corporation missing")))?
         };
         let ball = drone_ball(&fit, key, row.item_id, row.type_id, row.owner_id, (corp, -1), row.pos, condition.fractions().map(|v| v.clamp(0.0, 1.0)))?;
-        restored.push(PreparedDrone { ball, spec, condition, fit, key });
+        restored.push(PreparedDrone { ball, spec, condition, fit, key, npc_ignored: row.npc_ignored });
     }
     Ok(restored)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

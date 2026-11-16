@@ -28,5 +28,5 @@ pub(crate) async fn get(ex: &(impl Executor + ?Sized), character: i64, kind: &st
     ex.query_opt("SELECT character_id,kind,period_start,period_end,assigned_at,generation,namespace,version,revision FROM game.daily_goal_periods WHERE character_id=$1 AND kind=$2 AND period_start=$3", &[&character,&kind,&start]).await?.as_ref().map(PeriodRow::from_row).transpose()
 }
 pub(crate) async fn insert(ex: &(impl Executor + ?Sized), p: &PeriodRow) -> Result<bool, db::Error> {
-    Ok(ex.execute("INSERT INTO game.daily_goal_periods(character_id,kind,period_start,period_end,assigned_at,generation,namespace,version,revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (character_id,kind,period_start) DO NOTHING", &[&p.character_id,&p.kind,&p.period_start,&p.period_end,&p.assigned_at,&p.generation,&p.namespace,&p.version,&p.revision]).await? == 1)
+    Ok(ex.execute("INSERT INTO game.daily_goal_periods(character_id,kind,period_start,period_end,assigned_at,generation,namespace,version,revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING", &[&p.character_id,&p.kind,&p.period_start,&p.period_end,&p.assigned_at,&p.generation,&p.namespace,&p.version,&p.revision]).await? == 1)
 }

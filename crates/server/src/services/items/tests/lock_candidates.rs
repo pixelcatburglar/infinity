@@ -48,10 +48,10 @@ async fn selected_candidate_merges_only_the_locked_duplicate() {
     let locks = lock_items(&tx, &sde, &requests, &[first]).await.unwrap();
     let guard = ParentGuard::revalidate(&locks, &[snapshot]).unwrap();
     let mut outbox: Outbox = Outbox::default();
-    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 3, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 3, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
     let row = receipt.merged.as_ref().unwrap();
     assert_eq!((row.item.item_id, row.item.quantity, row.old_quantity), (first, 8, Some(5)));
-    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
     let row = receipt.merged.as_ref().unwrap();
     assert_eq!((row.item.item_id, row.item.quantity, row.old_quantity), (first, 10, Some(8)));
     let fresh = prep.fresh_attempt();
@@ -96,11 +96,11 @@ async fn deleted_or_moved_candidate_inserts_without_merging_another_stack() {
         let locks = lock_items(&tx, &sde, &requests, &[chosen]).await.unwrap();
         let guard = ParentGuard::revalidate(&locks, &[snapshot]).unwrap();
         let mut outbox: Outbox = Outbox::default();
-        let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 3, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+        let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 3, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
         let item = &receipt.created.as_ref().unwrap().item;
         assert_ne!(item.item_id, chosen);
         assert_ne!(item.item_id, other);
-        let merged = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+        let merged = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
         let row = merged.merged.as_ref().unwrap();
         assert_eq!((row.item.item_id, row.item.quantity, row.old_quantity), (item.item_id, 5, Some(3)));
         tx.commit().await.unwrap();
@@ -147,7 +147,7 @@ async fn stale_mandatory_parent_refuses_without_effects() {
     let locks = lock_items(&tx, &sde, &requests, &[candidate]).await.unwrap();
     let mut outbox: Outbox = Outbox::default();
     let result = match ParentGuard::revalidate(&locks, &[snapshot]) {
-        Ok(guard) => deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.map(|_| ()),
+        Ok(guard) => deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.map(|_| ()),
         Err(error) => Err(error),
     };
     assert!(result.is_err());
@@ -193,7 +193,7 @@ async fn candidate_also_mandatory_source_drift_refuses_during_lock_acquisition()
         let mut outbox: Outbox = Outbox::default();
         let result = match lock_items(&operation, &sde, &requests, &[]).await {
             Ok(locks) => match ParentGuard::revalidate(&locks, &[snapshot]) {
-                Ok(guard) => deposit_prepared(&operation, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.map(|_| ()),
+                Ok(guard) => deposit_prepared(&operation, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.map(|_| ()),
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
@@ -224,6 +224,9 @@ async fn concurrent_held_hull_deposits_merge_in_commit_order() {
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
     let owner = fixture.character;
     let hull = crate::dao::items::creation::rookie_ship(&db, hull_kind, owner, station, FLAG_HANGAR).await.unwrap();
+    crate::dao::items::dogma::set_override(&db, hull, infinity_core::consts::dogma::ATTR_CAPACITY, 1_000_000.0).await.unwrap();
+    let fit = crate::services::fit::Fit::load_unpiloted(&db, sde.clone(), hull).await.unwrap();
+    let source = crate::services::inventory::hold_storage::CapacitySource::Captured(crate::services::inventory::hold_storage::HoldCapacity::capture(&fit, FLAG_CARGO).unwrap());
     let original = transfers::insert(&db, kind, owner, hull, FLAG_CARGO, 5).await.unwrap();
     let mut a = connection().await;
     let mut b = connection().await;
@@ -234,9 +237,9 @@ async fn concurrent_held_hull_deposits_merge_in_commit_order() {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let first_op = async {
         let additions = [Addition { type_id: kind, singleton: false, quantity: 2 }];
-        let held = hold_storage::check_destination(&first, &sde, owner, hull, FLAG_CARGO, &additions, Default::default(), Some(1_000_000.0)).await.unwrap().unwrap();
+        let held = hold_storage::check_destination(&first, &sde, owner, hull, FLAG_CARGO, &additions, Default::default(), source).await.unwrap().unwrap();
         let mut outbox: Outbox = Outbox::default();
-        let receipt = deposit_held(&first, &sde, &mut outbox, &destination, kind, 2, 0, Some(&held), Some(1_000_000.0)).await.unwrap();
+        let receipt = deposit_held(&first, &sde, &mut outbox, &destination, kind, 2, 0, Some(&held), source).await.unwrap();
         let row = receipt.merged.as_ref().unwrap();
         assert_eq!((row.item.item_id, row.old_quantity), (original, Some(5)));
         ready_tx.send(()).unwrap();
@@ -246,9 +249,9 @@ async fn concurrent_held_hull_deposits_merge_in_commit_order() {
     let second_op = async {
         ready_rx.await.unwrap();
         let additions = [Addition { type_id: kind, singleton: false, quantity: 3 }];
-        let held = hold_storage::check_destination(&second, &sde, owner, hull, FLAG_CARGO, &additions, Default::default(), Some(1_000_000.0)).await.unwrap().unwrap();
+        let held = hold_storage::check_destination(&second, &sde, owner, hull, FLAG_CARGO, &additions, Default::default(), source).await.unwrap().unwrap();
         let mut outbox: Outbox = Outbox::default();
-        let receipt = deposit_held(&second, &sde, &mut outbox, &destination, kind, 3, 0, Some(&held), Some(1_000_000.0)).await.unwrap();
+        let receipt = deposit_held(&second, &sde, &mut outbox, &destination, kind, 3, 0, Some(&held), source).await.unwrap();
         let row = receipt.merged.as_ref().unwrap();
         assert_eq!((row.item.item_id, row.old_quantity), (original, Some(7)));
         second.commit().await.unwrap();
@@ -280,9 +283,9 @@ async fn created_guard_miss_rolls_back_and_fresh_attempt_discards_created_id() {
     let locks = lock_items(&tx, &sde, &requests, &[]).await.unwrap();
     let guard = ParentGuard::revalidate(&locks, std::slice::from_ref(&snapshot)).unwrap();
     let mut outbox: Outbox = Outbox::default();
-    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
     let created = &receipt.created.as_ref().unwrap().item;
-    let receipt2 = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+    let receipt2 = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
     let merged = receipt2.merged.as_ref().unwrap();
     assert_eq!((merged.item.item_id, merged.item.quantity, merged.old_quantity), (created.item_id, 4, Some(2)));
     drop(locks);
@@ -293,7 +296,7 @@ async fn created_guard_miss_rolls_back_and_fresh_attempt_discards_created_id() {
     let locks = lock_items(&tx, &sde, &requests, &[]).await.unwrap();
     let guard = ParentGuard::revalidate(&locks, std::slice::from_ref(&snapshot)).unwrap();
     let mut outbox: Outbox = Outbox::default();
-    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut fresh, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await.unwrap();
+    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut fresh, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.unwrap();
     let created_again = &receipt.created.as_ref().unwrap().item;
     assert_ne!(created_again.item_id, created.item_id);
     drop(locks);
@@ -309,9 +312,9 @@ async fn created_guard_miss_rolls_back_and_fresh_attempt_discards_created_id() {
             Box::pin(async move {
                 let locks = lock_items(tx, &sde, &requests, &[]).await?;
                 let guard = ParentGuard::revalidate(&locks, &[snapshot])?;
-                let receipt = deposit_prepared(tx, &sde, outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await?;
+                let receipt = deposit_prepared(tx, &sde, outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await?;
                 tx.execute("DELETE FROM game.items WHERE item_id = $1", &[&receipt.last().item_id]).await.unwrap();
-                deposit_prepared(tx, &sde, outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), None).await?;
+                deposit_prepared(tx, &sde, outbox, &mut prep, 2, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await?;
                 Ok(())
             })
         },

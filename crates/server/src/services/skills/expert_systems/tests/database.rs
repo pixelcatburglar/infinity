@@ -3,6 +3,8 @@
 //! Includes DAO guard and shared-service lifecycle behavior on a dedicated database.
 
 use crate::{config, dao::skills::expert_systems as expert, db::Db};
+use crate::services::fit::Key;
+use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
 
 async fn connected() -> Db {
     crate::tests::init_config();
@@ -240,19 +242,48 @@ async fn valid_service_renewal_extends_the_existing_row() {
     let definition = sde.expert_systems.iter().find(|d| !d.hidden && !d.retired).expect("installable expert-system SDE");
     let type_id = definition.type_id;
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
+    let mut recipient = None;
+    let scenario = crate::tests::catch_scenario(async {
     let identity = Identity { char_id: fixture.character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
     let world = World::new(db.clone(), sde.clone(), 1);
     let now = crate::client::filetime_now();
     let duration = definition.duration_filetime;
+    let &(skill, grant) = definition.skills.iter().find(|(_, level)| *level > 0).expect("positive expert grant");
     let expires = now + infinity_core::consts::FILETIME_DAY * 29;
     assert!(expert::insert(&db, fixture.character, type_id, now - 1, expires).await.unwrap());
     let before = expert::all(&db, fixture.character).await.unwrap();
+    let owner_ship = crate::dao::items::creation::rookie_ship(&db, infinity_core::consts::TYPE_CAPSULE, fixture.character, sde.map.stations().next().unwrap().station_id, infinity_core::consts::FLAG_HANGAR).await.unwrap();
+    crate::dao::characters::selection::set_ship(&db, fixture.character, owner_ship).await.unwrap();
+    recipient = Some({
+        let market = crate::services::market::lock().await;
+        crate::services::tests::fixture::LiveRecipient::cold(&world, fixture.character, None, &market).await
+    });
+    let live = recipient.as_ref().unwrap();
     super::super::gm(&identity, &db, &world, &sde, true, type_id, |_| Ok(())).await.unwrap();
     let after = expert::all(&db, fixture.character).await.unwrap();
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].installed_at, before[0].installed_at);
     assert_eq!(after[0].expires_at, before[0].expires_at + duration);
+    let installed_at = after[0].installed_at;
+    let old_expiry = before[0].expires_at;
+    let new_expiry = after[0].expires_at;
+    assert_eq!(live.read(move |fit| fit.character_inputs().installations.into_iter()
+        .find(|row| row.type_id == type_id).map(|row| (row.installed_at, row.expires_at))).await,
+        Some((installed_at, new_expiry)));
+    super::super::advance_expired(&db, &world, &sde, fixture.character, old_expiry, |_| Ok(())).await.unwrap();
+    assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, f64::from(grant));
+    super::super::advance_expired(&db, &world, &sde, fixture.character, new_expiry, |_| Ok(())).await.unwrap();
+    assert_eq!(live.read(move |fit| (fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL),
+        fit.character_inputs().installations.iter().any(|row| row.type_id == type_id))).await, (0.0, false));
+    }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
+    crate::scheduler::cancel(&db, &format!("{}:{}", crate::services::skills::completion::KIND, fixture.character)).await.unwrap();
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
@@ -360,7 +391,8 @@ async fn alpha_authority_installation_projects_virtual_skill_without_mutating_tr
     let &(skill, grant_level) = definition.skills.iter().find(|(_, level)| *level > 0).unwrap();
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
     let test_db = db.clone();
-    let result = tokio::spawn(async move {
+    let mut recipient = None;
+    let result = crate::tests::catch_scenario(async {
         let now = crate::client::filetime_now();
         training::starting_skill(&test_db, fixture.character, skill, 0, 123).await.unwrap();
         let before_skills = training::current(&test_db, fixture.character).await.unwrap();
@@ -374,9 +406,17 @@ async fn alpha_authority_installation_projects_virtual_skill_without_mutating_tr
         let authority = subscriptions::by_user(&test_db, fixture.account).await.unwrap();
         assert_eq!(rules::current(&test_db, fixture.account, now).await.unwrap(), rules::ALPHA);
         assert_eq!(authority.grade, rules::ALPHA);
+        let owner_ship = crate::dao::items::creation::rookie_ship(&test_db, infinity_core::consts::TYPE_CAPSULE, fixture.character, sde.map.stations().next().unwrap().station_id, infinity_core::consts::FLAG_HANGAR).await.unwrap();
+        crate::dao::characters::selection::set_ship(&test_db, fixture.character, owner_ship).await.unwrap();
+        recipient = Some({
+            let market = crate::services::market::lock().await;
+            crate::services::tests::fixture::LiveRecipient::cold(&world, fixture.character, None, &market).await
+        });
+        let live = recipient.as_ref().unwrap();
 
         let before = effective::snapshot_at(&test_db, &sde, fixture.character, now).await.unwrap();
         assert_eq!(before.level(skill), 0);
+        assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, 0.0);
         super::super::gm(&identity, &test_db, &world, &sde, true, expert_type_id, |_| Ok(())).await.unwrap();
         let installed = effective::snapshot_at(&test_db, &sde, fixture.character, crate::client::filetime_now()).await.unwrap();
         assert!(installed.level(skill) >= grant_level);
@@ -387,6 +427,12 @@ async fn alpha_authority_installation_projects_virtual_skill_without_mutating_tr
         assert!(history::list(&test_db, fixture.character, 50).await.unwrap().into_iter()
             .map(|row| (row.skill_type_id, row.event_type_id, row.absolute_points, row.log_date))
             .collect::<Vec<_>>() == before_history);
+        let level = installed.level(skill);
+        assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, f64::from(level));
+        assert_eq!(live.read(move |fit| {
+            let raw = fit.character_inputs();
+            crate::services::skills::effective::project(&raw.trained, &raw.installations, fit.sde(), raw.at).get(skill).unwrap().virtual_level
+        }).await, Some(grant_level));
 
         super::super::remove(&identity, &test_db, &world, &sde, expert_type_id, |_| Ok(())).await.unwrap();
         let reverted = effective::snapshot_at(&test_db, &sde, fixture.character, crate::client::filetime_now()).await.unwrap();
@@ -396,12 +442,16 @@ async fn alpha_authority_installation_projects_virtual_skill_without_mutating_tr
             .map(|row| (row.skill_type_id, row.event_type_id, row.absolute_points, row.log_date))
             .collect::<Vec<_>>() == before_history);
         assert!(crate::dao::skills::expert_systems::all(&test_db, fixture.character).await.unwrap().is_empty());
-        Ok::<_, crate::services::CallError>(())
+        assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, 0.0);
+        assert!(live.read(|fit| fit.character_inputs().installations.is_empty()).await);
     }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     db.execute("DELETE FROM game.jobs WHERE job_id = $1", &[&format!("{}:{}", crate::services::skills::completion::KIND, fixture.character)]).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id = $1", &[&fixture.character]).await.unwrap();
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
-    result.unwrap().unwrap();
+    result.unwrap();
 }
 
 #[tokio::test]
@@ -468,19 +518,39 @@ async fn expert_install_and_expiry_do_not_emit_skill_state_changed() {
     let definition = sde.expert_systems.iter().find(|d| !d.hidden && !d.retired).expect("installable expert system");
     let skill = definition.skills.first().expect("expert skill").0;
     let owner = fixture::create(&db).await.unwrap();
+    let mut recipient = None;
+    let scenario = crate::tests::catch_scenario(async {
     training::starting_skill(&db, owner.character, skill, 0, 0).await.unwrap();
     queue::insert(&db, owner.character, &queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(2) }).await.unwrap();
     let identity = Identity { char_id: owner.character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
     let world = World::new(db.clone(), sde.clone(), 1);
+    let owner_ship = crate::dao::items::creation::rookie_ship(&db, infinity_core::consts::TYPE_CAPSULE, owner.character, sde.map.stations().next().unwrap().station_id, infinity_core::consts::FLAG_HANGAR).await.unwrap();
+    crate::dao::characters::selection::set_ship(&db, owner.character, owner_ship).await.unwrap();
+    recipient = Some({
+        let market = crate::services::market::lock().await;
+        crate::services::tests::fixture::LiveRecipient::cold(&world, owner.character, None, &market).await
+    });
+    let live = recipient.as_ref().unwrap();
     super::super::gm(&identity, &db, &world, &sde, true, definition.type_id, |_| Ok(())).await.unwrap();
     let trained = crate::db::outbox::tests::events(&db, "SkillTrained", owner.character).await;
     assert!(trained.iter().any(|event| matches!(event, GameEvent::SkillTrained { char_id, type_id, level: 1 } if *char_id == owner.character && *type_id == skill)));
     assert!(crate::db::outbox::tests::events(&db, "SkillStateChanged", owner.character).await.is_empty());
+    let expected = definition.skills[0].1.max(1);
+    assert_eq!(live.read(move |fit| fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL)).await, f64::from(expected));
     let expiry = expert::all(&db, owner.character).await.unwrap()[0].expires_at;
     super::super::advance_expired(&db, &world, &sde, owner.character, expiry, |_| Ok(())).await.unwrap();
     assert!(expert::all(&db, owner.character).await.unwrap().is_empty());
+    assert_eq!(live.read(move |fit| (fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL),
+        fit.character_inputs().installations.is_empty())).await, (1.0, true));
     assert!(crate::db::outbox::tests::events(&db, "SkillStateChanged", owner.character).await.is_empty());
     assert_eq!(crate::db::outbox::tests::events(&db, "SkillTrained", owner.character).await.len(), trained.len());
+    }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", crate::services::skills::completion::KIND, owner.character)]).await.unwrap();
     fixture::cleanup(&db, owner).await.unwrap();
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
 }

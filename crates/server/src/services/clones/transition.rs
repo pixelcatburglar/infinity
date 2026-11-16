@@ -12,19 +12,15 @@ use crate::{dao::{characters::clones::{self as clones, CloneRow}, items::{brain:
 fn stale() -> CallError { notify_error(messages::clones::STALE_BODY) }
 fn invalid_slots() -> CallError { notify_error(messages::clones::INVALID_IMPLANT_SLOTS) }
 
-fn attribute(sde: &Sde, item: &BrainItem, overrides: &HashMap<(i64, i32), f64>, attr: i32) -> Option<f64> {
-    overrides.get(&(item.item_id, attr)).copied().or_else(|| sde.types.attribute(item.type_id, attr))
-}
-
 fn implant_slot(sde: &Sde, item: &BrainItem, overrides: &HashMap<(i64, i32), f64>) -> Result<i32, CallError> {
     if let Some(slot) = item.slot { return if slot > 0 { Ok(slot) } else { Err(invalid_slots()) }; }
-    let value = attribute(sde, item, overrides, ATTR_IMPLANTNESS).ok_or_else(invalid_slots)?;
+    let value = body_change::attribute(sde, item, overrides, ATTR_IMPLANTNESS).ok_or_else(invalid_slots)?;
     if !value.is_finite() || value <= 0.0 || value.fract() != 0.0 || value > i32::MAX as f64 { return Err(invalid_slots()); }
     Ok(value as i32)
 }
 
 fn follows(sde: &Sde, item: &BrainItem, overrides: &HashMap<(i64, i32), f64>) -> Result<bool, CallError> {
-    let value = attribute(sde, item, overrides, ATTR_FOLLOWS_JUMP_CLONES).unwrap_or(0.0);
+    let value = body_change::attribute(sde, item, overrides, ATTR_FOLLOWS_JUMP_CLONES).unwrap_or(0.0);
     if !value.is_finite() { return Err(invalid_slots()); }
     Ok(value != 0.0)
 }
@@ -80,11 +76,11 @@ pub(super) async fn jump_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<C
     let system = station.solar_system_id.ok_or_else(stale)?;
     let constellation = station.constellation_id.ok_or_else(stale)?;
     let region = station.region_id.ok_or_else(stale)?;
+    let character = clones::lock_character(ex, owner).await.map_err(db_err)?.ok_or_else(stale)?;
     let mut hulls = fit::owner_online_ships(ex, owner).await.map_err(db_err)?;
     hulls.push(old_ship);
     hulls.sort_unstable(); hulls.dedup();
     for hull in hulls { if !ship::lock_reload_ship(ex, hull).await.map_err(db_err)? { return Err(stale()); } }
-    let character = clones::lock_character(ex, owner).await.map_err(db_err)?.ok_or_else(stale)?;
     if character.ship_id != Some(old_ship) || character.station_id != Some(source_station) || sde.map.station(source_station).is_none() { return Err(stale()); }
     let capsule = load_items(ex, sde, ItemQuery::Id(old_ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(stale)?;
     if capsule.owner_id != owner || capsule.type_id != TYPE_CAPSULE || capsule.location_id != source_station || !capsule.singleton { return Err(stale()); }
@@ -110,10 +106,9 @@ pub(super) async fn jump_tx(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<C
     if custody::delete_capsule(ex, owner, old_ship, TYPE_CAPSULE).await.map_err(db_err)? != 1 { return Err(stale()); }
     let capsule = creation::rookie_ship(ex, TYPE_CAPSULE, owner, dest, FLAG_HANGAR).await.map_err(db_err)?;
     if clones::jump(ex, owner, capsule, dest, system, constellation, region, old_ship, source_station, (source_station != dest).then_some(now)).await.map_err(db_err)? != 1 { return Err(stale()); }
-    outbox.notify_pilot(owner, "OnJumpCloneCacheInvalidated", vec![]);
-    outbox.notify_pilot(owner, "OnStationJumpCloneCacheInvalidated", vec![Value::Int(source_station), Value::Int(owner)]);
+    lifecycle::invalidate(outbox, owner, source_station);
     if dest != source_station { outbox.notify_pilot(owner, "OnStationJumpCloneCacheInvalidated", vec![Value::Int(dest), Value::Int(owner)]); }
     Ok(Transition { station: dest, system, constellation, region, capsule })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;

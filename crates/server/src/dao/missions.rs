@@ -72,6 +72,6 @@ pub(crate) async fn accept_offered(ex: &(impl Executor + ?Sized), character_id: 
 pub(crate) async fn remove(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2", &[&character_id, &agent_id]).await
 }
-pub(crate) async fn remove_accepted(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, mission_id: i32, state: i32) -> Result<u64, db::Error> {
+pub(crate) async fn remove_observed(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, mission_id: i32, state: i32) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2 AND mission_id = $3 AND state = $4", &[&character_id, &agent_id, &mission_id, &state]).await
 }

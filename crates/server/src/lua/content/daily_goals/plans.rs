@@ -89,7 +89,7 @@ pub(crate) fn validate(lua: &Lua, source: &[u8], config: &LuaConfig) -> mlua::Re
 }
 fn invoke(pin: &PinnedPolicy, op: &str, input: Input, deadline: Option<Instant>) -> mlua::Result<Value> {
     if pin.daily_goals().is_none() { return Err(invalid()); }
-    run(&pin.registry.lua, &pin.package.source, &pin.package.config, Some(op), Some(input), deadline)
+    run(&pin.registry.lua, &pin.package.row.source, &pin.package.config, Some(op), Some(input), deadline)
 }
 fn valid_key(s: &str) -> bool { !s.is_empty() && s.len() <= MAX_PLAN_ENTRIES }
 fn bounded_strings(v: &[String]) -> bool { v.len() <= MAX_PLAN_ENTRIES && v.iter().all(|s| valid_key(s)) }
@@ -190,4 +190,4 @@ pub(crate) fn project(pin: &PinnedPolicy, input: &ProjectInput, deadline: Option
     decode_keys(invoke(pin, "Project", Input::Project(input.entries.clone()), deadline)?, &allowed)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

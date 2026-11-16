@@ -29,4 +29,4 @@ pub(super) fn receive(bytes: &[u8], application: &[u8; UUID_LEN]) -> Result<(), 
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

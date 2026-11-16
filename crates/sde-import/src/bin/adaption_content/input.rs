@@ -75,12 +75,16 @@ fn safe_member(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(joined)
 }
 
+pub(super) fn ordinary(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && matches!(Path::new(name).components().next(), Some(Component::Normal(_))) && Path::new(name).components().count() == 1
+}
+
 pub(super) fn load(root: &Path) -> Result<Bundle> {
     let root = fs::canonicalize(root)?;
     let bytes = read_regular(&safe_member(&root, "manifest.json")?)?;
     let manifest: SourceManifest = serde_json::from_value(json(&bytes)?)?;
     ensure!(manifest.schema == "cfsd-adaptation-bundle" && manifest.schema_version == 1, "unsupported source manifest schema");
-    ensure!(!manifest.client_build.is_empty() && Path::new(&manifest.client_build).components().count() == 1 && matches!(Path::new(&manifest.client_build).components().next(), Some(Component::Normal(_))) && !manifest.client_build.contains(|c| c == '/' || c == '\\'), "invalid client build");
+    ensure!(ordinary(&manifest.client_build), "invalid client build");
     let missing: Vec<_> = FAMILIES.iter().filter(|f| !manifest.datasets.contains_key(**f)).copied().collect();
     ensure!(missing.is_empty(), "missing datasets: {}", missing.join(", "));
     ensure!(manifest.datasets.len() == FAMILIES.len(), "unexpected datasets in source manifest");

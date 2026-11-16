@@ -1,12 +1,17 @@
 //! Fleet warp mirrors the client CmdWarpToStuff fleet flag, including mission and scan routes.
+//! Six arrival formations (Point, Sphere, Plane, Wall, Arrow, Relative) are planned once per
+//! order from a shared position sample; bookmark destinations resolve through their owner.
 //! Authority and consent are process-local and rechecked at actor commit using live fleet
 //! membership, space actors and fitted ship projections. Each accepted member pays
-//! independently at activation; one callback completes on the first full arrival or
-//! immediate native approach, not a partial trip. Persisted fleets, bookmark
-//! destination resolution and fleet boosts are not supported.
+//! independently at activation; the actor-owned callback completes on the first full arrival
+//! or immediate native approach, not a partial trip. Continuous formation follow, persisted
+//! fleets and fleet boosts are not supported.
 use super::*;
 use infinity_core::messages;
-use crate::{client::Client, space::{self, system::{Timer, warp::WarpDestination}}};
+use crate::{client::Client, space::{self, system::{warp::WarpDestination, warp_arrival::ArrivalCallback}}};
+
+mod formations;
+mod settings;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Position { wing: i64, squad: i64, role: i64 }
@@ -14,7 +19,7 @@ impl From<&Member> for Position {
     fn from(m: &Member) -> Self { Self { wing: m.wing, squad: m.squad, role: m.role } }
 }
 #[derive(Clone)]
-pub(crate) struct Order { fleet: i64, commander: i64, ship: i64, position: Position, members: Vec<(i64, Position)>, target: Option<(i64, i64)> }
+pub(crate) struct Order { fleet: i64, commander: i64, ship: i64, position: Position, members: Vec<(i64, Position)>, target: Option<(i64, i64)>, settings: settings::FormationSettings }
 pub(super) fn can_command(member: &Member) -> bool {
     matches!(member.role, ROLE_LEADER | ROLE_WING_COMMANDER | ROLE_SQUAD_COMMANDER)
 }
@@ -39,16 +44,17 @@ fn snapshot(st: &State, commander: i64, ship: i64) -> Option<Order> {
         (st.is_member(fleet, id) && m.opt_outs.accepts_fleet_warp && in_scope(commander_member, m)).then_some((id, p))
     }).collect();
     members.sort_by_key(|(id, _)| (*id == commander, *id));
-    Some(Order { fleet, commander, ship, position, members, target: None })
+    Some(Order { fleet, commander, ship, position, members, target: None, settings: settings::FormationSettings::default() })
 }
-pub(in crate::services) async fn authorize(c: &Client) -> Result<Order, CallError> {
+pub(in crate::services) async fn authorize(c: &Client, formation_wire: Option<&Value>) -> Result<Order, CallError> {
     let commander = c.session.int("charid").unwrap_or(0);
     let ship = c.session.int("shipid").unwrap_or(0);
-    let order = snapshot(&state(), commander, ship).ok_or_else(|| notify_error(messages::fleets::WARP_NOT_AUTHORIZED))?;
+    let mut order = snapshot(&state(), commander, ship).ok_or_else(|| notify_error(messages::fleets::WARP_NOT_AUTHORIZED))?;
     let Some(system) = c.session.int("solarsystemid") else { return Err(notify_error(messages::fleets::WARP_NOT_AUTHORIZED)) };
     if !c.world.with(system, move |s| live(s, commander, ship)).await.unwrap_or(false) {
         return Err(notify_error(messages::fleets::WARP_NOT_AUTHORIZED));
     }
+    order.settings = settings::load(&c.db, commander, formation_wire).await?;
     Ok(order)
 }
 pub(in crate::services) fn permits_target(order: &Order, pilot: i64) -> bool {
@@ -85,30 +91,43 @@ fn commit_in<T>(st: &State, s: &mut space::System, order: &Order, pilot: i64, sh
     Some(f(s))
 }
 
-pub(in crate::services) async fn execute(db: &crate::db::Db, world: &space::World, space_system: Option<i64>, order: Order, destination: WarpDestination, on_arrival: Option<Timer>, fleet_destination: Value) -> CallResult {
+/// Sample every candidate at one actor instant and freeze the nominal endpoints. The
+/// commander is sampled independently: opting out of the warp does not forfeit command.
+fn prepare(s: &space::System, order: &Order, destination: WarpDestination) -> Option<Vec<formations::PlannedPilot>> {
+    let commander_ball = s.pilot_ball(order.commander).filter(|_| live(s, order.commander, order.ship))?;
+    let ms = s.now_ms();
+    let commander = formations::MemberSnapshot {
+        pilot: order.commander, ship: commander_ball.id,
+        pos: commander_ball.position_at(ms), radius: f64::from(commander_ball.radius),
+    };
+    formations::plan(order.settings, destination, commander, order.members.iter().filter_map(|(id, _)| {
+        if *id == order.commander { return Some(commander); }
+        let b = s.pilot_ball(*id).filter(|b| live(s, *id, b.id))?;
+        Some(formations::MemberSnapshot { pilot: *id, ship: b.id, pos: b.position_at(ms), radius: f64::from(b.radius) })
+    }))
+}
+
+pub(in crate::services) async fn execute(db: &crate::db::Db, world: &space::World, space_system: Option<i64>, order: Order, destination: WarpDestination, on_arrival: Option<ArrivalCallback>, fleet_destination: Value) -> CallResult {
     if !destination.is_valid() { return Ok(Value::None); }
     let Some(system) = space_system else { return Ok(Value::None) };
-    let ids: Vec<_> = order.members.iter().map(|(id, _)| *id).collect();
-    let commander = order.commander;
-    let ship = order.ship;
-    let Some(ships) = world.with(system, move |s| {
-        if !live(s, commander, ship) { return Vec::new(); }
-        ids.into_iter().filter_map(|id| s.pilot_ball(id).filter(|b| live(s, id, b.id)).map(|b| (id, b.id))).collect::<Vec<_>>()
-    }).await else { return Ok(Value::None) };
+    let order = std::sync::Arc::new(order);
+    let held = order.clone();
+    let Some(planned) = world.with(system, move |s| prepare(s, &held, destination)).await.flatten() else { return Ok(Value::None) };
+    if planned.is_empty() { return Ok(Value::None); }
     let guard = match on_arrival {
         Some(callback) => match world.begin_warp_arrival(system, callback).await {
             Some(guard) => Some(guard), None => return Ok(Value::None),
         },
         None => None,
     };
-    let order = std::sync::Arc::new(order);
-    for (pilot, ship) in ships {
-        let queued = super::super::ship::warp_pilot(db, world, system, pilot, ship, destination, guard.as_ref().map(|g| g.id()), Some(order.clone())).await?;
-        if queued { world.notify_pilot(pilot, "OnRemoteMessage", vec![Value::str("FleetWarp"), fleet_destination.clone()]); }
+    for entry in planned {
+        let queued = super::super::ship::warp_pilot(db, world, system, entry.pilot, entry.ship,
+            WarpDestination::Exact(entry.endpoint), guard.as_ref().map(|g| g.id()), Some(order.clone())).await?;
+        if queued { world.notify_pilot(entry.pilot, "OnRemoteMessage", vec![Value::str("FleetWarp"), fleet_destination.clone()]); }
     }
     Ok(Value::None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 #[path = "tests/warp.rs"]
 mod tests;

@@ -1,7 +1,14 @@
 //! Actor-owned tractor movement and straight-flight projectile actions.
 //! Destiny FollowBall and GotoDirection are delivered at action boundaries;
 //! ownership and projectile timers are transient and are not persisted.
+//! Queued movement is fenced to the original ball instances.
+//! Bombs register one token-fenced terminal: the delay resolver is the only
+//! `Some(centre)` detonation, while removal or lethal damage complete the
+//! same callback once as `None`. Live-SDE projectiles carry a damageable
+//! structure profile from `space::damageable`; it never produces combat facts,
+//! killmails or durable loss.
 use super::*;
+use crate::space::system::observers::{BallToken, DestinyAudience};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) struct Tractor {
@@ -9,6 +16,14 @@ pub(super) struct Tractor {
     generation: Arc<AtomicBool>,
     source: i64,
     saved: Option<(f32, f32, u8, V3, i64, f32)>,
+}
+
+/// One registered bomb flight: the ball incarnation token that fences its
+/// launch action and delay timer, plus the callback completed exactly once by
+/// whichever terminal consumes it first.
+pub(super) struct BombFlight {
+    token: BallToken,
+    impact: Box<dyn FnOnce(&mut System, Option<V3>) + Send>,
 }
 
 impl System {
@@ -23,7 +38,10 @@ impl System {
         }
         self.tractor_epochs.entry(target).or_insert_with(|| Arc::new(()));
         self.tractors.insert(target, Tractor { module, generation: generation.clone(), source, saved: None });
+        let target_token = self.capture_ball(target).unwrap();
+        let source_token = self.capture_ball(source).unwrap();
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
+            if !s.ball_token_current(target_token) || !s.ball_token_current(source_token) { return; }
             if generation.load(Ordering::Relaxed) || !s.tractors.get(&target).is_some_and(|t| t.module == module && Arc::ptr_eq(&t.generation, &generation)) { return; }
             let Some(mut ball) = s.balls.remove(&target) else { s.tractors.remove(&target); return };
             let Some(source_ball) = s.balls.get(&source) else { s.balls.insert(target, ball); s.tractors.remove(&target); return };
@@ -46,7 +64,17 @@ impl System {
             }
             events.push(event(stamp, "FollowBall", vec![Value::Int(target), Value::Int(source), Value::Float(f64::from(stop_range))]));
             events.push(event(stamp, "SetSpeedFraction", vec![Value::Int(target), Value::Float(1.0)]));
-            s.deliver(Some(visibility), events);
+            // A follow event names the leading ball too: recipients must
+            // already cover both ends of the ordered pair.
+            let mut recipients = Vec::new();
+            for (token, _) in s.scene_observers(&DestinyAudience::Visible { id: visibility.0, cloak: visibility.1 }) {
+                if s.scene_ball_covered(token, source) { recipients.push(token); }
+            }
+            let count = recipients.len();
+            for (i, token) in recipients.into_iter().enumerate() {
+                let batch = if i + 1 == count { std::mem::take(&mut events) } else { events.clone() };
+                s.emit_destiny(DestinyAudience::Observer(token), batch);
+            }
         })));
         true
     }
@@ -86,10 +114,31 @@ impl System {
         for (target, module, generation) in affected { self.end_tractor(target, module, &generation); }
     }
 
-    pub(crate) fn launch_bomb(&mut self, ball: Ball, heading: V3, delay_ms: u64, impact: impl FnOnce(&mut System) + Send + 'static) {
+    /// Launch a straight-flight bomb and register its one token-fenced
+    /// terminal. `impact` runs at most once: `Some(centre)` only from the
+    /// delay resolver's real detonation, `None` for removal, lethal damage or
+    /// a refused launch. In a live-SDE actor the charge type must yield a
+    /// valid damageable profile: a refusal completes `impact` as `None`
+    /// without inserting. Actors without an SDE keep the neutral motion
+    /// behaviour and register no capability.
+    pub(crate) fn launch_bomb(&mut self, ball: Ball, heading: V3, delay_ms: u64,
+        impact: impl FnOnce(&mut System, Option<V3>) + Send + 'static) {
+        let profile = match self.sde() {
+            Some(sde) => match crate::space::damageable::DamageableProjectile::from_sde(sde, ball.type_id) {
+                Some(profile) => Some(profile),
+                None => { impact(self, None); return; }
+            },
+            None => None,
+        };
         let id = ball.id;
         self.add_ship(ball);
+        if let Some(profile) = profile {
+            self.damageable_projectiles.insert(id, profile);
+        }
+        let token = self.capture_ball(id).expect("inserted bomb");
+        self.bomb_flights.insert(id, BombFlight { token, impact: Box::new(impact) });
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
+            if !s.ball_token_current(token) { return; }
             let Some(ball) = s.balls.get_mut(&id) else { return };
             if !ball.goto_direction(heading) { return; }
             ball.set_speed_fraction(1.0);
@@ -99,12 +148,66 @@ impl System {
             ball.old_vel = ball.vel;
             ball.segment_acceleration = None;
             let visibility = (id, ball.cloak);
-            s.deliver(Some(visibility), vec![
+            s.publish_ready_prefix(stamp);
+            s.emit_destiny(DestinyAudience::Visible { id: visibility.0, cloak: visibility.1 }, vec![
                 event(stamp, "GotoDirection", vec![Value::Int(id), Value::Float(heading[0]), Value::Float(heading[1]), Value::Float(heading[2])]),
                 event(stamp, "SetSpeedFraction", vec![Value::Int(id), Value::Float(1.0)]),
             ]);
-            s.schedule(delay_ms, impact);
+            s.schedule(delay_ms, move |s| s.resolve_bomb(token));
         })));
+    }
+
+    /// The sole real detonation terminal: a current incarnation token and a
+    /// still-registered flight take the callback, the live ball's sampled
+    /// position becomes the centre, the capability is cleared and the ball
+    /// destroyed, and only then does the callback report `Some(centre)`. A
+    /// stale timer or an already-consumed flight is a no-op.
+    fn resolve_bomb(&mut self, token: BallToken) {
+        if !self.ball_token_current(token) { return; }
+        let id = token.id();
+        if !self.bomb_flights.get(&id).is_some_and(|flight| flight.token == token) { return; }
+        let flight = self.bomb_flights.remove(&id).expect("bomb flight verified");
+        let centre = self.sample_position(id);
+        self.damageable_projectiles.remove(&id);
+        self.destroy_ball(id);
+        (flight.impact)(self, centre);
+    }
+
+    /// Drop the bomb's terminal registration as its ball leaves, completing
+    /// the callback once as a cancel. The entry is taken before the callback
+    /// runs, so a re-entrant removal cannot consume it twice.
+    pub(super) fn remove_bomb_flight(&mut self, id: i64) {
+        let Some(flight) = self.bomb_flights.remove(&id) else { return };
+        (flight.impact)(self, None);
+    }
+
+    /// Whether the ball still carries a live damageable projectile profile.
+    pub(crate) fn projectile_damageable(&self, id: i64) -> bool {
+        self.damageable_projectiles.contains_key(&id)
+    }
+
+    /// Apply one typed raw vector to a live damageable projectile. `None`
+    /// means there is no profile or the vector was refused. A lethal outcome
+    /// runs the shared terminal and still reports itself; a non-lethal one
+    /// keeps the reduced structure in flight.
+    pub(crate) fn apply_projectile_damage(&mut self, id: i64, raw: [f64; 4])
+        -> Option<crate::space::damageable::ProjectileDamageOutcome> {
+        let outcome = self.damageable_projectiles.get_mut(&id)?.apply(raw)?;
+        if outcome.destroyed { self.end_projectile(id); }
+        Some(outcome)
+    }
+
+    /// Shared lethal terminal: take every projectile entry for this
+    /// incarnation, destroy the ball, then run each taken callback once as a
+    /// non-impact terminal. The ball's removal hooks then observe empty
+    /// registries and cannot consume anything twice.
+    fn end_projectile(&mut self, id: i64) {
+        self.damageable_projectiles.remove(&id);
+        let finish = self.take_missile_finish(id);
+        let impact = self.bomb_flights.remove(&id).map(|flight| flight.impact);
+        self.destroy_ball(id);
+        if let Some(finish) = finish { finish(self, None); }
+        if let Some(impact) = impact { impact(self, None); }
     }
 
     pub(crate) fn hostiles_targeting(&self, ship: i64) -> Vec<i64> {

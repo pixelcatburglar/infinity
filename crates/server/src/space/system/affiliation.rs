@@ -1,5 +1,6 @@
 //! Live pilot corporation and alliance metadata in the actor-owned ballpark.
 //! Destiny slim items use the current session affiliation; no persistent state is changed.
+//! Slim changes use the system's ordered scene channel.
 use super::*;
 
 impl System {
@@ -11,7 +12,7 @@ impl System {
     }
 
     pub(crate) fn refresh_pilot_affiliation(&mut self, character: i64, ship: i64, corp: Option<i64>, alliance: Option<i64>) {
-        if self.pilots.get(&character) != Some(&ship) { return; }
+        if self.pilots.get(&character).map(|p| p.ship_id) != Some(ship) { return; }
         let corp = corp.unwrap_or(-1);
         let alliance = alliance.unwrap_or(-1);
         let Some(ball) = self.balls.get(&ship) else { return };
@@ -22,9 +23,9 @@ impl System {
         ball.alliance_id = alliance;
         let slim = ball.slim_item();
         self.rebind_combat_character(character, (corp > 0).then_some(corp), (alliance > 0).then_some(alliance));
-        self.broadcast(ship, vec![event(self.current_time, "OnSlimItemChange", vec![Value::Int(ship), slim])]);
+        self.publish_destiny(ship, |stamp| vec![event(stamp, "OnSlimItemChange", vec![Value::Int(ship), slim])]);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-space"))]
 mod tests;

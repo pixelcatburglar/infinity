@@ -2,17 +2,27 @@
 //! Mirrors eve/client/script/dogma/allSkillsCharBrain.py and
 //! eve/common/script/dogma/effect.py, using Fit's SDE and active character material.
 //! Arithmetic operations through PostAssign and PostPercentUnNerfed are compiled;
-//! the special skill relationship is derived by Fit, not emitted. Structure effects
-//! and implant/booster injection or expiry are not supported. Versions are in-memory;
+//! the special skill relationship is derived by Fit, not emitted. Implant and
+//! booster injection and expiry arrive through the committed character-domain
+//! publish and expire inside the actor's deadline gate; structure effects are
+//! not supported. Versions are in-memory;
 //! training-completion updates follow scheduled and mutation-time completions.
-//! In-space brain changes replace the actor's cached fit behind membership and fitting revisions.
+//! An unlimited-cargo hull publishes one terminal capacity effect instead of its
+//! finite base override; finite and reset restore the ordinary preAssignment.
+//! In space the brain uses the live actor's prepared-fit gate when available;
+//! otherwise it cold-loads the projected fit without replacing actor state.
+//! Docked reads use the cold load.
 
 use super::super::{fit::{Fit, Key, OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_PERCENT_UNNERFED, OP_POST_ASSIGN, PERCENT_SCALE}, keyval, CallError};
-use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
+use infinity_core::consts::dogma::{ATTR_CAPACITY, ATTR_SKILL_LEVEL};
 use crate::client::Client;
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
+
+/// Client dogma protocol name of the versioned brainData notification
+/// (`allSkillsCharBrain.py` OnServerBrainUpdated).
+pub(crate) const UPDATED_EVENT: &str = "OnServerBrainUpdated";
 
 
 static VERSIONS: OnceLock<Mutex<HashMap<i64, i64>>> = OnceLock::new();
@@ -77,9 +87,11 @@ fn wire(target: &Target, effect: Effect, to_item: i64) -> Value {
 
 
 /// Compile from the same effective source values and modifier traversal as Fit.
+/// Operand values come from Fit::modifier_value, so the resonance floor never
+/// reaches the arithmetic the client re-derives from this notification.
 pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, Value) {
     let mut effects: BTreeMap<Target, Effect> = BTreeMap::new();
-    insert_hull_overrides(&mut effects, fit.overrides(Key::Ship), |attribute| fit.type_has_attribute(Key::Ship, attribute));
+    insert_hull_overrides(&mut effects, fit.overrides(Key::Ship), |attribute| !(fit.cargo_unlimited() && attribute == ATTR_CAPACITY) && fit.type_has_attribute(Key::Ship, attribute));
     fit.brain_modifiers(|source, modifier| {
         let Some(source_type) = fit.source_type(source) else { return };
         let ship = match modifier.domain.as_str() {
@@ -97,11 +109,18 @@ pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, V
         };
         if matches!(kind, "LG" | "LRS" | "ORS") && extra.is_none() { return; }
         if !(OP_PRE_ASSIGN..=OP_POST_ASSIGN).contains(&modifier.op) && modifier.op != OP_POST_PERCENT_UNNERFED { return; }
-        let value = fit.value(source, modifier.modifying);
+        let value = fit.modifier_value(source, modifier.modifying);
         if kind == "M" && modifier.modified == ATTR_SKILL_LEVEL { return; }
         let target = Target { ship, attribute: modifier.modified, kind, operation: modifier.op, extra };
         combine(&mut effects, target, value, source_type);
     });
+    // Unlimited cargo is published as a terminal representation intended to be
+    // beyond the client's own volume checks; the persisted row's real finite
+    // base stays in overrides and is restored for finite/reset.
+    if fit.cargo_unlimited() {
+        effects.insert(Target { ship: true, attribute: ATTR_CAPACITY, kind: "M", operation: OP_POST_ASSIGN, extra: None },
+            Effect { value: crate::services::fit::cargo::UNLIMITED_CARGO_WIRE_CAPACITY, skills: Vec::new() });
+    }
     let mut char_effects = Vec::new();
     let mut ship_effects = Vec::new();
     for (target, effect) in effects {
@@ -112,47 +131,39 @@ pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, V
     (Value::List(char_effects), Value::List(ship_effects), Value::list([]))
 }
 
-async fn effects(c: &Client, publish: bool) -> Result<(i64, Value, Value, Value), CallError> {
+async fn effects(c: &Client) -> Result<(i64, Value, Value, Value), CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let system = c.session.int("solarsystemid");
-    let token = if publish {
-        if let Some(system) = system {
-            c.world.with(system, move |s| {
-                Some((s.combat_membership_generation(ship_id)?, s.combat_fit_revision(ship_id)?))
-            }).await.flatten()
-        } else { None }
-    } else { None };
-    let fit = if let Some(system) = system {
-        Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
-    } else {
-        Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
-    };
-    let (character, ship, structure) = compile(&fit, char_id, ship_id);
-    if let (Some(system), Some((generation, fit_revision)), Some(revision)) = (system, token, fit.projection_revision()) {
-        c.world.post(system, move |s| {
-            if !s.replace_fitted_cache(ship_id, generation, fit_revision, fit, Key::Ship, Some(revision))
-                && s.combat_membership_generation(ship_id) == Some(generation) && s.combat_phase(ship_id) == Some(crate::space::combat::CombatPhase::Live) {
-                s.refresh_projection_target(ship_id);
+    if let Some(system) = c.session.int("solarsystemid") {
+        // Prefer the live piloted ship's prepared-fit gate in the actor turn.
+        // If that gate cannot supply the brain, compile a cold projected fit;
+        // the cold read never installs or replaces the actor's resident fit.
+        let compiled = c.world.with(system, move |s| {
+            if !s.pilot_ball(char_id).is_some_and(|ball| ball.id == ship_id && ball.char_id == Some(char_id) && ball.owner_id == char_id) {
+                return None;
             }
-            if s.combat_membership_generation(ship_id) == Some(generation) {
-                let drones: Vec<_> = s.drones().filter(|drone| drone.owner == char_id).map(|drone| drone.id).collect();
-                for drone in drones { s.refresh_projection_target(drone); }
-            }
-        });
+            s.with_combat_fit(ship_id, move |fit, _, _| compile(fit, char_id, ship_id))
+        }).await.flatten();
+        let (character, ship, structure) = match compiled {
+            Some(compiled) => compiled,
+            None => compile(&Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?, char_id, ship_id),
+        };
+        return Ok((char_id, character, ship, structure));
     }
+    let fit = Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
+    let (character, ship, structure) = compile(&fit, char_id, ship_id);
     Ok((char_id, character, ship, structure))
 }
 
 pub(crate) async fn bootstrap(c: &Client) -> Result<Value, CallError> {
-    let (char_id, character, ship, structure) = effects(c, false).await?;
-    let version = *versions().lock().unwrap().entry(char_id).or_insert(0);
+    let (char_id, character, ship, structure) = effects(c).await?;
+    let version = *crate::poison::lock_or_exit(versions().lock()).entry(char_id).or_insert(0);
     Ok(Value::tuple([Value::Int(version), character, ship, structure]))
 }
 
 /// Call after a committed skill change; sends one brainData tuple to the client.
 pub(crate) async fn update(c: &mut Client) -> Result<(), CallError> {
-    let (char_id, character, ship, structure) = effects(c, true).await?;
+    let (char_id, character, ship, structure) = effects(c).await?;
     notify_update(c, char_id, character, ship, structure);
     Ok(())
 }
@@ -163,15 +174,21 @@ pub(crate) fn update_from_fit(c: &mut Client, fit: &Fit, char_id: i64, ship_id: 
     notify_update(c, char_id, character, ship, structure);
 }
 
-fn notify_update(c: &mut Client, char_id: i64, character: Value, ship: Value, structure: Value) {
+/// Version-bump and marshal the brainData notification arguments. The version
+/// only advances here; a rolled-back transaction never reaches this helper.
+pub(crate) fn update_args(char_id: i64, character: Value, ship: Value, structure: Value) -> Vec<Value> {
     let version = {
-        let mut versions = versions().lock().unwrap();
+        let mut versions = crate::poison::lock_or_exit(versions().lock());
         let version = versions.entry(char_id).or_insert(0);
         *version += 1;
         *version
     };
     let bytes = marshal::dumps(&Value::tuple([character, ship, structure]));
-    c.notify("OnServerBrainUpdated", vec![Value::tuple([Value::Int(version), Value::Bytes(bytes)])]);
+    vec![Value::tuple([Value::Int(version), Value::Bytes(bytes)])]
 }
 
-#[cfg(test)] mod tests;
+fn notify_update(c: &mut Client, char_id: i64, character: Value, ship: Value, structure: Value) {
+    c.notify(UPDATED_EVENT, update_args(char_id, character, ship, structure));
+}
+
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

@@ -39,4 +39,4 @@ pub(crate) fn handle(db: Db, world: Arc<World>, job: Job) -> Pin<Box<dyn Future<
         result.map_err(|error| match error { CallError::Internal(error) => error, CallError::User { msg, .. } => anyhow::anyhow!("skill plan recovery refused: {msg}") })
     })
 }
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

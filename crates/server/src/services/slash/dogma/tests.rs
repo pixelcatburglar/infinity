@@ -20,7 +20,14 @@ fn resolved_kinematic_overrides_follow_ball_validation() {
     assert!(valid_kinematic_action(ATTR_MASS as i32, Action::Set("id", f64::MAX)));
     assert!(valid_kinematic_action(ATTR_MAX_VELOCITY as i32, Action::Set("id", 0.0)));
     assert!(!valid_kinematic_action(ATTR_MAX_VELOCITY as i32, Action::Set("id", f64::MAX)));
-    assert!(valid_kinematic_action(-1, Action::Set("other", -1.0)));
+    assert!(valid_kinematic_action(-1 as i32, Action::Set("other", -1.0)));
+    // `infinity` is a capacity-only action; other spellings parse as numbers
+    // and are refused later by the finite-value validation.
+    assert_eq!(parse(&["ship".into(), "capacity".into(), "infinity".into()]).unwrap().1, Action::Unlimited("capacity"));
+    for bad in ["inf", "+inf", "-inf", "nan", "1e999", "infinityy"] {
+        assert!(!matches!(parse(&["ship".into(), "capacity".into(), bad.into()]).map(|(_, a)| a), Some(Action::Unlimited(_))));
+    }
+    assert!(matches!(parse(&["flag:5".into(), "capacity".into(), "infinity".into()]).unwrap().1, Action::Unlimited(_)));
 }
 
 #[test]
@@ -92,21 +99,6 @@ fn late_gm_snapshot_requests_refresh_without_overwriting_newer_projection() {
     assert_eq!(system.ball(1).unwrap().max_vel, 10.0);
 }
 
-async fn smoke_fingerprint(db: &crate::db::Db) -> Vec<String> {
-    let mut result = Vec::new();
-    for sql in [
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY user_id), '')) AS fingerprint FROM game.accounts t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id), '')) AS fingerprint FROM game.characters t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.items t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id, attribute_id), '')) AS fingerprint FROM game.item_attributes t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY ship_id, flag_id), '')) AS fingerprint FROM game.module_charges t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id, type_id), '')) AS fingerprint FROM game.skills t",
-    ] {
-        result.push(db.query_one(sql, &[]).await.unwrap().get("fingerprint"));
-    }
-    result
-}
-
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
@@ -115,7 +107,6 @@ async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let before = smoke_fingerprint(&db).await;
     let (account, character, ship) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('gm-refusal-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
         let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,'gm-refusal-' || nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await?.get("character_id");
@@ -131,7 +122,7 @@ async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
         let (stream, address) = listener.accept().await.unwrap();
         let cfg = Arc::new(crate::config::Config::default());
         let login = crate::handshake::Login { user_id: account, user_name: "fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg.clone(), d.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone()), w.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg.clone(), d.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone()), w.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(1))]);
         let ball = Ball { id: ship, type_id: 587, owner_id: character, corp_id: 1, alliance_id: -1,
             char_id: Some(character), signature_radius: None, mode: MODE_STOP, radius: 1.0, mass: 1e6,
@@ -144,6 +135,8 @@ async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
         assert!(w.after(1, 1200).await);
         let (destiny, mut events) = tokio::sync::mpsc::unbounded_channel();
         w.observe(1, character, ship, destiny).await.unwrap();
+        crate::space::system::tests::events::initial_state(&mut events);
+        crate::space::system::tests::events::fleet_snapshot(&mut events);
         let (notices, mut received) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = notices.clone();
         w.register_pilot(character, notices);
@@ -172,11 +165,35 @@ async fn rejected_kinematic_commands_do_not_persist_notify_or_move() {
     world.unregister_pilot_generation(character, None);
     let flush = world.flush_positions().await;
     crate::services::combat::forget_ship(ship);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account, character }], &[ship]).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id = $1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id = $1 AND owner_id = $2", &[&ship, &character]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id = $1 AND user_id = $2", &[&character, &account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
-    assert_eq!(smoke_fingerprint(&db).await, before);
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.expect("GM refusal regression failed");
+}
+
+#[test]
+fn me_and_optional_equals_parse_as_ship_forms() {
+    let words = |line: &str| crate::services::slash::args::tokenize(line).unwrap();
+    for (attr, value, expected) in [
+        ("hiSlots", "8", Action::Set("hiSlots", 8.0)),
+        ("hiSlots", "reset", Action::Reset("hiSlots")),
+        ("capacity", "infinity", Action::Unlimited("capacity")),
+    ] {
+        for form in ["{a} {v}", "{a} = {v}", "{a}={v}", "{a}= {v}", "{a} ={v}"] {
+            let line = form.replace("{a}", attr).replace("{v}", value);
+            assert_eq!(parse(&words(&format!("me {line}"))), Some((Target::Ship, expected)), "{line}");
+        }
+    }
+    assert_eq!(parse(&words("me hiSlots")), Some((Target::Ship, Action::Query("hiSlots"))));
+    assert_eq!(parse(&words("me list")), Some((Target::Ship, Action::List)));
+    assert_eq!(parse(&words("ship hiSlots = 8")), Some((Target::Ship, Action::Set("hiSlots", 8.0))));
+    assert_eq!(parse(&words("123 37=8")), Some((Target::Item(123), Action::Set("37", 8.0))));
+    assert_eq!(parse(&words("flag:27 damageMultiplier =3")), Some((Target::Flag(27), Action::Set("damageMultiplier", 3.0))));
+    for bad in ["me hiSlots =", "me hiSlots = = 8", "me = 8", "me"] {
+        assert_eq!(parse(&words(bad)), None, "{bad}");
+    }
 }

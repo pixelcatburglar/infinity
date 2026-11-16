@@ -29,3 +29,21 @@ fn local_scope_is_captured_and_claims_are_exact() {
     assert!(sovereignty_claimed(&call));
     assert!(!sovereignty_claimed(&Call { method: "GetAlliance", service: "allianceRegistry", ..call }));
 }
+
+#[test]
+fn dev_index_calls_are_unbound_and_strictly_shaped() {
+    let kwargs = Value::Dict(vec![]);
+    let one = Call { service: "devIndexManager", method: "GetDevelopmentIndicesForSystem", args: &[Value::Int(42)], kwargs: &kwargs, bound: false, bind_params: None };
+    assert!(matches!(sovereignty_query(&one, Some(3), Some(7)), Ok(Query::DevelopmentIndices { system_id: 42 })));
+    let all = Call { service: "devIndexManager", method: "GetAllDevelopmentIndices", args: &[], kwargs: &kwargs, bound: false, bind_params: None };
+    assert!(matches!(sovereignty_query(&all, Some(3), Some(7)), Ok(Query::AllDevelopmentIndices)));
+    for args in [&[Value::Bool(true)][..], &[Value::Float(42.0)][..], &[Value::BigLong(vec![42])][..], &[Value::Int(0)][..], &[Value::Int(42), Value::Int(1)][..], &[][..]] {
+        assert!(sovereignty_query(&Call { args, ..one }, Some(3), Some(7)).is_err());
+    }
+    assert!(sovereignty_query(&Call { args: &[Value::Int(42)], ..all }, Some(3), Some(7)).is_err());
+    assert!(sovereignty_query(&Call { bound: true, ..all }, Some(3), Some(7)).is_err());
+    let params = Value::tuple([Value::Int(42)]);
+    assert!(sovereignty_query(&Call { bind_params: Some(&params), ..all }, Some(3), Some(7)).is_err());
+    assert!(sovereignty_query(&one, None, Some(7)).is_err());
+    assert!(sovereignty_claimed(&one) && sovereignty_claimed(&all));
+}

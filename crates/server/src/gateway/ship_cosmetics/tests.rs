@@ -131,7 +131,7 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     assert!(decoded.get_field_by_name("states").unwrap().as_list().unwrap().is_empty());
     let response = handle_request(&gateway, make_request(GET), None).await;
     assert_eq!(response.status_code, 404);
-    assert_eq!(response.status_message, infinity_core::messages::gateway::NOT_FOUND);
+    assert_eq!(response.status_message, "NOT_FOUND");
     assert!(response.payload.is_none());
     let observer = crate::services::tests::fixture::create(&db).await.unwrap();
     let outsider = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -187,7 +187,7 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     assert_eq!(crate::services::dispatch(&mut client, &call).await.unwrap(), marshal::Value::None);
     let mut first_notice = None;
     for (receiver, character) in [(&mut stream.rx, fixture.character), (&mut observer_stream.rx, observer.character)] {
-        let frame = receiver.try_recv().unwrap();
+        let frame = tokio::time::timeout(timeout, receiver.recv()).await.unwrap().unwrap();
         let notice = crate::gateway::protocol::Notice::decode(&frame[5..]).unwrap();
         assert_eq!(notice.target_group.as_ref().unwrap().target, Some(Target::Character(u32::try_from(character).unwrap())));
         let payload = notice.payload.as_ref().unwrap();
@@ -207,7 +207,7 @@ async fn query_status_distinguishes_unavailable_actor_and_empty_scope() {
     let args = [marshal::Value::Int(ship), marshal::Value::Int(i64::from(skin))];
     let call = crate::services::Call { service: "shipCosmeticsMgr", method: "ApplySkinToShip", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
     assert_eq!(crate::services::dispatch(&mut client, &call).await.unwrap(), marshal::Value::None);
-    let frame = stream.rx.try_recv().unwrap();
+    let frame = tokio::time::timeout(timeout, stream.rx.recv()).await.unwrap().unwrap();
     let notice = crate::gateway::protocol::Notice::decode(&frame[5..]).unwrap();
     let payload = notice.payload.unwrap();
     let decoded = DynamicMessage::decode(message(SET).unwrap(), payload.value.as_slice()).unwrap();

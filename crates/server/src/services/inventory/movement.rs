@@ -2,7 +2,9 @@
 //! Sources and destinations use fresh ancestry, owner-bound bay permissions and
 //! sampled physical reachability from game.items and the system actor. Shared-bay
 //! deposits preserve item ownership; whole takes acquire the subtree after pending
-//! reload settlement. Loot rights, suspect flags and POS tower control are not modelled.
+//! reload settlement. Enacted corporation blueprint locks and pending vote-case
+//! reservations freeze originals inside a moving subtree. Loot rights, suspect
+//! flags and POS tower control are not modelled.
 
 use super::access::{corporate_custody, custody_allowed, Container};
 use super::destination::{Custody, Destination};
@@ -25,7 +27,7 @@ use std::sync::Arc;
 
 const FLAG_AUTOFIT: i32 = 0;
 
-pub(super) enum MoveEffect {
+pub(in crate::services) enum MoveEffect {
     Bank(super::super::combat::banks::BankStop),
     Online(super::super::effects::online::OnlineChanged),
 }
@@ -35,7 +37,7 @@ impl From<super::super::effects::online::OnlineChanged> for MoveEffect {
     fn from(change: super::super::effects::online::OnlineChanged) -> Self { Self::Online(change) }
 }
 
-pub(super) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, world: &World, mut notify: impl FnMut(Notification) -> Result<(), CallError>) -> Result<T, CallError> {
+pub(in crate::services) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, world: &World, mut notify: impl FnMut(Notification) -> Result<(), CallError>) -> Result<T, CallError> {
     super::super::effects::online::dispatch_mixed_entries(value, outbox, world,
         |effect| match effect { MoveEffect::Online(change) => Ok(change), other => Err(other) },
         |effect| { match effect { MoveEffect::Bank(stop) => super::super::combat::banks::apply_stop(stop), MoveEffect::Online(_) => unreachable!() }; Ok(()) },
@@ -44,8 +46,6 @@ pub(super) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, world: &Wor
             Ok(())
         })
 }
-
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceProof { Corporate(i64, i64, i32), Personal, ForeignLoot, Shared }
 
@@ -99,6 +99,10 @@ async fn authorized_destination(ex: &(impl Executor + ?Sized), sde: &Sde, contai
                 if corporation != Some(corp) {
                     return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))] });
                 }
+                // Deposits into a corporation office require a currently active lease.
+                let active = crate::dao::offices::get(ex, *id).await.map_err(db_err)?
+                    .is_some_and(|lease| lease.is_active(crate::client::filetime_now()));
+                if !active { return Ok(None); }
                 let sag = FLAG_CORP_SAG1;
                 return Ok(Some((*id, corp, flag.filter(|f| (sag..sag + CORP_HANGAR_DIVISIONS).contains(f)).unwrap_or(sag), true)));
             }
@@ -221,7 +225,6 @@ pub(crate) async fn move_item(
     container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>,
     notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
 ) -> Result<Option<i64>, CallError> {
-    let _lock = super::super::market::lock().await;
     let char_id = identity.char_id;
     let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
     let station = identity.station_id;
@@ -278,7 +281,23 @@ pub(crate) async fn move_item(
     fence_owners.sort_unstable();
     fence_owners.dedup();
     let fences = super::super::effects::online::capture_online_fences(world, &fence_owners).await;
-    db.transaction(
+    let mut engage_ships = Vec::new();
+    if is_fitting_flag(item.flag_id) {
+        if let Some((sys, _)) = fences.membership(item.location_id) { engage_ships.push((sys, item.location_id)); }
+    }
+    let destination_fitting = matches!(container, Container::Item(_))
+        && (is_fitting_flag(destination_flag) || (destination_flag == FLAG_AUTOFIT
+            && (item.category_id == i64::from(infinity_core::consts::CATEGORY_MODULE) || item.category_id == i64::from(infinity_core::consts::CATEGORY_SUBSYSTEM))));
+    if destination_fitting {
+        if let Some((sys, _)) = fences.membership(location) { engage_ships.push((sys, location)); }
+    }
+    let armed = super::super::combat::loaded::LoadedHolds::arm(world, &engage_ships, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _lock = super::super::market::lock().await;
+    let mut holds = super::super::combat::loaded::LoadedHolds::lock(world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
+    let held = (holds.held(item.location_id), holds.held(location));
+    holds.may_execute();
+    let result = db.transaction(
         move |tx, outbox: &mut Outbox<MoveEffect>| {
             let item = item.clone();
             let container = container.clone();
@@ -286,6 +305,8 @@ pub(crate) async fn move_item(
             let policy = policy.clone();
             let fences = fences.clone();
             let reachability = reachability.clone();
+            let settle = settle.clone();
+            let held = held;
             let audience = audience.clone();
             let mut pending_snapshot = pending_snapshot.as_ref().map(|preparation| preparation.fresh_attempt());
             let destination_ancestry = destination_ancestry.clone();
@@ -307,6 +328,13 @@ pub(crate) async fn move_item(
                         requests.push(LockRequest { item_id: row.item_id, strength: LockStrength::Update });
                     }
                 }
+                // A whole singleton move carries its subtree: every descendant joins
+                // the final request set before the first row lock, so the locked set
+                // cannot grow afterwards. Share strength freezes each row.
+                let subtree = if item.singleton {
+                    inventory_dao::descendants(tx, &[item.item_id]).await.map_err(db_err)?
+                } else { Vec::new() };
+                requests.extend(subtree.iter().map(|id| LockRequest { item_id: *id, strength: LockStrength::Share }));
                 if let Some(preparation) = &pending_snapshot {
                     requests.extend(preparation.closure().iter().chain(preparation.ancestors()).map(|id|
                         LockRequest { item_id: *id, strength: LockStrength::Update }));
@@ -319,11 +347,16 @@ pub(crate) async fn move_item(
                     requests.extend_from_slice(preparation.refund().requests());
                 }
                 let locks = super::destination::lock_items(tx, &sde, &requests, &optional).await?;
+                super::super::combat::loaded::settle_in(tx, &settle).await?;
                 if crate::dao::items::deliveries::ancestry(tx, item.location_id).await.map_err(db_err)? != source_ancestry
                     || crate::dao::items::deliveries::ancestry(tx, location).await.map_err(db_err)? != destination_ancestry
                     || !locks.row(item.item_id).is_some_and(|row| row.jump_clone_id.is_none()
                         && row.type_id == item.type_id && row.owner_id == item.owner_id && row.location_id == item.location_id
                         && row.flag_id == item.flag_id && row.quantity == item.quantity && row.singleton == item.singleton) {
+                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                }
+                if !subtree.is_empty()
+                    && inventory_dao::descendants(tx, &[item.item_id]).await.map_err(db_err)? != subtree {
                     return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
                 }
                 if let Some(preparation) = &pending_snapshot {
@@ -427,11 +460,20 @@ pub(crate) async fn move_item(
                         to_location_id: location, quantity: take.unwrap_or_else(|| crate::services::item_volume::stack_size(item.singleton, item.quantity)),
                     });
                 }
-                Ok(Some(moved_id))
+                let mut seed_sets = Vec::new();
+                if held.0 && departure {
+                    seed_sets.push((item.location_id, super::super::combat::loaded::seed_entries(tx, item.location_id, &[(item.item_id, item.flag_id)]).await?));
+                }
+                if held.1 && is_fitting_flag(flag) {
+                    seed_sets.push((location, super::super::combat::loaded::seed_entries(tx, location, &[(moved_id, flag)]).await?));
+                }
+                Ok((Some(moved_id), seed_sets))
             })
         },
         |value, outbox| async move { dispatch_move(value, outbox, world, notify) },
-    ).await
+    ).await;
+    let seeds = match &result { Ok((_, seed_sets)) => seed_sets.clone(), _ => Vec::new() };
+    holds.finish(db, world, result, &seeds).await.map(|(moved, _)| moved)
 }
 
 /// Guarded movement primitive; `None` means no destination item was produced.
@@ -458,6 +500,11 @@ pub(in crate::services) async fn move_core<X: Send>(
     if crate::dao::industry::has_active_blueprint_job(tx, &guarded).await.map_err(db_err)? {
         return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
     }
+    // Enacted corporation locks and pending vote-case reservations freeze blueprint
+    // originals anywhere in the moving set; every moving row must already sit in
+    // the caller's lock token at its requested strength.
+    let blueprints = super::super::corps::item_locks::locked_blueprints(sde, locks, &guarded)?;
+    super::super::corps::item_locks::ensure_mutable(tx, &blueprints).await?;
     if item.item_id == location || crate::dao::items::deliveries::ancestry(tx, location).await.map_err(db_err)?.iter().any(|row| row.item_id == item.item_id) {
         return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
     }
@@ -491,7 +538,7 @@ pub(in crate::services) async fn move_core<X: Send>(
     let count = if same_box && take.is_some() { 2 } else { 1 };
     let excluded = if same_flag || same_box { std::slice::from_ref(&item.item_id) } else { &[] };
     super::hold_storage::check_destination(tx, sde, capacity_owner, location, flag, &additions[..count],
-        super::hold_storage::Replaced { items: excluded, reloads: &[] }, None).await?;
+        super::hold_storage::Replaced { items: excluded, reloads: &[] }, super::hold_storage::CapacitySource::Current).await?;
     let item_id = item.item_id;
     let corporate = corporate_custody(tx, Some(sde), item.item_id).await?.is_some();
     if let Some(q) = take {

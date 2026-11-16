@@ -125,7 +125,10 @@ fn character_target_is_current_visible_fleet_pilot_at_commit() {
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_none());
     s.insert(ball(105, 5));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(1_000_000_000_001, 103, tx);
+    let (completed_1, mut completion_1) = tokio::sync::oneshot::channel();
+    s.observe(1_000_000_000_001, 103, tx, completed_1);
+    crate::space::system::tests::events::publish_scene_prefix(&mut s, crate::space::collision::enabled());
+    assert_eq!(completion_1.try_recv(), Ok(true));
     assert!(s.fleet_broadcast_visible(3, 103));
     let mut self_cloaked = ball(103, 3);
     self_cloaked.cloak = 1;
@@ -148,11 +151,13 @@ fn character_target_is_current_visible_fleet_pilot_at_commit() {
     s.insert(ball(105, 5));
     s.unobserve(1_000_000_000_001);
     let (stale, _stale_rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(1_000_000_000_001, 104, stale);
+    let (completed_2, _completion_2) = tokio::sync::oneshot::channel();
+    s.observe(1_000_000_000_001, 104, stale, completed_2);
     assert!(!s.fleet_broadcast_visible(3, 104));
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_some());
     let (closed, closed_rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(1_000_000_000_001, 103, closed);
+    let (completed_3, _completion_3) = tokio::sync::oneshot::channel();
+    s.observe(1_000_000_000_001, 103, closed, completed_3);
     drop(closed_rx);
     assert!(!s.fleet_broadcast_visible(3, 104));
     assert!(commit_in(&st, &mut s, &order, 4, 104, |_| ()).is_some());
@@ -226,7 +231,7 @@ async fn fleet_execute_uses_each_pilots_real_fitted_speed() {
         assert!(crate::dao::items::dogma::set_override(&d, leader_ship,
             infinity_core::consts::dogma::ATTR_WARP_SPEED_MULTIPLIER, 0.0).await.unwrap());
         let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
-        let callback: Timer = Box::new(move |_| { let _ = arrived_tx.send(()); });
+        let callback: ArrivalCallback = Box::new(move |_| { let _ = arrived_tx.send(()); });
         let error = execute(&d, &w, Some(system), order, WarpDestination::Exact([200_000.0, 0.0, 0.0]),
             Some(callback), Value::None).await;
         assert!(error.is_err(), "later member's invalid fit must fail the order");
@@ -285,7 +290,7 @@ fn revision_and_scramble_preserve_single_arrival_callback() {
     s.insert(ball(104, 4));
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let callback: Timer = Box::new(move |_| { count.fetch_add(1, Ordering::SeqCst); });
+    let callback: ArrivalCallback = Box::new(move |_| { count.fetch_add(1, Ordering::SeqCst); });
     let arrival = s.register_warp_arrival(callback);
     let stale = s.projection_revision(104);
     s.refresh_projection_target(104);
@@ -307,3 +312,12 @@ fn revision_and_scramble_preserve_single_arrival_callback() {
     s.tick(3000);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[path = "warp/agent_mgr.rs"]
+mod agent_mgr;
+#[path = "warp/beyonce.rs"]
+mod beyonce;
+#[path = "warp/fixture.rs"]
+mod fixture;
+#[path = "warp/formations.rs"]
+mod formations;

@@ -1,13 +1,22 @@
+#[cfg(feature = "tests-lua")]
 use super::*;
 
+#[cfg(feature = "tests-lua")]
 mod acceptance;
+#[cfg(feature = "tests-lua")]
 mod budget;
+#[cfg(any(feature = "tests-lua", feature = "tests-gateway", feature = "tests-content"))]
 pub(crate) mod daily_goals;
+#[cfg(feature = "tests-lua")]
 mod fixture;
+#[cfg(feature = "tests-lua")]
 mod roots;
+#[cfg(feature = "tests-lua")]
 mod sovereignty;
+#[cfg(feature = "tests-lua")]
 pub(crate) mod ship_adaption;
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 async fn event_handlers_continue_in_order_after_errors_and_budget_exhaustion() -> mlua::Result<()> {
     let lua = mlua::Lua::new();
@@ -31,6 +40,7 @@ async fn event_handlers_continue_in_order_after_errors_and_budget_exhaustion() -
     Ok(())
 }
 
+#[cfg(feature = "tests-lua")]
 #[test]
 fn intercept_results_allow_deny_and_reject_invalid_shapes() -> mlua::Result<()> {
     let lua = mlua::Lua::new();

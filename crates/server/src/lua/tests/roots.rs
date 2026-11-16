@@ -3,7 +3,7 @@
 use super::super::*;
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE; run this exact test in its own process"]
 async fn list_shows_script_roots() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -23,13 +23,14 @@ async fn list_shows_script_roots() {
         config.lua.scripts_dir = primary.to_string_lossy().into_owned();
         config.lua.mod_dirs = vec![extra.to_string_lossy().into_owned()];
         let chat = crate::chat::Hub::new(&config.chat.domain, db.clone(), world.clone());
+        crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
         start(&config, &db, &sde, &world, &chat).await.unwrap();
         let cfg = Arc::new(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: 1, user_name: "roots".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world, login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, chat, world, login);
         let list = command(&mut client, "lua", &["list".into()]).await.unwrap().unwrap();
         assert!(list.contains(&format!("script: primary root={}", primary.canonicalize().unwrap().display())));
         assert!(list.contains(&format!("script: extra root={}", extra.canonicalize().unwrap().display())));

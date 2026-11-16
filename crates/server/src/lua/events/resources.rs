@@ -87,4 +87,4 @@ resource_events! {
     LoyaltyPointsEarned { char_id, issuer_id, amount, reason, occurred_at, context },
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

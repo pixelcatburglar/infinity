@@ -2,6 +2,8 @@
 //! The client `lpStoreSvc.py` consumes the resulting catalogue; this tool has
 //! no client mirror. Sources are ESI and `sde.crp_npc_corporations` / `sde.inv_types`.
 //! It does not fetch during server operation or delete offers absent from ESI.
+//! The server reads the catalogue into memory once at startup; restart it for
+//! imported or adjusted offers to take effect.
 
 mod offers;
 
@@ -60,6 +62,7 @@ async fn main() -> Result<()> {
         }
     }
     eprintln!("corporations={} succeeded={} failed={} offers={} errors={}", corporations.len(), imported, failed, count, failed);
+    eprintln!("Restart the server for imported LP offers to take effect.");
     if failed != 0 { bail!("one or more corporation imports failed"); }
     Ok(())
 }

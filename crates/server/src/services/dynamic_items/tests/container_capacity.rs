@@ -97,9 +97,9 @@ async fn same_box_exchange(mode: u8) {
         let snapshot = crate::dao::items::loading::capacity_snapshot(&f.db, parent).await.unwrap();
         let room = hold_storage::container_room(&f.sde, snapshot.parent.as_ref().unwrap(), &snapshot.items, &snapshot.reloads).unwrap().unwrap();
         let before_used = room.used;
-        if mode == 2 { assert!(room.capacity > 0.0); assert_eq!(room.used, room.capacity); }
-        if mode == 1 { assert!(room.used > room.capacity); }
-        if mode == 0 { assert_eq!(room.capacity, 0.0); }
+        if mode == 2 { assert!(matches!(room.capacity, crate::services::inventory::holds::CapacityLimit::Finite(v) if v > 0.0)); assert_eq!(room.used, match room.capacity { crate::services::inventory::holds::CapacityLimit::Finite(v) => v, crate::services::inventory::holds::CapacityLimit::Unlimited => unreachable!() }); }
+        if mode == 1 { assert!(room.used > match room.capacity { crate::services::inventory::holds::CapacityLimit::Finite(v) => v, crate::services::inventory::holds::CapacityLimit::Unlimited => unreachable!() }); }
+        if mode == 0 { assert_eq!(room.capacity, crate::services::inventory::holds::CapacityLimit::Finite(0.0)); }
         let dispatched = Arc::new(AtomicBool::new(false));
         let before = f.fingerprint().await;
         assert!(matches!(f.create(f.context(), f.mutator, f.source, true, dispatched.clone()).await, Err(CallError::Internal(_))));

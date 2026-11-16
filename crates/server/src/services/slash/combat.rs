@@ -27,4 +27,4 @@ fn parse(args: &[String]) -> Option<([bool; 3], f64)> {
     Some((layers, percent / PERCENT_SCALE))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-slash"))] mod tests;

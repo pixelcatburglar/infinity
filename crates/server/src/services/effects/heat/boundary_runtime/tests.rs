@@ -79,6 +79,45 @@ fn delayed_connection_matches_immediate_nominal_heat() {
 }
 
 #[test]
+fn reset_crossing_delayed_boundaries_preserves_waiters_and_next_cycle() {
+    let mut epoch_rack = super::super::Rack::default();
+    super::super::reset_rack(&mut epoch_rack, 0);
+    super::super::reanchor(&mut epoch_rack, -1);
+    assert_eq!(epoch_rack.anchor_at, 0);
+    assert_eq!(super::super::floor_time(&epoch_rack, -1), 0);
+    let generation = Arc::new(AtomicBool::new(false));
+    let mut rack = rack();
+    install_start(&mut rack, 11, generation.clone(), START);
+    let mut later = connect(&mut rack, 22, &generation, START + 500, 28, RATE);
+    drive(&mut rack, START + 2_000);
+    assert!(later.try_recv().is_err());
+    super::super::reset_rack(&mut rack, START + 2_000);
+    assert!(arm_start(&mut rack, 11, &generation, START, pending(27, RATE)));
+    assert!(install_end(&mut rack, 11, generation.clone(), START, START + 1_000));
+    let mut older = register_waiter(&mut rack, 11, generation.clone(), START, vec![11], false);
+    mark_ends_ready(&mut rack, &[11], &generation, START);
+    drive(&mut rack, START + 2_000);
+    let old = older.try_recv().unwrap().unwrap();
+    assert_eq!(old[0].heat, 0.0);
+    assert_eq!(old[0].sampled_at, START + 1_000);
+    assert_eq!(rack.anchor_at, START + 2_000);
+    assert!(later.try_recv().is_err());
+    assert!(Arc::ptr_eq(&rack.sources[&11].generation, &generation));
+    release_completed(&mut rack, &[11], &generation, START);
+    drive(&mut rack, START + 2_000);
+    assert_eq!(later.try_recv().unwrap().unwrap()[0].heat, 0.0);
+    release_completed(&mut rack, &[22], &generation, START + 500);
+    let mut next = connect(&mut rack, 11, &generation, START + 2_000, 27, RATE);
+    drive(&mut rack, START + 3_000);
+    assert!(next.try_recv().unwrap().unwrap()[0].heat > 0.0);
+    release_completed(&mut rack, &[11], &generation, START + 2_000);
+    let mut stopped = connect(&mut rack, 11, &generation, START + 3_000, 27, RATE);
+    super::super::apply_rack(&mut rack, START + 4_000, |module| module == 11);
+    assert!(stopped.try_recv().unwrap().is_some());
+    assert!(rack.sources[&11].stopping && rack.sources[&11].suspended);
+}
+
+#[test]
 fn refused_start_releases_the_rack() {
     let generation = Arc::new(AtomicBool::new(false));
     let mut rack = rack();

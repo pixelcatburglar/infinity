@@ -123,6 +123,7 @@ impl Fixture {
         let chat = crate::chat::Hub::new("test", db.clone(), world.clone());
         let mut config = crate::config::Config::default();
         config.lua.scripts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua").to_string_lossy().into_owned();
+        crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
         crate::lua::start(&config, &db, &sde, &world, &chat).await.unwrap();
         let resources = Resources { db, sde, world };
         recovery::recover(&resources).await.unwrap();

@@ -27,7 +27,7 @@ fn entries() -> Outbox<Mixed> {
     let mut out = Outbox::default();
     out.operation(Mixed::Other("first"));
     out.notify_client("before", vec![]);
-    out.operation(Mixed::Online(OnlineChanged::StoredFitting { owner: 1, changes: vec![Value::Int(1)] }));
+    out.operation(Mixed::Online(OnlineChanged::StoredFitting { owner: 1, changes: vec![Value::Int(1)], brain: None }));
     out.operation(Mixed::Other("second"));
     out.notify_client("after", vec![]);
     out
@@ -67,7 +67,7 @@ async fn ordinary_dispatch_warns_and_continues_after_notify_failure() {
     let world = world().await;
     let mut out: Outbox<OnlineChanged> = Outbox::default();
     out.notify_client("first", vec![]);
-    out.operation(OnlineChanged::StoredFitting { owner: 1, changes: vec![Value::Int(1)] });
+    out.operation(OnlineChanged::StoredFitting { owner: 1, changes: vec![Value::Int(1)], brain: None });
     out.notify_client("last", vec![]);
     let mut calls = Vec::new();
     let result: Result<_, CallError> = online::dispatch_entries(9, out, &world, |notification| {

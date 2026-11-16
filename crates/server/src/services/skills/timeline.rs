@@ -1,6 +1,10 @@
 //! Read-only chronological skill, booster, and expert-system projection for characterskills/util.py.
 //! The plan captures initial installations so historical fits retain grants through expiry.
 //! Completions precede booster and expert expiries at equal timestamps.
+//! A queue head with a start and no end is an active interval blocked by a zero
+//! rate; an expiry that restores a positive rate banks no SP for the blocked span
+//! and retimes the queue from the expiry instant, keeping the next real deadline.
+//! Rows past a stopped time cursor carry no times.
 //! Historical Fit snapshots cannot reconstruct brain items already removed from the database.
 use std::{collections::HashMap, sync::Arc};
 use infinity_core::consts::FLAG_BOOSTER;
@@ -96,16 +100,22 @@ pub(super) async fn plan_tx(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, char_
             plan.brain_changed = true;
         }
         if old != new {
-            if let Some(row) = plan.queue.first_mut() {
-                if let (Some(start), Some(end)) = (row.start_time, row.end_time) {
-                    let interpolated = training::points_at(row.start_sp, row.dest_sp, start, end, at);
-                    let banked = if let Some(skill) = plan.skills.iter_mut().find(|skill| skill.type_id == row.type_id) {
-                        skill.skill_points = skill.skill_points.max(interpolated);
-                        skill.skill_points.min(row.dest_sp)
-                    } else { interpolated };
-                    row.start_sp = banked;
-                    let mut time = at;
-                    for row in &mut plan.queue { time = training::schedule(sde, row, &new, time)?; }
+            if let Some(head) = plan.queue.first() {
+                if let Some(start) = head.start_time {
+                    // A blocked interval has no end to interpolate; its persisted
+                    // points still merge into start_sp so nothing banked is lost.
+                    let interpolated = head.end_time.map(|end| training::points_at(head.start_sp, head.dest_sp, start, end, at));
+                    let fallback = interpolated.unwrap_or(head.start_sp);
+                    let mut base = fallback;
+                    if let Some(skill) = plan.skills.iter_mut().find(|skill| skill.type_id == head.type_id) {
+                        if let Some(points) = interpolated {
+                            skill.skill_points = skill.skill_points.max(points);
+                        }
+                        base = skill.skill_points.max(fallback);
+                    }
+                    let head = plan.queue.first_mut().unwrap();
+                    head.start_sp = base.min(head.dest_sp);
+                    training::schedule_queue(sde, &mut plan.queue, &new, Some(at))?;
                     plan.queue_changed = true;
                 }
             }
@@ -114,5 +124,5 @@ pub(super) async fn plan_tx(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, char_
     Ok(plan)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-skills"))]
 mod tests;

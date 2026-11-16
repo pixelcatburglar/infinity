@@ -1,5 +1,6 @@
 use super::*;
-use crate::{conn::Conn, handshake::Login};
+use crate::handshake::Login;
+use infinity_wire::conn::Conn;
 
 mod integration;
 
@@ -82,9 +83,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let station = sde.map.stations().next().expect("station in SDE").station_id;
-    use infinity_core::consts::dogma::{ATTR_CPU, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_HI_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, EFFECT_TURRET_FITTED, EFFECT_LAUNCHER_FITTED, ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT};
-    /// SDE dogma effect hiPower, the client high-slot rack effect.
-    const EFFECT_HI_POWER: i32 = 12;
+    use infinity_core::consts::dogma::{ATTR_CPU, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_HI_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, EFFECT_TURRET_FITTED, EFFECT_LAUNCHER_FITTED, ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT, EFFECT_HI_POWER};
     /// Client dogma.const.attributeMaxGroupFitted.
     const MAX_GROUP_FITTED: i32 = 1544;
     /// Client dogma.const.attributeMaxTypeFitted.

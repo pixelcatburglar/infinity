@@ -103,4 +103,4 @@ pub(crate) fn generation_inputs(sde: &Sde, center: V3, field: Field, security: f
 }
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

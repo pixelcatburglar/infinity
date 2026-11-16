@@ -101,7 +101,8 @@ async fn shared_bay_dispatch_rechecks_membership_flags_range_and_stored_metadata
     assert_eq!(rpc(&mut client, host, "ListByFlags", &flags).await.unwrap().items().unwrap().len(), 2);
     let capacity = rpc(&mut client, host, "GetCapacity", &fh).await.unwrap();
     let fit = crate::services::fit::Fit::load_unpiloted(&db, client.sde.clone(), host).await.unwrap();
-    let expected = super::super::holds::effective_capacity(&fit, FLAG_FLEET_HANGAR);
+    let expected = match super::super::holds::effective_capacity(&fit, FLAG_FLEET_HANGAR) {
+        super::super::holds::CapacityLimit::Finite(value) => value, super::super::holds::CapacityLimit::Unlimited => crate::services::fit::cargo::UNLIMITED_CARGO_WIRE_CAPACITY };
     assert_eq!(crate::services::value_field(&capacity, "capacity"), Some(&Value::Float(expected)));
     let volume = crate::services::item_volume::item_volume(&client.sde, commodity, false, 1, None).unwrap();
     assert_eq!(crate::services::value_field(&capacity, "used"), Some(&Value::Float(2.0 * volume)));

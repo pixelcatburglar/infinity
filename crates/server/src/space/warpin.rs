@@ -104,4 +104,4 @@ impl PyRandom {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

@@ -1,4 +1,6 @@
 //! Reader, mirroring `Marshal::ReadObject` and friends in Marshal.cpp.
+//! The decode budget below is a conservative estimate of the decoded
+//! stream's size, not a cap on process RSS.
 
 use crate::dbrow::{rle_unpack, DbRowDescriptor};
 use crate::{strings, tag, Error, Value};
@@ -7,6 +9,16 @@ use crate::{strings, tag, Error, Value};
 const RECURSION_LIMIT: usize = 1000;
 /// Server codec design: cap initial dictionary allocation for untrusted stream counts.
 const DICT_INITIAL_CAPACITY_LIMIT: usize = 4096;
+/// Server codec design: upper bound on the estimated size of one decoded
+/// stream. The game listener admits many handshakes at once on a host with
+/// limited memory, so the per-stream bound is 32 MiB; a frame is at most
+/// 10 MiB, so a frame that is mostly raw payload still fits.
+const DECODE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Server codec design: estimated size of one decoded node.
+const NODE_COST: usize = std::mem::size_of::<Value>();
+/// Server codec design: one shared-object entry: a header map slot plus the
+/// shared slot holding the decoded value and its weight.
+const SHARED_SLOT_COST: usize = std::mem::size_of::<i32>() + std::mem::size_of::<Option<(Value, usize)>>();
 
 /// Decode one marshal stream (`0x7E` / `0x7D` header).
 pub fn loads(buf: &[u8]) -> Result<Value, Error> {
@@ -23,13 +35,15 @@ struct Reader<'a> {
     /// Version 0: 1-based slot for the n-th shared object in stream order.
     map: Vec<i32>,
     map_used: usize,
-    shared: Vec<Option<Value>>,
+    shared: Vec<Option<(Value, usize)>>,
     depth: usize,
+    /// Estimated decoded size charged against `DECODE_BUDGET_BYTES`.
+    spent: usize,
 }
 
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Result<Self, Error> {
-        let mut r = Reader { buf, pos: 0, end: buf.len(), version: 0, map: vec![], map_used: 0, shared: vec![], depth: 0 };
+        let mut r = Reader { buf, pos: 0, end: buf.len(), version: 0, map: vec![], map_used: 0, shared: vec![], depth: 0, spent: 0 };
         match r.u8()? {
             tag::SIGNATURE => {
                 let count = r.i32()?;
@@ -37,6 +51,9 @@ impl<'a> Reader<'a> {
                     return Err(Error::BadSharedMap(format!("count {count}")));
                 }
                 let count = count as usize;
+                // The header map and `shared` slots are allocated up front;
+                // charge their estimated size before collecting them.
+                r.charge(count.saturating_mul(SHARED_SLOT_COST))?;
                 r.end = buf.len() - count * 4;
                 r.map = buf[r.end..].chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
                 if let Some(bad) = r.map.iter().find(|&&m| m < 1 || m as usize > count) {
@@ -50,10 +67,20 @@ impl<'a> Reader<'a> {
         Ok(r)
     }
 
+    /// Charge `n` bytes of estimated decoded size against the stream budget.
+    fn charge(&mut self, n: usize) -> Result<(), Error> {
+        self.spent = self.spent.saturating_add(n);
+        if self.spent > DECODE_BUDGET_BYTES {
+            return Err(Error::TooLarge);
+        }
+        Ok(())
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         if n > self.end.saturating_sub(self.pos) {
             return Err(Error::Truncated { at: self.pos, wanted: n });
         }
+        self.charge(n)?;
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
@@ -88,6 +115,7 @@ impl<'a> Reader<'a> {
             self.map_used += 1;
             Ok(slot as usize - 1)
         } else {
+            self.charge(SHARED_SLOT_COST)?;
             self.shared.push(None);
             Ok(self.shared.len() - 1)
         }
@@ -98,7 +126,7 @@ impl<'a> Reader<'a> {
             return Err(Error::Truncated { at: self.pos, wanted: 1 });
         }
         if self.buf[self.pos] == tag::MARK {
-            self.pos += 1;
+            self.take(1)?;
             return Ok(true);
         }
         Ok(false)
@@ -110,11 +138,17 @@ impl<'a> Reader<'a> {
             return Err(Error::TooDeep);
         }
         let at = self.pos;
+        let start = self.spent;
+        self.charge(NODE_COST)?;
         let raw = self.u8()?;
         let slot = if raw & tag::SHARED_FLAG != 0 { Some(self.reserve_shared()?) } else { None };
         let v = self.body(raw & tag::TYPE_MASK, at)?;
         if let Some(slot) = slot {
-            self.shared[slot] = Some(v.clone());
+            // A shared object's weight is charged again for the slot copy;
+            // nested shared stores count toward the parent's weight.
+            let weight = self.spent - start;
+            self.charge(weight)?;
+            self.shared[slot] = Some((v.clone(), weight));
         }
         self.depth -= 1;
         Ok(v)
@@ -145,7 +179,9 @@ impl<'a> Reader<'a> {
             }
             tag::STR_TABLE => {
                 let i = self.u8()?;
-                Value::Bytes(strings::lookup(i).ok_or(Error::BadStringIndex(i))?.as_bytes().to_vec())
+                let s = strings::lookup(i).ok_or(Error::BadStringIndex(i))?;
+                self.charge(s.len())?;
+                Value::Bytes(s.as_bytes().to_vec())
             }
             tag::UNICODE | tag::UTF8 => {
                 let b = self.sized()?;
@@ -154,7 +190,9 @@ impl<'a> Reader<'a> {
             tag::UNICODE_0 => Value::Unicode(String::new()),
             tag::UNICODE_1 => {
                 let b = self.take(1)?;
-                Value::Unicode((b[0] as char).to_string())
+                let c = b[0] as char;
+                self.charge(c.len_utf8() - 1)?;
+                Value::Unicode(c.to_string())
             }
             tag::TUPLE | tag::LIST => {
                 let n = self.size()?;
@@ -199,11 +237,13 @@ impl<'a> Reader<'a> {
             tag::REFERENCE => {
                 let n = self.size()? as i32;
                 let idx = if self.version == 0 { n - 1 } else { n };
-                usize::try_from(idx)
-                    .ok()
-                    .and_then(|i| self.shared.get(i))
-                    .and_then(|v| v.clone())
-                    .ok_or(Error::BadReference(n))?
+                let i = usize::try_from(idx).map_err(|_| Error::BadReference(n))?;
+                let weight = match self.shared.get(i) {
+                    Some(Some((_, weight))) => *weight,
+                    _ => return Err(Error::BadReference(n)),
+                };
+                self.charge(weight)?;
+                self.shared[i].as_ref().unwrap().0.clone()
             }
             tag::CRC_CHECK => {
                 let _crc = self.i32()?;
@@ -221,6 +261,7 @@ impl<'a> Reader<'a> {
                     .ok_or(Error::Unsupported("DBRow with unrecognised descriptor"))?;
                 let layout = desc.layout();
                 let packed = self.sized()?;
+                self.charge(layout.data_len)?;
                 let data = rle_unpack(packed, layout.data_len)?;
                 let objects = (0..layout.n_objects).map(|_| self.object()).collect::<Result<Vec<_>, _>>()?;
                 Value::DbRow { descriptor: Box::new(descriptor), data, objects }

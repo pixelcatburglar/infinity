@@ -75,5 +75,5 @@ pub(super) fn select(row: &mut CaptureRow, team: Option<i64>, blocked: bool) {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-space"))]
 mod tests;

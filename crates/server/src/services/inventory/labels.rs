@@ -1,9 +1,15 @@
 //! Authoritative `invbroker.SetLabel` validation and post-commit location-cache updates.
 //!
-//! Client limits come from `eve/common/script/ui/services/shipNameDialog.py`
-//! (ship names) and `eve/common/script/inventory/menuFunctions.py`
-//! (container labels). Foreign ship ancestors require current bay access; naming
-//! guest-owned items without taking them is not supported.
+//! Client limits come from `eve/client/script/ui/shared/shipNameDialog.py`
+//! (ship names) and `eve/client/script/ui/services/menuSvcExtras/menuFunctions.py`
+//! (container labels). `game.items.name` is the persisted name source; after the
+//! rename commits, the caller receives a single seven-column `evelocations`
+//! record that the client's `Config`/`Recordset` cache consumes, so subsequent
+//! location queries return the new name. Foreign ship ancestors require current
+//! bay access; naming guest-owned items without taking them is not supported.
+//! When the renamed item sits at a solar-system root, the same record also
+//! refreshes that system actor's ball slim and the `evelocations` cache of
+//! ballpark-visible pilots; the caller always receives the record directly.
 use super::access::{corporate_custody, custody_allowed};
 use infinity_core::{consts::{CARGO_CONTAINER_GROUPS, CATEGORY_SHIP}, messages};
 use crate::{client::Client, dao::items::{inventory as inventory_dao, loading::ItemQuery}, db::outbox::{dispatch_client, Outbox}, services::{db_err, items::load_items, market, notify_error, CallError}, services::config};
@@ -48,13 +54,22 @@ pub(crate) async fn set_label(c: &mut Client, item_id: i64, name: String) -> Res
             if custody.is_none() && item.owner_id != me { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
             let limit = if ship { SHIP_NAME_LIMIT as i32 } else { CONTAINER_NAME_LIMIT as i32 };
             if !inventory_dao::rename(tx, item_id, &name, item.owner_id, item.type_id, item.location_id, item.flag_id, limit).await.map_err(db_err)? { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
-            Ok(config::location_row(item_id, &name))
+            let row = config::location_row(item_id, &name);
+            Ok((item.location_id, name, row))
         })
-    }, |row, mut outbox| async move {
-        outbox.notify_client("OnCfgDataChanged", vec![Value::str("evelocations"), Value::list([row])]);
+    }, |(location, name, row), mut outbox| async move {
+        // The market guard is still held through this projection and the caller
+        // dispatch: renames of one item commit and project in lock order, so a
+        // slower earlier callback cannot overwrite a later committed name. This
+        // orders same-item projections only, not two clients' event channels.
+        if c.sde.map.system(location).is_some() {
+            let observer_row = row.clone();
+            c.world.with(location, move |s| s.set_item_name(item_id, name, &observer_row, me)).await;
+        }
+        outbox.notify_client("OnCfgDataChanged", vec![Value::str("evelocations"), row]);
         dispatch_client(Value::None, outbox, c)
     }).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-inventory"))]
 mod tests;

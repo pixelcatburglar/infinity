@@ -1,4 +1,4 @@
-use super::{inventory, load_items, move_fingerprint, move_item, Call, CallError, Container, ItemQuery, Value, CATEGORY_SHIP, CONTAINER_HANGAR, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, INVENTORY, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1};
+use super::{inventory, item_state, load_items, move_item, Call, CallError, Container, ItemQuery, Value, CATEGORY_SHIP, CONTAINER_HANGAR, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, INVENTORY, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1};
 use crate::services::tests::fixture;
 
 type Notifications = tokio::sync::mpsc::UnboundedReceiver<(String, Vec<Value>)>;
@@ -26,10 +26,13 @@ fn has_item_change(client: &mut crate::client::Client, rx: &mut Notifications) -
     while let Ok((name, _)) = rx.try_recv() {
         found |= name == "OnItemChange";
     }
-    found |= client.outbox.drain(..).any(|packet| matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnItemChange")));
+    found |= client.outbox.drain(..).any(|packet| matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnItemChange")));
     found
 }
 
+async fn hangar_stacks(db: &crate::db::Db, owner: i64, stations: &[i64], type_id: i32) -> Vec<String> {
+    db.query("SELECT row_to_json(i)::text AS row FROM game.items i WHERE i.owner_id=$1 AND i.location_id=ANY($2) AND i.flag_id=$3 AND i.type_id=$4 ORDER BY i.item_id", &[&owner, &stations, &FLAG_HANGAR, &type_id]).await.unwrap().iter().map(|row| row.get("row")).collect()
+}
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated database with SDE"]
 async fn station_dispatch_rejects_remote_moves_and_merges() {
@@ -78,11 +81,11 @@ async fn station_dispatch_rejects_remote_moves_and_merges() {
         ("StackAll", &remote_ship_bind, vec![]),
     ];
     for (method, bind, args) in cases {
-        let before = move_fingerprint(&db).await;
+        let before = (item_state(&db, &[local_a, local_b, remote_a, remote_b, local_ship, remote_ship, local_cargo, local_cargo2, remote_cargo]).await.unwrap(), hangar_stacks(&db, actor.character, &[station, remote], type_id).await);
         clear_notifications(&mut client, &mut notifications);
         let call = Call { service: INVENTORY, method, args: &args, kwargs: &kwargs, bound: true, bind_params: Some(bind) };
         assert!(inventory(&mut client, &call).await.is_err(), "{method} unexpectedly succeeded");
-        assert_eq!(move_fingerprint(&db).await, before, "{method} changed rows");
+        assert_eq!((item_state(&db, &[local_a, local_b, remote_a, remote_b, local_ship, remote_ship, local_cargo, local_cargo2, remote_cargo]).await.unwrap(), hangar_stacks(&db, actor.character, &[station, remote], type_id).await), before, "{method} changed rows");
         assert_no_notifications(&mut client, &mut notifications);
     }
     let args = [Value::Int(local_cargo), Value::Int(local_ship)];
@@ -139,9 +142,9 @@ async fn ancestry_rechecks_roots_and_rejects_cycles_and_missing_parents() {
     for (column, value) in [("owner_id", actor.character + 1), ("flag_id", i64::from(FLAG_HANGAR)), ("location_id", alternate)] {
         let original: i64 = db.query_one(&format!("SELECT {column}::bigint AS value FROM game.items WHERE item_id = $1"), &[&nested]).await.unwrap().get("value");
         db.execute(&format!("UPDATE game.items SET {column} = $2::bigint WHERE item_id = $1"), &[&nested, &value]).await.unwrap();
-        let before = move_fingerprint(&db).await;
+        let before = item_state(&db, &[root, nested, alternate]).await.unwrap();
         assert!(reach.check(&db, &client.sde, endpoint).await.is_err());
-        assert_eq!(move_fingerprint(&db).await, before);
+        assert_eq!(item_state(&db, &[root, nested, alternate]).await.unwrap(), before);
         assert!(client.outbox.is_empty());
         db.execute(&format!("UPDATE game.items SET {column} = $2::bigint WHERE item_id = $1"), &[&nested, &original]).await.unwrap();
     }
@@ -154,7 +157,7 @@ async fn ancestry_rechecks_roots_and_rejects_cycles_and_missing_parents() {
     db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&nested, &root]).await.unwrap();
     for location in [remote, nested, -999_i64] {
         db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&root, &location]).await.unwrap();
-        let before = move_fingerprint(&db).await;
+        let before = item_state(&db, &[root, nested, alternate]).await.unwrap();
         let reach = reach.clone();
         let sde = client.sde.clone();
         let result: Result<(), CallError> = db.transaction(move |tx, _: &mut ()| {
@@ -163,7 +166,7 @@ async fn ancestry_rechecks_roots_and_rejects_cycles_and_missing_parents() {
             Box::pin(async move { reach.check(tx, &sde, endpoint).await })
         }, |(), ()| async move { Ok(()) }).await;
         assert!(result.is_err());
-        assert_eq!(move_fingerprint(&db).await, before);
+        assert_eq!(item_state(&db, &[root, nested, alternate]).await.unwrap(), before);
         assert!(client.outbox.is_empty());
     }
     fixture::cleanup(&db, actor).await.unwrap();
@@ -259,36 +262,36 @@ async fn space_surface_range_and_ship_bays_use_the_authoritative_root() {
     let far = ball(can, 2601.0);
     client.world.with(system, move |s| { s.insert(far); }).await.unwrap();
     for (destination, id) in [(Container::Item(ship), source), (Container::Item(ship), bare_source), (Container::Item(nested), aboard), (Container::Item(ship), inactive_cargo)] {
-        let before = move_fingerprint(&db).await;
+        let before = item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap();
         clear_notifications(&mut client, &mut notifications);
         assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
-        assert_eq!(move_fingerprint(&db).await, before);
+        assert_eq!(item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap(), before);
         assert_no_notifications(&mut client, &mut notifications);
     }
     let bind = Value::tuple([Value::Int(nested)]);
     let kwargs = Value::Dict(vec![]);
     let ship_bind = Value::tuple([Value::Int(ship)]);
     let distant_add = [Value::Int(source), Value::Int(nested)];
-    let before = move_fingerprint(&db).await;
+    let before = item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap();
     clear_notifications(&mut client, &mut notifications);
     let call = Call { service: INVENTORY, method: "Add", args: &distant_add, kwargs: &kwargs, bound: true, bind_params: Some(&ship_bind) };
     assert!(inventory(&mut client, &call).await.is_err());
-    assert_eq!(move_fingerprint(&db).await, before);
+    assert_eq!(item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap(), before);
     assert_no_notifications(&mut client, &mut notifications);
     let distant_multi = [Value::list([Value::Int(bare_source)]), Value::Int(can)];
-    let before = move_fingerprint(&db).await;
+    let before = item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap();
     clear_notifications(&mut client, &mut notifications);
     let call = Call { service: INVENTORY, method: "MultiAdd", args: &distant_multi, kwargs: &kwargs, bound: true, bind_params: Some(&ship_bind) };
     assert!(inventory(&mut client, &call).await.is_err());
-    assert_eq!(move_fingerprint(&db).await, before);
+    assert_eq!(item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap(), before);
     assert_no_notifications(&mut client, &mut notifications);
     let merge = [Value::list([Value::tuple([Value::Int(source), Value::Int(source2), Value::Int(1)])])];
     for (method, args) in [("MultiMerge", &merge[..]), ("StackAll", &[][..])] {
-        let before = move_fingerprint(&db).await;
+        let before = item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap();
         clear_notifications(&mut client, &mut notifications);
         let call = Call { service: INVENTORY, method, args, kwargs: &kwargs, bound: true, bind_params: Some(&bind) };
         assert!(inventory(&mut client, &call).await.is_err());
-        assert_eq!(move_fingerprint(&db).await, before);
+        assert_eq!(item_state(&db, &[ship, other_ship, can, nested, source, source2, bare_source, aboard, inactive_cargo]).await.unwrap(), before);
         assert_no_notifications(&mut client, &mut notifications);
     }
     let near = ball(can, 2600.0);
@@ -536,8 +539,8 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     let office_type = client.sde.types.get(27).expect("office type missing from SDE").type_id;
     let office = crate::dao::items::transfers::insert(&db, office_type, corp, station, FLAG_HANGAR, 1).await.unwrap();
     let distant_office = crate::dao::items::transfers::insert(&db, office_type, corp, remote, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::offices::insert(&db, office, corp, station, 1).await.unwrap();
-    crate::dao::offices::insert(&db, distant_office, corp, remote, 1).await.unwrap();
+    crate::dao::offices::insert(&db, office, corp, station, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
+    crate::dao::offices::insert(&db, distant_office, corp, remote, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
     let local = crate::dao::items::transfers::insert(&db, ty, corp, office, FLAG_CORP_SAG1, 1).await.unwrap();
     let distant = crate::dao::items::transfers::insert(&db, ty, corp, distant_office, FLAG_CORP_SAG1, 1).await.unwrap();
     db.execute("UPDATE game.items SET singleton = true WHERE item_id = ANY($1)", &[&&[office, distant_office, local, distant][..]]).await.unwrap();
@@ -551,19 +554,19 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     let personal = crate::dao::items::transfers::insert(&db, commodity, actor.character, station, FLAG_HANGAR, 10).await.unwrap();
     let hangar = Container::Hangar { station_id: station, owner_id: actor.character };
     for (destination, id) in [(hangar.clone(), remote_stack), (Container::Item(distant_office), personal)] {
-        let before = move_fingerprint(&db).await;
+        let before = (item_state(&db, &[office, distant_office, local, distant, local_stack, remote_stack, personal]).await.unwrap(), hangar_stacks(&db, actor.character, &[station], commodity).await);
         clear_notifications(&mut client, &mut notifications);
         assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &destination, id, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
-        assert_eq!(move_fingerprint(&db).await, before);
+        assert_eq!((item_state(&db, &[office, distant_office, local, distant, local_stack, remote_stack, personal]).await.unwrap(), hangar_stacks(&db, actor.character, &[station], commodity).await), before);
         assert_no_notifications(&mut client, &mut notifications);
     }
     let other_ceo = fixture::create(&db).await.unwrap();
     db.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &other_ceo.character]).await.unwrap();
     db.execute("UPDATE game.characters SET corp_roles = 0 WHERE character_id = $1", &[&actor.character]).await.unwrap();
-    let before = move_fingerprint(&db).await;
+    let before = (item_state(&db, &[office, distant_office, local, distant, local_stack, remote_stack, personal]).await.unwrap(), hangar_stacks(&db, actor.character, &[station], commodity).await);
     clear_notifications(&mut client, &mut notifications);
     assert!(move_item(&crate::services::identity::Identity::of_client(&client), &client.db, &client.world, &client.sde, client.session.int("solarsystemid"), client.notify_tx.clone(), &hangar, local_stack, None, None, None, |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await.is_err());
-    assert_eq!(move_fingerprint(&db).await, before);
+    assert_eq!((item_state(&db, &[office, distant_office, local, distant, local_stack, remote_stack, personal]).await.unwrap(), hangar_stacks(&db, actor.character, &[station], commodity).await), before);
     assert_no_notifications(&mut client, &mut notifications);
     db.execute("UPDATE game.characters SET corp_roles_hq = $2 WHERE character_id = $1", &[&actor.character, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
     clear_notifications(&mut client, &mut notifications);
@@ -577,8 +580,7 @@ async fn corporate_offices_are_local_even_for_ceo_and_director() {
     let moved = load_items(&db, &client.sde, ItemQuery::Id(personal)).await.unwrap().pop().unwrap();
     assert_eq!((moved.owner_id, moved.location_id), (corp, office));
     assert!(has_item_change(&mut client, &mut notifications));
-    crate::dao::offices::delete(&db, office).await.unwrap();
-    crate::dao::offices::delete(&db, distant_office).await.unwrap();
+    db.execute("DELETE FROM game.offices WHERE office_id = ANY($1)", &[&vec![office, distant_office]]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE owner_id = $1", &[&corp]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id = 1 WHERE character_id = $1", &[&actor.character]).await.unwrap();
     db.execute("DELETE FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.unwrap();

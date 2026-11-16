@@ -2,6 +2,8 @@
 use super::*;
 use super::super::completion;
 use crate::client::BRAIN_REFRESH;
+use crate::services::fit::Key;
+use infinity_core::consts::dogma::ATTR_CAPACITY;
 fn values(values: [i64; 5]) -> Value {
     Value::Dict(CHAR_ATTRIBUTES.into_iter().zip(values).map(|(id, value)| (Value::Int(id), Value::Int(value))).collect())
 }
@@ -51,15 +53,27 @@ async fn entitlement_persists_and_paused_queue_remains_paused() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let mut recipient = None;
+    let scenario = crate::tests::catch_scenario(async {
     fixture::seed_skill(&db, f.character).await.unwrap();
     db.execute("UPDATE game.skill_queue SET start_time=NULL, end_time=NULL WHERE character_id=$1", &[&f.character]).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
     use_real_skill(&db, f.character, &c.sde).await;
+    let owner_ship = crate::dao::items::creation::rookie_ship(&db, infinity_core::consts::TYPE_CAPSULE, f.character, c.sde.map.stations().next().unwrap().station_id, infinity_core::consts::FLAG_HANGAR).await.unwrap();
+    crate::dao::characters::selection::set_ship(&db, f.character, owner_ship).await.unwrap();
+    recipient = Some({
+        let market = crate::services::market::lock().await;
+        crate::services::tests::fixture::LiveRecipient::cold(&c.world, f.character, None, &market).await
+    });
+    let live = recipient.as_ref().unwrap();
+    let unchanged = live.read(|fit| fit.value(Key::Ship, ATTR_CAPACITY)).await;
     assert!(apply(&mut c, f.character, &values([17, 17, 17, 20, 27])).await.is_err());
     assert!(attributes::respec(&db, f.character).await.unwrap().is_none());
     get(&mut c, f.character).await.unwrap_or_else(|_| panic!("initialize remap"));
     let initial = attributes::respec(&db, f.character).await.unwrap().unwrap().free_respecs;
     apply(&mut c, f.character, &values([17, 17, 17, 21, 27])).await.unwrap_or_else(|_| panic!("timed remap"));
+    assert_eq!(live.read(|fit| CHAR_ATTRIBUTES.map(|id| fit.value(Key::Char, id as i32))).await, [17.0, 17.0, 17.0, 21.0, 27.0]);
+    assert_eq!(live.read(|fit| fit.value(Key::Ship, ATTR_CAPACITY)).await, unchanged);
     let first = attributes::respec(&db, f.character).await.unwrap().unwrap();
     assert_eq!(first.free_respecs, initial);
     assert_eq!(first.bases.as_deref(), Some(&[17, 17, 17, 21, 27][..]));
@@ -71,6 +85,8 @@ async fn entitlement_persists_and_paused_queue_remains_paused() {
     assert!(rows[0].start_time.is_none() && rows[0].end_time.is_none());
     if initial > 0 {
         apply(&mut c, f.character, &values([18, 17, 17, 20, 27])).await.unwrap_or_else(|_| panic!("bonus remap"));
+        assert_eq!(live.read(|fit| CHAR_ATTRIBUTES.map(|id| fit.value(Key::Char, id as i32))).await, [18.0, 17.0, 17.0, 20.0, 27.0]);
+        assert_eq!(live.read(|fit| fit.value(Key::Ship, ATTR_CAPACITY)).await, unchanged);
         let second = attributes::respec(&db, f.character).await.unwrap().unwrap();
         assert_eq!(second.free_respecs, initial - 1);
         assert_eq!(second.next_timed_respec, deadline);
@@ -88,7 +104,14 @@ async fn entitlement_persists_and_paused_queue_remains_paused() {
         assert_eq!(refused.next_timed_respec, deadline);
         assert_eq!(refused.bases.as_deref(), Some(&[18, 17, 17, 20, 27][..]));
     }
+    }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     fixture::cleanup(&db, f).await.unwrap();
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
@@ -137,32 +160,34 @@ async fn remap_rolls_back_after_staged_writes_and_batches_overdue_completion() {
     let sde = c.sde.clone();
     let fences = crate::services::effects::online::capture_online_fences(&c.world, &[f.character]).await;
     let dispatched = Arc::new(AtomicBool::new(false));
-    let flag = dispatched.clone();
     let _market = crate::services::market::lock().await;
-    let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
-        let sde = sde.clone(); let fences = fences.clone();
-        Box::pin(async move {
-            let value = apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], now).await?;
-            let staged = attributes::respec(tx, f.character).await.map_err(db_err)?.expect("staged remap");
-            assert_eq!(staged.bases.as_deref(), Some(&[17, 17, 17, 21, 27][..]));
-            tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
-            Ok(value)
-        })
-    }, |value, _outbox| async move { flag.store(true, Ordering::SeqCst); Ok(value) }).await;
-    match result {
-        Err(CallError::Internal(error)) => match error.downcast_ref::<crate::db::Error>() {
-            Some(crate::db::Error::Postgres(error)) => assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO)),
+    for (bases, kind, expected) in [([17, 17, 17, 21, 27], ChangeKind::Remap, [17, 17, 17, 21, 27]), ([0; 5], ChangeKind::Gm, [0; 5])] {
+        let flag = dispatched.clone();
+        let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
+            let sde = sde.clone(); let fences = fences.clone();
+            Box::pin(async move {
+                let value = apply_tx(tx, outbox, &sde, &fences, f.character, &bases, kind, now).await?;
+                let staged = attributes::respec(tx, f.character).await.map_err(db_err)?.expect("staged remap");
+                assert_eq!(staged.bases.as_deref(), Some(&expected[..]));
+                tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
+                Ok(value)
+            })
+        }, |value, _outbox| async move { flag.store(true, Ordering::SeqCst); Ok(value) }).await;
+        match result {
+            Err(CallError::Internal(error)) => match error.downcast_ref::<crate::db::Error>() {
+                Some(crate::db::Error::Postgres(error)) => assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO)),
+                _ => panic!("expected a PostgreSQL division-by-zero error"),
+            },
             _ => panic!("expected a PostgreSQL division-by-zero error"),
-        },
-        _ => panic!("expected a PostgreSQL division-by-zero error"),
+        }
     }
     assert!(!dispatched.load(Ordering::SeqCst));
     let after: String = db.query_one(snapshot_sql, &[&f.character, &id]).await.unwrap().get("snapshot");
     assert_eq!(before, after);
     let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone(); let fences = fences.clone();
-        Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], now).await })
-    }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("remap transaction"));
+        Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], ChangeKind::Remap, now).await })
+    }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); let owners: Vec<i64> = entries.iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(crate::services::effects::online::OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); entries }) }).await.unwrap_or_else(|_| panic!("remap transaction"));
     let (mut changed, mut brains) = (0, 0);
     let trained = crate::db::outbox::tests::events(&db, "SkillTrained", f.character).await.into_iter().filter(|event| matches!(event, GameEvent::SkillTrained { char_id, type_id: trained_type, level: 1 } if *char_id == f.character && *trained_type == type_id)).count();
     for effect in effects {
@@ -231,8 +256,8 @@ async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
                     let dest = super::super::formulas::sp_for_level(training::skill_type(&c.sde, skill.type_id).rank, 1);
                     let mut row = queue::QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: dest, start_time: None, end_time: None };
                     let mut slower = row.clone();
-                    let Ok(old_end) = training::schedule(&c.sde, &mut row, &old, start) else { continue };
-                    let Ok(new_end) = training::schedule(&c.sde, &mut slower, &new, start) else { continue };
+                    let Ok(Some(old_end)) = training::schedule(&c.sde, &mut row, &old, start) else { continue };
+                    let Ok(Some(new_end)) = training::schedule(&c.sde, &mut slower, &new, start) else { continue };
                     if old_end <= now || new_end <= old_end { continue; }
                     skill_dao::starting_skill(&db, f.character, skill.type_id, 0, 0).await.unwrap();
                     queue::insert(&db, f.character, &row).await.unwrap();
@@ -241,8 +266,8 @@ async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
                     let _market = crate::services::market::lock().await;
                     let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
                         let sde = c.sde.clone(); let fences = fences.clone();
-                        Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], now).await })
-                    }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("remap"));
+                        Box::pin(async move { apply_tx(tx, outbox, &sde, &fences, f.character, &[17, 17, 17, 21, 27], ChangeKind::Remap, now).await })
+                    }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); let owners: Vec<i64> = entries.iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(crate::services::effects::online::OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); entries }) }).await.unwrap_or_else(|_| panic!("remap"));
                     let saved = skill_dao::current(&db, f.character).await.unwrap();
                     assert_eq!(saved.iter().find(|s| s.type_id == skill.type_id).unwrap().skill_points, expected);
                     let active = queue::active(&db, f.character).await.unwrap().unwrap();
@@ -264,3 +289,5 @@ async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
     fixture::cleanup(&db, f).await.unwrap();
     if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }
+
+mod gm;

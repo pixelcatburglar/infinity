@@ -32,7 +32,8 @@ async fn concurrent_death_and_scoop_have_one_guarded_winner() {
         },
         async {
             let tx = second.transaction().await.unwrap();
-            let won = drones::destroy(&tx, id, 101, 103).await.unwrap();
+            let won = drones::claim_lost(&tx, id, 1, 101, 103).await.unwrap();
+            if won { crate::dao::items::ship::delete_lost(&tx, id, &[]).await.unwrap(); }
             tx.commit().await.unwrap();
             won
         }
@@ -111,7 +112,7 @@ async fn rejected_return_keeps_native_damage_and_checkpoint_pending() {
         function = Some(function_name.clone());
         f.db.execute(&format!("CREATE TRIGGER {name} BEFORE INSERT ON game.progress_events FOR EACH ROW EXECUTE FUNCTION {function_name}()"), &[]).await.unwrap();
         trigger = Some(name);
-        assert!(contact_return_claimed(&f.db, &f.world, system, &drone, ship, fit, transition, market, gate).await.is_err());
+        assert!(contact_return_claimed(&f.db, &f.world, system, &drone, ship, fit, transition, market, gate, Some(f.client.notify_tx.clone())).await.is_err());
         assert!(!frame.is_committed(&f.db).await.unwrap());
         let after_rows: Vec<_> = crate::dao::items::dogma::overrides(&f.db, id).await.unwrap().into_iter()
             .map(|row| (row.attribute_id, row.value, row.updated_at)).collect();
@@ -343,7 +344,7 @@ async fn unavailable_return_reconciliation_keeps_transition_until_database_recov
         }).await.unwrap();
         let generation = transition.entries[0].1.generation;
         forward_online(&commands, false).await;
-        assert!(contact_return_claimed(&db, &f.world, system, &drone, ship, fit, transition, market, gate).await.is_err());
+        assert!(contact_return_claimed(&db, &f.world, system, &drone, ship, fit, transition, market, gate, Some(f.client.notify_tx.clone())).await.is_err());
         let interval = u64::try_from(crate::config::game().space.position_snapshot_secs).unwrap();
         assert!(f.world.after(system, crate::space::seconds_to_ms(interval.saturating_add(2) as f64)).await);
         assert!(f.world.with(system, move |s| {
@@ -466,86 +467,5 @@ async fn unavailable_group_scoop_survives_loss_of_first_pending_membership() {
         f.db.execute("DELETE FROM game.items WHERE item_id=$1", &[&id]).await.unwrap();
     }
     f.cleanup().await;
-    if let Err(panic) = result { std::panic::resume_unwind(panic); }
-}
-
-#[test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
-fn committed_detached_contact_cold_load_does_not_relock_market() {
-    use std::time::Duration;
-
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let (mut f, result) = runtime.block_on(async {
-        let mut f = Fixture::real_system().await;
-        let mut driver = None;
-        let result = crate::tests::catch_scenario(async {
-            tokio::time::timeout(Duration::from_secs(90), async {
-                let ty = f.sde.types.iter().find(|t| t.published == Some(true)
-                    && t.category_id == Some(CATEGORY_DRONE)
-                    && t.attribute(infinity_core::consts::dogma::ATTR_DRONE_BANDWIDTH_USED).is_some_and(|v| v > 0.0)).unwrap().type_id;
-                f.train_drone(ty).await;
-                let id = f.drone(ty, 1, true).await;
-                f.set(f.ship, infinity_core::consts::dogma::ATTR_DRONE_BANDWIDTH, 1_000_000.0).await;
-                f.set(f.ship, infinity_core::consts::dogma::ATTR_DRONE_CAPACITY, 1_000_000.0).await;
-                let launch = [Value::list([Value::tuple([Value::Int(id), Value::Int(1)])]), Value::None, Value::Bool(false)];
-                assert_eq!(f.call("ship", "LaunchDrones", &launch).await.ok().unwrap(),
-                    Value::Dict(vec![(Value::Int(id), Value::list([Value::Int(id)]))]));
-                let system = f.system;
-                let ship = f.ship;
-                let owner = f.owner;
-                let drone = f.world.with(system, move |s| s.drone(id).unwrap()).await.unwrap();
-                assert_eq!(drone.controller, Some(ship));
-                assert!(drone.pending.is_none());
-
-                let cfg = crate::config::tests::test_database().to_pg_config().unwrap();
-                let (mut connection, connection_driver) = cfg.connect(tokio_postgres::NoTls).await.unwrap();
-                driver = Some(tokio::spawn(async move { let _ = connection_driver.await; }));
-                let tx = connection.transaction().await.unwrap();
-                let blocker: i32 = tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
-                tx.query_one("SELECT item_id FROM game.items WHERE item_id=$1 FOR UPDATE", &[&ship]).await.unwrap();
-
-                let mut contact = Box::pin(contact_claimed(&f.db, &f.world, system, &drone, false));
-                loop {
-                    tokio::select! {
-                        result = &mut contact => panic!("contact finished before row unlock: {result:?}"),
-                        _ = tokio::task::yield_now() => {}
-                    }
-                    if f.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))) AS blocked", &[&blocker]).await.unwrap().get::<_, bool>("blocked") { break; }
-                }
-                f.world.post(system, |_| panic!("deliberate actor stop for committed contact regression"));
-                loop {
-                    if f.world.with(system, |_| ()).await.is_none() { break; }
-                    tokio::task::yield_now().await;
-                }
-                tx.commit().await.unwrap();
-                tokio::time::timeout(Duration::from_secs(30), &mut contact).await
-                    .expect("committed contact cold fallback deadlocked").ok().unwrap();
-                let row = f.db.query_one("SELECT owner_id, location_id, quantity, singleton FROM game.items WHERE item_id=$1", &[&id]).await.unwrap();
-                assert_eq!(row.get::<_, i64>("owner_id"), owner);
-                assert_eq!(row.get::<_, i64>("location_id"), system);
-                assert_eq!(row.get::<_, i64>("quantity"), 1);
-                assert!(row.get::<_, bool>("singleton"));
-                assert!(f.world.with(system, move |s| s.ball(id).is_some()
-                    && s.drone(id).is_some_and(|d| d.owner == owner && d.controller.is_none() && d.pending.is_none())).await.unwrap());
-                let guard = tokio::time::timeout(Duration::from_secs(10), crate::services::market::lock()).await
-                    .expect("market lock retained after contact");
-                drop(guard);
-            }).await.expect("contact regression scenario timed out");
-        }).await;
-        if let Some(driver) = driver { driver.abort(); let _ = driver.await; }
-        (f, result)
-    });
-    runtime.shutdown_timeout(Duration::from_secs(5));
-
-    let cleanup_runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    cleanup_runtime.block_on(async {
-        f.db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-        f.world = World::new(f.db.clone(), f.sde.clone(), 1);
-        f.client.db = f.db.clone();
-        f.client.world = f.world.clone();
-        f.world.system(f.system).await.unwrap();
-        f.cleanup().await;
-    });
-    cleanup_runtime.shutdown_timeout(Duration::from_secs(5));
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

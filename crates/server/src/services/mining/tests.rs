@@ -1,7 +1,7 @@
 use super::*;
 use super::reprocessing_svc::add_output;
 use crate::services::drones::tests::fixture::Fixture;
-use infinity_core::consts::{dogma::{ATTR_CAPACITY, ATTR_GENERAL_MINING_HOLD_CAPACITY}, FLAG_GENERAL_MINING_HOLD};
+use infinity_core::consts::{dogma::{ATTR_CAPACITY, ATTR_GENERAL_MINING_HOLD_CAPACITY, ATTR_MAX_RANGE}, FLAG_GENERAL_MINING_HOLD};
 use infinity_core::consts::CATEGORY_ASTEROID;
 use crate::dao::asteroids::NewAsteroid;
 use crate::space::asteroids::generation::field_types;
@@ -71,14 +71,20 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
                 .filter(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP))
                 .find_map(|hull| {
                     let fit = Fit::for_space_type(sde.clone(), hull.type_id, Vec::new());
-                    let (actual_flag, capacity) = destination(&fit, ore.type_id);
-                    let count = (capacity / volume).floor();
+                    // A type-only fit has no real hull identity, so the flag and
+                    // limit are read directly rather than through the snapshot.
+                    let actual_flag = crate::services::inventory::holds::mining_flag(&sde, &fit, ore.type_id);
+                    let value = match crate::services::inventory::holds::effective_capacity(&fit, actual_flag) {
+                        crate::services::inventory::holds::CapacityLimit::Finite(value) => value,
+                        crate::services::inventory::holds::CapacityLimit::Unlimited => return None,
+                    };
+                    let count = (value / volume).floor();
                     if actual_flag != flag || !count.is_finite() || count < 1.0 || count >= i32::MAX as f64 - 2.0 {
                         return None;
                     }
-                    let full_room = ((capacity - count * volume) / volume).floor();
-                    let one_room = ((capacity - (count - 1.0) * volume) / volume).floor();
-                    (full_room < 1.0 && one_room == 1.0).then_some(fit)
+                    let full_room = ((value - count * volume) / volume).floor();
+                    let one_room = ((value - (count - 1.0) * volume) / volume).floor();
+                    (full_room < 1.0 && one_room == 1.0).then_some((hull.type_id, value))
                 });
             Some((ore, volume, [find_fit(FLAG_CARGO)?, find_fit(FLAG_GENERAL_MINING_HOLD)?]))
         })
@@ -89,35 +95,46 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
     let baseline = crate::dao::mining_ledger::list(&tx, owner, i64::MIN, i64::MAX).await.unwrap().len();
     let mut delivered_count = 0;
     let mut cargo_ship = 0;
-    for (mining_hold, fit) in [false, true].into_iter().zip(fits) {
-        let (_, capacity) = destination(&fit, ore.type_id);
+    for (mining_hold, (ship_type, _)) in [false, true].into_iter().zip(fits) {
         let flag = if mining_hold { FLAG_GENERAL_MINING_HOLD } else { FLAG_CARGO };
-        let ship: i64 = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,0,1,true) RETURNING item_id", &[&fit.source_type(Key::Ship).unwrap(), &owner, &103_i64]).await.unwrap().get("item_id");
-        if !mining_hold { cargo_ship = ship; }
+        let ship: i64 = tx.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,0,1,true) RETURNING item_id", &[&ship_type, &owner, &103_i64]).await.unwrap().get("item_id");
+        // The snapshot comes from the real inserted hull's fit; the type-only
+        // template fit only supplied its ship type and effective limit.
+        let real_fit = Fit::load_unpiloted(&tx, sde.clone(), ship).await.unwrap();
+        let snapshot = destination(&real_fit, ore.type_id).unwrap();
+        assert_eq!(snapshot.flag(), flag);
+        let capacity = match crate::services::inventory::holds::effective_capacity(&real_fit, flag) {
+            crate::services::inventory::holds::CapacityLimit::Finite(value) => value,
+            crate::services::inventory::holds::CapacityLimit::Unlimited => unreachable!(),
+        };
         let quantity = (capacity / volume).floor() as i64;
         let item = crate::dao::items::transfers::insert(&tx, ore.type_id, owner, ship, flag, quantity).await.unwrap();
         let mut outbox = crate::db::outbox::Outbox::default();
-        assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, ship, 103, 107, &pending, destination(&fit, ore.type_id)).await.ok().unwrap(), DeliveryOutcome::Full { flag: f } if f == flag));
+        assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, 103, 107, &pending, snapshot).await.ok().unwrap(), DeliveryOutcome::Full { flag: f } if f == flag));
         assert!(outbox.into_entries().is_empty());
         assert_eq!(crate::dao::mining_ledger::list(&tx, owner, i64::MIN, i64::MAX).await.unwrap().len(), baseline + delivered_count);
         assert_eq!(crate::dao::asteroids::lock(&tx, 103, rock, ore.type_id).await.unwrap(), Some(5));
-        assert!(deliver(&tx, &mut crate::db::outbox::Outbox::default(), &sde, owner, ship, 103, 107, &pending, (infinity_core::consts::FLAG_DRONE_BAY, capacity)).await.is_err());
+        let drone_bay = crate::services::inventory::hold_storage::HoldCapacity::capture(&real_fit, infinity_core::consts::FLAG_DRONE_BAY).unwrap();
+        assert!(deliver(&tx, &mut crate::db::outbox::Outbox::default(), &sde, owner, 103, 107, &pending, drone_bay).await.is_err());
         assert_eq!(crate::dao::asteroids::lock(&tx, 103, rock, ore.type_id).await.unwrap(), Some(5));
         tx.execute("UPDATE game.items SET quantity = quantity - 1 WHERE item_id = $1", &[&item]).await.unwrap();
         let mut outbox = crate::db::outbox::Outbox::default();
-        assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, ship, 103, 107, &pending, destination(&fit, ore.type_id)).await.ok().unwrap(), DeliveryOutcome::Delivered(d) if !d.repeat()));
+        assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, 103, 107, &pending, snapshot).await.ok().unwrap(), DeliveryOutcome::Delivered(d) if !d.repeat()));
         assert_eq!(outbox.into_entries().len(), 2);
         delivered_count += 1;
         let logs = crate::dao::mining_ledger::list(&tx, owner, i64::MIN, i64::MAX).await.unwrap();
         assert_eq!(logs.len(), baseline + delivered_count);
         assert_eq!((logs[0].type_id, logs[0].solar_system_id, logs[0].quantity, logs[0].quantity_wasted), (ore.type_id, 103, 1, 0));
         tx.execute("UPDATE game.asteroids SET quantity = 5 WHERE asteroid_id = $1", &[&rock]).await.unwrap();
+        if !mining_hold { cargo_ship = ship; }
     }
     tx.execute("UPDATE game.items SET quantity = $1 WHERE location_id = $2 AND type_id = $3 AND flag_id = $4", &[&(i64::MAX - 3), &cargo_ship, &ore.type_id, &FLAG_CARGO]).await.unwrap();
     tx.execute("UPDATE game.asteroids SET quantity = 10 WHERE asteroid_id = $1", &[&rock]).await.unwrap();
     pending.inputs.volume = volume * 10.0;
+    assert!(crate::dao::items::dogma::set_override(&tx, cargo_ship, ATTR_CAPACITY, volume * (i64::MAX as f64 + 4096.0)).await.unwrap());
+    let cargo_snapshot = destination(&Fit::load_unpiloted(&tx, sde.clone(), cargo_ship).await.unwrap(), ore.type_id).unwrap();
     let mut split_notices = crate::db::outbox::Outbox::default();
-    assert!(matches!(deliver(&tx, &mut split_notices, &sde, owner, cargo_ship, 103, 107, &pending, (FLAG_CARGO, volume * (i64::MAX as f64 + 4096.0))).await.unwrap(), DeliveryOutcome::Delivered(_)));
+    assert!(matches!(deliver(&tx, &mut split_notices, &sde, owner, 103, 107, &pending, cargo_snapshot).await.unwrap(), DeliveryOutcome::Delivered(_)));
     let stacks = crate::services::items::load_items(&tx, &sde, crate::dao::items::loading::ItemQuery::LocationFlagTypeOwnerStack(cargo_ship, FLAG_CARGO, ore.type_id, owner)).await.unwrap();
     assert_eq!(stacks.len(), 2);
     assert_eq!(stacks.iter().map(|item| i128::from(item.quantity)).sum::<i128>(), i128::from(i64::MAX) + 7);
@@ -127,16 +144,16 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
     for stack in &stacks {
         tx.execute("DELETE FROM game.items WHERE item_id = $1", &[&stack.item_id]).await.unwrap();
     }
+    crate::dao::items::dogma::clear_override(&tx, cargo_ship, ATTR_CAPACITY).await.unwrap();
+    let cargo_snapshot = destination(&Fit::load_unpiloted(&tx, sde.clone(), cargo_ship).await.unwrap(), ore.type_id).unwrap();
     tx.execute("UPDATE game.asteroids SET quantity = 5 WHERE asteroid_id = $1", &[&rock]).await.unwrap();
-    let hull = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)).unwrap();
-    let fit = Fit::for_space_type(sde.clone(), hull.type_id, Vec::new());
     let mut outbox = crate::db::outbox::Outbox::default();
     pending.inputs.volume = 0.0;
-    assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, cargo_ship, 103, 107, &pending, destination(&fit, ore.type_id)).await.ok().unwrap(), DeliveryOutcome::NoYield));
+    assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, 103, 107, &pending, cargo_snapshot).await.ok().unwrap(), DeliveryOutcome::NoYield));
     tx.execute("UPDATE game.asteroids SET quantity = 0 WHERE asteroid_id = $1", &[&rock]).await.unwrap();
-    assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, cargo_ship, 103, 107, &pending, destination(&fit, ore.type_id)).await.ok().unwrap(), DeliveryOutcome::Depleted { rock: r } if r == rock));
+    assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, 103, 107, &pending, cargo_snapshot).await.ok().unwrap(), DeliveryOutcome::Depleted { rock: r } if r == rock));
     pending.rock = rock + 1_000_000_000;
-    assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, cargo_ship, 103, 107, &pending, destination(&fit, ore.type_id)).await.ok().unwrap(), DeliveryOutcome::Missing));
+    assert!(matches!(deliver(&tx, &mut outbox, &sde, owner, 103, 107, &pending, cargo_snapshot).await.ok().unwrap(), DeliveryOutcome::Missing));
     assert_eq!(crate::dao::mining_ledger::list(&tx, owner, i64::MIN, i64::MAX).await.unwrap().len(), baseline + delivered_count);
     assert!(outbox.into_entries().is_empty());
     tx.rollback().await.unwrap();
@@ -162,7 +179,6 @@ async fn zero_row_retry_reconciles_suppressed_delivery_callback() {
     let ore = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ASTEROID) && t.volume.is_some_and(|v| v >= 0.01)).unwrap();
     let hull = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
         && t.attribute(ATTR_GENERAL_MINING_HOLD_CAPACITY).unwrap_or(0.0).max(t.attribute(ATTR_CAPACITY).unwrap_or(0.0)) >= ore.volume.unwrap()).unwrap();
-    let fit = Fit::for_space_type(sde.clone(), hull.type_id, Vec::new());
     let system = -crate::client::filetime_now();
     let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,0,1,true) RETURNING item_id", &[&hull.type_id, &owner, &system]).await.unwrap().get("item_id");
     let rock = crate::dao::asteroids::insert_batch(&db, system, &[NewAsteroid { field: system, type_id: ore.type_id, quantity: 1, radius: 1.0, pos: [0.0; 3] }]).await.unwrap()[0].id;
@@ -177,10 +193,11 @@ async fn zero_row_retry_reconciles_suppressed_delivery_callback() {
         let _market = super::super::market::lock().await;
         let pending = fixed_intent(rock, ore_type, volume, 1.0);
         let mut outbox = crate::db::outbox::Outbox::default();
-        assert!(matches!(deliver(&db, &mut outbox, &sde, owner, ship, system, 107, &pending, destination(&fit, ore_type)).await.unwrap(), DeliveryOutcome::Delivered(_)));
+        let snapshot = destination(&Fit::load_unpiloted(&db, sde.clone(), ship).await.unwrap(), ore_type).unwrap();
+        assert!(matches!(deliver(&db, &mut outbox, &sde, owner, system, 107, &pending, snapshot).await.unwrap(), DeliveryOutcome::Delivered(_)));
         assert_eq!(world.with(system, move |s| s.rock_type(rock)).await.flatten(), Some(ore_type));
         let mut retry_outbox = crate::db::outbox::Outbox::default();
-        assert!(matches!(deliver(&db, &mut retry_outbox, &sde, owner, ship, system, 107, &pending, destination(&fit, ore_type)).await.unwrap(), DeliveryOutcome::Depleted { rock: r } if r == rock));
+        assert!(matches!(deliver(&db, &mut retry_outbox, &sde, owner, system, 107, &pending, snapshot).await.unwrap(), DeliveryOutcome::Depleted { rock: r } if r == rock));
         reconcile_depleted(&db, &world, system, rock).await.unwrap();
         assert!(world.with(system, move |s| s.rock_type(rock)).await.flatten().is_none());
         assert!(crate::dao::asteroids::lock(&db, system, rock, ore_type).await.unwrap().is_none());
@@ -248,7 +265,7 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
         && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)
         && t.attribute(ATTR_GENERAL_MINING_HOLD_CAPACITY).is_some_and(|v| v.is_finite() && v > 0.0)
         && crate::services::inventory::holds::effective_capacity(
-            &Fit::for_space_type(f.sde.clone(), t.type_id, Vec::new()), infinity_core::consts::FLAG_SPECIAL_ASTEROID_HOLD) == 0.0)
+            &Fit::for_space_type(f.sde.clone(), t.type_id, Vec::new()), infinity_core::consts::FLAG_SPECIAL_ASTEROID_HOLD) == crate::services::inventory::holds::CapacityLimit::Finite(0.0))
         .expect("published ship with a general mining hold").type_id;
     f.db.execute("UPDATE game.items SET type_id = $2 WHERE item_id = $1", &[&f.ship, &ship_type]).await.unwrap();
     let mut ball = f.world.remove_ball(f.system, f.ship).await.expect("fixture ship ball");
@@ -281,14 +298,19 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     let baseline = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap();
     let (notify, mut notices) = tokio::sync::mpsc::unbounded_channel();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
-    assert_eq!(destination(&fit, ore_type).0, FLAG_CARGO, "zero mining-hold override must route to cargo: {:?}", destination(&fit, ore_type));
-    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
+    assert_eq!(destination(&fit, ore_type).unwrap().flag(), FLAG_CARGO, "zero mining-hold override must route to cargo");
+    let inputs = || crate::services::effects::parameters::MiningInputs {
+        range: fit.value(Key::Module(module), ATTR_MAX_RANGE),
+        values: yield_values(&fit, Key::Module(module)),
+        destination: destination(&fit, ore_type).map(|capacity| Some((capacity.flag(), capacity))),
+    };
+    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, inputs(), module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
     assert!(!result.repeat && result.outcome == Some(crate::lua::events::ModuleCycleOutcome::CargoFull));
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::CARGO_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(10));
     assert_eq!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap(), baseline);
     f.db.execute("UPDATE game.items SET quantity = 2 WHERE item_id = $1", &[&item]).await.unwrap();
-    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
+    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, inputs(), module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
     assert!(!result.repeat && result.outcome == Some(crate::lua::events::ModuleCycleOutcome::Completed));
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::CARGO_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
@@ -297,13 +319,22 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     assert_eq!((logs[0].type_id, logs[0].solar_system_id, logs[0].quantity, logs[0].quantity_wasted), (ore_type, f.system, 1, 0));
     f.set(f.ship, ATTR_GENERAL_MINING_HOLD_CAPACITY, volume).await;
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
-    let (flag, capacity) = destination(&fit, ore_type);
-    assert_eq!(flag, FLAG_GENERAL_MINING_HOLD, "positive mining-hold override destination: {:?}", (flag, capacity));
+    let inputs = || crate::services::effects::parameters::MiningInputs {
+        range: fit.value(Key::Module(module), ATTR_MAX_RANGE),
+        values: yield_values(&fit, Key::Module(module)),
+        destination: destination(&fit, ore_type).map(|capacity| Some((capacity.flag(), capacity))),
+    };
+    let snapshot = destination(&fit, ore_type).unwrap();
+    assert_eq!(snapshot.flag(), FLAG_GENERAL_MINING_HOLD, "positive mining-hold override destination: {:?}", snapshot);
+    let capacity = match crate::services::inventory::holds::effective_capacity(&fit, snapshot.flag()) {
+        crate::services::inventory::holds::CapacityLimit::Finite(value) => value,
+        crate::services::inventory::holds::CapacityLimit::Unlimited => panic!("fixture hold must be finite"),
+    };
     let unit_volume = crate::services::item_volume::item_volume(&f.sde, ore_type, false, 1, None).ok().unwrap();
     let full_quantity = (capacity / unit_volume).ceil();
     assert!(full_quantity.is_finite() && full_quantity >= 1.0 && full_quantity < i32::MAX as f64);
     let mining_stack = crate::dao::items::transfers::insert(&f.db, ore_type, f.owner, f.ship, FLAG_GENERAL_MINING_HOLD, full_quantity as i64).await.unwrap();
-    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
+    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, inputs(), module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
     assert!(!result.repeat && result.outcome == Some(crate::lua::events::ModuleCycleOutcome::CargoFull));
     let notice = format!("{:?}", notices.try_recv().unwrap());
     assert!(notice.contains(messages::MINING_HOLD_FULL), "unexpected notice: {notice}");
@@ -312,7 +343,12 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     f.set(f.ship, ATTR_GENERAL_MINING_HOLD_CAPACITY, volume * (i32::MAX as f64 + 2.0)).await;
     f.db.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&mining_stack, &i64::from(i32::MAX)]).await.unwrap();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
-    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
+    let inputs = || crate::services::effects::parameters::MiningInputs {
+        range: fit.value(Key::Module(module), ATTR_MAX_RANGE),
+        values: yield_values(&fit, Key::Module(module)),
+        destination: destination(&fit, ore_type).map(|capacity| Some((capacity.flag(), capacity))),
+    };
+    let result = extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, inputs(), module, module_type, infinity_core::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap();
     assert!(result.repeat && result.outcome == Some(crate::lua::events::ModuleCycleOutcome::Completed));
     assert!(notices.try_recv().is_err());
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(7));
@@ -360,7 +396,10 @@ async fn delivery_rollback_restores_all_resource_types_and_suppresses_dispatch()
                 let sde = sde.clone();
                 let pending = pending.clone();
                 Box::pin(async move {
-                    assert!(matches!(deliver(tx, outbox, &sde, owner, ship, system, 1, &pending, (FLAG_CARGO, volume * 10.0)).await?, DeliveryOutcome::Delivered(_)));
+                    crate::dao::items::dogma::set_override(tx, ship, ATTR_CAPACITY, volume * 10.0).await.map_err(crate::services::db_err)?;
+                    let snapshot = crate::services::inventory::hold_storage::HoldCapacity::capture(
+                        &Fit::load_unpiloted(tx, sde.clone(), ship).await?, FLAG_CARGO)?;
+                    assert!(matches!(deliver(tx, outbox, &sde, owner, system, 1, &pending, snapshot).await?, DeliveryOutcome::Delivered(_)));
                     let logs = crate::dao::mining_ledger::list(tx, owner, i64::MIN, i64::MAX).await?;
                     assert_eq!((logs[0].type_id, logs[0].quantity, logs[0].quantity_wasted), (type_id, 3, 2));
                     Err(CallError::Internal(anyhow::anyhow!("injected rollback")))
@@ -369,7 +408,7 @@ async fn delivery_rollback_restores_all_resource_types_and_suppresses_dispatch()
                 dispatched.store(true, Ordering::SeqCst);
                 Ok(())
             }).await;
-            anyhow::ensure!(result.is_err(), "delivery transaction unexpectedly committed");
+            anyhow::ensure!(matches!(result, Err(CallError::Internal(error)) if error.to_string() == "injected rollback"), "delivery did not reach injected rollback");
             anyhow::ensure!(!dispatched.load(Ordering::SeqCst), "rolled-back outbox was dispatched");
             anyhow::ensure!(crate::dao::asteroids::lock(&f.db, system, rock, type_id).await? == Some(5), "asteroid changed after rollback");
             anyhow::ensure!(crate::dao::mining_ledger::list(&f.db, owner, i64::MIN, i64::MAX).await? == before, "ledger changed after rollback");

@@ -14,9 +14,11 @@ enum Route {
     Corruption,
     Suppression,
     CharacterNamesByUser,
-    PlexBalance,
+    Plex,
     PersonalSkillPlan,
     PersonalMilestone,
+    CorporationSkillPlan,
+    CorporationMilestone,
     ShipCosmetics,
 }
 
@@ -29,7 +31,10 @@ const CLAIMS: &[(&str, Route)] = &[
     ("eve_public.pirate.corruption.api.GetStageThresholdsRequest", Route::Corruption),
     ("eve_public.pirate.suppression.api.GetStageThresholdsRequest", Route::Suppression),
     ("eve_public.character.GetNamesByUserRequest", Route::CharacterNamesByUser),
-    ("eve_public.plex.vault.api.BalanceRequest", Route::PlexBalance),
+    ("eve_public.plex.vault.api.BalanceRequest", Route::Plex),
+    ("eve_public.plex.vault.transaction.api.GetAllLoggedForUserRequest", Route::Plex),
+    ("eve_public.plex.vault.transaction.api.GetLogRequest", Route::Plex),
+    ("eve_public.plex.vault.transaction.api.GetStatisticsRequest", Route::Plex),
     ("eve_public.cosmetic.ship.api.GetRequest", Route::ShipCosmetics),
     ("eve_public.cosmetic.ship.api.GetAllInBubbleRequest", Route::ShipCosmetics),
     ("eve_public.character.skill.plan.CreateRequest", Route::PersonalSkillPlan),
@@ -46,6 +51,19 @@ const CLAIMS: &[(&str, Route)] = &[
     ("eve_public.character.skill.plan.milestone.CreateRequest", Route::PersonalMilestone),
     ("eve_public.character.skill.plan.milestone.DeleteRequest", Route::PersonalMilestone),
     ("eve_public.character.skill.plan.milestone.SetDescriptionRequest", Route::PersonalMilestone),
+    ("eve_public.corporation.skill.plan.GetAllRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.GetRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.GetSharedRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.CreateRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.DeleteRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.SetNameRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.SetDescriptionRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.SetSkillRequirementsRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.SetCategoryRequest", Route::CorporationSkillPlan),
+    ("eve_public.corporation.skill.plan.milestone.GetAllRequest", Route::CorporationMilestone),
+    ("eve_public.corporation.skill.plan.milestone.CreateRequest", Route::CorporationMilestone),
+    ("eve_public.corporation.skill.plan.milestone.DeleteRequest", Route::CorporationMilestone),
+    ("eve_public.corporation.skill.plan.milestone.SetDescriptionRequest", Route::CorporationMilestone),
 ];
 
 pub(crate) fn is_implemented(name: &str) -> bool {
@@ -58,6 +76,7 @@ pub(super) fn validate() -> anyhow::Result<()> {
         let response = response_name(name).expect("claimed request name");
         anyhow::ensure!(message(&response).is_some(), "missing response descriptor {response}");
     }
+    plex::validate()?;
     ship_cosmetics::validate()?;
     crate::services::daily_goals::wire::validate()?;
     Ok(())
@@ -76,12 +95,14 @@ pub(super) async fn handle(ctx: &HandlerContext<'_>, name: &str, req: &DynamicMe
         Route::Corruption => insurgency::corruption::handle(name).map_err(GatewayError::Internal),
         Route::Suppression => insurgency::suppression::handle(name).map_err(GatewayError::Internal),
         Route::CharacterNamesByUser => characters::names_by_user(ctx).await,
-        Route::PlexBalance => plex::plex_balance(ctx).await,
+        Route::Plex => plex::handle(ctx, name, req).await,
         Route::PersonalSkillPlan => skill_plans::personal::skill_plan(ctx, name, req).await,
         Route::PersonalMilestone => skill_plans::personal_milestones::handle(ctx, name, req).await,
+        Route::CorporationSkillPlan => skill_plans::corporation::handle(ctx, name, req).await,
+        Route::CorporationMilestone => skill_plans::corporation_milestones::handle(ctx, name, req).await,
         Route::ShipCosmetics => ship_cosmetics::handle(ctx, name, req).await,
     };
     Dispatch::Claimed(result)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

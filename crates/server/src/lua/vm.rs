@@ -58,7 +58,7 @@ pub fn budgeted_invocation(lua: &Lua, handler: Function, config: &LuaConfig, dea
     let interval = u64::from(config.instruction_hook_interval).min(maximum);
     let setup = lua.create_function(move |_, thread: Thread| {
         install_budget(&thread, maximum, interval, deadline)?;
-        *installed.lock().map_err(|e| mlua::Error::runtime(e.to_string()))? = Some(thread);
+        *crate::poison::lock_or_exit(installed.lock()) = Some(thread);
         Ok(())
     })?;
     // mlua's current_thread() maps implicit call_async coroutines to their owner.
@@ -183,7 +183,7 @@ pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>
     let rpc_open = open.clone();
     register.set("rpc", lua.create_function(move |_, (service, method, function): (String, String, Function)| {
         if !rpc_open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
-        let mut claims = rpc_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let mut claims = crate::poison::lock_or_exit(rpc_claims.lock());
         let key = (service, method);
         if let Some(previous) = claims.rpc.get(&key) { return Err(mlua::Error::runtime(format!("duplicate RPC {}::{} in {} and {}", key.0, key.1, previous.script, rpc_script))); }
         claims.rpc.insert(key, Handler { script: rpc_script.clone(), function });
@@ -196,7 +196,7 @@ pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>
         if !gateway_open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
         super::content::protocol::gateway::descriptors(&name).map_err(mlua::Error::external)?;
         if crate::gateway::handlers::is_implemented(&name) { return Err(mlua::Error::runtime("gateway request already implemented in Rust")); }
-        let mut claims = gateway_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let mut claims = crate::poison::lock_or_exit(gateway_claims.lock());
         if claims.gateway.contains_key(&name) { return Err(mlua::Error::runtime(format!("duplicate gateway request {name}"))); }
         claims.gateway.insert(name, Handler { script: gateway_script.clone(), function });
         Ok(())
@@ -209,7 +209,7 @@ pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>
         if service.is_empty() || method.is_empty() || service.contains('*') || method.contains('*') {
             return Err(mlua::Error::runtime("intercept requires an exact service and method"));
         }
-        let mut claims = intercept_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let mut claims = crate::poison::lock_or_exit(intercept_claims.lock());
         let key = (service, method);
         if let Some(previous) = claims.intercepts.get(&key) { return Err(mlua::Error::runtime(format!("duplicate intercept {}::{} in {} and {}", key.0, key.1, previous.script, intercept_script))); }
         claims.intercepts.insert(key, Handler { script: intercept_script.clone(), function });
@@ -223,7 +223,7 @@ pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>
         let name: String = spec.get("name")?;
         if name.is_empty() || !name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') || name == "lua" { return Err(mlua::Error::runtime("invalid or reserved command name")); }
         let command = Command { handler: Handler { script: cmd_script.clone(), function: spec.get("fn")? }, help: spec.get("help")?, gm: spec.get("gm")? };
-        let mut claims = cmd_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let mut claims = crate::poison::lock_or_exit(cmd_claims.lock());
         if let Some(previous) = claims.commands.get(&name) { return Err(mlua::Error::runtime(format!("duplicate command {name} in {} and {cmd_script}", previous.handler.script))); }
         claims.commands.insert(name, command);
         Ok(())
@@ -247,7 +247,7 @@ pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>
             return Err(mlua::Error::runtime("tick interval exceeds timer range"));
         }
         let function: Function = spec.get("fn")?;
-        let mut claims = tick_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let mut claims = crate::poison::lock_or_exit(tick_claims.lock());
         if claims.ticks.iter().any(|tick| tick.handler.script == tick_script && tick.name == name) {
             return Err(mlua::Error::runtime(format!("duplicate tick {name} in {tick_script}")));
         }
@@ -257,7 +257,7 @@ pub(super) fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>
     register.set("event", lua.create_function(move |_, (name, function): (String, Function)| {
         if !open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
         if !super::events::known_kind(&name) { return Err(mlua::Error::runtime(format!("unsupported event {name}"))); }
-        claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?.events.entry(name).or_default().push(Handler { script: script.clone(), function });
+        crate::poison::lock_or_exit(claims.lock()).events.entry(name).or_default().push(Handler { script: script.clone(), function });
         Ok(())
     })?)?;
     env.set("register", register)
@@ -285,7 +285,8 @@ fn discover(config: &LuaConfig) -> Result<Vec<(std::path::PathBuf, std::path::Pa
     Ok(scripts)
 }
 
-pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry> {
+pub fn build(config: &LuaConfig, resources: &host::Resources, catalogue: &super::catalogue::Catalogue) -> Result<Registry> {
+    let canonical = catalogue.canonical()?;
     let bundle = config.content_data_dir.as_ref().map(|root| {
         super::content::bundle::Bundle::load(Path::new(root), config.data_file_limit_bytes).map(Arc::new)
     }).transpose()?;
@@ -301,13 +302,13 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
         host::register(&lua, &env, &script, &settings, resources)?;
         let open = Arc::new(AtomicBool::new(true));
         super::content::install_data(&lua, &env, bundle.clone(), open.clone())?;
-        let bytes = if script == "sovereignty_content" || script == "ship_adaption_mgr" {
+        let bytes = if matches!(script.as_str(), "sovereignty_content" | "ship_adaption_mgr" | "sovereignty_indices") {
             super::content::bytes(&root, &format!("{script}.lua"), config.data_file_limit_bytes)?
         } else {
             std::fs::read(&path)?
         };
         register_claims(&lua, &env, claims.clone(), script.clone(), open.clone())?;
-        super::content::register(&lua, &env.get("register")?, definitions.clone(), open.clone(), &root, &script, if script == "sovereignty_content" || script == "ship_adaption_mgr" { bytes.clone() } else { Vec::new() }, config, bundle.clone(), resources.sde.clone())?;
+        super::content::register(&lua, &env.get("register")?, definitions.clone(), open.clone(), &root, &script, if matches!(script.as_str(), "sovereignty_content" | "ship_adaption_mgr" | "sovereignty_indices") { bytes.clone() } else { Vec::new() }, config, bundle.clone(), resources.sde.clone(), canonical.clone())?;
         let result = (|| -> Result<()> {
             let bytes = &bytes;
             let function = lua.load(bytes.as_slice()).set_name(path.to_string_lossy()).set_mode(ChunkMode::Text).set_environment(env.clone()).into_function()?;
@@ -319,10 +320,10 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
         open.store(false, Ordering::Release);
         result.with_context(|| format!("loading script {script}"))?;
         env.set("register", mlua::Value::Nil)?;
-        claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?.script_roots.insert(script.clone(), root);
-        claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?.scripts.push(script);
+        crate::poison::lock_or_exit(claims.lock()).script_roots.insert(script.clone(), root);
+        crate::poison::lock_or_exit(claims.lock()).scripts.push(script);
     }
-    let claims = std::mem::take(&mut *claims.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?);
+    let claims = std::mem::take(&mut *crate::poison::lock_or_exit(claims.lock()));
     if !claims.rpc.is_empty() { tracing::info!("Lua RPC claims take precedence over Rust handlers"); }
     for ((service, method), handler) in &claims.rpc {
         tracing::info!(script = %handler.script, service, method, "Lua RPC claim");
@@ -339,12 +340,16 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
     for tick in &claims.ticks {
         tracing::info!(script = %tick.handler.script, name = %tick.name, interval_ms = tick.interval.as_millis(), "Lua tick claim");
     }
-    let content = std::mem::take(&mut *definitions.lock().map_err(|e| anyhow::anyhow!(e.to_string()))?);
-    if bundle.is_some() && !content.packages.contains_key("ship_adaption") {
-        anyhow::bail!("configured adaptation bundle has no registered consumer");
+    let content = std::mem::take(&mut *crate::poison::lock_or_exit(definitions.lock()));
+    if let Some(bundle) = &bundle {
+        for (namespace, error) in bundle.required_consumers() {
+            if !content.packages.contains_key(namespace) {
+                anyhow::bail!("{error}");
+            }
+        }
     }
     Ok(Registry { lua, claims, content, overrides: Mutex::new(Default::default()) })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

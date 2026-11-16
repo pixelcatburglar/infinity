@@ -40,7 +40,7 @@ async fn created_module_reloads_into_fit_and_consumes_last_mutator() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let world = crate::space::World::new(reopened.clone(), f.sde.clone(), 1);
-        let mut client = crate::client::Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), reopened.clone(), f.sde.clone(),
+        let mut client = crate::client::Client::new(infinity_wire::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), reopened.clone(), f.sde.clone(),
             crate::chat::Hub::new("localhost", reopened.clone(), world.clone()), world, crate::handshake::Login { user_id: f.account, user_name: "dynamic-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         client.session.apply(vec![("charid", Value::Int(f.owner)), ("shipid", Value::Int(f.ship))]);
         let args = [Value::Int(result)];

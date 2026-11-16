@@ -1,7 +1,7 @@
 //! Native old-style orbit steering (Ballpark.cpp 1246-1328), consumed by
 //! the client through remote/michelle.py. State and target snapshots are transient,
 //! not database-backed. New-style orbit and dynamical orientation are unsupported.
-use super::{add, len, norm, scale, sub, Ball, TargetState, V3, AU, DESTINY_FRICTION, MODE_ORBIT};
+use super::{add, cross, len, norm, scale, sub, Ball, TargetState, V3, AU, DESTINY_FRICTION, MODE_ORBIT};
 
 /// Precession from carbon engine Ballpark.cpp EvolveOldStyleOrbit/ORBITAL_PRECESSION.
 const PRECESSION: f64 = 0.001;
@@ -11,10 +11,6 @@ const PLANE_PRECISION: f64 = 10_000_000.0;
 const RADIAL_FALLOFF: f64 = 40_000.0;
 /// The 10 AU goto projection factor from EvolveOldStyleOrbit.
 const GOTO_REACH_AU: f64 = 10.0;
-
-fn cross(a: V3, b: V3) -> V3 {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
 
 impl Ball {
     /// Begin orbiting a visible distinct target at a finite range.
@@ -62,4 +58,4 @@ impl Ball {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

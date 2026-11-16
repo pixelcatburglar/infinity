@@ -17,5 +17,5 @@ pub(crate) async fn ensure(ex: &(impl Executor + ?Sized), owner_id: i64, key: i3
     ).await?))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

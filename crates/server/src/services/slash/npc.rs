@@ -71,7 +71,7 @@ async fn spawn(c: &mut Client, command: &str, args: &[String]) -> Result<String,
         let pos = [0, 1, 2].map(|i| center[i] + direction[i] * distance);
         let data = c.sde.types.get(id).expect("resolved NPC type");
         let npc = super::super::combat::npc::spawn(&c.db, &c.world, system, data, corp, pos, tick, Some(crate::space::HOSTILE_TO_ALL)).await?;
-        spawned().lock().unwrap().insert(npc);
+        crate::poison::lock_or_exit(spawned().lock()).insert(npc);
     }
     Ok(messages::gm::gm_npc_spawned(count))
 }
@@ -82,14 +82,14 @@ async fn clear(c: &mut Client, args: &[String]) -> Result<String, CallError> {
         Some(distance(args.first(), crate::config::game().gm.clear_radius_m).ok_or_else(|| slash_error(messages::gm::GM_NPC_CLEAR_USAGE.into()))?)
     };
     let (system, center) = position(c).await?;
-    let ids: Vec<_> = spawned().lock().unwrap().iter().copied().collect();
+    let ids: Vec<_> = crate::poison::lock_or_exit(spawned().lock()).iter().copied().collect();
     let mut removed = 0;
     for id in ids {
         let pos = c.world.with(system, move |s| s.sample_position(id)).await.flatten();
         if pos.is_some_and(|pos| radius.is_none_or(|r| dist(center, pos) <= r)) {
             if c.world.remove_ball(system, id).await.is_some() {
                 super::super::combat::forget_gm_spawn(&c.world, id);
-                spawned().lock().unwrap().remove(&id);
+                crate::poison::lock_or_exit(spawned().lock()).remove(&id);
                 removed += 1;
             }
         }
@@ -115,8 +115,8 @@ async fn debris(c: &mut Client, command: &str, args: &[String]) -> Result<String
     let pos = [center[0] + distance, center[1], center[2]];
     let owner = c.session.int("charid").ok_or_else(usage)?;
     let corp = c.session.int("corpid").unwrap_or(0);
-    let id = super::super::combat::groups_health::spawn_wreck(&c.db, &c.world, system, type_id, owner, corp, pos, None).await?;
+    let id = super::super::combat::groups_health::spawn_wreck(&c.db, &c.world, system, type_id, owner, corp, pos, None, None).await?;
     Ok(messages::gm::gm_debris_spawned(id))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-slash"))] mod tests;

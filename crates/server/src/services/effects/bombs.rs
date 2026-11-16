@@ -1,13 +1,15 @@
 //! Bomb charges fly straight before applying area damage at their sampled position.
 //! Mirrors tactical.py's charge explosionDelay, maxVelocity and empFieldRange;
-//! flight is transient actor state. Dynamic ship orientation is not represented.
+//! flight is transient actor state. The flight's one terminal either detonates
+//! through the shared sampled path or cancels by finishing the source attempt
+//! in the actor. Dynamic ship orientation is not represented.
 use super::aoe;
 use super::lifecycle::{Cycle, CycleOutcome, Module};
+use super::parameters::MemberPacket;
 use super::registry::Effect;
 use super::weapons::{consume_charge, next_missile_id};
-use infinity_core::consts::{dogma::ATTR_EMP_FIELD_RANGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_MAX_VELOCITY};
-use crate::services::combat::{self, Ctx, ATTR_DAMAGE};
-use crate::services::fit::{Fit, Key};
+use crate::services::combat::{self, Ctx};
+use crate::services::fit::Fit;
 use crate::services::CallError;
 use crate::space::{Ball, MODE_STOP, MODE_WARP};
 use marshal::Value;
@@ -21,19 +23,23 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
     aoe::validate(cx, fit, module, effect, target).await
 }
 
-pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let master = cycle.modules[0].id;
     for index in 0..cycle.modules.len() {
         let module = cycle.modules[index].clone();
-        let key = Key::Charge(module.id);
-        let Some(expected) = fit.source_type(key) else { return Ok(CycleOutcome::Stop("out of charges")); };
-        let Some(attempt) = super::lifecycle::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
+        let Some(member) = cycle.inputs.members.get_mut(index) else {
+            return Err(CallError::Internal(anyhow::anyhow!("bomb cycle captured without member inputs")));
+        };
+        let (permit, token) = member.take_charge();
+        let MemberPacket::Bomb(inputs) = &member.packet else {
+            return Err(CallError::Internal(anyhow::anyhow!("bomb cycle captured without bomb inputs")));
+        };
+        let (expected, velocity, delay, radius, raw) =
+            (inputs.charge, inputs.velocity, inputs.delay_ms, inputs.radius, inputs.raw);
+        let Some(expected) = expected else { return Ok(CycleOutcome::Stop("out of charges")); };
+        let Some(mut attempt) = super::lifecycle::combat_source::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
             return Ok(CycleOutcome::Stop("source lost or activation replaced"));
         };
-        let velocity = fit.value(key, ATTR_MAX_VELOCITY);
-        let delay = fit.value(key, ATTR_EXPLOSION_DELAY);
-        let radius = fit.value(key, ATTR_EMP_FIELD_RANGE);
-        let raw = ATTR_DAMAGE.map(|attr| fit.value(key, attr).max(0.0));
         let Some(size) = cx.world.sde().types.get(expected) else {
             return Err(CallError::Internal(anyhow::anyhow!("unknown bomb type {expected}")));
         };
@@ -48,7 +54,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
             let source = s.sampled_ball(ship_id).filter(|ship| ship.mode != MODE_WARP)?;
             Some((source, s.heading(ship_id)?))
         }).await.flatten() else { return Ok(CycleOutcome::Stop("source lost, in warp or activation replaced")); };
-        let Some(charge) = consume_charge(cx, &module, Some(expected)).await? else { return Ok(CycleOutcome::Stop("out of charges")); };
+        let Some(charge) = consume_charge(cx, permit, token).await else { return Ok(CycleOutcome::Stop("out of charges")); };
         cycle.charge_type = Some(charge);
         let id = next_missile_id();
         let launch_ms = crate::space::now_ms();
@@ -67,12 +73,11 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         let weapon = module.type_id;
         let context = cx.clone();
         cx.world.with(cx.system_id, move |s| {
-            s.launch_bomb(bomb, direction, delay_ms, move |s| {
-                let Some(center) = s.sample_position(id) else { return };
+            s.launch_bomb(bomb, direction, delay_ms, move |s, center| {
+                let Some(center) = center else { attempt.finish_in_actor(s); return };
                 let victims = aoe::victims(s, id, center, radius);
-                s.destroy_ball(id);
                 s.defer(async move {
-                    match aoe::apply_damage_guarded(&context.db, &context.world, context.system_id, weapon, victims, raw, None, attempt, None).await {
+                    match aoe::apply_damage_guarded(&context.db, &context.world, context.system_id, weapon, victims, aoe::DamageApplication::Fixed(raw), None, attempt).await {
                         Ok(()) => {}
                         Err(CallError::Internal(error)) => tracing::warn!(%error, bomb = id, "bomb damage failed"),
                         Err(CallError::User { msg, dict }) if msg == infinity_core::messages::MSG_CUSTOM_NOTIFY
@@ -88,4 +93,4 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
     Ok(CycleOutcome::Continue)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

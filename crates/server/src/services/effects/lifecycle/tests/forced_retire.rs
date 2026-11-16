@@ -30,19 +30,6 @@ fn ordinary_deactivation_remains_in_fit_input() {
     assert!(!active_modules().contains(&module));
 }
 
-async fn fixture_fingerprint(db: &crate::db::Db) -> Vec<String> {
-    let mut values = Vec::new();
-    for sql in [
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY user_id), '')) AS fingerprint FROM game.accounts t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id), '')) AS fingerprint FROM game.characters t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.items t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id, attribute_id), '')) AS fingerprint FROM game.item_attributes t",
-    ] {
-        values.push(db.query_one(sql, &[]).await.unwrap().get("fingerprint"));
-    }
-    values
-}
-
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
@@ -61,7 +48,6 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
     let scram_type = sde.types.iter().find(|t| sde.types.effects(t.type_id).iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_WARP_SCRAMBLE)).unwrap().type_id;
     let modifying = sde.dogma.effect(infinity_core::consts::dogma::EFFECT_WARP_SCRAMBLE).unwrap().modifiers().iter()
         .find(|row| row.domain == "targetID" && row.modified == ATTR_ACTIVATION_BLOCKED).unwrap().modifying;
-    let before = fixture_fingerprint(&db).await;
     let (account, character, ship, module) = db.transaction(
         |tx, _: &mut ()| Box::pin(async move {
             let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('retire-fixture-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
@@ -90,7 +76,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         let mut source_ball = ball.clone();
         source_ball.id = source;
         source_ball.char_id = None;
-        test_world.add_ship(1, ball).await.ok().expect("adding target ball");
+        crate::services::effects::tests::fixture::admit(&test_db, &test_world, 1, ball).await;
         test_world.add_ship(1, source_ball).await.ok().expect("adding source ball");
         let baseline = Fit::load_in_space(&test_db, &test_world, 1, character, ship).await.ok().expect("loading baseline fit")
             .value(Key::Ship, ATTR_MAX_VELOCITY);
@@ -115,7 +101,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
             });
             assert_eq!(s.projections_on(ship).len(), 1);
         }).await.unwrap();
-        stop_blocked_propulsion(&test_db, &test_world, 1, ship).await;
+        stop_blocked_propulsion(&test_world, 1, ship).await;
         test_world.with(1, |_| ()).await.unwrap();
         assert!(stop.load(Ordering::Relaxed));
         assert!(!active_modules().contains(&module));
@@ -138,7 +124,8 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         let make_cycle = || Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: infinity_core::consts::FLAG_FITTING_FIRST }],
             effect: effect.clone(), target: None, repeat: 3, stop: stop.clone(),
             owner: ActivationOwner { master: module, generation: stop.clone(), armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
-            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
+            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
+            source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
         let first = make_cycle();
         let duplicate = make_cycle();
         test_world.with(1, move |s| { cycle_stop(s, first); cycle_stop(s, duplicate); }).await.unwrap();
@@ -172,7 +159,8 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         let cycle = Cycle { cx, modules: vec![Module { id: module, type_id: module_type, flag: infinity_core::consts::FLAG_FITTING_FIRST }],
             effect, target: None, repeat: 3, stop: ordinary.clone(),
             owner: ActivationOwner { master: module, generation: ordinary, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
-            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
+            started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
+            source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
         test_world.with(1, move |s| cycle_stop(s, cycle)).await.unwrap();
         assert!(!active_modules().contains(&module));
         let retired = Fit::load_in_space(&test_db, &test_world, 1, character, ship).await.ok().expect("loading retired fit")
@@ -194,12 +182,13 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         st.activation_generation.remove(&module);
     }
     crate::services::combat::forget_ship(ship);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account, character }], &[ship, module]).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id = ANY($1)", &[&&[module, ship][..]]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id = $1 AND owner_id = $2 AND location_id = $3", &[&module, &character, &ship]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id = $1 AND owner_id = $2", &[&ship, &character]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id = $1 AND user_id = $2", &[&character, &account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
-    assert_eq!(fixture_fingerprint(&db).await, before);
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.expect("forced retirement scenario failed");
 }

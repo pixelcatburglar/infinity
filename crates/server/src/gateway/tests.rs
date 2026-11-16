@@ -1,18 +1,22 @@
+#[cfg(any(feature = "tests-ships", feature = "tests-content", feature = "tests-space", feature = "tests-lua", feature = "tests-gateway", feature = "tests-economy"))]
 use super::*;
 
+#[cfg(feature = "tests-gateway")]
 #[test]
 fn embedded_descriptors_validate() {
     validate().expect("embedded gateway descriptors must satisfy startup validation");
 }
 
+#[cfg(feature = "tests-gateway")]
 pub(super) async fn gateway() -> Arc<Gateway> {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let sde = crate::tests::shared_sde(&db).await;
     let world = World::new(db.clone(), sde.clone(), 1);
     Gateway::new(db, world, Arc::new(Config::default()))
 }
 
+#[cfg(any(feature = "tests-ships", feature = "tests-content", feature = "tests-space", feature = "tests-lua", feature = "tests-gateway", feature = "tests-economy"))]
 pub(crate) fn notice_stream(world: &World, application: [u8; 16], character: i64, capacity: usize) -> notices::registry::Registration {
     let hub = world.notice_hub();
     let lease = hub.lease(application);
@@ -21,6 +25,7 @@ pub(crate) fn notice_stream(world: &World, application: [u8; 16], character: i64
     hub.register(application, capacity)
 }
 
+#[cfg(any(feature = "tests-ships", feature = "tests-content", feature = "tests-space", feature = "tests-lua", feature = "tests-gateway", feature = "tests-economy"))]
 pub(crate) fn decode_notice(frame: &[u8]) -> (protocol::Notice, prost_reflect::DynamicMessage) {
     use prost::Message;
     let notice = protocol::Notice::decode(&frame[5..]).unwrap();

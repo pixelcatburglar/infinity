@@ -32,6 +32,8 @@ pub const MSG_NOT_ENOUGH_DRONE_BAY_SPACE: &str = "NotEnoughDroneBaySpace";
 pub const MSG_NOT_ENOUGH_FIGHTER_BAY_SPACE: &str = "NotEnoughFighterBaySpace";
 pub const MSG_NOT_ENOUGH_SPECIAL_BAY_SPACE: &str = "NotEnoughSpecialBaySpace";
 pub const MSG_CANNOT_STORE_DESTINATION_RESTRICTED: &str = "CannotStoreDestinationRestricted";
+pub mod bills;
+pub mod offices;
 pub mod inventory;
 pub mod encoded_items;
 pub mod access_groups;
@@ -44,6 +46,7 @@ pub mod contacts;
 pub mod corporations;
 pub mod corps;
 pub mod crates;
+pub mod crimewatch;
 pub mod drones;
 pub mod effects;
 pub mod dynamic_items;
@@ -55,7 +58,6 @@ pub mod fighters;
 pub mod warp_vector;
 pub mod super_weapon;
 pub mod fleets;
-pub mod gateway;
 pub mod gm;
 pub mod expert_systems;
 pub mod heat;
@@ -70,6 +72,7 @@ pub mod map;
 pub mod plex_vault;
 pub mod planetary;
 pub mod repair;
+pub mod repairable_ship;
 pub mod scheduler;
 pub mod settings_sharing;
 pub mod lua;
@@ -77,7 +80,6 @@ pub mod loyalty;
 pub mod standings;
 pub mod trade;
 pub mod skills;
-pub mod skill_plans;
 pub mod store;
 pub mod structures;
 pub mod subscriptions;
@@ -112,6 +114,8 @@ pub const MSG_ALREADY_INJECTED_TODAY: &str = "AlreadyInjectedToday";
 pub const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";
 /// Generic connection refusal mapped by `carbon/common/script/net/ExceptionMappingGPCS.py:16`.
 pub const ACL_NOTACCEPTING: &str = "ACL_NOTACCEPTING";
+/// Planned-shutdown login refusal mapped by `carbon/common/script/net/ExceptionMappingGPCS.py:16`.
+pub const ACL_SHUTTINGDOWN: &str = "ACL_SHUTTINGDOWN";
 
 // Alliances (services/alliances.rs)
 /// Alliance action requires a player-corporation CEO.
@@ -384,18 +388,6 @@ pub const GM_NOT_WORMHOLE: &str = "not a wormhole";
 pub fn gm_wormhole_result(target: &str, type_id: i32, system: i64, dest_system: i64, dest_class: i64) -> String { format!("wormhole {} (type {}) in {} -> system {} (class {})", target, type_id, system, dest_system, dest_class) }
 /// GM scan-all result.
 pub fn gm_sites_scanned(count: usize) -> String { format!("{} sites scanned", count) }
-/// Wormhole description in a GM site list.
-pub fn gm_wormhole_site(type_id: i32, dest_system: i64, dest_class: i64) -> String { format!("wormhole {} -> {} (class {})", type_id, dest_system, dest_class) }
-/// Data site label in a GM site list.
-pub const GM_SITE_DATA: &str = "data";
-/// Relic site label in a GM site list.
-pub const GM_SITE_RELIC: &str = "relic";
-/// Combat site label in a GM site list.
-pub const GM_SITE_COMBAT: &str = "combat";
-/// Anomaly label in a GM site list.
-pub const GM_SITE_ANOMALY: &str = "anomaly";
-/// Signature label in a GM site list.
-pub const GM_SITE_SIGNATURE: &str = "signature";
 
 // Fitting (services/fitting.rs)
 /// Insufficient item quantity.
@@ -542,8 +534,6 @@ pub const NO_OFFICE_RENTAL_ROLE: &str = "你没有租用办公室的职权。";
 pub const OFFICE_RENT_CHANGED: &str = "办公室租金已变动，请重新查询。";
 /// No permission to release office.
 pub const NO_OFFICE_RELEASE_ROLE: &str = "你没有退租办公室的职权。";
-/// Empty hangar before office release.
-pub const EMPTY_CORPORATION_HANGAR_BEFORE_RELEASE: &str = "请先清空军团机库再退租办公室。";
 
 // Organizations (services/orgs.rs)
 /// Insufficient role for operation.

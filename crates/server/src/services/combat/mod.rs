@@ -49,6 +49,8 @@
 //! fleet and ammo holds. Remote, foreign and recursively nested containers are unsupported.
 //! Wire charge stack quantities in notifications and the charge cache are
 //! projected to the client display limit; stored module_charges stay exact.
+//! A narrow GM adapter (admin) lets `/suicide` destroy the caller's live ship
+//! through the guarded damage path; it holds no combat state of its own.
 
 pub(crate) mod capacity;
 
@@ -66,7 +68,7 @@ use infinity_core::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_RATE_OF_F
 use infinity_core::consts::{dogma::ATTR_ARMOR_HP, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_SCAN_RESOLUTION, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SHIELD_RECHARGE_RATE, dogma::ATTR_RELOAD_TIME, dogma::ATTR_NEXT_ACTIVATION_TIME, dogma::ATTR_ENTITY_FLY_RANGE, dogma::ATTR_ENTITY_ATTACK_RANGE, dogma::ATTR_ENTITY_MISSILE_TYPE, dogma::ATTR_ENTITY_KILL_BOUNTY, dogma::ATTR_ENTITY_SHIELD_BOOST_AMOUNT, dogma::ATTR_ENTITY_SHIELD_BOOST_DURATION, dogma::ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, dogma::ATTR_ENTITY_ARMOR_REPAIR_DURATION};
 use crate::db::Db;
 use crate::db::executor::Executor;
-use crate::db::outbox::{Outbox, dispatch_world};
+use crate::db::outbox::Outbox;
 use infinity_core::messages;
 use crate::sde::Sde;
 use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
@@ -107,12 +109,20 @@ pub(super) struct ActiveModule {
     pub(super) forced_inactive: bool,
 }
 
+/// A lock attempt in progress. `ui_owner` holds the originating connection of
+/// an attempt the client's targeting UI waits on; internal attempts carry none.
+struct PendingLock {
+    attempt: u64,
+    ui_owner: Option<NotifyTx>,
+}
+
+
 #[derive(Default)]
 pub(super) struct State {
     /// charID -> locked targets
     targets: HashMap<i64, HashSet<i64>>,
-    /// (charID, targetID) -> lock attempt in progress
-    locking: HashMap<(i64, i64), u64>,
+    /// (charID, targetID) -> pending lock attempt and its origin
+    locking: HashMap<(i64, i64), PendingLock>,
     /// shipID -> independent jammer identities and their deadlines.
     jammed: HashMap<i64, HashMap<(i64, i64), jamming::Jam>>,
     /// Announced locks, with source ship and target pilot for symmetric loss notices.
@@ -130,7 +140,9 @@ pub(super) struct State {
 impl State {
     fn reset_character(&mut self, char_id: i64) {
         self.targets.remove(&char_id);
-        self.locking.retain(|(ch, _), _| *ch != char_id);
+        self.locking.retain(|&(ch, target), lock| {
+            if ch == char_id { publish_pending_failure(ch, target, lock); false } else { true }
+        });
         for active in self.active.values().filter(|active| active.char_id == char_id) {
             active.stop.store(true, Ordering::Relaxed);
         }
@@ -144,7 +156,7 @@ pub fn active_modules() -> HashSet<i64> {
 
 pub(super) fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(STATE.get_or_init(Default::default).lock())
 }
 
 /// What a cycle task needs once the call that started it has returned.
@@ -210,22 +222,33 @@ use targeting_charges::*;
 pub(in crate::services) mod banks;
 pub(crate) mod groups_health;
 pub(crate) mod unpiloted;
-#[cfg(test)] #[path = "drone_health/tests.rs"] mod drone_health_tests;
+pub(crate) mod loaded;
+#[cfg(all(test, feature = "tests-combat"))] #[path = "drone_health/tests.rs"] mod drone_health_tests;
 pub(crate) mod damage;
 use groups_health::*;
 use super::effects::notify::attribute_change;
 pub(crate) mod npc;
+pub(crate) mod admin;
 use npc::*;
 
 /// `OnModuleAttributeChanges` for a charge sublocation's stack quantity;
 /// wire new/old values are projected to the client display limit.
-pub(super) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, new: i64, old: i64) -> Value {
+pub(crate) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, new: i64, old: i64) -> Value {
     let cap = super::dogma::info::cap_client_quantity;
     Value::list([attribute_change(owner, charge_key(ship, flag, type_id), ATTR_QUANTITY, Value::Int(cap(new)), Value::Int(cap(old)))])
 }
 
+/// Shield charge and armor/hull damage wire values, in client attribute order.
+fn health_changes(owner: i64, item: i64, new: [f64; 3], old: [f64; 3]) -> Vec<Value> {
+    vec![
+        attribute_change(owner, Value::Int(item), ATTR_SHIELD_CHARGE, Value::Float(new[0]), Value::Float(old[0])),
+        attribute_change(owner, Value::Int(item), ATTR_ARMOR_DAMAGE, Value::Float(new[1]), Value::Float(old[1])),
+        attribute_change(owner, Value::Int(item), ATTR_HULL_DAMAGE, Value::Float(new[2]), Value::Float(old[2])),
+    ]
+}
+
 pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>), CallError> {
-    let rows = crate::dao::items::charges::all(&c.db, ship).await.map_err(db_err)?;
+    let rows = loaded::rows(&c.db, &c.world, c.session.int("solarsystemid"), ship).await?;
     let header = marshal::DbRowDescriptor::new([
         ("locationID", marshal::DbType::I8),
         ("flagID", marshal::DbType::I2),
@@ -272,7 +295,9 @@ pub(crate) async fn targeters(world: &World, system: i64, ship: i64) -> Vec<i64>
 }
 
 
-/// Persist dirty actor conditions in one batch and return only IDs written by the DAO.
+/// Persist dirty actor conditions and their carried loaded rows in one batch,
+/// returning only condition IDs written by the DAO. A partially matched loaded
+/// batch fails the checkpoint rather than persisting a wrong absolute.
 pub(crate) async fn checkpoint_conditions_in<E: Send>(
     ex: &(impl Executor + ?Sized),
     outbox: &mut crate::db::outbox::Outbox<E>,
@@ -280,6 +305,8 @@ pub(crate) async fn checkpoint_conditions_in<E: Send>(
     snapshots: &[ActorConditionSnapshot],
     facts: Option<&crate::space::snapshot::FactCheckpoint>,
 ) -> Result<Vec<i64>, CallError> {
+    let writes: Vec<_> = snapshots.iter().flat_map(|snapshot| snapshot.loaded.iter().cloned()).collect();
+    loaded::settle_in(ex, &writes).await?;
     let mut rows: Vec<_> = snapshots.iter()
         .filter(|snapshot| snapshot.revision != snapshot.saved_revision)
         .map(|snapshot| {
@@ -390,19 +417,6 @@ fn restored_condition(stats: &ShipStats, values: [Option<f64>; 3], at: i64, now:
 }
 
 
-/// Repair the selected in-space ship through its owning actor.
-pub(crate) async fn gm_repair(world: &World, system: i64, char_id: i64, ship: i64) -> Result<(), CallError> {
-    let repaired = world.with(system, move |s| {
-        if !s.ball(ship).is_some_and(|ball| ball.char_id == Some(char_id))
-            || s.combat_phase(ship) != Some(crate::space::combat::CombatPhase::Live) {
-            return false;
-        }
-        if s.set_condition_fraction(ship, 1.0) { s.set_health(ship, [1.0; 3]); }
-        true
-    }).await.unwrap_or(false);
-    if !repaired { return Err(CallError::Internal(anyhow::anyhow!("ship condition unavailable"))); }
-    Ok(())
-}
 
 pub fn forget_ship(ship: i64) {
     state().capacitor.remove(&ship);
@@ -451,7 +465,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                     if let Some((charge, _)) = stats.missile {
                         missile_attempt = Some(prepare(me.id, victim.id, *generation, None, None, Some(charge))?);
                     }
-                    if stats.damage.iter().any(|damage| *damage > 0.0) {
+                    if stats.turret_effect.is_some() || stats.damage.iter().any(|damage| *damage > 0.0) {
                         turret_attempt = Some(prepare(me.id, victim.id, *generation, None, None, None)?);
                     }
                 }
@@ -459,6 +473,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                     let effect = super::effects::registry::resolve(&sde, *effect_id)?;
                     let tracked = matches!(effect.kind, super::effects::EffectKind::Turret | super::effects::EffectKind::Missile
                         | super::effects::EffectKind::Smartbomb | super::effects::EffectKind::RemoteRepair { .. }
+                        | super::effects::EffectKind::Vorton
                         | super::effects::EffectKind::Projected { jamming: super::effects::JammingType::Scramble });
                     if tracked {
                         let weapon = if matches!(effect.kind, super::effects::EffectKind::Missile) {
@@ -489,18 +504,39 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                     }
                     NpcAction::Effect { me, victim, effect_id, source_module, duration_ms, generation } => {
                         if let Some(effect) = super::effects::registry::resolve(world.sde(), effect_id) {
-                            let source = me.id;
-                            let target = victim.id;
-                            let Some(Some(projections)) = world.with(system, move |s|
-                                s.npc_projection_valid(source, target, generation).then(|| s.projections_on(source))).await else { return };
-                            let fit = Fit::for_space_type(world.sde().clone(), me.type_id, projections);
-                            let cx = super::effects::space_source::SourceContext {
-                                db: &db, world: &world, system, source: &me, target: &victim,
-                                module: source_module, effect: &effect, duration_ms, fit: &fit, key: Key::Ship,
-                                guard: super::effects::space_source::SourceGuard::Npc { source, target, generation },
-                                attacker: None, drone: None, phase: crate::space::drone::DronePhase::Begin,
+                            let result = if matches!(effect.kind, super::effects::EffectKind::Smartbomb) {
+                                // A smartbomb samples its own fit and victim
+                                // geometry inside the final actor turn, so no
+                                // typed packet is captured for it.
+                                let Some(attempt) = effect_attempt else { return };
+                                super::effects::aoe::apply_npc(&db, &world, system, source_module, &me, &victim,
+                                    &effect, duration_ms, generation, attempt).await
+                            } else {
+                                let source = me.id;
+                                let target = victim.id;
+                                let Some(Some(projections)) = world.with(system, move |s|
+                                    s.npc_projection_valid(source, target, generation).then(|| s.projections_on(source))).await else { return };
+                                let fit = Fit::for_space_type(world.sde().clone(), me.type_id, projections);
+                                let inputs = match super::effects::parameters::capture_source(&fit, Key::Ship, &effect, duration_ms) {
+                                    Ok(inputs) => inputs,
+                                    Err(error) => {
+                                        if !capacity::is_refusal(&error) {
+                                            warn!("npc {id} effect {effect_id} capture: {}", match &error {
+                                                CallError::Internal(error) => format!("{error:#}"),
+                                                CallError::User { msg, .. } => msg.clone(),
+                                            });
+                                        }
+                                        return;
+                                    }
+                                };
+                                let cx = super::effects::space_source::SourceContext {
+                                    db: &db, world: &world, system, source: &me, target: &victim,
+                                    module: source_module, effect: &effect, duration_ms, inputs: &inputs,
+                                    guard: super::effects::space_source::SourceGuard::Npc { source, target, generation },
+                                    attacker: None, drone: None, phase: crate::space::drone::DronePhase::Begin,
+                                };
+                                super::effects::space_source::apply(&cx, effect_attempt).await
                             };
-                            let result = super::effects::space_source::apply(&cx, effect_attempt).await;
                             match &result {
                                 Err(CallError::Internal(error)) => warn!("npc {id} effect {effect_id}: {error:#}"),
                                 Err(error) if capacity::is_refusal(error) => {}
@@ -520,7 +556,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         .or_else(|| world.sde().dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).filter(|value| *value > 0.0));
     for entry in world.sde().types.effects(type_id) {
         let Some(effect) = super::effects::registry::resolve(world.sde(), entry.effect_id) else { continue };
-        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. } | super::effects::EffectKind::Ecm | super::effects::EffectKind::Smartbomb) { continue; }
+        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. } | super::effects::EffectKind::Ecm | super::effects::EffectKind::Smartbomb | super::effects::EffectKind::Vorton) { continue; }
         if matches!(effect.kind, super::effects::EffectKind::RemoteRepair { .. }) && !super::effects::npc_repair::supported_for_type(world.sde(), type_id, &effect) {
             let name = world.sde().dogma.effect(entry.effect_id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
             let _ = super::effects::unsupported::refusal(Some(entry.effect_id), name, type_id);
@@ -547,5 +583,5 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
 }
 
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-slash")))] pub(crate) mod tests;
 

@@ -85,8 +85,18 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
     use crate::space::system::boarding::transitions::{PreparedOld, PreparedTarget, PreparedTransition, settle_space};
     use marshal::Value;
 
-    let market = crate::services::market::lock().await;
     let (station, bound_system) = super::configuration::current_binding(c, call).ok_or_else(unavailable)?;
+    let system_admission = c.world.admission(bound_system).map_err(super::db_err)?;
+    // A store or board boundary owns the outgoing hull's loaded slots: refuse
+    // new use and wait out admitted finite work before the market guard.
+    let held_loaded = if operation != Operation::Launch && station.is_none() {
+        match c.session.int("shipid").filter(|id| *id > 0) {
+            Some(ship) => Some(crate::space::system::boarding::quiesce_ship_loaded(&c.world, bound_system, &[ship]).await.map_err(|refusal| refusal.into_call_error(unavailable()))?),
+            None => None,
+        }
+    } else { None };
+    let market = crate::services::market::lock().await;
+    system_admission.check().map_err(super::db_err)?;
     if station.is_some() { return Err(unavailable()); }
     let gate = if operation == Operation::Launch { None } else {
         Some(c.world.lock_condition_snapshot(bound_system).await.map_err(db_err)?)
@@ -99,6 +109,8 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
         || session.ship_id != c.session.int("shipid") || session.system_id != Some(bound_system) || session.station_id.is_some()) { return Err(unavailable()); }
     let Current { identity, system, old, transition, host, corporation, alliance } =
         current(c, call, host_id, target_id, operation != Operation::Launch, expected.clone()).await?;
+    let mut transition = transition;
+    if let Some(transition) = transition.as_mut() { transition.held_loaded = held_loaded; }
     let character = identity.char_id;
     let old_id = old.id;
     if operation == Operation::Store && old_id == host_id { return Err(unavailable()); }
@@ -151,6 +163,7 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
             let states = $states.to_vec();
             let facts = $facts;
             Box::pin(async move {
+                selection::lock_character(tx, character).await.map_err(db_err)?;
                 use crate::dao::items::parent_locks::{LockRequest, LockStrength};
                 let mut ancestors = preparation.ancestors().to_vec();
                 ancestors.extend(host_ancestry.iter().map(|row| row.item_id));
@@ -268,10 +281,10 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
         };
         let expected = expected.ok_or_else(unavailable)?;
         let selected = settle_space(c.world.clone(), db, c.sde.clone(), system, character, client, expected.clone(),
-            transition.ok_or_else(unavailable)?, market, gate.ok_or_else(unavailable)?, plan,
+            transition.ok_or_else(unavailable)?, market, gate.ok_or_else(unavailable)?, system_admission, plan,
             move |tx, outbox, states, facts| execute!(tx, outbox, states, facts)).await?;
         super::boarding::finish(c, selected, Some(system), Some(&expected)).await
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;

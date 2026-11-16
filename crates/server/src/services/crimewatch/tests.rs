@@ -1,5 +1,7 @@
 use super::*;
+use crate::services::{effects::tests::fixture::{admit, ball}, slash::tests::support::{register_online, rpc}};
 use crate::space::System;
+use infinity_core::{consts::GM_ROLES, session::OnlineSession};
 
 #[tokio::test]
 #[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with SDE"]
@@ -10,7 +12,7 @@ async fn entosis_activation_refreshes_only_the_weapons_timer() {
     let before = filetime_now();
     weapons_activate(&world, character);
     let first = state().pilots.get(&character).unwrap().weapons_until;
-    assert!(first >= weapons_deadline(before));
+    assert!(first >= timers::natural_deadline(control::TimerKind::Weapons, before));
     {
         let mut st = state();
         st.pilots.get_mut(&character).unwrap().weapons_until = 1;
@@ -19,64 +21,64 @@ async fn entosis_activation_refreshes_only_the_weapons_timer() {
     weapons_activate(&world, character);
     let mut st = state();
     let pilot = st.pilots.get(&character).unwrap();
-    assert!(pilot.weapons_until >= weapons_deadline(before_refresh));
+    assert!(pilot.weapons_until >= timers::natural_deadline(control::TimerKind::Weapons, before_refresh));
     assert_eq!((pilot.pvp_until, pilot.criminal_until, pilot.suspect_until), (0, 0, 0));
     assert!(!st.engagements.keys().any(|&(a, b)| a == character || b == character));
-    assert!(!st.concord.contains(&character));
+    assert!(!st.concord.contains_key(&character));
     st.pilots.remove(&character);
 }
 
 #[test]
-fn concord_reservation_respects_policy_without_clearing_criminal_flag() {
-    let criminal = -104;
-    state().pilots.entry(criminal).or_default().criminal_until = 10;
-
-    assert!(!reserve_concord(false, 1.0, 0.5, criminal));
-    assert!(!state().concord.contains(&criminal));
-    assert!(is_criminal(criminal, 0));
-    assert!(!reserve_concord(true, 0.4, 0.5, criminal));
-    assert!(reserve_concord(true, 0.5, 0.5, criminal));
-    assert!(!reserve_concord(true, 1.0, 0.5, criminal));
-
-    let mut st = state();
-    assert!(st.concord.remove(&criminal));
-    st.pilots.remove(&criminal);
-}
-
-#[test]
-fn discarded_concord_callback_clears_marker() {
+fn concord_tickets_gate_reserve_cancel_and_stale_drop() {
     crate::tests::init_config();
     let criminal = -101;
-    assert!(state().concord.insert(criminal));
-    let callback = concord_response(PendingConcord(criminal), 1, Weak::new());
-    assert!(state().concord.contains(&criminal));
-    drop(callback);
-    assert!(!state().concord.contains(&criminal));
+    state().pilots.entry(criminal).or_default().criminal_until = 10;
+    assert!(reserve_concord(&mut *state(), false, 1.0, 0.5, criminal).is_none());
+    assert!(reserve_concord(&mut *state(), true, 0.4, 0.5, criminal).is_none());
+    let old = reserve_concord(&mut *state(), true, 0.5, 0.5, criminal).unwrap();
+    assert!(is_criminal(criminal, 0) && reserve_concord(&mut *state(), true, 1.0, 0.5, criminal).is_none());
+    cancel_concord(criminal);
+    let new = reserve_concord(&mut *state(), true, 0.5, 0.5, criminal).unwrap();
+    assert!((new.generation != old.generation, concord_ticket_current(old), concord_ticket_current(new)) == (true, false, true));
+    let mut system = System::default();
+    system.schedule(1, concord_response(PendingConcord(old), 1, Weak::new()));
+    system.tick(1);
+    drop(PendingConcord(old));
+    assert!(concord_ticket_current(new));
+    drop(PendingConcord(new));
+    assert!(!state().concord.contains_key(&criminal));
+    state().pilots.remove(&criminal);
 }
 
 #[test]
-fn dropping_system_clears_queued_concord_marker() {
+fn queued_concord_ticket_releases_on_drop_or_execution() {
     crate::tests::init_config();
     let criminal = -102;
-    assert!(state().concord.insert(criminal));
+    let ticket = reserve_concord(&mut *state(), true, 1.0, 0.5, criminal).unwrap();
     let mut system = System::default();
-    system.schedule(1, concord_response(PendingConcord(criminal), 1, Weak::new()));
-    assert!(state().concord.contains(&criminal));
+    system.schedule(1, concord_response(PendingConcord(ticket), 1, Weak::new()));
     drop(system);
-    assert!(!state().concord.contains(&criminal));
+    assert!(!concord_ticket_current(ticket));
+    let ticket = reserve_concord(&mut *state(), true, 1.0, 0.5, criminal).unwrap();
+    let mut system = System::default();
+    system.schedule(1, concord_response(PendingConcord(ticket), 1, Weak::new()));
+    system.tick(1);
+    assert!(reserve_concord(&mut *state(), true, 1.0, 0.5, criminal).is_some());
+    drop(system);
+    cancel_concord(criminal);
 }
 
 #[test]
-fn executed_concord_callback_allows_another_response() {
+fn concord_guard_refuses_only_ignored_pilot() {
     crate::tests::init_config();
-    let criminal = -103;
-    assert!(state().concord.insert(criminal));
-    let mut system = System::default();
-    system.schedule(1, concord_response(PendingConcord(criminal), 1, Weak::new()));
-    system.tick(1);
-    assert!(state().concord.insert(criminal));
-    drop(system);
-    assert!(state().concord.remove(&criminal));
+    let mut s = System::default(); s.insert(crate::services::effects::tests::fixture::ball(1, 1, 2, Some(2), 0.0));
+    let stats = crate::services::combat::groups_health::ShipStats { max: [100.0; 3], resonance: [[1.0; 4]; 3], shield_tau_ms: 1e30 };
+    s.install_condition(1, crate::services::combat::groups_health::Condition { now: stats.max, stats, shield_at: filetime_now() },
+        crate::services::fit::Fit::for_space_type(Arc::new(crate::sde::Sde::default()), 1, Vec::new()));
+    let generation = s.combat_membership_generation(1).unwrap();
+    assert!(concord_target_current(&s, 2, 1, generation));
+    assert!(s.install_pilot_npc_ignored(2, 1, true));
+    assert!(!concord_target_current(&s, 2, 1, generation));
 }
 
 #[test]
@@ -226,8 +228,9 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
         (characters[1], Contribution { damage: 20.0, ship_type: 1, weapon_type: 1, illegal: false }),
         (characters[2], Contribution { damage: 10.0, ship_type: 1, weapon_type: 1, illegal: false }),
     ];
+    let prices = crate::sde::prices::Prices::default();
     let source = crate::services::combat::damage::DamageSource { attacker_id: Some(characters[1]), source_ship_type: Some(7), weapon_type_id: Some(42), ..Default::default() };
-    let (kill_id, _, _, _) = match write_killmail(&save, &mut outbox, 1, characters[0], corps[0], 1, &Lost::new(), &mut attackers, 4, None, &source).await {
+    let (kill_id, _, _, _) = match write_killmail(&save, &mut outbox, &prices, 1, characters[0], corps[0], 1, &Lost::new(), &mut attackers, 4, None, &source).await {
         Ok(result) => result,
         Err(_) => panic!("killmail writer failed"),
     };
@@ -268,7 +271,7 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     assert_eq!(fields.get("finalCorporationID"), Some(&Value::Int(corps[1])));
     assert_eq!(fields.get("finalAllianceID"), Some(&Value::None));
     assert_eq!(fields.get("warID"), Some(&Value::Int(war.war_id)));
-    let (pod_id, _, _, _) = write_killmail(&save, &mut outbox, 1, characters[0], corps[0], infinity_core::consts::TYPE_CAPSULE, &Lost::new(), &mut [], 5, None, &Default::default()).await.unwrap();
+    let (pod_id, _, _, _) = write_killmail(&save, &mut outbox, &prices, 1, characters[0], corps[0], infinity_core::consts::TYPE_CAPSULE, &Lost::new(), &mut [], 5, None, &Default::default()).await.unwrap();
     let pod = save.query_one("SELECT solar_system_id, event_time, kind FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &pod_id]).await.unwrap();
     assert_eq!((pod.get::<_, i64>("solar_system_id"), pod.get::<_, i64>("event_time"), pod.get::<_, i16>("kind")), (1, 5, crate::dao::map_telemetry::EventKind::Pod as i16));
     assert_eq!(save.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=ANY($2)", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &&[kill_id, pod_id][..]]).await.unwrap().len(), 2);
@@ -286,7 +289,7 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     let impact = crate::services::combat::damage::DamageSource {
         attacker_id: Some(characters[2]), source_ship_type: Some(7), weapon_type_id: Some(42), ..Default::default()
     };
-    ship_lost_in(&save, &mut outbox, 1, characters[0], corps[0], ship, 1, &Lost::new(), &impact, now, &contributions).await.unwrap();
+    ship_lost_in(&save, &mut outbox, &prices, 1, characters[0], corps[0], ship, 1, &Lost::new(), &impact, now, &contributions).await.unwrap();
     let mail = save.query_one("SELECT final_char_id, final_ship_type, final_weapon_type, final_damage, attacker_ids FROM game.killmails WHERE victim_item_id=$1", &[&ship]).await.unwrap();
     assert_eq!(mail.get::<_, Option<i64>>("final_char_id"), Some(characters[2]));
     assert_eq!((mail.get::<_, i32>("final_ship_type"), mail.get::<_, i32>("final_weapon_type"), mail.get::<_, f64>("final_damage")), (7, 42, 10.0));
@@ -298,4 +301,50 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     assert!(crate::dao::killmails::wars::killmails(&tx, war.war_id).await.unwrap().is_empty());
     assert!(tx.query_opt("SELECT character_id FROM game.characters WHERE character_id=$1", &[&characters[0]]).await.unwrap().is_some());
     tx.rollback().await.unwrap();
+}
+
+fn states_slot(v: &Value, slot: usize) -> &Value { &v.items().unwrap()[0].items().unwrap()[slot].items().unwrap()[0] }
+fn states_safety(v: &Value) -> i64 { v.items().unwrap()[3].as_int().unwrap_or(-1) }
+fn cwatch_call<'a>(method: &'static str, args: &'a [Value], kwargs: &'a Value) -> Call<'a> { Call { service: "crimewatch", method, args, kwargs, bound: true, bind_params: None } }
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn cwatch_controls_clear_and_naughty_use_real_routes() {
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
+        let (mut c, _peer) = crate::services::tests::client(db.clone(), fixture.character).await;
+        let (world, me) = (c.world.clone(), fixture.character);
+        let system = c.sde.map.systems().find(|s| s.security.is_some_and(|x| x >= crate::config::game().crimewatch.highsec_threshold)).unwrap().solar_system_id;
+        let ship_type = c.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)).unwrap().type_id;
+        let ship = crate::dao::items::creation::positioned(&db, ship_type, me, system, [0.0; 3]).await.unwrap();
+        admit(&db, &world, system, ball(ship, ship_type, me, Some(me), 0.0)).await;
+        c.session.apply(vec![("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
+        let _rx = register_online(&world, OnlineSession::from_session(&c.session).unwrap());
+        let kwargs = Value::Dict(vec![]);
+        assert!(matches!(rpc(&mut c, "/cwatch status").await.unwrap_err(), CallError::User { dict, .. } if dict[0].1 == Value::unicode(messages::gm::GM_ROLE_REQUIRED)));
+        assert_eq!(crate::services::dispatch(&mut c, &cwatch_call("SetSafetyLevel", &[Value::Int(1)], &kwargs)).await.unwrap(), Value::None);
+        assert!(crate::services::dispatch(&mut c, &cwatch_call("SetSafetyLevel", &[Value::Int(7)], &kwargs)).await.is_err());
+        assert_eq!((crate::dao::characters::crimewatch::safety(&db, me).await.unwrap(), states_safety(&crate::services::dispatch(&mut c, &cwatch_call("GetClientStates", &[], &kwargs)).await.unwrap())), (Some(1), 1));
+        c.login.role = GM_ROLES;
+        for kind in ["weapon", "pvp", "npc", "criminal", "suspect", "disapproval"] { rpc(&mut c, &format!("/cwatch {kind} 60s")).await.unwrap(); }
+        let snap = control::snapshot(&db, me).await.unwrap();
+        assert!([snap.weapons, snap.pvp, snap.npc, snap.criminal, snap.suspect, snap.disapproval].iter().all(Option::is_some) && state().concord.contains_key(&me));
+        assert_eq!(states_slot(&crate::services::dispatch(&mut c, &cwatch_call("GetClientStates", &[], &kwargs)).await.unwrap(), 3), &Value::Int(CRIMINAL_TIMER));
+        assert_eq!(rpc(&mut c, "/cwatch criminal off").await.unwrap(), Value::unicode(messages::gm::gm_cwatch_status(me, [snap.weapons, snap.pvp, snap.npc, None, snap.suspect, snap.disapproval], snap.safety as i64)));
+        assert!((states_slot(&crate::services::dispatch(&mut c, &cwatch_call("GetClientStates", &[], &kwargs)).await.unwrap(), 3), state().concord.contains_key(&me)) == (&Value::Int(SUSPECT_TIMER), false));
+        assert_eq!(rpc(&mut c, "/cwatch safety full").await.unwrap(), Value::unicode(messages::gm::gm_cwatch_safety_saved(2)));
+        assert_eq!((crate::dao::characters::crimewatch::safety(&db, me).await.unwrap(), states_safety(&crate::services::dispatch(&mut c, &cwatch_call("GetClientStates", &[], &kwargs)).await.unwrap())), (Some(2), 2));
+        assert_eq!(rpc(&mut c, "/naughty").await.unwrap(), Value::unicode(messages::gm::GM_CWATCH_NAUGHTY_QUEUED));
+        state().engagements.insert((me, me + 1), i64::MAX);
+        crate::dao::characters::crimewatch::set_security(&db, me, -4.0).await.unwrap();
+        crate::dao::kill_rights::create(&db, me + 1, me, 1, i64::MAX).await.unwrap().unwrap();
+        assert!(state().concord.contains_key(&me));
+        assert_eq!(rpc(&mut c, "/cwatch clear").await.unwrap(), Value::unicode(messages::gm::GM_CWATCH_CLEARED));
+        assert_eq!({ let s = control::snapshot(&db, me).await.unwrap(); (s.safety as i64, [s.weapons, s.pvp, s.npc, s.criminal, s.suspect, s.disapproval].iter().all(Option::is_none)) }, (2, true));
+        assert!({ let mut st = state(); st.engagements.remove(&(me, me + 1)).is_some() && !st.concord.contains_key(&me) });
+        assert_eq!((crate::dao::characters::crimewatch::security(&db, me).await.unwrap(), db.query_opt("SELECT kill_right_id FROM game.kill_rights WHERE to_id=$1", &[&me]).await.unwrap().is_some()), (Some(-4.0), true));
+    }).await;
+    db.execute("DELETE FROM game.kill_rights WHERE to_id=$1", &[&fixture.character]).await.unwrap();
+    crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

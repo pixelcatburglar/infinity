@@ -40,11 +40,11 @@ async fn ordered_stacks_shortage_and_guarded_prefix_rollback() {
     let second: i64 = tx.query_one(insert, &[&fuel, &owner, &ship, &FLAG_SPECIALIZED_FUEL_BAY, &3_i64]).await.unwrap().get("item_id");
     let flags = [FLAG_CARGO, FLAG_SPECIALIZED_FUEL_BAY];
     let items = load_items(&tx, &sde, ItemQuery::LocationOwnerFlags(ship, owner, &flags)).await.unwrap();
-    let changes = plan(&BTreeMap::from([(fuel, 6)]), &items, &[second], &sde, owner).unwrap();
+    let changes = plan(&[(fuel, 6)], &items, &[second], &sde, owner).unwrap();
     assert_eq!(changes[&first].quantity, None);
     assert_eq!(changes[&cargo].quantity, Some(1));
     assert!(!changes.contains_key(&second));
-    assert!(plan(&BTreeMap::from([(fuel, 8)]), &items, &[second], &sde, owner).is_err());
+    assert!(plan(&[(fuel, 8)], &items, &[second], &sde, owner).is_err());
     let block = sde.types.iter().find(|ty| ty.group_id == Some(GROUP_FUEL_BLOCK)).expect("fuel block in SDE").type_id;
     let generic = sde.types.iter().find(|ty| ty.group_id != Some(GROUP_FUEL_BLOCK) && ty.group_id != Some(GROUP_ICE_PRODUCT)).expect("generic type in SDE").type_id;
     let base = items[0].clone();
@@ -63,15 +63,15 @@ async fn ordered_stacks_shortage_and_guarded_prefix_rollback() {
         candidate(9, generic, FLAG_CARGO, -1, owner, false),
         candidate(10, generic, FLAG_CARGO, 20, owner, false),
     ];
-    let mixed = plan(&BTreeMap::from([(block, 4), (generic, 3)]), &candidates, &[10], &sde, owner).unwrap();
+    let mixed = plan(&[(block, 4), (generic, 3)], &candidates, &[10], &sde, owner).unwrap();
     assert_eq!(mixed.len(), 3);
     assert_eq!(mixed[&3].quantity, None);
     assert_eq!(mixed[&2].quantity, Some(3));
     assert_eq!(mixed[&5].quantity, None);
-    assert!(plan(&BTreeMap::from([(generic, 4)]), &candidates, &[10], &sde, owner).is_err());
+    assert!(plan(&[(generic, 4)], &candidates, &[10], &sde, owner).is_err());
     for quantity in [i64::from(i32::MAX) + 1, 1_i64 << 32, (1_i64 << 53) + 1, i64::MAX] {
         let wide = [candidate(11, generic, FLAG_CARGO, quantity, owner, false)];
-        let changes = plan(&BTreeMap::from([(generic, quantity - 1)]), &wide, &[], &sde, owner).unwrap();
+        let changes = plan(&[(generic, quantity - 1)], &wide, &[], &sde, owner).unwrap();
         assert_eq!(changes[&11].quantity, Some(1));
     }
     let inner = tx.transaction().await.unwrap();
@@ -115,30 +115,34 @@ async fn effective_bank_requirements_commit_once_per_cycle_and_notify() {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let cx = Ctx { db: db.clone(), world, notify: sender, char_id: owner, ship_id: ship, system_id: 1 };
     let fit = Fit::load(&db, sde, owner, ship).await.unwrap();
-    consume_cycle(&cx, &fit, &modules).await.unwrap();
+    let requirements = super::requirements(&fit, &modules, Vec::new()).unwrap();
+    assert_eq!(requirements, vec![(fuel, 4)]);
+    consume_cycle(&cx, &requirements).await.unwrap();
     let remaining = load_items(&db, cx.world.sde(), ItemQuery::Id(stack)).await.unwrap().remove(0);
     assert_eq!(remaining.quantity, 4);
     let (name, args) = receiver.try_recv().unwrap();
     assert_eq!(name, "OnItemChange");
     assert_eq!(args, vec![remaining.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(8))]), Value::None]);
-    consume_cycle(&cx, &fit, &modules).await.unwrap();
+    consume_cycle(&cx, &requirements).await.unwrap();
     assert!(load_items(&db, cx.world.sde(), ItemQuery::Id(stack)).await.unwrap().is_empty());
     let (name, args) = receiver.try_recv().unwrap();
     assert_eq!(name, "OnItemChange");
     let removed = Item { location_id: infinity_core::consts::LOCATION_JUNKYARD, ..remaining };
     assert_eq!(args, vec![removed.row(), Value::Dict(vec![(Value::Int(infinity_core::consts::IX_LOCATION_ID), Value::Int(ship))]), Value::None]);
-    assert!(consume_cycle(&cx, &fit, &modules).await.is_err());
+    assert!(consume_cycle(&cx, &requirements).await.is_err());
     assert!(receiver.try_recv().is_err());
     for module in &modules {
         dogma::set_override(&db, module.id, ATTR_CONSUMPTION_QUANTITY, 4_611_686_018_427_387_904.0).await.unwrap();
     }
     let overflow_fit = Fit::load(&db, cx.world.sde().clone(), owner, ship).await.unwrap();
-    assert!(matches!(consume_cycle(&cx, &overflow_fit, &modules).await, Err(CallError::Internal(_))));
+    assert!(matches!(super::requirements(&overflow_fit, &modules, Vec::new()),
+        Err(CallError::Internal(_))));
     assert!(cx.world.sde().types.get(i32::MAX).is_none(), "unknown fuel type fixture must not exist in SDE");
     dogma::set_override(&db, modules[0].id, ATTR_CONSUMPTION_TYPE, f64::from(i32::MAX)).await.unwrap();
     dogma::set_override(&db, modules[0].id, ATTR_CONSUMPTION_QUANTITY, 1.0).await.unwrap();
     let unknown_fit = Fit::load(&db, cx.world.sde().clone(), owner, ship).await.unwrap();
-    assert!(matches!(consume_cycle(&cx, &unknown_fit, &modules[..1]).await, Err(CallError::Internal(_))));
+    assert!(matches!(super::requirements(&unknown_fit, &modules[..1], Vec::new()),
+        Err(CallError::Internal(_))));
     assert!(receiver.try_recv().is_err());
     }).await;
     let cleanup = crate::tests::catch_scenario(async {

@@ -49,5 +49,5 @@ pub(crate) async fn presence_changed(db: &Db, world: &World, char_id: i64, onlin
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

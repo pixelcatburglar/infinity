@@ -7,7 +7,7 @@ pub(crate) mod operations;
 pub(crate) mod policy;
 pub(crate) mod wire;
 
-use crate::{client::Client, dao, lua::content::{self, protocol::{self, Identity, Response}}, services::{Call, CallResult, db_err, notify_error}};
+use crate::{client::Client, dao, lua::content::protocol::{self, Identity, Response}, services::{Call, CallResult, db_err, notify_error}};
 use marshal::Value;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -38,19 +38,17 @@ async fn read_retained(c: &mut Client, call: &Call<'_>) -> CallResult {
         c.notify(event, vec![Value::str(text)]);
         return Ok(Value::None);
     };
-    let row = dao::lua_content::load(&c.db, &subject.content_namespace, &subject.content_version).await.map_err(db_err)?
-        .ok_or_else(|| db_err(anyhow::anyhow!("missing retained adaptation catalogue")))?;
-    let definitions = content::decode_retained_adaption(&row, &c.cfg.lua, &c.sde).map_err(db_err)?;
+    let definitions = crate::lua::retained_adaption(&subject.content_namespace, &subject.content_version)?;
     let identity = || Identity { user, character };
     let (event, text) = match request {
         model::Request::Tree(tree) if definitions.published_tree(tree) => ("OnTreeResponsed", protocol::encode_content_text(Response::Tree { identity: identity(), tree }).map_err(db_err)?),
         model::Request::Missions => ("OnMissionResponsed", protocol::encode_content_text(Response::Mission { identity: identity() }).map_err(db_err)?),
-        model::Request::User => ("OnUserResponsed", wire::user(&definitions, &snapshot, user, character)?),
+        model::Request::User => ("OnUserResponsed", wire::user(definitions.as_ref(), &snapshot, user, character)?),
         _ => return Err(notify_error(infinity_core::messages::ship_adaption::UNAVAILABLE)),
     };
     c.notify(event, vec![Value::str(text)]);
     Ok(Value::None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-ships"))]
 mod tests;

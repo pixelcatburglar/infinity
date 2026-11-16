@@ -105,5 +105,5 @@ impl FactCheckpoint {
     }
 }
 
-#[cfg(test)] mod tests;
-#[cfg(test)] pub(crate) use tests::facts_test_init;
+#[cfg(all(test, any(feature = "tests-effects", feature = "tests-space")))] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] pub(crate) use tests::facts_test_init;

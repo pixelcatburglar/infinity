@@ -1,10 +1,14 @@
 //! Launches persistent drone identities from the active ship into space.
 //! Each source stack is committed separately; unsupported work effects may still launch physically.
+//! A singleton source reuses the fitting snapshot taken before its transaction:
+//! the ship's active projections are applied to it once, every attempt borrows
+//! the frozen snapshot, and only a successful commit moves it into the actor.
+//! Committed item-change notices are addressed to the owning pilot.
 
 use marshal::Value;
 use crate::client::Client;
-use infinity_core::consts::{dogma::ATTR_DRONE_BANDWIDTH, dogma::ATTR_MAX_ACTIVE_DRONES, CATEGORY_DRONE, CATEGORY_SHIP, FLAG_DRONE_BAY, GROUP_SOLAR_SYSTEM, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
-use crate::dao::items::{drones, loading::ItemQuery, ship as ship_dao};
+use infinity_core::consts::{dogma::ATTR_DRONE_BANDWIDTH, dogma::ATTR_MAX_ACTIVE_DRONES, CATEGORY_DRONE, FLAG_DRONE_BAY, GROUP_SOLAR_SYSTEM, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
+use crate::dao::items::{drones, loading::ItemQuery};
 use crate::db::outbox::{dispatch_world, Outbox};
 use infinity_core::messages::drones as text;
 use crate::services::{db_err, notify_error, Call, CallError, CallResult, fit::{Fit, Key}, items::load_items};
@@ -38,7 +42,9 @@ pub(crate) async fn launch(c: &mut Client, call: &Call<'_>) -> CallResult {
 }
 
 async fn launch_one(c: &mut Client, owner: i64, ship: i64, system: i64, id: i64, count: i32) -> Result<Vec<i64>, CallError> {
+    let admission = c.world.admission(system).map_err(db_err)?;
     let market = crate::services::market::lock().await;
+    admission.check().map_err(db_err)?;
     let unavailable = || notify_error(text::NOT_AVAILABLE);
     let item = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;
     if item.owner_id != owner || item.location_id != ship || item.flag_id != FLAG_DRONE_BAY || item.category_id != i64::from(CATEGORY_DRONE) || i64::from(count) > item.quantity || (item.singleton && (item.quantity != 1 || count != 1)) { return Err(unavailable()); }
@@ -58,17 +64,29 @@ async fn launch_one(c: &mut Client, owner: i64, ship: i64, system: i64, id: i64,
         crate::services::effects::fitting::required_skills(&fit, &c.sde, key, item.type_id, false)?;
         super::super::worker::spec(&fit, key, item.type_id)?
     };
-    let mut original_fit = item.singleton.then_some(fit);
     let retains_original = i64::from(count) == item.quantity;
     let mut bandwidths = vec![pristine_spec.bandwidth; count as usize];
     if retains_original { bandwidths[0] = original_spec.bandwidth; }
     let token = c.world.with(system, move |s| s.reserve_drone_launch(owner, ship, &bandwidths, max_active, total_bandwidth)).await
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?.ok_or_else(|| notify_error(text::BANDWIDTH_EXCEEDED))?;
-    let ship_projections = c.world.with(system, move |s| s.projections_on(ship)).await
+    let mut ship_projections = c.world.with(system, move |s| s.projections_on(ship)).await
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+    // The singleton's fit is shared, not copied: projections are applied once
+    // here, every attempt borrows it through a weak input, and the post-commit
+    // dispatcher holds the only long-lived strong reference.
+    let original_fit = item.singleton.then(|| {
+        let mut fit = fit;
+        fit.replace_projections_for(Key::Ship, std::mem::take(&mut ship_projections), None);
+        std::sync::Arc::new(fit)
+    });
+    let input = LaunchInput {
+        sde: c.sde.clone(),
+        expected: item.clone(),
+        owner, ship, system, count, pos, affiliation,
+        ship_projections,
+        original_fit: original_fit.as_ref().map(std::sync::Arc::downgrade),
+    };
     let db = c.db.clone();
-    let sde = c.sde.clone();
-    let expected = item.clone();
     let world = c.world.clone();
     let effects = super::super::worker::effects(db.clone(), std::sync::Arc::downgrade(&world), system);
     let actor_world = world.clone();
@@ -76,72 +94,43 @@ async fn launch_one(c: &mut Client, owner: i64, ship: i64, system: i64, id: i64,
     let submitted = actor_world.with(system, move |s| s.try_defer(async move {
     let committed = db.transaction(
         move |tx, outbox: &mut Outbox| {
-            let sde = sde.clone();
-            let expected = expected.clone();
-            let ship_projections = ship_projections.clone();
-            let mut original_fit = original_fit.take();
-            Box::pin(async move {
-                if !ship_dao::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Err(unavailable()); }
-                if crate::dao::characters::selection::ship_id(tx, owner).await.map_err(db_err)? != Some(ship) { return Err(unavailable()); }
-                let hull = load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;
-                if hull.owner_id != owner || hull.location_id != system || hull.category_id != i64::from(CATEGORY_SHIP) || !hull.singleton { return Err(unavailable()); }
-                let fresh = load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;
-                if fresh.owner_id != owner || fresh.location_id != ship || fresh.flag_id != FLAG_DRONE_BAY || fresh.category_id != i64::from(CATEGORY_DRONE) || fresh.type_id != expected.type_id || fresh.quantity != expected.quantity || fresh.singleton != expected.singleton { return Err(unavailable()); }
-                let ids = drones::launch(tx, &fresh, count, owner, ship, system, pos).await.map_err(db_err)?.ok_or_else(unavailable)?;
-                let mut change = vec![(IX_STACK_SIZE, Value::Int(fresh.quantity))];
-                if retains_original {
-                    change.push((IX_LOCATION_ID, Value::Int(ship)));
-                    change.push((IX_FLAG, Value::Int(i64::from(FLAG_DRONE_BAY))));
-                    if !fresh.singleton { change.push((IX_SINGLETON, Value::Bool(false))); }
-                }
-                crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, id, change).await?;
-                for &new_id in ids.iter().filter(|&&new_id| new_id != id) {
-                    crate::services::inventory::notifications::notify_item_change(tx, &sde, outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
-                }
-                let mut entries = Vec::with_capacity(ids.len());
-                for &new_id in &ids {
-                    let key = Key::Drone(new_id);
-                    let fit = if new_id == id {
-                        if let Some(mut fit) = original_fit.take() {
-                            fit.replace_projections_for(Key::Ship, ship_projections.clone(), None);
-                            fit
-                        } else {
-                            Fit::load_drone(tx, sde.clone(), owner, ship, new_id, ship_projections.clone(), Vec::new()).await?
-                        }
-                    } else {
-                        Fit::load_drone(tx, sde.clone(), owner, ship, new_id, ship_projections.clone(), Vec::new()).await?
-                    };
-                    let spec = super::super::worker::spec(&fit, key, fresh.type_id)?;
-                    let condition = crate::services::combat::prepare_condition_with_fit_key(tx, new_id, &fit, key).await?;
-                    let ball = super::drone_ball(&fit, key, new_id, fresh.type_id, owner, affiliation, pos,
-                        condition.fractions().map(|v| v.clamp(0.0, 1.0)))?;
-                    entries.push(crate::space::drone::PreparedDrone { ball, spec, condition, fit, key });
-                }
-                Ok((ids, entries))
-            })
+            let input = input.clone();
+            Box::pin(launch_attempt(tx, outbox, input))
         },
-        |(ids, entries), outbox| {
+        |prepared, outbox| {
             let world = &world;
             let market = &market;
             async move {
+            let (ids, entries) = match prepared.finish(original_fit) {
+                Ok(done) => done,
+                Err(error) => {
+                    if let Err(failure) = dispatch_world((), outbox, &world) {
+                        tracing::warn!(system, ?failure, "committed drone launch notification failed");
+                    }
+                    return Ok(Err(error));
+                }
+            };
             let entries = std::sync::Arc::new(std::sync::Mutex::new(Some(entries)));
             let first = entries.clone();
             let first_effects = effects.clone();
             let published = world.with(system, move |s| {
-                let entries = first.lock().unwrap().take().unwrap();
+                let entries = crate::poison::lock_or_exit(first.lock()).take().unwrap();
                 s.complete_drone_launch(token, owner, ship, entries, first_effects)
             }).await;
             let ack = match published {
                 Some(ack) => Some(ack),
-                None => match world.system_locked(system, market).await {
-                    Ok(()) => world.with(system, move |s| {
-                        entries.lock().unwrap().take().map(|entries|
-                            s.complete_drone_launch(token, owner, ship, entries, effects))
-                    }).await.flatten(),
-                    Err(error) => {
-                        tracing::warn!(system, %error, "failed to restore committed drone launch");
-                        None
-                    }
+                None => match admission.check() {
+                    Err(error) => Some(Err(CallError::Internal(error.into()))),
+                    Ok(()) => match world.system_locked(system, market).await {
+                        Ok(()) => world.with(system, move |s| {
+                            crate::poison::lock_or_exit(entries.lock()).take().map(|entries|
+                                s.complete_drone_launch(token, owner, ship, entries, effects))
+                        }).await.flatten(),
+                        Err(error) => {
+                            tracing::warn!(system, %error, "failed to restore committed drone launch");
+                            None
+                        }
+                    },
                 },
             };
             let admission = match ack {
@@ -172,4 +161,103 @@ async fn launch_one(c: &mut Client, owner: i64, ship: i64, system: i64, id: i64,
     receiver.await.map_err(|error| CallError::Internal(error.into()))?
 }
 
-#[cfg(test)] mod tests;
+/// One stack's launch facts, cloned into each attempt by the retrying transaction runner.
+#[derive(Clone)]
+struct LaunchInput {
+    sde: std::sync::Arc<crate::sde::Sde>,
+    expected: crate::dao::items::loading::Item,
+    owner: i64,
+    ship: i64,
+    system: i64,
+    count: i32,
+    pos: [f64; 3],
+    affiliation: (i64, i64),
+    ship_projections: Vec<crate::services::effects::projection::Projection>,
+    /// Frozen singleton fitting; the post-commit dispatcher owns the only strong Arc.
+    original_fit: Option<std::sync::Weak<Fit>>,
+}
+
+/// Singleton calculations staged inside an attempt; the frozen fit joins them after commit.
+struct OriginalDrone {
+    ball: crate::space::Ball,
+    spec: crate::space::drone::DroneSpec,
+    condition: crate::services::combat::ConditionSeed,
+    npc_ignored: bool,
+}
+
+struct PreparedLaunch {
+    ids: Vec<i64>,
+    entries: Vec<crate::space::drone::PreparedDrone>,
+    original: Option<OriginalDrone>,
+}
+
+impl PreparedLaunch {
+    /// Runs only after COMMIT: moves the frozen fit into the staged singleton
+    /// entry. An ownership breach is a post-commit error, never a reload.
+    fn finish(mut self, original_fit: Option<std::sync::Arc<Fit>>) -> Result<(Vec<i64>, Vec<crate::space::drone::PreparedDrone>), CallError> {
+        if let Some(original) = self.original {
+            let key = Key::Drone(original.ball.id);
+            let fit = original_fit.and_then(|fit| std::sync::Arc::try_unwrap(fit).ok())
+                .ok_or_else(|| CallError::Internal(anyhow::anyhow!("committed singleton drone launch has no unique frozen fit")))?;
+            self.entries.push(crate::space::drone::PreparedDrone { ball: original.ball, spec: original.spec, condition: original.condition, fit, key, npc_ignored: original.npc_ignored });
+        }
+        Ok((self.ids, self.entries))
+    }
+}
+
+/// One launch transaction attempt; the runner may invoke it again after a conflict.
+async fn launch_attempt(
+    tx: &crate::db::Transaction<'_>,
+    outbox: &mut Outbox,
+    input: LaunchInput,
+) -> Result<PreparedLaunch, CallError> {
+    let unavailable = || notify_error(text::NOT_AVAILABLE);
+    let LaunchInput { sde, expected, owner, ship, system, count, pos, affiliation, ship_projections, original_fit } = input;
+    let id = expected.item_id;
+    super::prepare_ship(tx, &sde, owner, ship, system).await?;
+    let fresh = load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;
+    if fresh.owner_id != owner || fresh.location_id != ship || fresh.flag_id != FLAG_DRONE_BAY || fresh.category_id != i64::from(CATEGORY_DRONE) || fresh.type_id != expected.type_id || fresh.quantity != expected.quantity || fresh.singleton != expected.singleton { return Err(unavailable()); }
+    let ids = drones::launch(tx, &fresh, count, owner, ship, system, pos).await.map_err(db_err)?.ok_or_else(unavailable)?;
+    let retains_original = i64::from(count) == expected.quantity;
+    let mut change = vec![(IX_STACK_SIZE, Value::Int(fresh.quantity))];
+    if retains_original {
+        change.push((IX_LOCATION_ID, Value::Int(ship)));
+        change.push((IX_FLAG, Value::Int(i64::from(FLAG_DRONE_BAY))));
+        if !fresh.singleton { change.push((IX_SINGLETON, Value::Bool(false))); }
+    }
+    for (item_id, change) in std::iter::once((id, change)).chain(
+        ids.iter().filter(|&&new_id| new_id != id)
+            .map(|&new_id| (new_id, vec![(IX_LOCATION_ID, Value::Int(0))])),
+    ) {
+        if let Some(item) = load_items(tx, &sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() {
+            crate::services::inventory::notifications::notify_owner_item_change(outbox, &item, owner, change);
+        }
+    }
+    let npc_ignored = crate::dao::characters::npc_control::get(tx, owner).await.map_err(db_err)?
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("drone launch owner character missing")))?;
+    let mut entries = Vec::with_capacity(ids.len());
+    let mut original = None;
+    for &new_id in &ids {
+        let key = Key::Drone(new_id);
+        if let Some(weak) = original_fit.as_ref().filter(|_| new_id == id) {
+            // The frozen fit carries the pre-transaction state; an attempt
+            // borrows it and must not resample the database on a retry.
+            let fit = weak.upgrade().ok_or_else(|| CallError::Internal(anyhow::anyhow!("frozen drone launch fit lost before commit")))?;
+            let spec = super::super::worker::spec(&fit, key, fresh.type_id)?;
+            let condition = crate::services::combat::prepare_condition_with_fit_key(tx, new_id, &fit, key).await?;
+            let ball = super::drone_ball(&fit, key, new_id, fresh.type_id, owner, affiliation, pos,
+                condition.fractions().map(|v| v.clamp(0.0, 1.0)))?;
+            original = Some(OriginalDrone { ball, spec, condition, npc_ignored });
+        } else {
+            let fit = Fit::load_drone(tx, sde.clone(), owner, ship, new_id, ship_projections.clone(), Vec::new()).await?;
+            let spec = super::super::worker::spec(&fit, key, fresh.type_id)?;
+            let condition = crate::services::combat::prepare_condition_with_fit_key(tx, new_id, &fit, key).await?;
+            let ball = super::drone_ball(&fit, key, new_id, fresh.type_id, owner, affiliation, pos,
+                condition.fractions().map(|v| v.clamp(0.0, 1.0)))?;
+            entries.push(crate::space::drone::PreparedDrone { ball, spec, condition, fit, key, npc_ignored });
+        }
+    }
+    Ok(PreparedLaunch { ids, entries, original })
+}
+
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

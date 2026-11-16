@@ -92,5 +92,5 @@ pub(crate) fn journal_balance_client_isk(value: &str, cap: IskAmount) -> Result<
     Ok(IskAmount::client_cents(cents, cap))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

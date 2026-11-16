@@ -108,7 +108,7 @@ async fn neutral_hub_uses_actual_type_and_one_capture_slim() {
     let claimed_target = claimed.capture.as_mut().unwrap();
     claimed_target.ownership_epoch += 1;
     claimed_target.defender_team = 30;
-    let expected = crate::services::sovereignty::wire::structures(std::slice::from_ref(claimed.hub.as_ref().unwrap()), std::slice::from_ref(&policy));
+    let expected = crate::services::sovereignty::wire::structures(std::slice::from_ref(claimed.hub.as_ref().unwrap()), std::slice::from_ref(&policy), None).unwrap();
     super::super::apply(&mut actor, claimed, false, std::slice::from_ref(&policy)).unwrap();
     let (event, args) = notifications.try_recv().unwrap();
     assert_eq!(event, "OnSolarSystemSovStructuresUpdated");

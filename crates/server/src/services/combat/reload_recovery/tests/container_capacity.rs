@@ -81,7 +81,7 @@ async fn mixed_source_refunds_are_one_atomic_group() {
     assert_eq!(pending.len(), 1);
     let addition = [Addition { type_id: charge, singleton: false, quantity: 1 }];
     assert!(hold_storage::check_destination(&tx, &sde, owner, ship, FLAG_CARGO, &addition,
-        Replaced { items: &[], reloads: &[id] }, None).await.is_err());
+        Replaced { items: &[], reloads: &[id] }, crate::services::inventory::hold_storage::CapacitySource::Current).await.is_err());
     drop(locks);
     assert!(pending == pending_reloads::for_ship(&tx, ship).await.unwrap());
     assert!(loading::load_items(&tx, ItemQuery::Location(ship)).await.unwrap().is_empty());
@@ -149,7 +149,7 @@ async fn overfull_box_refunds_reservation_and_missing_ship_discards_under_source
     let pending = pending_reloads::for_ship(&tx, ship).await.unwrap();
     let snapshot = loading::capacity_snapshot(&tx, source).await.unwrap();
     let room = hold_storage::container_room(&sde, snapshot.parent.as_ref().unwrap(), &snapshot.items, &snapshot.reloads).unwrap().unwrap();
-    assert!(room.used > room.capacity);
+    assert!(room.used > match room.capacity { crate::services::inventory::holds::CapacityLimit::Finite(v) => v, crate::services::inventory::holds::CapacityLimit::Unlimited => f64::INFINITY });
     let mut refund = RefundPreparation::capture_pending(&tx, &sde, &pending).await.unwrap();
     assert!(refund.requests().iter().any(|r| r.item_id == source && r.strength == LockStrength::Update));
     assert!(refund.requests().iter().any(|r| r.item_id == ship && r.strength == LockStrength::Update));
@@ -405,7 +405,7 @@ async fn zero_capacity_box_accepts_its_own_reserved_ammunition() {
     let id = pending_reloads::insert(&tx, 101, ship, 1, 1, charge, 1, FLAG_CARGO, source).await.unwrap();
     let before = loading::capacity_snapshot(&tx, source).await.unwrap();
     let room = hold_storage::container_room(&sde, before.parent.as_ref().unwrap(), &before.items, &before.reloads).unwrap().unwrap();
-    assert_eq!(room.capacity, 0.0);
+    assert_eq!(room.capacity, crate::services::inventory::holds::CapacityLimit::Finite(0.0));
     assert!(room.used > 0.0);
     let pending = pending_reloads::for_ship(&tx, ship).await.unwrap();
     let mut refund = RefundPreparation::capture_pending(&tx, &sde, &pending).await.unwrap();

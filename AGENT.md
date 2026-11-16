@@ -15,11 +15,13 @@ These rules apply to anyone changing this repository, coding agents and humans a
   - anything under `/tools/`
   - client caches, settings, and logs (`/logs/`)
 
-  The only captured data in the tree is `crates/server/retail/`, which is wired in through `crates/server/src/retail.rs`, and the protobuf descriptor set `crates/server/proto/eve_protos.desc`, which the public gateway compiles in. `crates/server/content/` is not captured data: it holds the server's own content for what the client never shipped, such as crate contents, embedded at compile time and validated by the static-data loader that uses it.
+  The only captured data in the tree is `crates/server/retail/`, which is wired in through `crates/content/src/retail.rs`, and the protobuf descriptor set `crates/server/proto/eve_protos.desc`, which the public gateway compiles in. `crates/server/content/` is not captured data: it holds the server's own content for what the client never shipped, such as crate contents, embedded at compile time and validated by the static-data loader that uses it.
 - **Release builds only.** Use `--release` for every build, test and run. Do not add debug profiles or rely on debug builds. Builds are warning-free; CI denies warnings.
 - **The client is the specification.** Argument shapes, return shapes and behaviour come from the client's own Python (`eve/client/script/...`, `eve/common/script/...`, `carbon/common/script/...`) and from carbonengine sources. When the live server's data or logic never shipped with the client (dungeon layouts, LP offers, the store catalogue, the hacking board generator), build the closest faithful substitute and document it in the module docs.
 - **Keep diffs minimal and on-topic.** No drive-by refactors, renames or reformatting of code you are not changing. Cleanups that the rules below require (removing a duplicate helper, naming a constant, migrating to the one mechanism) go into a commit of their own, never mixed into a feature commit.
 - **One architecture per concern.** Each concern is handled one way across the whole server. When a mechanism replaces another, migrate every caller and delete the old one in the same change: no parallel paths, compatibility shims, aliases, re-exports or flags that keep an old design alive. For example, space state is reached only through `World`, and timed effects in space run only on actor timers (see Shared state and concurrency).
+- **Static data is read from memory, never from the database.** All static data is loaded once at startup into `Sde`. After that no code path queries a static table, not even for one row or from a rarely used command (see Database).
+- **No database work on recurring paths.** Work that repeats on its own while a ship is in space (a module or drone cycle, a shot, an NPC decision, a tick) reads the state the system actor already holds and never loads it from the database again. What it uses up is saved in batches, never in a transaction per repetition (see Recurring work in space).
 - **No hardcoding.** Logic contains no magic numbers and no literal type, group, attribute or item IDs.
   - Name every value as a `const`. Its doc comment states the source: a client constant (file and name), an SDE ID, a carbonengine value, or a design decision of this server. A constant only one module uses sits at the top of that module. A game-data constant used by more than one module is defined once in `crates/core/src/consts.rs`, or in `crates/core/src/consts/dogma.rs` for dogma attribute and effect IDs, and imported through `infinity_core::consts` (see Shared helpers); never redefine it locally, and never give two different meanings the same name (an effect ID and an effect category, seconds and FILETIME units).
   - Values the SDE or dogma data provides are read from that data, not copied. For example, lock time comes from the ship's scan resolution and the target's signature radius, for players and NPCs alike.
@@ -28,7 +30,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
   - Player-visible text and client message names are never written inline; they are defined in `infinity_core::messages` (see Player-visible text).
   - Unit conversions go through the shared helpers, never inline factors such as `* 10_000` or `/ 1000`.
   - Exempt: `0` and `1` as identities, array indices, and test fixtures.
-- **No duplicated helpers.** Before writing a helper, search for an existing one. A helper needed by more than one module lives in one shared place (see Shared helpers); never copy it into another module.
+- **No duplicated helpers.** Before writing a helper, search for an existing one. When two places do the same thing, in production or test code, that code is one shared function both call (see Shared helpers); never copy it into another module. The only exceptions are sharing that would change behaviour, errors or cost at either call site, break a layering rule (SQL outside `dao/`, `infinity-core` depending on the server) or widen a production item's visibility for a test; the module docs then say which. A change that adds or touches a duplicate extracts it in a commit of its own within the same pull request.
 - **Small files, one concern each.** A Rust source file covers one feature, answers at most one client service, and stays under 800 lines. Tests live in their own files, never in a code file. See File layout and Testing and verification.
 
 ## 2. Build, test, run
@@ -41,6 +43,7 @@ The server crate embeds `crates/server/proto/eve_protos.desc` at compile time; i
 | Build every target for tests | `env CARGO_PROFILE_RELEASE_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked --workspace --all-targets` |
 | All unit tests | the same `env` overrides, then `cargo test --release --locked --workspace` |
 | Tests for one crate | `cargo test --release -p infinity-core` (packages: `server`, `infinity-core`, `marshal`, `sde-import`, `blue-patch`) |
+| Server tests of selected domains | the same `env` overrides, then `cargo test --release --locked -p server --no-default-features --features tests-<domain>[,tests-<domain>]` (domains: `docs/development.md`) |
 | Tests in Docker | `docker build --target test .` |
 | Rebuild and restart the server | `docker compose up -d --build server` |
 | End-to-end check with the client | `scripts/iterate.ps1` (`-Seconds`, `-AutoSelect`, `-NoBuild`) |
@@ -74,7 +77,7 @@ Any other tag starts nothing.
 | Server logs | `logging.rs` (stdout, plus time-rotated server and client-error files when `logging.dir` is set; `main` keeps the writer guards until exit so the last lines are flushed) |
 | Client error reports | `services/alert.rs` (traceback upload, repeat counts and log-mode changes), `services/event_log.rs` (crash notes), `dao/client_errors.rs` (`game.client_errors`, `game.client_error_reports`, `game.client_crashes`) |
 | Login handshake | `handshake.rs` (GPS, Placebo crypto), `live_sessions.rs` (one live session per account) |
-| Packet loop, session changes, notifications | `client.rs`, `macho.rs`, `conn.rs`, `framing.rs`; shared session data in `crates/core/src/session.rs` |
+| Packet loop, session changes, notifications | `client.rs`; packet framing, framed connections and machoNet values in `crates/wire/src/{framing,conn,macho}.rs`; shared session data in `crates/core/src/session.rs` |
 | Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |
 | Lua scripts | `lua/` (VM, typed values, host functions and reload), `lua/host/pilots/` (simulated-pilot lifecycle and game-operation adapters), `dao/lua_store.rs` (`game.lua_store`); the shipped scripts are in `crates/server/lua/`, and `docs/lua.md` documents the script API |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM), `services/effects/` (effect registry, activation lifecycle and the effect families; see `docs/effects.md`) |
@@ -83,14 +86,14 @@ Any other tag starts nothing.
 | Progress events | `progress/` (event registration, durable consumers and their delivery, the Lua observer; `progress/codec.rs` encodes stored events), `dao/progress/` (`game.progress_events`, subscriptions and deliveries); `docs/progress-events.md` documents the guarantees |
 | Public gateway (gRPC) | `gateway/mod.rs` (`Gateway`, built once with its database, world and config), `gateway/transport.rs` (HTTP/2 streams), `gateway/protocol.rs` and `gateway/message.rs` (envelopes and messages), `gateway/requests.rs` (the one table of claimed requests), `gateway/context.rs` (`HandlerContext`: the authenticated caller and identity of one request), `gateway/error.rs` (typed failures), `gateway/events.rs`, `gateway/fallback.rs`; one module per feature (`skill_plans/`, `achievements/`, `characters.rs`, `plex.rs`, ...) |
 | Chat | `chat.rs` and `chat/` (XMPP transport, connected occupants and stanzas); `services/chat/` (`XmppChatMgr`, room admission and moderation authority, moderation expiry); `dao/chat_channels.rs` |
-| Image server and content CDN | `images.rs`, `cdn.rs` |
-| Captured retail data | `retail.rs` and `crates/server/retail/` |
+| Image server and content CDN | `images.rs`, `crates/content/src/cdn.rs` |
+| Captured retail data | `crates/content/src/retail.rs` and `crates/server/retail/` |
 | Server-authored content | `crates/server/content/` (embedded with `include_str!`, validated when the `sde/` dataset that uses it loads; `crates.jsonl` is read by `sde/crates.rs`) |
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
 | Static data (SDE) | `sde/mod.rs` (`Sde`: loaded once at startup, read-only, shared as `Arc<Sde>`; one module per dataset such as `types`, `dogma`, `map`, `industry`, `missions`), `dao/sde/` (the only static-data SQL, run once by the loader) |
 | Game data access (all `game.*` SQL) | `dao/`: one module per kind of data (`accounts`, `characters`, `items`, `wallets`, `skills`, `market`, `contracts`, ...); a feature's statements on shared data live in `dao/<data>/<feature>.rs` |
 | Player-visible text and client message names | `crates/core/src/messages.rs` and `crates/core/src/messages/<feature>.rs` (`infinity_core::messages`) |
-| Wire format | `crates/marshal` |
+| Wire format | `crates/marshal` for the marshal codec; `crates/wire` for packet framing, framed transport and machoNet values |
 
 ## 4. Conventions
 
@@ -189,12 +192,25 @@ Any other tag starts nothing.
 - Rules for closures that run inside a system, including `command`, on-cleared and timer closures:
   - Never `.await`, never touch the database, and never call `World`. Closures must be `Send + 'static`: use `move` and capture owned values.
   - Copy out only what the caller needs, such as a few balls or scalar facts. Never clone every ball of a system.
-  - Hand database or other async work to `System::defer(async move { ... })`. The future runs on the system's worker, outside the actor, and may use the database and `World`.
+  - Hand database or other async work to `System::defer(async move { ... })`. The future runs on the system's worker, outside the actor, and may use the database and `World`. Deferred work that repeats is bound by the rules in Recurring work in space.
 - Ball state that carbonengine destiny changes through an action (movement, speed, max speed, mass and agility, cloak, missile launch, and the AddBalls/RemoveBalls notices for balls entering or leaving) changes only through the system's action queue: `System::command` / `World::command`, or the `System` method for that action (`launch_missile`, `add_ship`, `remove_ball`, `uncloak`). An action issued while the system holds tick C is stamped C and applies before the step to C + 1. Never change a ball's motion state directly from a timer or a service.
 - `Ball::pos` and `Ball::vel` are the state at the current destiny tick; the state stream, position snapshots and the position saved at logout use them. Anything that runs between ticks and needs where a ball is (ranges, NPC decisions, scans, warp and gate checks, where a destroyed ball leaves its wreck or capsule) reads `System::sample_position(id)`, `System::sampled_ball(id)` or `Ball::position_at(ms)`, which interpolate the last completed tick as the client renders it; `System::destroy_ball` returns the ball at its sampled position. Never integrate in smaller steps.
 - Look pilots up through the pilot index (`System::pilots`, `System::pilot_ball`), not by scanning every ball.
 - NPCs are `NpcBrain`s owned by their system and decide inside the tick. Their shots and repairs run on the system's worker through `NpcEffects`. NPCs that must be cleared together form a spawn group (`System::spawn_group`), whose on-cleared closure runs once when the last member leaves. Do not add polling loops that watch the space.
 - Long-running background tasks (`tokio::spawn`) log failures with `warn!` and never panic.
+
+### Recurring work in space
+
+Recurring work is anything that runs again on its own while the pilot does nothing: a module cycle and its repeats, each phase of a drone's cycle, a shot or a missile launch, an NPC decision, a tick, a timer that re-arms itself. When a repetition costs a database round trip, the cost of a fight grows with every module and drone that is cycling: activations wait on the database, and the rest of the server queues for the same connection pool. Therefore:
+
+- **Recurring work never reads the database.** What it needs is already in memory: static data in `Sde`, the entity's evaluated fit and condition in the system actor's combat record (`space/combat.rs`), and the projections on it, which the actor also holds. There is one such copy per ship or drone. Extend it when a recurring path needs more; never load a second copy beside it.
+- **State is loaded when it changes, not when it is used.** The actor's copy is built when the entity enters the system and replaced when something it depends on changes: fitting, module state, charges, skills, implants, boosters, expert systems, projected effects. The operation that makes the change publishes the new state to the actor after it commits (see Notify after commit). Never refresh the copy at the start of a cycle or on a timer, and never give it an expiry time.
+- **What a cycle changes on the ship stays in the actor and is saved in batches.** Capacitor, damage, heat, module state, the charge loaded in a module, and the quantities a running module or drone takes from or adds to the ship's holds on every cycle (fuel and booster charges from the hold; ore, ice and gas delivered to it, together with what leaves the rock) are changed in the actor's memory, and the client is told when the change takes effect there. They reach the database with the system's periodic snapshot (`space/snapshot.rs`), one batch for the system. Never open a transaction per cycle or per shot for them, and never save what a cycle consumes and what it produces in different batches.
+- **A pilot's one-off operation is a business operation.** Moving, splitting or merging items, jettisoning, looting, launching or scooping a drone, refitting in space, unloading a charge, renaming or insuring a ship, and the items a successful salvage or hack creates are written in one transaction when they happen and notified after commit (see Database). That transaction first writes the pending quantities of every ship it reads or changes, so the rows it works on are current. The database stays the only record of which items exist and who owns them: the actor holds pending quantity changes, never an inventory of its own.
+- **State is written when it leaves the actor.** Docking, a jump or a transfer to another system, boarding or swapping ships, storing a ship, logoff, unloading the system, shutdown, and the destruction of a ship or drone write the same pending batch through the same path, inside the transaction of that operation, and hand over only after it commits. A ship loss with its kill report, insurance payout and bounty is one transaction at the moment of the loss.
+- **A reader of a ship's holds sees what has taken effect.** A request that lists or checks the contents of a ship in space either writes the pending quantities first or applies them to what it read; it never shows a quantity older than one the client was already told.
+- **Database cost follows changes, not repetitions.** A change that adds a database read to recurring work, or a transaction for state the actor owns, is refused in review, however small the statement. A pull request that touches a recurring path states its database statements per repetition before and after; for reads and for actor-owned state the number after is zero.
+- Paths that predate this rule and still break it are listed in `docs/limitations.md`. Do not copy them and do not add callers to them. A change that touches one either moves it onto the actor's state or leaves its cost per repetition no higher.
 
 ### Shared helpers
 
@@ -204,10 +220,12 @@ Helpers and constants used by more than one module, each defined once:
 - `space/mod.rs`: vector math on `V3` (`add`, `sub`, `scale`, `len`, `dist`), the wall clock (`now_ms`) and unit conversions (`ms_to_seconds`, `seconds_to_ms`). Destiny stamps are not conversions of the wall clock; they come from `System::current_time()`.
 - `client.rs`: FILETIME conversions (`filetime_now` and conversions from unix time).
 - `hash.rs`: `sha256_hex`, the lowercase hexadecimal SHA-256 digest of a byte slice, used for shared settings and Lua content identities. The importer crate has its own `sde_import::encoding::hex` for raw bytes.
-- `crates/core/src/consts.rs` and its child `crates/core/src/consts/dogma.rs`: game-data constants used by more than one module, grouped by source. Dogma attribute and effect IDs live in `crates/core/src/consts/dogma.rs` and are imported as `infinity_core::consts::dogma::...`; `crates/core/src/consts.rs` holds the rest: FILETIME durations, distances, SDE type, group and category IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `macho::cmd` and the space ball modes and flags.
+- `crates/core/src/consts.rs` and its child `crates/core/src/consts/dogma.rs`: game-data constants used by more than one module, grouped by source. Dogma attribute and effect IDs live in `crates/core/src/consts/dogma.rs` and are imported as `infinity_core::consts::dogma::...`; `crates/core/src/consts.rs` holds the rest: FILETIME durations, distances, SDE type, group and category IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `infinity_wire::macho::cmd` and the space ball modes and flags.
 - `dao/`: statements used by several features, in the module of their data (see Database).
 - `sde/mod.rs`: `Sde::celestial_radius`, the one collision radius of a celestial (its own radius, then its type's, then one documented fallback), as the `f32` destiny sends. Static balls and every placement next to a celestial widen that value; never apply a separate fallback or cast.
 - Game formulas used by several callers (such as lock time) are one function in the module that owns the mechanic, called by every user, players and NPCs alike.
+- Outside tests, every `std::sync` lock result goes through `crate::poison::lock_or_exit`; production code does not `unwrap`/`expect`, recover the inner value, or `map_err` a poison result. Tokio locks are unaffected.
+- Test fixtures and assertions used by several test modules live in the shared test module of their area (`services/tests/fixture.rs`, `space/tests/`), gated per item for the domains that use them (see Testing and verification).
 
 ### Database
 
@@ -219,12 +237,22 @@ Helpers and constants used by more than one module, each defined once:
   - Rows are read by column name into a named struct with one `from_row` per row shape, never by position. Give computed columns an alias so they have a name. A presence check is `query_opt(...).await?.is_some()`.
   - Data used by several features lives in the dao module of that data (`dao/items`, `dao/characters`, `dao/wallets`, `dao/skills`, ...). A feature that adds statements there does so in a file named after the feature. Search the module before adding a statement; never write a second copy.
   - SQL assembled from fragments lives in `dao/` together with its builder. Services pass typed filter values, never SQL text.
-  - Static data (`sde.*`, `sde_native.*`, `sde_compat.*`) is read only by the loaders in `dao/sde/`, once at startup, into `Sde`. Services read it from `&Sde`: synchronous, no lock, no await, no query. A statement never joins `game.*` with static tables; the dao returns game rows and the service enriches them from `Sde`.
+- **Static data is read from memory.** Static data (`sde.*`, `sde_native.*`, `sde_compat.*` and the content files compiled into the server) is read only by the loaders in `dao/sde/` and `sde/`, once at startup (`Sde::load`), into `Sde`.
+  - Services read it from `&Sde`: synchronous, no lock, no await, no query. After startup no code path queries a static table: not for a single row, not for a rarely used lookup, not from a GM command or a Lua script.
+  - A statement never joins `game.*` with static tables; the dao returns game rows and the service enriches them from `Sde`.
+  - Static data a feature needs that `Sde` does not hold yet is added to a dataset in `sde/` and loaded at startup. Never fetch it on demand, and never fill a cache on first use.
+  - The one exception is a startup schema migration: it runs before `Sde` exists and may call a `dao/sde/` loader inside the schema transaction.
 - **One business operation, one transaction.** An operation that writes more than one row, or more than one table, runs in `db.transaction(operation, dispatch)`.
   - `operation` gets the transaction and an `Outbox`. The runner commits, or rolls back on error.
   - The runner reruns `operation` once on a deadlock or serialization failure, so `operation` must be safe to repeat: capture inputs before the call and rebuild any mutable state inside it.
   - `dispatch` runs after COMMIT and receives the outbox.
   - Dao functions take an `Executor`; service helpers that queue effects also take the outbox. Both work inside a transaction and on their own, and never open a transaction themselves.
+
+- **Loss-tolerant commits require an explicit transaction-level opt-in.** Use `Db::transaction_with_commit(CommitMode::LossTolerant, operation, dispatch)` only when every write in the complete transaction may be lost. The runner issues `SET LOCAL synchronous_commit = off` immediately after BEGIN, before the operation, and repeats it for each retry; `Db::transaction` keeps the database's existing commit policy. Never change global or session PostgreSQL settings for this purpose.
+  - Approved callers are periodic space snapshots and the independent NPC map-event projection. Periodic combat facts may insert their journal rows and initial pending delivery rows atomically with the snapshot; this does not permit claiming, applying, retrying or terminating progress receipts asynchronously.
+  - Wallets, ownership and item-existence changes, market and contract operations, skills, scheduler control and progress receipt processing keep the default commit policy. Inspect DAO initialization and outbox preparation as part of the write set; a checkpoint name is not permission to opt in.
+  - Actor-boundary and final snapshot writes keep the default policy. An empty final flush remains a no-op and does not make earlier asynchronous commits durable. Do not add a WAL barrier or force clean state to be rewritten.
+  - `database.loss_tolerant_async_commit` defaults to `true`; setting it to `false` disables all explicit asynchronous opt-ins after restart. A PostgreSQL or operating-system crash can lose recent acknowledged asynchronous transactions until WAL is flushed: normally up to three times `wal_writer_delay`, about 600 ms at its default 200 ms. This is additional to the actor's existing snapshot window; the ordinary PostgreSQL commit policy and `fsync` must remain enabled for durable business operations.
 - **Notify after commit.** Inside `operation`:
   - Never notify a client, call `World`, or change memory state directly. Queue the effect in the outbox; a rolled-back operation sends nothing.
   - A game event is queued with `outbox.event(...)` inside `operation`. The runner journals it before COMMIT and hands it to consumers and Lua after; an event never reaches them outside a transaction.
@@ -262,6 +290,7 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
 | Missiles in flight (temporary) | 9,800,000,000,000 | `combat::MISSILE_ID_START` |
 | Mailing lists | 9,900,000,000,000 to 9,949,999,999,999 | `game.mailing_lists_list_id_seq` |
 | Shared setting links | 9,950,000,000,000 to 9,999,999,999,999 | `game.shared_setting_links_sq_id_seq` |
+| Recovery groups and members | 10,000,000,000,000 to 10,049,999,999,999 | `game.repairable_recovery_groups_group_id_seq`: one sequence for both, so a group ID never equals a member ID |
 
 ### Logging
 
@@ -278,9 +307,10 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
     - `foo.rs` → `foo/tests.rs`
     - `foo/mod.rs` → `foo/tests.rs`
     - a crate root (`lib.rs`, `main.rs`) → `src/tests.rs`, as the marshal crate already does
-  - The module declares them with one line at its end: `#[cfg(test)] mod tests;`.
+  - The module declares them with one line at its end: `#[cfg(test)] mod tests;`. In the server crate that line carries the module's test domain instead (see Test domains below).
   - A code file holds no test code: no inline `mod tests { ... }` block, and no test-only helpers, fixtures or other `#[cfg(test)]` items. Test helpers belong in the test file.
   - As a child module, `tests.rs` already sees the module's private items through `use super::*`. Never widen an item's visibility for a test.
+- **Test domains.** Each server test module declaration names the domain its source path belongs to: `#[cfg(all(test, feature = "tests-<domain>"))]`, with the domain table in `docs/development.md`. The default feature `tests-all` enables every domain, so default builds and CI compile every test. A declaration with a plain `#[cfg(test)]` is compiled in every selection. Production modules and behaviour never depend on these features. A test helper shared across domains is gated per item for the domains that use it; never widen visibility, allow a warning or enable another domain's tests to make a selection compile. Building the server tests with no domain selected is a compile error.
 - Test behaviour a client or player would notice: wire encoding round-trips, formulas, boundaries, state transitions and error cases. Do not write tests that only restate constants or wiring.
 - Protocol and gameplay changes must be exercised with the real client. Run `scripts/iterate.ps1`, walk through the changed path, and confirm the run adds none of the following:
   - `UNHANDLED` calls

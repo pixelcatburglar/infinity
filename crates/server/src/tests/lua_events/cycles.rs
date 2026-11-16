@@ -124,9 +124,8 @@ pub(super) async fn run(ctx: &super::Context) {
         idle(&r.world, system, module, duration * 2 + 15_000).await;
         assert_eq!(crate::dao::mining_ledger::list(&r.db, id, i64::MIN, i64::MAX).await.unwrap().len(), 1);
         crate::dao::items::dogma::clear_override(&r.db, ship, ATTR_CAPACITOR_CAPACITY).await.unwrap();
-        let (generation, revision, projection) = r.world.with(system, move |s| (s.combat_membership_generation(ship).unwrap(), s.combat_fit_revision(ship).unwrap(), s.projection_revision(ship))).await.unwrap();
         let refreshed = Fit::load_in_space(&r.db, &r.world, system, id, ship).await.unwrap();
-        assert!(r.world.with(system, move |s| s.replace_fitted_cache(ship, generation, revision, refreshed, Key::Ship, Some(projection))).await.unwrap());
+        assert!(crate::services::tests::fixture::publish_fitting(&r.world, system, id, ship, refreshed).await);
         combat::groups_health::inject(&r.db, &r.world, system, ship, f64::MAX).await.unwrap();
         lua.load("pilots.activate(cycle_id,cycle_module,cycle_rock,nil)").exec_async().await.unwrap();
         idle(&r.world, system, module, duration + 15_000).await;

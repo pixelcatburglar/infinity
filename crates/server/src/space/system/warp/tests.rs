@@ -62,7 +62,8 @@ fn warp_threshold_uses_unadjusted_distance_and_keeps_long_warp_events() {
         assert_eq!(events, vec![
             event(77, "WarpTo", vec![Value::Int(123), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2]), Value::Float(min_range), Value::Int(3000)]),
             event(77, "SetSpeedFraction", vec![Value::Int(123), Value::Float(1.0)]),
-            special_fx(77, 123, None, None, "effects.Warping", 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, None),
+            special_fx(77, 123, None, None, None, "effects.Warping", false, 1, 0,
+                Value::Int(SPECIAL_FX_UNSPECIFIED_DURATION), 0, None, 0, Value::None),
         ]);
     }
 }
@@ -73,5 +74,17 @@ fn destination_validation_rejects_nonfinite_geometry() {
         assert!(!WarpDestination::Exact([value, 0.0, 0.0]).is_valid());
         assert!(!WarpDestination::Ordinary { point: [0.0; 3], object_radius: Some(value), min_range: 0.0 }.is_valid());
         assert!(!WarpDestination::Ordinary { point: [0.0; 3], object_radius: None, min_range: value }.is_valid());
+    }
+}
+
+#[test]
+fn ordinary_standoff_uses_object_clearance_or_clamped_point_range() {
+    for (object_radius, min_range, expected) in [
+        (Some(10_000.0), 5_000.0, 10_000.0 + 50.0 + 5_000.0),
+        (Some(10_000.0), -5_000.0, 10_000.0 + 50.0 + 2_500.0),
+        (None, 5_000.0, 5_000.0),
+        (None, -5_000.0, 0.0),
+    ] {
+        assert_eq!(ordinary_warp_standoff(object_radius, 50.0, min_range), expected);
     }
 }

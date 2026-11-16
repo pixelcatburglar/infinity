@@ -1,4 +1,4 @@
-//! Effect notifications consumed by client dogma and fxSequencer.
+//! Effect notifications consumed by client dogma.
 //! Payloads use runtime effect and item data; EWAR slots follow client
 //! dogma/effects/GetEwarTypeByEffectID and buffBarConst. Jam start times are
 //! FILETIME and durations are milliseconds. Scheduling and delivery are elsewhere.
@@ -7,7 +7,6 @@
 
 use crate::client::filetime_now;
 use crate::services::combat::Ctx;
-use crate::space::event;
 use marshal::Value;
 
 use super::environment;
@@ -114,38 +113,6 @@ pub(in crate::services) fn ship_scan_completed(cx: &Ctx, target: i64, charge: f6
     cx.notify("OnShipScanCompleted", ship_scan_args(target, charge, capacity, rows));
 }
 
-/// A weapon firing animation (fxSequencer.OnSpecialFX) from `shooter`.
-/// `is_offensive` precedes the start flag and comes from the source effect.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fire_fx(stamp: i64, shooter: i64, module: Option<(i64, i32)>, guid: &str, target: Option<i64>, charge: Option<i32>, is_offensive: bool, start: bool, duration_ms: f64, repeat: i64) -> Value {
-    fire_fx_with_info(stamp, shooter, module, guid, target, charge, is_offensive, start, duration_ms, repeat, Value::None)
-}
-
-/// As `fire_fx`, with client-specific graphic information.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fire_fx_with_info(stamp: i64, shooter: i64, module: Option<(i64, i32)>, guid: &str, target: Option<i64>, charge: Option<i32>, is_offensive: bool, start: bool, duration_ms: f64, repeat: i64, graphic_info: Value) -> Value {
-    event(
-        stamp,
-        "OnSpecialFX",
-        vec![
-            Value::Int(shooter),
-            module.map(|m| Value::Int(m.0)).unwrap_or(Value::None),
-            module.map(|m| Value::Int(m.1 as i64)).unwrap_or(Value::None),
-            target.map(Value::Int).unwrap_or(Value::None),
-            charge.map(|t| Value::Int(t as i64)).unwrap_or(Value::None),
-            Value::str(guid),
-            Value::Bool(is_offensive),
-            Value::Int(start as i64),
-            Value::Int(start as i64),
-            Value::Float(duration_ms),
-            Value::Int(repeat),
-            Value::None,
-            Value::Int(0),
-            graphic_info,
-        ],
-    )
-}
-
 /// One `OnModuleAttributeChanges` entry.
 pub(crate) fn attribute_change(owner: i64, item: Value, attribute: i32, new: Value, old: Value) -> Value {
     attribute_change_at(owner, item, attribute, new, old, filetime_now())
@@ -181,4 +148,4 @@ pub(crate) fn overload_effect(owner: i64, ship: i64, module: i64, effect: i32, s
     ("OnGodmaShipEffect", ship_effect_args(module, i64::from(effect), environment, start, now, -1.0, -1, now))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

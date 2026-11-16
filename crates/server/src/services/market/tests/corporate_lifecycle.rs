@@ -46,7 +46,7 @@ async fn corporate_bid_reprice_and_cancel_refund_original_division() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
-async fn cancelled_corporate_ask_returns_to_deliveries_when_office_is_lost() {
+async fn cancelled_corporate_ask_returns_to_deliveries_when_office_is_inactive() {
     use infinity_core::consts::{FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1};
     use super::super::trading::place_sell;
     crate::tests::init_config();
@@ -59,10 +59,12 @@ async fn cancelled_corporate_ask_returns_to_deliveries_when_office_is_lost() {
         let item: i64 = test_db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,2,false) RETURNING item_id", &[&f.type_id, &f.corporation, &f.office, &FLAG_CORP_SAG1]).await.unwrap().get("item_id");
         place_sell(&Identity::of_client(&c), &c.db, &c.world, &c.sde, SellRequest { item_id: item, station_id: f.at.id, type_id: f.type_id.into(), price: 100000.0, quantity: 2, duration: 1, office_id: Some(f.office), expected_brokers_fee: None }, Some(ACCOUNT_CASH + 1)).await.unwrap();
         let order: i64 = test_db.query_one("SELECT order_id FROM game.market_orders WHERE char_id=$1 AND NOT bid", &[&f.issuer.character]).await.unwrap().get("order_id");
-        test_db.execute("DELETE FROM game.offices WHERE office_id=$1", &[&f.office]).await.unwrap();
+        test_db.execute("UPDATE game.offices SET lease_state=1 WHERE office_id=$1", &[&f.office]).await.unwrap();
         lifecycle::cancel_order(&Identity::of_client(&c), &c.db, &c.world, &c.sde, order, f.at.region).await.unwrap();
         let row = test_db.query_one("SELECT quantity FROM game.items WHERE owner_id=$1 AND location_id=$2 AND flag_id=$3 AND type_id=$4", &[&f.corporation, &f.at.id, &FLAG_CORP_DELIVERIES, &f.type_id]).await.unwrap();
         assert_eq!(row.get::<_, i64>("quantity"), 2);
+        let lease = crate::dao::offices::identity(&test_db, f.corporation, f.at.id).await.unwrap().unwrap();
+        assert_eq!(lease.office_id, f.office);
     }).await;
     f.cleanup(&db).await;
     scenario.unwrap();

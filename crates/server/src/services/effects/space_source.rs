@@ -1,11 +1,13 @@
 //! Shared dispatch for actor-owned in-space effect sources.
 use std::sync::Arc;
 use crate::db::Db;
-use crate::services::{CallError, fit::{Fit, Key}};
+use crate::services::CallError;
 use crate::space::{Ball, System, World, drone::{DroneOrder, DronePhase, DroneRecord}};
-use super::{EffectKind, registry::Effect};
+use super::{EffectKind, parameters::SourceInputs, registry::Effect};
 
 /// An admitted native attempt remains owned even if an async reply is dropped.
+/// Actor-resident consumers finish it in place with `finish_in_actor`; `Drop`
+/// remains only the fallback that posts the finish to the actor.
 pub(crate) struct PreparedCombatAttempt {
     facts: crate::space::combat_facts::CombatSource,
     world: std::sync::Weak<World>,
@@ -46,6 +48,15 @@ impl PreparedCombatAttempt {
                 }
             }
         });
+    }
+
+    /// Finish this attempt inside the actor turn that already owns it and
+    /// disarm. No-op when the attempt was already finished or disarmed; unlike
+    /// `Drop` this never goes through `World::post`.
+    pub(crate) fn finish_in_actor(&mut self, s: &mut System) {
+        if !self.armed { return; }
+        s.finish_combat_attempt(&self.facts);
+        self.armed = false;
     }
 
     /// Disarm only after the actor has finished this attempt.
@@ -102,8 +113,7 @@ pub(crate) struct SourceContext<'a> {
     pub module: i64,
     pub effect: &'a Effect,
     pub duration_ms: f64,
-    pub fit: &'a Fit,
-    pub key: Key,
+    pub inputs: &'a SourceInputs,
     pub guard: SourceGuard,
     pub attacker: Option<i64>,
     pub drone: Option<&'a DroneRecord>,
@@ -117,14 +127,14 @@ pub(crate) async fn apply(cx: &SourceContext<'_>, attempt: Option<PreparedCombat
         EffectKind::Ecm => super::ecm::apply_source(cx).await,
         EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapTransfer => super::npc_capacitor::apply_source(cx).await,
         EffectKind::RemoteRepair { .. } => super::npc_repair::apply_source(cx, attempt).await,
-        EffectKind::Mining if matches!(cx.phase, DronePhase::End) && cx.drone.is_some() =>
-            crate::services::drones::mining::finish_cycle(cx.db, cx.world, cx.system, cx.drone.unwrap().clone(), cx.target.id, cx.fit).await,
-        EffectKind::Mining if matches!(cx.phase, DronePhase::Begin) && cx.drone.is_some() => Ok(()),
-        EffectKind::Smartbomb if matches!(cx.guard, SourceGuard::Npc { .. }) => {
-            let SourceGuard::Npc { generation, .. } = cx.guard else { unreachable!() };
-            let attempt = attempt.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing admitted combat attempt")))?;
-            super::aoe::apply_npc(cx.db, cx.world, cx.system, cx.module, cx.source, cx.target, cx.effect, cx.duration_ms, generation, attempt).await
+        EffectKind::Mining if matches!(cx.phase, DronePhase::End) && cx.drone.is_some() => {
+            let SourceInputs::DroneMining(mining) = cx.inputs else {
+                return Err(CallError::Internal(anyhow::anyhow!("mining phase captured without drone mining inputs")));
+            };
+            crate::services::drones::mining::finish_cycle(cx.db, cx.world, cx.system, cx.drone.unwrap().clone(), cx.target.id, mining.values).await
         }
+        EffectKind::Mining if matches!(cx.phase, DronePhase::Begin) && cx.drone.is_some() => Ok(()),
+        EffectKind::Vorton => super::vorton::apply_source(cx, attempt).await,
         _ => {
             let id = cx.effect.id as i32;
             let name = cx.world.sde().dogma.effect(id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
@@ -133,4 +143,4 @@ pub(crate) async fn apply(cx: &SourceContext<'_>, attempt: Option<PreparedCombat
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

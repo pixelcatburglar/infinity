@@ -1,6 +1,6 @@
 //! Orders locks on existing `game.items` rows for inventory transactions.
 //! This DAO has no direct client mirror; callers supply classification and policy.
-//! It does not discover ancestors or open transactions.
+//! It does not discover ancestors or open transactions. Typed metadata predicates compare captured rows; locking and authorization stay with the caller.
 
 use crate::db::{self, executor::Executor};
 use std::{collections::{BTreeMap, BTreeSet}, marker::PhantomData};
@@ -30,6 +30,21 @@ impl Parent {
             singleton: row.get("singleton"),
             jump_clone_id: row.get("jump_clone_id"),
         }
+    }
+
+    /// Item identity is matched by the caller. Jump-clone identity compares exactly, including `None`.
+    pub(crate) fn same_metadata(&self, other: &Self) -> bool {
+        self.type_id == other.type_id && self.owner_id == other.owner_id
+            && self.location_id == other.location_id && self.flag_id == other.flag_id
+            && self.quantity == other.quantity && self.singleton == other.singleton
+            && self.jump_clone_id == other.jump_clone_id
+    }
+
+    /// Item identity and jump-clone eligibility stay with the caller. Category, group and custom info are not compared.
+    pub(crate) fn matches_item_metadata(&self, item: &super::loading::Item) -> bool {
+        self.type_id == item.type_id && self.owner_id == item.owner_id
+            && self.location_id == item.location_id && self.flag_id == item.flag_id
+            && self.quantity == item.quantity && self.singleton == item.singleton
     }
 }
 
@@ -110,4 +125,4 @@ pub(crate) async fn lock<'tx>(ex: &'tx (impl Executor + ?Sized), hull_ids: &[i64
     Ok(LockedItems { inline_hull: None, rows, strengths, _transaction: PhantomData })
 }
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-economy", feature = "tests-effects", feature = "tests-inventory", feature = "tests-lua", feature = "tests-ships", feature = "tests-storage", feature = "tests-content")))] pub(crate) mod tests;

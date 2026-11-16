@@ -1,6 +1,6 @@
 //! Repackaging contents, batch, and refusal scenarios against the real database.
 use super::*;
-use infinity_core::consts::dogma::EFFECT_ONLINE;
+use infinity_core::consts::dogma::{EFFECT_ONLINE, EFFECT_HI_POWER};
 use infinity_core::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_HI_SLOT_FIRST, FLAG_SUBSYSTEM_FIRST};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -18,9 +18,10 @@ pub(super) async fn many(c: &mut Client, station: i64, ids: &[i64], confirmation
 }
 
 async fn unchanged(c: &mut Client, db: &Db, f: Fixture, id: i64, events: &mut Events) {
-    let before = fingerprint(db).await;
+    let ids = crate::dao::items::inventory::descendants(db, &[id]).await.unwrap();
+    let before = state(db, &ids, f.owner, f.station, &[]).await;
     assert!(many(c, f.station, &[id], Some(Value::Bool(true))).await.is_err());
-    assert_eq!(fingerprint(db).await, before);
+    assert_eq!(state(db, &ids, f.owner, f.station, &[]).await, before);
     assert!(events.try_recv().is_err());
 }
 
@@ -29,11 +30,11 @@ pub(super) async fn sealed_wrap(c: &mut Client, db: &Db, f: Fixture, rig_type: i
     let wrap = insert(db, f.owner, infinity_core::consts::TYPE_PLASTIC_WRAP, f.station, FLAG_HANGAR, -2, true, false).await;
     let child = insert(db, f.owner, rig_type, wrap, FLAG_CARGO, 3, false, false).await;
     assert!(ordinary < wrap);
-    let before = fingerprint(db).await;
+    let before = state(db, &[ordinary, wrap, child], f.owner, f.station, &[]).await;
     for ids in [&[wrap][..], &[ordinary, wrap][..]] {
         let result = many(c, f.station, ids, Some(Value::Bool(true))).await;
         assert!(matches!(result, Err(CallError::User { msg, dict }) if msg == infinity_core::messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
-        assert_eq!(fingerprint(db).await, before);
+        assert_eq!(state(db, &[ordinary, wrap, child], f.owner, f.station, &[]).await, before);
         assert!(events.try_recv().is_err());
         assert!(c.outbox.is_empty());
         let row = db.query_one("SELECT quantity,singleton FROM game.items WHERE item_id=$1", &[&wrap]).await.unwrap();
@@ -50,7 +51,7 @@ pub(super) async fn sealed_wrap(c: &mut Client, db: &Db, f: Fixture, rig_type: i
 }
 
 async fn contents(c: &mut Client, db: &Db, f: Fixture, hull_type: i32, rig_type: i32, events: &mut Events) {
-    let module_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE) && t.effects().iter().any(|e| e.effect_id == 12)).expect("online high-slot module").type_id;
+    let module_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE) && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE) && t.effects().iter().any(|e| e.effect_id == EFFECT_HI_POWER)).expect("online high-slot module").type_id;
     let charge_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_CHARGE) && crate::services::item_volume::item_volume(&c.sde, t.type_id, false, 1, None).is_ok_and(|v| v.is_finite() && v > 0.0)).expect("charge with positive volume").type_id;
     let drone_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_DRONE)).expect("drone").type_id;
     let subsystem_type = c.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SUBSYSTEM)).expect("subsystem").type_id;
@@ -75,12 +76,13 @@ async fn contents(c: &mut Client, db: &Db, f: Fixture, hull_type: i32, rig_type:
     let total_recovered_volume = volume(charge_type, false, 11);
     assert!(crate::dao::items::dogma::set_override(db, ship, capacity_attribute, cargo_volume + 2.0 * recovered_volume).await.unwrap());
     let fit = crate::services::fit::Fit::load_unpiloted(db, c.sde.clone(), ship).await.unwrap();
-    let capacity = crate::services::inventory::holds::effective_capacity(&fit, FLAG_CARGO);
+    let capacity = match crate::services::inventory::holds::effective_capacity(&fit, FLAG_CARGO) {
+        crate::services::inventory::holds::CapacityLimit::Finite(value) => value, crate::services::inventory::holds::CapacityLimit::Unlimited => f64::INFINITY };
     assert!(capacity >= cargo_volume + total_recovered_volume, "valid fixture capacity {capacity}, cargo {cargo_volume}, recovery {total_recovered_volume}");
-    let before = fingerprint(db).await;
+    let before = state(db, &[ship, module, fitted_rig, subsystem, cargo, drone, container, nested], f.owner, f.station, &[charge_type]).await;
     for confirmation in [None, Some(Value::Bool(false)), Some(Value::str("true"))] {
         assert!(matches!(many(c, f.station, &[ship], confirmation).await, Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_CONFIRM_REPACKAGE_SOMETHING_WITH_UPGRADES));
-        assert_eq!(fingerprint(db).await, before);
+        assert_eq!(state(db, &[ship, module, fitted_rig, subsystem, cargo, drone, container, nested], f.owner, f.station, &[charge_type]).await, before);
         assert!(events.try_recv().is_err());
     }
     let result = many(c, f.station, &[ship], Some(Value::Bool(true))).await;
@@ -175,9 +177,9 @@ async fn batch_and_strategic(c: &mut Client, db: &Db, f: Fixture, hull_type: i32
 async fn guards(c: &mut Client, db: &Db, f: Fixture, hull_type: i32, rig_type: i32, events: &mut Events) {
     let ship = insert(db, f.owner, hull_type, f.station, FLAG_HANGAR, 1, true, false).await;
     c.session.apply(vec![("shipid", Value::Int(ship))]);
-    let before = fingerprint(db).await;
+    let before = state(db, &[ship], f.owner, f.station, &[]).await;
     assert!(matches!(many(c, f.station, &[ship], None).await, Err(CallError::User { msg, .. }) if msg == infinity_core::messages::MSG_CANT_REPACKAGE_ACTIVE_SHIP));
-    assert_eq!(fingerprint(db).await, before);
+    assert_eq!(state(db, &[ship], f.owner, f.station, &[]).await, before);
     assert!(events.try_recv().is_err());
     c.session.apply(vec![("shipid", Value::Int(0))]);
     c.session.apply(vec![("charid", Value::Int(0))]);
@@ -186,15 +188,15 @@ async fn guards(c: &mut Client, db: &Db, f: Fixture, hull_type: i32, rig_type: i
     db.execute("UPDATE game.items SET flag_id=$2 WHERE item_id=$1", &[&ship,&FLAG_CARGO]).await.unwrap();
     unchanged(c, db, f, ship, events).await;
     db.execute("UPDATE game.items SET flag_id=$2 WHERE item_id=$1", &[&ship,&FLAG_HANGAR]).await.unwrap();
-    let before = fingerprint(db).await;
+    let before = state(db, &[ship], f.owner, f.station, &[]).await;
     assert!(many(c, f.station + 1, &[ship], None).await.is_err());
-    assert_eq!(fingerprint(db).await, before);
+    assert_eq!(state(db, &[ship], f.owner, f.station, &[]).await, before);
     assert!(events.try_recv().is_err());
     let args = [Value::Dict(vec![(Value::Int(f.station), Value::list([Value::tuple([Value::Int(ship), Value::Int(f.station + 1)])]))])];
     let kwargs = Value::Dict(vec![]);
     let call = Call { service: "repackagingSvc", method: "RepackageItems", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
     assert!(super::super::dispatch(c, &call).await.unwrap().is_err());
-    assert_eq!(fingerprint(db).await, before);
+    assert_eq!(state(db, &[ship], f.owner, f.station, &[]).await, before);
     assert!(events.try_recv().is_err());
     let foreign = insert(db, -f.owner, rig_type, ship, FLAG_CARGO, 1, false, false).await;
     unchanged(c, db, f, ship, events).await;

@@ -1,6 +1,8 @@
 //! Point and bookmark navigation and ballpark diagnostics for `michelle.py`.
 //! Bookmarks are resolved from the bookmark service; movement uses the system actor.
 //! Bubble IDs use the solar system ID, not an original-server bubble algorithm.
+//! Fleet bookmark warps forward the request's `fleetFormationSettings` dictionary
+//! to fleet authorization; single-pilot requests ignore it.
 use super::*;
 use crate::client::filetime_now;
 use infinity_core::consts::GM_ROLES;
@@ -44,10 +46,10 @@ pub(super) async fn align_bookmark(c: &Client, id: i64) -> CallResult {
     })
 }
 
-pub(super) async fn warp_bookmark(c: &Client, id: i64, min_range: f64, fleet: bool) -> CallResult {
+pub(super) async fn warp_bookmark(c: &Client, id: i64, min_range: f64, fleet: bool, formation_wire: Option<&Value>) -> CallResult {
     if !min_range.is_finite() { return Ok(Value::None); }
     let Some(destination) = destination(c, id).await? else { return Ok(Value::None) };
-    let order = if fleet { Some(fleets::warp::authorize(c).await?) } else { None };
+    let order = if fleet { Some(fleets::warp::authorize(c, formation_wire).await?) } else { None };
     warp_destination(&Identity::of_client(c), &c.db, &c.world, c.session.int("solarsystemid"), order, WarpDestination::Ordinary { point: destination.pos, object_radius: None, min_range }, None, Value::dict([("bookmarkID", Value::Int(destination.bookmark_id))])).await
 }
 

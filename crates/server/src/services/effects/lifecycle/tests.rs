@@ -7,6 +7,9 @@ mod banks_db;
 mod boundary;
 mod event_guards;
 mod remote_facts;
+mod actor_fit;
+mod civilian_weapon;
+mod active_attributes;
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]

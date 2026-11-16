@@ -106,7 +106,7 @@ async fn run(case: u8) {
                 payments::pay_for_completion(&f.resources, &f.identity, f.owner.account, &other.goal.goal_id, at).await.unwrap();
                 assert_eq!(f.balance().await, 4500);
                 assert_eq!(receipts::payment(&f.db, f.owner.character, &other.goal.goal_id).await.unwrap().unwrap().amount, 2500);
-                let uuid = crate::uuid_text::parse(&jump.goal_id, crate::uuid_text::Case::Either).unwrap();
+                let uuid = infinity_content::uuid_text::parse(&jump.goal_id, infinity_content::uuid_text::Case::Either).unwrap();
                 let mut seen_progress = false;
                 let mut seen_completed = false;
                 while let Ok(frame) = notices.rx.try_recv() {
@@ -163,6 +163,31 @@ async fn run(case: u8) {
                     assert_eq!(receipts::payment(&f.db, f.owner.character, &jump.goal_id).await.unwrap().unwrap(), receipt);
                 }
             }
+            4 => {
+                let key = f.publish_jump(at).await;
+                let before = rows(f, &bounds).await;
+                let balance = f.balance().await;
+                let limit = crate::config::game().progress.permanent_retry_limit;
+                let attempt = journal::due(&f.db, crate::client::filetime_now(), 64, &[key.consumer_key.as_str()]).await.unwrap()
+                    .into_iter().find(|attempt| attempt.key == key).expect("due receipt observation");
+                let (pid, release, holder) = hold(f, Some(jump.goal_id.clone())).await;
+                let pay = payments::pay_for_completion(&f.resources, &f.identity, f.owner.account, &jump.goal_id, at);
+                let controller = async {
+                    blocked(&f.db, pid).await;
+                    f.db.execute("UPDATE game.progress_deliveries SET permanent_rejections=$3 WHERE consumer_key=$1 AND event_id=$2::text::uuid",
+                        &[&key.consumer_key, &key.event_id, &limit]).await.unwrap();
+                    let update = journal::failed(&f.db, &attempt, crate::client::filetime_now(), "terminal fixture", true, limit).await.unwrap().expect("terminal failure update");
+                    assert!(update.terminal);
+                    release.send(()).unwrap();
+                    holder.await.unwrap();
+                };
+                let (result, ()) = tokio::join!(pay, controller);
+                assert!(matches!(result, Err(Error::Unavailable)));
+                assert_eq!(rows(f, &bounds).await, before);
+                assert_eq!(f.balance().await, balance);
+                assert!(receipts::payment(&f.db, f.owner.character, &jump.goal_id).await.unwrap().is_none());
+                assert!(matches!(journal::delivery(&f.db, &key).await.unwrap(), DeliveryState::Terminal));
+            }
             _ => unreachable!(),
         }
     }).await;
@@ -199,3 +224,4 @@ race_test!(concurrent_distinct_payments_and_replay, "INFINITY_DAILY_RACE_PAY_CHI
 race_test!(natural_completion_wins_payment, "INFINITY_DAILY_RACE_NATURAL_CHILD", 1);
 race_test!(pending_snapshot_growth_reprepares, "INFINITY_DAILY_RACE_GROWTH_CHILD", 2);
 race_test!(late_source_after_verified_snapshot, "INFINITY_DAILY_RACE_LATE_CHILD", 3);
+race_test!(terminal_receipt_refuses_captured_payment, "INFINITY_DAILY_RACE_TERMINAL_CHILD", 4);

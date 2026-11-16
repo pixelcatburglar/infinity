@@ -16,7 +16,7 @@ async fn prepare_settles_overdue_training_and_updates_snapshot() {
     let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, 1);
     let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
     let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
-    plans::create(&db, &plan, owner.character, "plan", "", &[skill], &[1]).await.unwrap();
+    plans::create(&db, &plan, plans::Owner::Character(owner.character), "plan", "", &[skill], &[1], None).await.unwrap();
     plan_milestones::create(&db, &milestone, &plan, "skill", skill, Some(1)).await.unwrap();
     training::starting_skill(&db, owner.character, skill, 0, 0).await.unwrap();
     queue::insert(&db, owner.character, &queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: points, start_time: Some(1), end_time: Some(2) }).await.unwrap();
@@ -30,7 +30,7 @@ async fn prepare_settles_overdue_training_and_updates_snapshot() {
     let row = db.query_one("SELECT completed,trained_sp FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&owner.character, &milestone]).await.unwrap();
     assert!(row.get::<_, bool>("completed"));
     assert_eq!(row.get::<_, i64>("trained_sp"), points);
-    plans::delete(&db, owner.character, &plan).await.unwrap();
+    plans::delete(&db, plans::Owner::Character(owner.character), &plan).await.unwrap();
     db.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", crate::services::skills::completion::KIND, owner.character)]).await.unwrap();
     let owned = db.query("SELECT item_id FROM game.items WHERE owner_id=$1", &[&owner.character]).await.unwrap();
     for row in &owned { let id: i64 = row.get("item_id"); db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&id]).await.unwrap(); }

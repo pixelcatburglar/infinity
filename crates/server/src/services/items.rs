@@ -5,13 +5,14 @@
 //! Market callers deliver corporate purchases to station Deliveries and use the returned
 //! actual stack metadata; structure market destinations are unsupported.
 //! `OnItemChange` quantities are projected to the client display limit; moved and stored
-//! quantities stay exact.
+//! quantities stay exact. Enacted corporation blueprint locks and pending vote-case
+//! reservations refuse quantity removal from originals.
 use super::{db_err, notify_error, CallError};
 use super::inventory::access::corporate_custody;
-use super::inventory::notifications::{item_change_dict, notify_corp_item_change, notify_corp_item_removed};
+use super::inventory::notifications::{item_change_dict, notify_corp_item_change, notify_corp_item_removed, notify_owner_item_change, notify_owner_item_removed};
 use super::inventory::destination::{Destination, ParentGuard};
-use super::inventory::hold_storage::Replaced;
-use infinity_core::consts::{FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use super::inventory::hold_storage::{CapacitySource, Replaced};
+use infinity_core::consts::{CATEGORY_BLUEPRINT, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::dao::items::{quantities::{self, QuantityChange}, transfers};
 use crate::dao::items::loading::{self, Item, ItemQuery};
 use crate::db::{self, executor::Executor, outbox::Outbox};
@@ -41,6 +42,16 @@ pub(crate) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &
         return Err(notify_error(infinity_core::messages::INSUFFICIENT_ITEM_QUANTITY));
     }
     let corporate = corporate_custody(db, None, item.item_id).await?.is_some();
+    // Enacted corporation locks and pending vote-case reservations exist only on
+    // singleton blueprint originals (admission requires both facts), so
+    // non-singleton blueprint stacks and non-blueprint items keep the old path
+    // with no added query. Production callers reach this only through market
+    // sells, where assets::source already refuses singletons; the guard is the
+    // boundary for any future caller, which must already hold the item's update
+    // lock for the check to be race-free against reservation creation.
+    if item.singleton && item.category_id == i64::from(CATEGORY_BLUEPRINT) {
+        super::corps::item_locks::ensure_mutable(db, &[item.item_id]).await?;
+    }
     let full = quantity == available;
     let remaining = (!full).then_some(item.quantity - quantity);
     let changes = BTreeMap::from([(item.item_id, QuantityChange::new(&item, remaining))]);
@@ -51,10 +62,8 @@ pub(crate) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &
         if corporate {
             notify_corp_item_removed(db, outbox, &item).await?;
         } else {
-            let old = item.location_id;
             let owner = item.owner_id;
-            let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
-            outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+            notify_owner_item_removed(outbox, item, owner);
         }
     } else {
         let old_quantity = item.quantity;
@@ -63,8 +72,7 @@ pub(crate) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &
         if corporate {
             notify_corp_item_change(db, outbox, &left, change).await?;
         } else {
-            let change = item_change_dict(change);
-            outbox.notify_pilot(left.owner_id, "OnItemChange", vec![left.row(), change, Value::None]);
+            notify_owner_item_change(outbox, &left, left.owner_id, change);
         }
     }
     Ok(())
@@ -198,9 +206,9 @@ pub(in crate::services) async fn deposit_prepared<X: Send>(
     db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>,
     preparation: &mut DepositPreparation, quantity: i64, from: i64,
     locks: Option<&crate::dao::items::parent_locks::LockedItems<'_>>, parent: Option<&ParentGuard<'_, '_>>,
-    replaced: Replaced<'_>, capacity: Option<f64>,
+    replaced: Replaced<'_>, source: CapacitySource,
 ) -> Result<DepositReceipt, CallError> {
-    let receipt = deposit_statement(db, sde, outbox, preparation, quantity, from, locks, parent, replaced, capacity).await?;
+    let receipt = deposit_statement(db, sde, outbox, preparation, quantity, from, locks, parent, replaced, source).await?;
     if preparation.is_excluded() { return Ok(receipt); }
     let invalid = || CallError::Internal(anyhow::anyhow!("invalid prepared deposit receipt"));
     if let Some(merged) = &receipt.merged {
@@ -238,7 +246,7 @@ async fn deposit_statement<X: Send>(
     db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>,
     preparation: &DepositPreparation, quantity: i64, from: i64,
     locks: Option<&crate::dao::items::parent_locks::LockedItems<'_>>, parent: Option<&ParentGuard<'_, '_>>,
-    replaced: Replaced<'_>, capacity: Option<f64>,
+    replaced: Replaced<'_>, source: CapacitySource,
 ) -> Result<DepositReceipt, CallError> {
     let Destination { capacity_owner, location, flag, .. } = preparation.destination;
     let refuse = || notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
@@ -253,13 +261,11 @@ async fn deposit_statement<X: Send>(
             let locks = locks.ok_or_else(refuse)?;
             let row = locks.row(location).ok_or_else(refuse)?;
             if parent.is_none() || !locks.is_write_locked(location) || row.jump_clone_id.is_some()
-                || row.type_id != observed.type_id || row.owner_id != observed.owner_id
-                || row.location_id != observed.location_id || row.flag_id != observed.flag_id
-                || row.quantity != observed.quantity || row.singleton != observed.singleton { return Err(refuse()); }
+                || !row.matches_item_metadata(observed) { return Err(refuse()); }
         }
     }
     super::inventory::hold_storage::check_destination(db, sde, capacity_owner, location, flag,
-        &[super::inventory::hold_storage::Addition { type_id: preparation.type_id, singleton: false, quantity: i64::from(quantity) }], replaced, capacity).await?;
+        &[super::inventory::hold_storage::Addition { type_id: preparation.type_id, singleton: false, quantity: i64::from(quantity) }], replaced, source).await?;
     let (candidate, write_locks) = match &preparation.classification {
         DestinationClassification::Excluded => (transfers::DepositCandidate::InStatement, None),
         DestinationClassification::Item(_, selected) => {
@@ -294,13 +300,13 @@ async fn deposit_statement<X: Send>(
 pub(in crate::services) async fn deposit_held<X: Send>(
     db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>,
     destination: &Destination, type_id: i32, quantity: i64, from: i64,
-    held: Option<&crate::dao::items::parent_locks::LockedItems<'_>>, capacity: Option<f64>,
+    held: Option<&crate::dao::items::parent_locks::LockedItems<'_>>, source: CapacitySource,
 ) -> Result<DepositReceipt, CallError> {
     let refuse = || notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
     let admitted = super::inventory::hold_storage::check_destination(db, sde, destination.capacity_owner,
         destination.location, destination.flag,
         &[super::inventory::hold_storage::Addition { type_id, singleton: false, quantity: i64::from(quantity) }],
-        Replaced::default(), capacity).await?.ok_or_else(refuse)?;
+        Replaced::default(), source).await?.ok_or_else(refuse)?;
     let locks = held.unwrap_or(&admitted);
     let hull = locks.row(destination.location).ok_or_else(refuse)?;
     if !locks.is_write_locked(destination.location) || hull.owner_id != destination.capacity_owner
@@ -350,34 +356,33 @@ pub(super) async fn deliver<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, o
     let docked = transfers::docked(db, owner).await.map_err(db_err)?;
     if docked == Some(station) {
         for row in receipt.rows() {
-            let change = item_change_dict([row.old_quantity.map_or((IX_LOCATION_ID, Value::Int(0)), |old| (IX_STACK_SIZE, Value::Int(old)))]);
-            outbox.notify_pilot(owner, "OnItemChange", vec![row.item.row(), change, Value::None]);
+            notify_owner_item_change(outbox, &row.item, owner, [row.old_quantity.map_or((IX_LOCATION_ID, Value::Int(0)), |old| (IX_STACK_SIZE, Value::Int(old)))]);
         }
     }
     Ok(receipt)
 }
 pub(crate) async fn deposit<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>, destination: &Destination, type_id: i32, quantity: i64, from: i64) -> Result<DepositReceipt, CallError> {
-    deposit_with_capacity(db, sde, outbox, destination, type_id, quantity, from, Replaced::default(), None).await
+    deposit_with_capacity(db, sde, outbox, destination, type_id, quantity, from, Replaced::default(), CapacitySource::Current).await
 }
 
 /// Returns every physical row changed by the atomic deposit.
-pub(crate) async fn deposit_with_capacity<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>, destination: &Destination, type_id: i32, quantity: i64, from: i64, replaced: Replaced<'_>, capacity: Option<f64>) -> Result<DepositReceipt, CallError> {
+pub(crate) async fn deposit_with_capacity<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>, destination: &Destination, type_id: i32, quantity: i64, from: i64, replaced: Replaced<'_>, source: CapacitySource) -> Result<DepositReceipt, CallError> {
     let preparation = DepositPreparation::capture(db, sde, destination, type_id).await?;
-    deposit_planned(db, sde, outbox, &preparation, quantity, from, replaced, capacity, &[]).await
+    deposit_planned(db, sde, outbox, &preparation, quantity, from, replaced, source, &[]).await
 }
 
 
 pub(in crate::services) async fn deposit_planned<X: Send>(
     db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<X>,
     preparation: &DepositPreparation, quantity: i64, from: i64,
-    replaced: Replaced<'_>, capacity: Option<f64>, extra_requests: &[crate::dao::items::parent_locks::LockRequest],
+    replaced: Replaced<'_>, source: CapacitySource, extra_requests: &[crate::dao::items::parent_locks::LockRequest],
 ) -> Result<DepositReceipt, CallError> {
     use crate::dao::items::parent_locks::LockStrength;
     use super::inventory::destination::{lock_items, ParentSnapshot};
     let refuse = || notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
     let destination = preparation.destination;
     let observed = match &preparation.classification {
-        DestinationClassification::Excluded => return deposit_statement(db, sde, outbox, preparation, quantity, from, None, None, replaced, capacity).await,
+        DestinationClassification::Excluded => return deposit_statement(db, sde, outbox, preparation, quantity, from, None, None, replaced, source).await,
         DestinationClassification::Item(observed, _) => observed,
     };
     let ancestry = crate::dao::items::deliveries::ancestry(db, destination.location).await.map_err(db_err)?;
@@ -392,13 +397,11 @@ pub(in crate::services) async fn deposit_planned<X: Send>(
     let locks = lock_items(db, sde, &requests, &optional).await?;
     if crate::dao::items::deliveries::ancestry(db, destination.location).await.map_err(db_err)? != ancestry { return Err(refuse()); }
     let current = locks.row(destination.location).ok_or_else(refuse)?;
-    if current.jump_clone_id.is_some() || current.type_id != observed.type_id || current.owner_id != observed.owner_id
-        || current.location_id != observed.location_id || current.flag_id != observed.flag_id
-        || current.quantity != observed.quantity || current.singleton != observed.singleton { return Err(refuse()); }
+    if current.jump_clone_id.is_some() || !current.matches_item_metadata(observed) { return Err(refuse()); }
     let snapshot = (observed.category_id != i64::from(infinity_core::consts::CATEGORY_SHIP))
         .then(|| ParentSnapshot { item: observed.clone(), ancestry });
     let guard = snapshot.as_ref().map(|snapshot| ParentGuard::revalidate(&locks, std::slice::from_ref(snapshot))).transpose()?;
-    deposit_statement(db, sde, outbox, preparation, quantity, from, Some(&locks), guard.as_ref(), replaced, capacity).await
+    deposit_statement(db, sde, outbox, preparation, quantity, from, Some(&locks), guard.as_ref(), replaced, source).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

@@ -1,5 +1,5 @@
 use super::*;
-use infinity_core::consts::FLAG_HI_SLOT_FIRST;
+use infinity_core::consts::{dogma::ATTR_MAX_RANGE, FLAG_HI_SLOT_FIRST};
 use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -34,8 +34,8 @@ impl MiningFixture {
         Fit::load_in_space(&self.f.db, &self.f.world, self.f.system, self.f.owner, self.f.ship).await.map_err(|e| anyhow::anyhow!("fit: {e:?}"))
     }
 
-    async fn extract(&self, fit: &Fit, notify: &crate::space::NotifyTx) -> anyhow::Result<Extraction> {
-        extract(&self.f.db, &self.f.world, notify, self.f.owner, self.f.ship, self.f.system, fit, self.module, self.module_type, FLAG_HI_SLOT_FIRST, self.rock).await.map_err(|e| anyhow::anyhow!("extract: {e:?}"))
+    async fn extract(&self, inputs: crate::services::effects::parameters::MiningInputs, notify: &crate::space::NotifyTx) -> anyhow::Result<Extraction> {
+        extract(&self.f.db, &self.f.world, notify, self.f.owner, self.f.ship, self.f.system, inputs, self.module, self.module_type, FLAG_HI_SLOT_FIRST, self.rock).await.map_err(|e| anyhow::anyhow!("extract: {e:?}"))
     }
 
     async fn snapshot(&self) -> anyhow::Result<(Option<i64>, i64, usize)> {
@@ -64,11 +64,16 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
     let m = MiningFixture::new(10, 1.0).await;
     let result: anyhow::Result<()> = async {
         let fit = m.fit().await?;
+        let inputs = || crate::services::effects::parameters::MiningInputs {
+            range: fit.value(Key::Module(m.module), ATTR_MAX_RANGE),
+            values: yield_values(&fit, Key::Module(m.module)),
+            destination: destination(&fit, m.ore).map(|capacity| Some((capacity.flag(), capacity))),
+        };
         let (notify, mut direct) = tokio::sync::mpsc::unbounded_channel();
         let missing_target = -1;
-        let target = extract(&m.f.db, &m.f.world, &notify, m.f.owner, m.f.ship, m.f.system, &fit, m.module, m.module_type, FLAG_HI_SLOT_FIRST, missing_target).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let target = extract(&m.f.db, &m.f.world, &notify, m.f.owner, m.f.ship, m.f.system, inputs(), m.module, m.module_type, FLAG_HI_SLOT_FIRST, missing_target).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
         anyhow::ensure!(!target.repeat && target.outcome == Some(crate::lua::events::ModuleCycleOutcome::TargetLost));
-        let source = extract(&m.f.db, &m.f.world, &notify, m.f.owner, -1, m.f.system, &fit, m.module, m.module_type, FLAG_HI_SLOT_FIRST, missing_target).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let source = extract(&m.f.db, &m.f.world, &notify, m.f.owner, -1, m.f.system, inputs(), m.module, m.module_type, FLAG_HI_SLOT_FIRST, missing_target).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
         anyhow::ensure!(!source.repeat && source.outcome.is_none());
         let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
         m.f.world.register_pilot(m.f.owner, pilot);
@@ -83,7 +88,7 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
         ];
         for sql in changes {
             m.f.db.execute(sql, &[&m.module]).await?;
-            let rejected = m.extract(&fit, &notify).await;
+            let rejected = m.extract(inputs(), &notify).await;
             m.f.db.execute("UPDATE game.items SET online=true,location_id=$2,flag_id=$3,owner_id=$4,singleton=true WHERE item_id=$1", &[&m.module, &m.f.ship, &FLAG_HI_SLOT_FIRST, &m.f.owner]).await?;
             let rejected = rejected?;
             anyhow::ensure!(!rejected.repeat && rejected.outcome.is_none(), "stale module accepted: {sql}");
@@ -91,17 +96,17 @@ async fn stale_module_and_hull_identity_refuse_without_changes() -> anyhow::Resu
             anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "stale module emitted notification: {sql}");
         }
         m.f.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&m.module, &other_type]).await?;
-        let type_result = m.extract(&fit, &notify).await;
+        let type_result = m.extract(inputs(), &notify).await;
         m.f.db.execute("UPDATE game.items SET type_id=$2 WHERE item_id=$1", &[&m.module, &m.module_type]).await?;
         let type_result = type_result?;
         anyhow::ensure!(!type_result.repeat && type_result.outcome.is_none() && m.snapshot().await? == before, "changed type accepted");
         m.f.db.execute("UPDATE game.items SET singleton=false WHERE item_id=$1", &[&m.f.ship]).await?;
-        let hull_result = m.extract(&fit, &notify).await;
+        let hull_result = m.extract(inputs(), &notify).await;
         m.f.db.execute("UPDATE game.items SET singleton=true WHERE item_id=$1", &[&m.f.ship]).await?;
         let hull_result = hull_result?;
         anyhow::ensure!(!hull_result.repeat && hull_result.outcome.is_none() && m.snapshot().await? == before, "invalid hull accepted");
         m.f.db.execute("DELETE FROM game.items WHERE item_id=$1", &[&m.module]).await?;
-        let missing = m.extract(&fit, &notify).await?;
+        let missing = m.extract(inputs(), &notify).await?;
         anyhow::ensure!(!missing.repeat && missing.outcome.is_none() && m.snapshot().await? == before, "missing module accepted");
         anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "refusal emitted notification");
         Ok(())
@@ -118,14 +123,18 @@ async fn fixed_rounding_commits_only_positive_yield() -> anyhow::Result<()> {
         let before = m.snapshot().await?;
         let mut pending = fixed_intent(m.rock, m.ore, m.volume, 0.5);
         let (owner, ship, system) = (m.f.owner, m.f.ship, m.f.system);
+        crate::dao::items::dogma::set_override(&m.f.db, ship, infinity_core::consts::dogma::ATTR_CAPACITY, m.volume * 10.0).await?;
         for (draw, expected) in [(0.75, false), (0.25, true)] {
             pending.draws.normal_round = draw;
             let sde = m.f.sde.clone();
+            let (old, old_rx) = tokio::sync::mpsc::unbounded_channel();
             let (delivered, entries) = m.f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| {
                 let sde = sde.clone();
                 let pending = pending.clone();
                 Box::pin(async move {
-                    let outcome = deliver(tx, outbox, &sde, owner, ship, system, 1, &pending, (FLAG_CARGO, pending.unit_volume * 10.0)).await?;
+                    let snapshot = crate::services::inventory::hold_storage::HoldCapacity::capture(
+                        &Fit::load_unpiloted(tx, sde.clone(), ship).await?, FLAG_CARGO)?;
+                    let outcome = deliver(tx, outbox, &sde, owner, system, 1, &pending, snapshot).await?;
                     Ok(matches!(outcome, DeliveryOutcome::Delivered(_)))
                 })
             }, |delivered, outbox: crate::db::outbox::Outbox| async move {
@@ -137,7 +146,21 @@ async fn fixed_rounding_commits_only_positive_yield() -> anyhow::Result<()> {
                 let logs = crate::dao::mining_ledger::list(&m.f.db, owner, i64::MIN, i64::MAX).await?;
                 anyhow::ensure!((logs[0].type_id, logs[0].quantity, logs[0].quantity_wasted) == (m.ore, 1, 0), "one-unit ledger incorrect");
                 use crate::db::outbox::{Effect, Notification};
-                anyhow::ensure!(matches!(&entries[..], [Effect::Notification(Notification::Pilot { event: item, .. }), Effect::Notification(Notification::Pilot { event: ore, .. })] if item == "OnItemChange" && ore == "OnOreMined"), "delivery outbox incorrect");
+                anyhow::ensure!(matches!(&entries[..], [Effect::Notification(Notification::Pilot { event: item, .. }), Effect::Notification(Notification::DirectClient { event: ore, .. })] if item == "OnItemChange" && ore == "OnOreMined"), "delivery outbox incorrect");
+                drop(old_rx);
+                anyhow::ensure!(old.is_closed(), "old cycle receiver stayed open");
+                let (fresh, mut fresh_rx) = tokio::sync::mpsc::unbounded_channel();
+                m.f.world.register_pilot(owner, fresh);
+                for entry in entries {
+                    match entry {
+                        Effect::Notification(notification) => notification.dispatch_sender(&m.f.world, Some(&old)).map_err(|e| anyhow::anyhow!("dispatch: {e:?}"))?,
+                        Effect::Operation(never) => match never {},
+                    }
+                }
+                // The committed item fact follows the live owner route exactly once.
+                let (event, _) = fresh_rx.try_recv().map_err(|_| anyhow::anyhow!("new owner missed the committed item fact"))?;
+                anyhow::ensure!(event == "OnItemChange" && fresh_rx.try_recv().is_err(),
+                    "committed fact was not delivered exactly once, or the new owner received the stale cycle");
             } else {
                 anyhow::ensure!(m.snapshot().await? == before && entries.is_empty(), "zero yield changed resources or outbox");
             }
@@ -160,31 +183,36 @@ async fn critical_yield_uses_locked_quantity_across_rollback() -> anyhow::Result
         pending.draws.crit_round = 0.25;
         let calculated = rounding::mining_result(pending.inputs, pending.unit_volume, 3, pending.draws).unwrap();
         anyhow::ensure!((calculated.normal_quantity, calculated.critical_hit_quantity) == (3, 2), "critical yield did not use locked quantity");
+        let (notify, mut direct) = tokio::sync::mpsc::unbounded_channel();
         let (pilot, mut notices) = tokio::sync::mpsc::unbounded_channel();
         m.f.world.register_pilot(m.f.owner, pilot);
         let (owner, ship, system) = (m.f.owner, m.f.ship, m.f.system);
+        crate::dao::items::dogma::set_override(&m.f.db, ship, infinity_core::consts::dogma::ATTR_CAPACITY, m.volume * 10.0).await?;
         for rollback in [true, false] {
             let sde = m.f.sde.clone();
             let world = m.f.world.clone();
+            let cycle = notify.clone();
             let outcome: Result<(), CallError> = m.f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| {
                 let sde = sde.clone();
                 let pending = pending.clone();
                 Box::pin(async move {
-                    assert!(matches!(deliver(tx, outbox, &sde, owner, ship, system, 1, &pending, (FLAG_CARGO, pending.unit_volume * 10.0)).await?, DeliveryOutcome::Delivered(_)));
+                    let snapshot = crate::services::inventory::hold_storage::HoldCapacity::capture(
+                        &Fit::load_unpiloted(tx, sde.clone(), ship).await?, FLAG_CARGO)?;
+                    assert!(matches!(deliver(tx, outbox, &sde, owner, system, 1, &pending, snapshot).await?, DeliveryOutcome::Delivered(_)));
                     if rollback { return Err(CallError::Internal(anyhow::anyhow!("injected rollback"))); }
                     Ok(())
                 })
             }, |(), outbox| async move {
-                crate::db::outbox::dispatch_world((), outbox, &world)
+                crate::db::outbox::dispatch_sender((), outbox, &world, Some(&cycle))
             }).await;
             if rollback {
-                anyhow::ensure!(outcome.is_err() && m.snapshot().await? == before && notices.try_recv().is_err(), "rollback changed resources or sent notices");
+                anyhow::ensure!(outcome.is_err() && m.snapshot().await? == before && notices.try_recv().is_err() && direct.try_recv().is_err(), "rollback changed resources or sent notices");
             } else {
                 outcome.map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 anyhow::ensure!(m.snapshot().await? == (Some(0), 3, before.2 + 1), "committed delivery incorrect");
                 let (first, _) = notices.try_recv()?;
-                let (event, args) = notices.try_recv()?;
-                anyhow::ensure!(first == "OnItemChange" && event == "OnOreMined" && notices.try_recv().is_err(), "delivery notices incorrect");
+                let (event, args) = direct.try_recv()?;
+                anyhow::ensure!(first == "OnItemChange" && event == "OnOreMined" && notices.try_recv().is_err() && direct.try_recv().is_err(), "delivery notices incorrect");
                 let Some(Value::Dict(fields)) = args.first() else { anyhow::bail!("missing ore notice fields") };
                 anyhow::ensure!(fields.iter().any(|(key, value)| *key == Value::str("amountCritBonus") && *value == Value::Int(2)), "critical notice incorrect");
             }
@@ -223,8 +251,13 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
     let db = m.f.db.clone();
     let world = m.f.world.clone();
     let (owner, ship, system, module, module_type, rock) = (m.f.owner, m.f.ship, m.f.system, m.module, m.module_type, m.rock);
+    let inputs = crate::services::effects::parameters::MiningInputs {
+        range: fit.value(Key::Module(module), ATTR_MAX_RANGE),
+        values: yield_values(&fit, Key::Module(module)),
+        destination: destination(&fit, m.ore).map(|capacity| Some((capacity.flag(), capacity))),
+    };
     let mut handle = tokio::spawn(async move {
-        let result = extract(&db, &world, &notify, owner, ship, system, &fit, module, module_type, FLAG_HI_SLOT_FIRST, rock).await;
+        let result = extract(&db, &world, &notify, owner, ship, system, inputs, module, module_type, FLAG_HI_SLOT_FIRST, rock).await;
         result
     });
     let barrier = wait_for_blocked(&observer, blocker).await;
@@ -266,14 +299,13 @@ async fn blocked_extraction(m: &MiningFixture, cancel: bool) -> anyhow::Result<(
         let rock = m.rock;
         anyhow::ensure!(m.f.world.with(m.f.system, move |s| s.rock_field(rock)).await.flatten().is_none(), "depleted rock remains cached");
         anyhow::ensure!(m.f.world.ball(m.f.system, m.rock).await.is_none(), "depleted rock remains in actor");
-        anyhow::ensure!(notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnItemChange") && notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnOreMined") && notices.try_recv().is_err(), "cancelled delivery notices incorrect");
+        anyhow::ensure!(notices.try_recv().map(|n| n.0).ok().as_deref() == Some("OnItemChange") && direct.try_recv().map(|n| n.0).ok().as_deref() == Some("OnOreMined") && notices.try_recv().is_err() && direct.try_recv().is_err(), "cancelled delivery notices incorrect");
     } else {
         anyhow::ensure!(m.snapshot().await? == before, "stale raced extraction changed resources");
         anyhow::ensure!(direct.try_recv().is_err() && notices.try_recv().is_err(), "stale raced extraction emitted notices");
     }
     Ok(())
 }
-
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]

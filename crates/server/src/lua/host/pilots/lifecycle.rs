@@ -6,13 +6,15 @@
 
 use infinity_core::{messages, session::OnlineSession};
 use crate::{dao::characters::selection::{self, SelectedCharacter}, db::outbox::{dispatch_world, Outbox}, lua::events::GameEvent, services::{self, CallError}, space::NotifyTx};
-use super::Resources;
+use super::{Pilots, Resources};
 use crate::services::identity::Identity;
 
 pub(super) struct OnlinePilot {
     pub(super) session: OnlineSession,
     pub(super) notify: NotifyTx,
     drain: tokio::task::JoinHandle<()>,
+    binding: std::sync::Arc<crate::space::containment::PilotBinding>,
+    admitted: bool,
 }
 
 async fn selected(r: &Resources, id: i64) -> Result<SelectedCharacter, CallError> {
@@ -21,7 +23,10 @@ async fn selected(r: &Resources, id: i64) -> Result<SelectedCharacter, CallError
 }
 
 pub(super) async fn snapshot(r: &Resources, id: i64, row: &SelectedCharacter) -> Result<Identity, CallError> {
-    Ok(Identity { char_id: id, corp_id: row.corporation_id, ship_id: selection::ship_id(&r.db, id).await.map_err(services::db_err)?, station_id: row.station_id, system_id: Some(row.solar_system_id) })
+    identity_from(&r.db, id, row).await
+}
+async fn identity_from(db: &crate::db::Db, id: i64, row: &SelectedCharacter) -> Result<Identity, CallError> {
+    Ok(Identity { char_id: id, corp_id: row.corporation_id, ship_id: selection::ship_id(db, id).await.map_err(services::db_err)?, station_id: row.station_id, system_id: Some(row.solar_system_id) })
 }
 /// Mirrors `eve/client/script/parklife/sensorSuiteService.py` `OnEnterSpace`,
 /// which calls `scanMgr.SignalTrackerRegister` after `solarsystemid` is available.
@@ -82,13 +87,29 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
             }
         }
     });
+    // The slot is owned before `prepare`: session, notify receiver, drain task
+    // and binding already exist, so a failed or panicking prepare has exactly
+    // this generation to finish. `ship_id` stays absent until prepare returns.
+    let mut session = OnlineSession { character_id: id, user_id: None, session_id: 0, ship_id: None,
+        station_id: row.station_id.filter(|id| *id > 0), system_id: Some(row.solar_system_id), corporation_id: Some(row.corporation_id),
+        alliance_id: row.alliance_id.filter(|id| *id > 0), faction_id: None, fleet_id: None, role: 0, corporation_role: row.roles };
+    *state = Some(OnlinePilot {
+        session: session.clone(), notify: notify.clone(), drain,
+        binding: bind_headless(&r, id, notify.clone())?, admitted: false,
+    });
     let prepared = match services::presence::prepare(&r.db, &r.world, &r.sde, id, &row,
         |n| services::effects::online::dispatch_notification(n, &r.world, &notify, Some(id))).await {
         Ok(prepared) => prepared,
-        Err(error) => { drain.abort(); return Err(error); }
+        Err(error) => {
+            if let Err(cleanup) = finish_slot(&r.pilots, &r.world, id, Some(&row), &mut state).await {
+                tracing::warn!(?cleanup, char_id = id, "simulated pilot cleanup failed");
+            }
+            return Err(error);
+        }
     };
     let identity = Identity { char_id: id, corp_id: row.corporation_id, ship_id: Some(prepared.ship_id), station_id: row.station_id, system_id: Some(row.solar_system_id) };
-    let mut session = OnlineSession { character_id: id, user_id: None, session_id: 0, ship_id: Some(prepared.ship_id), station_id: row.station_id.filter(|id| *id > 0), system_id: Some(row.solar_system_id), corporation_id: Some(row.corporation_id), alliance_id: row.alliance_id.filter(|id| *id > 0), faction_id: None, fleet_id: None, role: 0, corporation_role: row.roles };
+    session.ship_id = Some(prepared.ship_id);
+    if let Some(pilot) = state.as_mut() { pilot.session = session.clone(); }
     r.pilots.hub.set_profile(id, &row.name, i64::from(row.gender_id), row.corporation_id, row.alliance_id, None, 0);
     services::presence::online(&identity, &r.world, &r.pilots.hub, notify.clone(), None, session.clone());
     let admission = async {
@@ -96,10 +117,7 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
         entered_space(&r, &session).await
     }.await;
     if let Err(error) = admission {
-        if let Err(cleanup) = services::presence::leave(&identity, None, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), None, || {}).await {
-            tracing::warn!(%cleanup, "simulated pilot admission cleanup failed");
-        }
-        drain.abort();
+        finish_slot(&r.pilots, &r.world, id, Some(&row), &mut state).await?;
         return Err(error);
     }
     let reconciled: Result<(), CallError> = async {
@@ -116,13 +134,11 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
         Ok(())
     }.await;
     if let Err(error) = reconciled {
-        if let Err(cleanup) = services::presence::leave(&identity, None, &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), None, || {}).await {
-            tracing::warn!(%cleanup, "simulated pilot reconciliation cleanup failed");
-        }
-        drain.abort();
+        finish_slot(&r.pilots, &r.world, id, Some(&row), &mut state).await?;
         return Err(error);
     }
-    *state = Some(OnlinePilot { session, notify, drain });
+    state.as_mut().expect("headless slot").admitted = true;
+    state.as_mut().expect("headless slot").session = session;
     services::online_status::presence_changed(&r.db, &r.world, id, true).await;
     let world = r.world.clone();
     let user_id = r.pilots.account;
@@ -141,9 +157,69 @@ pub(super) async fn online(r: Resources, id: i64) -> Result<bool, CallError> {
 pub(super) async fn offline(r: Resources, id: i64) -> Result<(), CallError> {
     let (mut state, row) = locked(&r, id).await?;
     if state.is_none() { return Ok(()); }
-    let identity = snapshot(&r, id, &row).await?;
-    let result = services::presence::leave(&identity, Some(r.pilots.account), &r.db, &r.world, &r.pilots.hub, &r.sde, row.station_id.is_none().then_some(row.solar_system_id), None, || {}).await;
-    if let Some(pilot) = state.take() { pilot.drain.abort(); }
-    result.map_err(CallError::Internal)?;
+    finish_slot(&r.pilots, &r.world, id, Some(&row), &mut state).await
+}
+
+fn bind_headless(r: &Resources, id: i64, notify: NotifyTx) -> Result<std::sync::Arc<crate::space::containment::PilotBinding>, CallError> {
+    r.world.bind_pilot(id, notify, Some(crate::space::containment::DisconnectTarget::Headless(std::sync::Arc::downgrade(&r.pilots))), None)
+}
+
+/// One finishing path for ordinary offline, a failed admission and an exact
+/// actor retirement: attempt the real presence leave while the caller's slot
+/// guard serializes it, then always take this exact slot, abort and await its
+/// notification receiver, and release the binding root. The leave's real
+/// result is returned; a never-admitted pilot leaves without a user id.
+async fn finish_slot(pilots: &Pilots, world: &std::sync::Arc<crate::space::World>, id: i64, row: Option<&SelectedCharacter>,
+    state: &mut Option<OnlinePilot>) -> Result<(), CallError> {
+    if state.is_none() { return Ok(()); }
+    let leave = match row {
+        Some(row) => match identity_from(world.db(), id, row).await {
+            Ok(identity) => {
+                let user = state.as_ref().expect("headless slot").admitted.then_some(pilots.account);
+                services::presence::leave(&identity, user, world.db(), world, &pilots.hub, world.sde(),
+                    row.station_id.is_none().then_some(row.solar_system_id), None, || {}).await.map_err(CallError::Internal)
+            }
+            Err(error) => Err(error),
+        },
+        None => Err(CallError::Internal(anyhow::anyhow!("headless character identity unavailable"))),
+    };
+    let Some(pilot) = state.take() else { return leave };
+    pilot.drain.abort();
+    let _ = pilot.drain.await;
+    drop(pilot.binding);
+    leave
+}
+
+/// Retire the exact old generation matching `expected`: an absent or closed
+/// slot is already gone and a live replacement is left alone. The same slot
+/// guard that serializes normal offline verifies the channel and runs the
+/// real cleanup; an ordinary cleanup error is reported, not a lost proof.
+pub(super) async fn retire_generation(pilots: &Pilots, world: &std::sync::Arc<crate::space::World>, character: i64,
+    expected: &NotifyTx) -> Result<(), crate::space::containment::ContainmentFailure>
+{
+    let state = pilots.state(character);
+    let mut guard = state.lock().await;
+    let matched = match guard.as_ref() {
+        Some(pilot) if pilot.notify.same_channel(expected) => true,
+        _ if expected.is_closed() => false,
+        _ => return Err(crate::space::containment::ContainmentFailure::HeadlessOwnerUnproven),
+    };
+    if !matched { return Ok(()); }
+    let selected = selection::selected(world.db(), character, pilots.account).await;
+    let row = match &selected { Ok(row) => row.as_ref(), Err(_) => None };
+    if let Err(error) = finish_slot(pilots, world, character, row, &mut guard).await {
+        tracing::warn!(?error, character, "retired headless pilot cleanup failed");
+    }
+    match selected {
+        Ok(Some(_)) => {}
+        other => {
+            let error = match other {
+                Err(error) => services::db_err(error),
+                Ok(None) => CallError::Internal(anyhow::anyhow!("headless character identity unavailable")),
+                Ok(Some(_)) => unreachable!("matched identity was already returned"),
+            };
+            tracing::warn!(?error, character, "retired headless identity failed after cleanup");
+        }
+    }
     Ok(())
 }

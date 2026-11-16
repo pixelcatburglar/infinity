@@ -30,5 +30,5 @@ fn qa_dispatch(service: &str, method: &str) -> Option<CallResult> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

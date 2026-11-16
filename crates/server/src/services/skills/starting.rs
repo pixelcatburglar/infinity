@@ -21,5 +21,5 @@ pub(super) fn starting_levels(sde: &crate::sde::Sde, race_id: i32) -> impl Itera
         .map(|skill| (skill.type_id, skill.level))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-skills"))]
 mod tests;

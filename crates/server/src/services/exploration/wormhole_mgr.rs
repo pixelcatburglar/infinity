@@ -124,5 +124,5 @@ pub(crate) async fn gm_clear(c: &Client) -> Result<String, CallError> {
     Ok(messages::gm::gm_wh_cleared(count))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

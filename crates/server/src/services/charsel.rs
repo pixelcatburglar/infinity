@@ -120,12 +120,25 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         |value, ()| async move { Ok(value) },
     ).await?
         .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
-    super::ship_cosmetics_mgr::expiry::converge(&c.db, &c.world, char_id, crate::client::filetime_now()).await?;
+    // Space entry captures its actor admission before the first market guard.
+    let admission = if r.station_id.is_none() {
+        Some(c.world.admission(r.solar_system_id).map_err(db_err)?)
+    } else {
+        None
+    };
+    // The exact session binding exists before any prepare or ship publication.
+    c.binding = Some(c.world.bind_pilot(char_id, c.notify_tx.clone(), c.failure.clone().map(crate::space::containment::DisconnectTarget::Tcp), c.binding.as_ref())?);
+    let market = super::market::lock().await;
+    if let Some(token) = &admission {
+        token.check().map_err(db_err)?;
+    }
+    super::ship_cosmetics_mgr::expiry::converge_locked(&c.db, &c.world, char_id, crate::client::filetime_now(), &market).await?;
+    drop(market);
     let station = r.station_id;
     let system = r.solar_system_id;
     let race = r.race_id;
-    let super::presence::Prepared { ship_id: ship, cloak_until } = super::presence::prepare(
-        &c.db, &c.world, &c.sde, char_id, &r,
+    let super::presence::Prepared { ship_id: ship, cloak_until } = super::presence::prepare_for_entry(
+        &c.db, &c.world, &c.sde, char_id, &r, admission,
         |n| super::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid")),
     ).await?;
     let int = Value::Int;
@@ -171,6 +184,11 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     let updates: Vec<_> = values.into_iter().filter(|(name, value)| c.session.int(name) != *value)
         .map(|(name, value)| (name, opt(value))).collect();
     if !updates.is_empty() { c.change_session(updates); }
+    // The shutdown broadcast missed a session created after it ran; enqueue on
+    // the same notify channel so it lands after anything already queued.
+    crate::shutdown::catch_up(&c.world, char_id, c.session.sid, |event, args| {
+        let _ = c.notify_tx.send((event.to_owned(), args));
+    });
     characters::selection::logon(&c.db, char_id).await.map_err(db_err)?;
     let now = crate::client::filetime_now();
     let active = skills::expert_systems::active(&c.db, char_id, now).await.map_err(db_err)?;
@@ -319,5 +337,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

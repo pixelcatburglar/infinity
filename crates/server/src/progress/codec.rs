@@ -64,4 +64,4 @@ pub(crate) fn decode(version: i32, kind: &str, payload: &str) -> anyhow::Result<
     Ok(event)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

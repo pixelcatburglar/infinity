@@ -4,8 +4,11 @@
 //! plus SDE stations and types. Confirmed ordinary ship rigs are destroyed; other
 //! direct contents return to the owning station hangar atomically. Repackaged
 //! hulls become non-singleton items and do not receive a fitting terminal.
+//! Locked items with service-life damage cannot be repackaged.
 //! Structure access, sealed plastic wrap repackaging, and repackaging the contents
 //! of non-ship containers are unsupported.
+//! Corporation-locked and vote-reserved originals are refused before any hull is
+//! flipped into a sellable stack or a fitting is moved or destroyed.
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use crate::client::Client;
@@ -157,6 +160,11 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                 for (&id, children) in &locked_children {
                     if fitting_dao::children(tx, id).await.map_err(db_err)? != *children { return Err(refuse()); }
                 }
+                let affected = roots.iter().map(|item| item.item_id)
+                    .chain(locked_children.values().flatten().copied())
+                    .map(|id| crate::dao::repairable_ship::ItemId::new(id).ok_or_else(refuse))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::services::repairable_ship::service_life::require_pristine(tx, &affected).await?;
                 refund.revalidate(tx, &sde, &locks).await?;
                 let root_ids: Vec<_> = roots.iter().map(|item| item.item_id).collect();
                 let tree = crate::dao::trades::descendants(tx, &root_ids).await.map_err(db_err)?;
@@ -166,6 +174,14 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                 if crate::dao::industry::has_active_blueprint_job(tx, &tree).await.map_err(db_err)? {
                     return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
                 }
+                // Repackaging flips a singleton into a sellable stack and moves or
+                // destroys its contents: screen the mutated roots and children so a
+                // corporation-locked or vote-reserved original is never washed into
+                // a plain stack. Non-ship roots mutate only themselves.
+                let mut guarded = root_ids.clone();
+                guarded.extend(locked_children.values().flatten().copied());
+                let blueprints = crate::services::corps::item_locks::locked_blueprints(&sde, &locks, &guarded)?;
+                crate::services::corps::item_locks::ensure_mutable(tx, &blueprints).await?;
                 let mut pending = BTreeMap::new();
                 let mut destructive = false;
                 for root in &roots {
@@ -253,4 +269,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     match call.method { "RepackageItems" => Some(repackage(c, call).await), _ => None }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

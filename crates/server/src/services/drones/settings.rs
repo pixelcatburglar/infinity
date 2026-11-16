@@ -26,7 +26,7 @@ struct State { owners: HashMap<i64, DroneSettings> }
 
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(STATE.get_or_init(Default::default).lock())
 }
 
 pub(crate) fn parse(args: &[Value]) -> Result<Patch, CallError> {
@@ -71,5 +71,5 @@ pub(crate) fn logged_off(owner: i64) {
     state().owners.remove(&owner);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-combat"))]
 mod tests;

@@ -29,7 +29,9 @@ async fn recover_once(resources: &Resources, now: i64) -> Result<(), CallError> 
         .collect();
     packages.sort_unstable();
     packages.dedup();
-    super::validate_retained(&packages.iter().map(|(namespace, version)| (namespace.as_str(), version.as_str())).collect::<Vec<_>>()).await?;
+    for (namespace, version) in &packages {
+        crate::lua::validate_retained_identity(namespace, version)?;
+    }
     let packages = Arc::new(packages);
     let _market = market::lock().await;
     let world = resources.world.clone();
@@ -91,7 +93,7 @@ async fn recover_once(resources: &Resources, now: i64) -> Result<(), CallError> 
                 after_target.revision = after_target.revision.checked_add(1).ok_or_else(corrupt)?;
                 publications.push(HubPublication { system: updated, hub: Some(after_hub), capture: Some(after_target) });
             }
-            outbox.sovereignty(CommittedPublication { sources: changes, hubs: publications, capitals: capitals.into_values().collect() });
+            outbox.sovereignty(CommittedPublication { sources: changes, hubs: publications, capitals: capitals.into_values().collect(), ..Default::default() });
             Ok(())
         })
     }, |value, outbox| async move { dispatch_world(value, outbox, &world) }).await

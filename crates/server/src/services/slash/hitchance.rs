@@ -2,7 +2,7 @@
 //! The slash client forwards this command; fitted attributes come from game
 //! data and the SDE, while the system actor supplies both sampled balls.
 //! Missing balls are refused; this command does not fire or modify weapons.
-use super::{db_err, slash_error, CallError, Client};
+use super::{args, db_err, slash_error, CallError, Client};
 use infinity_core::consts::{dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_TRACKING_SPEED};
 use infinity_core::messages;
 use crate::services::effects::{registry, weapons::{target_signature, turret_chance, turret_geometry}, EffectKind};
@@ -10,7 +10,7 @@ use crate::services::fit::{Fit, Key};
 
 fn parse(args: &[String]) -> Option<i64> {
     let [target] = args else { return None };
-    target.parse::<i64>().ok().filter(|id| *id > 0)
+    args::positive_i64(target)
 }
 
 
@@ -43,4 +43,4 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     else { Ok(rows.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n")) }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-slash"))] mod tests;

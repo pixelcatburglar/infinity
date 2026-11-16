@@ -36,4 +36,4 @@ pub(super) async fn get(c: &Client, char_id: i64, value: Option<&Value>) -> Resu
     ]))))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

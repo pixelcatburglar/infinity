@@ -97,9 +97,15 @@ impl CombatFacts {
     pub fn runtime_epoch(&self) -> u64 { self.runtime_epoch }
     pub fn is_dirty(&self) -> bool { self.dirty_unsealed_keys != 0 }
     pub fn is_full(&self) -> bool { self.live_key_count >= self.key_capacity || self.batches.len() >= self.handle_capacity }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tests-space"))]
     pub fn key_count(&self) -> usize { self.live_key_count }
     pub fn batch_count(&self) -> usize { self.batches.len() }
+    /// Outstanding replay attempts or unresolved slot reservations: a clean
+    /// journal can still hold in-flight native work that `is_dirty` and
+    /// `batch_count` do not cover. Read-only; used by the NPC sleep admission.
+    pub(in crate::space) fn has_pending_attempts(&self) -> bool {
+        self.replay.has_pending_attempts() || self.slots.iter().flatten().any(|slot| slot.reservations != 0)
+    }
     pub fn register_source(&mut self, activation: [u8; 16], generation: u64, first_sequence: u64) -> Result<(), Refusal> {
         if u64::from_be_bytes(activation[8..].try_into().expect("fixed activation")) != generation { return Err(Refusal::Invalid); }
         self.replay.register(activation, generation, first_sequence)
@@ -171,4 +177,4 @@ impl CombatFacts {
         self.boundaries.import_scope(character, receipt)
     }
 }
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

@@ -30,10 +30,9 @@ fn holds(group: Option<i32>) -> &'static [i32] {
     }
 }
 
-fn plan(requirements: &BTreeMap<i32, i64>, items: &[Item], reserved: &[i64], sde: &crate::sde::Sde, owner: i64) -> Result<BTreeMap<i64, QuantityChange>, CallError> {
+fn plan(requirements: &[(i32, i64)], items: &[Item], reserved: &[i64], sde: &crate::sde::Sde, owner: i64) -> Result<BTreeMap<i64, QuantityChange>, CallError> {
     let mut changes = BTreeMap::new();
-    for (&type_id, &amount) in requirements {
-        let mut remaining = amount;
+    for &(type_id, mut remaining) in requirements {
         let group = sde.types.get(type_id).and_then(|ty| ty.group_id);
         for &flag in holds(group) {
             for item in items.iter().filter(|item| item.type_id == type_id && item.flag_id == flag && item.owner_id == owner && !item.singleton && item.quantity > 0 && reserved.binary_search(&item.item_id).is_err()) {
@@ -50,16 +49,25 @@ fn plan(requirements: &BTreeMap<i32, i64>, items: &[Item], reserved: &[i64], sde
     Ok(changes)
 }
 
-pub(super) async fn consume_cycle(cx: &Ctx, fit: &Fit, modules: &[Module]) -> Result<(), CallError> {
-    let mut requirements = BTreeMap::<i32, i64>::new();
+/// Aggregate every module's positive requirement by type into the reused
+/// buffer; per-module fractions round up before summing.
+pub(super) fn requirements(fit: &Fit, modules: &[Module], mut requirements: Vec<(i32, i64)>) -> Result<Vec<(i32, i64)>, CallError> {
+    requirements.clear();
     for module in modules {
         let key = Key::Module(module.id);
         if let Some((type_id, units)) = requirement(fit.value(key, ATTR_CONSUMPTION_TYPE), fit.value(key, ATTR_CONSUMPTION_QUANTITY))? {
-            if cx.world.sde().types.get(type_id).is_none() { return Err(CallError::Internal(anyhow::anyhow!("unknown module fuel type {type_id}"))); }
-            let total = requirements.entry(type_id).or_default();
-            *total = total.checked_add(units).ok_or_else(|| CallError::Internal(anyhow::anyhow!("module fuel total overflow")))?;
+            if fit.sde().types.get(type_id).is_none() { return Err(CallError::Internal(anyhow::anyhow!("unknown module fuel type {type_id}"))); }
+            match requirements.iter_mut().find(|(id, _)| *id == type_id) {
+                Some((_, total)) => *total = total.checked_add(units).ok_or_else(|| CallError::Internal(anyhow::anyhow!("module fuel total overflow")))?,
+                None => requirements.push((type_id, units)),
+            }
         }
     }
+    requirements.sort_by_key(|(type_id, _)| *type_id);
+    Ok(requirements)
+}
+
+pub(super) async fn consume_cycle(cx: &Ctx, requirements: &[(i32, i64)]) -> Result<(), CallError> {
     if requirements.is_empty() { return Ok(()); }
     let sde = cx.world.sde().clone();
     let world = cx.world.clone();
@@ -68,12 +76,12 @@ pub(super) async fn consume_cycle(cx: &Ctx, fit: &Fit, modules: &[Module]) -> Re
     cx.db.transaction(
         |tx, outbox: &mut Outbox| {
             let sde = sde.clone();
-            let requirements = requirements.clone();
+            let requirements = requirements.to_vec();
             Box::pin(async move {
                 if !ship::lock_reload_ship(tx, ship_id).await.map_err(db_err)? { return Err(refusal()); }
                 let flags = [FLAG_CARGO, FLAG_SPECIALIZED_FUEL_BAY, FLAG_COLONY_RESOURCES_HOLD];
                 let items = load_items(tx, &sde, ItemQuery::LocationOwnerFlags(ship_id, owner, &flags)).await.map_err(db_err)?;
-                let ids: Vec<_> = items.iter().filter(|item| requirements.contains_key(&item.type_id) && !item.singleton && item.quantity > 0).map(|item| item.item_id).collect();
+                let ids: Vec<_> = items.iter().filter(|item| requirements.iter().any(|(id, _)| *id == item.type_id) && !item.singleton && item.quantity > 0).map(|item| item.item_id).collect();
                 let reserved = trades::reserved(tx, &ids).await.map_err(db_err)?;
                 let changes = plan(&requirements, &items, &reserved, &sde, owner)?;
                 if !quantities::apply(tx, &changes).await.map_err(db_err)? { return Err(refusal()); }
@@ -86,8 +94,8 @@ pub(super) async fn consume_cycle(cx: &Ctx, fit: &Fit, modules: &[Module]) -> Re
                 Ok(())
             })
         },
-        |value, outbox| async move { dispatch_sender(value, outbox, &world, &sender) },
+        |value, outbox| async move { dispatch_sender(value, outbox, &world, Some(&sender)) },
     ).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

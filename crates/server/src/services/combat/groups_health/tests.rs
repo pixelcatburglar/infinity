@@ -1,15 +1,16 @@
 //! Health and capacitor boundary tests without a database or running system actor.
 use super::*;
 
-mod db_smoke;
-mod fixture;
-mod rewards;
+#[cfg(feature = "tests-combat")] mod db_smoke;
+#[cfg(feature = "tests-combat")] mod rewards;
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects"))]
 /// Drain up to the requested amount for capacitor integration tests.
 pub(in crate::services) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
     Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
+#[cfg(feature = "tests-ships")]
 pub(in crate::services) fn replace_capacitor_test_entry(ship: i64, entry: Option<(f64, i64)>) -> Option<(f64, i64)> {
     let mut state = state();
     match entry {
@@ -18,6 +19,7 @@ pub(in crate::services) fn replace_capacitor_test_entry(ship: i64, entry: Option
     }
 }
 
+#[cfg(feature = "tests-ships")]
 pub(in crate::services) fn capacitor_snapshot_for_capture(ship: i64, capacity: f64, recharge_tau_ms: f64) -> (i64, f64) {
     let mut st = state();
     let now = filetime_now();
@@ -25,14 +27,14 @@ pub(in crate::services) fn capacitor_snapshot_for_capture(ship: i64, capacity: f
     (now, result.after)
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn recharge_uses_existing_curve_and_never_runs_backwards() {
     let level = recharge(25.0, 100.0, 1000.0, 1.0);
     assert!((level - 100.0 * (1.0 - 0.5 * (-5.0_f64).exp()).powi(2)).abs() < 1e-9);
     assert_eq!(recharge(25.0, 100.0, 1000.0, -1.0), 25.0);
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn injection_and_capacity_are_clamped() {
     let mut entries = HashMap::new();
     entries.insert(1, (80.0, 0));
@@ -44,7 +46,7 @@ fn injection_and_capacity_are_clamped() {
     assert_eq!(result.after, 0.0);
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn drone_assistance_rejects_missing_or_self_source() {
     let system = crate::space::System::new(1, std::sync::Arc::default(), 0);
     for target in [1, 2] {
@@ -54,7 +56,7 @@ fn drone_assistance_rejects_missing_or_self_source() {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn drain_is_partial_and_negative_input_cannot_add_energy() {
     let mut entries = HashMap::new();
     entries.insert(1, (30.0, 0));
@@ -66,7 +68,7 @@ fn drain_is_partial_and_negative_input_cannot_add_energy() {
     assert_eq!((result.after, result.amount), (0.0, 0.0));
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn warp_debit_uses_shared_recharged_balance_and_partial_drain() {
     let ship = -920_202;
     state().capacitor.insert(ship, (25.0, FILETIME_SECOND));
@@ -79,7 +81,7 @@ fn warp_debit_uses_shared_recharged_balance_and_partial_drain() {
     state().capacitor.remove(&ship);
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn warp_debit_and_module_operations_share_one_balance() {
     let ship = -920_203;
     state().capacitor.insert(ship, (100.0, FILETIME_SECOND));
@@ -96,7 +98,7 @@ fn warp_debit_and_module_operations_share_one_balance() {
 }
 
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn concurrent_warp_and_module_debits_cannot_double_spend() {
     let ship = -920_204;
     state().capacitor.insert(ship, (100.0, FILETIME_SECOND));
@@ -116,7 +118,7 @@ fn concurrent_warp_and_module_debits_cannot_double_spend() {
     assert!(warp >= 0.0 && module >= 0.0);
     assert_eq!(state().capacitor.remove(&ship).unwrap().0, 0.0);
 }
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn refused_cycle_drain_leaves_stored_state_untouched() {
     let mut entries = HashMap::new();
     entries.insert(1, (20.0, 0));
@@ -125,7 +127,7 @@ fn refused_cycle_drain_leaves_stored_state_untouched() {
     assert_eq!(entries.get(&1), Some(&(20.0, 0)));
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn fitting_capacitor_rebases_old_curve_and_preserves_depletion() {
     let mut entries = HashMap::new();
     entries.insert(1, (25.0, 0));
@@ -141,7 +143,7 @@ fn fitting_capacitor_rebases_old_curve_and_preserves_depletion() {
     assert_eq!(rebase_capacitor_at(&mut entries, 3, 100.0, 1000.0, 200.0, 0), (0.0, 0.0));
 }
 
-#[test]
+#[cfg(feature = "tests-combat")] #[test]
 fn actor_fitting_publication_keeps_intervening_capacitor_spend() {
     use crate::services::fit::attributes::tests::ship_fit;
     use crate::space::{Ball, System, MODE_STOP};
