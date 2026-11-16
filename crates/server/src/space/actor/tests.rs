@@ -170,10 +170,21 @@ fn summary_cost_excluded_from_tick() {
         ready: Arc<std::sync::Barrier>, done: Arc<std::sync::Barrier>, fired: std::sync::atomic::AtomicBool }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
         fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-            let mut fields = Vec::new(); event.record(&mut Visit(&mut fields));
-            if *event.metadata().level() == tracing::Level::INFO
-                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) { self.ready.wait(); self.done.wait(); }
-            let _ = self.tx.send((*event.metadata().level(), fields));
+            let mut fields = Vec::new();
+            event.record(&mut Visit(&mut fields));
+            let level = *event.metadata().level();
+            let expected = match level {
+                tracing::Level::INFO => fields.iter().any(|(name, _)| *name == "window_ns"),
+                tracing::Level::TRACE => fields.iter().any(|(name, _)| *name == "duration_us"),
+                tracing::Level::WARN => fields.iter().any(|(name, _)| *name == "duration_ns"),
+                _ => false,
+            };
+            if event.metadata().target() != "infinity_server::space::actor" || !expected { return; }
+            if level == tracing::Level::INFO && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.ready.wait();
+                self.done.wait();
+            }
+            let _ = self.tx.send((level, fields));
         }
     }
     use tracing_subscriber::layer::SubscriberExt as _;
