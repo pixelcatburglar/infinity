@@ -74,9 +74,9 @@ pub(super) async fn guarded_capacitor(f: &Fixture, target: usize, source: usize,
     let guard = NpcCapacitorGuard::Attack { source: source_ship, target: target_ship, source_guard: None, player: None, optimal, falloff: 0.0, offensive: false };
     let capacity = capacitor_snapshot(&r.db, &r.world, system, target_ship).await.unwrap().unwrap().capacity;
     assert!(capacity.is_finite() && capacity > 0.0);
-    let drained = drain_exact_guarded(&r.db, &r.world, system, target_ship, capacity / 4.0, guard.clone()).await.unwrap().expect("guarded drain must be admitted").0;
+    let drained = drain_exact_guarded(&r.db, &r.world, system, target_ship, capacity / 4.0, None, guard.clone()).await.unwrap().expect("guarded drain must be admitted").0;
     assert!(drained > 0.0);
-    let accepted = inject_guarded(&r.db, &r.world, system, target_ship, drained, guard).await.unwrap();
+    let accepted = inject_guarded(&r.db, &r.world, system, target_ship, drained, None, guard).await.unwrap();
     if blocked { assert_eq!(accepted, 0.0, "remote capacitor assistance must be blocked"); }
     else { assert!(accepted > 0.0, "eligible remote capacitor assistance must be admitted"); }
 }
@@ -92,9 +92,9 @@ pub(super) async fn self_capacitor(f: &Fixture, ship: usize, other: usize) {
     }).await.unwrap();
     let guard = NpcCapacitorGuard::Attack { source: ship, target: other, source_guard: None, player: None, optimal, falloff: 0.0, offensive: false };
     let capacity = capacitor_snapshot(&r.db, &r.world, system, ship).await.unwrap().unwrap().capacity;
-    let drained = drain_exact_guarded(&r.db, &r.world, system, ship, capacity / 4.0, guard.clone()).await.unwrap().expect("self drain must be admitted").0;
+    let drained = drain_exact_guarded(&r.db, &r.world, system, ship, capacity / 4.0, None, guard.clone()).await.unwrap().expect("self drain must be admitted").0;
     assert!(drained > 0.0);
-    assert!(inject_guarded(&r.db, &r.world, system, ship, drained, guard).await.unwrap() > 0.0, "self capacitor injection must remain admitted");
+    assert!(inject_guarded(&r.db, &r.world, system, ship, drained, None, guard).await.unwrap() > 0.0, "self capacitor injection must remain admitted");
 }
 
 /// Start a real SDE assistance projection before the capital link is admitted.

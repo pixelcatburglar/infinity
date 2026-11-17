@@ -4,7 +4,7 @@
 //! invalid dispatch returns internal errors, and unexpected cleanup logs a warning.
 //! Effect animations are published through the system's ordered scene channel.
 use super::parameters::{direct_damage_weapon, MasterPacket, MemberInputs, MemberPacket};
-use super::{EffectKind, repair, mining, capacitor, projected, range, ecm, aoe, bombs, vorton, cloak, mjd, compression, tractor, scan, targeting, salvage};
+use super::{EffectKind, repair, mining, capacitor, projected, range, ecm, aoe, bombs, vorton, cloak, mjd, compression, tractor, scan, targeting, salvage, defenders};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::lifecycle::{Module, Cycle, CycleOutcome, charge_kind, UE_TYPEID};
 use super::fx::weapon_fx;
@@ -20,18 +20,18 @@ use crate::space::{special_fx, FxModule, System, MODE_WARP, system::presentation
 use marshal::Value;
 use std::sync::Arc;
 use tracing::warn;
-fn repair_inputs(cycle: &Cycle) -> Result<(f64, f64, f64, f64), CallError> {
+fn repair_inputs(cycle: &Cycle) -> Result<(f64, f64, f64, f64, Option<i32>), CallError> {
     let Some(MasterPacket::Repair(inputs)) = cycle.inputs.frame.as_ref().map(|frame| &frame.packet) else {
         return Err(CallError::Internal(anyhow::anyhow!("repair cycle captured without repair inputs")));
     };
-    Ok((inputs.base, inputs.charged, inputs.ranges.optimal, inputs.ranges.falloff))
+    Ok((inputs.base, inputs.charged, inputs.ranges.optimal, inputs.ranges.falloff, inputs.resistance_attribute))
 }
 
 async fn remote_repair(cx: &Ctx, cycle: &mut Cycle, layer: usize) -> Result<CycleOutcome, CallError> {
     let Some(mut attempt) = cycle.owner.pending_combat.take() else {
         return Err(CallError::Internal(anyhow::anyhow!("missing remote repair attempt")));
     };
-    let (_, _, optimal, falloff) = repair_inputs(cycle)?;
+    let (_, _, optimal, falloff, resistance_attribute) = repair_inputs(cycle)?;
     let Ok((target, pilot, multiplier)) = repair::target(cx, cycle.target, optimal, falloff).await else {
         return Ok(super::lifecycle::target_loss(cycle).await);
     };
@@ -57,13 +57,61 @@ async fn remote_repair(cx: &Ctx, cycle: &mut Cycle, layer: usize) -> Result<Cycl
     };
     let amount = cycle.repair_amount * multiplier;
     let result = crate::services::combat::damage::repair_target(&cx.world, cx.system_id, target, layer, amount,
-        crate::space::combat::RepairSource::Remote(attempt.facts()), guard).await;
+        resistance_attribute, crate::space::combat::RepairSource::Remote(attempt.facts()), guard).await;
     if result.is_ok() { attempt.disarm(); }
     result?;
     Ok(CycleOutcome::Continue)
 }
 
+async fn defender_cycle(cx: &Ctx, cycle: &mut Cycle) -> Result<Option<CycleOutcome>, CallError> {
+    if !matches!(cycle.effect.kind, EffectKind::Missile) { return Ok(None); }
+    for index in 0..cycle.modules.len() {
+        let (charge, module) = {
+            let Some(member) = cycle.inputs.members.get(index) else { continue };
+            let MemberPacket::Missile(inputs) = &member.packet else { continue };
+            let Some(charge) = inputs.charge else { continue };
+            (charge, cycle.modules[index].clone())
+        };
+        let Some(module_type) = cx.world.sde().types.get(module.type_id) else { continue };
+        let Some(charge_type) = cx.world.sde().types.get(charge) else { continue };
+        if module_type.group_id != Some(defenders::GROUP_MISSILE_LAUNCHER_DEFENDER)
+            || charge_type.group_id != Some(defenders::GROUP_DEFENDER_MISSILE) {
+            continue;
+        }
+        if !defenders::is_defender_fit(module_type.group_id, cycle.effect.id as i32, charge_type.group_id,
+            cx.world.sde().types.effects(charge).iter().map(|row| row.effect_id)) {
+            continue;
+        }
+        let inputs = {
+            let MemberPacket::Missile(inputs) = &cycle.inputs.members[index].packet else { continue };
+            super::parameters::MissileInputs {
+                charge: inputs.charge, raw: inputs.raw, aoe_cloud: inputs.aoe_cloud,
+                aoe_velocity: inputs.aoe_velocity, drf: inputs.drf, velocity: inputs.velocity,
+                flight_time_ms: inputs.flight_time_ms,
+            }
+        };
+        let Some(attempt) = super::lifecycle::combat_source::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
+            return Ok(Some(CycleOutcome::Stop("activation lost")));
+        };
+        let (permit, token) = cycle.inputs.members[index].take_charge();
+        let Some((target_id, target_token)) = defenders::reserve_target(cx,
+            inputs.velocity * crate::space::ms_to_seconds(inputs.flight_time_ms)).await else {
+            defenders::release_permit(cx, permit);
+            return Ok(Some(CycleOutcome::Stop("no Defender target")));
+        };
+        let Some(charge) = consume_charge(cx, permit, token).await else {
+            defenders::release_target(cx, target_id).await;
+            return Ok(Some(CycleOutcome::Stop("out of charges")));
+        };
+        defenders::start(cx, &inputs, &module, charge, target_id, target_token, attempt).await?;
+        cycle.charge_type = Some(charge);
+        return Ok(Some(CycleOutcome::Continue));
+    }
+    Ok(None)
+}
+
 pub(super) async fn on_cycle_start(cx: &Ctx, cycle: &mut Cycle, charged: bool) -> Result<CycleOutcome, CallError> {
+    if let Some(outcome) = defender_cycle(cx, cycle).await? { return Ok(outcome); }
     use EffectKind::*;
     let outcome = match cycle.effect.kind {
         Turret | Missile => {
@@ -157,13 +205,13 @@ pub(super) async fn on_cycle_start(cx: &Ctx, cycle: &mut Cycle, charged: bool) -
             Ok(CycleOutcome::Continue)
         }
         LocalRepair { layer, .. } => {
-            let (base, charged_amount, _, _) = repair_inputs(cycle)?;
+            let (base, charged_amount, _, _, _) = repair_inputs(cycle)?;
             cycle.repair_amount = if charged { charged_amount } else { base };
             repair::apply(cx, cycle, layer, cycle.repair_amount, true).await?;
             Ok(CycleOutcome::Continue)
         }
         FueledLocalRepair { layer, .. } => {
-            let (base, charged_amount, _, _) = repair_inputs(cycle)?;
+            let (base, charged_amount, _, _, _) = repair_inputs(cycle)?;
             let module = &cycle.modules[0];
             if !charged && !empty_charge(cx, module).await { return Ok(CycleOutcome::Stop("out of charges")); }
             cycle.repair_amount = if charged { charged_amount } else { base };
@@ -178,7 +226,7 @@ pub(super) async fn on_cycle_start(cx: &Ctx, cycle: &mut Cycle, charged: bool) -
             Ok(CycleOutcome::Continue)
         }
         RemoteRepair { layer } => {
-            let (base, charged_amount, optimal, falloff) = repair_inputs(cycle)?;
+            let (base, charged_amount, optimal, falloff, _) = repair_inputs(cycle)?;
             if repair::target(cx, cycle.target, optimal, falloff).await.is_err() {
                 return Ok(super::lifecycle::target_loss(cycle).await);
             }
@@ -230,12 +278,13 @@ pub(super) async fn on_cycle_start(cx: &Ctx, cycle: &mut Cycle, charged: bool) -
             Ok(CycleOutcome::Continue)
         }
         Ecm | BurstJammer => ecm::start(cx, cycle).await,
+        SuperWeapon => super::super_weapon::start(cx, cycle).await,
         Propulsion | Modifiers => Ok(CycleOutcome::Continue),
         Smartbomb => aoe::start(cx, cycle).await,
         Bomb => bombs::start(cx, cycle).await,
         Vorton => vorton::start(cx, cycle).await,
-        Cloak => cloak::start(cx, cycle).await,
         MicroJumpDrive => mjd::start(cx, cycle).await,
+        Cloak => cloak::start(cx, cycle).await,
         Compression => compression::start(cx, cycle).await,
         Tractor => tractor::start(cx, cycle).await,
         CargoScan | ShipScan | SurveyScan => scan::start(cx, cycle).await,
@@ -260,6 +309,7 @@ pub(super) async fn on_cycle_end(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOut
         MicroJumpDrive => mjd::end(cx, cycle).await,
         Salvage => salvage::end(cx, cycle).await,
         CargoScan | ShipScan | SurveyScan => scan::end(cx, cycle).await,
+        SuperWeapon => super::super_weapon::end(cx, cycle).await,
         Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer | Smartbomb | Vorton | Cloak | Tractor | AutoTarget | PassiveTarget | Bomb | Compression | Entosis => Ok(CycleOutcome::Continue),
         kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle end kind: {kind:?}"))),
     }
@@ -268,13 +318,14 @@ pub(super) async fn on_cycle_end(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOut
 pub(super) fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
     use EffectKind::*;
     match cycle.effect.kind {
-        Turret | Missile | BurstJammer | Smartbomb | Bomb | Vorton => {
+        Turret | Missile | BurstJammer | Smartbomb | Bomb | Vorton | SuperWeapon => {
             if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()) {
                 s.publish_destiny(cx.ship_id, |stamp| cycle.modules.iter().map(|m| special_fx(
                     stamp, cx.ship_id, Some(FxModule { item: Some(m.id), type_id: m.type_id }),
                     cycle.target, cycle.charge_type.map(i64::from), guid, cycle.effect.has(EffectFlag::Offensive),
                     0, 0, Value::Float(cycle.duration_ms), cycle.repeat, None, 0, Value::None)).collect());
             }
+            if matches!(cycle.effect.kind, SuperWeapon) { super::super_weapon::stop(s, cx, cycle); }
         }
         FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm => {
             s.retire_fx_activation(cycle.modules[0].id, &cycle.stop);
@@ -308,6 +359,7 @@ pub(super) struct Activation {
     pub(super) effect: Effect,
     pub(super) module: Module,
     pub(super) target: Option<i64>,
+    pub(super) aim: Option<super::parameters::SuperWeaponAim>,
 }
 
 pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(), CallError> {
@@ -363,6 +415,7 @@ pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) ->
         }
         CapTransfer | Neutralizer | Nosferatu | CapBooster => capacitor::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Ecm | BurstJammer => ecm::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        SuperWeapon => super::super_weapon::validate(cx, fit, activation).await,
         Propulsion if activation.effect.id == i64::from(EFFECT_MICROWARPDRIVE) => {
             if fit.value(Key::Module(activation.module.id), ATTR_ACTIVATION_BLOCKED) > 0.0 {
                 return Err(user_error(messages::MSG_MODULE_IS_BLOCKED, vec![]));

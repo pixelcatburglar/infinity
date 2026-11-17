@@ -226,7 +226,7 @@ fn bomb_flight_and_timer_begin_at_same_boundary() {
     bomb.max_vel = 50.0;
     let fired = Arc::new(AtomicBool::new(false));
     let hit = fired.clone();
-    s.launch_bomb(bomb, [1.0, 0.0, 0.0], 500, move |_, _| { hit.store(true, Ordering::Relaxed); });
+    s.launch_bomb(bomb, [1.0, 0.0, 0.0], 500, 0.0, move |_, _| { hit.store(true, Ordering::Relaxed); });
     s.tick(1500);
     assert!(!fired.load(Ordering::Relaxed));
     assert_eq!(s.ball(3).unwrap().mode, MODE_STOP);

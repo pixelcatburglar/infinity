@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Scale multiplier and divisor operands around their neutral value, rather
 /// than scaling the operand itself. Percent and additive operands have zero
 /// as their neutral value.
-fn scaled(value: f64, op: i32, strength: f64) -> f64 {
+pub(crate) fn scaled(value: f64, op: i32, strength: f64) -> f64 {
     match op {
         OP_PRE_MUL | OP_PRE_DIV | OP_POST_MUL | OP_POST_DIV => 1.0 + (value - 1.0) * strength,
         _ => value * strength,
@@ -83,7 +83,19 @@ async fn insert(world: &Arc<World>, system: i64, source: i64, target: i64, modul
         let until_ms = if duration_ms < 0.0 { i64::MAX } else {
             s.now_ms().saturating_add(duration_ms as i64).saturating_add(seconds_to_ms(1.0) as i64)
         };
-        let mut projection = Projection { source_ship: source, source_module: module, source_type, effect_id, kind, until_ms, values, charge_values, charge_type, scramble: None };
+        let mut projection = Projection {
+            source_ship: source,
+            source_module: module,
+            source_type,
+            effect_id,
+            kind,
+            until_ms,
+            values,
+            charge_values,
+            charge_type,
+            resistance_attribute: inputs.resistance_attribute,
+            scramble: None,
+        };
         if matches!(kind, super::EffectKind::Projected { jamming: super::JammingType::Scramble }) {
             let token = attempt.as_mut().ok_or(crate::space::combat_facts::Refusal::Invalid)?;
             let facts = token.facts();

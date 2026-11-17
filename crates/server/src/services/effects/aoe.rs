@@ -13,7 +13,7 @@ use infinity_core::consts::dogma::ATTR_EMP_FIELD_RANGE;
 use infinity_core::messages;
 use crate::db::Db;
 use crate::services::combat::{self, Ctx, ATTR_DAMAGE};
-use crate::services::combat::damage::{DamageSource, complete_damage_outcome};
+use crate::services::combat::damage;
 use crate::services::fit::{Fit, Key};
 use crate::services::{user_error, CallError};
 use crate::space::{dist, Ball, System, World, V3, MODE_WARP};
@@ -45,12 +45,16 @@ pub(super) enum DamageGuard {
 /// absolute sampled velocity independently through the shared missile
 /// formula; there is no turret chance, miss or wrecking roll.
 #[derive(Clone, Copy)]
-pub(super) enum DamageApplication {
+pub(crate) enum DamageApplication {
     /// One fixed typed damage vector applied to every victim.
     Fixed([f64; 4]),
     /// Vorton packet: charge-raw damage scaled per target by missile
     /// application on that target's own signature and absolute speed.
     Vorton(super::parameters::VortonInputs),
+    /// Fitted-signature scaling: `raw` scaled per target by
+    /// `min(1, target_signature / signature_radius)`; a non-positive radius
+    /// applies the full vector and a zero factor skips the victim.
+    Signature { raw: [f64; 4], signature_radius: f64 },
 }
 
 pub(super) async fn apply_damage_guarded(
@@ -71,7 +75,6 @@ pub(super) async fn apply_damage_guarded(
     let db = db.clone();
     let deferred = guard.is_none();
     let result = world.with(system, move |s| {
-        let result = (|| {
         let valid_source = match guard {
             None => true,
             Some(DamageGuard::Player(master, generation)) => generation_valid(master, &generation)
@@ -79,78 +82,12 @@ pub(super) async fn apply_damage_guarded(
             Some(DamageGuard::Npc(source, hostile, generation)) => s.npc_projection_valid(source, hostile, generation)
                 && s.ball(source).is_some_and(|ball| ball.mode != MODE_WARP),
         };
-        if !valid_source { return Ok((Vec::new(), None, Vec::new())); }
-        s.observe_combat_utc().map_err(|error| match error {
-            crate::space::combat_facts::Refusal::Full => crate::services::combat::capacity::refusal(system),
-            other => CallError::Internal(anyhow::anyhow!("area boundary refusal: {other:?}")),
-        })?;
-        let at = s.combat_observed_time();
-        victims.sort_unstable_by_key(|entry| entry.0);
-        let mut targets = Vec::with_capacity(victims.len());
-        let mut projectiles = Vec::new();
-        for (target, pilot, membership, illegal, report) in &mut victims {
-            let (target, pilot, membership, illegal) = (*target, *pilot, *membership, *illegal);
-            if s.projectile_damageable(target) {
-                let base = match application {
-                    DamageApplication::Fixed(raw) => raw,
-                    DamageApplication::Vorton(inputs) => inputs.raw,
-                };
-                projectiles.push((target, base));
-                continue;
-            }
-            if !s.ball(target).is_some_and(|ball| ball.char_id == pilot)
-                || s.combat_membership_generation(target) != membership { continue; }
-            if s.is_damage_immune(target) { continue; }
-            let raw = match application {
-                DamageApplication::Fixed(raw) => {
-                    *report = Some((super::weapons::hit_quality(1.0), 0.0));
-                    raw
-                }
-                DamageApplication::Vorton(inputs) => {
-                    let Some(victim) = s.sampled_ball(target) else { continue };
-                    *report = Some((super::weapons::hit_quality(1.0), 0.0));
-                    super::vorton::vorton_application(inputs.raw,
-                        super::weapons::target_signature(&sde, &victim),
-                        dist(victim.vel, [0.0; 3]), inputs.aoe_cloud, inputs.aoe_velocity, inputs.drf)
-                }
-            };
-            let source = DamageSource { attacker_id: attacker, attacker_ball_id: Some(ship),
-                source_ship_id: Some(ship), source_ship_type: Some(facts.entity.type_id),
-                weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal };
-            match s.plan_area_damage(target, raw, source, at) {
-                Some(plan) => targets.push(plan),
-                None if matches!(s.combat_phase(target), Some(crate::space::combat::CombatPhase::Live)) =>
-                    return Err(CallError::Internal(anyhow::anyhow!("area damage plan failed for live target"))),
-                None => { *report = None; }
-            }
-        }
-        targets.sort_unstable_by_key(|target| (target.target.item_id, target.target.incarnation));
-        let applied = if targets.is_empty() { s.admit_area_source(facts, &mut [], at, |_| valid_source) }
-            else { s.apply_area_damage(facts, &mut targets, at, |_| valid_source) };
-        attempt.disarm();
-        match applied {
-            Ok(false) => return Ok((Vec::new(), None, victims)),
-            Err(crate::space::combat_facts::Refusal::Full) => return Err(crate::services::combat::capacity::refusal(system)),
-            Err(crate::space::combat_facts::Refusal::Replay | crate::space::combat_facts::Refusal::Busy) => return Ok((Vec::new(), None, Vec::new())),
-            Err(error) => return Err(CallError::Internal(anyhow::anyhow!("area combat refusal: {error:?}"))),
-            Ok(true) => {}
-        }
-        for (target, projectile_raw) in projectiles { s.apply_projectile_damage(target, projectile_raw); }
-        let mut receipts = Vec::new();
-        let mut first_error = None;
-        for target in &mut targets {
-            let Some(outcome) = target.payload.outcome.take() else { continue };
-            if let Ok(index) = victims.binary_search_by_key(&target.target.item_id, |entry| entry.0) {
-                if let Some((_, dealt)) = victims[index].4.as_mut() { *dealt = outcome.dealt; }
-            }
-            match complete_damage_outcome(s, &db, system, target.target.item_id, outcome) {
-                Ok((_, Some(receipt))) => receipts.push(receipt),
-                Ok((_, None)) => {},
-                Err(error) => if first_error.is_none() { first_error = Some(error); },
-            }
-        }
-        Ok((receipts, first_error, victims))
-        })();
+        let completion = damage::apply_area_damage_in_actor(s, &db, system, weapon, &mut victims, application, facts, &sde, valid_source);
+        if completion.attempt_finished { attempt.disarm(); }
+        let result = match completion.fatal {
+            Some(error) => Err(error),
+            None => Ok((completion.receipts, completion.first_error, victims)),
+        };
         (result, attempt)
     }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("combat actor unavailable")))?;
     let (result, attempt) = result;

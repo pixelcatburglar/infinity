@@ -19,10 +19,15 @@ pub(super) struct Tractor {
 }
 
 /// One registered bomb flight: the ball incarnation token that fences its
-/// launch action and delay timer, plus the callback completed exactly once by
+/// launch action and delay timer, the launch-time owner identity and fitted
+/// blast reach for Defender threat checks, the armed detonation deadline
+/// once the launch applies, plus the callback completed exactly once by
 /// whichever terminal consumes it first.
 pub(super) struct BombFlight {
     token: BallToken,
+    identity: Option<crate::services::effects::defenders::ProjectileIdentity>,
+    blast_range: f64,
+    detonate_at_ms: Option<i64>,
     impact: Box<dyn FnOnce(&mut System, Option<V3>) + Send>,
 }
 
@@ -121,7 +126,7 @@ impl System {
     /// valid damageable profile: a refusal completes `impact` as `None`
     /// without inserting. Actors without an SDE keep the neutral motion
     /// behaviour and register no capability.
-    pub(crate) fn launch_bomb(&mut self, ball: Ball, heading: V3, delay_ms: u64,
+    pub(crate) fn launch_bomb(&mut self, ball: Ball, heading: V3, delay_ms: u64, blast_range: f64,
         impact: impl FnOnce(&mut System, Option<V3>) + Send + 'static) {
         let profile = match self.sde() {
             Some(sde) => match crate::space::damageable::DamageableProjectile::from_sde(sde, ball.type_id) {
@@ -132,11 +137,14 @@ impl System {
         };
         let id = ball.id;
         self.add_ship(ball);
+        let identity = self.projectile_identity(id);
         if let Some(profile) = profile {
             self.damageable_projectiles.insert(id, profile);
         }
         let token = self.capture_ball(id).expect("inserted bomb");
-        self.bomb_flights.insert(id, BombFlight { token, impact: Box::new(impact) });
+        self.bomb_flights.insert(id, BombFlight {
+            token, identity, blast_range, detonate_at_ms: None, impact: Box::new(impact),
+        });
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
             if !s.ball_token_current(token) { return; }
             let Some(ball) = s.balls.get_mut(&id) else { return };
@@ -153,6 +161,9 @@ impl System {
                 event(stamp, "GotoDirection", vec![Value::Int(id), Value::Float(heading[0]), Value::Float(heading[1]), Value::Float(heading[2])]),
                 event(stamp, "SetSpeedFraction", vec![Value::Int(id), Value::Float(1.0)]),
             ]);
+            if let Some(flight) = s.bomb_flights.get_mut(&id) {
+                flight.detonate_at_ms = Some(s.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)));
+            }
             s.schedule(delay_ms, move |s| s.resolve_bomb(token));
         })));
     }
@@ -185,6 +196,41 @@ impl System {
     pub(crate) fn projectile_damageable(&self, id: i64) -> bool {
         self.damageable_projectiles.contains_key(&id)
     }
+    /// Select and reserve one hostile bomb whose remaining blast path still
+    /// covers the source, inside `reach_m` surface distance. The source must
+    /// be a known, present, non-warping pilot ball: an unknown source fails
+    /// closed, exactly like an unknown projectile identity.
+    pub(crate) fn reserve_defender_target(&mut self, source_id: i64, reach_m: f64)
+        -> Option<(i64, crate::space::system::observers::BallToken)> {
+        if !reach_m.is_finite() || reach_m <= 0.0 { return None; }
+        let source_identity = self.projectile_identity(source_id)?;
+        let source_ball = self.ball(source_id)?;
+        if source_ball.is_warping() { return None; }
+        let (source_pos, source_radius) = (source_ball.position_at(self.ms), f64::from(source_ball.radius));
+        let mut candidates = Vec::new();
+        for (&id, flight) in &self.bomb_flights {
+            if id == source_id || self.defender_reservations.contains(&id) { continue; }
+            let (Some(identity), Some(detonate_at_ms)) = (flight.identity, flight.detonate_at_ms) else { continue; };
+            let Some(bomb) = self.ball(id) else { continue };
+            let (bomb_pos, bomb_vel) = bomb.state_at(self.ms);
+            let surface_distance = (crate::space::dist(source_pos, bomb_pos)
+                - source_radius - f64::from(bomb.radius)).max(0.0);
+            if !surface_distance.is_finite() || surface_distance > reach_m { continue; }
+            let endpoint = crate::space::add(bomb_pos, crate::space::scale(bomb_vel,
+                crate::space::ms_to_seconds(detonate_at_ms.saturating_sub(self.ms).max(0) as f64)));
+            if !crate::services::effects::defenders::bomb_threatens(source_pos, source_radius,
+                bomb_pos, f64::from(bomb.radius), endpoint, flight.blast_range) { continue; }
+            candidates.push(crate::services::effects::defenders::Candidate {
+                id, surface_distance, expiry_at_ms: detonate_at_ms, identity,
+            });
+        }
+        let selected = crate::services::effects::defenders::choose_candidate(source_identity, candidates,
+            &self.defender_reservations)?;
+        let token = self.capture_ball(selected.id)?;
+        self.defender_reservations.insert(selected.id);
+        Some((selected.id, token))
+    }
+
 
     /// Apply one typed raw vector to a live damageable projectile. `None`
     /// means there is no profile or the vector was refused. A lethal outcome
@@ -201,7 +247,7 @@ impl System {
     /// incarnation, destroy the ball, then run each taken callback once as a
     /// non-impact terminal. The ball's removal hooks then observe empty
     /// registries and cannot consume anything twice.
-    fn end_projectile(&mut self, id: i64) {
+    pub(super) fn end_projectile(&mut self, id: i64) {
         self.damageable_projectiles.remove(&id);
         let finish = self.take_missile_finish(id);
         let impact = self.bomb_flights.remove(&id).map(|flight| flight.impact);

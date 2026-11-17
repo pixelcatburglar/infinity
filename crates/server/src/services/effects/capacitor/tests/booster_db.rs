@@ -108,7 +108,7 @@ async fn cap_booster_db_smoke() {
             source: fixture.ship, target: -9_001_001, source_guard: None, player: None,
             optimal: 100.0, falloff: 0.0, offensive: false,
         };
-        assert_eq!(drain_exact_guarded(&test_db, &test_world, system, -9_001_001, 10.0, admitted).await.ok().unwrap().unwrap().0, 0.0);
+        assert_eq!(drain_exact_guarded(&test_db, &test_world, system, -9_001_001, 10.0, None, admitted).await.ok().unwrap().unwrap().0, 0.0);
         test_world.remove_ball(system, -9_001_001).await;
         combat::forget_ship(-9_001_001);
         let stale = NpcCapacitorGuard::Attack {
@@ -116,7 +116,7 @@ async fn cap_booster_db_smoke() {
             source_guard: Some(crate::services::effects::space_source::SourceGuard::Drone { source: fixture.ship, target: fixture.ship, generation: 0 }),
             player: None, optimal: 100.0, falloff: 0.0, offensive: true,
         };
-        assert!(drain_exact_guarded(&test_db, &test_world, system, fixture.ship, 0.0, stale).await.ok().unwrap().is_none());
+        assert!(drain_exact_guarded(&test_db, &test_world, system, fixture.ship, 0.0, None, stale).await.ok().unwrap().is_none());
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: fixture.character, ship_id: fixture.ship, system_id: system };
         let module = Module { id: fixture.module, type_id: module_type, flag: FLAG_FITTING_FIRST };
         let stop = Arc::new(AtomicBool::new(false));

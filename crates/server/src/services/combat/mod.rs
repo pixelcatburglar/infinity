@@ -74,7 +74,7 @@ use crate::sde::Sde;
 use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
 use crate::space::combat::ActorConditionSnapshot;
 use marshal::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{debug, info, warn};
@@ -109,6 +109,48 @@ pub(super) struct ActiveModule {
     pub(super) forced_inactive: bool,
 }
 
+/// Runtime record of one duration-bounded module activation, keyed by module
+/// item ID. `services::effects::active_cycle` owns the transitions; the records
+/// are memory-only and are cleared on server restart.
+pub(super) enum ActiveCycle {
+    /// Registered activation not yet accepted by its actor; carries no bonus,
+    /// effect animation or cooldown.
+    Pending {
+        /// The activation's generation token, shared with `State::active`.
+        generation: Arc<AtomicBool>,
+        /// The hull the module is fitted on.
+        ship: i64,
+    },
+    /// Accepted activation applying its module modifier until the nominal end.
+    Running {
+        /// The activation's generation token, shared with `State::active`.
+        generation: Arc<AtomicBool>,
+        /// The pilot that activated the module.
+        owner: i64,
+        /// The hull the module is fitted on.
+        ship: i64,
+        /// The SDE effect ID the activation runs.
+        effect: i64,
+        /// Actor time in milliseconds when the activation was accepted; the
+        /// effect's interval is [start, start + duration).
+        start: i64,
+        /// Frozen fitted effect duration in milliseconds.
+        duration_ms: f64,
+        /// Frozen module reactivation delay in milliseconds, read from the
+        /// resident fit at acceptance.
+        delay_ms: i64,
+        /// Activation repeat after the module's disallowRepeatingActivation.
+        repeat: i64,
+    },
+    /// Terminal stop recorded; reactivation is refused until the deadline.
+    Cooling {
+        /// Actor time in milliseconds when the terminal stop happened.
+        stopped: i64,
+        /// Actor time in milliseconds when reactivation becomes legal again.
+        deadline: i64,
+    },
+}
+
 /// A lock attempt in progress. `ui_owner` holds the originating connection of
 /// an attempt the client's targeting UI waits on; internal attempts carry none.
 struct PendingLock {
@@ -135,6 +177,10 @@ pub(super) struct State {
     capacitor: HashMap<i64, (f64, i64)>,
     /// moduleID -> FILETIME its reload finishes
     pub(super) reloading: HashMap<i64, i64>,
+    /// moduleID -> duration-bounded activation record (services::effects::active_cycle)
+    pub(super) active_cycles: HashMap<i64, ActiveCycle>,
+    /// (cooling deadline ms, moduleID): ordered expiry index for cooling records.
+    pub(super) cycle_deadlines: BTreeSet<(i64, i64)>,
 }
 
 impl State {
@@ -150,8 +196,14 @@ impl State {
 }
 
 /// Modules currently running their activation effect (services::fit applies them).
+/// A duration-bounded activation still pending acceptance carries no bonus.
 pub fn active_modules() -> HashSet<i64> {
-    state().active.iter().filter_map(|(&id, active)| (!active.forced_inactive).then_some(id)).collect()
+    let st = state();
+    st.active.iter().filter_map(|(&id, active)| {
+        if active.forced_inactive { return None; }
+        if matches!(st.active_cycles.get(&id), Some(ActiveCycle::Pending { .. })) { return None; }
+        Some(id)
+    }).collect()
 }
 
 pub(super) fn state() -> MutexGuard<'static, State> {
@@ -208,7 +260,11 @@ pub(crate) fn reset_pilot(world: &crate::space::World, char_id: i64, space_ship:
     clear_character_locks(world, char_id);
     state().reset_character(char_id);
     if let Some((system, ship)) = space_ship {
-        world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
+        world.post(system, move |s| {
+            jamming::clear(s, ship);
+            s.remove_projections_from(ship);
+            super::effects::active_cycle::ship_departure(s, ship);
+        });
     }
 }
 

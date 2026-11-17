@@ -11,6 +11,7 @@ mod effect_actions;
 #[cfg(feature = "tests-space")] mod missiles;
 #[cfg(feature = "tests-space")] mod projectiles;
 #[cfg(feature = "tests-space")] mod gm_effects;
+#[cfg(feature = "tests-space")] mod super_weapons;
 
 #[cfg(feature = "tests-space")]
 pub(super) fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
@@ -36,7 +37,7 @@ fn projection_replacement_expiry_and_departure_cleanup() {
     let projection = |module, deadline| Projection {
         source_ship: 1, source_module: module, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: deadline,
-        values: Vec::new(), charge_values: Vec::new(), charge_type: None, scramble: None,
+        values: Vec::new(), charge_values: Vec::new(), charge_type: None, resistance_attribute: None, scramble: None,
     };
     system.upsert_projection(2, projection(10, 1500));
     system.upsert_projection(3, projection(10, 2000));

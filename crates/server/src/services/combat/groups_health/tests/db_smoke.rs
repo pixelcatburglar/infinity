@@ -393,7 +393,7 @@ async fn capacitor_consumer_expires_inputs_before_timer_and_preserves_debit() {
     assert_eq!(system.combat_fit_revision(ship), Some(0));
     let delta = active.min(expired) / 8.0;
     let (snapshot, accepted, _) = capacitor_operation_in_actor(
-        &mut system, &sde, ship, Operation::Inject(delta), None).unwrap();
+        &mut system, &sde, ship, Operation::Inject(delta), None, None).unwrap();
     assert_eq!(snapshot.capacity, expired);
     assert_eq!(accepted, delta);
     assert!(snapshot.level >= active.min(expired) / 4.0 + delta && snapshot.level < expired);
@@ -401,7 +401,7 @@ async fn capacitor_consumer_expires_inputs_before_timer_and_preserves_debit() {
     assert!(system.combat_fit_revision(ship).unwrap() > 0);
     let revision = system.combat_fit_revision(ship);
     let (_, drained, _) = capacitor_operation_in_actor(
-        &mut system, &sde, ship, Operation::Drain(delta), None).unwrap();
+        &mut system, &sde, ship, Operation::Drain(delta), None, None).unwrap();
     assert_eq!(drained, delta);
     assert_eq!(system.combat_fit_revision(ship), revision);
     crate::services::combat::forget_ship(ship);

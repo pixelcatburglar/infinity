@@ -72,3 +72,40 @@ fn special_fx_encodes_start_time_phase_and_graphic_info() {
         Value::Float(250.0), Value::Int(3), Value::None, Value::Int(0), Value::None]);
     assert_eq!(marshal::dumps(&fresh), marshal::dumps(&fresh_expected));
 }
+
+#[test]
+fn super_weapon_guid_selects_family_and_race() {
+    use crate::space::system::super_weapons::{super_weapon_guid, SuperWeaponFxFamily};
+    for (family, expected) in [
+        (SuperWeaponFxFamily::Single, "effects.SuperWeapon"),
+        (SuperWeaponFxFamily::DamageBeam, "effects.SWDamageBeam"),
+        (SuperWeaponFxFamily::SlashBeam, "effects.SWSlashBeam"),
+    ] {
+        for (race, suffix) in [(4, "Amarr"), (1, "Caldari"), (8, "Gallente"), (2, "Minmatar")] {
+            assert_eq!(super_weapon_guid(family, Some(race)), Some(format!("{expected}{suffix}").as_str()));
+        }
+        assert_eq!(super_weapon_guid(family, None), None);
+        assert_eq!(super_weapon_guid(family, Some(3)), None);
+    }
+    // The cone family is race-free: every race maps to the same GUID.
+    for race in [None, Some(1), Some(3)] {
+        assert_eq!(super_weapon_guid(SuperWeaponFxFamily::Cone, race), Some("effects.SuperWeaponCone"));
+    }
+}
+
+#[test]
+fn super_weapon_graphic_info_carries_exact_keys_and_units() {
+    use crate::space::system::super_weapons::{directional_weapon_graphic_info, slash_weapon_graphic_info};
+    let vector = |v: V3| Value::tuple(v.into_iter().map(Value::Float).collect::<Vec<_>>());
+    let expected = crate::services::keyval([
+        ("targetOffset", vector([1.0, 2.0, 3.0])),
+        ("duration", Value::Float(5_000.0)),
+    ]);
+    assert_eq!(marshal::dumps(&directional_weapon_graphic_info([1.0, 2.0, 3.0], 5_000.0)), marshal::dumps(&expected));
+    let expected = crate::services::keyval([
+        ("startTargetOffset", vector([1.0, 2.0, 3.0])),
+        ("endTargetOffset", vector([4.0, 5.0, 6.0])),
+        ("duration", Value::Float(12_000.0)),
+    ]);
+    assert_eq!(marshal::dumps(&slash_weapon_graphic_info([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 12_000.0)), marshal::dumps(&expected));
+}

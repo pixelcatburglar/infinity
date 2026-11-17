@@ -5,7 +5,7 @@
 use super::*;
 use infinity_core::consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER_OUTPUT, dogma::ATTR_QUANTITY};
 use crate::{client::Client, config::deployment::DatabaseConfig, dao::items::dogma,
-    services::{character::provisioning::ensure_ship, combat::{self, targeting_charges::loaded}, Call}};
+    services::{character::provisioning::ensure_ship, combat::{self, targeting_charges::loaded}, Call, CallResult}};
 
 async fn call(client: &mut Client, method: &str, args: &[Value]) -> CallResult {
     let kwargs = Value::Dict(vec![]);

@@ -125,6 +125,7 @@ struct Node {
     active: bool,
     overloaded: bool,
     projected_effect: Option<i32>,
+    projection_resistance_attribute: Option<i32>,
     receiver: Option<Key>,
     charge_type: Option<i32>,
     level: Option<i32>,
@@ -237,7 +238,7 @@ impl Fit {
         let mut nodes = HashMap::new();
         nodes.insert(Key::Ship, Node {
             type_id, data_position: sde.types.position(type_id), location: Location::Space,
-            online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
+            online: true, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
             charge_type: None, level: None, overrides: Vec::new(), cargo_unlimited: false, charge_values: Vec::new(),
         });
         Self::insert_projections(&sde, &mut nodes, Key::Ship, projections);
@@ -255,7 +256,7 @@ impl Fit {
             nodes.insert(Key::Projected(key), Node {
                 type_id: p.source_type, data_position: sde.types.position(p.source_type),
                 location: Location::Space, online: true, active: true, overloaded: false,
-                projected_effect: Some(p.effect_id), receiver: Some(receiver), charge_type: p.charge_type, level: None, overrides: values, cargo_unlimited: false, charge_values,
+                projected_effect: Some(p.effect_id), projection_resistance_attribute: p.resistance_attribute, receiver: Some(receiver), charge_type: p.charge_type, level: None, overrides: values, cargo_unlimited: false, charge_values,
             });
         }
     }
@@ -334,7 +335,7 @@ impl Fit {
         let mut nodes = HashMap::new();
         let node = |type_id, location, online, active, level, overrides| Node {
             type_id, data_position: sde.types.position(type_id), location, online, active,
-            overloaded: false, projected_effect: None, receiver: None, charge_type: None, level, overrides, cargo_unlimited: false, charge_values: Vec::new(),
+            overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None, charge_type: None, level, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         };
 
         let mut ship_node = node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default());
@@ -388,7 +389,7 @@ impl Fit {
         overrides.sort_by_key(|v| v.0);
         self.nodes.insert(Key::Module(item), Node {
             type_id, data_position: self.sde.types.position(type_id), location: Location::Ship,
-            online: false, active: false, overloaded: false, projected_effect: None, receiver: None,
+            online: false, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
             charge_type: None, level: None, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         });
         crate::poison::lock_or_exit(self.memo.get_mut()).clear();
@@ -401,7 +402,7 @@ impl Fit {
         self.nodes.insert(Key::Drone(id), Node {
             type_id, data_position: self.sde.types.position(type_id),
             location: Location::Space, online: true, active: false, overloaded: false,
-            projected_effect: None, receiver: None, charge_type: None, level: None, overrides, cargo_unlimited: false, charge_values: Vec::new(),
+            projected_effect: None, projection_resistance_attribute: None, receiver: None, charge_type: None, level: None, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         });
         crate::poison::lock_or_exit(self.memo.get_mut()).clear();
     }
@@ -619,7 +620,7 @@ impl Fit {
                         for m in effect.modifiers().iter().filter(|m| m.modified == attr) {
                             if !effect_running(source, node, effect_id, effect.effect_category.unwrap_or(0), &m.domain)
                                 || !self.applies(source, m, key) { continue; }
-                            let value = projected_value(node, Some(data), self.sde.dogma.attribute(m.modifying), m.modifying);
+                            let value = projected_value(self, key, node, Some(data), self.sde.dogma.attribute(m.modifying), m.modifying, m.op, visiting);
                             mods.push((m.op, value, !stackable && !stacking_exempt(data.category_id.unwrap_or(0))));
                         }
                     }
@@ -663,8 +664,9 @@ fn stacking_exempt(category: i32) -> bool {
     matches!(category, CATEGORY_SHIP | CATEGORY_CHARGE | CATEGORY_SKILL | CATEGORY_IMPLANT | CATEGORY_SUBSYSTEM)
 }
 
-fn projected_value(node: &Node, data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
-    node.base(data, meta, attr)
+fn projected_value(fit: &Fit, target: Key, node: &Node, data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32, op: i32, visiting: &mut HashSet<(Key, i32)>) -> f64 {
+    let value = node.base(data, meta, attr);
+    node.projection_resistance_attribute.map_or(value, |resistance| crate::services::effects::projected::scaled(value, op, fit.value_guarded(target, resistance, visiting)))
 }
 
 /// Boundary clamp for the twelve damage resonance attributes: finite values

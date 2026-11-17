@@ -404,7 +404,7 @@ fn removed_locks_clear_only_matching_outgoing_projections() {
     let projection = |source_ship, source_module| Projection {
         source_ship, source_module, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-        values: vec![], charge_values: vec![], charge_type: None, scramble: None,
+        values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None,
     };
     s.upsert_projection(2, projection(1, 10));
     s.upsert_projection(3, projection(1, 11));

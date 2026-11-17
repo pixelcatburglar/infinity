@@ -38,6 +38,7 @@ impl Default for Sde {
             prices: Default::default(),
             lp_offers: Default::default(),
             repairable_ship: Default::default(),
+            super_weapons: Default::default(),
         }
     }
 }

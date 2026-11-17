@@ -101,7 +101,7 @@ impl Fit {
         };
         let node = |type_id, level, overrides| Node {
             type_id, data_position: self.sde.types.position(type_id), location: Location::Char,
-            online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
+            online: true, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
             charge_type: None, level, overrides, cargo_unlimited: false, charge_values: Vec::new(),
         };
         if let Some(attributes) = inputs.attributes {

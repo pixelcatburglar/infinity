@@ -154,12 +154,16 @@ pub(crate) enum NpcCapacitorGuard {
     Assistance { source: i64, hostile: i64, target: i64, generation: u64, optimal: f64, falloff: f64 },
     DroneAssistance { source: i64, target: i64, generation: u64, optimal: f64, falloff: f64, owner: i64 },
     Attack { source: i64, target: i64, source_guard: Option<crate::services::effects::space_source::SourceGuard>, player: Option<(i64, i64, std::sync::Arc<std::sync::atomic::AtomicBool>)>, optimal: f64, falloff: f64, offensive: bool },
+    /// One superweapon's warmup neutralization: only the firing activation's
+    /// generation and source identity are required, never a target lock.
+    SuperWeapon { source: i64, character: i64, module: i64, generation: std::sync::Arc<std::sync::atomic::AtomicBool> },
 }
 
 impl NpcCapacitorGuard {
     fn source(&self) -> i64 {
         match self {
-            Self::Assistance { source, .. } | Self::DroneAssistance { source, .. } | Self::Attack { source, .. } => *source,
+            Self::Assistance { source, .. } | Self::DroneAssistance { source, .. } | Self::Attack { source, .. }
+            | Self::SuperWeapon { source, .. } => *source,
         }
     }
 
@@ -198,6 +202,10 @@ impl NpcCapacitorGuard {
                     let distance = (crate::space::dist(me.pos, other.pos) - f64::from(me.radius) - f64::from(other.radius)).max(0.0);
                     crate::services::effects::npc_capacitor::in_range(distance, optimal, falloff)
                 }),
+            Self::SuperWeapon { source, character, module, generation } =>
+                !generation.load(std::sync::atomic::Ordering::Relaxed)
+                && s.pilot_ball(character).is_some_and(|ball| ball.id == source && ball.mode != crate::space::MODE_WARP)
+                && state().active.get(&module).is_some_and(|active| std::sync::Arc::ptr_eq(&active.stop, &generation)),
         }
     }
 }
@@ -205,7 +213,7 @@ impl NpcCapacitorGuard {
 
 /// One capacitor operation executed inside the system actor's own turn: the
 /// gate prepares current defense with the same body membership; a miss refuses.
-fn capacitor_operation_in_actor(s: &mut crate::space::System, sde: &crate::sde::Sde, ship: i64, op: Operation, guard: Option<NpcCapacitorGuard>) -> Option<(CapacitorSnapshot, f64, Option<i64>)> {
+fn capacitor_operation_in_actor(s: &mut crate::space::System, sde: &crate::sde::Sde, ship: i64, op: Operation, resistance_attribute: Option<i32>, guard: Option<NpcCapacitorGuard>) -> Option<(CapacitorSnapshot, f64, Option<i64>)> {
     let ball = s.ball(ship)?;
     let (type_id, pilot) = (ball.type_id, ball.char_id);
     let drone = s.drone(ship);
@@ -233,6 +241,13 @@ fn capacitor_operation_in_actor(s: &mut crate::space::System, sde: &crate::sde::
     {
         return None;
     }
+    let op = match resistance_attribute {
+        Some(attribute) => {
+            let factor = s.with_combat_fit(ship, |fit, key, _| fit.value(key, attribute)).unwrap_or(1.0);
+            match op { Operation::Inject(amount) => Operation::Inject(amount * factor), Operation::Drain(amount) => Operation::Drain(amount * factor), other => other }
+        }
+        None => op,
+    };
     let result = {
         let mut st = state();
         mutate(&mut st.capacitor, ship, capacity, tau, filetime_now(), op)
@@ -247,30 +262,62 @@ fn capacitor_operation_in_actor(s: &mut crate::space::System, sde: &crate::sde::
     Some((CapacitorSnapshot { capacity, level: result.after }, result.amount, s.combat_owner(ship)))
 }
 
-async fn capacitor_operation(_db: &Db, world: &World, system: i64, ship: i64, op: Operation, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64, Option<i64>)>, CallError> {
+async fn capacitor_operation(_db: &Db, world: &World, system: i64, ship: i64, op: Operation, resistance_attribute: Option<i32>, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64, Option<i64>)>, CallError> {
     let sde = world.sde().clone();
-    Ok(world.with(system, move |s| capacitor_operation_in_actor(s, &sde, ship, op, guard)).await.flatten())
+    Ok(world.with(system, move |s| capacitor_operation_in_actor(s, &sde, ship, op, resistance_attribute, guard)).await.flatten())
 }
 
 /// Return the current capacitor for a ship present in the system.
 pub(crate) async fn capacitor_snapshot(db: &Db, world: &World, system: i64, ship: i64) -> Result<Option<CapacitorSnapshot>, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None).await?.map(|(snapshot, _, _)| snapshot))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None, None).await?.map(|(snapshot, _, _)| snapshot))
 }
 
 /// Inject energy, returning the amount accepted.
 pub(crate) async fn inject(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None, None).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
 /// Inject energy only while the source and range guard remain valid.
-pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), Some(guard)).await?.map_or(0.0, |(_, amount, _)| amount))
+pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, resistance_attribute: Option<i32>, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), resistance_attribute, Some(guard)).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
 /// Drain only while the guarded attack remains valid. `None` means refused;
 /// an accepted drain can have a zero amount.
-pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<Option<(f64, Option<i64>)>, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), Some(guard)).await?.map(|(_, amount, owner)| (amount, owner)))
+pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, resistance_attribute: Option<i32>, guard: NpcCapacitorGuard) -> Result<Option<(f64, Option<i64>)>, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), resistance_attribute, Some(guard)).await?.map(|(_, amount, owner)| (amount, owner)))
+}
+
+/// One superweapon warmup neutralization inside the system actor's own turn:
+/// every ball inside `radius` of `center` except `source` loses `amount`
+/// scaled by its signature factor against `signature_radius` and by its fitted
+/// resistance attribute `resistance_attr`, through the same resident-fit gate
+/// and pilot notifications as every other capacitor debit. The
+/// source-generation `guard` admits each debit; no target lock is required and
+/// nothing here touches the database.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drain_area_in_actor(
+    s: &mut crate::space::System, sde: &crate::sde::Sde,
+    source: i64, center: crate::space::V3, radius: f64, amount: f64,
+    signature_radius: f64, resistance_attr: i32, guard: &NpcCapacitorGuard,
+) {
+    if !radius.is_finite() || radius < 0.0 || !amount.is_finite() || amount <= 0.0 { return; }
+    let victims: Vec<i64> = s.balls()
+        .filter(|ball| ball.id != source)
+        .filter(|ball| s.sample_position(ball.id).is_some_and(|pos| crate::space::dist(pos, center) <= radius))
+        .map(|ball| ball.id)
+        .collect();
+    for victim in victims {
+        let signature = s.sampled_ball(victim)
+            .map(|ball| crate::services::effects::weapons::target_signature(sde, &ball))
+            .unwrap_or(0.0);
+        let factor = if signature_radius > 0.0 { (signature / signature_radius).clamp(0.0, 1.0) } else { 1.0 };
+        let resistance = s.with_combat_fit(victim, |fit, key, _stamp| fit.value(key, resistance_attr))
+            .unwrap_or_else(|| attr(sde, s.ball(victim).map(|ball| ball.type_id).unwrap_or(0), resistance_attr, 0.0));
+        let scaled = amount * factor * (1.0 - resistance).max(0.0);
+        if scaled <= 0.0 { continue; }
+        capacitor_operation_in_actor(s, sde, victim, Operation::Drain(scaled), None, Some(guard.clone()));
+    }
 }
 
 /// A ship's hit points and resistances, from its fit.

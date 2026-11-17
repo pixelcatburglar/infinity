@@ -31,16 +31,16 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
     match cx.effect.kind {
         EffectKind::Neutralizer => {
             let amount = scaled_amount(amount, distance, optimal, falloff);
-            admitted_owner = drain_exact_guarded(cx.db, cx.world, cx.system, cx.target.id, amount, guard).await?;
+            admitted_owner = drain_exact_guarded(cx.db, cx.world, cx.system, cx.target.id, amount, inputs.resistance_attribute, guard).await?;
         }
         EffectKind::Nosferatu => {
             let Some(source) = capacitor_snapshot(cx.db, cx.world, cx.system, cx.source.id).await? else { return Ok(()) };
             let Some(target) = capacitor_snapshot(cx.db, cx.world, cx.system, cx.target.id).await? else { return Ok(()) };
             if nos_allowed(source.level, source.capacity, target.level, target.capacity, nos_override) {
                 let amount = scaled_amount(amount, distance, optimal, falloff);
-                if let Some((drained, owner)) = drain_exact_guarded(cx.db, cx.world, cx.system, cx.target.id, amount, guard.clone()).await? {
+                if let Some((drained, owner)) = drain_exact_guarded(cx.db, cx.world, cx.system, cx.target.id, amount, inputs.resistance_attribute, guard.clone()).await? {
                     admitted_owner = Some((drained, owner));
-                    inject_guarded(cx.db, cx.world, cx.system, cx.source.id, drained, guard).await?;
+                    inject_guarded(cx.db, cx.world, cx.system, cx.source.id, drained, None, guard).await?;
                 }
             }
         }
@@ -66,7 +66,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
                 }
             };
             let amount = scaled_amount(amount, distance, optimal, falloff);
-            inject_guarded(cx.db, cx.world, cx.system, target, amount, guard).await?;
+            inject_guarded(cx.db, cx.world, cx.system, target, amount, inputs.resistance_attribute, guard).await?;
         }
         _ => unreachable!("not a capacitor effect"),
     }

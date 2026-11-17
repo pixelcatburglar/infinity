@@ -1,0 +1,17 @@
+{
+  "arc_path_half_angle_proxy": 15.0,
+  "weapons": [
+    { "type_id": 40631, "classification": "cylinder", "mode": "point", "guid_family": "SWDamageBeam" },
+    { "type_id": 40632, "classification": "slice", "mode": "slash", "guid_family": "SWSlashBeam" },
+    { "type_id": 40633, "classification": "cone", "mode": "point", "guid_family": "SuperWeaponCone" },
+    { "type_id": 41439, "classification": "cylinder", "mode": "point", "guid_family": "SWDamageBeam" },
+    { "type_id": 41440, "classification": "cylinder", "mode": "point", "guid_family": "SWDamageBeam" },
+    { "type_id": 41441, "classification": "cylinder", "mode": "point", "guid_family": "SWDamageBeam" },
+    { "type_id": 41442, "classification": "slice", "mode": "slash", "guid_family": "SWSlashBeam" },
+    { "type_id": 41443, "classification": "slice", "mode": "slash", "guid_family": "SWSlashBeam" },
+    { "type_id": 41444, "classification": "slice", "mode": "slash", "guid_family": "SWSlashBeam" },
+    { "type_id": 74251, "classification": "cylinder", "mode": "point", "guid_family": "SWDamageBeam" },
+    { "type_id": 74252, "classification": "slice", "mode": "slash", "guid_family": "SWSlashBeam" },
+    { "type_id": 74253, "classification": "cone", "mode": "point", "guid_family": "SuperWeaponCone" }
+  ]
+}

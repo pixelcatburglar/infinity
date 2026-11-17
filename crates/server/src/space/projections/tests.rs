@@ -25,7 +25,7 @@ fn expiration_invalidates_the_receiving_snapshot() {
     system.upsert_projection(1, Projection {
         source_ship: 2, source_module: 3, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: 0,
-        values: vec![], charge_values: vec![], charge_type: None, scramble: None,
+        values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None,
     });
     let revision = system.projection_revision(1);
     assert_eq!(system.projections_on(1).len(), 1);
@@ -48,7 +48,7 @@ fn fixture_ball(id: i64, owner: i64, character: Option<i64>) -> Ball {
 fn fixture_projection(module: i64, until_ms: i64, values: Vec<(i32, f64)>) -> Projection {
     Projection { source_ship: 2, source_module: module, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms,
-        values, charge_values: vec![], charge_type: None, scramble: None }
+        values, charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None }
 }
 
 #[test]
@@ -153,7 +153,7 @@ async fn projected_free_hull_refresh_keeps_fitting_and_overrides() {
                 }
                 let projection = Projection { source_ship: ship, source_module: -1, source_type: source.type_id,
                     effect_id: effect.effect_id, kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-                    values, charge_values: vec![], charge_type: None, scramble: None };
+                    values, charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
                 let fitted = Fit::load_unpiloted_projected(&d, sde.clone(), ship, vec![projection.clone()]).await.unwrap();
                 let speed = fitted.value(Key::Ship, ATTR_MAX_VELOCITY) as f32;
                 if speed.is_finite() && speed > 0.0 && speed != baseline_speed {

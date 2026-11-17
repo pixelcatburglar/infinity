@@ -47,6 +47,7 @@ pub(crate) mod appearance;
 mod affiliation;
 mod npc_control;
 mod sovereignty_placement;
+pub(crate) mod super_weapons;
 pub(crate) mod gm_effects;
 pub(crate) mod missiles;
 mod tick;
@@ -118,6 +119,8 @@ pub struct System {
     /// Live damageable projectile profiles, one per launched missile or bomb
     /// incarnation; cleared by the same terminals that end its flight.
     damageable_projectiles: HashMap<i64, damageable::DamageableProjectile>,
+    /// One reserved Defender target per bomb ID; token fencing remains terminal authority.
+    pub(super) defender_reservations: HashSet<i64>,
     /// The one bomb terminal registry: each entry owns its impact callback
     /// until the delay resolver or a removal consumes it exactly once.
     bomb_flights: HashMap<i64, effects::BombFlight>,
@@ -172,6 +175,8 @@ pub struct System {
     pub(super) snapshot_due: i64,
     pub(super) loaded_quiescing: bool,
     pub(super) loaded_failed_periods: i64,
+    /// Superweapon firing-source lockouts and generation-guarded pulse jobs.
+    super_weapons: super_weapons::SuperWeapons,
     gm_previews: HashMap<i64, gm_effects::SentPreviews>,
     /// NPC bounty pools owned by this actor; the shared coordinator is World-side.
     pub(super) bounties: bounties::State,
@@ -340,6 +345,7 @@ impl System {
     /// that targets or was launched by it, and its bomb registration.
     fn missile_departure(&mut self, id: i64) {
         self.damageable_projectiles.remove(&id);
+        self.defender_reservations.remove(&id);
         self.remove_missile_flight(id);
         self.invalidate_missile_target(id);
         self.invalidate_missile_launcher(id);
@@ -376,8 +382,10 @@ impl System {
         self.compressors.remove(&id);
         self.module_cloaks.remove(&id);
         self.cloak_targeting.remove(&id);
+        self.super_weapon_ship_left(id);
         self.remove_projections_from(id);
         self.remove_projections_on_departure(id);
+        crate::services::effects::active_cycle::ship_departure(self, id);
         self.gm_effect_ball_leaving(id);
         self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
@@ -561,6 +569,11 @@ impl System {
     pub(crate) fn has_module_cloak(&self, ship: i64) -> bool {
         self.module_cloaks.contains_key(&ship)
     }
+    pub(crate) fn release_defender_target(&mut self, target: i64) {
+        self.defender_reservations.remove(&target);
+    }
+
+
     pub(crate) fn cloak_obstructed(&self, ship: i64) -> bool {
         let Some(me) = self.sampled_ball(ship) else { return true };
         self.balls.values().filter(|other| other.id != ship && other.cloak == 0).any(|other|

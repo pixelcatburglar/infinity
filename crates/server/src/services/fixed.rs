@@ -429,7 +429,6 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
 
         ("fighterMgr", "ExecuteMovementCommandOnFighters" | "LoadFightersToTube" | "UnloadTubeToFighterBay" | "LaunchFightersFromTubes" | "RecallFightersToTubes" | "CmdAbandonFighter" | "CmdScoopAbandonedFighterFromSpace" | "CmdActivateAbilitySlots" | "CmdDeactivateAbilitySlots") => Err(notify_error(infinity_core::messages::fighters::UNAVAILABLE)),
         ("warpVectorMgr", "UseVector") => Err(notify_error(infinity_core::messages::warp_vector::UNAVAILABLE)),
-        ("superWeaponMgr", "ActivateSinglePointTargetedModule" | "ActivateSlashModule") => Err(notify_error(infinity_core::messages::super_weapon::UNAVAILABLE)),
         ("essMgr", "AttemptLinkToMainBank" | "AttemptLinkToReserveBank" | "RequestMainBankUnlink" | "RequestReserveBankUnlink" | "RequestUnlockReserveBank") => Err(notify_error(infinity_core::messages::ess::UNAVAILABLE)),
         // menuFunctions.py:DecryptItem cannot open media without a supported source; refuse without consuming the item.
         ("encodedItems", "DecodeItem") => Err(notify_error(infinity_core::messages::encoded_items::DECODE_UNAVAILABLE)),

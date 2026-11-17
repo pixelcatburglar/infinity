@@ -22,6 +22,7 @@ pub(crate) struct Effect {
     pub(crate) disallow_auto_repeat: bool, pub(crate) electronic_chance: bool, pub(crate) propulsion_chance: bool,
     pub(crate) discharge_attribute_id: Option<i32>, pub(crate) range_attribute_id: Option<i32>,
     pub(crate) falloff_attribute_id: Option<i32>, pub(crate) tracking_attribute_id: Option<i32>,
+    pub(crate) resistance_attribute_id: Option<i32>,
     modifiers: Vec<Modifier>
 }
 impl Effect {
@@ -41,7 +42,7 @@ impl Dogma {
         for r in effects {
             let pos = result.effects.len(); result.effect_ids.insert(r.effect_id, pos);
             if let Some(name) = &r.name { result.effect_names.entry(name.clone()).or_default().push(pos); }
-            result.effects.push(Effect { effect_id: r.effect_id, name: r.name, guid: r.guid, effect_category: r.effect_category, duration_attribute_id: r.duration_attribute_id, fitting_usage_chance_attribute_id: r.fitting_usage_chance_attribute_id, is_offensive: r.is_offensive, is_assistance: r.is_assistance, disallow_auto_repeat: r.disallow_auto_repeat, electronic_chance: r.electronic_chance, propulsion_chance: r.propulsion_chance, discharge_attribute_id: r.discharge_attribute_id, range_attribute_id: r.range_attribute_id, falloff_attribute_id: r.falloff_attribute_id, tracking_attribute_id: r.tracking_attribute_id, modifiers: Vec::new() });
+            result.effects.push(Effect { effect_id: r.effect_id, name: r.name, guid: r.guid, effect_category: r.effect_category, duration_attribute_id: r.duration_attribute_id, fitting_usage_chance_attribute_id: r.fitting_usage_chance_attribute_id, is_offensive: r.is_offensive, is_assistance: r.is_assistance, disallow_auto_repeat: r.disallow_auto_repeat, electronic_chance: r.electronic_chance, propulsion_chance: r.propulsion_chance, discharge_attribute_id: r.discharge_attribute_id, range_attribute_id: r.range_attribute_id, falloff_attribute_id: r.falloff_attribute_id, tracking_attribute_id: r.tracking_attribute_id, resistance_attribute_id: r.resistance_attribute_id, modifiers: Vec::new() });
         }
         for r in modifiers {
             if let Some(&i) = result.effect_ids.get(&r.effect_id) {

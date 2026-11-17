@@ -7,7 +7,7 @@ fn effect(name: &str) -> Effect {
         fitting_usage_chance_attribute_id: None,
         disallow_auto_repeat: false, electronic_chance: false, propulsion_chance: false,
         discharge_attribute_id: None, range_attribute_id: None, falloff_attribute_id: None,
-        tracking_attribute_id: None, modifiers: Vec::new(),
+        tracking_attribute_id: None, resistance_attribute_id: None, modifiers: Vec::new(),
     }
 }
 

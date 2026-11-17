@@ -275,7 +275,7 @@ fn projectile_reference_events_keep_fifo_position() {
     let mut rx = watch(&mut s, 1, 1);
     let (missile_tx, missile_rx) = channel();
     s.launch_missile(missile(3), 2, 1, 5_000.0, move |_, i| missile_tx.send(i).unwrap());
-    s.launch_bomb(missile(4), [0.0, 1.0, 0.0], 50_000, |_, _| {});
+    s.launch_bomb(missile(4), [0.0, 1.0, 0.0], 50_000, 0.0, |_, _| {});
     s.set_ball_position(3, [7.0, 0.0, 0.0], |_, _| true);
     s.actions.push_back((s.current_time, Box::new(move |s, _| s.add_ship(ball(6, None, 6.0)))));
     let before = crate::client::filetime_now();
@@ -340,7 +340,7 @@ fn projectile_reference_events_keep_fifo_position() {
     let mut z = System::new(0, Arc::default(), 0);
     z.insert(ball(1, None, 0.0));
     let (impact_tx, impact_rx) = std::sync::mpsc::channel();
-    z.launch_bomb(missile(4), [1.0, 0.0, 0.0], 1_000, move |_, center| { impact_tx.send(center.is_some()).unwrap(); });
+    z.launch_bomb(missile(4), [1.0, 0.0, 0.0], 1_000, 0.0, move |_, center| { impact_tx.send(center.is_some()).unwrap(); });
     z.tick(1_000);
     z.tick(2_000);
     assert_eq!(impact_rx.try_recv(), Ok(true));

@@ -263,7 +263,7 @@ async fn prepare_restores_docked_and_space_pilots_without_a_connection() {
             s.upsert_projection(drone, Projection {
                 source_ship: drone, source_module: drone, source_type: projection_type, effect_id: projection_effect,
                 kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-                values: vec![(modifier, -10.0)], charge_values: vec![], charge_type: None, scramble: None,
+                values: vec![(modifier, -10.0)], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None,
             });
             assert!(s.set_condition_fraction_mask(drone, 0b110, 0.75));
             let condition = s.combat_condition_snapshot(drone).unwrap().condition;

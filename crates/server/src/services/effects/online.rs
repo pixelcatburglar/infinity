@@ -392,6 +392,9 @@ pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
     burnt.sort_unstable_by_key(|module| module.item_id);
     for entry in burnt {
         if !super::heat::damage::burnt(&fit, entry.item_id) { continue; }
+        // The energizer's activation burn keeps its own module online for the
+        // accepted duration; ordinary burnt modules still reconcile offline.
+        if super::active_cycle::running(entry.item_id) { continue; }
         let module = load_items(ex, sde, ItemQuery::Id(entry.item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
         if module.owner_id != owner || module.location_id != ship || !module.singleton || !crate::services::inventory::is_fitting_flag(module.flag_id) { return Err(refuse()); }
         if !mutate_online(ex, outbox, fences, &hull, &module, false, true, None).await? { return Err(refuse()); }

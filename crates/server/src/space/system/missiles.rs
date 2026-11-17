@@ -42,8 +42,12 @@ pub(super) struct Flight {
     flight_time_ms: f64,
     /// Actor wall millisecond at which the launch action applied the flight.
     applied_at_ms: Option<i64>,
+    /// Reserved target incarnation captured at Defender admission.
+    target_token: Option<BallToken>,
     /// False permanently: never regains a target or produces a contact.
     eligible: bool,
+    /// Defender flights resolve at the source-backed five-metre surface gap.
+    defender: bool,
     pending: Option<PendingContact>,
     finish: Option<Box<dyn FnOnce(&mut System, Option<MissileImpact>) + Send>>,
 }
@@ -67,6 +71,12 @@ impl System {
     /// behaviour and register no capability.
     pub(crate) fn launch_missile(&mut self, ball: Ball, target: i64, launcher: i64, flight_time_ms: f64,
         finish: impl FnOnce(&mut System, Option<MissileImpact>) + Send + 'static) {
+        self.register_missile(ball, target, launcher, flight_time_ms, false, None, finish);
+    }
+
+    fn register_missile(&mut self, ball: Ball, target: i64, launcher: i64, flight_time_ms: f64,
+        defender: bool, target_token: Option<BallToken>,
+        finish: impl FnOnce(&mut System, Option<MissileImpact>) + Send + 'static) {
         if !flight_time_ms.is_finite() || flight_time_ms <= 0.0 || flight_time_ms.ceil() >= i64::MAX as f64 {
             finish(self, None);
             return;
@@ -86,12 +96,46 @@ impl System {
         let token = self.capture_ball(id).expect("inserted missile");
         self.missile_flights.insert(id, Flight {
             target, launcher, flight_time_ms,
-            applied_at_ms: None, eligible: true, pending: None,
+            applied_at_ms: None, target_token, eligible: true, defender, pending: None,
             finish: Some(Box::new(finish)),
         });
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
             s.apply_missile_launch(token, stamp);
         })));
+    }
+    /// Register a Defender flight atomically with its reserved target token.
+    /// The wrapped finish is the one reservation release point: on a contact
+    /// it ends the still-current, still-reserved target through the shared
+    /// projectile terminal (a cancel, never a detonation), then always
+    /// releases the reservation before reporting.
+    pub(crate) fn launch_defender(&mut self, ball: Ball, target: i64, target_token: BallToken, launcher: i64, flight_time_ms: f64,
+        finish: impl FnOnce(&mut System, Option<MissileImpact>) + Send + 'static) {
+        self.register_missile(ball, target, launcher, flight_time_ms, true, Some(target_token), move |s, contact| {
+            if contact.is_some() && s.ball_token_current(target_token) && s.defender_reservations.contains(&target) {
+                s.end_projectile(target);
+            }
+            s.defender_reservations.remove(&target);
+            finish(s, contact);
+        });
+    }
+
+    /// The one launch-time identity capture in the crate: the ball owner's
+    /// online session (its pilot session first, then the owner id). `None`
+    /// when the ball, the session or the owning corporation is unknown; a
+    /// projectile with no identity is never a Defender target.
+    pub(crate) fn projectile_identity(&self, ball: i64)
+        -> Option<crate::services::effects::defenders::ProjectileIdentity> {
+        let source = self.ball(ball)?;
+        let session = source.char_id.and_then(|character| self.registry.online_session(character))
+            .or_else(|| self.registry.online_session(source.owner_id))?;
+        if source.owner_id <= 0 { return None; }
+        Some(crate::services::effects::defenders::ProjectileIdentity {
+            owner: source.owner_id,
+            corporation: session.corporation_id?,
+            alliance: session.alliance_id,
+            war_faction: session.faction_id,
+            fleet: session.fleet_id,
+        })
     }
 
     /// Permanently cancel every pending hit on `target` (dock/jump acceptance,
@@ -233,11 +277,12 @@ impl System {
         for id in ids.drain(..) {
             let Some(flight) = self.missile_flights.get(&id) else { continue };
             if !flight.eligible || flight.pending.is_some() { continue; }
-            let (applied, target, launcher, lifetime) = (
-                flight.applied_at_ms.unwrap(), flight.target, flight.launcher, flight.flight_time_ms);
+            let (applied, target, launcher, lifetime, target_token) = (
+                flight.applied_at_ms.unwrap(), flight.target, flight.launcher, flight.flight_time_ms, flight.target_token);
             let f_min = ((applied - anchor_ms) as f64 / MILLISECONDS_PER_SECOND as f64).max(0.0);
             let dead = self.balls.get(&id).is_none() || {
-                let target_dead = self.balls.get(&target).is_none_or(|b| b.cloak != 0 || b.is_warping());
+                let target_dead = self.balls.get(&target).is_none_or(|b| b.cloak != 0 || b.is_warping())
+                    || target_token.is_some_and(|token| !self.ball_token_current(token));
                 let source_id = launcher.checked_abs().unwrap_or(launcher);
                 let source_dead = source_id != id
                     && self.balls.get(&source_id).is_none_or(|b| b.cloak != 0 || b.is_warping());
@@ -250,7 +295,8 @@ impl System {
             let (q0, q1) = if in_segment(target_ball) { (target_ball.old_pos, target_ball.pos) }
                 else { (target_ball.pos, target_ball.pos) };
             let clip = |a: V3, b: V3| add(a, scale(sub(b, a), f_min));
-            let radius = f64::from(me.radius) + f64::from(target_ball.radius);
+            let radius = f64::from(me.radius) + f64::from(target_ball.radius)
+                + if flight.defender { crate::services::effects::defenders::DEFENDER_INTERCEPT_SURFACE_METRES } else { 0.0 };
             let (t_old_vel, t_vel, t_accel, t_mass) = if in_segment(target_ball) {
                 (target_ball.old_vel, target_ball.vel, target_ball.segment_acceleration,
                     target_ball.mass * target_ball.agility as f64)

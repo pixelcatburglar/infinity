@@ -163,3 +163,34 @@ pub(in crate::services) fn ball(id: i64, type_id: i32, owner: i64, pilot: Option
         warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
         effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
+
+#[cfg(feature = "tests-effects")]
+/// One dogmaIM dispatch on the test client (Activate, Deactivate, ShipGetInfo).
+pub(in crate::services::effects) async fn dogma_call(client: &mut crate::client::Client, method: &str, args: &[marshal::Value]) -> crate::services::CallResult {
+    let kwargs = marshal::Value::Dict(vec![]);
+    crate::services::dogma::dispatch(client, &crate::services::Call { service: "dogmaIM", method, args, kwargs: &kwargs, bound: false, bind_params: None }).await
+}
+
+#[cfg(feature = "tests-effects")]
+/// The item's `ShipGetInfo` instance fields.
+pub(in crate::services::effects) async fn ship_info_item(client: &mut crate::client::Client, item: i64) -> marshal::Value {
+    let marshal::Value::Dict(entries) = dogma_call(client, "ShipGetInfo", &[]).await.unwrap_or_else(|e| panic!("ShipGetInfo CallError: {e:?}")) else { panic!("ship info") };
+    let Some((_, marshal::Value::Instance(_, fields))) = entries.iter().find(|(k, _)| k.as_int() == Some(item)) else { panic!("item info") };
+    fields.as_ref().clone()
+}
+
+#[cfg(feature = "tests-effects")]
+/// One fitted attribute of an item through the public `ShipGetInfo` path.
+pub(in crate::services::effects) async fn fitted_attr(client: &mut crate::client::Client, item: i64, attr: i32) -> f64 {
+    let fields = ship_info_item(client, item).await;
+    let Some(marshal::Value::Dict(attrs)) = fields.get("attributes") else { panic!("attributes") };
+    attrs.iter().find_map(|(k, v)| (k.as_int() == Some(i64::from(attr))).then(|| v.as_float()).flatten()).expect("attribute")
+}
+
+#[cfg(feature = "tests-effects")]
+/// Toggle a module online/offline through the real online path.
+pub(in crate::services::effects) async fn module_online(client: &crate::client::Client, ship: i64, module: i64, on: bool) -> crate::services::CallResult {
+    crate::services::effects::online::set_online(&crate::services::identity::Identity::of_client(client), &client.db, &client.world, &client.sde,
+        client.notify_tx.clone(), client.login.user_id, ship, module, on,
+        |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await
+}

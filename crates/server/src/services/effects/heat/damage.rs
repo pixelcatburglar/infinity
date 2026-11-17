@@ -6,7 +6,7 @@
 //! Paste repair and structure repair are unsupported.
 
 use std::sync::Arc;
-use infinity_core::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MED_SLOTS, dogma::ATTR_HI_SLOTS, dogma::ATTR_RIG_SLOTS, CATEGORY_MODULE, CATEGORY_SHIP};
+use infinity_core::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MED_SLOTS, dogma::ATTR_HI_SLOTS, dogma::ATTR_RIG_SLOTS, dogma::EFFECT_EMERGENCY_HULL_ENERGIZER, CATEGORY_MODULE, CATEGORY_SHIP};
 use crate::dao::items::{dogma, loading::ItemQuery};
 use crate::db::outbox::Outbox;
 use infinity_core::messages;
@@ -153,6 +153,67 @@ pub(in crate::services::effects) async fn apply(cx: &Ctx, membership: Option<u64
                 {
                     let state = combat::state();
                     if sources.iter().any(|source| !state.active.get(&source.master).is_some_and(|active| active.char_id == owner && Arc::ptr_eq(&active.stop, &source.generation))) { return Err(stale()); }
+                }
+                Ok(())
+            })
+        },
+        |value, outbox| async move { online::dispatch_changed_world(value, outbox, &cx.world) },
+    ).await
+}
+
+/// The energizer's one pilot-initiated activation write: module damage becomes
+/// exactly the module's captured effective hit points
+/// (`eve/common/script/dogma/pythonEffects/emergencyHullEnergizer.py:22-24`).
+/// This is not a recurring-cycle write: it runs once per accepted activation.
+/// Shares `apply`'s market-lock policy, `lock_reload_ship` and subject/identity
+/// revalidation, but never rolls damage, never calls `set_online_core` and
+/// never offlines: the same Running activation keeps the burned module alive
+/// until its accepted duration ends. A refused transaction emits no write.
+pub(in crate::services::effects) async fn burn_for_activation(
+    cx: &Ctx, module: i64, hp: f64, membership: Option<u64>,
+) -> Result<(), CallError> {
+    if !hp.is_finite() || hp <= 0.0 { return Err(stale()); }
+    let ship = cx.ship_id;
+    let owner = cx.char_id;
+    let system = cx.system_id;
+    let _lock = market::lock().await;
+    let policy = OnlinePolicy { owner, active_ship: Some(ship), station: None, notify: cx.notify.clone() };
+    let sde = cx.world.sde().clone();
+    cx.db.transaction(
+        |tx, outbox: &mut Outbox<OnlineChanged>| {
+            let policy = policy.clone();
+            let sde = sde.clone();
+            Box::pin(async move {
+                if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Err(stale()); }
+                let hull = load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(stale)?;
+                if hull.owner_id != owner || !hull.singleton || hull.category_id != i64::from(CATEGORY_SHIP) || hull.location_id != system { return Err(stale()); }
+                let item = load_items(tx, &sde, ItemQuery::Id(module)).await.map_err(db_err)?.into_iter().next().ok_or_else(stale)?;
+                if item.owner_id != owner || item.location_id != ship || !item.singleton
+                    || item.category_id != i64::from(CATEGORY_MODULE)
+                    || !crate::services::inventory::is_fitting_flag(item.flag_id) { return Err(stale()); }
+                // Only the energizer may burn on activation; any other caller
+                // or a type that no longer declares the effect is a stale write.
+                if !super::super::lifecycle::has_effect(sde.types.effects(item.type_id), EFFECT_EMERGENCY_HULL_ENERGIZER) { return Err(stale()); }
+                if !crate::dao::items::dogma::online(tx, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == module) { return Err(stale()); }
+                {
+                    let state = combat::state();
+                    if !state.active.get(&module).is_some_and(|active| active.char_id == owner) { return Err(stale()); }
+                }
+                let overrides = dogma::overrides_for(tx, &[module]).await.map_err(db_err)?;
+                let old = overrides.iter().find(|v| v.item_id == module && v.attribute_id == ATTR_HULL_DAMAGE).map(|v| v.state());
+                let damage = old.map(|state| state.value).unwrap_or(0.0);
+                // An already-exhausted module was refused by the admission's
+                // burnt validation; a racy change inside the lock is stale.
+                if exhausted(hp, damage) { return Err(stale()); }
+                if !dogma::set_override_if(tx, module, ATTR_HULL_DAMAGE, old, hp).await.map_err(db_err)? { return Err(stale()); }
+                let attr = super::super::notify::attribute_change(owner, Value::Int(module), ATTR_HULL_DAMAGE, Value::Float(hp), Value::Float(damage));
+                outbox.notify_sender(policy.notify.clone(), "OnModuleAttributeChanges", vec![Value::list([attr])]);
+                let fences = online::OnlineFences::single(system, ship, membership);
+                // The damage-only committed patch updates the resident fit;
+                // nothing reloads or rewrites the rest of the module node.
+                if let Some((system, generation)) = fences.membership(ship) {
+                    let patch = crate::services::fit::attributes::CommittedFitting::overridden_attributes(vec![(Key::Module(module), ATTR_HULL_DAMAGE, Some(hp))]);
+                    outbox.operation(OnlineChanged::Fitting { system, ship, owner, generation, patch }.into());
                 }
                 Ok(())
             })

@@ -51,7 +51,7 @@ fn select_targets(s: &System, sde: &crate::sde::Sde, source: i64, primary: i64, 
 /// Scale one target's typed raw damage by the shared missile application:
 /// that target's own effective signature and absolute sampled speed decide the
 /// factor, so the primary and every arc target apply independently.
-pub(super) fn vorton_application(
+pub(crate) fn vorton_application(
     raw: [f64; 4],
     target_signature: f64,
     target_absolute_speed: f64,

@@ -1,5 +1,7 @@
 use super::*;
 use crate::db::outbox::{Effect as OutboxEffect, Outbox};
+use crate::services::identity::Identity;
+use infinity_core::consts::dogma::EFFECT_ONLINE;
 use std::sync::Mutex;
 mod refund_db;
 mod forced_retire;
@@ -278,4 +280,143 @@ fn bank_stop_dispatch_stops_current_cycle_after_commit() {
 fn passive_effect_list_is_not_online_capable() {
     let passive = [crate::sde::types::TypeEffect { effect_id: 1, is_default: false }];
     assert!(!has_effect(&passive, EFFECT_ONLINE as i32));
+}
+
+#[test]
+fn activation_current_binds_character_stop_generation_and_inactive_flag() {
+    let generation = Arc::new(AtomicBool::new(false));
+    let other = Arc::new(AtomicBool::new(false));
+    let module = -9_000_030_i64;
+    {
+        let mut st = crate::services::combat::state();
+        st.active.insert(module, ActiveModule { char_id: 7, stop: generation.clone(), forced_inactive: false });
+    }
+    assert!(activation_current(module, 7, &generation));
+    assert!(!activation_current(module, 8, &generation), "different pilot");
+    assert!(!activation_current(module, 7, &other), "stale activation generation");
+    {
+        let mut st = crate::services::combat::state();
+        st.active.get_mut(&module).unwrap().forced_inactive = true;
+    }
+    assert!(!activation_current(module, 7, &generation), "forced-inactive module");
+    crate::services::combat::state().active.remove(&module);
+}
+
+// Superweapon source lockouts: armed once per accepted firing, refusing until
+// their deadlines regardless of activation stop, and bounded by the expiry
+// timer, replacement and ball departure.
+fn sw_ball(id: i64, character: Option<i64>, x: f64) -> crate::space::Ball {
+    crate::space::Ball { id, type_id: 1, owner_id: character.unwrap_or(1), corp_id: 1, alliance_id: -1,
+        char_id: character, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1e6,
+        max_vel: 0.0, agility: 1.0, speed_fraction: 0.0, pos: [x, 0.0, 0.0], vel: [0.0; 3],
+        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3], follow_id: 0,
+        follow_range: 0.0, free: true, global: false, interactive: character.is_some(), massive: true,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
+        effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
+}
+
+fn sw_spec(ship: i64, character: i64, master: i64, generation: &Arc<AtomicBool>,
+    immobility_ms: i64, no_jump_or_cloak_ms: i64) -> crate::space::system::super_weapons::FiringSpec {
+    crate::space::system::super_weapons::FiringSpec { ship, character, master, weapon_type: 1, effect: 1,
+        generation: generation.clone(), combat_generation: 0, sequence: 1,
+        aim: crate::space::system::super_weapons::Aim::Cone { origin: [0.0; 3], direction: [1.0, 0.0, 0.0], cos_half: 1.0 },
+        hit_delay_ms: 0, window_ms: 0, cycle_ms: 1.0, radius: 100.0, range: 1_000.0,
+        signature_radius: 400.0, damage: [100.0; 4], immobility_ms, no_jump_or_cloak_ms, single: true, illegal: false }
+}
+
+/// Admit one activation owner, source ball and firing through the production
+/// `arm_super_weapon_firing` admission path.
+fn sw_arm(s: &mut crate::space::System, ship: i64, character: i64, master: i64, generation: &Arc<AtomicBool>,
+    immobility_ms: i64, no_jump_or_cloak_ms: i64) -> bool {
+    {
+        let mut st = crate::services::combat::state();
+        st.active.insert(master, ActiveModule { char_id: character, stop: generation.clone(), forced_inactive: false });
+    }
+    s.insert(sw_ball(ship, Some(character), 0.0));
+    s.arm_super_weapon_firing(sw_spec(ship, character, master, generation, immobility_ms, no_jump_or_cloak_ms))
+}
+
+#[test]
+fn lockout_is_armed_once_with_exact_fitted_deadlines() {
+    crate::tests::init_config();
+    let mut s = crate::space::System::new(1, Arc::default(), 1_000);
+    let generation = Arc::new(AtomicBool::new(false));
+    assert!(sw_arm(&mut s, 7, 42, 9_000_011, &generation, 30_000, 300_000));
+    // `until > now_ms()` is the exact comparison the movement/warp/jump/cloak
+    // seams apply; the deadline itself is the exclusive boundary.
+    assert_eq!((s.super_weapon_immobile_until(7), s.super_weapon_jump_cloak_until(7)),
+        (Some(31_000), Some(301_000)));
+    assert!(s.super_weapon_immobile_until(7).is_some_and(|u| u > s.now_ms()));
+    assert!(s.super_weapon_jump_cloak_until(7).is_some_and(|u| u > s.now_ms()));
+    // A second ball nearby is never a lockout source: firing ship only.
+    s.insert(sw_ball(8, Some(43), 50.0));
+    assert_eq!((s.super_weapon_immobile_until(8), s.super_weapon_jump_cloak_until(8)), (None, None));
+    s.tick(31_000);
+    assert_eq!(s.super_weapon_immobile_until(7), Some(31_000));
+    assert!(!s.super_weapon_immobile_until(7).is_some_and(|u| u > s.now_ms()));
+    assert!(s.super_weapon_jump_cloak_until(7).is_some_and(|u| u > s.now_ms()));
+    crate::services::combat::state().active.remove(&9_000_011);
+}
+
+#[test]
+fn lockout_survives_module_stop_and_dies_on_deadline() {
+    crate::tests::init_config();
+    let mut s = crate::space::System::new(1, Arc::default(), 1_000);
+    let generation = Arc::new(AtomicBool::new(false));
+    assert!(sw_arm(&mut s, 7, 42, 9_000_012, &generation, 30_000, 300_000));
+    generation.store(true, Ordering::Relaxed);
+    s.end_super_weapon_firing(9_000_012, &generation);
+    // Stop/offline cancels future pulses but never clears an armed deadline.
+    assert_eq!((s.super_weapon_immobile_until(7), s.super_weapon_jump_cloak_until(7)),
+        (Some(31_000), Some(301_000)));
+    s.tick(300_999);
+    assert_eq!(s.super_weapon_jump_cloak_until(7), Some(301_000));
+    assert!(s.super_weapon_jump_cloak_until(7).is_some_and(|u| u > s.now_ms()));
+    s.tick(301_000);
+    assert_eq!((s.super_weapon_immobile_until(7), s.super_weapon_jump_cloak_until(7)), (None, None));
+    crate::services::combat::state().active.remove(&9_000_012);
+}
+
+#[test]
+fn expiry_timer_removes_only_the_same_lockout() {
+    crate::tests::init_config();
+    let mut s = crate::space::System::new(1, Arc::default(), 1_000);
+    let first = Arc::new(AtomicBool::new(false));
+    assert!(sw_arm(&mut s, 7, 42, 9_000_013, &first, 30_000, 300_000));
+    first.store(true, Ordering::Relaxed);
+    // A new accepted firing replaces the lockout and arms its own expiry;
+    // the older timer must never remove it.
+    let second = Arc::new(AtomicBool::new(false));
+    assert!(sw_arm(&mut s, 7, 42, 9_000_014, &second, 10_000, 500_000));
+    assert_eq!(s.super_weapon_jump_cloak_until(7), Some(501_000));
+    s.tick(301_000);
+    assert_eq!(s.super_weapon_jump_cloak_until(7), Some(501_000));
+    s.tick(501_000);
+    assert_eq!(s.super_weapon_jump_cloak_until(7), None);
+    crate::services::combat::state().active.remove(&9_000_013);
+    crate::services::combat::state().active.remove(&9_000_014);
+}
+
+#[test]
+fn ball_leaving_removes_lockout_and_missing_or_stale_source_cannot_arm() {
+    crate::tests::init_config();
+    let mut s = crate::space::System::new(1, Arc::default(), 1_000);
+    let generation = Arc::new(AtomicBool::new(false));
+    assert!(sw_arm(&mut s, 7, 42, 9_000_015, &generation, 30_000, 300_000));
+    assert!(s.remove_ball(7).is_some());
+    assert_eq!((s.super_weapon_immobile_until(7), s.super_weapon_jump_cloak_until(7)), (None, None));
+    let stale = Arc::new(AtomicBool::new(false));
+    {
+        let mut st = crate::services::combat::state();
+        st.active.insert(9_000_016, ActiveModule { char_id: 42, stop: stale.clone(), forced_inactive: false });
+    }
+    // No source ball: admission refuses and installs nothing.
+    assert!(!s.arm_super_weapon_firing(sw_spec(7, 42, 9_000_016, &stale, 30_000, 300_000)));
+    assert_eq!(s.super_weapon_immobile_until(7), None);
+    // A stopped activation generation refuses the same way.
+    s.insert(sw_ball(7, Some(42), 0.0));
+    stale.store(true, Ordering::Relaxed);
+    assert!(!s.arm_super_weapon_firing(sw_spec(7, 42, 9_000_016, &stale, 30_000, 300_000)));
+    crate::services::combat::state().active.remove(&9_000_015);
+    crate::services::combat::state().active.remove(&9_000_016);
 }

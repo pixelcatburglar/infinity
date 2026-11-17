@@ -28,7 +28,7 @@ fn score(fraction: Option<f64>, distance: f64, optimal: f64, falloff: f64) -> Op
     fraction.filter(|value| value.is_finite() && *value < 1.0 && range_multiplier(distance, optimal, falloff) > 0.0)
 }
 
-fn apply(s: &mut System, system: i64, source: i64, hostile: i64, target: i64, generation: u64, layer: usize, amount: f64, optimal: f64, falloff: f64, mut attempt: PreparedCombatAttempt) {
+fn apply(s: &mut System, system: i64, source: i64, hostile: i64, target: i64, generation: u64, layer: usize, amount: f64, resistance_attribute: Option<i32>, optimal: f64, falloff: f64, mut attempt: PreparedCombatAttempt) {
     let guard = move |s: &System| {
         if !s.npc_projection_valid(source, hostile, generation) || target == hostile || !s.npc_assist_eligible(source, target) { return false; }
         let Some((me, other)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return false };
@@ -37,7 +37,7 @@ fn apply(s: &mut System, system: i64, source: i64, hostile: i64, target: i64, ge
     if !guard(s) { return; }
     let Some((me, other)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return };
     let amount = repair::scaled_amount(amount, gap(&me, &other), optimal, falloff);
-    let result = crate::services::combat::damage::repair_target_in_system(s, target, layer, amount,
+    let result = crate::services::combat::damage::repair_target_in_system(s, target, layer, amount, resistance_attribute,
         crate::space::combat::RepairSource::Remote(attempt.facts()));
     attempt.disarm();
     match result {
@@ -54,6 +54,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>, attempt: Option<Prepare
     };
     let optimal = inputs.ranges.optimal;
     let falloff = inputs.ranges.falloff;
+    let resistance_attribute = inputs.resistance_attribute;
     let base = inputs.base;
     let sde = cx.world.sde().clone();
     match cx.guard {
@@ -69,9 +70,9 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>, attempt: Option<Prepare
                     score(npc_health_fraction(candidate, layer), gap(me, candidate), optimal, falloff)
                 }) else { return };
                 if repair::applies_at_start(layer) {
-                    apply(s, system, source, hostile, target.id, generation, layer, base, optimal, falloff, attempt);
+                    apply(s, system, source, hostile, target.id, generation, layer, base, resistance_attribute, optimal, falloff, attempt);
                 } else if duration_ms.is_finite() && duration_ms > 0.0 {
-                    s.schedule(duration_ms as u64, move |s| apply(s, system, source, hostile, target.id, generation, layer, base, optimal, falloff, attempt));
+                    s.schedule(duration_ms as u64, move |s| apply(s, system, source, hostile, target.id, generation, layer, base, resistance_attribute, optimal, falloff, attempt));
                 }
             }).await;
         }
@@ -100,7 +101,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>, attempt: Option<Prepare
                 Some(gap(&me, &other))
             }).await.flatten() else { return Ok(()) };
             let amount = repair::scaled_amount(base, distance, optimal, falloff);
-            let result = crate::services::combat::damage::repair_target(cx.world, cx.system, target, layer, amount,
+            let result = crate::services::combat::damage::repair_target(cx.world, cx.system, target, layer, amount, resistance_attribute,
                 crate::space::combat::RepairSource::Remote(attempt.facts()), valid).await;
             if result.is_ok() || result.as_ref().is_err_and(crate::services::combat::capacity::is_refusal) { attempt.disarm(); }
             result?;

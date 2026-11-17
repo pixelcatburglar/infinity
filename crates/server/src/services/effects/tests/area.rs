@@ -550,3 +550,117 @@ async fn smartbomb_pulse_destroys_in_range_missile_and_refusal_leaves_it_intact(
     flush.unwrap();
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
+async fn defender_no_target_preserves_loaded_charge_and_permit() {
+    use crate::services::effects::behaviors;
+    use infinity_core::consts::{CATEGORY_CHARGE, dogma::{EFFECT_DEFENDER_MISSILE_LAUNCHING, EFFECT_USE_MISSILES}};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let hull = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
+    let launcher = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_MODULE) && ty.group_id == Some(512)
+        && ty.effects().iter().any(|row| row.effect_id == EFFECT_USE_MISSILES)).unwrap().type_id;
+    let charge = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_CHARGE) && ty.group_id == Some(88)
+        && ty.effects().iter().any(|row| row.effect_id == EFFECT_DEFENDER_MISSILE_LAUNCHING)).unwrap().type_id;
+    let f = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[ShipItemSpec { type_id: launcher, flag_id: FLAG_HI_SLOT_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] }]).await.unwrap();
+    let module = f.module();
+    db.execute("INSERT INTO game.module_charges (ship_id, flag_id, type_id, quantity) VALUES ($1,$2,$3,1)", &[&f.ship, &FLAG_HI_SLOT_FIRST, &charge]).await.unwrap();
+    let world = World::new(db.clone(), sde.clone(), 1);
+    world.system(1).await.unwrap();
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    world.register_pilot(f.character, tx.clone());
+    fixture::admit(&db, &world, 1, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await;
+    fixture::publish_fit(&db, &world, 1, f.character, f.ship).await;
+    let effect = registry::resolve(&sde, EFFECT_USE_MISSILES).unwrap();
+    let generation = Arc::new(AtomicBool::new(false));
+    combat::state().active.insert(module, ActiveModule { char_id: f.character, stop: generation.clone(), forced_inactive: false });
+    combat::state().activation_generation.insert(module, generation.clone());
+    let cx = Ctx { db: db.clone(), world: world.clone(), notify: tx, char_id: f.character, ship_id: f.ship, system_id: 1 };
+    let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: launcher, flag: FLAG_HI_SLOT_FIRST }], effect,
+        target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation, armed: true, combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id: module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
+            pending_combat: None, world: Arc::downgrade(&world), system: 1 }, started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0,
+        nominal_start: 0, other: None, repair_amount: 0.0, illegal: false, source_membership: None, target_type: None, inputs: Default::default() };
+    cycle = fixture::capture_cycle(cycle).await;
+    assert!(matches!(behaviors::on_cycle_start(&cx, &mut cycle, false).await.unwrap(), crate::services::effects::lifecycle::CycleOutcome::Stop("no Defender target")));
+    assert_eq!(crate::services::combat::targeting_charges::loaded(&db, f.ship, FLAG_HI_SLOT_FIRST).await.unwrap().map(|(_, quantity)| quantity), Some(1));
+    assert!(world.with(1, |s| !s.loaded_outstanding()).await.unwrap());
+    {
+        let mut state = combat::state();
+        if let Some(active) = state.active.remove(&module) { active.stop.store(true, Ordering::Relaxed); }
+        state.activation_generation.remove(&module);
+    }
+    world.remove_ball(1, f.ship).await;
+    world.unregister_pilot_generation(f.character, None);
+    let flush = world.flush_positions().await;
+    combat::forget_ship(f.ship);
+    drop(world);
+    cleanup_ship(&db, None, f).await.unwrap();
+    flush.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn signature_application_scales_victims_by_effective_signature() {
+    use crate::services::effects::space_source::PreparedCombatAttempt;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let hull_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)
+        && t.attribute(ATTR_SHIELD_CAPACITY).is_some_and(|v| v > 10.0)
+        && t.attribute(ATTR_SHIELD_EM_DAMAGE_RESONANCE).is_some_and(|v| v > 0.0)).expect("shielded hull");
+    let hull = hull_type.type_id;
+    // EM damage that strips 40% of the shield at full application, so no
+    // victim saturates and the signature ratios stay observable.
+    let em = 0.4 * hull_type.attribute(ATTR_SHIELD_CAPACITY).unwrap()
+        / hull_type.attribute(ATTR_SHIELD_EM_DAMAGE_RESONANCE).unwrap();
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let test_world = world.clone();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        test_world.system(1).await.unwrap();
+        test_world.with(1, |s| s.ensure_combat_facts()).await.unwrap();
+        fixture::admit_npc(&test_world, 1, fixture::ball(1, hull, 1, None, 0.0)).await;
+        // Three identical hulls in one batch; only the victims' effective
+        // signatures differ, so dealt ratios isolate the fitted
+        // `min(1, target_signature / weapon_signature)` factor.
+        for (id, signature) in [(2, 200.0), (3, 400.0), (4, 800.0)] {
+            let mut victim = fixture::ball(id, hull, 1, None, id as f64 + 48.0);
+            victim.signature_radius = Some(signature);
+            fixture::admit_npc(&test_world, 1, victim).await;
+        }
+        let loss = |s: &crate::space::System, id: i64| 1.0 - npc_health_fraction(s.ball(id).unwrap(), 0).unwrap_or(1.0);
+        assert_eq!(test_world.with(1, move |s| [2, 3, 4].map(|id| loss(s, id))).await.unwrap(), [0.0, 0.0, 0.0]);
+        let facts = test_world.with(1, move |s| s.prepare_combat_source(1, None, None, Some(hull),
+            crate::lua::events::resources::FactOrigin::Natural,
+            crate::space::targeting::next_generation(), 1, 1, |_| true)).await.unwrap().unwrap();
+        let victims = test_world.with(1, |s| aoe::victims(s, 1, [0.0; 3], 1_000.0)).await.unwrap();
+        aoe::apply_damage_guarded(&test_db, &test_world, 1, hull, victims,
+            aoe::DamageApplication::Signature { raw: [em, 0.0, 0.0, 0.0], signature_radius: 400.0 },
+            None, PreparedCombatAttempt::new(facts, Arc::downgrade(&test_world), 1)).await.unwrap();
+        let after = test_world.with(1, move |s| [2, 3, 4].map(|id| loss(s, id))).await.unwrap();
+        // sig 200/400 -> 0.5x; sig 400/400 -> 1.0x; sig 800/400 clamps to 1.0x.
+        assert!(after[0] > 0.0 && (after[1] - 2.0 * after[0]).abs() < 1e-3 && (after[2] - after[1]).abs() < 1e-3,
+            "shield loss {after:?}");
+        // A non-positive weapon signature applies the full vector, and no
+        // victim ever receives a source lockout.
+        let facts = test_world.with(1, move |s| s.prepare_combat_source(1, None, None, Some(hull),
+            crate::lua::events::resources::FactOrigin::Natural,
+            crate::space::targeting::next_generation(), 2, 1, |_| true)).await.unwrap().unwrap();
+        let victims = test_world.with(1, |s| aoe::victims(s, 1, [0.0; 3], 1_000.0)).await.unwrap();
+        aoe::apply_damage_guarded(&test_db, &test_world, 1, hull, victims,
+            aoe::DamageApplication::Signature { raw: [em, 0.0, 0.0, 0.0], signature_radius: 0.0 },
+            None, PreparedCombatAttempt::new(facts, Arc::downgrade(&test_world), 1)).await.unwrap();
+        let second = test_world.with(1, move |s| [2, 3, 4].map(|id| loss(s, id))).await.unwrap();
+        assert!(second.iter().all(|v| *v > after[1]) , "full-damage second apply {second:?}");
+        let unlocked = test_world.with(1, |s| [2, 3, 4].iter().all(|&id|
+            s.super_weapon_immobile_until(id).is_none() && s.super_weapon_jump_cloak_until(id).is_none())).await.unwrap();
+        assert!(unlocked);
+    }).await;
+    for id in 1..=4 { world.remove_ball(1, id).await; combat::forget_ship(id); }
+    let flush = world.flush_positions().await;
+    drop(world);
+    flush.unwrap();
+    result.unwrap();
+}

@@ -491,6 +491,13 @@ pub(in crate::services) async fn move_core<X: Send>(
     let mut guarded = if take.is_none() && (item.singleton || custody == Custody::TakeSubtree) {
         inventory_dao::descendants(tx, &[item.item_id]).await.map_err(db_err)?
     } else { vec![item.item_id] };
+    // A module with a live duration-bounded activation record cannot leave its
+    // fitted location: running or pending records refuse as activated, an
+    // unexpired cooling record refuses with its remaining delay. Same-location
+    // fitting-flag moves are not refused.
+    if is_fitting_flag(item.flag_id) && (item.location_id != location || !is_fitting_flag(flag)) {
+        super::super::effects::active_cycle::removal_refusal(item.item_id)?;
+    }
     if !guarded.contains(&item.item_id) { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
     guarded.push(location);
     if !crate::dao::trades::reserved(tx, &guarded).await.map_err(db_err)?.is_empty() {

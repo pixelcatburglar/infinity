@@ -242,7 +242,7 @@ fn projected_cycles_are_independent_and_stale_jobs_cannot_restore_effects() {
     assert!(s.npc_projection_valid(1000, 1, generation));
     s.upsert_projection(1, Projection { source_ship: 1000, source_module: first,
         source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     s.tick(deadline + 1000);
     assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Effect { source_module, .. } if source_module == first));
     assert!(jobs.try_recv().is_err());
@@ -266,7 +266,7 @@ fn departing_npc_removes_its_projections_and_invalidates_jobs() {
     let generation = s.brains[&1000].target_generation;
     s.upsert_projection(1, Projection { source_ship: 1000, source_module: -1,
         source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     s.remove_ball(1000);
     assert!(s.projections_on(1).is_empty());
     assert!(!s.npc_projection_valid(1000, 1, generation));
@@ -452,7 +452,7 @@ fn jam_drops_completed_lock_and_invalidates_queued_projection() {
     assert!(s.npc_projection_valid(id, 1, shot_generation));
     s.upsert_projection(1, Projection { source_ship: id, source_module, source_type: 1,
         effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otheradd".as_slice()));
     crate::services::combat::jamming::apply(&mut s, 1, -8_901_002, id, 4000.0);
     assert!(s.brains[&id].target.is_none());

@@ -335,6 +335,9 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         if space::sovereignty::links::blocks(s, ship) {
             return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
         }
+        if s.super_weapon_jump_cloak_until(ship).is_some_and(|until| until > s.now_ms()) {
+            return Err(super::notify_error(messages::super_weapon::JUMP_LOCKED));
+        }
         s.uncloak(ship);
         s.command(ship, move |b, t, _| {
             b.stop();
@@ -470,6 +473,9 @@ pub async fn send_state(c: &mut Client) -> Result<(), CallError> {
 fn movement(identity: &Identity, world: &space::World, space_system: Option<i64>, f: impl FnOnce(&mut Ball, i64, &space::System) -> Vec<Value> + Send + 'static) -> CallResult {
     let (Some(system), Some(ship)) = (space_system, identity.ship_id) else { return Ok(Value::None) };
     world.post(system, move |s| {
+        // A superweapon's immobility deadline refuses steering outright; the
+        // arrival jump cloak stays since no command was accepted.
+        if s.super_weapon_immobile_until(ship).is_some_and(|until| until > s.now_ms()) { return; }
         s.drop_jump_cloak(ship);
         s.command(ship, f);
     });
@@ -534,17 +540,19 @@ pub(super) async fn warp_pilot(db: &crate::db::Db, world: &space::World, system:
             WarpCommit::Unavailable => return Ok(false),
             WarpCommit::EntosisBlocked if !is_fleet => return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED)),
             WarpCommit::Scrambled if !is_fleet => return Err(super::notify_error(messages::effects::WARP_SCRAMBLED)),
-            WarpCommit::EntosisBlocked | WarpCommit::Scrambled => return Ok(false),
+            WarpCommit::Immobile if !is_fleet => return Err(super::notify_error(messages::super_weapon::WARP_LOCKED)),
+            WarpCommit::EntosisBlocked | WarpCommit::Scrambled | WarpCommit::Immobile => return Ok(false),
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum WarpCommit { Queued, RetryProjection, Scrambled, EntosisBlocked, Unavailable }
+pub(super) enum WarpCommit { Queued, RetryProjection, Scrambled, Immobile, EntosisBlocked, Unavailable }
 
 pub(super) fn commit_warp(s: &mut space::System, ship: i64, revision: u64, scrambled: bool,
     factor: i64, destination: WarpDestination, arrival: Option<WarpArrivalId>) -> WarpCommit {
     if space::sovereignty::links::blocks(s, ship) { return WarpCommit::EntosisBlocked; }
+    if s.super_weapon_immobile_until(ship).is_some_and(|until| until > s.now_ms()) { return WarpCommit::Immobile; }
     if s.projection_revision(ship) != revision { return WarpCommit::RetryProjection; }
     if scrambled { return WarpCommit::Scrambled; }
     s.drop_jump_cloak(ship);

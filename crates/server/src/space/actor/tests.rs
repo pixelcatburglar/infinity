@@ -157,6 +157,15 @@ async fn queued_arrival_prevents_stop_and_executes() {
 
 #[test]
 fn summary_cost_excluded_from_tick() {
+    const CHILD: &str = "INFINITY_ACTOR_SUMMARY_TEST_CHILD";
+    const NAME: &str = "space::actor::tests::summary_cost_excluded_from_tick";
+    // Other actor tests share the process summary window and slow-report limit.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"]).env(CHILD, "1").output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Field { U64(u64), I64(i64), Bool(bool), Other }
     struct Visit<'a>(&'a mut Vec<(&'static str, Field)>);
@@ -170,8 +179,7 @@ fn summary_cost_excluded_from_tick() {
         ready: Arc<std::sync::Barrier>, done: Arc<std::sync::Barrier>, fired: std::sync::atomic::AtomicBool }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
         fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-            let mut fields = Vec::new();
-            event.record(&mut Visit(&mut fields));
+            let mut fields = Vec::new(); event.record(&mut Visit(&mut fields));
             let level = *event.metadata().level();
             let expected = match level {
                 tracing::Level::INFO => fields.iter().any(|(name, _)| *name == "window_ns"),
@@ -180,10 +188,8 @@ fn summary_cost_excluded_from_tick() {
                 _ => false,
             };
             if event.metadata().target() != "infinity_server::space::actor" || !expected { return; }
-            if level == tracing::Level::INFO && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                self.ready.wait();
-                self.done.wait();
-            }
+            if level == tracing::Level::INFO
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) { self.ready.wait(); self.done.wait(); }
             let _ = self.tx.send((level, fields));
         }
     }

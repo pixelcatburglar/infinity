@@ -13,35 +13,37 @@
 //! A non-targeted module's first-cycle FX may be unseen by observers until the next
 //! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
 //! Activation and retirement update the system actor's cached fitted defenses.
+//! Duration-bounded pure-modifier activations additionally carry module-item
+//! keyed Pending/Running/Cooling records in shared combat state (active_cycle.rs).
 //! Weapon animations are published through the system's ordered scene channel.
-use super::{EffectKind, parameters, registry, spool, unsupported, repair};
-use super::registry::{Effect, EffectAttribute, EffectFlag};
+use super::{EffectKind, parameters, registry, spool, repair};
+use super::registry::{Effect, EffectFlag};
 use super::notify::ship_effect;
-use super::behaviors::{Activation, on_activate, on_cycle_end, on_stop};
+use super::behaviors::{on_cycle_end, on_stop};
 use crate::services::combat::{state, ActiveModule, Ctx};
 use crate::services::combat::groups_health::inject;
-use crate::services::combat::targeting_charges::{bank, charge_key};
-use crate::services::fit::{Fit, Key};
+use crate::services::fit::Key;
 use crate::services::items::load_items;
-use crate::services::{db_err, notify_error, user_error, CallError, CallResult};
-use crate::services::identity::Identity;
+use crate::services::{db_err, notify_error, CallError};
 use crate::dao::items::loading::{Item, ItemQuery};
-use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, FLAG_HANGAR};
-use infinity_core::consts::{dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
-use crate::client::{filetime_from_unix_ms, filetime_now};
+use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, FLAG_HANGAR};
+use infinity_core::consts::{dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
+use crate::client::filetime_from_unix_ms;
 use infinity_core::messages;
-use crate::space::{ms_to_seconds, seconds_to_ms, NotifyTx, System, World, MODE_WARP};
+use crate::space::{ms_to_seconds, seconds_to_ms, System, World, MODE_WARP};
 use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use crate::db::Db;
 use crate::db::executor::Executor;
-use crate::db::outbox::Notification;
 use crate::sde::Sde;
 use crate::lua::events::{GameEvent, ModuleCycleOutcome};
 use super::online::OnlinePolicy;
+mod activation;
+pub(crate) use activation::{activate, activate_inner, deactivate};
 mod begin;
+pub(super) mod end;
 pub(in crate::services::effects) mod combat_source;
 
 
@@ -76,6 +78,7 @@ pub(in crate::services) async fn stop_offensive(cx: &Ctx, except_module: i64) {
             let ship = cx.ship_id;
             cx.world.post(cx.system_id, move |s| {
                 if force_inactive(module, &generation) {
+                    super::active_cycle::finish_module(s, ship, module);
                     s.fitted_module_active(ship, module, false);
                     s.refresh_projection_target(ship);
                 }
@@ -86,8 +89,6 @@ pub(in crate::services) async fn stop_offensive(cx: &Ctx, except_module: i64) {
 }
 
 
-/// Existing server module duration fallback, in milliseconds.
-const DEFAULT_MODULE_DURATION_MS: f64 = 1000.0;
 /// Existing server minimum module cycle duration.
 pub(super) const MIN_MODULE_DURATION_MS: f64 = 250.0;
 /// Client UserError type-ID substitution tag.
@@ -110,7 +111,7 @@ pub(super) struct NativeCombatGeneration {
 }
 
 
-fn retire_combat_generations(s: &mut System, generations: Vec<NativeCombatGeneration>) {
+pub(in crate::services::effects) fn retire_combat_generations(s: &mut System, generations: Vec<NativeCombatGeneration>) {
     for member in generations {
         let _ = s.retire_combat_source(member.generation);
     }
@@ -137,6 +138,13 @@ impl Drop for ActivationOwner {
             if st.activation_generation.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
                 st.activation_generation.remove(&self.master);
             }
+            // When no world remains to run the posted terminal, the dropping
+            // generation's record still ends: Pending cancels and Running
+            // starts its cooling against the wall clock. A live system's
+            // posted finish_record owns the published terminal instead.
+            if self.world.upgrade().is_none() {
+                super::active_cycle::stopped(crate::space::now_ms(), &mut st, self.master, &self.generation);
+            }
         }
         drop(self.pending_combat.take());
         let generations = std::mem::take(&mut self.combat_generations);
@@ -146,6 +154,7 @@ impl Drop for ActivationOwner {
                 world.post(self.system, move |s| {
                     retire_combat_generations(s, generations);
                     s.retire_fx_activation(master, &generation);
+                    super::active_cycle::finish_record(s, master, &generation);
                 });
             }
         }
@@ -200,13 +209,13 @@ pub(super) fn cycle_valid(s: &System, cycle: &Cycle) -> bool {
         && state().active.get(&cycle.modules[0].id).is_some_and(|v| Arc::ptr_eq(&v.stop, &cycle.stop))
 }
 
-fn cycle_source_current(s: &System, cycle: &Cycle) -> bool {
+pub(in crate::services::effects) fn cycle_source_current(s: &System, cycle: &Cycle) -> bool {
     !cycle.stop.load(Ordering::Relaxed)
         && s.ball(cycle.cx.ship_id).is_some_and(|ball| ball.char_id == Some(cycle.cx.char_id))
         && state().active.get(&cycle.modules[0].id).is_some_and(|active| Arc::ptr_eq(&active.stop, &cycle.stop))
 }
 
-fn cycle_target_lost(s: &System, cycle: &Cycle) -> bool {
+pub(in crate::services::effects) fn cycle_target_lost(s: &System, cycle: &Cycle) -> bool {
     cycle_source_current(s, cycle) && cycle.target.is_some_and(|target| !s.contains(target))
 }
 
@@ -222,7 +231,7 @@ pub(super) async fn target_loss(cycle: &Cycle) -> CycleOutcome {
     else { CycleOutcome::Stop("target lost") }
 }
 
-fn publish_cycle(cycle: &Cycle, outcome: ModuleCycleOutcome) {
+pub(in crate::services::effects) fn publish_cycle(cycle: &Cycle, outcome: ModuleCycleOutcome) {
     for module in &cycle.modules {
         crate::progress::publish_live(cycle.cx.world.progress_registry(), &GameEvent::ModuleCycleEnded {
             char_id: cycle.cx.char_id, module_item_id: module.id, effect_id: cycle.effect.id, outcome,
@@ -252,7 +261,7 @@ pub(super) fn schedule_cycle_end(s: &mut System, start: i64, duration_ms: f64, f
     s.schedule_at(end, move |s| f(s, end));
 }
 
-pub(super) fn retire_activation(active: &mut HashMap<i64, ActiveModule>, master: i64, stop: &Arc<AtomicBool>, publish: impl FnOnce()) -> bool {
+pub(in crate::services::effects) fn retire_activation(active: &mut HashMap<i64, ActiveModule>, master: i64, stop: &Arc<AtomicBool>, publish: impl FnOnce()) -> bool {
     if !active.get(&master).is_some_and(|current| Arc::ptr_eq(&current.stop, stop)) { return false; }
     publish();
     active.remove(&master);
@@ -366,6 +375,11 @@ pub(super) fn capture_cycle_inputs(s: &mut System, cycle: &mut Cycle) -> Result<
             }
         }
     }
+    if cycle.effect.kind == EffectKind::SuperWeapon && cycle.inputs.aim.is_none() {
+        // A target without a combat record captures generation 0, which no
+        // real membership generation can equal: the hit is suppressed later.
+        cycle.inputs.aim = cycle.target.map(|id| parameters::SuperWeaponAim::NormalTarget { id, ball_generation: s.combat_membership_generation(id).unwrap_or(0) });
+    }
     // Admit each member's one payable loaded use; consume or stop releases it.
     let kind = charge_kind(cycle.effect.id, cycle.effect.kind);
     let ship = cycle.cx.ship_id;
@@ -381,20 +395,20 @@ pub(super) fn capture_cycle_inputs(s: &mut System, cycle: &mut Cycle) -> Result<
     Ok(true)
 }
 
-pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) {
+pub(in crate::services::effects) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) {
     if cycle.effect.id == i64::from(EFFECT_MICROWARPDRIVE) && propulsion_blocked(cycle.cx.world.sde(), &s.projections_on(cycle.cx.ship_id)) {
         cycle.stop.store(true, Ordering::Relaxed);
-        cycle_stop(s, cycle);
+        end::cycle_stop(s, cycle);
         return;
     }
     if matches!(cycle.effect.kind, EffectKind::Projected { .. })
         && s.ball(cycle.cx.ship_id).is_some_and(|ball| ball.mode == MODE_WARP) {
-        cycle_stop(s, cycle);
+        end::cycle_stop(s, cycle);
         return;
     }
     if !cycle_valid(s, &cycle) {
         if cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
-        cycle_stop(s, cycle);
+        end::cycle_stop(s, cycle);
         return;
     }
     if cycle.cycles == 0 {
@@ -411,28 +425,28 @@ pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) 
     super::heat::begin_cycle(s, &cycle);
     match capture_cycle_inputs(s, &mut cycle) {
         Ok(true) => s.defer(async move { begin::cycle_begin_work(cycle).await; }),
-        Ok(false) => cycle_stop(s, cycle),
+        Ok(false) => end::cycle_stop(s, cycle),
         Err(error) => {
             report_cycle_error(&cycle.cx, cycle.modules[0].id, "capture", error);
-            cycle_stop(s, cycle);
+            end::cycle_stop(s, cycle);
         }
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) enum CycleOutcome {
+pub(in crate::services::effects) enum CycleOutcome {
     Continue,
     Stop(&'static str),
     Ended { reason: &'static str, outcome: ModuleCycleOutcome },
 }
 
-fn cycle_discharge(kind: EffectKind, charged: bool, need: f64) -> f64 {
+pub(in crate::services::effects) fn cycle_discharge(kind: EffectKind, charged: bool, need: f64) -> f64 {
     if matches!(kind, EffectKind::FueledLocalRepair { layer: 0, .. }) && charged { 0.0 } else { need }
 }
 
-fn needs_charge(kind: EffectKind) -> bool { matches!(kind, EffectKind::CapBooster | EffectKind::Bomb | EffectKind::Vorton) }
+pub(in crate::services::effects) fn needs_charge(kind: EffectKind) -> bool { matches!(kind, EffectKind::CapBooster | EffectKind::Bomb | EffectKind::Vorton) }
 
-fn charge_sensitive(kind: EffectKind) -> bool {
+pub(in crate::services::effects) fn charge_sensitive(kind: EffectKind) -> bool {
     matches!(kind, EffectKind::CapBooster | EffectKind::FueledLocalRepair { .. } | EffectKind::Bomb | EffectKind::Vorton)
 }
 
@@ -444,14 +458,14 @@ pub(super) fn charge_kind(id: i64, kind: EffectKind) -> EffectKind {
     }
 }
 
-async fn refund_refused_charge(cx: &Ctx, amount: f64) -> Result<(), CallError> {
+pub(in crate::services::effects) async fn refund_refused_charge(cx: &Ctx, amount: f64) -> Result<(), CallError> {
     if amount > 0.0 {
         inject(&cx.db, &cx.world, cx.system_id, cx.ship_id, amount).await?;
     }
     Ok(())
 }
 
-fn report_cycle_error(cx: &Ctx, module: i64, phase: &str, error: CallError) {
+pub(in crate::services::effects) fn report_cycle_error(cx: &Ctx, module: i64, phase: &str, error: CallError) {
     if crate::services::combat::capacity::is_refusal(&error) {
         cx.notify("OnRemoteMessage", vec![Value::str(messages::MSG_CUSTOM_NOTIFY),
             Value::dict([("notify", Value::unicode(messages::effects::COMBAT_CAPACITY_FULL))])]);
@@ -462,109 +476,6 @@ fn report_cycle_error(cx: &Ctx, module: i64, phase: &str, error: CallError) {
         }
     }
 }
-
-
-
-pub(super) fn cycle_end(s: &mut System, cycle: Cycle, end: i64) {
-    if !cycle_valid(s, &cycle) {
-        if cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
-        cycle_stop(s, cycle);
-        return;
-    }
-    let final_cycle = cycle_is_final(cycle.stop.load(Ordering::Relaxed), cycle.effect.has(EffectFlag::DisallowAutoRepeat), cycle.repeat, cycle.cycles);
-    let Some(receiver) = super::heat::finish_cycle(s, &cycle, end, final_cycle) else { cycle_stop(s, cycle); return };
-    let membership = s.combat_membership_generation(cycle.cx.ship_id);
-    s.defer(async move { cycle_end_work(cycle, end, final_cycle, membership, receiver).await; });
-}
-
-/// Family end, then heat damage, then one actor closure that completes heat
-/// immediately before the repeat or the retirement.
-async fn cycle_end_work(mut cycle: Cycle, end: i64, final_cycle: bool, membership: Option<u64>, receiver: tokio::sync::oneshot::Receiver<Option<Vec<super::heat::SourceSnapshot>>>) {
-    let cx = cycle.cx.clone();
-    let captured = match receiver.await {
-        Ok(Some(sources)) => Some(sources),
-        Ok(None) | Err(_) => None,
-    };
-    let mut public = None;
-    let (sources, finished) = if let Some(sources) = captured {
-        let mut finished = match on_cycle_end(&cx, &mut cycle).await {
-            Ok(CycleOutcome::Continue) => { public = Some(ModuleCycleOutcome::Completed); final_cycle }
-            Ok(CycleOutcome::Ended { outcome, .. }) => { public = Some(outcome); true }
-            Ok(CycleOutcome::Stop(_)) => true,
-            Err(e) => { report_cycle_error(&cx, cycle.modules[0].id, "end", e); true }
-        };
-        if let Err(e) = super::heat::damage::apply(&cx, membership, sources).await {
-            warn!("module {} heat damage failed: {}", cycle.modules[0].id, match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
-            finished = true;
-        }
-        (true, finished)
-    } else {
-        (false, true)
-    };
-    cx.world.post(cx.system_id, move |s| {
-        let continuing = boundary_continues(sources, finished, &cycle.stop);
-        super::heat::complete_cycle(s, &cycle, !continuing);
-        if let Some(outcome) = public { publish_cycle(&cycle, outcome); }
-        if continuing {
-            cycle_start(s, cycle, end);
-        } else {
-            cycle_stop(s, cycle);
-        }
-    });
-}
-
-pub(super) fn cycle_stop(s: &mut System, mut cycle: Cycle) {
-    let master = cycle.modules[0].id;
-    let cx = cycle.cx.clone();
-    debug!("module {master} stopped after {} cycles", cycle.cycles);
-    super::heat::stop_cycle(s, &cycle);
-    if let Some(mut pending) = cycle.owner.pending_combat.take() {
-        s.finish_combat_attempt(&pending.facts());
-        pending.disarm();
-    }
-    // Residual turret-bank round tokens close in place before their native
-    // generations retire; a cycle never stops inside a resolved volley. Any
-    // unconsumed loaded use returns its admission to the slot.
-    for member in &mut cycle.inputs.members {
-        if let Some(permit) = member.permit.take() { s.release_loaded_use(permit); }
-        if let Some(round) = member.turret_round.as_mut() {
-            if let Some(attempt) = round.attempt.as_mut() { attempt.finish_in_actor(s); }
-        }
-        member.turret_round = None;
-    }
-    retire_combat_generations(s, std::mem::take(&mut cycle.owner.combat_generations));
-    let mut st = state();
-    let retired = retire_activation(&mut st.active, master, &cycle.stop, || {
-        if cycle.effect.kind != EffectKind::Entosis || cycle.cycles > 0 {
-            ship_effect(&cx, master, cycle.effect.id, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
-        }
-    });
-    if retired && cycle.effect.kind != EffectKind::Propulsion && st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &cycle.stop)) {
-        st.activation_generation.remove(&master);
-    }
-    if retired { cycle.owner.armed = false; }
-    drop(st);
-    if cycle.effect.kind == EffectKind::Entosis { super::entosis::stop(s, &cycle); }
-    if retired {
-        for module in &cycle.modules { s.fitted_module_active(cx.ship_id, module.id, false); }
-    }
-    if retired && matches!(cycle.effect.kind, EffectKind::Cloak | EffectKind::MicroJumpDrive) {
-        s.refresh_projection_target(cx.ship_id);
-    }
-    if retired { on_stop(s, &cx, &cycle); }
-    // A retired activation reports its ramp attributes back to zero and drops
-    // its readouts; a superseded generation is untouched by its fencing.
-    if retired { s.spool_readout_clear(cx.ship_id, &cycle.stop); }
-    s.retire_fx_activation(master, &cycle.stop);
-    if retired && matches!(charge_kind(cycle.effect.id, cycle.effect.kind), EffectKind::FueledLocalRepair { .. }) {
-        s.defer(async move {
-            if let Err(error) = crate::services::combat::targeting_charges::auto_reload(&cx, master).await {
-                warn!("module {master} automatic reload failed: {}", match error { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
-            }
-        });
-    }
-}
-
 
 pub(in crate::services) fn has_effect(effects: &[crate::sde::types::TypeEffect], effect: i32) -> bool {
     effects.iter().any(|entry| entry.effect_id == effect)
@@ -623,181 +534,5 @@ pub(super) async fn cycle_subject_valid(cycle: &Cycle) -> bool {
     world.with(system, move |s| source_subject_current(s, cx.ship_id, cx.char_id, membership, &module, effect, &activation)).await.unwrap_or(false)
 }
 
-/// Activate an effect. `login_user` feeds the activation, online and hacking-start info logs.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn activate(
-    identity: &Identity, db: &Db, world: &Arc<World>, sde: &Arc<Sde>, space_system: Option<i64>,
-    sender: NotifyTx, login_user: i64, mut item_id: i64, effect_name: &str, target: Option<i64>, repeat: i64,
-    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
-) -> CallResult {
-    let Some(cx) = Ctx::from_identity(identity, db, world, space_system, sender.clone()) else { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)) };
-    let module = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next()
-        .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    let mut matches = cx.world.sde().dogma.effects_by_name(effect_name);
-    let Some(row) = matches.next() else { return Err(unsupported::refusal(None, effect_name, module.type_id)) };
-    if matches.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {effect_name}"))); }
-    drop(matches);
-    let id = row.effect_id;
-    // Fitting mutations and non-online activation share this lock through registration and FX queuing.
-    // Online activation takes it inside set_online instead.
-    let _lock = if id != EFFECT_ONLINE as i32 { Some(crate::services::market::lock().await) } else { None };
-    let policy = OnlinePolicy::from_identity(identity, sender.clone())?;
-    let mut module = subject(db, sde, &policy, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
-    let Some(effect) = registry::resolve(cx.world.sde(), id) else {
-        return Err(unsupported::refusal(Some(id), effect_name, module.type_id));
-    };
-    let kind = effect.kind;
-    let target = if kind == EffectKind::BurstJammer { None } else { target };
-    if id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER || !registry::activation_in_scope(module.category_id, module.group_id, kind) || !effect.manually_activatable() {
-        return Err(unsupported::refusal(Some(id), effect_name, module.type_id));
-    }
-    // Bank selection is serialized with fitting mutations by the shared lock above.
-    if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
-        let master = crate::services::combat::targeting_charges::master_for_member(db, cx.ship_id, item_id).await?;
-        if master != item_id {
-            module = subject(db, sde, &policy, cx.ship_id, master, id, true).await?;
-            if !registry::activation_in_scope(module.category_id, module.group_id, kind) {
-                return Err(unsupported::refusal(Some(id), effect_name, module.type_id));
-            }
-            item_id = master;
-        }
-    }
-    match kind {
-        EffectKind::Hacking => {
-            super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::super::hacking::start(identity, db, world, sde, space_system, sender, login_user, item_id, target, notify).await;
-        }
-        EffectKind::Online => {
-            super::cloak::before_activate(&cx, item_id, kind).await?;
-            return super::online::set_online(identity, db, world, sde, sender, login_user, cx.ship_id, item_id, true, notify).await;
-        }
-        EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
-        EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
-        EffectKind::Propulsion | EffectKind::Mining | EffectKind::Projected { .. } | EffectKind::CapTransfer |
-        EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::RemoteRepair { .. } |
-        EffectKind::Ecm | EffectKind::BurstJammer |
-        EffectKind::Smartbomb | EffectKind::Vorton | EffectKind::Cloak |
-        EffectKind::MicroJumpDrive | EffectKind::Salvage | EffectKind::Tractor |
-        EffectKind::CargoScan | EffectKind::ShipScan | EffectKind::SurveyScan |
-        EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb | EffectKind::Compression | EffectKind::Entosis => {}
-        EffectKind::ProbeLaunch => return Err(unsupported::refusal(Some(id), effect_name, module.type_id)),
-    }
-    super::cloak::before_activate(&cx, item_id, kind).await?;
-    if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
-        return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
-    }
-    let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
-    let activation = Activation { effect: effect.clone(), module: Module { id: item_id, type_id: module.type_id, flag: module.flag_id }, target };
-    if state().active.contains_key(&item_id) {
-        return Ok(Value::None);
-    }
-    let duration_ms = effect.attribute(EffectAttribute::Duration).map(|a| fit.value(Key::Module(item_id), a)).unwrap_or(DEFAULT_MODULE_DURATION_MS).max(MIN_MODULE_DURATION_MS);
-    // The group fires together.
-    let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];
-    if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
-        for slave in bank(&cx.db, cx.ship_id, item_id).await?.into_iter().skip(1) {
-            let m = subject(db, sde, &policy, cx.ship_id, slave, id, true).await?;
-            modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
-        }
-    }
-    for module in &modules { super::heat::damage::validate(&fit, module.id)?; }
-    let masters: Vec<i64> = state().active.iter().filter(|(_, active)| active.char_id == cx.char_id && !active.forced_inactive).map(|(&id, _)| id).collect();
-    let mut active = Vec::new();
-    for master in masters { active.extend(bank(&cx.db, cx.ship_id, master).await?); }
-    active.sort_unstable();
-    active.dedup();
-    let activating: Vec<i64> = modules.iter().map(|module| module.id).collect();
-    super::fitting::validate_active(&cx.db, sde.clone(), &fit, cx.ship_id, &active, &activating).await?;
-    on_activate(&cx, &fit, &activation).await?;
-    let mut illegal = false;
-    if matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Neutralizer | EffectKind::Nosferatu) {
-        let t = target.unwrap_or(0);
-        let victim = cx.world.with(cx.system_id, move |s| s.ball(t).and_then(|b| b.char_id)).await.flatten();
-        if let Some(victim) = victim {
-            illegal = super::super::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, victim).await?;
-        }
-    }
-    let (ship, system, module_item) = (cx.ship_id, cx.system_id, item_id);
-    let other = cx.world.with(system, move |s| s.loaded_effective(ship, module_item)).await.flatten()
-        .map(|(_, type_id, _, _)| charge_key(ship, module.flag_id, type_id));
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let mut st = state();
-        if st.active.contains_key(&item_id) { return Ok(Value::None); }
-        if st.reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
-            return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
-        }
-        st.active.insert(item_id, ActiveModule { char_id: cx.char_id, stop: stop.clone(), forced_inactive: false });
-        st.activation_generation.insert(item_id, stop.clone());
-    }
-    let ship = cx.ship_id;
-    cx.world.post(cx.system_id, move |s| {
-        s.drop_jump_cloak(ship);
-        if matches!(kind, EffectKind::Cloak | EffectKind::MicroJumpDrive) {
-            s.refresh_projection_target(ship);
-        }
-    });
-    let combat_generations = modules.iter().map(|module| NativeCombatGeneration {
-        module_id: module.id, generation: crate::space::targeting::next_generation(), sequence: 0,
-    }).collect();
-    let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true,
-        combat_generations, pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id };
-    if kind != EffectKind::Entosis {
-        ship_effect(&cx, item_id, effect.id, target, other.clone(), true, filetime_now(), duration_ms, repeat);
-    }
-    info!(user = login_user, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());
-    let world = cx.world.clone();
-    let cycle = Cycle { cx, modules, effect, target, repeat, stop, owner, started: filetime_now(), charge_type: None, cycles: 0, duration_ms, nominal_start: 0, other, repair_amount: 0.0, illegal, source_membership: None, target_type: None, inputs: Default::default() };
-    world.post(cycle.cx.system_id, move |s| {
-        let now = s.now_ms();
-        cycle_start(s, cycle, now);
-    });
-    Ok(Value::None)
-}
-
-
-/// Stop after the current cycle. `login_user` is read only by the online/offline info log.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn deactivate(
-    identity: &Identity, db: &Db, world: &Arc<World>, sde: &Arc<Sde>, space_system: Option<i64>,
-    sender: NotifyTx, login_user: i64, item_id: i64, effect_name: &str,
-    notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
-) -> CallResult {
-    let Some(cx) = Ctx::from_identity(identity, db, world, space_system, sender.clone()) else { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)) };
-    let module = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    let name = effect_name;
-    let mut rows = sde.dogma.effects_by_name(name);
-    let Some(row) = rows.next() else { return Err(unsupported::refusal(None, name, module.type_id)) };
-    if rows.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {name}"))); }
-    let id = row.effect_id;
-    drop(rows);
-    let policy = OnlinePolicy::from_identity(identity, sender.clone())?;
-    let module = subject(db, sde, &policy, cx.ship_id, item_id, id, false).await?;
-    let Some(kind) = registry::kind(sde, id) else { return Err(unsupported::refusal(Some(id), name, module.type_id)) };
-    if !sde.types.effects(module.type_id).iter().any(|effect| effect.effect_id == id)
-        || !registry::activation_in_scope(module.category_id, module.group_id, kind) {
-        return Err(unsupported::refusal(Some(id), name, module.type_id));
-    }
-    if kind == EffectKind::Online { return super::online::set_online(identity, db, world, sde, sender, login_user, cx.ship_id, item_id, false, notify).await; }
-    if let Some(stop) = state().active.get(&item_id) {
-        stop_generation(&stop.stop);
-    }
-    if kind == EffectKind::Cloak {
-        let generation = state().active.get(&item_id).map(|active| active.stop.clone());
-        let ship = cx.ship_id;
-        cx.world.post(cx.system_id, move |s| {
-            if let Some(generation) = generation { s.stop_module_cloak(ship, item_id, &generation); }
-        });
-    }
-    if matches!(kind, EffectKind::Projected { .. }) {
-        let generation = state().active.get(&item_id).map(|active| active.stop.clone());
-        cx.world.post(cx.system_id, move |s| {
-            if generation.as_ref().is_some_and(|generation| state().active.get(&item_id).is_some_and(|active| Arc::ptr_eq(&active.stop, generation))) {
-                s.remove_projection(item_id);
-            }
-        });
-    }
-    Ok(Value::None)
-}
 
 #[cfg(all(test, feature = "tests-effects"))] mod tests;

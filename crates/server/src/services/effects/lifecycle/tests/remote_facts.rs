@@ -2,6 +2,8 @@
 use super::*;
 use crate::services::combat::tests::remote_repair_db as fixture;
 use crate::services::effects::behaviors::on_cycle_start;
+use crate::services::effects::registry::EffectAttribute;
+use crate::services::fit::Fit;
 use infinity_core::consts::dogma::ATTR_CAPACITOR_NEED;
 use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST,
     dogma::{ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE,
@@ -40,7 +42,7 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
         world.add_ship(1, fixture::ball(f.victim, ship_type, f.target)).await.unwrap();
         fixture::install_half(&world, 1, f.ship, Fit::load_in_space(&db, &world, 1, f.source, f.ship).await.unwrap()).await;
         fixture::install_half(&world, 1, f.victim, Fit::load_in_space(&db, &world, 1, f.target, f.victim).await.unwrap()).await;
-        crate::services::combat::damage::repair_target(&world, 1, f.victim, layer, 1.0, RepairSource::Local, |_| true).await.unwrap();
+        crate::services::combat::damage::repair_target(&world, 1, f.victim, layer, 1.0, None, RepairSource::Local, |_| true).await.unwrap();
         assert!(world.with(1, |s| crate::space::snapshot::capture_fact_checkpoint(s).unwrap().is_none()).await.unwrap());
         let before = fixture::condition(&world, 1, f.victim).await;
         let stop = Arc::new(AtomicBool::new(false));
@@ -111,7 +113,7 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
             assert_eq!(cycle.repair_amount, 1.0);
             assert!(cycle.owner.pending_combat.is_some());
         }
-        world.with(1, move |s| cycle_stop(s, cycle)).await.unwrap();
+        world.with(1, move |s| crate::services::effects::lifecycle::end::cycle_stop(s, cycle)).await.unwrap();
         assert_eq!(fixture::condition(&world, 1, f.victim).await.now[layer], after.now[layer]);
         fixture::set_locked_target(f.source, f.victim, false);
         world.remove_ball(1, f.ship).await;
@@ -186,7 +188,7 @@ async fn full_remote_repair_refuses_and_driver_retires_activation() {
         started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0,
         other: None, repair_amount: 0.0, illegal: false,
         source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
-    world.with(1, move |s| cycle_stop(s, stale)).await.unwrap();
+    world.with(1, move |s| crate::services::effects::lifecycle::end::cycle_stop(s, stale)).await.unwrap();
     assert!(state().active.get(&f.module).is_some_and(|active| Arc::ptr_eq(&active.stop, &replacement)));
     state().active.remove(&f.module);
     state().activation_generation.remove(&f.module);

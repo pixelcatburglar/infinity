@@ -14,5 +14,6 @@ pub(crate) struct Projection {
     pub values: Vec<(i32, f64)>,
     pub charge_values: Vec<(i32, f64)>,
     pub charge_type: Option<i32>,
+    pub resistance_attribute: Option<i32>,
     pub scramble: Option<crate::space::combat_facts::scramble::ScrambleHandle>,
 }

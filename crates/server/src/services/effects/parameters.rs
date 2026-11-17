@@ -13,16 +13,21 @@ use super::{EffectKind, lifecycle::{self, Cycle, Module}, registry::{Effect, Eff
 use super::spool::{SpoolParameters, SpoolState};
 use crate::space::combat::inputs::{ChargeToken, FitStamp};
 use crate::space::combat::loaded::LoadedPermit;
+use crate::space::V3;
 use infinity_core::consts::{dogma::ATTR_ACCESS_DIFFICULTY_BONUS, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR,
     dogma::ATTR_AOE_VELOCITY, dogma::ATTR_CAPACITOR_BONUS, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITOR_NEED,
-    dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_EMP_FIELD_RANGE,
+    dogma::ATTR_DAMAGE_DELAY_DURATION, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_DOOMSDAY_AOE_DURATION, dogma::ATTR_DOOMSDAY_DAMAGE_CYCLE_TIME,
+    dogma::ATTR_DOOMSDAY_DAMAGE_RADIUS, dogma::ATTR_DOOMSDAY_DAMAGE_DURATION, dogma::ATTR_DOOMSDAY_ENERGY_NEUT_AMOUNT,
+    dogma::ATTR_DOOMSDAY_ENERGY_NEUT_RADIUS, dogma::ATTR_DOOMSDAY_ENERGY_NEUT_RESISTANCE_ID, dogma::ATTR_DOOMSDAY_ENERGY_NEUT_SIGNATURE_RADIUS,
+    dogma::ATTR_DOOMSDAY_IMMOBILITY_DURATION, dogma::ATTR_DOOMSDAY_NO_JUMP_OR_CLOAK_DURATION, dogma::ATTR_DOOMSDAY_WARNING_DURATION,
+    dogma::ATTR_EMP_FIELD_RANGE, dogma::ATTR_REMOTE_RESISTANCE_ID,
     dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_ENTITY_MISSILE_TYPE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_FALLOFF,
     dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER,
     dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
     dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER,
     dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_POWER_TRANSFER_AMOUNT, dogma::ATTR_REACTIVATION_DELAY, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_TARGETING_DELAY,
     dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_PER_CYCLE, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_MAX, dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK,
-    dogma::ATTR_TRACKING_SPEED, FLAG_CARGO};
+    dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED, FLAG_CARGO};
 
 /// Fitted optimal and falloff pair shared by typed packets.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,6 +42,13 @@ fn ranges(fit: &Fit, key: Key, effect: &Effect) -> Ranges {
         optimal: effect.attribute(EffectAttribute::Range).map_or(0.0, |attr| fit.value(key, attr)),
         falloff: effect.attribute(EffectAttribute::Falloff).map_or(0.0, |attr| fit.value(key, attr)),
     }
+}
+
+fn resistance_attribute(fit: &Fit, key: Key, effect: &Effect) -> Option<i32> {
+    effect.attribute(EffectAttribute::Resistance).or_else(|| {
+        let value = fit.value(key, ATTR_REMOTE_RESISTANCE_ID);
+        (value.is_finite() && value > 0.0).then_some(value as i32)
+    })
 }
 
 /// A turret shot's fitted parameters and unscaled typed damage.
@@ -96,6 +108,7 @@ pub(crate) struct VortonInputs {
 pub(crate) struct RepairInputs {
     pub(crate) base: f64,
     pub(crate) charged: f64,
+    pub(crate) resistance_attribute: Option<i32>,
     pub(crate) ranges: Ranges,
 }
 
@@ -106,6 +119,7 @@ pub(crate) struct CapacitorInputs {
     pub(crate) amount: f64,
     pub(crate) nos_override: bool,
     pub(crate) source_type: Option<i32>,
+    pub(crate) resistance_attribute: Option<i32>,
 }
 
 /// Jammer values: sensor strengths in primary-sensor order, the selected jam
@@ -119,6 +133,7 @@ pub(crate) struct EcmInputs {
     /// The real owner hull and its ship-domain projection revision; `None` for
     /// non-drone sources. Never the delegated controller's hull.
     pub(crate) owner_projection: Option<(i64, u64)>,
+    pub(crate) resistance_attribute: Option<i32>,
 }
 
 /// Projected-effect operands kept separate for module and charge domains.
@@ -127,6 +142,7 @@ pub(crate) struct ProjectionInputs {
     pub(crate) charge_type: Option<i32>,
     pub(crate) module_values: Vec<(i32, f64, i32)>,
     pub(crate) charge_values: Vec<(i32, f64, i32)>,
+    pub(crate) resistance_attribute: Option<i32>,
 }
 
 /// Player mining values; the destination is evaluated against the target type
@@ -177,6 +193,16 @@ pub(crate) struct CompressionInputs {
 pub(crate) struct EntosisInputs {
     pub(crate) parameters: Option<(f64, f64)>,
     pub(crate) would_be_active: bool,
+}
+
+/// The duration-bounded consumer's fitted packet: the module's reactivation
+/// delay in milliseconds and its effective hit points (the energizer burn).
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveCycleInputs {
+    /// Frozen moduleReactivationDelay (attribute 669) in milliseconds.
+    pub(crate) delay_ms: i64,
+    /// Frozen effective module hit points read at cycle capture.
+    pub(crate) hp: f64,
 }
 
 /// The per-member closed packet of families that execute every fitted member.
@@ -260,6 +286,46 @@ impl MemberInputs {
     }
 }
 
+/// Frozen activation aim carried through every cycle-input buffer reuse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SuperWeaponAim {
+    NormalTarget { id: i64, ball_generation: u64 },
+    Point { destination: V3 },
+    Slash { p0: V3, p1: V3 },
+}
+
+/// Fitted values consumed by the superweapon actor phases.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SuperWeaponInputs {
+    /// `doomsdayWarningDuration`: time before the positional pulse window.
+    pub(crate) warning_ms: f64,
+    /// `damageDelayDuration`: the normal-target hit delay.
+    pub(crate) damage_delay_ms: f64,
+    /// `doomsdayDamageDuration`: the pulse window's own length.
+    pub(crate) duration_ms: f64,
+    /// `doomsdayDamageCycleTime`: pulse cadence.
+    pub(crate) cycle_ms: f64,
+    /// `doomsdayDamageRadius`: beam half-width and slash beam thickness.
+    pub(crate) radius: f64,
+    /// `maxRange`: beam/cone reach and slash sweep extent.
+    pub(crate) range: f64,
+    /// `signatureRadius`: the weapon signature for the scaling factor.
+    pub(crate) signature_radius: f64,
+    pub(crate) damage: [f64; 4],
+    /// `doomsdayAOEDuration`: fallback pulse window when `duration_ms` is unset.
+    pub(crate) aoe_duration_ms: f64,
+    /// `doomsdayEnergyNeutRadius`/`Amount`/`SignatureRadius`: warmup neut.
+    pub(crate) neut_radius: f64,
+    pub(crate) neut_amount: f64,
+    pub(crate) neut_signature_radius: f64,
+    /// `doomsdayImmobilityDuration` / `doomsdayNoJumpOrCloakDuration`: the
+    /// firing ship's lockout durations armed once at accepted firing.
+    pub(crate) immobility_ms: f64,
+    pub(crate) no_jump_or_cloak_ms: f64,
+    /// `doomsdayEnergyNeutResistanceID`: the victim resistance attribute id.
+    pub(crate) resistance_id: i32,
+}
+
 /// The single closed packet of master-only families.
 pub(crate) enum MasterPacket {
     Repair(RepairInputs),
@@ -270,10 +336,13 @@ pub(crate) enum MasterPacket {
     Tractor(TractorInputs),
     Scan(ScanInputs),
     Cloak(CloakInputs),
+    SuperWeapon(SuperWeaponInputs),
     /// Compression values stay a `Result` so attribute validation keeps its
     /// original position inside the family start.
     Compression(Result<CompressionInputs, CallError>),
     Entosis(EntosisInputs),
+    /// Duration-bounded pure-modifier consumer values.
+    ActiveCycle(ActiveCycleInputs),
     /// A family with no extra captured values or a member-packet family.
     None,
 }
@@ -304,11 +373,12 @@ pub(crate) struct CycleInputs {
     /// Positive fuel requirements aggregated by type, or the original
     /// validation failure consumed at the fuel stage.
     pub(crate) fuel: Result<Vec<(i32, i64)>, CallError>,
+    pub(crate) aim: Option<SuperWeaponAim>,
 }
 
 impl Default for CycleInputs {
     fn default() -> Self {
-        Self { frame: None, members: Vec::new(), fuel: Ok(Vec::new()) }
+        Self { frame: None, members: Vec::new(), fuel: Ok(Vec::new()), aim: None }
     }
 }
 
@@ -443,6 +513,7 @@ fn repair(fit: &Fit, cycle: &Cycle) -> RepairInputs {
     RepairInputs {
         base: super::repair::amount(fit, master, amount_attr),
         charged: super::repair::fueled(fit, master, amount_attr, bonus_attr, true),
+        resistance_attribute: resistance_attribute(fit, Key::Module(master), &cycle.effect),
         ranges: ranges(fit, Key::Module(master), &cycle.effect),
     }
 }
@@ -459,6 +530,7 @@ fn capacitor(fit: &Fit, key: Key, charge_key: Option<Key>, effect: &Effect, sour
         amount,
         nos_override: fit.value(key, ATTR_NOS_OVERRIDE) > 0.0,
         source_type: fit.source_type(source_key),
+        resistance_attribute: resistance_attribute(fit, key, effect),
     }
 }
 
@@ -475,6 +547,7 @@ pub(super) fn capture_ecm(fit: &Fit, key: Key, effect: &Effect, duration_ms: f64
         duration_ms: super::ecm::selected_duration(fit, key, duration_ms),
         projection_revision: if drone { fit.drone_projection_revision() } else { fit.projection_revision() },
         owner_projection: if drone { fit.ship_id().zip(fit.projection_revision()) } else { None },
+        resistance_attribute: resistance_attribute(fit, key, effect),
     }
 }
 
@@ -485,7 +558,13 @@ fn fill_projection(fit: &Fit, key: Key, effect: &Effect, charge_type: Option<i32
 }
 
 fn projection(fit: &Fit, key: Key, effect: &Effect, charge_type: Option<i32>) -> ProjectionInputs {
-    let mut inputs = ProjectionInputs { ranges: Ranges { optimal: 0.0, falloff: 0.0 }, charge_type: None, module_values: Vec::new(), charge_values: Vec::new() };
+    let mut inputs = ProjectionInputs {
+        ranges: Ranges { optimal: 0.0, falloff: 0.0 },
+        charge_type: None,
+        module_values: Vec::new(),
+        charge_values: Vec::new(),
+        resistance_attribute: resistance_attribute(fit, key, effect),
+    };
     fill_projection(fit, key, effect, charge_type, &mut inputs);
     inputs
 }
@@ -516,7 +595,13 @@ fn member_packet(fit: &Fit, cycle: &Cycle, module: &Module, existing: MemberPack
             let charge_type = fit.source_type(Key::Charge(module.id));
             let mut inputs = match existing {
                 MemberPacket::Projected(inputs) => inputs,
-                _ => Arc::new(ProjectionInputs { ranges: ranges(fit, key, &cycle.effect), charge_type: None, module_values: Vec::new(), charge_values: Vec::new() }),
+                _ => Arc::new(ProjectionInputs {
+                    ranges: ranges(fit, key, &cycle.effect),
+                    charge_type: None,
+                    module_values: Vec::new(),
+                    charge_values: Vec::new(),
+                    resistance_attribute: resistance_attribute(fit, key, &cycle.effect),
+                }),
             };
             // The buffer is uniquely owned at capture: a cloned handle kept
             // elsewhere is a holder-lifetime bug, not a reason to copy operands.
@@ -562,6 +647,23 @@ fn master_packet(fit: &Fit, cycle: &Cycle, duration_ms: f64) -> Result<MasterPac
             reactivation_ms: fit.value(key, ATTR_REACTIVATION_DELAY).max(0.0) as i64,
             targeting_ms: fit.value(key, ATTR_TARGETING_DELAY).max(0.0) as i64,
         }),
+        EffectKind::SuperWeapon => MasterPacket::SuperWeapon(SuperWeaponInputs {
+            warning_ms: fit.value(key, ATTR_DOOMSDAY_WARNING_DURATION),
+            damage_delay_ms: fit.value(key, ATTR_DAMAGE_DELAY_DURATION),
+            duration_ms: fit.value(key, ATTR_DOOMSDAY_DAMAGE_DURATION),
+            cycle_ms: fit.value(key, ATTR_DOOMSDAY_DAMAGE_CYCLE_TIME),
+            radius: fit.value(key, ATTR_DOOMSDAY_DAMAGE_RADIUS),
+            range: fit.value(key, ATTR_MAX_RANGE),
+            signature_radius: fit.value(key, ATTR_SIGNATURE_RADIUS),
+            damage: ATTR_DAMAGE.map(|attr| fit.value(key, attr).max(0.0)),
+            aoe_duration_ms: fit.value(key, ATTR_DOOMSDAY_AOE_DURATION),
+            neut_radius: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_RADIUS),
+            neut_amount: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_AMOUNT),
+            neut_signature_radius: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_SIGNATURE_RADIUS),
+            immobility_ms: fit.value(key, ATTR_DOOMSDAY_IMMOBILITY_DURATION),
+            no_jump_or_cloak_ms: fit.value(key, ATTR_DOOMSDAY_NO_JUMP_OR_CLOAK_DURATION),
+            resistance_id: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_RESISTANCE_ID) as i32,
+        }),
         EffectKind::Compression => {
             MasterPacket::Compression(super::compression::values(fit, master).map(|(list, range)| CompressionInputs { list, range }))
         }
@@ -571,6 +673,9 @@ fn master_packet(fit: &Fit, cycle: &Cycle, duration_ms: f64) -> Result<MasterPac
         }),
         EffectKind::ProbeLaunch | EffectKind::Hacking | EffectKind::Online => {
             return Err(CallError::Internal(anyhow::anyhow!("unsupported cycle kind {:?}", cycle.effect.kind)));
+        }
+        EffectKind::Modifiers if super::active_cycle::consumer(cycle.effect.id) => {
+            MasterPacket::ActiveCycle(super::active_cycle::capture(fit, master))
         }
         _ => MasterPacket::None,
     })
@@ -639,7 +744,12 @@ pub(crate) fn capture_source(fit: &Fit, key: Key, effect: &Effect, duration_ms: 
         }
         EffectKind::RemoteRepair { layer } => {
             let base = fit.value(key, super::repair::amount_attribute(layer));
-            SourceInputs::RemoteRepair(RepairInputs { base, charged: base, ranges: ranges(fit, key, effect) })
+            SourceInputs::RemoteRepair(RepairInputs {
+                base,
+                charged: base,
+                resistance_attribute: resistance_attribute(fit, key, effect),
+                ranges: ranges(fit, key, effect),
+            })
         }
         EffectKind::Mining => SourceInputs::DroneMining(DroneMiningInputs { values: crate::services::mining::yield_values(fit, key) }),
         _ => return Err(CallError::Internal(anyhow::anyhow!("unsupported source effect kind {:?}", effect.kind))),

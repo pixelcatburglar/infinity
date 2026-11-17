@@ -96,9 +96,9 @@ pub(super) async fn validate_cycle(cx: &Ctx, cycle: &Cycle) -> Result<(), CallEr
 }
 
 #[derive(Clone)]
-struct Source { id: i64, type_id: Option<i32>, module: i64, optimal: f64, falloff: f64, strengths: [f64; 4], duration: f64, burst: bool, offensive: bool, revision: Option<u64>, owner_revision: Option<(i64, u64)> }
+struct Source { id: i64, type_id: Option<i32>, module: i64, optimal: f64, falloff: f64, strengths: [f64; 4], duration: f64, resistance_attribute: Option<i32>, burst: bool, offensive: bool, revision: Option<u64>, owner_revision: Option<(i64, u64)> }
 fn from_inputs(inputs: &EcmInputs, id: i64, module: i64, effect: &Effect) -> Source {
-    Source { id, type_id: inputs.source_type, module, optimal: inputs.ranges.optimal, falloff: inputs.ranges.falloff, strengths: inputs.strengths, duration: inputs.duration_ms, burst: effect.kind == EffectKind::BurstJammer, offensive: effect.has(EffectFlag::Offensive), revision: inputs.projection_revision, owner_revision: inputs.owner_projection }
+    Source { id, type_id: inputs.source_type, module, optimal: inputs.ranges.optimal, falloff: inputs.ranges.falloff, strengths: inputs.strengths, duration: inputs.duration_ms, resistance_attribute: inputs.resistance_attribute, burst: effect.kind == EffectKind::BurstJammer, offensive: effect.has(EffectFlag::Offensive), revision: inputs.projection_revision, owner_revision: inputs.owner_projection }
 }
 fn source(fit: &Fit, key: Key, id: i64, module: i64, effect: &Effect, cycle: f64) -> Source {
     from_inputs(&super::parameters::capture_ecm(fit, key, effect, cycle), id, module, effect)
@@ -149,9 +149,10 @@ fn apply_one_in_actor(s: &mut System, sde: &Arc<Sde>, src: &Source, gate: Target
     let resident = gate.victim.char_id.is_some()
         || drone.as_ref().is_some_and(|drone| drone.owner != infinity_core::consts::OWNER_UNOWNED)
         || (drone.is_none() && s.persistent_generation(id).is_some());
-    let (values, revision, owner_revision) = if resident {
+    let (values, resistance, revision, owner_revision) = if resident {
         let Some(captured) = s.with_combat_fit(id, |fit, key, _| (
             SENSORS.map(|a| fit.value(key, a)),
+            src.resistance_attribute.map(|attribute| fit.value(key, attribute)),
             if matches!(key, Key::Drone(_)) { fit.drone_projection_revision() } else { fit.projection_revision() },
             if matches!(key, Key::Drone(_)) { fit.ship_id().zip(fit.projection_revision()) } else { None },
         )) else { return None };
@@ -159,10 +160,10 @@ fn apply_one_in_actor(s: &mut System, sde: &Arc<Sde>, src: &Source, gate: Target
     } else {
         let projections = s.projections_on(id);
         let fit = Fit::for_space_type(sde.clone(), gate.victim.type_id, projections);
-        (SENSORS.map(|a| fit.value(Key::Ship, a)), Some(s.projection_revision(id)), None)
+        (SENSORS.map(|a| fit.value(Key::Ship, a)), src.resistance_attribute.map(|attribute| fit.value(Key::Ship, attribute)), Some(s.projection_revision(id)), None)
     };
     let (index, defense) = primary(values).unwrap_or((0, 0.0));
-    let strength = src.strengths[index];
+    let strength = src.strengths[index] * resistance.unwrap_or(1.0);
     let Some((_, _, multiplier)) = current_attempt(s, sde, src, &gate.victim, revision, owner_revision, &gate.player, gate.guard) else { return None };
     if src.offensive { s.drone_attack(src.id, id); }
     if gate.roll < chance(strength, defense, multiplier) && src.duration.is_finite() && src.duration > 0.0 {

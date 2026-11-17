@@ -42,6 +42,7 @@
 //! refused name.
 
 use super::*;
+use super::super_weapons::{directional_weapon_graphic_info, super_weapon_guid, SuperWeaponFxFamily};
 use crate::space::system::observers::{BallToken, DestinyAudience, ObserverToken};
 use crate::services::combat::targeting_charges;
 use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP};
@@ -307,10 +308,26 @@ impl SentPreviews {
     }
 }
 
+/// Resolve the shared GUID family used by a GM preview.
+fn guid_for_effect(effect: VisualEffect) -> &'static str {
+    let guid = match effect {
+        VisualEffect::SuperWeaponAmarr => super_weapon_guid(SuperWeaponFxFamily::Single, Some(4)),
+        VisualEffect::SuperWeaponCaldari => super_weapon_guid(SuperWeaponFxFamily::Single, Some(1)),
+        VisualEffect::SuperWeaponGallente => super_weapon_guid(SuperWeaponFxFamily::Single, Some(8)),
+        VisualEffect::SuperWeaponMinmatar => super_weapon_guid(SuperWeaponFxFamily::Single, Some(2)),
+        VisualEffect::LanceAmarr => super_weapon_guid(SuperWeaponFxFamily::DamageBeam, Some(4)),
+        VisualEffect::LanceCaldari => super_weapon_guid(SuperWeaponFxFamily::DamageBeam, Some(1)),
+        VisualEffect::LanceGallente => super_weapon_guid(SuperWeaponFxFamily::DamageBeam, Some(8)),
+        VisualEffect::LanceMinmatar => super_weapon_guid(SuperWeaponFxFamily::DamageBeam, Some(2)),
+        _ => Some(effect.entry().guid),
+    };
+    guid.expect("catalogued superweapon visual has a GUID")
+}
+
 /// OnSpecialFX start queued for `(ship, module, target, guid)`.
 fn play_event(stamp: i64, ship: i64, target: Option<i64>, effect: VisualEffect, module_type: Option<i32>) -> Value {
     special_fx(stamp, ship,
-        module_type.map(|type_id| FxModule { item: None, type_id }), target, None, effect.entry().guid,
+        module_type.map(|type_id| FxModule { item: None, type_id }), target, None, guid_for_effect(effect),
         false, 1, 1, Value::Float(SPECIAL_FX_UNSPECIFIED_DURATION as f64),
         0, None, 0, graphic_info(effect, true))
 }
@@ -318,15 +335,19 @@ fn play_event(stamp: i64, ship: i64, target: Option<i64>, effect: VisualEffect, 
 /// never carry a module type, so the stop always sends `moduleID` and
 /// `moduleTypeID` as `None`.
 fn stop_event(stamp: i64, ship: i64, sent: Sent) -> Value {
-    special_fx(stamp, ship, None, sent.target, None, sent.effect.entry().guid,
+    special_fx(stamp, ship, None, sent.target, None, guid_for_effect(sent.effect),
         false, 0, 0, Value::Float(SPECIAL_FX_UNSPECIFIED_DURATION as f64),
         0, None, 0, graphic_info(sent.effect, false))
 }
 /// Only the celestial beam carries firing state: a Float flag the client
-/// reads as `graphicInfo.isFiring`. Every other effect sends `None`.
+/// reads as `graphicInfo.isFiring`. Directional superweapon previews use the
+/// shared util.KeyVal payload consumed by `DirectionalWeapon`.
 fn graphic_info(effect: VisualEffect, start: bool) -> Value {
     match effect {
         VisualEffect::CelestialBeam => Value::dict([("isFiring", Value::Float(if start { 1.0 } else { 0.0 }))]),
+        VisualEffect::LanceAmarr | VisualEffect::LanceCaldari
+        | VisualEffect::LanceGallente | VisualEffect::LanceMinmatar =>
+            directional_weapon_graphic_info([0.0; 3], SPECIAL_FX_UNSPECIFIED_DURATION as f64),
         _ => Value::None,
     }
 }

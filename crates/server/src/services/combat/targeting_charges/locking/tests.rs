@@ -423,7 +423,7 @@ fn tick_sweep_removes_only_failed_locks_and_their_projections() {
     let mut g = lock_scene(10.0, 20.0, 50.0, 200.0, None);
     complete_state(&g);
     f.system.upsert_projection(f.target, Projection { source_ship: f.ship, source_module: f.target + 5, source_type: 1, effect_id: 1,
-        kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     republish_range(&mut f, 200.0, 100.0);
     f.system.tick(1100);
     assert!(!has_target(f.character, f.target));

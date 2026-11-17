@@ -84,6 +84,7 @@ mod station;
 pub(crate) mod subscriptions;
 mod store;
 mod structure_directory;
+mod super_weapon;
 pub(crate) mod trade;
 mod universe;
 pub(crate) mod wallets;
@@ -391,6 +392,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         if crate::lua::sovereignty_claimed(call) {
             return Err(CallError::Internal(anyhow::anyhow!("sovereignty content unavailable")));
         }
+        if let Some(reply) = super_weapon::dispatch(c, call).await { return reply; }
         if let Some(reply) = fixed::root(call) { return reply; }
         if let Some(reply) = chat::root(c, call).await { return reply; }
         if let Some(reply) = station::root(c, call).await { return reply; }

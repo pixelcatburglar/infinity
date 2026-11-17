@@ -127,14 +127,18 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         let (destiny_tx, mut destiny_rx) = tokio::sync::mpsc::unbounded_channel();
         test_world.observe(system, f.source, f.ship, destiny_tx).await.unwrap();
         let source_fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
+        let resistance = effect.attribute(crate::services::effects::registry::EffectAttribute::Resistance)
+            .expect("remote repair resistance selector");
+        crate::dao::items::dogma::set_override(&test_db, f.victim, resistance, 0.5).await.unwrap();
         let target_fit = Fit::load_in_space(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap();
+        assert_eq!(target_fit.value(Key::Ship, resistance), 0.5);
         let target_max = ShipStats::from_fit(&target_fit, Key::Ship).max;
         install_half(&test_world, system, f.ship, source_fit).await;
         install_half(&test_world, system, f.victim, target_fit).await;
         let source_before = condition(&test_world, system, f.ship).await.now;
         let target_before = condition(&test_world, system, f.victim).await.now;
         let target_db_before = crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap();
-        assert!(target_db_before.is_empty());
+        assert_eq!(target_db_before.iter().find(|row| row.attribute_id == resistance).map(|row| row.value), Some(0.5));
         let args = [Value::Int(f.module), Value::str(effect_name), Value::Int(f.victim), Value::Int(1)];
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
@@ -155,7 +159,7 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         assert_eq!(payload[3], Value::Int(1));
         let fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
         let amount = fit.value(Key::Module(f.module), [infinity_core::consts::dogma::ATTR_SHIELD_BONUS, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT, infinity_core::consts::dogma::ATTR_STRUCTURE_DAMAGE_AMOUNT][layer]);
-        let expected = (target_before[layer] + amount).min(target_max[layer]);
+        let expected = (target_before[layer] + amount * 0.5).min(target_max[layer]);
         let duration = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Duration).unwrap()).max(250.0) as u64;
         assert!(test_world.after(system, 1500).await);
         if layer == 0 {
@@ -198,7 +202,8 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         let target_after = condition(&test_world, system, f.victim).await;
         assert!(target_after.now[layer] > target_before[layer]);
         assert!((target_after.now[layer] - expected).abs() < 1e-7 * expected.max(1.0));
-        assert!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap().is_empty());
+        assert!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap()
+            .iter().all(|row| ![ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE].contains(&row.attribute_id)));
         let capacity = fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY);
         let need = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Discharge).unwrap());
         let remaining = state().capacitor[&f.ship].0;
@@ -218,12 +223,12 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         }
         let repaired = target_after.now[layer];
         state().targets.remove(&f.source);
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local,
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local,
             move |_| state().targets.get(&f.source).is_some_and(|targets| targets.contains(&f.victim))).await.ok().unwrap();
         assert_eq!(condition(&test_world, system, f.victim).await.now[layer], repaired, "lost lock");
         let old_generation = Arc::new(AtomicBool::new(false));
         state().active.insert(f.module, ActiveModule { char_id: f.source, stop: Arc::new(AtomicBool::new(false)), forced_inactive: false });
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local,
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local,
             move |_| state().active.get(&f.module).is_some_and(|active| Arc::ptr_eq(&active.stop, &old_generation))).await.ok().unwrap();
         assert_eq!(condition(&test_world, system, f.victim).await.now[layer], repaired, "stale generation");
         state().active.remove(&f.module);
@@ -243,12 +248,12 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         test_world.add_ship(system, distant).await.unwrap();
         let target_fit = Fit::load_in_space(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap();
         test_world.with(system, move |s| s.install_condition(f.victim, target_after, target_fit)).await.unwrap();
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local, move |s| {
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local, move |s| {
             s.sampled_ball(f.ship).zip(s.sampled_ball(f.victim)).is_some_and(|(a, b)| crate::space::dist(a.pos, b.pos) < 1000.0)
         }).await.ok().unwrap();
         assert_eq!(condition(&test_world, system, f.victim).await.now[layer], repaired, "out of range");
         test_world.remove_ball(system, f.victim).await;
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local, move |s| s.contains(f.victim)).await.ok().unwrap();
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local, move |s| s.contains(f.victim)).await.ok().unwrap();
         assert_eq!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap().iter().find(|row| row.attribute_id == [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE][layer]).unwrap().value,
             persisted, "target removed");
     }).await;

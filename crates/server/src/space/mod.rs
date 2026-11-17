@@ -29,7 +29,6 @@
 //! `UpdateStateRequest`, boarding finish, a same-system teleport and the
 //! post-loss capsule.
 //!
-//!
 //! GOTO stores an absolute point; direction commands project from the current
 //! position while their events retain the raw direction. `Ballpark::WarpTo`
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
@@ -405,6 +404,7 @@ pub(crate) struct FxModule {
     pub(crate) item: Option<i64>,
     pub(crate) type_id: i32,
 }
+
 
 /// Encode fxSequencer.OnSpecialFX's 14 arguments without normalizing values.
 /// Duration is an Int for space transitions and a Float for module/GM effects.

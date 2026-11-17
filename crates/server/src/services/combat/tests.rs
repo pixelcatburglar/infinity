@@ -149,7 +149,7 @@ async fn npc_projected_weapon_attributes_change_application() {
     let projected = Fit::for_space_type(sde.clone(), npc, vec![Projection {
         source_ship: 10, source_module: 11, source_type: npc, effect_id: effect.effect_id,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-        values: values.to_vec(), charge_values: Vec::new(), charge_type: None, scramble: None,
+        values: values.to_vec(), charge_values: Vec::new(), charge_type: None, resistance_attribute: None, scramble: None,
     }]);
     let base_tracking = baseline.value(Key::Ship, ATTR_TRACKING_SPEED);
     let tracking = projected.value(Key::Ship, ATTR_TRACKING_SPEED);
@@ -239,7 +239,7 @@ async fn npc_projected_weapon_attributes_change_application() {
                 kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
                 values: vec![(modifier_ids[0], tracking), (modifier_ids[1], explosion_velocity),
                     (modifier_ids[2], explosion_radius)],
-                charge_values: Vec::new(), charge_type: None, scramble: None,
+                charge_values: Vec::new(), charge_type: None, resistance_attribute: None, scramble: None,
             };
             world.with(system, move |s| s.upsert_projection(shooter_id, p)).await.unwrap();
         }
@@ -469,7 +469,7 @@ async fn condition_persists_recharges_and_rollback_preserves_all_layers() {
     let ids = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
     dogma::save_conditions(&db, station, &ids, &[(ship, [levels[0], 3.0, 2.0], filetime_now())]).await.unwrap();
     assert!(damage::apply_damage_guarded(&db, &world, -1, ship, [100.0; 4], Default::default(), false, |_| true).await.is_err());
-    assert!(damage::repair_target(&world, -1, ship, 1, 1.0, crate::space::combat::RepairSource::Local, |_| true).await.is_err());
+    assert!(damage::repair_target(&world, -1, ship, 1, 1.0, None, crate::space::combat::RepairSource::Local, |_| true).await.is_err());
     let rows = dogma::overrides(&db, ship).await.unwrap();
     let original = ids.map(|id| {
         let row = rows.iter().find(|r| r.attribute_id == id).unwrap();

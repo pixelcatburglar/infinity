@@ -95,7 +95,7 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
     assert_eq!(level, 3);
     let node = super::Node {
         type_id: 1, data_position: None, location: super::Location::Char,
-        online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
+        online: true, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
         charge_type: None, level: Some(level), overrides: vec![(super::ATTR_SKILL_LEVEL, 99.0)], cargo_unlimited: false, charge_values: vec![],
     };
     assert_eq!(node.base(None, None, super::ATTR_SKILL_LEVEL), 3.0);
@@ -113,7 +113,7 @@ fn supplied_skill_level_comes_from_points_not_stored_level() {
 
 fn fixture_node(location: super::Location) -> super::Node {
     super::Node { type_id: 1, data_position: None, location, online: true,
-        active: false, overloaded: false, projected_effect: None, receiver: None,
+        active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
         charge_type: None, level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![] }
 }
 
@@ -193,7 +193,7 @@ async fn real_sde_prospective_drone_and_projection_receivers() {
         .expect("web velocity modifier in SDE");
     let projection = Projection { source_ship: 1, kind: EffectKind::Modifiers, until_ms: i64::MAX,
         source_module: 42, source_type: 587, effect_id: EFFECT_REMOTE_WEBIFIER_FALLOFF,
-        values: vec![(modifier.modifying, -60.0)], charge_values: vec![], charge_type: None, scramble: None };
+        values: vec![(modifier.modifying, -60.0)], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
     let ship_before = fit.value(Key::Ship, ATTR_MAX_VELOCITY);
     Fit::insert_projections(&sde, &mut fit.nodes, Key::Drone(7), vec![projection.clone()]);
     fit.memo.get_mut().unwrap().clear();
@@ -378,6 +378,8 @@ fn source_categories_and_client_eight_modifier_limit() {
 #[test]
 fn projection_script_uses_injected_value_and_target_domain() {
     use super::{effect_running, modifier_applies, projected_value, Key, Location};
+    let fit = super::Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, vec![]);
+    let mut visiting = std::collections::HashSet::new();
     let mut source = fixture_node(Location::Space);
     source.projected_effect = Some(42);
     source.overrides = vec![(2, -30.0)];
@@ -386,12 +388,12 @@ fn projection_script_uses_injected_value_and_target_domain() {
     let default = super::Attribute { attribute_id: 2, default_value: Some(-10.0), stackable: Some(true) };
     assert!(effect_running(Key::Projected(5), &source, 42, 2, &script.domain));
     assert!(modifier_applies(Key::Projected(5), Some(Key::Ship), &script, Key::Ship, &victim, None, false));
-    let injected = projected_value(&source, None, Some(&default), script.modifying);
+    let injected = projected_value(&fit, Key::Ship, &source, None, Some(&default), script.modifying, script.op, &mut visiting);
     // A hypothetical victim bonus affects the victim, not the already effective
     // injected source value. The script is a target row with its own attribute.
     assert!((apply(100.0, &[(6, injected, false), (6, 20.0, false)]) - 84.0).abs() < 1e-9);
     source.overrides.clear();
-    assert_eq!(projected_value(&source, None, Some(&default), script.modifying), -10.0);
+    assert_eq!(projected_value(&fit, Key::Ship, &source, None, Some(&default), script.modifying, script.op, &mut visiting), -10.0);
 }
 
 #[test]
@@ -400,7 +402,9 @@ fn projected_module_and_charge_keep_distinct_operands() {
     source.overrides = vec![(2, -60.0)];
     source.charge_values = vec![(2, 20.0)];
     let meta = super::Attribute { attribute_id: 2, default_value: Some(5.0), stackable: Some(true) };
-    let module_value = super::projected_value(&source, None, Some(&meta), 2);
+    let fit = super::Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, vec![]);
+    let mut visiting = std::collections::HashSet::new();
+    let module_value = super::projected_value(&fit, super::Key::Ship, &source, None, Some(&meta), 2, 0, &mut visiting);
     let charge_value = source.charge_base(None, Some(&meta), 2);
     assert_eq!(module_value, -60.0);
     assert_eq!(charge_value, 20.0);
@@ -448,7 +452,7 @@ fn drone_physical_base_corrects_only_missing_or_nonpositive_inputs() {
 #[test]
 fn node_override_precedence_and_modifier() {
     use super::{Node, Location, ATTR_SKILL_LEVEL};
-    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, receiver: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], cargo_unlimited: false, charge_values: vec![] };
+    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], cargo_unlimited: false, charge_values: vec![] };
     let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
     assert_eq!(node.base(None, Some(&meta), 1), 10.0);
     assert_eq!(node.base(None, None, 2), 0.0);

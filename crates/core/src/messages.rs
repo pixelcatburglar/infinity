@@ -600,6 +600,10 @@ pub const MSG_BLUEPRINT_NOT_FOUND: &str = "BlueprintNotFound";
 pub const MSG_BOOKMARK_FOLDER_NO_LONGER_THERE: &str = "BookmarkFolderNoLongerThere";
 /// Client message `CanNotPlaceActiveShipInAnotherHangar`.
 pub const MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR: &str = "CanNotPlaceActiveShipInAnotherHangar";
+/// Client message `CannotRemoveActivatedModule`.
+pub const MSG_CANNOT_REMOVE_ACTIVATED_MODULE: &str = "CannotRemoveActivatedModule";
+/// Client message `CannotRemoveModuleReactivationDelayed2`.
+pub const MSG_CANNOT_REMOVE_MODULE_REACTIVATION_DELAYED: &str = "CannotRemoveModuleReactivationDelayed2";
 /// Client message `CantActivateReloadingModule`.
 pub const MSG_CANT_ACTIVATE_RELOADING_MODULE: &str = "CantActivateReloadingModule";
 /// Client message `CantApplyTwiceToAlliance`.
@@ -686,6 +690,8 @@ pub const MSG_JUMP_GATE_HAS_NO_DESTINATION: &str = "JumpGateHasNoDestination";
 pub const MSG_MAIL_LABEL_MUST_PROVIDE_NAME: &str = "MailLabelMustProvideName";
 /// Client message `MktOrderDidNotMatch`.
 pub const MSG_MKT_ORDER_DID_NOT_MATCH: &str = "MktOrderDidNotMatch";
+/// Client message `ModuleReactivationDelayed2`.
+pub const MSG_MODULE_REACTIVATION_DELAYED: &str = "ModuleReactivationDelayed2";
 /// Client message `NoCharges`.
 pub const MSG_NO_CHARGES: &str = "NoCharges";
 /// Client message `NotAtStation`.

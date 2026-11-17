@@ -29,6 +29,7 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Eff
     let status = cx.world.with(cx.system_id, move |s| {
         if crate::space::sovereignty::links::blocks(s, ship) { 4 }
         else if s.ball(ship).is_none_or(|b| b.cloak != 0) || s.has_module_cloak(ship) { 1 }
+        else if s.super_weapon_jump_cloak_until(ship).is_some_and(|until| until > s.now_ms()) { 5 }
         else if !s.cloak_reactivation_ready(id) { 2 }
         else if s.cloak_obstructed(ship) { 3 }
         else { 0 }
@@ -38,6 +39,7 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Eff
         2 => Err(notify_error(messages::effects::CLOAK_REACTIVATION_DELAY)),
         3 => Err(notify_error(messages::effects::CLOAK_TOO_CLOSE)),
         4 => Err(notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED)),
+        5 => Err(notify_error(messages::super_weapon::CLOAK_LOCKED)),
         _ => Ok(()),
     }
 }

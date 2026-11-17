@@ -6,7 +6,7 @@ use crate::space::{SceneDelivery, HOSTILE_TO_ALL};
 use crate::space::system::npc_sleep::NpcSpawnOrigin;
 use crate::services::combat::damage::{apply_damage_guarded, DamageSource};
 use crate::lua::events::resources::FactOrigin;
-use infinity_core::consts::{CATEGORY_ENTITY, dogma::ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, dogma::ATTR_ENTITY_SHIELD_BOOST_AMOUNT};
+use infinity_core::consts::{CATEGORY_ENTITY, dogma::ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, dogma::ATTR_ENTITY_SHIELD_BOOST_AMOUNT, dogma::EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR, dogma::EFFECT_NPC_BEHAVIOR_SHIELD_BOOST};
 use marshal::Value;
 
 fn real_belt(sde: &Arc<crate::sde::Sde>) -> (i64, i64, V3) {
@@ -76,6 +76,8 @@ async fn site_cohort(npcs: usize, save: bool) -> (Db, Arc<World>, i64, Site, Vec
     let type_id = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)
         && t.attribute(ATTR_ENTITY_SHIELD_BOOST_AMOUNT).unwrap_or(0.0) <= 0.0
         && t.attribute(ATTR_ENTITY_ARMOR_REPAIR_AMOUNT).unwrap_or(0.0) <= 0.0
+        && t.effects().iter().all(|entry| entry.effect_id != EFFECT_NPC_BEHAVIOR_SHIELD_BOOST
+            && entry.effect_id != EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR)
         && t.group_id.and_then(|g| sde.wrecks.get(g, t.race_id.unwrap_or(0))).is_none())
         .expect("SDE entity type without local repair or wreck").type_id;
     let world = World::new(db.clone(), sde, 0);

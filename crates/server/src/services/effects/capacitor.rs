@@ -65,7 +65,7 @@ pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, C
         return Err(CallError::Internal(anyhow::anyhow!("capacitor cycle captured without capacitor inputs")));
     };
     let (optimal, falloff) = (packet.ranges.optimal, packet.ranges.falloff);
-    let (amount, nos_override, source_type) = (packet.amount, packet.nos_override, packet.source_type);
+    let (amount, nos_override, source_type, resistance_attribute) = (packet.amount, packet.nos_override, packet.source_type, packet.resistance_attribute);
     if cycle.effect.kind == EffectKind::CapBooster {
         let ship = cx.ship_id;
         if cx.world.with(cx.system_id, move |s| s.ball(ship).is_some_and(|b| b.mode != MODE_WARP)).await != Some(true) {
@@ -94,14 +94,14 @@ pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, C
     match cycle.effect.kind {
         EffectKind::Neutralizer => {
             let amount = amount.max(0.0) * scale;
-            victim_owner = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await?.and_then(|(_, owner)| owner);
+            victim_owner = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, resistance_attribute, guard).await?.and_then(|(_, owner)| owner);
         }
         EffectKind::Nosferatu => {
             let Some(source) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, cx.ship_id).await? else { return Ok(CycleOutcome::Stop("source lost")); };
             let Some(victim) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, target).await? else { return Ok(super::lifecycle::target_loss(cycle).await); };
             if nos_allowed(source.level, source.capacity, victim.level, victim.capacity, nos_override) {
                 let amount = amount.max(0.0) * scale;
-                if let Some((drained, owner)) = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await? {
+                if let Some((drained, owner)) = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, resistance_attribute, guard).await? {
                     victim_owner = owner;
                     inject(&cx.db, &cx.world, cx.system_id, cx.ship_id, drained).await?;
                 }
@@ -109,7 +109,7 @@ pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, C
         }
         EffectKind::CapTransfer => {
             let amount = amount.max(0.0) * scale;
-            inject_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await?;
+            inject_guarded(&cx.db, &cx.world, cx.system_id, target, amount, resistance_attribute, guard).await?;
         }
         _ => unreachable!("not a capacitor effect"),
     }

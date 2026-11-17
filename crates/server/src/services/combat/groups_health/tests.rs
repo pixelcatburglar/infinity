@@ -7,7 +7,7 @@ use super::*;
 #[cfg(any(feature = "tests-combat", feature = "tests-effects"))]
 /// Drain up to the requested amount for capacitor integration tests.
 pub(in crate::services) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None, None).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
 #[cfg(feature = "tests-ships")]
@@ -180,4 +180,90 @@ fn actor_fitting_publication_keeps_intervening_capacitor_spend() {
     assert_eq!(fields[3].as_int(), Some(i64::from(ATTR_CHARGE)));
     assert_eq!(fields[5], Value::Float(25.0));
     assert_eq!(state().capacitor.remove(&ship).unwrap().0, 25.0);
+}
+
+#[cfg(feature = "tests-combat")] #[test]
+fn super_weapon_guard_requires_live_generation_pilot_ball_and_module() {
+    let mut s = crate::space::System::new(1, std::sync::Arc::default(), 0);
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let module = -9_000_005_i64;
+    let guard = NpcCapacitorGuard::SuperWeapon { source: 1, character: 7, module, generation: generation.clone() };
+    assert!(!guard.valid(&s), "no pilot ball and no module activation yet");
+    let mut b = crate::space::Ball { id: 1, type_id: 1, owner_id: 7, corp_id: 1, alliance_id: -1,
+        char_id: Some(7), signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1e6,
+        max_vel: 0.0, agility: 1.0, speed_fraction: 0.0, pos: [0.0; 3], vel: [0.0; 3],
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3], follow_id: 0,
+        follow_range: 0.0, free: true, global: false, interactive: true, massive: true,
+        warp: crate::space::WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0,
+        effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() };
+    // Registering the pilot ball alone is not enough: the module activation
+    // must carry the same stop generation.
+    s.insert(b.clone());
+    assert!(!guard.valid(&s));
+    {
+        let mut st = state();
+        st.active.insert(module, ActiveModule { char_id: 7, stop: generation.clone(), forced_inactive: false });
+    }
+    assert!(guard.valid(&s));
+    // A stale activation generation, a replaced module and a warping source
+    // each refuse the warmup drain.
+    generation.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(!guard.valid(&s));
+    let wrong_module = NpcCapacitorGuard::SuperWeapon { source: 1, character: 7, module: -9_000_006, generation: generation.clone() };
+    assert!(!wrong_module.valid(&s));
+    b.mode = crate::space::MODE_WARP;
+    s.insert(b);
+    assert!(!guard.valid(&s));
+    state().active.remove(&module);
+}
+
+#[cfg(feature = "tests-combat")] #[test]
+fn super_weapon_warmup_neut_drains_once_scaled_by_resistance_and_signature() {
+    use crate::services::fit::attributes::tests::ship_fit;
+    use crate::space::{Ball, System, MODE_STOP};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    crate::tests::init_config();
+    let (source, victim, outside, module, character, victim_char) = (-920_311_i64, -920_312, -920_313, -920_314, 2_i64, 3_i64);
+    let generation = Arc::new(AtomicBool::new(false));
+    let resistance_attr = infinity_core::consts::dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE;
+    let ball_at = |id: i64, x: f64, signature: Option<f64>, character: Option<i64>| Ball {
+        id, type_id: 1, owner_id: character.unwrap_or(1), corp_id: 1, alliance_id: -1, char_id: character,
+        signature_radius: signature, mode: MODE_STOP, radius: 1.0, mass: 1e6, max_vel: 0.0,
+        agility: 1.0, speed_fraction: 0.0, pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0],
+        old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
+        free: true, global: false, interactive: character.is_some(), massive: true,
+        warp: Default::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() };
+    let mut system = System::new(1, Arc::default(), 0);
+    // The source pilot ball is also the guard's activation carrier.
+    system.insert(ball_at(source, 0.0, None, Some(character)));
+    system.insert(ball_at(victim, 50.0, Some(200.0), Some(victim_char)));
+    system.insert(ball_at(outside, 200.0, None, None));
+    // Fit the victim: capacitor 500, recharge tau 2s, 25% resistance.
+    let before = ship_fit(&[]);
+    let patch = ship_fit(&[(ATTR_CAPACITOR_CAPACITY, 500.0), (ATTR_RECHARGE_RATE, 2_000.0), (resistance_attr, 0.25)])
+        .into_committed_fitting(&before);
+    let victim_generation = system.persistent_generation(victim).unwrap_or_else(|| {
+        system.add_persistent_ship(ball_at(victim, 50.0, Some(200.0), Some(victim_char)));
+        system.persistent_generation(victim).unwrap()
+    });
+    let stats = ShipStats::from_fit(&before, Key::Ship);
+    system.install_condition(victim, Condition { now: stats.max, stats, shield_at: filetime_now() }, before);
+    assert!(system.publish_fitting(victim, victim_char, victim_generation, patch, vec![]));
+    state().capacitor.insert(victim, (500.0, filetime_now()));
+    state().capacitor.insert(outside, (500.0, filetime_now()));
+    {
+        let mut st = state();
+        st.active.insert(module, ActiveModule { char_id: character, stop: generation.clone(), forced_inactive: false });
+    }
+    let guard = NpcCapacitorGuard::SuperWeapon { source, character, module, generation: generation.clone() };
+    let sde = crate::sde::Sde::default();
+    drain_area_in_actor(&mut system, &sde, source, [0.0; 3], 100.0, 100.0, 400.0, resistance_attr, &guard);
+    // amount(100) * signature factor(200/400) * (1 - resistance 0.25) = 37.5, applied once.
+    assert_eq!(state().capacitor.get(&victim).unwrap().0, 462.5);
+    assert_eq!(state().capacitor.get(&outside).unwrap().0, 500.0, "outside the neut radius");
+    state().active.remove(&module);
+    state().capacitor.remove(&victim);
+    state().capacitor.remove(&outside);
 }

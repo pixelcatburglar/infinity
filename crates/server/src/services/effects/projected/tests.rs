@@ -25,7 +25,7 @@ fn same_id_resonance_operand_stays_raw_while_receiver_value_clamps() {
     let source_module = -7;
     let projection = Projection { source_ship: -1, kind: EffectKind::Modifiers, until_ms: i64::MAX,
         source_module, source_type: 1, effect_id: 1, values: vec![(RESONANCE, 0.01)],
-        charge_values: vec![], charge_type: None, scramble: None };
+        charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
     let fit = Fit::for_space_type(sde, 1, vec![projection]);
     let key = Key::Projected(source_module);
     assert_eq!(fit.value(key, RESONANCE), floor);
@@ -64,7 +64,7 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
     let projection = Projection { source_ship: -1, source_module: -2, source_type: module_type,
         effect_id: EFFECT_WARP_SCRAMBLE, kind: effect.kind, until_ms: i64::MAX,
         values: module_values.into_iter().map(|(id, value, _)| (id, value)).collect(),
-        charge_values: charge_values.into_iter().map(|(id, value, _)| (id, value)).collect(), charge_type: None, scramble: None };
+        charge_values: charge_values.into_iter().map(|(id, value, _)| (id, value)).collect(), charge_type: None, resistance_attribute: None, scramble: None };
     let boost_attr = sde.dogma.attributes_by_name("speedBoostFactor").next().unwrap().attribute_id;
     let mwd_effect = registry::resolve(&sde, EFFECT_MICROWARPDRIVE).unwrap();
     let duration_attr = mwd_effect.attribute(registry::EffectAttribute::Duration).unwrap();
@@ -156,7 +156,7 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
         let cx = Ctx { db: d.clone(), world: w.clone(), notify, char_id: f.source, ship_id: f.ship, system_id: 1 };
         on_activate(&cx, &fit, &Activation { effect: effect.clone(),
             module: Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST },
-            target: Some(f.victim) }).await.unwrap();
+            target: Some(f.victim), aim: None }).await.unwrap();
         let generation = crate::space::targeting::next_generation();
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
             effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),

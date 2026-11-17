@@ -332,6 +332,14 @@ impl System {
             self.notify_pilot(owner, crate::services::dogma::brain::UPDATED_EVENT,
                 crate::services::dogma::brain::update_args(owner, character, ship_value, structure));
         }
+        // A committed offline or a module leaving the fit is the forced
+        // terminal for any duration-bounded activation record on the ship;
+        // the record's own generation fences stale matches.
+        for module in crate::services::effects::active_cycle::ship_records(ship) {
+            if self.actor_combat[&ship].fit.module_state(module).is_none_or(|(online, _)| !online) {
+                crate::services::effects::active_cycle::finish_module(self, ship, module);
+            }
+        }
         true
     }
 

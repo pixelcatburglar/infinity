@@ -38,7 +38,7 @@ async fn fixture_for(jamming: JammingType) -> (space::System, Projection) {
             }
             let p = Projection { source_ship: 124, source_module: 125, source_type: source.type_id,
                 effect_id: effect.effect_id, kind: EffectKind::Projected { jamming },
-                until_ms: i64::MAX, values, charge_values: vec![], charge_type: None, scramble: None };
+                until_ms: i64::MAX, values, charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
             let projected = Fit::for_space_type(sde.clone(), hull, vec![p.clone()]);
             if projected.value(Key::Ship, ATTR_WARP_SCRAMBLE_STATUS) > 0.0 {
                 selected = Some(p);

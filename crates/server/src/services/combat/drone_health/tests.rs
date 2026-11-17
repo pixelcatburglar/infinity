@@ -52,7 +52,7 @@ async fn indexed_drone_repair_uses_actor_health() {
     let prepared = crate::space::drone::PreparedDrone { ball, spec, condition, fit, key: Key::Ship, npc_ignored: false };
     system.restore_drone(prepared, Arc::new(|_, _| Some(Box::pin(async {}))));
     assert!(system.set_condition_fraction(id, 0.5));
-    assert!(damage::repair_target_in_system(&mut system, id, 1, 25.0, crate::space::combat::RepairSource::Local).unwrap());
+    assert!(damage::repair_target_in_system(&mut system, id, 1, 25.0, None, crate::space::combat::RepairSource::Local).unwrap());
     let snapshot = system.combat_condition_snapshot(id).unwrap();
     assert_eq!(snapshot.condition.now[1], (initial[1] + 25.0).min(snapshot.condition.stats.max[1]));
     assert_eq!(snapshot.condition.now[2], initial[2]);

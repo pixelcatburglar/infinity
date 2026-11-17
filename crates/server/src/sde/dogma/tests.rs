@@ -15,6 +15,7 @@ pub(crate) fn overload_fixture() -> Dogma {
         is_offensive: false, is_assistance: false, disallow_auto_repeat: false,
         electronic_chance: false, propulsion_chance: false, discharge_attribute_id: None,
         range_attribute_id: None, falloff_attribute_id: None, tracking_attribute_id: None,
+        resistance_attribute_id: None,
         modifiers: vec![Modifier { func: "ItemModifier".into(), domain: "shipID".into(),
             op: 2, modified: infinity_core::consts::dogma::ATTR_ARMOR_HP, modifying: BONUS_ATTRIBUTE,
             group: None, skill: None, target_category: None }],

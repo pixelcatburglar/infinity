@@ -46,7 +46,7 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.upsert_projection(1, Projection {
         source_ship: 2, source_module: 3, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-        values: vec![], charge_values: vec![], charge_type: None, scramble: None,
+        values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None,
     });
     let current = system.projection_revision(1);
     system.queue_projection_kinematics(1, current, Kinematics { speed: 10.0, mass: 30.0, agility: 0.25, signature: 40.0 });

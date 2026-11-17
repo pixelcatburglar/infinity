@@ -2,6 +2,7 @@ use super::*;
 use infinity_core::{consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_RECHARGE_RATE, CATEGORY_SHIP}};
 use crate::{dao::items::{combat, pending_reloads}, services::combat::{groups_health::{capacitor_snapshot, drain_capacitor}, targeting_charges::loaded}, space::World};
 use crate::services::effects::weapons::consume_charge;
+use crate::services::fit::Fit;
 use crate::space::combat::loaded::LoadedSeed;
 
 #[tokio::test]
@@ -67,7 +68,7 @@ async fn refused_charge_consumption_refunds_debit() {
         let released = w.with(1, move |s| {
             assert!(crate::services::effects::lifecycle::capture_cycle_inputs(s, &mut cycle).unwrap());
             let held = s.loaded_outstanding();
-            crate::services::effects::lifecycle::cycle_stop(s, cycle);
+            crate::services::effects::lifecycle::end::cycle_stop(s, cycle);
             let readmit = s.hold_loaded_use(ship, module_id);
             if let Some(readmit) = readmit { s.release_loaded_use(readmit); }
             (held, s.loaded_outstanding(), readmit.is_some())

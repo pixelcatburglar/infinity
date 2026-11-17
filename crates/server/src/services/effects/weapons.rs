@@ -454,19 +454,14 @@ pub(crate) struct Missile {
 }
 
 
-/// Launch a native-steered missile flight; the actor sweeps target contact and
-/// expires the flight at its frozen effective lifetime. A committed contact
-/// applies explosion radius and velocity against the target at that actor turn.
-pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile, guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
-    let size = world.sde().types.get(m.charge)
+/// Build the transient projectile ball shared by ordinary and Defender launches.
+fn build_projectile_ball(sde: &Sde, from: &Ball, target: &Ball, owner: i64, module: Option<i64>, m: &Missile) -> Result<Ball, CallError> {
+    let size = sde.types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
-    if !m.flight_time_ms.is_finite() || m.flight_time_ms <= 0.0 {
-        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {}", m.flight_time_ms)));
-    }
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
     let launch_ms = now_ms();
-    let missile = Ball {
+    Ok(Ball {
         id: next_missile_id(),
         type_id: m.charge,
         owner_id: owner,
@@ -499,7 +494,17 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         health: [1.0; 3],
         launcher: 0,
         slim,
-    };
+    })
+}
+
+/// Launch a native-steered missile flight; the actor sweeps target contact and
+/// expires the flight at its frozen effective lifetime. A committed contact
+/// applies explosion radius and velocity against the target at that actor turn.
+pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile, guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
+    if !m.flight_time_ms.is_finite() || m.flight_time_ms <= 0.0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {}", m.flight_time_ms)));
+    }
+    let missile = build_projectile_ball(world.sde(), &from, &target, owner, module, &m)?;
     let missile_id = missile.id;
     let flight_time_ms = m.flight_time_ms;
     let shooter_id = from.id;
@@ -609,6 +614,61 @@ pub(super) async fn fire_missile(cx: &Ctx, inputs: &MissileInputs, module: &Modu
         illegal,
     };
     launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile, None, attempt).await
+}
+
+/// Launch a no-damage Defender flight using an actor-local target reservation.
+pub(super) async fn launch_defender(cx: &Ctx, inputs: &MissileInputs, module: &Module, charge: i32, target_id: i64,
+    target_token: crate::space::system::observers::BallToken, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
+    let ship_id = cx.ship_id;
+    let system_id = cx.system_id;
+    let character_id = cx.char_id;
+    let module_id = module.id;
+    let m = Missile {
+        charge,
+        raw: inputs.raw,
+        aoe_cloud: inputs.aoe_cloud,
+        aoe_velocity: inputs.aoe_velocity,
+        drf: inputs.drf,
+        velocity: inputs.velocity,
+        flight_time_ms: inputs.flight_time_ms,
+        weapon: module.type_id,
+        illegal: false,
+    };
+    if !m.flight_time_ms.is_finite() || m.flight_time_ms <= 0.0 {
+        super::defenders::release_target(cx, target_id).await;
+        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {}", m.flight_time_ms)));
+    }
+    let sde = cx.world.sde().clone();
+    let mut pending_attempt = Some(attempt);
+    let result = cx.world.with(system_id, move |s| {
+        let Some(source) = s.sampled_ball(ship_id) else {
+            s.release_defender_target(target_id);
+            if let Some(mut attempt) = pending_attempt.take() { attempt.finish_in_actor(s); }
+            return None;
+        };
+        let Some(target) = s.sampled_ball(target_id) else {
+            s.release_defender_target(target_id);
+            if let Some(mut attempt) = pending_attempt.take() { attempt.finish_in_actor(s); }
+            return None;
+        };
+        let ball = match build_projectile_ball(&sde, &source, &target, character_id, Some(module_id), &m) {
+            Ok(ball) => ball,
+            Err(_) => {
+                s.release_defender_target(target_id);
+                if let Some(mut attempt) = pending_attempt.take() { attempt.finish_in_actor(s); }
+                return None;
+            }
+        };
+        let lifetime = m.flight_time_ms;
+        s.launch_defender(ball, target_id, target_token, ship_id, lifetime, move |s, _contact| {
+            if let Some(mut attempt) = pending_attempt.take() { attempt.finish_in_actor(s); }
+        });
+        Some(())
+    }).await;
+    if result.flatten().is_none() {
+        super::defenders::release_target(cx, target_id).await;
+    }
+    Ok(())
 }
 
 /// Execute an actor-owned weapon using the sampled source and its typed inputs.

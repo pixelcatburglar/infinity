@@ -7,7 +7,7 @@ use infinity_core::{
 use crate::{
     client::Client,
     dao::items::{charges, combat as item_combat, dogma},
-    services::{combat::{self, targeting_charges::loaded}, Call},
+    services::{combat::{self, targeting_charges::loaded}, effects::registry::EffectAttribute, Call, CallResult},
     space::{Ball, WarpState, World, MODE_STOP},
 };
 

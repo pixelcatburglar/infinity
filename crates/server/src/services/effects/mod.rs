@@ -22,14 +22,17 @@ pub(crate) mod spool;
 pub(in crate::services::effects) mod fx;
 pub(crate) mod hacking;
 pub(crate) mod lifecycle;
+pub(crate) mod active_cycle;
 mod fuel;
 mod entosis;
 mod behaviors;
 pub(crate) mod online;
 pub(crate) mod fitting;
 pub(crate) mod aoe;
+pub(crate) mod defenders;
+pub(crate) mod super_weapon;
 mod bombs;
-mod vorton;
+pub(crate) mod vorton;
 pub(crate) mod cloak;
 mod mjd;
 mod compression;
@@ -51,7 +54,7 @@ pub(crate) enum JammingType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EffectKind {
-    Modifiers, Turret, Missile, Smartbomb, Vorton,
+    Modifiers, Turret, Missile, Smartbomb, Vorton, SuperWeapon,
     LocalRepair { layer: usize, amount_attr: i32 },
     FueledLocalRepair { layer: usize, amount_attr: i32, charge_bonus_attr: Option<i32> },
     RemoteRepair { layer: usize },

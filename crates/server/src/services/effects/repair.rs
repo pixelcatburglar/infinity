@@ -63,7 +63,7 @@ pub(super) async fn apply(cx: &Ctx, cycle: &super::lifecycle::Cycle, layer: usiz
     let generation = cycle.stop.clone();
     let ship = cx.ship_id;
     let character = cx.char_id;
-    crate::services::combat::damage::repair_target(&cx.world, cx.system_id, ship, layer, amount, crate::space::combat::RepairSource::Local, move |s| {
+    crate::services::combat::damage::repair_target(&cx.world, cx.system_id, ship, layer, amount, None, crate::space::combat::RepairSource::Local, move |s| {
         crate::services::combat::state().active.get(&module).is_some_and(|active| std::sync::Arc::ptr_eq(&active.stop, &generation))
             && s.pilot_ball(character).is_some_and(|ball| ball.id == ship)
     }).await

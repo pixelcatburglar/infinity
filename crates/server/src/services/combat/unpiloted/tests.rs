@@ -48,7 +48,7 @@ async fn persistent_damage_repair_guard_and_death() {
             s.install_condition(ship, seed, fit);
         }).await.unwrap();
         let before_npc_repair = w.with(system, move |s| s.combat_health_scalars(ship).unwrap()).await.unwrap();
-        damage::repair_target(&w, system, ship, 1, 1.0, crate::space::combat::RepairSource::Local, move |s| s.is_npc(ship)).await.unwrap();
+        damage::repair_target(&w, system, ship, 1, 1.0, None, crate::space::combat::RepairSource::Local, move |s| s.is_npc(ship)).await.unwrap();
         let after_npc_repair = w.with(system, move |s| s.combat_health_scalars(ship).unwrap()).await.unwrap();
         assert_eq!(after_npc_repair.0, before_npc_repair.0);
         assert_eq!(after_npc_repair.1[1..], before_npc_repair.1[1..]);
@@ -73,7 +73,7 @@ async fn persistent_damage_repair_guard_and_death() {
         assert!(damage::apply_damage_guarded(&d, &w, system, ship, [1.0, 0.0, 0.0, 0.0], damage::DamageSource { facts: Some(facts), ..Default::default() }, false, |_| true).await.unwrap().unwrap().dealt > 0.0);
         let before_guard = fingerprint(&d, ship).await;
         let health_guard = w.ball(system, ship).await.unwrap().health;
-        damage::repair_target(&w, system, ship, 0, 1.0, crate::space::combat::RepairSource::Local, |_| false).await.unwrap();
+        damage::repair_target(&w, system, ship, 0, 1.0, None, crate::space::combat::RepairSource::Local, |_| false).await.unwrap();
         assert_eq!(fingerprint(&d, ship).await, before_guard);
         assert_eq!(w.ball(system, ship).await.unwrap().health, health_guard);
         let initial = fingerprint(&d, ship).await;
@@ -86,7 +86,7 @@ async fn persistent_damage_repair_guard_and_death() {
         let damaged = fingerprint(&d, ship).await;
         assert_ne!(initial, damaged);
         assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap().is_empty());
-        damage::repair_target(&w, system, ship, 0, 1.0, crate::space::combat::RepairSource::Local, |_| true).await.unwrap();
+        damage::repair_target(&w, system, ship, 0, 1.0, None, crate::space::combat::RepairSource::Local, |_| true).await.unwrap();
         assert_eq!(fingerprint(&d, ship).await, damaged);
         w.flush_positions().await.unwrap();
         let repaired = fingerprint(&d, ship).await;
@@ -145,7 +145,7 @@ async fn persistent_damage_repair_guard_and_death() {
         assert_eq!((events[0].get::<_, i64>("solar_system_id"), events[0].get::<_, i16>("kind")), (system, crate::dao::map_telemetry::EventKind::Ship as i16));
         assert!(damage::apply_damage_guarded(&d, &w, system, ship, [1e30, 0.0, 0.0, 0.0], Default::default(), false, |_| true).await.unwrap().is_none());
         assert_eq!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap().len(), 1);
-        assert!(damage::repair_target(&w, system, ship, 2, 1e30, crate::space::combat::RepairSource::Local, |_| true).await.is_err());
+        assert!(damage::repair_target(&w, system, ship, 2, 1e30, None, crate::space::combat::RepairSource::Local, |_| true).await.is_err());
         assert!(w.ball(system, ship).await.is_none());
         let group: i64 = d.query_one("SELECT group_id FROM game.repairable_recovery_groups WHERE beneficiary_id=$1 AND source_item_id=$2", &[&owner, &ship]).await.unwrap().get("group_id");
         let root = crate::dao::items::loading::load_items(&d, crate::dao::items::loading::ItemQuery::Id(ship)).await.unwrap();

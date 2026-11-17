@@ -1,5 +1,6 @@
 use super::*;
 use crate::services::combat::active_modules;
+use crate::services::fit::Fit;
 
 #[test]
 fn forced_inactive_is_excluded_from_fit_input_immediately() {
@@ -97,7 +98,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
                 source_ship: source, source_module: -module, source_type: scram_type,
                 effect_id: infinity_core::consts::dogma::EFFECT_WARP_SCRAMBLE,
                 kind: EffectKind::Projected { jamming: super::super::super::JammingType::Scramble },
-                until_ms: i64::MAX, values: vec![(modifying, 1.0)], charge_values: vec![], charge_type: None, scramble: None,
+                until_ms: i64::MAX, values: vec![(modifying, 1.0)], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None,
             });
             assert_eq!(s.projections_on(ship).len(), 1);
         }).await.unwrap();
@@ -128,7 +129,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
             source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
         let first = make_cycle();
         let duplicate = make_cycle();
-        test_world.with(1, move |s| { cycle_stop(s, first); cycle_stop(s, duplicate); }).await.unwrap();
+        test_world.with(1, move |s| { crate::services::effects::lifecycle::end::cycle_stop(s, first); crate::services::effects::lifecycle::end::cycle_stop(s, duplicate); }).await.unwrap();
         assert!(!state().active.contains_key(&module));
         let mut stops = Vec::new();
         while let Ok((event, args)) = rx.try_recv() {
@@ -161,7 +162,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
             owner: ActivationOwner { master: module, generation: ordinary, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
             started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
             source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
-        test_world.with(1, move |s| cycle_stop(s, cycle)).await.unwrap();
+        test_world.with(1, move |s| crate::services::effects::lifecycle::end::cycle_stop(s, cycle)).await.unwrap();
         assert!(!active_modules().contains(&module));
         let retired = Fit::load_in_space(&test_db, &test_world, 1, character, ship).await.ok().expect("loading retired fit")
             .value(Key::Ship, ATTR_MAX_VELOCITY);

@@ -24,7 +24,7 @@ fn bomb_flies_straight_and_excludes_itself_not_the_launcher() {
     assert_eq!(launcher_generation, None);
     let observed = Arc::new(Mutex::new(None));
     let result = observed.clone();
-    system.launch_bomb(ball(2, 0.0), [1.0, 0.0, 0.0], 1000, move |s, center| {
+    system.launch_bomb(ball(2, 0.0), [1.0, 0.0, 0.0], 1000, 0.0, move |s, center| {
         let center = center.unwrap();
         *result.lock().unwrap() = Some((center, aoe::victims(s, 2, center, 1000.0)));
     });
@@ -43,7 +43,7 @@ fn removed_bomb_has_no_detonation_victims() {
     system.insert(ball(1, 0.0));
     let observed = Arc::new(Mutex::new(None));
     let result = observed.clone();
-    system.launch_bomb(ball(2, 0.0), [1.0, 0.0, 0.0], 1000, move |s, center| {
+    system.launch_bomb(ball(2, 0.0), [1.0, 0.0, 0.0], 1000, 0.0, move |s, center| {
         if let Some(center) = center {
             *result.lock().unwrap() = Some(aoe::victims(s, 2, center, 1000.0));
         }

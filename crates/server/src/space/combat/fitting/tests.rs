@@ -326,7 +326,7 @@ fn stale_gates_reject_and_due_expiry_fires_before_its_timer() {
     use crate::services::effects::{projection::Projection, EffectKind, JammingType};
     let projection = |until_ms| Projection { source_ship: 8, source_module: 9, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms,
-        values: vec![(1, -1.0)], charge_values: vec![], charge_type: None, scramble: None };
+        values: vec![(1, -1.0)], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
     system.upsert_projection(1, projection(100));
     let now = crate::client::filetime_now();
     let expiry = now - infinity_core::consts::FILETIME_SECOND;
@@ -373,7 +373,7 @@ fn publish_replaces_domain_on_ship_and_owned_drones_and_preserves_live_state() {
     let (_, seeded) = crate::services::combat::groups_health::fill_capacitor(1, 100.0, 1000.0, crate::client::filetime_now());
     system.upsert_projection(1, Projection { source_ship: 8, source_module: 9, source_type: 1,
         effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
-        values: vec![(1, -10.0)], charge_values: vec![], charge_type: None, scramble: None });
+        values: vec![(1, -10.0)], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     assert!(system.publish_character_inputs(1, 2, generation,
         &crate::services::fit::character::CharacterInputs { at: now + 1, trained: vec![], ..character(now, None) }));
     assert_eq!(system.with_combat_fit(1, |fit, _, _| (

@@ -68,7 +68,7 @@ async fn real_projection_refresh_and_stop_record_actual_lifetime() {
     let generation = crate::space::targeting::next_generation();
     let mut projection = Projection { source_ship: 1, source_module: 10, source_type: ty, effect_id: 11,
         kind: EffectKind::Projected { jamming: JammingType::Scramble }, until_ms: i64::MAX,
-        values: vec![], charge_values: vec![], charge_type: None, scramble: None };
+        values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
     for sequence in 1..=2 {
         let source = system.prepare_combat_source(1, Some(10), Some(11), None, FactOrigin::Natural,
             generation, sequence, 1, |_| true).unwrap();

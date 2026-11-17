@@ -30,7 +30,7 @@ pub(super) fn activation_in_scope(category: i64, group: i64, kind: EffectKind) -
 
 /// SDE dogma effect attribute-ID columns, in descriptor array order.
 #[derive(Clone, Copy)]
-pub(crate) enum EffectAttribute { Duration, Discharge, Range, Falloff, Tracking }
+pub(crate) enum EffectAttribute { Duration, Discharge, Range, Falloff, Tracking, Resistance }
 
 /// SDE dogma effect boolean columns, in descriptor bit order.
 #[derive(Clone, Copy)]
@@ -46,19 +46,20 @@ pub(crate) struct Effect {
     pub(crate) kind: EffectKind,
     pub(crate) guid: Option<String>,
     category: Option<i32>,
-    attributes: [Option<i32>; 5],
+    attributes: [Option<i32>; 6],
     flags: u8,
 }
 
 impl Effect {
     fn from_row(row: &crate::sde::dogma::Effect, kind: EffectKind) -> Self {
-        let mut attributes = [None; 5];
+        let mut attributes = [None; 6];
         for (key, value) in [
             (EffectAttribute::Duration, row.duration_attribute_id),
             (EffectAttribute::Discharge, row.discharge_attribute_id),
             (EffectAttribute::Range, row.range_attribute_id),
             (EffectAttribute::Falloff, row.falloff_attribute_id),
             (EffectAttribute::Tracking, row.tracking_attribute_id),
+            (EffectAttribute::Resistance, row.resistance_attribute_id),
         ] { attributes[key as usize] = value; }
         let mut flags = 0;
         for (key, value) in [
@@ -86,6 +87,7 @@ pub(crate) fn resolve(sde: &Sde, effect_id: i32) -> Option<Effect> {
     let row = sde.dogma.effect(effect_id)?;
     Some(Effect::from_row(row, classify(effect_id, !row.modifiers().is_empty())?))
 }
+
 
 
 pub(crate) fn kind(sde: &Sde, effect_id: i32) -> Option<EffectKind> {
@@ -164,10 +166,10 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_EXCLUDED_6478 => return None,
         EFFECT_EXCLUDED_6479 => return None,
         EFFECT_EXCLUDED_6476 => return None,
-        EFFECT_EXCLUDED_6472 => return None,
-        EFFECT_EXCLUDED_6473 => return None,
+        EFFECT_DOOMSDAY_BEAM_DOT => SuperWeapon,
+        EFFECT_DOOMSDAY_CONE_DOT => SuperWeapon,
         EFFECT_EXCLUDED_6474 => return None,
-        EFFECT_EXCLUDED_6201 => return None,
+        EFFECT_DOOMSDAY_SLASH => SuperWeapon,
         EFFECT_EXCLUDED_6440 => return None,
         EFFECT_EXCLUDED_6439 => return None,
         EFFECT_EXCLUDED_6485 => return None,
@@ -182,10 +184,10 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_EXCLUDED_6435 => return None,
         EFFECT_EXCLUDED_6464 => return None,
         EFFECT_EXCLUDED_6436 => return None,
-        EFFECT_EXCLUDED_4489 => return None,
-        EFFECT_EXCLUDED_4490 => return None,
-        EFFECT_EXCLUDED_4491 => return None,
-        EFFECT_EXCLUDED_4492 => return None,
+        EFFECT_SUPER_WEAPON_AMARR => SuperWeapon,
+        EFFECT_SUPER_WEAPON_CALDARI => SuperWeapon,
+        EFFECT_SUPER_WEAPON_GALLENTE => SuperWeapon,
+        EFFECT_SUPER_WEAPON_MINMATAR => SuperWeapon,
         EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR => RemoteRepair { layer: 1 },
         EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD => RemoteRepair { layer: 0 },
         EFFECT_NPC_BEHAVIOR_REMOTE_CAPACITOR => CapTransfer,
@@ -195,8 +197,8 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_NPC_BEHAVIOR_MWD => Propulsion,
         EFFECT_NPC_BEHAVIOR_MINING => Mining,
         EFFECT_NPC_BEHAVIOR_SMARTBOMB => Smartbomb,
-        EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR => LocalRepair { layer: 1, amount_attr: ATTR_ENTITY_ARMOR_REPAIR_AMOUNT },
-        EFFECT_NPC_BEHAVIOR_SHIELD_BOOST => LocalRepair { layer: 0, amount_attr: ATTR_ENTITY_SHIELD_BOOST_AMOUNT },
+        EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR => LocalRepair { layer: 1, amount_attr: ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT },
+        EFFECT_NPC_BEHAVIOR_SHIELD_BOOST => LocalRepair { layer: 0, amount_attr: ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT },
         EFFECT_NPC_BEHAVIOR_WEB => Projected { jamming: JammingType::Webify },
         EFFECT_NPC_BEHAVIOR_GUIDANCE_DISRUPTOR => Projected { jamming: JammingType::GuidanceDisrupt },
         EFFECT_NPC_BEHAVIOR_TRACKING_DISRUPTOR => Projected { jamming: JammingType::TrackingDisrupt },
@@ -224,6 +226,8 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_TRIAGE_MODE => return None,
         EFFECT_TRIAGE_MODE_7 => return None,
         EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE => Propulsion,
+        EFFECT_BASTION |
+        EFFECT_SACRIBIS_BASTION => Modifiers,
         id if id == EFFECT_ONLINE as i32 => Online,
         EFFECT_CYNO_GENERATION |
         EFFECT_CLONE_JUMP_ACCEPTING |
@@ -231,8 +235,6 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_INDUSTRIAL_CORE |
         EFFECT_JUMP_PORTAL |
         EFFECT_JUMP_PORTAL_BO |
-        EFFECT_BASTION |
-        EFFECT_SACRIBIS_BASTION |
         EFFECT_SIEGE |
         EFFECT_TRIAGE |
         EFFECT_STELLIAN_TRIAGE |

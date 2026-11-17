@@ -235,7 +235,7 @@ async fn ecm_final_consumer_expires_defense_and_rejects_replaced_body() {
     let roll = (chance(strength, active, 1.0) + chance(strength, expired, 1.0)) / 2.0;
     assert_ne!(roll < chance(strength, active, 1.0), roll < chance(strength, expired, 1.0));
     let src = Source { id: source, type_id: Some(hull), module: -986_203,
-        optimal: 1000.0, falloff: 0.0, strengths: [strength; 4], duration: 1000.0,
+        optimal: 1000.0, falloff: 0.0, strengths: [strength; 4], duration: 1000.0, resistance_attribute: None,
         burst: false, offensive: false, revision: None, owner_revision: None };
     assert_eq!(system.combat_fit_revision(target), Some(0));
     let gate = TargetGate { victim: victim.clone(), membership, owner: None,

@@ -228,6 +228,8 @@ pub const ATTR_ACCESS_DIFFICULTY_BONUS: i32 = 902;
 pub const ATTR_REACTIVATION_DELAY: i32 = 669;
 /// SDE dgmAttributeTypes: cloakingTargetingDelay.
 pub const ATTR_TARGETING_DELAY: i32 = 560;
+/// SDE dgmAttributeTypes: disallowRepeatingActivation.
+pub const ATTR_DISALLOW_REPEATING_ACTIVATION: i32 = 1014;
 /// SDE dgmAttributeTypes: quantity.
 pub const ATTR_QUANTITY: i32 = 805;
 /// SDE dgmAttributeTypes: isOnline.
@@ -279,6 +281,8 @@ pub const EFFECT_TARGET_DISINTEGRATOR_ATTACK: i32 = 6995;
 pub const EFFECT_GUNNERY_MAX_RANGE_FALLOFF_TRACKING_SPEED_BONUS: i32 = 4559;
 /// SDE dgmEffects: useMissiles.
 pub const EFFECT_USE_MISSILES: i32 = 101;
+/// SDE dgmEffects: defenderMissileLaunching; charge-content admission only.
+pub const EFFECT_DEFENDER_MISSILE_LAUNCHING: i32 = 103;
 /// SDE dgmEffects: shieldBoosting.
 pub const EFFECT_SHIELD_BOOSTING: i32 = 4;
 /// SDE dgmEffects: armorRepair.
@@ -503,6 +507,14 @@ pub const ATTR_ENTITY_SHIELD_BOOST_DURATION: i32 = 636;
 pub const ATTR_ENTITY_ARMOR_REPAIR_AMOUNT: i32 = 631;
 /// SDE dgmAttributeTypes: entity_armor_repair_duration.
 pub const ATTR_ENTITY_ARMOR_REPAIR_DURATION: i32 = 630;
+/// SDE dgmAttributeTypes: behavior_shield_booster_amount.
+pub const ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT: i32 = 2723;
+/// SDE dgmAttributeTypes: behavior_shield_booster_duration.
+pub const ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION: i32 = 2725;
+/// SDE dgmAttributeTypes: behavior_armor_repairer_amount.
+pub const ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT: i32 = 2635;
+/// SDE dgmAttributeTypes: behavior_armor_repairer_duration.
+pub const ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION: i32 = 2633;
 /// SDE dgmAttributeTypes: shield_bonus.
 pub const ATTR_SHIELD_BONUS: i32 = 68;
 /// SDE dgmAttributeTypes: armor_damage_amount.
@@ -511,6 +523,10 @@ pub const ATTR_ARMOR_DAMAGE_AMOUNT: i32 = 84;
 pub const ATTR_STRUCTURE_DAMAGE_AMOUNT: i32 = 83;
 /// SDE dgmAttributeTypes: charged_armor_damage_multiplier.
 pub const ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER: i32 = 1886;
+/// SDE dgmAttributeTypes: remoteResistanceID; a source's nonzero value selects
+/// the target attribute resisting its remote effect when the effect row
+/// declares no resistanceAttributeID.
+pub const ATTR_REMOTE_RESISTANCE_ID: i32 = 2138;
 /// Client dogma.const attributeLowSlots.
 pub const ATTR_LOW_SLOTS: i32 = 12;
 /// Client dogma.const attributeMedSlots.
@@ -620,13 +636,13 @@ pub const EFFECT_EXCLUDED_6479: i32 = 6479;
 /// SDE dgmEffects: doomsdayAOEWeb.
 pub const EFFECT_EXCLUDED_6476: i32 = 6476;
 /// SDE dgmEffects: doomsdayBeamDOT.
-pub const EFFECT_EXCLUDED_6472: i32 = 6472;
+pub const EFFECT_DOOMSDAY_BEAM_DOT: i32 = 6472;
 /// SDE dgmEffects: doomsdayConeDOT.
-pub const EFFECT_EXCLUDED_6473: i32 = 6473;
+pub const EFFECT_DOOMSDAY_CONE_DOT: i32 = 6473;
 /// SDE dgmEffects: doomsdayHOG.
 pub const EFFECT_EXCLUDED_6474: i32 = 6474;
 /// SDE dgmEffects: doomsdaySlash.
-pub const EFFECT_EXCLUDED_6201: i32 = 6201;
+pub const EFFECT_DOOMSDAY_SLASH: i32 = 6201;
 /// SDE dgmEffects: fighterAbilityAfterburner.
 pub const EFFECT_EXCLUDED_6440: i32 = 6440;
 /// SDE dgmEffects: fighterAbilityEvasiveManeuvers.
@@ -656,11 +672,49 @@ pub const EFFECT_EXCLUDED_6464: i32 = 6464;
 /// SDE dgmEffects: fighterAbilityWarpDisruption.
 pub const EFFECT_EXCLUDED_6436: i32 = 6436;
 /// SDE dgmEffects: superWeaponAmarr.
-pub const EFFECT_EXCLUDED_4489: i32 = 4489;
+pub const EFFECT_SUPER_WEAPON_AMARR: i32 = 4489;
 /// SDE dgmEffects: superWeaponCaldari.
-pub const EFFECT_EXCLUDED_4490: i32 = 4490;
+pub const EFFECT_SUPER_WEAPON_CALDARI: i32 = 4490;
 /// SDE dgmEffects: superWeaponGallente.
-pub const EFFECT_EXCLUDED_4491: i32 = 4491;
+pub const EFFECT_SUPER_WEAPON_GALLENTE: i32 = 4491;
 /// SDE dgmEffects: superWeaponMinmatar.
-pub const EFFECT_EXCLUDED_4492: i32 = 4492;
+pub const EFFECT_SUPER_WEAPON_MINMATAR: i32 = 4492;
+/// SDE dgmEffects: moduleBonusAssaultDamageControl.
+pub const EFFECT_ASSAULT_DAMAGE_CONTROL: i32 = 7012;
+/// SDE dgmEffects: emergencyHullEnergizer.
+pub const EFFECT_EMERGENCY_HULL_ENERGIZER: i32 = 6484;
+/// SDE dgmEffects: targetSpectrumBreakerBonus (signature radius suppressor).
+pub const EFFECT_TARGET_SPECTRUM_BREAKER_BONUS: i32 = 8109;
+
+// Superweapon dogma attributes (client `dogma/const.py` attribute* rows).
+/// SDE dgmAttributeTypes: disallowInEmpireSpace.
+pub const ATTR_DISALLOW_IN_EMPIRE_SPACE: i32 = 1074;
+/// SDE dgmAttributeTypes: damageDelayDuration.
+pub const ATTR_DAMAGE_DELAY_DURATION: i32 = 1839;
+/// SDE dgmAttributeTypes: doomsdayEnergyNeutRadius.
+pub const ATTR_DOOMSDAY_ENERGY_NEUT_RADIUS: i32 = 2259;
+/// SDE dgmAttributeTypes: doomsdayEnergyNeutAmount.
+pub const ATTR_DOOMSDAY_ENERGY_NEUT_AMOUNT: i32 = 2260;
+/// SDE dgmAttributeTypes: doomsdayEnergyNeutSignatureRadius.
+pub const ATTR_DOOMSDAY_ENERGY_NEUT_SIGNATURE_RADIUS: i32 = 2261;
+/// SDE dgmAttributeTypes: doomsdayWarningDuration.
+pub const ATTR_DOOMSDAY_WARNING_DURATION: i32 = 2262;
+/// SDE dgmAttributeTypes: doomsdayDamageRadius.
+pub const ATTR_DOOMSDAY_DAMAGE_RADIUS: i32 = 2263;
+/// SDE dgmAttributeTypes: doomsdayDamageDuration.
+pub const ATTR_DOOMSDAY_DAMAGE_DURATION: i32 = 2264;
+/// SDE dgmAttributeTypes: doomsdayDamageCycleTime.
+pub const ATTR_DOOMSDAY_DAMAGE_CYCLE_TIME: i32 = 2265;
+/// SDE dgmAttributeTypes: doomsdayAOERange.
+pub const ATTR_DOOMSDAY_AOE_RANGE: i32 = 2279;
+/// SDE dgmAttributeTypes: doomsdayAOEDuration.
+pub const ATTR_DOOMSDAY_AOE_DURATION: i32 = 2280;
+/// SDE dgmAttributeTypes: doomsdayAOESignatureRadius.
+pub const ATTR_DOOMSDAY_AOE_SIGNATURE_RADIUS: i32 = 2281;
+/// SDE dgmAttributeTypes: doomsdayNoJumpOrCloakDuration.
+pub const ATTR_DOOMSDAY_NO_JUMP_OR_CLOAK_DURATION: i32 = 2427;
+/// SDE dgmAttributeTypes: doomsdayImmobilityDuration.
+pub const ATTR_DOOMSDAY_IMMOBILITY_DURATION: i32 = 2428;
+/// SDE dgmAttributeTypes: doomsdayEnergyNeutResistanceID.
+pub const ATTR_DOOMSDAY_ENERGY_NEUT_RESISTANCE_ID: i32 = 2609;
 

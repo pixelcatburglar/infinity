@@ -9,12 +9,15 @@ use super::*;
 use crate::services::effects::weapons::{launch_missile, turret_shot, Missile, TurretSpool};
 use crate::services::effects::spool::{SpoolBinding, SpoolParameters};
 use infinity_core::consts::dogma::ATTR_AGILITY;
-use infinity_core::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_PER_CYCLE, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_MAX, dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK};
+use infinity_core::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_PER_CYCLE, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_MAX, dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK, dogma::EFFECT_NPC_BEHAVIOR_SHIELD_BOOST, dogma::EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR, dogma::ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT, dogma::ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION, dogma::ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT, dogma::ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION};
 use crate::sde::types::TypeData;
 use crate::space::{special_fx, System, MODE_STOP, V3};
 
 /// SDE optimalSigRadius attribute metadata default when metadata is absent.
 const DEFAULT_OPTIMAL_SIG_RADIUS: f64 = 1000.0;
+/// The existing shared NPC repair cycle floor (ms): both local repair layers
+/// tick on one common cycle and only longer legacy durations raise the period.
+const NPC_REPAIR_CYCLE_FLOOR_MS: f64 = 5_000.0;
 
 /// Create the SDE-derived NPC ball and attach its existing combat brain.
 pub(crate) async fn spawn(db: &Db, world: &Arc<World>, system: i64, data: &TypeData, corp: i64, pos: V3, tick: i64, owner: Option<i64>) -> Result<i64, CallError> {
@@ -65,6 +68,8 @@ pub(crate) async fn spawn(db: &Db, world: &Arc<World>, system: i64, data: &TypeD
 #[derive(Clone)]
 pub(super) struct NpcStats {
     /// (shield boost, armor repair) amount per repair cycle, and the cycle (ms).
+    /// A carried behavior repair effect (SDE 6990/6884) supplies a layer's
+    /// amount rescaled to the shared cycle when no valid legacy amount exists.
     pub(super) repairs: (f64, f64, f64),
     pub(super) scan_resolution: f64,
     pub(super) fly_range: f64,
@@ -104,13 +109,26 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
     let attribute = |id, fallback| sde.types.attribute(type_id, id)
         .or_else(|| sde.dogma.attribute(id).and_then(|a| a.default_value))
         .unwrap_or(fallback);
+    // Both repair layers tick on one existing shared cycle (floor unchanged).
+    // A carried npcBehaviorShieldBooster/npcBehaviorArmorRepairer effect (SDE
+    // 6990/6884) supplies that layer's amount rescaled onto the shared cycle —
+    // only when no finite positive legacy amount exists; never added on top.
+    let repair_cycle_ms = attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_DURATION, 0.0)
+        .max(attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_DURATION, 0.0)).max(NPC_REPAIR_CYCLE_FLOOR_MS);
+    let behavior = |legacy: f64, effect: i32, amount_id: i32, duration_id: i32| {
+        if legacy.is_finite() && legacy > 0.0
+            || !sde.types.effects(type_id).iter().any(|entry| entry.effect_id == effect) { return legacy; }
+        behavior_cycle_amount(sde.types.attribute(type_id, amount_id),
+            sde.types.attribute(type_id, duration_id), repair_cycle_ms).unwrap_or(legacy)
+    };
+    let repairs = (
+        behavior(attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0), EFFECT_NPC_BEHAVIOR_SHIELD_BOOST, ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT, ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION),
+        behavior(attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0), EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR, ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT, ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION),
+        repair_cycle_ms,
+    );
     Ok(NpcStats {
         scan_resolution: attr(sde, type_id, ATTR_SCAN_RESOLUTION, 0.0),
-        repairs: (
-            attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0),
-            attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0),
-            attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_DURATION, 0.0).max(attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_DURATION, 0.0)).max(5_000.0),
-        ),
+        repairs,
         fly_range: attr(sde, type_id, ATTR_ENTITY_FLY_RANGE, 7_500.0).max(1_000.0),
         aggro_range: attr(sde, type_id, ATTR_ENTITY_ATTACK_RANGE, 0.0).max(optimal * 3.0).max(60_000.0),
         rate_of_fire_ms: attr(sde, type_id, ATTR_RATE_OF_FIRE, 4_000.0).max(1_000.0),
@@ -123,6 +141,16 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
         fx,
         turret_effect,
     })
+}
+
+/// Per-cycle amount of one carried NPC behavior repair effect rescaled onto
+/// the shared cycle: SDE `amount * cycle_ms / duration`. Missing, non-finite
+/// or non-positive inputs admit no behavior amount.
+fn behavior_cycle_amount(amount: Option<f64>, duration: Option<f64>, cycle_ms: f64) -> Option<f64> {
+    let (amount, duration) = (amount?, duration?);
+    (amount.is_finite() && amount > 0.0 && duration.is_finite() && duration > 0.0)
+        .then(|| amount * cycle_ms / duration)
+        .filter(|scaled| scaled.is_finite())
 }
 
 /// Attach a brain to a spawned NPC; its effects run on the system's worker.
@@ -292,5 +320,7 @@ pub(super) fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) 
         s.set_health(id, health);
     });
 }
+
+#[cfg(all(test, feature = "tests-combat"))] mod tests;
 
 

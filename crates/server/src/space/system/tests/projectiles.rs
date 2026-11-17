@@ -67,7 +67,7 @@ fn live_launch_refuses_undamageable_charge() {
     let mut charge = projectile(4);
     charge.type_id = 999;
     let (tx, rx) = std::sync::mpsc::channel::<Option<V3>>();
-    s.launch_bomb(charge, [1.0, 0.0, 0.0], 1_000, move |_, c| tx.send(c).unwrap());
+    s.launch_bomb(charge, [1.0, 0.0, 0.0], 1_000, 0.0, move |_, c| tx.send(c).unwrap());
     assert!(rx.try_recv().unwrap().is_none());
     assert!(!s.contains(4) && !s.projectile_damageable(4) && !s.bomb_flights.contains_key(&4));
 }
@@ -103,7 +103,7 @@ fn bomb_delay_detonates_once_removal_and_lethal_damage_cancel() {
     let mut s = live();
     s.insert(ball(1, None, 0.0));
     let (tx, rx) = std::sync::mpsc::channel::<Option<V3>>();
-    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, move |_, c| tx.send(c).unwrap());
+    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, 0.0, move |_, c| tx.send(c).unwrap());
     assert!(s.projectile_damageable(4) && s.bomb_flights.contains_key(&4));
     s.tick(1_000);
     assert!(rx.try_recv().is_err() && s.ball(4).is_some());
@@ -116,7 +116,7 @@ fn bomb_delay_detonates_once_removal_and_lethal_damage_cancel() {
     let mut s = live();
     s.insert(ball(1, None, 0.0));
     let (tx, rx) = std::sync::mpsc::channel::<Option<V3>>();
-    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 5_000, move |_, c| tx.send(c).unwrap());
+    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 5_000, 0.0, move |_, c| tx.send(c).unwrap());
     s.tick(1_000);
     let out = s.apply_projectile_damage(4, [0.0, 0.0, 100.0, 0.0]).unwrap();
     assert!(out.destroyed && rx.try_recv().unwrap().is_none());
@@ -127,7 +127,7 @@ fn bomb_delay_detonates_once_removal_and_lethal_damage_cancel() {
     let mut s = live();
     s.insert(ball(1, None, 0.0));
     let (tx, rx) = std::sync::mpsc::channel::<Option<V3>>();
-    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, move |_, c| tx.send(c).unwrap());
+    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, 0.0, move |_, c| tx.send(c).unwrap());
     s.tick(1_000);
     s.take(4);
     assert!(rx.try_recv().unwrap().is_none());
@@ -144,10 +144,10 @@ fn same_id_replacement_preserves_new_incarnation() {
     let mut s = live();
     s.insert(ball(1, None, 0.0));
     let (tx1, rx1) = std::sync::mpsc::channel::<Option<V3>>();
-    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, move |_, c| tx1.send(c).unwrap());
+    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, 0.0, move |_, c| tx1.send(c).unwrap());
     s.tick(1_000);
     let (tx2, rx2) = std::sync::mpsc::channel::<Option<V3>>();
-    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, move |_, c| tx2.send(c).unwrap());
+    s.launch_bomb(projectile(4), [1.0, 0.0, 0.0], 1_000, 0.0, move |_, c| tx2.send(c).unwrap());
     // Replacement consumed the old terminal as a cancel, exactly once.
     assert!(rx1.try_recv().unwrap().is_none() && rx1.try_recv().is_err());
     assert!(s.projectile_damageable(4) && s.bomb_flights.contains_key(&4));
@@ -184,4 +184,147 @@ fn lethal_damage_ends_missile_without_combat_record() {
     s.tick(2_000);
     assert!(s.apply_projectile_damage(4, [0.0, 0.0, 100.0, 0.0]).unwrap().destroyed && rx.try_recv().unwrap().is_none());
     assert!(s.ball(4).is_none() && !s.projectile_damageable(4));
+}
+
+/// An online session for `character` in `corporation`; the returned receiver
+/// must stay alive for the session to read as online.
+fn online(s: &System, character: i64, corporation: i64)
+    -> tokio::sync::mpsc::UnboundedReceiver<(String, Vec<marshal::Value>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    s.registry.register_pilot(character, tx);
+    s.registry.set_online_session(character, Some(infinity_core::session::OnlineSession {
+        character_id: character, user_id: None, session_id: character, ship_id: None,
+        station_id: None, system_id: Some(0), corporation_id: Some(corporation),
+        alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
+    }));
+    rx
+}
+
+fn bomb_at(id: i64, owner: i64, pos: V3) -> Ball {
+    let mut b = projectile(id);
+    b.owner_id = owner;
+    b.pos = pos;
+    b
+}
+
+const SOURCE_CORP: i64 = 100;
+const HOSTILE_CORP: i64 = 7;
+
+#[test]
+fn defender_selects_and_ends_only_the_threatening_bomb() {
+    let mut s = live();
+    s.insert(ball(1, Some(1), 0.0));
+    let _source = online(&s, 1, SOURCE_CORP);
+    let _hostile = online(&s, 7, HOSTILE_CORP);
+    // Same corporation as the source: friendly, never a target.
+    let _friend = online(&s, 8, SOURCE_CORP);
+    let (bomb_tx, bomb_rx) = std::sync::mpsc::channel::<Option<V3>>();
+    // Covering and in reach: the only legal target.
+    s.launch_bomb(bomb_at(2, 7, [-4_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0,
+        move |_, c| bomb_tx.send(c).unwrap());
+    // In reach but its path never crosses the source.
+    s.launch_bomb(bomb_at(3, 7, [2_000.0, 3_000.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    // Friendly covering bomb.
+    s.launch_bomb(bomb_at(4, 8, [-2_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    // Covering but beyond the Defender's reach.
+    s.launch_bomb(bomb_at(5, 7, [-50_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    // An ordinary hostile missile is never a Defender target.
+    s.launch_missile(projectile(6), 1, 5, 50_000.0, |_, _| {});
+    s.tick(1_000); s.tick(2_000);
+    let (picked, token) = s.reserve_defender_target(1, 10_000.0).expect("one legal bomb");
+    assert_eq!(picked, 2);
+    assert!(s.defender_reservations.contains(&2));
+    let (tx, rx) = channel();
+    s.launch_defender(projectile(9), 2, token, 1, 10_000.0, move |_, hit| tx.send(hit).unwrap());
+    let mut hit = None;
+    for ms in [3_000_i64, 4_000, 5_000, 6_000] {
+        s.tick(ms);
+        if let Ok(done) = rx.try_recv() { hit = Some(done); break; }
+    }
+    assert_eq!(hit.expect("Defender terminal ran").expect("contact reports the target").target, 2);
+    assert!(bomb_rx.try_recv().unwrap().is_none(), "contact cancels, never detonates");
+    assert!(s.ball(2).is_none() && !s.projectile_damageable(2));
+    assert!(s.defender_reservations.is_empty());
+    assert!(!s.actor_combat.contains_key(&2) && !s.actor_combat.contains_key(&9));
+}
+
+#[test]
+fn defender_source_without_session_selects_nothing() {
+    let mut s = live();
+    s.insert(ball(1, Some(1), 0.0));
+    let _hostile = online(&s, 7, HOSTILE_CORP);
+    s.launch_bomb(bomb_at(2, 7, [-4_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    s.tick(1_000); s.tick(2_000);
+    assert!(s.reserve_defender_target(1, 10_000.0).is_none() && s.defender_reservations.is_empty());
+}
+
+#[test]
+fn defender_expiry_releases_reservation_and_bomb_keeps_flying() {
+    let mut s = live();
+    s.insert(ball(1, Some(1), 0.0));
+    let _source = online(&s, 1, SOURCE_CORP);
+    let _hostile = online(&s, 7, HOSTILE_CORP);
+    let mut slow = bomb_at(2, 7, [-4_000.0, 0.0, 0.0]);
+    slow.max_vel = 500.0;
+    s.launch_bomb(slow, [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    s.tick(1_000); s.tick(2_000);
+    let (picked, token) = s.reserve_defender_target(1, 10_000.0).unwrap();
+    assert_eq!(picked, 2);
+    let (tx, rx) = channel();
+    s.launch_defender(projectile(9), 2, token, 1, 400.0, move |_, hit| tx.send(hit).unwrap());
+    s.tick(3_000); s.tick(4_000); s.tick(5_000);
+    assert!(rx.try_recv().unwrap().is_none());
+    assert!(s.defender_reservations.is_empty() && s.ball(2).is_some() && s.ball(9).is_none());
+}
+
+#[test]
+fn defender_lethal_damage_releases_reservation() {
+    let mut s = live();
+    s.insert(ball(1, Some(1), 0.0));
+    let _source = online(&s, 1, SOURCE_CORP);
+    let _hostile = online(&s, 7, HOSTILE_CORP);
+    s.launch_bomb(bomb_at(2, 7, [-4_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    s.tick(1_000); s.tick(2_000);
+    let (picked, token) = s.reserve_defender_target(1, 10_000.0).unwrap();
+    assert_eq!(picked, 2);
+    let (tx, rx) = channel();
+    s.launch_defender(projectile(9), 2, token, 1, 10_000.0, move |_, hit| tx.send(hit).unwrap());
+    assert!(s.apply_projectile_damage(9, [0.0, 0.0, 100.0, 0.0]).unwrap().destroyed);
+    assert!(rx.try_recv().unwrap().is_none());
+    s.tick(3_000);
+    assert!(s.defender_reservations.is_empty() && s.ball(2).is_some() && !s.actor_combat.contains_key(&9));
+}
+
+#[test]
+fn defender_target_departure_releases_reservation() {
+    let mut s = live();
+    s.insert(ball(1, Some(1), 0.0));
+    let _source = online(&s, 1, SOURCE_CORP);
+    let _hostile = online(&s, 7, HOSTILE_CORP);
+    s.launch_bomb(bomb_at(2, 7, [-4_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    s.tick(1_000); s.tick(2_000);
+    let (picked, _) = s.reserve_defender_target(1, 10_000.0).unwrap();
+    assert_eq!(picked, 2);
+    s.take(2);
+    assert!(s.defender_reservations.is_empty());
+}
+
+#[test]
+fn defender_stale_token_cannot_end_replacement() {
+    let mut s = live();
+    s.insert(ball(1, Some(1), 0.0));
+    let _source = online(&s, 1, SOURCE_CORP);
+    let _hostile = online(&s, 7, HOSTILE_CORP);
+    s.launch_bomb(bomb_at(2, 7, [-4_000.0, 0.0, 0.0]), [1.0, 0.0, 0.0], 60_000, 500.0, |_, _| {});
+    s.tick(1_000); s.tick(2_000);
+    let (picked, token) = s.reserve_defender_target(1, 10_000.0).unwrap();
+    assert_eq!(picked, 2);
+    s.take(2);
+    s.insert(ball(2, None, 5.0));
+    s.defender_reservations.insert(2);
+    let (tx, rx) = channel();
+    s.launch_defender(projectile(9), 2, token, 1, 10_000.0, move |_, hit| tx.send(hit).unwrap());
+    s.tick(3_000); s.tick(4_000);
+    assert!(rx.try_recv().unwrap().is_none());
+    assert!(s.ball(2).is_some() && s.defender_reservations.is_empty());
 }

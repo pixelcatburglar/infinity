@@ -138,7 +138,7 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
                     // shield recharge from the exact before/after actor comparison.
                     let max_shield = s.combat_condition_snapshot(old).unwrap().condition.stats.max[0];
                     assert!(crate::services::combat::damage::repair_target_in_system(
-                        s, old, 0, max_shield, crate::space::combat::RepairSource::Local).unwrap());
+                        s, old, 0, max_shield, None, crate::space::combat::RepairSource::Local).unwrap());
                     let condition = s.combat_condition_snapshot(old).unwrap().condition;
                     assert_eq!(condition.now[0], condition.stats.max[0]);
                     crate::space::snapshot::capture_fact_checkpoint(s).unwrap().unwrap()

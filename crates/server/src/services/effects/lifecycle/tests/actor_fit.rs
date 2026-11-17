@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::fit::Fit;
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn cycle_source_gate_consumes_deadline_and_binds_membership() {

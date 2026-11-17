@@ -6,7 +6,7 @@
 //! quantities stay exact (see `cap_client_quantity`).
 use crate::services::{db_err, item_descriptor, keyval, CallError};
 use crate::services::{combat, fit, skills};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_from_unix_ms, filetime_now, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::services::items::load_items;
 use crate::dao::items::dogma as dogma_dao;
@@ -100,6 +100,25 @@ pub(super) fn active_effect(item_id: i64, char_id: i64, ship_id: i64, effect_id:
 
 pub(super) fn online_effect(item_id: i64, char_id: i64, ship_id: i64) -> Vec<(Value, Value)> {
     vec![active_effect(item_id, char_id, ship_id, EFFECT_ONLINE)]
+}
+
+/// The same activeEffects tuple for one Running duration-bounded activation,
+/// with the recorded FILETIME start, frozen duration in milliseconds and the
+/// activation's repeat counter. Pending and Cooling records are never listed.
+fn running_effect(item_id: i64, char_id: i64, ship_id: i64, effect: i64, start: i64, duration_ms: f64, repeat: i64) -> (Value, Value) {
+    let env = [
+        Value::Int(item_id),
+        Value::Int(char_id),
+        Value::Int(ship_id),
+        Value::None,
+        Value::None,
+        Value::list([]),
+        Value::Int(effect),
+        Value::Int(filetime_from_unix_ms(start)),
+        Value::Float(duration_ms),
+        Value::Int(repeat),
+    ];
+    (Value::Int(effect), Value::tuple(env))
 }
 
 async fn heat_snapshot(c: &Client, ship: i64, fit: &fit::Fit) -> Vec<crate::services::effects::heat::RackSnapshot> {
@@ -276,6 +295,9 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
             }
         }
         attrs.entry(ATTR_MASS as i64).or_insert(0.0); // mass is always present
+        if let Some((effect, start, duration_ms, repeat)) = crate::services::effects::active_cycle::running_effect(item.item_id) {
+            active.push(running_effect(item.item_id, char_id, ship_id, effect, start, duration_ms, repeat));
+        }
         if item.item_id == ship_id {
             attrs.insert(ATTR_CHARGE as i64, cap);
             attrs.insert(ATTR_SHIELD_CHARGE as i64, shield);

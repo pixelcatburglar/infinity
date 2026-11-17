@@ -13,7 +13,7 @@ fn fit() -> Fit {
 fn module(fit: &mut Fit, id: i64, online: bool, overrides: Vec<(i32, f64)>) {
     fit.nodes.insert(Key::Module(id), Node {
         type_id: 1, data_position: fit.sde.types.position(1), location: Location::Ship,
-        online, active: false, overloaded: false, projected_effect: None, receiver: None,
+        online, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
         charge_type: None, level: None, overrides, cargo_unlimited: false, charge_values: vec![],
     });
 }
@@ -34,7 +34,7 @@ pub(crate) fn module_fit(sde: std::sync::Arc<crate::sde::Sde>, hull: i32, module
     let mut fit = Fit::for_space_type(sde, hull, vec![]);
     fit.nodes.insert(Key::Module(2), Node {
         type_id: module_type, data_position: fit.sde.types.position(module_type), location: Location::Ship,
-        online, active: false, overloaded: false, projected_effect: None, receiver: None,
+        online, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
         charge_type: None, level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![],
     });
     fit
@@ -148,13 +148,13 @@ fn current_projection_and_charge_topology_are_independent() {
     module(&mut final_fit, 3, true, vec![]);
     let mut charge = Node {
         type_id: 1, data_position: current.sde.types.position(1), location: Location::Ship,
-        online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
+        online: true, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
         charge_type: None, level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![],
     };
     current.nodes.insert(Key::Charge(2), charge);
     charge = Node {
         type_id: 1, data_position: current.sde.types.position(1), location: Location::Space,
-        online: true, active: true, overloaded: false, projected_effect: None, receiver: Some(Key::Ship),
+        online: true, active: true, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: Some(Key::Ship),
         charge_type: None, level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![],
     };
     current.nodes.insert(Key::Projected(9), charge);
@@ -169,7 +169,7 @@ fn current_projection_and_charge_topology_are_independent() {
 fn charge_incarnations_and_drone_nodes_track_committed_patches() {
     let node = |location| Node {
         type_id: 9, data_position: None, location, online: true, active: false,
-        overloaded: false, projected_effect: None, receiver: None, charge_type: None,
+        overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None, charge_type: None,
         level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![],
     };
     // A cold charge insertion through the committed patch receives a fresh

@@ -303,7 +303,7 @@ async fn projection_changes_capital(db: &Db, sde: &Arc<Sde>, ids: Ids, ty: i32, 
         }
         if attributes.is_empty() { continue; }
         let projection = Projection { source_ship: ids.ships[0], source_module: ids.assistance, source_type: ty,
-            effect_id: entry.effect_id, kind: effect.kind, until_ms: i64::MAX, values, charge_values: Vec::new(), charge_type: None, scramble: None };
+            effect_id: entry.effect_id, kind: effect.kind, until_ms: i64::MAX, values, charge_values: Vec::new(), charge_type: None, resistance_attribute: None, scramble: None };
         let projected = Fit::load_projected(db, sde.clone(), ids.characters[2], ids.ships[2], vec![projection]).await.expect("evaluate capital projection");
         if attributes.iter().any(|&attr| {
             let before = target.value(Key::Ship, attr);

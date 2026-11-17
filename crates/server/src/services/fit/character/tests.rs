@@ -59,7 +59,7 @@ fn replacement_half_open_expiry_and_late_publish_semantics() {
 fn owner_inputs_replace_ship_domain_and_preserve_drone_domain() {
     let node = |location| Node {
         type_id: 9, data_position: None, location, online: true, active: false,
-        overloaded: false, projected_effect: None, receiver: None, charge_type: None,
+        overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None, charge_type: None,
         level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![],
     };
     // A type-only snapshot owns no ship item and produces no package.

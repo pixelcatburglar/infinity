@@ -5,7 +5,9 @@ use super::*;
 use crate::services::effects::fx::weapon_fx;
 use crate::services::effects::{capacitor, ecm, entosis, fuel, heat};
 use crate::services::effects::behaviors::on_cycle_start;
+use crate::client::filetime_now;
 use crate::services::combat::groups_health::drain_capacitor;
+use crate::services::combat::targeting_charges::charge_key;
 use crate::space::system::presentation::FxRetention;
 pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     let cx = cycle.cx.clone();
@@ -87,6 +89,22 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             }
             return Err("fuel unavailable");
         }
+        if cycle.effect.kind == EffectKind::SuperWeapon {
+            cycle.target = None;
+        }
+        // The energizer's one activation write burns the module to its captured
+        // effective hit points through the shared heat-damage authority, after
+        // the capacitor precharge and before the Running record is accepted. A
+        // refused write refunds the precharge and emits no start or cooldown.
+        if cycle.cycles == 0 && cycle.effect.id == i64::from(infinity_core::consts::dogma::EFFECT_EMERGENCY_HULL_ENERGIZER) {
+            if let Err(error) = super::super::active_cycle::burn(&cx, &cycle).await {
+                report_cycle_error(&cx, master, "start", error);
+                if let Err(refund) = refund_refused_charge(&cx, need).await {
+                    warn!("module {master} capacitor refund failed: {}", match refund { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
+                }
+                return Err("energizer burn refused");
+            }
+        }
         let start_result = if let Some(proof) = entosis_proof {
             if let Some(start) = entosis::begin(&cx, proof, cycle.duration_ms).await {
                 cycle.nominal_start = start;
@@ -116,12 +134,20 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
         }
         Ok(())
     }.await;
-    let (result, cycle) = if result.is_ok() {
+    let (result, cycle, deadline) = if result.is_ok() {
         // The heat connection runs inside one actor turn on the captured
-        // packet, then the cycle returns and the original order continues.
-        // Members whose shot actually fired publish their ramp readout in the
-        // same turn — only `spool_applied` carriers reach it.
+        // packet, then the cycle returns and the original order continues. A
+        // duration-bounded consumer accepts its Pending record in the same
+        // turn; a stale admission returns for the ordinary stop. Members whose
+        // shot actually fired publish their ramp readout in the same turn.
+        // Only `spool_applied` carriers reach it.
         match cx.world.with(cx.system_id, move |s| {
+            let deadline = if super::super::active_cycle::consumer(cycle.effect.id) {
+                match super::super::active_cycle::accept(s, &mut cycle) {
+                    Some(deadline) => Some(deadline),
+                    None => return (None, cycle),
+                }
+            } else { None };
             for module in &cycle.modules {
                 s.fitted_module_active(cycle.cx.ship_id, module.id, true);
             }
@@ -135,9 +161,9 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
                 let max_at = parameters.maximum_at(nominal, state.current(parameters), cycle.duration_ms);
                 s.spool_readout_publish(cycle.cx.ship_id, member.module, &cycle.stop, applied, max_at, cycle.cx.char_id);
             }
-            (heat::connect_cycle(s, &cycle), cycle)
+            (Some((heat::connect_cycle(s, &cycle), deadline)), cycle)
         }).await {
-            Some((Ok(()), returned)) => {
+            Some((Some((Ok(()), deadline)), returned)) => {
                 let mut result = Ok(());
                 if returned.effect.kind == EffectKind::Entosis && returned.cycles == 0
                     && !entosis::publish_start(&cx, &returned).await {
@@ -147,22 +173,31 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
                     let retention = if matches!(returned.effect.kind, EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm) { FxRetention::Current } else { FxRetention::Transient };
                     weapon_fx(&cx, &returned.modules, &returned.effect, returned.target, returned.charge_type, true, returned.duration_ms, returned.repeat, master, &returned.stop, retention, Value::None);
                 }
-                (result, Some(returned))
+                (result, Some(returned), deadline)
             }
-            Some((Err(error), returned)) => {
+            Some((Some((Err(error), _)), returned)) => {
                 warn!("module {master} heat connection failed: {}", match error { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
-                (Err("heat connection failed"), Some(returned))
+                (Err("heat connection failed"), Some(returned), None)
             }
-            None => (Err("system unavailable"), None),
+            Some((None, returned)) => (Err("activation stale"), Some(returned), None),
+            None => (Err("system unavailable"), None, None),
         }
-    } else { (result, Some(cycle)) };
+    } else { (result, Some(cycle), None) };
     match (result, cycle) {
         (Ok(()), Some(mut cycle)) => {
             cycle.cycles += 1;
-            let (start, duration) = (cycle.nominal_start, cycle.duration_ms);
-            cx.world.post(cx.system_id, move |s| {
-                schedule_cycle_end(s, start, duration, move |s, end| cycle_end(s, cycle, end));
-            });
+            if let Some(deadline) = deadline {
+                // The consumer's nominal end is the one terminal owner; it
+                // never re-enters the repeating cycle boundary.
+                cx.world.post(cx.system_id, move |s| {
+                    s.schedule_at(deadline, move |s| super::super::active_cycle::finish_current(s, cycle));
+                });
+            } else {
+                let (start, duration) = (cycle.nominal_start, cycle.duration_ms);
+                cx.world.post(cx.system_id, move |s| {
+                    schedule_cycle_end(s, start, duration, move |s, end| super::end::cycle_end(s, cycle, end));
+                });
+            }
         }
         (Err(reason), Some(cycle)) => {
             debug!("module {master} stopped: {reason}");
@@ -171,7 +206,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
                     if let Some(outcome) = public { publish_cycle(&cycle, outcome); }
                     else if check_target && cycle_target_lost(s, &cycle) { publish_cycle(&cycle, ModuleCycleOutcome::TargetLost); }
                 }
-                cycle_stop(s, cycle);
+                super::end::cycle_stop(s, cycle);
             });
         }
         (Err(reason), None) => {

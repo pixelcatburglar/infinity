@@ -73,7 +73,7 @@ pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, C
         let weapon = module.type_id;
         let context = cx.clone();
         cx.world.with(cx.system_id, move |s| {
-            s.launch_bomb(bomb, direction, delay_ms, move |s, center| {
+            s.launch_bomb(bomb, direction, delay_ms, radius, move |s, center| {
                 let Some(center) = center else { attempt.finish_in_actor(s); return };
                 let victims = aoe::victims(s, id, center, radius);
                 s.defer(async move {

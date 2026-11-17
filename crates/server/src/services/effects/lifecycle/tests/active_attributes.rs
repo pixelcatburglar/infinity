@@ -2,7 +2,7 @@
 //! changed effective attributes to the pilot on `OnModuleAttributeChanges`.
 use super::*;
 use crate::client::Client;
-use crate::services::{Call, combat::{self, targeting_charges::loaded}, effects::tests::fixture, slash, tests::fixture::{cleanup_ship, create_ship, ShipItemSpec, ShipLocation}};
+use crate::services::{Call, combat::{self, targeting_charges::loaded}, effects::tests::fixture, identity::Identity, slash, tests::fixture::{cleanup_ship, create_ship, ShipItemSpec, ShipLocation}};
 use crate::dao::items::{combat as item_combat, dogma as item_dogma};
 use infinity_core::consts::{FLAG_CARGO, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST, GM_ROLES,
     dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CPU_OUTPUT, ATTR_FALLOFF, ATTR_MAX_RANGE, ATTR_POWER_OUTPUT, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION, ATTR_SHIELD_CAPACITY, ATTR_TURRET_SLOTS_LEFT,
@@ -14,10 +14,6 @@ const FX_TC: i32 = 4559; const FX_HARDENER: i32 = 5230; const MAX_GROUP: i32 = 7
 const RESONANCES: [i32; 4] = [ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE];
 const TURRET_ATTRS: [i32; 3] = [ATTR_MAX_RANGE, ATTR_FALLOFF, ATTR_TRACKING_SPEED];
 
-async fn call(client: &mut Client, method: &str, args: &[Value]) -> CallResult {
-    let kwargs = Value::Dict(vec![]);
-    crate::services::dogma::dispatch(client, &Call { service: "dogmaIM", method, args, kwargs: &kwargs, bound: false, bind_params: None }).await
-}
 /// `(item, attribute, old, new)` rows this event window published to `owner`.
 fn macs(ev: &[(String, Vec<Value>)], owner: i64) -> Vec<(i64, i64, f64, f64)> {
     ev.iter().filter(|(n, _)| n == "OnModuleAttributeChanges").flat_map(|(_, a)| a.first().and_then(Value::items).unwrap_or(&[]).iter()
@@ -35,18 +31,6 @@ fn turret_fx(sde: &Sde, t: i32) -> String {
     let id = sde.types.get(t).expect("turret type").effects().iter().map(|e| e.effect_id)
         .find(|&id| registry::resolve(sde, id).is_some_and(|r| r.kind == EffectKind::Turret)).expect("turret effect");
     sde.dogma.effect(id).and_then(|e| e.name.clone()).expect("effect name")
-}
-/// Toggle a module online/offline through the real online path.
-async fn module_online(client: &Client, ship: i64, m: i64, on: bool) -> CallResult {
-    crate::services::effects::online::set_online(&Identity::of_client(client), &client.db, &client.world, &client.sde, client.notify_tx.clone(), client.login.user_id, ship, m, on,
-        |n| crate::services::effects::online::dispatch_notification(n, &client.world, &client.notify_tx, client.session.int("charid"))).await
-}
-/// Effective attribute of one fitted item through the public `ShipGetInfo` path.
-async fn fitted_attr(client: &mut Client, item: i64, attr: i32) -> f64 {
-    let Value::Dict(entries) = call(client, "ShipGetInfo", &[]).await.unwrap_or_else(|e| panic!("ShipGetInfo CallError: {e:?}")) else { panic!("ship info") };
-    let Some((_, Value::Instance(_, fields))) = entries.iter().find(|(k, _)| k.as_int() == Some(item)) else { panic!("item info") };
-    let Some(Value::Dict(attrs)) = fields.get("attributes") else { panic!("attributes") };
-    attrs.iter().find_map(|(k, v)| (k.as_int() == Some(i64::from(attr))).then(|| v.as_float()).flatten()).expect("attribute")
 }
 
 #[tokio::test]
@@ -105,13 +89,13 @@ async fn active_transitions_publish_effective_attribute_rows() {
                     || crate::space::dist(pos, other.position_at(s.now_ms())) > f64::from(b.radius) + f64::from(other.radius))
             })
         }).await.expect("fixture geometry"), "fixture positions must match DB and not overlap");
-        call(&mut client, "AddTarget", &[Value::Int(target)]).await.ok().expect("target request");
+        fixture::dogma_call(&mut client, "AddTarget", &[Value::Int(target)]).await.ok().expect("target request");
         tokio::time::timeout(std::time::Duration::from_secs(60), async { while !combat::targeting_charges::targets_of(f.character).contains(&target) { assert!(world.after(system, 200).await); } }).await.expect("target lock");
-        module_online(&client, f.ship, hardener, false).await.ok().expect("offline hardener");
-        module_online(&client, f.ship, hardener, true).await.ok().expect("online hardener");
+        fixture::module_online(&client, f.ship, hardener, false).await.ok().expect("offline hardener");
+        fixture::module_online(&client, f.ship, hardener, true).await.ok().expect("online hardener");
         assert!(world.after(system, 300).await);
         let _ = drain(&mut rx);
-        call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("activate TC");
+        fixture::dogma_call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("activate TC");
         assert!(world.after(system, 300).await);
         let on = drain(&mut rx); let on_rows = rows(&on);
         let baseline = |g: i64, a: i32| on_rows.iter().find(|r| r.0 == g && r.1 == i64::from(a)).expect("missing TC start row").2;
@@ -119,10 +103,10 @@ async fn active_transitions_publish_effective_attribute_rows() {
             let hits: Vec<_> = on_rows.iter().filter(|r| r.0 == *g && r.1 == i64::from(a)).collect();
             assert!(hits.len() == 1 && hits[0].3 > hits[0].2, "TC start row for gun {g} attr {a}: {hits:?}"); } }
         assert!(ordered(&on, module_id, i64::from(FX_TC), 1), "start GSF must precede the delta");
-        call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("repeat activate");
+        fixture::dogma_call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("repeat activate");
         assert!(world.after(system, 200).await);
         assert!(rows(&drain(&mut rx)).is_empty(), "same-state activate republished rows");
-        call(&mut client, "Activate", &act(guns[0], &turret_fx(&sde, GUN), Value::Int(target))).await.ok().expect("activate bank");
+        fixture::dogma_call(&mut client, "Activate", &act(guns[0], &turret_fx(&sde, GUN), Value::Int(target))).await.ok().expect("activate bank");
         let mut cycling: Vec<(String, Vec<Value>)> = Vec::new();
         // Each member still consumes one charge per volley; those quantity rows
         // bound the round inside which one grouped volley publishes one report.
@@ -143,27 +127,27 @@ async fn active_transitions_publish_effective_attribute_rows() {
             || !a.first().is_some_and(|p| p.get("target") == Some(&Value::Int(target)))
             || a[0].get("isBanked") == Some(&Value::Bool(true))), "banked volley reported unbanked");
         assert!(!rows(&cycling).iter().any(|r| guns.contains(&r.0) && TURRET_ATTRS.contains(&(r.1 as i32))), "repeat cycles republished attributes");
-        call(&mut client, "Deactivate", &dec(module_id, &fx_name(FX_TC))).await.ok().expect("deactivate TC");
+        fixture::dogma_call(&mut client, "Deactivate", &dec(module_id, &fx_name(FX_TC))).await.ok().expect("deactivate TC");
         retired(module_id).await.expect("TC retired");
         let off = drain(&mut rx); let off_rows = rows(&off);
         for g in &guns { for a in TURRET_ATTRS {
             let hits: Vec<_> = off_rows.iter().filter(|r| r.0 == *g && r.1 == i64::from(a)).collect();
             assert!(hits.len() == 1 && hits[0].3 < hits[0].2, "TC stop row for gun {g} attr {a}: {hits:?}"); } }
         assert!(ordered(&off, module_id, i64::from(FX_TC), 0), "stop GSF must precede the delta");
-        assert_eq!(fitted_attr(&mut client, guns[0], ATTR_TRACKING_SPEED).await, baseline(guns[0], ATTR_TRACKING_SPEED), "stopped ShipGetInfo baseline");
+        assert_eq!(fixture::fitted_attr(&mut client, guns[0], ATTR_TRACKING_SPEED).await, baseline(guns[0], ATTR_TRACKING_SPEED), "stopped ShipGetInfo baseline");
         // The 29001 script zeroes range and falloff: only tracking changes.
         combat::targeting_charges::load_ammo_core(&mut client, f.ship, vec![module_id], vec![script], Some(f.ship)).await.ok().expect("load script");
         tokio::time::timeout(std::time::Duration::from_secs(60), async { while loaded(&db, f.ship, FLAG_MED_SLOT_FIRST).await.ok().flatten() != Some((SCRIPT, 1)) { assert!(world.after(system, 200).await); } }).await.expect("script loaded");
-        call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("activate scripted TC");
+        fixture::dogma_call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("activate scripted TC");
         assert!(world.after(system, 300).await);
         let sc_rows = rows(&drain(&mut rx));
         for g in &guns {
             let hits: Vec<_> = sc_rows.iter().filter(|r| r.0 == *g && r.1 == i64::from(ATTR_TRACKING_SPEED)).collect();
             assert_eq!(hits.len(), 1); assert!(hits[0].3 > hits[0].2, "scripted TC did not raise tracking on {g}");
             for a in [ATTR_MAX_RANGE, ATTR_FALLOFF] { assert!(!sc_rows.iter().any(|r| r.0 == *g && r.1 == i64::from(a)), "scripted TC still moved {a}"); } }
-        assert_eq!(fitted_attr(&mut client, guns[0], ATTR_TRACKING_SPEED).await, sc_rows.iter().find(|r| r.0 == guns[0] && r.1 == i64::from(ATTR_TRACKING_SPEED)).unwrap().3, "ShipGetInfo prime disagrees");
+        assert_eq!(fixture::fitted_attr(&mut client, guns[0], ATTR_TRACKING_SPEED).await, sc_rows.iter().find(|r| r.0 == guns[0] && r.1 == i64::from(ATTR_TRACKING_SPEED)).unwrap().3, "ShipGetInfo prime disagrees");
         // The 5230 hardener moves the ship's four shield resonances.
-        call(&mut client, "Activate", &act(hardener, &fx_name(FX_HARDENER), Value::None)).await.ok().expect("activate hardener");
+        fixture::dogma_call(&mut client, "Activate", &act(hardener, &fx_name(FX_HARDENER), Value::None)).await.ok().expect("activate hardener");
         assert!(world.after(system, 300).await);
         let hd_rows = rows(&drain(&mut rx));
         for a in RESONANCES { let hits: Vec<_> = hd_rows.iter().filter(|r| r.0 == f.ship && r.1 == i64::from(a)).collect();
@@ -175,7 +159,7 @@ async fn active_transitions_publish_effective_attribute_rows() {
         assert!(world.after(system, 200).await);
         assert_eq!(rows(&drain(&mut rx)).iter().filter(|r| r.0 == f.ship && r.1 == i64::from(ATTR_SCAN_RESOLUTION)).count(), 1, "scanResolution positive control");
         // Real dock and undock resurrect no activation; a fresh one publishes again.
-        for (m, n) in [(module_id, fx_name(FX_TC)), (hardener, fx_name(FX_HARDENER)), (guns[0], turret_fx(&sde, GUN))] { call(&mut client, "Deactivate", &dec(m, &n)).await.ok().expect("deactivate"); }
+        for (m, n) in [(module_id, fx_name(FX_TC)), (hardener, fx_name(FX_HARDENER)), (guns[0], turret_fx(&sde, GUN))] { fixture::dogma_call(&mut client, "Deactivate", &dec(m, &n)).await.ok().expect("deactivate"); }
         tokio::time::timeout(std::time::Duration::from_secs(60), async { while !state().active.is_empty() { assert!(world.after(system, 200).await); } }).await.expect("retirements");
         let end_rows = rows(&drain(&mut rx));
         for a in RESONANCES { let hits: Vec<_> = end_rows.iter().filter(|r| r.0 == f.ship && r.1 == i64::from(a)).collect();
@@ -192,8 +176,8 @@ async fn active_transitions_publish_effective_attribute_rows() {
         let undocked = crate::services::ship::ship::undock(&docked, &db, &world, &client.sde, None, None).await.expect("undock");
         client.change_session(undocked.change.updates); drop(undocked.economy);
         let _ = drain(&mut rx);
-        assert_eq!(fitted_attr(&mut client, guns[0], ATTR_TRACKING_SPEED).await, baseline(guns[0], ATTR_TRACKING_SPEED), "undock resurrected the bonus");
-        call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("reactivate TC");
+        assert_eq!(fixture::fitted_attr(&mut client, guns[0], ATTR_TRACKING_SPEED).await, baseline(guns[0], ATTR_TRACKING_SPEED), "undock resurrected the bonus");
+        fixture::dogma_call(&mut client, "Activate", &act(module_id, &fx_name(FX_TC), Value::None)).await.ok().expect("reactivate TC");
         assert!(world.after(system, 300).await);
         let re_rows = rows(&drain(&mut rx));
         let hits: Vec<_> = re_rows.iter().filter(|r| r.0 == guns[0] && r.1 == i64::from(ATTR_TRACKING_SPEED)).collect();
