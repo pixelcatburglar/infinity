@@ -57,3 +57,33 @@ async fn personal_escrow_departure_and_docked_arrival_notify_once() {
     assert_eq!(fixture::remaining(&db, pilot).await.unwrap(), 0);
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires a dedicated test database with SDE"]
+async fn inactive_retained_office_denies_source_and_returns_to_station_deliveries() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let actor = fixture::create(&db).await.unwrap();
+    let sde = Sde::load(&db).await.unwrap();
+    let station = sde.map.stations().next().unwrap().station_id;
+    let corp = fixture::create_corporation(&db, actor.character, station).await.unwrap();
+    fixture::assign_corporation(&db, actor.character, corp, infinity_core::consts::ROLE_DIRECTOR).await.unwrap();
+    let office = transfers::insert(&db, infinity_core::consts::TYPE_OFFICE, corp, station, 0, 1).await.unwrap();
+    crate::dao::offices::insert(&db, office, corp, station, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
+    let contract = Contract {
+        id: 0, kind: 0, issuer: actor.character, issuer_corp: corp, for_corp: true,
+        issuer_wallet_key: 0, acceptor_wallet_key: 0, issuer_hangar_flag: FLAG_CORP_SAG1,
+        issuer_source_location: office, assignee: 0, acceptor: 0, start: station, end: 0,
+        price: 0.0, reward: 0.0, collateral: 0.0, paid_deposit: 0.0, auction_tax_rate: 0.0,
+        auction_tax_maximum: 0.0, title: String::new(), description: String::new(), volume: 0.0,
+        num_days: 0, status: 0, issued: 0, expires: 0, accepted: 0, completed: 0, package: None,
+    };
+    assert_eq!(issuer_return(&db, &contract).await.unwrap().location, office);
+    db.execute("UPDATE game.offices SET lease_state=1 WHERE office_id=$1", &[&office]).await.unwrap();
+    assert!(issuer_source(&db, actor.character, corp, true, station, FLAG_CORP_SAG1).await.is_err());
+    let destination = issuer_return(&db, &contract).await.unwrap();
+    assert_eq!((destination.owner, destination.location, destination.flag), (corp, station, FLAG_CORP_DELIVERIES));
+    assert!(crate::dao::offices::identity(&db, corp, station).await.unwrap().is_some());
+    fixture::cleanup_corporation(&db, corp, &[actor.character], office).await.unwrap();
+    fixture::cleanup(&db, actor).await.unwrap();
+}

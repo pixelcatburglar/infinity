@@ -14,6 +14,7 @@ pub(crate) mod crimewatch;
 pub(crate) mod lookup;
 pub(crate) mod members;
 pub(crate) mod newbie;
+pub(crate) mod npc_control;
 pub(crate) mod persistence;
 pub(crate) mod roles;
 pub(crate) mod routing;

@@ -1,14 +1,22 @@
-//! Real PostgreSQL regressions for destination-parent locks.
+//! Captured-metadata comparison rules and real PostgreSQL regressions for destination-parent locks.
+#[cfg(feature = "tests-storage")]
 use super::*;
-use crate::{dao::items::{inventory, quantities::{self, QuantityChange}, transfers}, db::Db};
+#[cfg(any(feature = "tests-storage", feature = "tests-lua", feature = "tests-combat", feature = "tests-economy", feature = "tests-effects", feature = "tests-inventory", feature = "tests-content", feature = "tests-ships"))]
+use crate::db::Db;
+#[cfg(feature = "tests-storage")]
+use crate::dao::items::{inventory, quantities::{self, QuantityChange}, transfers};
+#[cfg(feature = "tests-storage")]
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+#[cfg(feature = "tests-storage")]
 use tokio::sync::{Barrier, oneshot};
 
+#[cfg(any(feature = "tests-storage", feature = "tests-lua", feature = "tests-combat", feature = "tests-economy", feature = "tests-effects", feature = "tests-inventory", feature = "tests-ships", feature = "tests-content"))]
 /// Return the holder backend so an internally opened service transaction can be observed.
-pub(crate) async fn backend_pid(tx: &tokio_postgres::Transaction<'_>) -> i32 {
+pub(crate) async fn backend_pid(tx: &(impl crate::db::executor::Executor + ?Sized)) -> i32 {
     tx.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid")
 }
 
+#[cfg(any(feature = "tests-storage", feature = "tests-lua", feature = "tests-combat", feature = "tests-economy", feature = "tests-effects", feature = "tests-inventory", feature = "tests-content", feature = "tests-ships"))]
 /// Wait until PostgreSQL reports a backend blocked by this fixture's holder.
 pub(crate) async fn wait_blocked(db: &Db, blocker_pid: i32) -> i32 {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -25,6 +33,82 @@ pub(crate) async fn wait_blocked(db: &Db, blocker_pid: i32) -> i32 {
     }).await.expect("backend did not block on the fixture transaction")
 }
 
+#[cfg(feature = "tests-ships")]
+use std::future::Future;
+#[cfg(feature = "tests-ships")]
+/// Hold only the character row, then require each existing item to remain
+/// available while the real service waits on that character lock.
+pub(crate) async fn character_before_items<F: Future>(
+    db: &Db, character: i64, items: &[i64], service: F,
+) -> F::Output {
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let config = crate::config::tests::test_database().to_pg_config().unwrap();
+    let (mut holder, holder_connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    let holder_driver = tokio::spawn(async move { holder_connection.await });
+    let (mut observer, observer_connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    let observer_driver = tokio::spawn(async move { observer_connection.await });
+    let hold = holder.transaction().await.unwrap();
+    crate::dao::characters::selection::lock_character(&hold, character).await.unwrap();
+    let holder_pid = backend_pid(&hold).await;
+    let mut probe = observer.transaction().await.unwrap();
+    let mut output = None;
+    let mut waiter = 0;
+    let mut query = String::new();
+    let mut locked = Vec::new();
+    let mut blocked = std::pin::pin!(wait_blocked(db, holder_pid));
+    let (caught, service_end, observer_rolled, holder_rolled) = {
+        let mut service_end = None;
+        let mut service = std::pin::pin!(crate::tests::catch_scenario(async {
+            output = Some(service.await);
+        }));
+        let caught = crate::tests::catch_scenario(async {
+            while waiter == 0 && service_end.is_none() {
+                tokio::select! { biased;
+                    pid = &mut blocked => waiter = pid,
+                    end = &mut service => service_end = Some(end),
+                }
+            }
+            query = db.query_opt("SELECT query FROM pg_stat_activity WHERE pid = $1", &[&waiter]).await.unwrap()
+                .map(|row| row.get("query")).unwrap_or_default();
+            for item in items {
+                let point = probe.transaction().await.expect("item probe savepoint");
+                let result = point.query_opt("SELECT item_id FROM game.items WHERE item_id=$1 FOR UPDATE NOWAIT", &[item]).await;
+                let state = match &result {
+                    Ok(Some(_)) => "row", Ok(None) => "missing",
+                    Err(error) => error.code().map(|code| code.code()).unwrap_or("none"),
+                };
+                locked.push((*item, state.to_owned()));
+                point.rollback().await.expect("item probe savepoint rollback");
+            }
+        }).await;
+        let observer_rolled = probe.rollback().await;
+        let holder_rolled = hold.rollback().await;
+        if service_end.is_none() {
+            service_end = Some(match tokio::time::timeout(LIMIT, &mut service).await {
+                Ok(end) => end,
+                Err(_) => Err(Box::new("service did not finish after the character lock was released")),
+            });
+        }
+        (caught, service_end, observer_rolled, holder_rolled)
+    };
+    drop(holder);
+    drop(observer);
+    let holder_done = tokio::time::timeout(LIMIT, holder_driver).await;
+    let observer_done = tokio::time::timeout(LIMIT, observer_driver).await;
+    if let Err(panic) = caught { std::panic::resume_unwind(panic); }
+    if let Some(Err(panic)) = service_end { std::panic::resume_unwind(panic); }
+    observer_rolled.expect("observer rollback");
+    holder_rolled.expect("holder rollback");
+    holder_done.expect("holder driver timeout").expect("holder driver join").expect("holder connection");
+    observer_done.expect("observer driver timeout").expect("observer driver join").expect("observer connection");
+    let character_lock = query.contains("game.characters") && query.contains("FOR UPDATE");
+    assert!(character_lock && locked.len() == items.len() && !locked.is_empty() && locked.iter().all(|(_, state)| state == "row"),
+        "holder={holder_pid} waiter={waiter} query={query:?} probed H={locked:?} SQLSTATE={}",
+        locked.iter().map(|(_, state)| state.as_str()).collect::<Vec<_>>().join(","));
+    output.expect("service completed without a result")
+}
+
+#[cfg(feature = "tests-storage")]
 async fn connection() -> tokio_postgres::Client {
     let cfg = crate::config::tests::test_database();
     let (client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
@@ -32,6 +116,7 @@ async fn connection() -> tokio_postgres::Client {
     client
 }
 
+#[cfg(feature = "tests-storage")]
 async fn fixture(db: &Db) -> (i64, i64) {
     let child = transfers::insert(db, 1, 101, 102, 4, 1).await.unwrap();
     let parent = transfers::insert(db, 1, 101, 102, 4, 1).await.unwrap();
@@ -39,10 +124,12 @@ async fn fixture(db: &Db) -> (i64, i64) {
     (parent, child)
 }
 
+#[cfg(feature = "tests-storage")]
 async fn cleanup(db: &Db, parent: i64) {
     db.execute("DELETE FROM game.items WHERE item_id = $1 OR location_id = $1", &[&parent]).await.unwrap();
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires a dedicated PostgreSQL database"]
 async fn take_first_returns_fresh_parent_and_refuses_stale_insert() {
@@ -81,6 +168,7 @@ async fn take_first_returns_fresh_parent_and_refuses_stale_insert() {
     cleanup(&db, parent).await;
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires a dedicated PostgreSQL database"]
 async fn insert_first_share_compatibility_and_take_includes_child() {
@@ -125,6 +213,7 @@ async fn insert_first_share_compatibility_and_take_includes_child() {
     cleanup(&db, parent).await;
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires a dedicated PostgreSQL database"]
 async fn constructed_deadlock_retries_whole_transaction_once() {
@@ -187,6 +276,7 @@ async fn constructed_deadlock_retries_whole_transaction_once() {
     db.execute("DELETE FROM game.items WHERE item_id = $1", &[&source]).await.unwrap();
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires a dedicated PostgreSQL database"]
 async fn nested_reservation_and_outbox_survive_rollback() {
@@ -219,6 +309,7 @@ async fn nested_reservation_and_outbox_survive_rollback() {
     cleanup(&db, parent).await;
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires a dedicated PostgreSQL database"]
 async fn hull_before_older_source_crossing_commits_without_retry() {
@@ -262,4 +353,23 @@ async fn hull_before_older_source_crossing_commits_without_retry() {
     assert_eq!(first_count.load(Ordering::SeqCst), 1);
     assert_eq!(second_count.load(Ordering::SeqCst), 1);
     cleanup(&db, hull).await;
+}
+
+#[cfg(feature = "tests-storage")]
+#[test]
+fn captured_metadata_preserves_jump_clone_identity() {
+    // An ordinary implant parked in a jump clone: the clone identity compares exactly.
+    let before = Parent {
+        item_id: 1, type_id: 1, owner_id: 2, location_id: 2,
+        flag_id: infinity_core::consts::FLAG_IMPLANT,
+        quantity: 1, singleton: true, jump_clone_id: Some(3),
+    };
+    let mut after = before.clone();
+    assert!(before.same_metadata(&after));
+    after.jump_clone_id = None;
+    assert!(!before.same_metadata(&after));
+    after.jump_clone_id = Some(4);
+    assert!(!before.same_metadata(&after));
+    after.jump_clone_id = before.jump_clone_id;
+    assert!(before.same_metadata(&after));
 }

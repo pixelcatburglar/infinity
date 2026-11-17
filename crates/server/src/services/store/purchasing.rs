@@ -4,7 +4,7 @@
 //! checkout and daily free gifts are not handled here.
 use super::{db_err, TOKEN_LABEL};
 use crate::{dao::store::purchases, db::outbox::Outbox, live_sessions, services::{CallError, plex_vault::{self, VaultAudience, VaultChange, VaultContext, VaultKind}}};
-use tokio_postgres::Transaction;
+use crate::db::Transaction;
 
 
 #[derive(Clone, Copy)]
@@ -61,5 +61,5 @@ pub(super) async fn purchase(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

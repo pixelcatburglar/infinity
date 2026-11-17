@@ -4,15 +4,13 @@ use infinity_core::consts::{CATEGORY_SHIP, dogma::{ATTR_CAPACITOR_CAPACITY, ATTR
 use crate::services::fit::{Fit, Key};
 use std::sync::Arc;
 
-#[path = "../../combat/groups_health/tests/fixture.rs"]
-mod fixture;
+use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipLocation};
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn real_fitted_positive_warp_debits_shared_capacitor() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let before = fixture::fingerprint(&db).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let ship_type = sde.types.iter().find(|ty| {
         if ty.category_id != Some(CATEGORY_SHIP) { return false; }
@@ -36,14 +34,15 @@ async fn real_fitted_positive_warp_debits_shared_capacitor() {
         .expect("published microwarpdrive").type_id;
     let effect_name = sde.dogma.effect(infinity_core::consts::dogma::EFFECT_MICROWARPDRIVE).unwrap().name.clone().unwrap();
     let system = -1;
-    let rows = fixture::create(&db, ship_type, system).await.unwrap();
+    let mut rows = create_ship(&db, ship_type, ShipLocation::Space { system }, &[]).await.unwrap();
     let module = match crate::dao::items::creation::rookie_ship(&db, module_type, rows.character, rows.ship, infinity_core::consts::FLAG_MED_SLOT_FIRST).await {
         Ok(module) => module,
         Err(error) => {
-            fixture::cleanup(&db, rows).await.unwrap();
+            cleanup_ship(&db, None, rows).await.unwrap();
             panic!("module fixture creation failed: {error}");
         }
     };
+    rows.items.push(module);
     let setup = async {
         let updated = crate::dao::items::combat::set_online(&db, module, rows.ship, rows.character,
             infinity_core::consts::FLAG_MED_SLOT_FIRST, module_type, ship_type, system, 0, true, true).await.map_err(|error| error.to_string())?;
@@ -57,7 +56,7 @@ async fn real_fitted_positive_warp_debits_shared_capacitor() {
     }.await;
     if let Err(error) = setup {
         crate::dao::items::inventory::delete(&db, module).await.unwrap();
-        fixture::cleanup(&db, rows).await.unwrap();
+        cleanup_ship(&db, None, rows).await.unwrap();
         panic!("module fixture setup failed: {error}");
     }
     let world = space::World::new(db.clone(), sde.clone(), 1);
@@ -76,13 +75,16 @@ async fn real_fitted_positive_warp_debits_shared_capacitor() {
         let identity = Identity { char_id: rows.character, ship_id: Some(rows.ship), corp_id: 1, station_id: None, system_id: Some(system) };
         crate::services::effects::lifecycle::activate(&identity, &d, &w, w.sde(), Some(system),
             notify, rows.account, module, &effect_name, None, 1, |_| Ok(())).await.unwrap();
+        let ship_charge = move |change: &Value| change.items().is_some_and(|fields|
+            fields.get(1).and_then(Value::as_int) == Some(rows.character)
+                && fields.get(2).and_then(Value::as_int) == Some(rows.ship)
+                && fields.get(3).and_then(Value::as_int) == Some(i64::from(infinity_core::consts::dogma::ATTR_CHARGE)));
+        let has_charge = |args: &[Value]| args.first().and_then(Value::items)
+            .is_some_and(|changes| changes.iter().any(&ship_charge));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let (name, args) = notices.recv().await.expect("pilot notification channel closed");
-                if name == "OnModuleAttributeChanges" && args.first().and_then(Value::items).is_some_and(|changes| changes.iter().any(|change| {
-                    let Some(fields) = change.items() else { return false };
-                    fields.get(3).and_then(Value::as_int) == Some(i64::from(infinity_core::consts::dogma::ATTR_CHARGE))
-                })) { break; }
+                if name == "OnModuleAttributeChanges" && has_charge(&args) { break; }
             }
         }).await.expect("real module capacitor debit");
         let initial = crate::services::combat::groups_health::capacitor_snapshot(&d, &w, system, rows.ship).await.unwrap().unwrap();
@@ -96,15 +98,13 @@ async fn real_fitted_positive_warp_debits_shared_capacitor() {
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let (name, args) = notices.recv().await.expect("pilot notification channel closed");
-                if name == "OnModuleAttributeChanges" { break args; }
+                if name == "OnModuleAttributeChanges" && has_charge(&args) { break args; }
             }
         }).await.expect("warp debit notice");
         let Value::List(changes) = &notice[0] else { panic!("expected attribute change list") };
-        assert!(changes.iter().any(|change| {
-            let Some(fields) = change.items() else { return false };
-            fields.get(3).and_then(Value::as_int) == Some(i64::from(infinity_core::consts::dogma::ATTR_CHARGE))
-                && matches!((fields.get(5), fields.get(6)), (Some(Value::Float(after)), Some(Value::Float(before))) if after < before)
-        }));
+        let fields = changes.iter().find(|change| ship_charge(*change)).and_then(|change| change.items())
+            .expect("ship charge change");
+        assert!(matches!((fields.get(5), fields.get(6)), (Some(Value::Float(after)), Some(Value::Float(before))) if after < before));
         let before_inject = crate::services::combat::groups_health::capacitor_snapshot(&d, &w, system, rows.ship).await.unwrap().unwrap();
         let injected = crate::services::combat::groups_health::inject(&d, &w, system, rows.ship, initial.capacity * 0.1).await.unwrap();
         assert!(injected > 0.0);
@@ -123,9 +123,11 @@ async fn real_fitted_positive_warp_debits_shared_capacitor() {
     crate::services::combat::forget_ship(rows.ship);
     let flush = world.flush_positions().await;
     drop(world);
+    let captured = crate::services::tests::fixture::capture_fixture_rows(&db,
+        &[crate::services::tests::fixture::Fixture { account: rows.account, character: rows.character }], &[rows.ship, module]).await.unwrap();
     crate::dao::items::inventory::delete(&db, module).await.unwrap();
-    fixture::cleanup(&db, rows).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    cleanup_ship(&db, None, rows).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &captured).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

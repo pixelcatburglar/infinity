@@ -196,5 +196,5 @@ pub(super) fn build(bundle: &Bundle, sde: &Sde, messages: BTreeMap<String, Strin
     Ok(Definitions { chip_types, trees, quotes, issuers, messages })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

@@ -6,6 +6,7 @@ use crate::space::{MODE_GOTO, MODE_STOP, MODE_WARP};
 mod navigation;
 mod configuration;
 mod cleaning;
+mod killmarks;
 
 mod fitted_warp;
 mod warp_admission;
@@ -32,6 +33,13 @@ fn ship() -> Ball {
     b
 }
 
+fn missile(id: i64, pos: V3, vel: V3) -> Ball {
+    let mut b = ship();
+    b.id = id; b.pos = pos; b.old_pos = pos; b.vel = vel; b.old_vel = vel;
+    b.mode = MODE_STOP; b.segment_acceleration = None;
+    b
+}
+
 async fn admit_fixture_ship(db: &crate::db::Db, world: &std::sync::Arc<space::World>,
     system: i64, character: i64, hull: i64, piloted: bool) {
     world.system(system).await.unwrap();
@@ -49,6 +57,45 @@ async fn admit_fixture_ship(db: &crate::db::Db, world: &std::sync::Arc<space::Wo
     world.with(system, move |s| prepared.install(s, |s, ball| {
         if piloted { s.add_ship(ball); } else { s.add_persistent_ship(ball); }
     })).await.unwrap();
+}
+
+/// Surface clearance used for shared station-approach placement.
+const APPROACH_CLEARANCE: f64 = 100.0;
+
+/// Stop `ship` at a collision-clear point `clearance` metres of surface gap from
+/// `station`; acknowledged queued placement, then assert the sampled geometry.
+async fn approach_station(world: &std::sync::Arc<space::World>, system: i64, station: i64, ship: i64, clearance: f64) {
+    let clear = |s: &space::System, ship: i64, radius: f64, pos: V3| !s.balls().any(|other| {
+        other.id != ship && other.massive && crate::space::collision::enabled()
+            && other.cloak == 0 && other.mode != space::MODE_MISSILE
+            && space::dist(other.position_at(s.now_ms()), pos) <= f64::from(other.radius) + radius
+    });
+    let point = world.with(system, move |s| {
+        let position = s.ball(station).expect("station ball").position_at(s.now_ms());
+        let radius = f64::from(s.ball(ship).expect("ship ball").radius);
+        let offset = f64::from(s.ball(station).unwrap().radius) + radius + clearance;
+        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]
+            .into_iter().map(|d| [position[0] + d[0] * offset, position[1] + d[1] * offset, position[2] + d[2] * offset])
+            .find(|&point| clear(s, ship, radius, point))
+    }).await.expect("system actor").expect("collision-clear approach direction");
+    let (sent, received) = tokio::sync::oneshot::channel();
+    world.with(system, move |s| s.command(ship, move |ball, _, _| {
+        ball.pos = point;
+        ball.vel = [0.0; 3];
+        ball.stop();
+        let _ = sent.send(());
+        Vec::new()
+    })).await.expect("system actor");
+    received.await.expect("approach action");
+    let (gap, overlapped) = world.with(system, move |s| {
+        let ship = s.ball(ship).expect("ship ball");
+        let station = s.ball(station).expect("station ball");
+        let pos = ship.position_at(s.now_ms());
+        (space::dist(pos, station.position_at(s.now_ms())) - f64::from(ship.radius) - f64::from(station.radius),
+            !clear(s, ship.id, f64::from(ship.radius), pos))
+    }).await.expect("system actor");
+    assert!((if clearance > DOCKING_RANGE { gap > DOCKING_RANGE } else { gap > 0.0 && gap < DOCKING_RANGE })
+        && !overlapped, "sampled surface gap {gap}, overlapped={overlapped}, requested clearance {clearance}");
 }
 
 #[test]
@@ -124,7 +171,7 @@ async fn docking_checks_surface_range_before_accepting() {
     let (stream, address) = listener.accept().await.unwrap();
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
-    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
     client.session.apply(vec![("solarsystemid", Value::Int(system)), ("shipid", Value::Int(123))]);
     let mut vessel = ship();
     vessel.mode = MODE_STOP;
@@ -139,11 +186,22 @@ async fn docking_checks_surface_range_before_accepting() {
     station.pos = [3551.0, 0.0, 0.0];
     station.old_pos = station.pos;
     world.with(system, move |s| { s.insert(vessel); s.insert(station); }).await.unwrap();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+    world.with(system, move |s| {
+        s.insert(missile(10, [20_000.0, 0.0, 0.0], [0.0; 3]));
+        s.insert(missile(9, [0.0; 3], [0.0; 3]));
+        s.launch_missile(missile(11, [20_000.0, 0.0, 0.0], [0.0; 3]), 123, 10, 60_000.0,
+            move |_, hit| { in_tx.send(hit.is_some()).ok(); });
+        s.launch_missile(missile(12, [0.0; 3], [0.0; 3]), 9, 123, 60_000.0,
+            move |_, hit| { out_tx.send(hit.is_some()).ok(); });
+    }).await.unwrap();
     for target in [999, 456] {
         let args = [Value::Int(target)];
         let call = Call { service: "beyonce", method: "CmdDock", args: &args, kwargs: &Value::None, bound: false, bind_params: None };
         assert!(matches!(crate::services::dispatch(&mut client, &call).await, Err(CallError::User { msg, .. }) if msg == messages::MSG_DOCKING_REQUEST_DENIED));
     }
+    assert!(in_rx.try_recv().is_err());
     world.with(system, |s| {
         let mut station = s.ball(456).unwrap().clone();
         station.pos = [3550.0, 0.0, 0.0];
@@ -156,10 +214,13 @@ async fn docking_checks_surface_range_before_accepting() {
     tokio::pin!(docking);
     let frame = tokio::select! {
         _ = &mut docking => panic!("docking finalized before acceptance delay"),
-        frame = tokio::time::timeout(std::time::Duration::from_secs(2), crate::framing::read_frame(&mut peer)) => frame.unwrap().unwrap().unwrap(),
+        frame = tokio::time::timeout(std::time::Duration::from_secs(2), infinity_wire::framing::read_frame(&mut peer)) => frame.unwrap().unwrap().unwrap(),
     };
-    let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
-    assert!(matches!(packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
+    let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
+    assert!(matches!(packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
+    assert!(world.with(system, |s| s.ball(11).is_some()).await.unwrap());
+    assert_eq!(in_rx.try_recv().unwrap(), false);
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(15), out_rx.recv()).await.unwrap(), Some(true));
 }
 
 #[tokio::test]
@@ -192,7 +253,7 @@ async fn completed_jumps_record_only_destination_arrivals() {
         let cfg = Arc::new(crate::config::Config::default());
         let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
         let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(origin))]);
         let market = crate::services::market::lock().await;
         let cold_started = std::time::Instant::now();
@@ -208,8 +269,19 @@ async fn completed_jumps_record_only_destination_arrivals() {
             s.combat_health_scalars(hull).unwrap()
         }).await.unwrap();
         assert_eq!(crate::dao::items::dogma::overrides(&d, hull).await.unwrap().len(), before);
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        w.with(origin, move |s| {
+            s.insert(missile(88, [20_000.0, 0.0, 0.0], [0.0; 3]));
+            s.insert(missile(89, [0.0; 3], [0.0; 3]));
+            s.launch_missile(missile(11, [20_000.0, 0.0, 0.0], [0.0; 3]), hull, 88, 60_000.0,
+                move |_, hit| { in_tx.send(hit.is_some()).ok(); });
+            s.launch_missile(missile(12, [0.0; 3], [0.0; 3]), 89, hull, 60_000.0,
+                move |_, hit| { out_tx.send(hit.is_some()).ok(); });
+        }).await.unwrap();
         let jump = |dest_system| Jump { through: 1, guid: "effects.JumpOut", other_type: None, dest_system, pos: [0.0; 3] };
         assert!(jump_out_and_arrive(&mut client, origin, hull, character, jump(-1)).await.is_err());
+        assert!(in_rx.try_recv().is_err());
         w.system(destination).await.unwrap();
         let mut blocker = ship();
         blocker.id = -77;
@@ -218,6 +290,9 @@ async fn completed_jumps_record_only_destination_arrivals() {
         assert!(matches!(jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await, Err(CallError::User { msg, .. }) if msg == "SystemCheck_JumpFailed_Queued"));
         assert!(map_telemetry::visits(&d, character).await.unwrap().is_empty());
         assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap().is_empty());
+        assert!(w.with(origin, |s| s.ball(11).is_some()).await.unwrap());
+        assert_eq!(in_rx.try_recv().unwrap(), false);
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(15), out_rx.recv()).await.unwrap(), Some(true));
         w.remove_ball(destination, -77).await;
         jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await.unwrap();
         let arrived = w.with(destination, move |s| s.combat_health_scalars(hull).unwrap()).await.unwrap();
@@ -278,8 +353,10 @@ async fn headless_docking_returns_session_and_event() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let system = -1;
-    let station_id = -2;
+    let station_row = sde.map.stations().find(|s| s.solar_system_id.is_some() && s.constellation_id.is_some() && s.region_id.is_some()
+        && sde.map.celestial(s.station_id).is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some()))
+        .expect("dedicated SDE must contain a station with full ancestry");
+    let (station_id, system) = (station_row.station_id, station_row.solar_system_id.unwrap());
     let (account, character, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
         let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,solar_system_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,$2) RETURNING character_id", &[&account, &system]).await?.get("character_id");
@@ -298,17 +375,7 @@ async fn headless_docking_returns_session_and_event() {
             };
         }
         phase!("initial admission", admit_fixture_ship(&d, &w, system, character, hull, true));
-        let mut station = ship();
-        station.id = station_id;
-        station.char_id = None;
-        station.mode = MODE_STOP;
-        station.vel = [0.0; 3];
-        station.old_vel = [0.0; 3];
-        station.segment_acceleration = None;
-        station.radius = 1000.0;
-        station.pos = [3551.0, 0.0, 0.0];
-        station.old_pos = station.pos;
-        w.with(system, move |s| s.insert(station)).await.unwrap();
+        approach_station(&w, system, station_id, hull, DOCKING_RANGE + APPROACH_CLEARANCE).await;
         let identity = Identity { char_id: character, ship_id: Some(hull), corp_id: 0, station_id: None, system_id: None };
         let missing_ship = Identity { char_id: character, ship_id: None, corp_id: 0, station_id: None, system_id: None };
         for (pilot, space_system) in [(&identity, None), (&missing_ship, Some(system)), (&identity, Some(system))] {
@@ -317,17 +384,12 @@ async fn headless_docking_returns_session_and_event() {
         }
         let row = d.query_one("SELECT location_id FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
         assert_eq!(row.get::<_, i64>("location_id"), system);
-        w.with(system, move |s| {
-            let mut station = s.ball(station_id).unwrap().clone();
-            station.pos = [3550.0, 0.0, 0.0];
-            station.old_pos = station.pos;
-            s.insert(station);
-        }).await.unwrap();
+        approach_station(&w, system, station_id, hull, APPROACH_CLEARANCE).await;
         let damaged = w.with(system, move |s| {
             assert!(s.set_condition_fraction_mask(hull, 0b110, 0.5));
             s.combat_health_scalars(hull).unwrap().1
         }).await.unwrap();
-        d.execute("ALTER TABLE game.characters ADD CONSTRAINT test_dock_rollback CHECK (station_id IS DISTINCT FROM -2) NOT VALID", &[]).await.unwrap();
+        d.execute(&format!("ALTER TABLE game.characters ADD CONSTRAINT test_dock_rollback CHECK (station_id IS DISTINCT FROM {station_id}) NOT VALID"), &[]).await.unwrap();
         let failure = phase!("failed durable dock", dock(&identity, &d, &w, Some(system), station_id, None::<&mut Client>));
         d.execute("ALTER TABLE game.characters DROP CONSTRAINT test_dock_rollback", &[]).await.unwrap();
         assert!(failure.is_err());
@@ -350,16 +412,17 @@ async fn headless_docking_returns_session_and_event() {
         }
         let row = d.query_one("SELECT station_id, solar_system_id FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
         assert_eq!((row.get::<_, Option<i64>>("station_id"), row.get::<_, i64>("solar_system_id")), (Some(station_id), system));
-        item_dao::position(&d, hull, system, [0.0; 3]).await.unwrap();
+        item_dao::undock(&d, hull, system, [0.0; 3]).await.unwrap();
         d.execute("UPDATE game.characters SET station_id=NULL, solar_system_id=$2 WHERE character_id=$1", &[&character, &system]).await.unwrap();
         phase!("RPC admission", admit_fixture_ship(&d, &w, system, character, hull, true));
+        approach_station(&w, system, station_id, hull, APPROACH_CLEARANCE).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let cfg = Arc::new(crate::config::Config::default());
         let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
         let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(system))]);
         let args = [Value::Int(station_id)];
         let call = Call { service: "beyonce", method: "CmdDock", args: &args, kwargs: &Value::None, bound: false, bind_params: None };
@@ -368,21 +431,22 @@ async fn headless_docking_returns_session_and_event() {
             tokio::pin!(docking);
             let frame = tokio::select! {
                 _ = &mut docking => panic!("docking finalized before acceptance delay"),
-                frame = tokio::time::timeout(std::time::Duration::from_secs(2), crate::framing::read_frame(&mut peer)) => frame.unwrap().unwrap().unwrap(),
+                frame = tokio::time::timeout(std::time::Duration::from_secs(2), infinity_wire::framing::read_frame(&mut peer)) => frame.unwrap().unwrap().unwrap(),
             };
-            let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
-            assert!(matches!(packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
+            let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
+            assert!(matches!(packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
             assert!(phase!("RPC completion", &mut docking).is_ok());
         }
         assert_eq!(client.session.int("solarsystemid"), None);
         assert_eq!(client.session.int("stationid"), Some(station_id));
-        assert!(client.outbox.iter().any(|packet| packet.command == crate::macho::cmd::SESSIONCHANGENOTIFICATION));
-        item_dao::position(&d, hull, system, [0.0; 3]).await.unwrap();
+        assert!(client.outbox.iter().any(|packet| packet.command == infinity_wire::macho::cmd::SESSIONCHANGENOTIFICATION));
+        item_dao::undock(&d, hull, system, [0.0; 3]).await.unwrap();
         phase!("free hull admission", admit_fixture_ship(&d, &w, system, character, hull, false));
         assert!(w.with(system, move |s| {
             let persistent = s.persistent_generation(hull);
             persistent.is_some() && persistent == s.combat_membership_generation(hull)
         }).await.unwrap(), "unpiloted hull membership and combat generations must match");
+        approach_station(&w, system, station_id, hull, APPROACH_CLEARANCE).await;
         let no_character = Identity { char_id: 0, ship_id: Some(hull), corp_id: 0, station_id: None, system_id: None };
         let change = phase!("free hull dock", dock(&no_character, &d, &w, Some(system), station_id, None::<&mut Client>)).ok().unwrap();
         assert_eq!(change.updates, vec![("solarsystemid", Value::None), ("stationid", Value::Int(station_id))]);
@@ -452,8 +516,8 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
         drop(undocked.economy);
         drop(waiting.await);
         w.remove_ball(system, hull).await;
-        item_dao::dock(&d, hull, station_id, FLAG_HANGAR).await.unwrap();
-        character_dao::dock(&d, character, station_id, system).await.unwrap();
+        d.execute("UPDATE game.items SET location_id=$2, flag_id=$3, x=NULL, y=NULL, z=NULL WHERE item_id=$1", &[&hull, &station_id, &FLAG_HANGAR]).await.unwrap();
+        d.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&character, &station_id, &system]).await.unwrap();
         d.execute("UPDATE game.characters SET corporation_id=2 WHERE character_id=$1", &[&character]).await.unwrap();
         let expected_space = balls::selected(&identity, &d, &w, &sde, Some(system), None, hull, [0.0; 3]).await.expect("load RPC undock ball");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -462,19 +526,19 @@ async fn undock_headless_and_rpc_preserve_departure_and_economy_lock() {
         let cfg = Arc::new(crate::config::Config::default());
         let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
         let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde.clone(), chat, w.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, d.clone(), sde.clone(), chat, w.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("stationid", Value::Int(station_id)), ("solarsystemid2", Value::Int(system)), ("solarsystemid", Value::Int(system))]);
         let call = Call { service: "ship", method: "Undock", args: &[], kwargs: &Value::None, bound: false, bind_params: None };
         crate::services::dispatch(&mut client, &call).await.expect("dispatch undock RPC");
         assert_eq!(client.session.int("stationid"), None);
         assert_eq!(client.session.int("solarsystemid"), Some(system));
         assert_eq!(client.session.int("corpid"), Some(2));
-        assert!(client.outbox.iter().any(|packet| packet.command == crate::macho::cmd::SESSIONCHANGENOTIFICATION));
+        assert!(client.outbox.iter().any(|packet| packet.command == infinity_wire::macho::cmd::SESSIONCHANGENOTIFICATION));
         let rpc_ball = w.with(system, move |s| s.ball(hull).cloned()).await.unwrap().unwrap();
         assert_eq!(rpc_ball.corp_id, 2);
         assert_eq!((rpc_ball.mass, rpc_ball.max_vel, rpc_ball.agility, rpc_ball.signature_radius), (expected_space.ball.mass, expected_space.ball.max_vel, expected_space.ball.agility, expected_space.ball.signature_radius));
         w.remove_ball(system, hull).await;
-        item_dao::dock(&d, hull, station_id, FLAG_HANGAR).await.unwrap();
+        d.execute("UPDATE game.items SET location_id=$2, flag_id=$3, x=NULL, y=NULL, z=NULL WHERE item_id=$1", &[&hull, &station_id, &FLAG_HANGAR]).await.unwrap();
         assert!(d.query_opt("SELECT character_id FROM game.characters WHERE character_id=$1", &[&0i64]).await.expect("check anonymous character").is_none());
         let missing_bloodline = crate::dao::characters::attributes::bloodline(&d, 0).await.expect_err("anonymous character has no bloodline");
         let before = d.query_one("SELECT location_id, flag_id, x, y, z FROM game.items WHERE item_id=$1", &[&hull]).await.expect("read docked hull before anonymous undock");
@@ -548,7 +612,7 @@ async fn movement_dispatch_and_headless_guards() {
     let (stream, address) = listener.accept().await.unwrap();
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
-    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
     client.session.apply(vec![("shipid", Value::Int(123)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
     for (method, mode, range) in [
         ("CmdStop", MODE_STOP, 0.0),
@@ -618,7 +682,7 @@ async fn warp_dispatch_and_identity_guards() {
         let (stream, address) = listener.accept().await.unwrap();
         let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
         let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: connection, session_id: character, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
         let args = [Value::str("item"), Value::Int(target_id)];
         let call = Call { service: "beyonce", method: "CmdWarpToStuff", args: &args, kwargs: &Value::None, bound: false, bind_params: None };
@@ -628,7 +692,7 @@ async fn warp_dispatch_and_identity_guards() {
         assert_eq!(ball.mode, MODE_GOTO);
         assert_eq!(ball.goto, [1000.0, 0.0, 0.0]);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let callback: Timer = Box::new(move |_| { let _ = tx.send(()); });
+        let callback: ArrivalCallback = Box::new(move |_| { let _ = tx.send(()); });
         assert!(matches!(warp_to(&identity, &d, &w, Some(system), WarpDestination::Exact([2000.0, 0.0, 0.0]), Some(callback)).await, Ok(Value::None)));
         tokio::time::timeout(std::time::Duration::from_secs(3), rx).await.unwrap().unwrap();
         assert_eq!(w.ball(system, hull).await.unwrap().goto, [2000.0, 0.0, 0.0]);

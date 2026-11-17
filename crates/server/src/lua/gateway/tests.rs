@@ -219,7 +219,7 @@ async fn failed_gateway_reload_preserves_active_registry() {
     let script = dir.join("test.lua");
     std::fs::write(&script, "register.gateway('eve_public.dailygoal.api.GetAllCurrentRequest', function(c, r) return c:content_read('daily_goals') end)").unwrap();
     let config = crate::config::lua::LuaConfig { scripts_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
-    let host = Host::new(config, resources).await.unwrap();
+    let host = Host::new(config.clone(), resources.clone(), crate::lua::catalogue::Catalogue::load(&resources.db, &config, &resources.sde).await.unwrap()).await.unwrap();
     let old = host.snapshot();
     for source in [
         "register.gateway('eve_public.dailygoal.api.FutureRequest', function() end)",

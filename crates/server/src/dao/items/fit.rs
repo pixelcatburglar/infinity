@@ -9,8 +9,6 @@ use tokio_postgres::Row;
 
 pub(crate) struct Module { pub item_id: i64, pub type_id: i32, pub online: bool, pub flag_id: i32 }
 impl Module { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), online: r.get("online"), flag_id: r.get("flag_id") } } }
-pub(crate) struct Charge { pub flag_id: i32, pub type_id: i32 }
-impl Charge { fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id"), type_id: r.get("type_id") } } }
 
 pub(crate) struct Drone { pub item_id: i64, pub type_id: i32 }
 impl Drone { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id") } } }
@@ -36,7 +34,4 @@ pub(crate) async fn owner_online_ships(ex: &(impl Executor + ?Sized), owner: i64
                  WHERE h.owner_id = $1 AND m.online AND (m.flag_id BETWEEN $2 AND $3 OR m.flag_id BETWEEN $4 AND $5 OR m.flag_id BETWEEN $6 AND $7)
                  ORDER BY h.item_id",
         &[&owner, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST]).await?.iter().map(|row| row.get("ship_id")).collect())
-}
-pub(crate) async fn charges(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<Charge>, Error> {
-    Ok(ex.query("SELECT flag_id, type_id FROM game.module_charges WHERE ship_id = $1", &[&ship]).await?.iter().map(Charge::from_row).collect())
 }

@@ -42,9 +42,7 @@ impl Default for TradeConfig {
 
 impl TradeConfig {
     pub(super) fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.idle_timeout_secs > 0, "trade.idle_timeout_secs must be positive");
-        super::duration("trade.idle_timeout_secs", self.idle_timeout_secs, infinity_core::consts::FILETIME_SECOND, true)?;
-        Ok(())
+        super::positive_duration("trade.idle_timeout_secs", self.idle_timeout_secs, infinity_core::consts::FILETIME_SECOND)
     }
 }
 /// Daily free offer from services/store/store_manager.rs.

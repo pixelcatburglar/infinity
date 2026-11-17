@@ -8,7 +8,7 @@
 mod map;
 pub(crate) mod events;
 pub(crate) mod retention;
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;
 
 use crate::client::Client;
 use super::{Call, CallResult};

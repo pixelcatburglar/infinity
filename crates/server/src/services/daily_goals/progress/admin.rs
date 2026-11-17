@@ -48,4 +48,4 @@ pub(crate) async fn prepare(resources: &Resources, user: i64, owner: i64, id: &s
         after: serde_json::to_string(&after).map_err(anyhow::Error::from)? })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

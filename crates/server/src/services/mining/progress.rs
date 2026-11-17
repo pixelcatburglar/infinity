@@ -28,7 +28,7 @@ fn group(rows: Vec<ProgressLog>) -> anyhow::Result<Vec<Group>> {
     Ok(groups.into_values().collect())
 }
 
-pub(crate) async fn aggregate_tx(tx: &tokio_postgres::Transaction<'_>, outbox: &mut Outbox, limit: i64) -> Result<usize, CallError> {
+pub(crate) async fn aggregate_tx(tx: &crate::db::Transaction<'_>, outbox: &mut Outbox, limit: i64) -> Result<usize, CallError> {
     let rows = progress::lock_pending(tx, limit).await.map_err(db_err)?;
     let ids: Vec<i64> = rows.iter().map(|row| row.log_id).collect();
     let groups = group(rows)?;
@@ -56,4 +56,4 @@ pub(crate) fn handle(db: Db, _world: Arc<World>, _job: Job) -> Pin<Box<dyn Futur
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

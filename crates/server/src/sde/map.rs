@@ -3,13 +3,17 @@
 //! `eve/client/script/parklife/autopilot.py:260-261,329-332`, and
 //! `evestations/standingsrestriction.py`. Standing skill bonuses and map presentation
 //! are outside this dataset.
+//!
+//! `is_public_system` and `public_systems` expose the public solar-system
+//! membership GM preloading uses: a static-map member inside the client's
+//! known-space or wormhole ID ranges. The raw `systems` view keeps every row.
 
 use std::collections::HashMap;
+use infinity_core::consts::{
+    KNOWN_SPACE_SYSTEM_START, STANDING_SKILL_EXEMPT_FACTIONS, WORMHOLE_SYSTEM_END,
+    WORMHOLE_SYSTEM_START,
+};
 use crate::{dao::sde::map as dao, db::Db};
-
-/// `appConst.factionsWhoseStandingsAreNotAffectedBySkillBonuses`; see
-/// `standingUtil.GetStandingBonusSkillTypeID` for the skill exemption.
-const STANDING_SKILL_EXEMPT_FACTIONS: &[i64] = &[500024, 500025, 500026, 500027];
 
 pub(crate) struct SolarSystem {
     pub solar_system_id: i64,
@@ -82,6 +86,14 @@ pub(crate) struct Map {
     station_standing_restrictions: HashMap<i64, HashMap<i32, f64>>,
 }
 
+/// Public-membership ID half of the public-system rule: the client's
+/// known-space or wormhole solar-system ranges, both closed. A range hit
+/// alone is not membership; the map methods below also require a real row.
+fn is_public_system_id(id: i64) -> bool {
+    (KNOWN_SPACE_SYSTEM_START..=(WORMHOLE_SYSTEM_START - 1)).contains(&id)
+        || (WORMHOLE_SYSTEM_START..=WORMHOLE_SYSTEM_END).contains(&id)
+}
+
 impl Map {
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
         let (systems, regions, constellations, stargates, stations, celestials, jumps, restrictions) = tokio::try_join!(
@@ -124,6 +136,16 @@ impl Map {
     pub(crate) fn celestials(&self, system: i64) -> impl Iterator<Item = &Celestial> { self.system_celestials.get(&system).into_iter().flatten().map(|&i| &self.celestials[i]) }
     pub(crate) fn stations_by_owner(&self, owner: i64) -> impl Iterator<Item = &Station> { self.owner_stations.get(&owner).into_iter().flatten().map(|&i| &self.stations[i]) }
     pub(crate) fn jumps(&self, system: i64) -> &[i64] { self.jumps.get(&system).map_or(&[], Vec::as_slice) }
+    /// Whether `id` names a public solar system: a map member inside the
+    /// client's known-space or wormhole ID ranges.
+    pub(crate) fn is_public_system(&self, id: i64) -> bool {
+        is_public_system_id(id) && self.system(id).is_some()
+    }
+    /// Every public solar system: map members inside the client's known-space
+    /// or wormhole ID ranges, including systems without stargates.
+    pub(crate) fn public_systems(&self) -> impl Iterator<Item = &SolarSystem> {
+        self.systems().filter(|system| is_public_system_id(system.solar_system_id))
+    }
 }
 
 fn project_station_standing_restrictions(
@@ -156,5 +178,5 @@ fn project_station_standing_restrictions(
     Ok(projected)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

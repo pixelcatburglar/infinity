@@ -2,14 +2,15 @@
 //! The client identifies effect 6063 in dogma/const.py; corporation and source
 //! generations come from the sovereignty DAOs under canonical admission locks.
 //! Only neutral Hub capture is supported; owned campaigns are not implemented.
-use super::{behaviors::Activation, lifecycle::Cycle, registry::EffectAttribute};
+//! Effect animations are published through the system's ordered scene channel.
+use super::{behaviors::Activation, lifecycle::Cycle, parameters::EntosisInputs, registry::EffectAttribute};
 use infinity_core::messages;
 use crate::{
     client::filetime_from_unix_ms,
     dao::{characters::ship, corporations::registry, sovereignty::sources},
     db::outbox::Outbox,
     services::{combat::{Ctx, targeting_charges::has_target}, db_err, fit::{Fit, Key}, notify_error, CallError, sovereignty::CaptureContributor},
-    space::{sovereignty::links::{self, LinkCycle}, MODE_WARP},
+    space::{sovereignty::links::{self, LinkCycle}, system::presentation::{FxRetention, ModuleFx}, MODE_WARP},
 };
 
 fn refused() -> CallError { notify_error(messages::effects::ENTOSIS_UNAVAILABLE) }
@@ -20,7 +21,7 @@ fn valid_parameters(duration: f64, range: f64) -> Option<(f64, f64)> {
 
 // CCP's Entosis Link article specifies capital duration; SDE passive ship
 // modifiers are already evaluated by Fit, so no additional multiplier is applied.
-fn parameters(fit: &Fit, effect: &super::registry::Effect, module: i64) -> Option<(f64, f64)> {
+pub(super) fn parameters(fit: &Fit, effect: &super::registry::Effect, module: i64) -> Option<(f64, f64)> {
     let key = Key::Module(module);
     valid_parameters(fit.value(key, effect.attribute(EffectAttribute::Duration)?),
         fit.value(key, effect.attribute(EffectAttribute::Range)?))
@@ -45,8 +46,8 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Re
 }
 
 /// Capture one source generation under the same organization guard as invalidations.
-pub(super) async fn prepare(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> Result<LinkCycle, CallError> {
-    let (_, range) = parameters(fit, &cycle.effect, cycle.modules[0].id).ok_or_else(refused)?;
+pub(super) async fn prepare(cx: &Ctx, inputs: &EntosisInputs, cycle: &Cycle) -> Result<LinkCycle, CallError> {
+    let (_, range) = inputs.parameters.ok_or_else(refused)?;
     let target = cycle.target.filter(|target| has_target(cx.char_id, *target)).ok_or_else(refused)?;
     let (character, ship, module) = (cx.char_id, cx.ship_id, cycle.modules[0].id);
     let activation = cycle.stop.clone();
@@ -68,7 +69,11 @@ pub(super) async fn prepare(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> Result<LinkCy
             let version = sources::ensure(tx, character).await.map_err(db_err)?;
             Ok(CaptureContributor { character_id: character, ship_id: ship, module_id: module, corporation_id: corporation, alliance_id: alliance, source_revision: version.revision })
         }), |contributor, _| async move { Ok(contributor) }).await?;
-        LinkCycle { target_item_id: target, target_epoch: epoch, contributor, membership_generation, activation, range_m: range, scoring: false, expires_sim: 0 }
+        LinkCycle {
+            target_item_id: target, target_epoch: epoch, contributor, membership_generation,
+            activation, range_m: range, scoring: false, expires_sim: 0,
+            publication_pending: inputs.would_be_active,
+        }
     };
     next_cycle(&mut proof, cycle.cycles, range);
     let check = proof.clone();
@@ -96,18 +101,18 @@ pub(super) async fn publish_start(cx: &Ctx, cycle: &Cycle) -> bool {
     let (target, other, started, duration, repeat, charge) =
         (cycle.target, cycle.other.clone(), cycle.started, cycle.duration_ms, cycle.repeat, cycle.charge_type);
     world.with(cx.system_id, move |s| {
-        let Some(link) = links::cycle(s, module.id, &generation) else { return false };
-        if link.expires_sim <= filetime_from_unix_ms(s.now_ms()) || !links::valid_paid(s, &link) {
-            return false;
-        }
-        let current = crate::services::combat::state().active.get(&module.id)
-            .is_some_and(|active| std::sync::Arc::ptr_eq(&active.stop, &generation) && !active.forced_inactive);
-        if !current { return false; }
+        if !links::publish_start(s, module.id, &generation) { return false; }
         super::notify::ship_effect(&cx, module.id, effect.id, target, other, true, started, duration, repeat);
         if let Some(guid) = effect.guid.as_deref().and_then(|guid| guid.split(',').next()) {
-            let event = super::notify::fire_fx(s.current_time(), cx.ship_id, Some((module.id, module.type_id)),
-                guid, target, charge, effect.has(super::registry::EffectFlag::Offensive), true, duration, repeat);
-            s.broadcast(cx.ship_id, vec![event]);
+            s.publish_module_fx(module.id, &generation, ModuleFx {
+                module: crate::space::FxModule { item: Some(module.id), type_id: module.type_id },
+                guid: guid.to_owned(),
+                charge,
+                offensive: effect.has(super::registry::EffectFlag::Offensive),
+                duration_ms: duration,
+                repeat,
+                graphic_info: marshal::Value::None,
+            }, true, FxRetention::Current);
         }
         true
     }).await.unwrap_or(false)
@@ -117,4 +122,4 @@ pub(super) fn stop(s: &mut crate::space::System, cycle: &Cycle) {
     links::stop(s, cycle.modules[0].id, &cycle.stop);
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

@@ -4,7 +4,7 @@ use crate::services::{self, CallError};
 const FIGHTER_TUBE_0: i64 = 159;
 
 
-const ACTIONS: [(&str, &str, &str); 12] = [
+const ACTIONS: [(&str, &str, &str); 10] = [
     ("fighterMgr", "ExecuteMovementCommandOnFighters", infinity_core::messages::fighters::UNAVAILABLE),
     ("fighterMgr", "LoadFightersToTube", infinity_core::messages::fighters::UNAVAILABLE),
     ("fighterMgr", "UnloadTubeToFighterBay", infinity_core::messages::fighters::UNAVAILABLE),
@@ -15,13 +15,10 @@ const ACTIONS: [(&str, &str, &str); 12] = [
     ("fighterMgr", "CmdActivateAbilitySlots", infinity_core::messages::fighters::UNAVAILABLE),
     ("fighterMgr", "CmdDeactivateAbilitySlots", infinity_core::messages::fighters::UNAVAILABLE),
     ("warpVectorMgr", "UseVector", infinity_core::messages::warp_vector::UNAVAILABLE),
-    ("superWeaponMgr", "ActivateSinglePointTargetedModule", infinity_core::messages::super_weapon::UNAVAILABLE),
-    ("superWeaponMgr", "ActivateSlashModule", infinity_core::messages::super_weapon::UNAVAILABLE),
 ];
 
 fn args(method: &str, id: i64) -> Vec<Value> {
     let ids = || Value::list([Value::Int(id)]);
-    let point = || Value::tuple([Value::Int(1), Value::Int(0), Value::Int(0)]);
     match method {
         "ExecuteMovementCommandOnFighters" => vec![ids(), Value::str("STOP")],
         "LoadFightersToTube" => vec![Value::Int(id), Value::Int(FIGHTER_TUBE_0)],
@@ -31,8 +28,6 @@ fn args(method: &str, id: i64) -> Vec<Value> {
         "RecallFightersToTubes" => vec![ids()],
         "CmdAbandonFighter" | "UseVector" => vec![Value::Int(id)],
         "CmdActivateAbilitySlots" | "CmdDeactivateAbilitySlots" => vec![ids(), Value::Int(0)],
-        "ActivateSinglePointTargetedModule" => vec![Value::Int(id), Value::Int(0), point()],
-        "ActivateSlashModule" => vec![Value::Int(id), point(), point()],
         _ => unreachable!(),
     }
 }

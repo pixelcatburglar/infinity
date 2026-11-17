@@ -53,10 +53,34 @@ fn station_without_services_requires_system_before_filtering() {
 
 mod corporation;
 
-pub(super) async fn database_fingerprint(db: &crate::db::Db) -> Vec<Vec<String>> {
-    let mut result = Vec::new();
-    for table in ["accounts", "characters", "corporations", "corp_titles", "corp_wallets", "offices", "skills", "items", "blueprints", "industry_jobs", "market_orders", "market_order_history", "market_transactions", "trades", "trade_items", "jobs"] {
-        result.push(crate::services::drones::tests::fixture::table_fingerprint(db, table).await.unwrap());
-    }
-    result
+#[tokio::test]
+#[ignore = "requires a dedicated test database with SDE"]
+async fn large_personal_owner_receives_industry_notifications() {
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let location = crate::services::tests::fixture::default_location(crate::tests::shared_sde(&db).await.as_ref());
+    let character = 1_500_000_124_i64;
+    let job = Job { id: 1, installer: character, owner: character, activity: MANUFACTURING, blueprint_id: 2, blueprint_type: 1,
+        blueprint_copy: false, facility: 3, system: 4, runs: 1, licensed_runs: 1, successful_runs: None, product_type: None,
+        optional_type: None, cost: 0.0, probability: 1.0, time: 0, start: 0, end: 0, completed: None, completed_by: None,
+        status: INDUSTRY_JOB_STATUS_READY, input_location: 5, input_flag: infinity_core::consts::FLAG_HANGAR, output_location: 6,
+        output_flag: infinity_core::consts::FLAG_HANGAR, wallet_owner: character, wallet_account_key: infinity_core::consts::ACCOUNT_CASH,
+        blueprint_location: 7, blueprint_flag: infinity_core::consts::FLAG_HANGAR };
+    let result: Result<(), CallError> = db.transaction(|tx, _: &mut ()| { let job = job.clone(); Box::pin(async move {
+        crate::services::tests::fixture::create_with_character_id(tx, character, location).await?;
+        let mut outbox = Outbox::<()>::default();
+        tell_job(tx, &mut outbox, &job).await?;
+        let observed: Vec<_> = outbox.into_entries().into_iter().map(|entry| match entry {
+            crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { char_id, event, args }) => (char_id, event, args),
+            _ => (0, String::new(), Vec::new()),
+        }).collect();
+        let expected = vec![
+            (character, "OnIndustryJob".to_string(), vec![Value::Int(1), Value::Int(character), Value::Int(2), Value::Int(character), Value::Int(i64::from(INDUSTRY_JOB_STATUS_READY)), Value::None]),
+            (character, "OnBlueprintsUpdated".to_string(), vec![Value::Int(character)]),
+        ];
+        if observed != expected { return Err(CallError::Internal(anyhow::anyhow!("industry owner notifications differed"))); }
+        Err(CallError::Internal(anyhow::anyhow!("owner fixture rollback")))
+    }) }, |(), ()| async { unreachable!("rolled-back owner fixture must not dispatch") }).await;
+    let Err(CallError::Internal(error)) = result else { panic!("owner fixture must roll back") };
+    assert_eq!(error.to_string(), "owner fixture rollback");
+    assert!(db.query_opt("SELECT character_id FROM game.characters WHERE character_id = $1", &[&character]).await.unwrap().is_none());
 }

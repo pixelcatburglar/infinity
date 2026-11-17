@@ -99,7 +99,7 @@ async fn headless_undock_and_canonical_kick_reconcile_sessions() {
             let (stream, address) = listener.accept().await?;
             let cfg = std::sync::Arc::new(crate::config::Config::default());
             let login = crate::handshake::Login { user_id: r.pilots.account, user_name: "test".into(), role: 0, client_id: ceo, session_id: ceo, language_id: "EN".into() };
-            let mut admin = crate::client::Client::new(crate::conn::Conn::new(stream, address), cfg, r.db.clone(), r.sde.clone(), r.pilots.hub.clone(), r.world.clone(), login);
+            let mut admin = crate::client::Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, r.db.clone(), r.sde.clone(), r.pilots.hub.clone(), r.world.clone(), login);
             admin.session.apply(vec![("charid", marshal::Value::Int(ceo)), ("corpid", marshal::Value::Int(corp)), ("allianceid", marshal::Value::Int(alliance))]);
             let args = [marshal::Value::Int(corp)];
             let kwargs = marshal::Value::None;

@@ -2,7 +2,7 @@
 //! No client API is mirrored; the source is `game.progress_events`.
 //! This is startup-only and does not replay or modify delivery receipts.
 
-use crate::{dao::progress::migration as dao, db::{Db, Error}, isk::IskAmount, progress::codec};
+use crate::{dao::progress::migration as dao, db::{executor::Executor, Db, Error}, isk::IskAmount, progress::codec};
 use anyhow::Context;
 
 fn convert(version: i32, kind: &str, payload: &str) -> anyhow::Result<String> {
@@ -28,7 +28,7 @@ fn convert(version: i32, kind: &str, payload: &str) -> anyhow::Result<String> {
     Ok(result)
 }
 
-async fn migrate_tx(tx: &tokio_postgres::Transaction<'_>) -> Result<usize, Error> {
+async fn migrate_tx(tx: &(impl Executor + ?Sized)) -> Result<usize, Error> {
     let events = dao::legacy(tx).await?;
     for event in &events {
         let payload = convert(event.version, &event.kind, &event.payload)
@@ -44,9 +44,9 @@ async fn migrate_tx(tx: &tokio_postgres::Transaction<'_>) -> Result<usize, Error
 /// Run after schema setup and before any progress consumers or listeners start.
 pub(crate) async fn migrate(db: &Db) -> Result<usize, Error> {
     db.transaction::<_, _, Error, (), _, _, _>(
-        |tx, _| Box::pin(async move { migrate_tx(tx).await }),
+        |tx, _| Box::pin(async move { migrate_tx(&tx.uncached()).await }),
         |count, ()| async move { Ok(count) },
     ).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

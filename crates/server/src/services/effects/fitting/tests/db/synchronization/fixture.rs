@@ -5,7 +5,7 @@ use infinity_core::{
 };
 use crate::{
     client::Client,
-    services::{self, CallError, fit::{Fit, Key}, inventory::{access::Container, movement}},
+    services::{self, CallError, fit::{Fit, Key}, inventory::{access::Container, movement}, tests::fixture::{cleanup_ship, create_ship, ShipItemSpec, ShipLocation, ShipFixture}},
 };
 use marshal::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -16,7 +16,7 @@ const ONLINE_EFFECT_CATEGORY: i32 = 4;
 pub(super) struct MovementFixture {
     pub client: Client,
     pub _peer: tokio::net::TcpStream,
-    pub rows: super::super::fixture::Fixture,
+    pub rows: ShipFixture,
     pub second_ship: i64,
     pub slot: i32,
     pub requires_online: bool,
@@ -24,6 +24,8 @@ pub(super) struct MovementFixture {
 }
 
 impl MovementFixture {
+    /// The two fitting modules created by this fixture; later items may be helper hulls.
+    pub fn modules(&self) -> [i64; 2] { [self.rows.items[0], self.rows.items[1]] }
     pub async fn create(target: i32) -> Self {
         Self::create_for(target, false, false, false).await
     }
@@ -104,13 +106,19 @@ impl MovementFixture {
             .expect("published hull with two compatible slots and positive target attribute in SDE").type_id;
         let station = sde.map.stations().next().expect("station in SDE").station_id;
         let cleanup_world = crate::space::World::new(db.clone(), std::sync::Arc::new(sde), 1);
-        let rows = super::super::fixture::create(&db, hull, module_type).await.unwrap();
+        let mut rows = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[
+            ShipItemSpec { type_id: module_type, flag_id: FLAG_CARGO, quantity: 1, singleton: true, online: false, attributes: &[] },
+            ShipItemSpec { type_id: module_type, flag_id: FLAG_CARGO, quantity: 1, singleton: true, online: false, attributes: &[] },
+        ]).await.unwrap();
+        let spawn_rows = ShipFixture { items: rows.items.clone(), ..rows };
         let setup_db = db.clone();
         let result = tokio::spawn(async move {
         let db = setup_db;
+        let mut rows = spawn_rows;
         db.execute("UPDATE game.items SET location_id=$2,flag_id=$3 WHERE item_id=$1", &[&rows.ship, &station, &FLAG_HANGAR]).await.unwrap();
-        let second_ship = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &rows.owner, &station, &FLAG_HANGAR]).await.unwrap().get("item_id");
-        let (mut client, peer) = services::tests::client(db, rows.owner).await;
+        let second_ship = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &rows.character, &station, &FLAG_HANGAR]).await.unwrap().get("item_id");
+        rows.items.push(second_ship);
+        let (mut client, peer) = services::tests::client(db, rows.character).await;
         client.login.user_id = rows.account;
         client.login.role = infinity_core::consts::GM_ROLES;
         client.session.apply(vec![("stationid", Value::Int(station)), ("shipid", Value::Int(rows.ship))]);
@@ -124,7 +132,7 @@ impl MovementFixture {
                 if !skills.iter().any(|&(id, _)| id == skill) { skills.push((skill, 5)); }
             }
         }
-        services::skills::gm::apply(&mut client, rows.owner, services::skills::gm::Change::Set(skills)).await.ok().expect("seed required module skills");
+        services::skills::gm::apply(&mut client, rows.character, services::skills::gm::Change::Set(skills)).await.ok().expect("seed required module skills");
         for ship in [rows.ship, second_ship] {
             for attr in [ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT] {
                 assert!(crate::dao::items::dogma::set_override(&client.db, ship, attr, 1_000_000.0).await.unwrap());
@@ -137,7 +145,9 @@ impl MovementFixture {
         match result {
             Ok(f) => f,
             Err(error) => {
-                super::super::fixture::cleanup(&db, &cleanup_world, rows).await.expect("clean failed fixture setup");
+                rows.items.extend(db.query("SELECT item_id FROM game.items WHERE owner_id = $1", &[&rows.character]).await.unwrap().iter().map(|row| row.get::<_, i64>("item_id")));
+                cleanup_world.unobserve(rows.character);
+                cleanup_ship(&db, Some(cleanup_world.as_ref()), rows).await.expect("clean failed fixture setup");
                 std::panic::resume_unwind(error.into_panic())
             }
         }
@@ -148,13 +158,13 @@ impl MovementFixture {
         result
     }
     pub async fn fit(&self, ship: i64) -> Fit {
-        Fit::load(&self.client.db, self.client.sde.clone(), self.rows.owner, ship).await.ok().expect("load final fit")
+        Fit::load(&self.client.db, self.client.sde.clone(), self.rows.character, ship).await.ok().expect("load final fit")
     }
     pub async fn value(&self, ship: i64, attribute: i32) -> f64 {
         self.fit(ship).await.value(Key::Ship, attribute)
     }
     pub async fn move_to(&self, ship: i64, source: i64, flag: i32) -> Result<Option<i64>, CallError> {
-        self.move_module(ship, source, flag, self.rows.modules[0]).await
+        self.move_module(ship, source, flag, self.rows.module()).await
     }
     pub async fn move_module(&self, ship: i64, source: i64, flag: i32, module: i64) -> Result<Option<i64>, CallError> {
         let c = &self.client;
@@ -163,7 +173,7 @@ impl MovementFixture {
             |n| services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await
     }
     pub async fn online(&self, ship: i64) {
-        self.set_online(ship, self.rows.modules[0], true).await.ok().expect("online SDE extender");
+        self.set_online(ship, self.rows.module(), true).await.ok().expect("online SDE extender");
     }
     pub async fn set_online(&self, ship: i64, module: i64, online: bool) -> services::CallResult {
         let c = &self.client;

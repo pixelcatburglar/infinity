@@ -122,7 +122,7 @@ async fn compress(c: &mut Client, source_id: i64, facility: i64) -> CallResult {
         Box::pin(async move {
             let locks = inventory::hold_storage::check_destination(tx, &sde, context.character, context.ship, expected_source.flag_id,
                 &[inventory::hold_storage::Addition { type_id: output_type(&sde, expected_source.type_id)?, singleton: false, quantity: expected_source.quantity }],
-                inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, None).await?
+                inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await?
                 .ok_or_else(|| notify_error(msg::COMPRESSION_ITEM))?;
             let container = inventory::access::Container::Item(context.ship);
             let (destination, _) = inventory::movement::authorize_move(tx, &sde, &identity, &reach, &source, Some(source.location_id), &container, Some(source.flag_id)).await?
@@ -155,4 +155,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

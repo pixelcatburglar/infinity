@@ -6,10 +6,14 @@ use crate::services::fit::{Fit, Key};
 use std::{sync::Arc, time::Duration};
 
 
-async fn receive_warp(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<Value>>, hull: i64) -> i64 {
+async fn receive_warp(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::space::SceneDelivery>, hull: i64) -> i64 {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            for event in rx.recv().await.expect("observer closed") {
+            let batch = match rx.recv().await.expect("observer closed") {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
+            for event in batch {
                 let Value::Tuple(parts) = event else { continue };
                 let Some(Value::Tuple(call)) = parts.get(1) else { continue };
                 if call.first() != Some(&Value::str("WarpTo")) { continue; }

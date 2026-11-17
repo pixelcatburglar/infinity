@@ -12,7 +12,7 @@ use super::super::{db_err, notify_error, user_error, CallError, fit::{Fit, Key}}
 /// Client dogma effectSubSystem.
 const EFFECT_SUBSYSTEM: i32 = 3772;
 /// Client dogma rack effects and slot-count attributes (rigSlots is not upgradeSlotsLeft).
-const RACKS: [(i32, i32, i32); 5] = [(11, ATTR_LOW_SLOTS, FLAG_FITTING_FIRST), (13, ATTR_MED_SLOTS, FLAG_MED_SLOT_FIRST), (12, ATTR_HI_SLOTS, FLAG_HI_SLOT_FIRST), (EFFECT_RIG_SLOT, ATTR_RIG_SLOTS, FLAG_RIG_FIRST), (EFFECT_SUBSYSTEM, 1367, FLAG_SUBSYSTEM_FIRST)];
+const RACKS: [(i32, i32, i32); 5] = [(EFFECT_LO_POWER, ATTR_LOW_SLOTS, FLAG_FITTING_FIRST), (EFFECT_MED_POWER, ATTR_MED_SLOTS, FLAG_MED_SLOT_FIRST), (EFFECT_HI_POWER, ATTR_HI_SLOTS, FLAG_HI_SLOT_FIRST), (EFFECT_RIG_SLOT, ATTR_RIG_SLOTS, FLAG_RIG_FIRST), (EFFECT_SUBSYSTEM, 1367, FLAG_SUBSYSTEM_FIRST)];
 /// Client inventory rack width.
 pub(crate) const RACK_WIDTH: i32 = 8;
 /// Client visible subsystem slots.
@@ -233,4 +233,4 @@ pub(crate) async fn overload_candidate(ex: &(impl Executor + ?Sized), sde: Arc<S
     Ok((fit, candidate))
 }
 
-#[cfg(test)] pub(in crate::services) mod tests;
+#[cfg(all(test, any(feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;

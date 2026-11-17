@@ -1,11 +1,11 @@
 //! Decode and route requests from `requestBroker.py:new_eve_public_request`.
 //! Uses embedded descriptors, gateway handlers and scoped Lua daily-goal calls;
-//! unclaimed CDN requests have no payload and other unclaimed requests receive defaults.
-use prost_reflect::{DynamicMessage, ReflectMessage};
+//! known unsupported actions are refused, unclaimed CDN requests have no payload
+//! and other unclaimed requests receive defaults.
+use prost_reflect::{DynamicMessage, ReflectMessage, Value};
 use tracing::{debug, info, warn};
-use super::{Gateway, Caller, context::HandlerContext, handlers, protocol::{Request, Response, now_timestamp}, message::{message, pack, response_name, type_name}, fallback::{known_ids, fill_defaults}};
+use super::{Gateway, Caller, context::HandlerContext, handlers, protocol::{Request, Response, now_timestamp}, message::{message, pack, response_for, response_name, set, type_name}, fallback::{known_ids, fill_defaults, unsupported_action, UnsupportedAction}};
 use super::error::{FailureCode, GatewayError};
-use infinity_core::messages::gateway as text;
 
 /// Server limit for gateway request log excerpts, in bytes.
 const LOG_EXCERPT_LEN: usize = 300;
@@ -28,7 +28,7 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&su
     };
     let Some(any) = req.payload else {
         rsp.status_code = FailureCode::BadRequest.status();
-        rsp.status_message = text::INVALID_REQUEST.into();
+        rsp.status_message = FailureCode::BadRequest.status_text().into();
         return rsp;
     };
     let name = type_name(&any.type_url).to_string();
@@ -46,7 +46,7 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&su
         }
         warn!("gateway: unknown request type {name}");
         rsp.status_code = FailureCode::BadRequest.status();
-        rsp.status_message = text::INVALID_REQUEST.into();
+        rsp.status_message = FailureCode::BadRequest.status_text().into();
         return rsp;
     };
     let payload = match DynamicMessage::decode(desc, any.value.as_slice()) {
@@ -54,17 +54,18 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&su
         Err(e) => {
             warn!("gateway: invalid request payload {name}: {e}");
             rsp.status_code = FailureCode::BadRequest.status();
-            rsp.status_message = text::INVALID_REQUEST.into();
+            rsp.status_message = FailureCode::BadRequest.status_text().into();
             return rsp;
         }
     };
-    let context = match HandlerContext::for_request(gw, caller.clone()).await {
+    let mut context = match HandlerContext::for_request(gw, caller.clone()).await {
         Ok(context) => context,
         Err(error) => {
             apply_error(&mut rsp, &name, error);
             return rsp;
         }
     };
+    context.application_instance_uuid = <[u8; infinity_core::consts::UUID_LEN]>::try_from(req.application_instance_uuid.as_slice()).ok();
     if let (Some(lease), Some(user), Some(character), Some(session)) = (lease, caller.user_id, caller.character_id, admitted_session) {
         if session.user_id == Some(user) && gw.world.online_session(character).is_some_and(|current| current.user_id == Some(user) && current.session_id == session.session_id) {
             lease.bind(&session, |id| gw.world.online_session(id));
@@ -87,6 +88,16 @@ pub(super) async fn handle_request(gw: &Gateway, req: Request, lease: Option<&su
 }
 
 fn apply_unclaimed(rsp: &mut Response, name: &str, payload: &DynamicMessage, caller: &Caller) {
+    if let Some(action) = unsupported_action(name) {
+        apply_error(rsp, name, GatewayError::refusal(FailureCode::NotImplemented));
+        if let UnsupportedAction::TypedFailure = action {
+            match response_for(name).and_then(|mut m| { set(&mut m, "unspecified_error", Value::Bool(true))?; Ok(m) }) {
+                Ok(m) => rsp.payload = Some(pack(&m)),
+                Err(error) => apply_error(rsp, name, GatewayError::Internal(error)),
+            }
+        }
+        return;
+    }
     if payload.descriptor().get_field_by_name("no_local_version_available").is_some() {
         // CDN content checkpoints (content/client/flatbuffer/provider.py): no payload
         // means "nothing published", which the client treats as no content.
@@ -105,7 +116,7 @@ fn apply_unclaimed(rsp: &mut Response, name: &str, payload: &DynamicMessage, cal
         None => {
             warn!("gateway: UNHANDLED {name} (no matching response type) {}", short_msg(payload));
             rsp.status_code = FailureCode::NotImplemented.status();
-            rsp.status_message = text::NOT_IMPLEMENTED.into();
+            rsp.status_message = FailureCode::NotImplemented.status_text().into();
         }
     }
 }
@@ -119,12 +130,12 @@ fn apply_error(rsp: &mut Response, name: &str, error: GatewayError) {
         GatewayError::Database(error) => {
             warn!("gateway: {name} database failure: {error:#}");
             rsp.status_code = FailureCode::Internal.status();
-            rsp.status_message = text::INTERNAL_ERROR.into();
+            rsp.status_message = FailureCode::Internal.status_text().into();
         }
         GatewayError::Internal(error) => {
             warn!("gateway: {name} failed: {error:#}");
             rsp.status_code = FailureCode::Internal.status();
-            rsp.status_message = text::INTERNAL_ERROR.into();
+            rsp.status_message = FailureCode::Internal.status_text().into();
         }
     }
 }
@@ -137,4 +148,4 @@ fn short_msg(m: &DynamicMessage) -> String {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

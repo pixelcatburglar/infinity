@@ -1,5 +1,5 @@
 use super::*;
-use super::fixture;
+use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipLocation};
 use std::sync::Arc;
 use infinity_core::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP}};
 use crate::{space::{Ball, World, WarpState, MODE_STOP}};
@@ -36,7 +36,7 @@ async fn actor_damage_keeps_checkpoint_unchanged_until_flush_and_records_positiv
         && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|value| value > 0.0))
         .expect("SDE must contain a ship with structure").type_id;
     let system = 1;
-    let f = fixture::create(&db, ship_type, system).await.unwrap();
+    let f = create_ship(&db, ship_type, ShipLocation::Space { system }, &[]).await.unwrap();
     db.execute("UPDATE game.characters SET ship_id=$2, solar_system_id=$3, station_id=NULL WHERE character_id=$1",
         &[&f.character, &f.ship, &system]).await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
@@ -78,11 +78,30 @@ async fn actor_damage_keeps_checkpoint_unchanged_until_flush_and_records_positiv
     world.flush_positions().await.unwrap();
     let after = crate::dao::items::dogma::overrides(&db, f.ship).await.unwrap();
     assert_ne!(values(&after), values(&before));
+    let before_second = values(&after);
+    let weak = Arc::downgrade(&world);
+    let mut attempt = world.with(system, move |s| {
+        let facts = s.prepare_combat_source(f.ship, None, None, Some(ship_type),
+            crate::lua::events::resources::FactOrigin::Natural, generation, 2, 1,
+            move |s| s.pilot_ball(f.character).is_some_and(|ball| ball.id == f.ship)).unwrap();
+        crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system)
+    }).await.unwrap();
+    let source = crate::services::combat::damage::DamageSource {
+        attacker_id: Some(f.character), source_ship_id: Some(f.ship),
+        source_ship_type: Some(ship_type), weapon_type_id: Some(ship_type),
+        facts: Some(attempt.facts()), illegal: true, ..Default::default()
+    };
+    let second = crate::services::combat::damage::apply_damage_guarded(&db, &world, system, f.ship, [1.0, 0.0, 0.0, 0.0], source, false, |_| true).await.unwrap().unwrap();
+    attempt.disarm();
+    assert!(second.dealt > 0.0);
+    assert_eq!(values(&crate::dao::items::dogma::overrides(&db, f.ship).await.unwrap()), before_second);
+    world.flush_positions().await.unwrap();
+    assert_ne!(values(&crate::dao::items::dogma::overrides(&db, f.ship).await.unwrap()), before_second);
     }).await;
     world.remove_ball(system, f.ship).await;
     world.flush_positions().await.unwrap();
     db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&f.character]).await.unwrap();
-    fixture::cleanup(&db, f).await.unwrap();
+    cleanup_ship(&db, None, f).await.unwrap();
     result.unwrap();
 }
 
@@ -102,8 +121,7 @@ async fn capacitor_db_smoke() {
     let npc_type = select(CATEGORY_ENTITY);
     let npc_capacity = sde.types.attribute(npc_type, ATTR_CAPACITOR_CAPACITY).unwrap();
     let system = 1;
-    let before = fixture::fingerprint(&db).await.unwrap();
-    let fixture = fixture::create(&db, ship_type, system).await.unwrap();
+    let fixture = create_ship(&db, ship_type, ShipLocation::Space { system }, &[]).await.unwrap();
     let npc = -fixture.ship;
     let world = World::new(db.clone(), sde.clone(), 1);
     let test_world = world.clone();
@@ -119,15 +137,18 @@ async fn capacitor_db_smoke() {
         assert!(tau.is_finite() && tau > 0.0);
         let tolerance = (capacity * 1e-12).max(1e-12);
         assert!(capacity.is_finite() && capacity > 0.0);
+        assert!(capacitor_snapshot(&test_db, &test_world, system, fixture.ship).await.ok().expect("snapshot player").is_none());
+        let condition = crate::services::combat::prepare_condition_with_fit(&test_db, fixture.ship, &fit).await.ok().expect("load condition");
+        test_world.with(system, move |s| s.install_condition(fixture.ship, condition.into_condition(), fit)).await.unwrap();
         let player = capacitor_snapshot(&test_db, &test_world, system, fixture.ship).await.ok().expect("snapshot player").unwrap();
         assert_eq!(player.capacity, capacity);
         assert_eq!(player.level, capacity);
         let target = capacitor_snapshot(&test_db, &test_world, system, npc).await.ok().expect("snapshot NPC").unwrap();
         assert_eq!((target.capacity, target.level), (npc_capacity, npc_capacity));
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: fixture.character, ship_id: fixture.ship, system_id: system };
-        assert!(drain_capacitor(&cx, &fit, capacity / 2.0));
+        assert!(drain_capacitor(&cx, capacity, tau, capacity / 2.0));
         check_notification(rx.try_recv().unwrap(), fixture.character, fixture.ship, false);
-        assert!(!drain_capacitor(&cx, &fit, capacity * 2.0));
+        assert!(!drain_capacitor(&cx, capacity, tau, capacity * 2.0));
         assert!(rx.try_recv().is_err());
         let before_drain = filetime_now();
         let drained = drain_exact(&test_db, &test_world, system, fixture.ship, capacity * 2.0).await.ok().expect("drain player");
@@ -153,6 +174,22 @@ async fn capacitor_db_smoke() {
         let npc_full = capacitor_snapshot(&test_db, &test_world, system, npc).await.ok().expect("snapshot injected NPC").unwrap();
         assert_eq!(npc_full.level, npc_capacity);
         assert!(rx.try_recv().is_err());
+        let old = capacitor_snapshot(&test_db, &test_world, system, fixture.ship).await.unwrap().unwrap();
+        let (mut client, _peer) = crate::services::tests::client(test_db.clone(), fixture.character).await;
+        client.world = test_world.clone();
+        client.session.apply(vec![("charid", Value::Int(fixture.character)),
+            ("shipid", Value::Int(fixture.ship)), ("solarsystemid", Value::Int(system))]);
+        crate::services::effects::tests::fixture::gm_value(&mut client, fixture.ship,
+            ATTR_CAPACITOR_CAPACITY, old.capacity * 2.0).await;
+        let expected = Fit::load(&test_db, test_world.sde().clone(), fixture.character, fixture.ship).await.unwrap()
+            .value(Key::Ship, ATTR_CAPACITOR_CAPACITY);
+        assert!(expected > old.capacity, "fixture must increase effective capacity");
+        let current = capacitor_snapshot(&test_db, &test_world, system, fixture.ship).await.unwrap().unwrap();
+        assert_eq!(current.capacity, expected);
+        assert!(current.level < current.capacity, "changed maximum refilled the capacitor");
+        let amount = (current.capacity - current.level) / 2.0;
+        assert!(amount > 0.0);
+        assert!(inject(&test_db, &test_world, system, fixture.ship, amount).await.unwrap() > 0.0);
     }).await;
     world.remove_ball(system, fixture.ship).await;
     world.remove_ball(system, npc).await;
@@ -160,8 +197,9 @@ async fn capacitor_db_smoke() {
     let flush = world.flush_positions().await;
     { let mut state = state(); state.capacitor.remove(&fixture.ship); state.capacitor.remove(&npc); }
     drop(world);
-    fixture::cleanup(&db, fixture).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: fixture.account, character: fixture.character }], &[fixture.ship]).await.unwrap();
+    cleanup_ship(&db, None, fixture).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }
@@ -186,6 +224,8 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0)
         && t.group_id.and_then(|group| f.sde.wrecks.get(group, t.race_id.unwrap_or(0))).is_some())
         .expect("bounty-bearing NPC with wreck").type_id;
+    let npc_row = f.sde.types.get(npc_type).unwrap();
+    let wreck_type = npc_row.group_id.and_then(|group| f.sde.wrecks.get(group, npc_row.race_id.unwrap_or(0))).unwrap();
     let drone_type = f.sde.types.iter().find(|t| t.published == Some(true)
         && t.category_id == Some(infinity_core::consts::CATEGORY_DRONE)
         && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0))
@@ -257,6 +297,13 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         }, false, |_| true).await.unwrap().unwrap();
         attempt.disarm();
         assert!(second.ball(system, npc).await.is_none());
+        let wrecks = second.with(system, move |s| s.balls().filter(|b| b.type_id == wreck_type)
+            .map(|b| (b.id, b.slim.clone())).collect::<Vec<_>>()).await.unwrap();
+        assert_eq!(wrecks.len(), 1);
+        assert_ne!(wrecks[0].0, npc);
+        assert_eq!(wrecks[0].1.iter().find(|(key, _)| *key == "launcherID").map(|(_, value)| value), Some(&Value::Int(npc)));
+        let debris = spawn_wreck(&db, &second, system, wreck_type, owner, 1, [0.0; 3], None, None).await.unwrap();
+        assert!(!second.ball(system, debris).await.unwrap().slim.iter().any(|(key, _)| *key == "launcherID"));
         assert!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap() > balance);
         assert!(db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2 AND item_id<>$3",
             &[&owner, &system, &drone]).await.unwrap().get::<_, i64>("count") >= 2);
@@ -295,7 +342,7 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         b.owner_id = owner;
         let fit = Fit::for_space_type(sde.clone(), drone_type, Vec::new());
         let condition = prepare_condition_with_fit_key(&db, drone, &fit, Key::Ship).await.unwrap();
-        let prepared = crate::space::drone::PreparedDrone { ball: b, spec, condition, fit, key: Key::Ship };
+        let prepared = crate::space::drone::PreparedDrone { ball: b, spec, condition, fit, key: Key::Ship, npc_ignored: false };
         world.with(system, move |s| s.restore_drone(prepared, Arc::new(|_, _| Some(Box::pin(async {}))))).await.unwrap();
         let mut attempt = player_source(world.clone()).await;
         crate::services::combat::damage::apply_damage_guarded(&db, &world, system, drone, [1e30; 4], crate::services::combat::damage::DamageSource {
@@ -304,7 +351,9 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         }, false, |_| true).await.unwrap().unwrap();
         attempt.disarm();
         assert!(world.ball(system, drone).await.is_none());
-        assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_none());
+        let in_items = db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_some();
+        let in_recovery = db.query_opt("SELECT item_id FROM game.repairable_recovery_items WHERE item_id=$1", &[&drone]).await.unwrap().is_some();
+        assert_eq!(in_items, in_recovery, "drone item is either deleted or retained in recovery custody");
         assert_eq!(events().await.len(), 2);
     }).await;
     if let Some(ids) = world2.with(system, |s| s.balls().map(|b| b.id).collect::<Vec<_>>()).await {
@@ -321,4 +370,39 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
     f.cleanup().await;
     assert_eq!(deleted as usize, ids.len(), "captured self-kill events were not all removed");
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn capacitor_consumer_expires_inputs_before_timer_and_preserves_debit() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let hull = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SHIP)
+        && ty.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > 0.0)).unwrap().type_id;
+    let ship = -986_101;
+    let fit = Fit::for_space_type(sde.clone(), hull, vec![]);
+    let (fit, active, expired) = crate::services::effects::tests::fixture::due_fit(
+        fit, &sde, |fit| fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY));
+    let stats = ShipStats::from_fit(&fit, Key::Ship);
+    let mut system = crate::space::System::default();
+    system.add_persistent_ship(ball(ship, hull, Some(1)));
+    system.install_condition(ship, Condition { now: stats.max, stats, shield_at: 0 }, fit);
+    let membership = system.combat_membership_generation(ship);
+    state().capacitor.insert(ship, (active.min(expired) / 4.0, i64::MAX));
+    assert_eq!(system.combat_fit_revision(ship), Some(0));
+    let delta = active.min(expired) / 8.0;
+    let (snapshot, accepted, _) = capacitor_operation_in_actor(
+        &mut system, &sde, ship, Operation::Inject(delta), None, None).unwrap();
+    assert_eq!(snapshot.capacity, expired);
+    assert_eq!(accepted, delta);
+    assert!(snapshot.level >= active.min(expired) / 4.0 + delta && snapshot.level < expired);
+    assert_eq!(system.combat_membership_generation(ship), membership);
+    assert!(system.combat_fit_revision(ship).unwrap() > 0);
+    let revision = system.combat_fit_revision(ship);
+    let (_, drained, _) = capacitor_operation_in_actor(
+        &mut system, &sde, ship, Operation::Drain(delta), None, None).unwrap();
+    assert_eq!(drained, delta);
+    assert_eq!(system.combat_fit_revision(ship), revision);
+    crate::services::combat::forget_ship(ship);
 }

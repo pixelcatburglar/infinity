@@ -5,6 +5,14 @@ use super::*;
 use crate::services::tests::{client, fixture};
 mod space;
 mod rollback;
+mod gm;
+
+async fn dirt_stamp(db: &crate::db::Db, ship: i64) -> Option<i64> {
+    db.query_opt("SELECT dirt_timestamp FROM game.ship_dirt WHERE ship_item_id=$1", &[&ship]).await.unwrap().map(|row| row.get("dirt_timestamp"))
+}
+fn slim_stamp(ball: &Ball) -> Option<i64> {
+    ball.slim.iter().find(|(k, _)| *k == "dirtTime").and_then(|(_, v)| marshal::loads(&marshal::dumps(v)).unwrap().as_int())
+}
 
 async fn rpc(c: &mut Client, service: &str, method: &str, args: &[Value], bind: &Value) -> CallResult {
     crate::services::dispatch(c, &Call { service, method, args, kwargs: &Value::None, bound: true, bind_params: Some(bind) }).await
@@ -37,7 +45,7 @@ async fn dirt_persists_and_station_authorization_is_guarded() {
         let other = crate::dao::items::creation::rookie_ship(&d, hull, foreign.character, station, FLAG_HANGAR).await.unwrap();
         let object = crate::dao::items::creation::rookie_ship(&d, nonship, owner.character, station, FLAG_HANGAR).await.unwrap();
         crate::dao::characters::selection::set_ship(&d, owner.character, active).await.unwrap();
-        crate::dao::characters::ship::dock(&d, owner.character, station, system).await.unwrap();
+        d.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&owner.character, &station, &system]).await.unwrap();
         c.session.apply(vec![("shipid", Value::Int(active)), ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system)), ("solarsystemid", Value::None)]);
         let bind = Value::tuple([Value::Int(station), Value::Int(infinity_core::consts::GROUP_STATION)]);
         let args = [Value::Int(active)];
@@ -59,7 +67,11 @@ async fn dirt_persists_and_station_authorization_is_guarded() {
         assert!(matches!(rpc(&mut c, "ship", "ResetDirtTimestamp", &inactive_args, &bind).await.unwrap(), Value::Int(_)));
         rollback::failed_reset(&mut c, &d, active, owner.character, &bind).await;
         for id in [far, other, object, i64::MAX] {
-            for method in ["GetDirtTimestamp", "ResetDirtTimestamp"] { refused(rpc(&mut c, "ship", method, &[Value::Int(id)], &bind).await); }
+            for method in ["GetDirtTimestamp", "ResetDirtTimestamp"] {
+                let Err(CallError::User { msg, dict }) = rpc(&mut c, "ship", method, &[Value::Int(id)], &bind).await else { panic!("expected user refusal") };
+                assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                assert_eq!(dict, vec![("notify".into(), Value::unicode(infinity_core::messages::ship::CLEANING_INACCESSIBLE))]);
+            }
         }
         for method in ["GetDirtTimestamp", "ResetDirtTimestamp"] {
             for args in [vec![], vec![Value::None], vec![Value::Int(-1)], vec![Value::Int(active), Value::Int(active)]] { refused(rpc(&mut c, "ship", method, &args, &bind).await); }
@@ -70,9 +82,9 @@ async fn dirt_persists_and_station_authorization_is_guarded() {
         refused(rpc(&mut c, "ship", "ResetDirtTimestamp", &args, &bind).await);
         refused(rpc(&mut c, "ship", "GetDirtTimestamp", &args, &bind).await);
         c.login.user_id = owner.account;
-        crate::dao::characters::ship::dock(&d, owner.character, remote, system).await.unwrap();
+        d.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&owner.character, &remote, &system]).await.unwrap();
         refused(rpc(&mut c, "ship", "ResetDirtTimestamp", &args, &bind).await);
-        crate::dao::characters::ship::dock(&d, owner.character, station, system).await.unwrap();
+        d.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&owner.character, &station, &system]).await.unwrap();
         d.execute("UPDATE game.items SET singleton=false WHERE item_id=$1", &[&inactive]).await.unwrap();
         refused(rpc(&mut c, "ship", "ResetDirtTimestamp", &inactive_args, &bind).await);
         d.execute("UPDATE game.items SET singleton=true, flag_id=0 WHERE item_id=$1", &[&inactive]).await.unwrap();

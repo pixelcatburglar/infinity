@@ -1,11 +1,27 @@
 use super::*;
 
+#[cfg(any(feature = "tests-ships", feature = "tests-slash"))]
 pub(crate) fn cached_fitting(s: &System, ship: i64, module: i64, attr: i32) -> Option<(f64, Option<(bool, bool)>)> {
     let fit = &s.actor_combat.get(&ship)?.fit;
     Some((fit.value(Key::Ship, attr), fit.module_state(module)))
 }
 
+#[cfg(any(feature = "tests-ships", feature = "tests-slash"))]
+pub(crate) fn cached_overloaded(s: &System, ship: i64, module: i64) -> Option<bool> {
+    s.actor_combat.get(&ship)?.fit.module_overloaded(module)
+}
+
+#[cfg(feature = "tests-ships")]
+pub(crate) fn cached_module_attribute(
+    s: &System, ship: i64, module: i64, attr: i32,
+) -> Option<(f64, Option<u64>)> {
+    let fit = &s.actor_combat.get(&ship)?.fit;
+    fit.module_state(module)?;
+    Some((fit.value(Key::Module(module), attr), fit.projection_revision()))
+}
+
 impl System {
+    #[cfg(any(feature = "tests-services", feature = "tests-space"))]
     pub(crate) fn dying_snapshot(&self, ship: i64) -> Option<Arc<FirstLethalSnapshot>> {
         match self.actor_combat.get(&ship)?.pending.as_ref()? {
             PendingCombat::Dying { snapshot, .. } => Some(Arc::clone(snapshot)),
@@ -13,6 +29,7 @@ impl System {
         }
     }
 
+    #[cfg(any(feature = "tests-space", feature = "tests-combat"))]
     pub(crate) fn pending_reconciliations(&self) -> Vec<(i64, u64, u64)> {
         self.actor_combat.iter().filter_map(|(&ship, record)| {
             record.pending.as_ref().map(|pending| (ship, record.membership_generation,
@@ -23,6 +40,7 @@ impl System {
     }
 }
 
+#[cfg(feature = "tests-space")]
 fn condition(now: [f64; 3]) -> Condition {
     Condition {
         stats: ShipStats { max: [100.0, 200.0, 300.0], resonance: [[1.0; 4]; 3], shield_tau_ms: 1e30 },
@@ -30,7 +48,7 @@ fn condition(now: [f64; 3]) -> Condition {
         shield_at: filetime_now() + FILETIME_SECOND,
     }
 }
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn combat_clock_never_regresses_before_actor_tick() {
     let mut system = System::default();
     let future = filetime_now().saturating_add(FILETIME_SECOND);
@@ -41,7 +59,7 @@ fn combat_clock_never_regresses_before_actor_tick() {
 }
 
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn typed_damage_spills_once_and_preserves_existing_overdamage() {
     let mut c = condition([10.0, 20.0, 30.0]);
     let layers = absorb_preserving_overdamage(&mut c, [35.0, 0.0, 0.0, 0.0]);
@@ -52,7 +70,7 @@ fn typed_damage_spills_once_and_preserves_existing_overdamage() {
     assert_eq!(c.now, [0.0, -30.0, 25.0]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn rebase_retains_overdamage_and_unchanged_stats_do_not_reanchor() {
     let mut c = condition([80.0, 50.0, 70.0]);
     let original = c.stats.clone();
@@ -68,7 +86,7 @@ fn rebase_retains_overdamage_and_unchanged_stats_do_not_reanchor() {
     assert_eq!(&c.now[1..], &[50.0, 70.0]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn rebase_samples_shield_at_old_rate_and_new_anchor() {
     let mut c = condition([25.0, 100.0, 200.0]);
     c.stats.shield_tau_ms = 10_000.0;
@@ -86,7 +104,7 @@ fn rebase_samples_shield_at_old_rate_and_new_anchor() {
     assert_eq!(&c.now[1..], &old.now[1..]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn fitted_maxima_and_resistance_preserve_condition() {
     let mut c = condition([80.0, 150.0, 210.0]);
     let original = c.stats.clone();
@@ -106,7 +124,64 @@ fn fitted_maxima_and_resistance_preserve_condition() {
     assert!(rebase_condition(&mut c, boundary));
     assert_eq!(c.now, [20.0, 0.0, 0.0]);
 }
-#[tokio::test]
+#[cfg(feature = "tests-space")] #[test]
+fn floored_resonance_reaches_absorbed_damage_and_repair_stays_unscaled() {
+    crate::tests::init_config();
+    let floor = crate::config::game().combat.resonance_floor;
+    assert_eq!(floor, 0.05);
+    // A drone node's overrides pin all twelve resonances below the floor;
+    // ShipStats must carry the boundary value, not the raw base.
+    use infinity_core::consts::dogma::{
+        ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE,
+        ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE,
+        ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE,
+        ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE,
+        ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE,
+        ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE};
+    let resonance = [
+        ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE,
+        ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE,
+        ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE,
+        ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE,
+        ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE,
+        ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE,
+    ].map(|attr| (attr, 0.01));
+    let mut fit = Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, Vec::new());
+    fit.include_drone(7, 1, resonance.to_vec());
+    let stats = ShipStats::from_fit(&fit, Key::Drone(7));
+    assert!(stats.resonance.iter().flatten().all(|value| *value == floor));
+    // Every channel absorbs raw x floor, not raw x 0.01: 5% of the hit lands.
+    for channel in 0..4 {
+        let mut c = Condition { stats: stats.clone(), now: stats.max, shield_at: filetime_now() };
+        let mut raw = [0.0; 4];
+        raw[channel] = 20.0;
+        let dealt = absorb_preserving_overdamage(&mut c, raw);
+        assert!((dealt[0] - 20.0 * floor).abs() < 1e-9, "channel {channel}: {dealt:?}");
+        assert_eq!(&dealt[1..], &[0.0, 0.0]);
+    }
+    // Armor and hull absorb through their own floored resonance rows once the
+    // layers above are gone.
+    let mut c = Condition { stats: stats.clone(), now: [0.0, stats.max[1], stats.max[2]], shield_at: filetime_now() };
+    let dealt = absorb_preserving_overdamage(&mut c, [0.0, 0.0, 20.0, 0.0]);
+    assert!((dealt[1] - 20.0 * floor).abs() < 1e-9);
+    let mut c = Condition { stats: stats.clone(), now: [0.0, 0.0, stats.max[2]], shield_at: filetime_now() };
+    let dealt = absorb_preserving_overdamage(&mut c, [0.0, 0.0, 0.0, 20.0]);
+    assert!((dealt[2] - 20.0 * floor).abs() < 1e-9);
+    // Overflow re-applies the floored resonance at each layer on the way down.
+    let mut c = Condition { stats: stats.clone(), now: stats.max, shield_at: filetime_now() };
+    let dealt = absorb_preserving_overdamage(&mut c, [4000.0, 0.0, 0.0, 0.0]);
+    assert!((dealt[0] - 100.0).abs() < 1e-9);
+    assert!((dealt[1] - 100.0).abs() < 1e-9);
+    assert!(dealt[2] < 1e-9, "hull keeps nearly all its hitpoints: {dealt:?}");
+    // Repair restores the raw amount; resonance never scales it.
+    let mut system = System::default();
+    system.install_condition_with_key(1, Condition {
+        stats, now: [100.0, 50.0, 100.0], shield_at: filetime_now() }, fit, Key::Drone(7));
+    assert!(system.repair_condition(1, 1, 25.0, RepairSource::Local).unwrap());
+    assert_eq!(system.actor_combat.get(&1).unwrap().condition.now[1], 75.0);
+}
+
+#[cfg(feature = "tests-space")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn hub_damage_immunity_covers_single_and_area_native_paths() {
     crate::tests::init_config();
@@ -172,7 +247,7 @@ async fn hub_damage_immunity_covers_single_and_area_native_paths() {
 }
 
 
-#[tokio::test]
+#[cfg(feature = "tests-space")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn actor_dirty_ack_and_lethal_rollback_fences() {
     crate::tests::init_config();
@@ -200,6 +275,7 @@ async fn actor_dirty_ack_and_lethal_rollback_fences() {
     let mut system = System::default();
     system.insert(ball.clone());
     system.install_condition(1, Condition { now: stats.max, stats: stats.clone(), shield_at: filetime_now() }, fit);
+    assert!(system.install_pilot_npc_ignored(2, 1, true));
     for (id, character) in [(3, Some(3)), (4, None)] {
         let mut source_ball = ball.clone();
         source_ball.id = id;
@@ -390,6 +466,7 @@ async fn actor_dirty_ack_and_lethal_rollback_fences() {
     system.insert(victim);
     system.install_condition(6, Condition { now: stats.max, stats: stats.clone(), shield_at: filetime_now() },
         Fit::for_space_type(sde, ty, Vec::new()));
+    assert!(system.install_pilot_npc_ignored(6, 6, true));
     let make_drone = |system: &mut System| system.prepare_body_combat_source(5, None, None, None,
         crate::lua::events::resources::FactOrigin::Natural, |_| true).unwrap();
     let source = make_drone(&mut system);

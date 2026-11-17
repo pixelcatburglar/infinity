@@ -100,4 +100,4 @@ pub(super) async fn purchase(c: &mut Client, char_id: i64, args: &[Value], kwarg
     }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

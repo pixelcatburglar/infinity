@@ -1,11 +1,13 @@
 //! Sandboxed Lua RPC, intercept, command, post-commit event and periodic extensions.
 //! Scripts use client, world and DAO facades and a typed persistent store.
+//! The retained catalogue is loaded for startup validation even when Lua is
+//! disabled; VM calls, authored policy pinning and script events are disabled then.
 //! Sovereignty authored content uses a separate capability-closed environment in
 //! the same VM. Events and process-local ticks carry no synchronous reply.
-
 pub mod host;
 pub mod events;
 pub mod value;
+pub(crate) mod catalogue;
 pub(crate) mod content;
 pub(crate) mod gateway;
 mod json;
@@ -24,44 +26,83 @@ use value::WireValue;
 static HOST: OnceLock<Arc<reload::Host>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static EVENTS: OnceLock<tokio::sync::mpsc::UnboundedSender<events::GameEvent>> = OnceLock::new();
-
+static CATALOGUE: OnceLock<Arc<catalogue::Catalogue>> = OnceLock::new();
 pub fn enabled() -> bool { ENABLED.load(Ordering::Acquire) }
+
+/// Typed host-missing marker: `development-index` loaders downcast this to
+/// classify provider unavailability instead of guessing at message text.
+fn host_unavailable() -> CallError {
+    CallError::Internal(reload::HostUnavailable.into())
+}
+
 pub(crate) fn content_policy(namespace: &str) -> Result<content::PinnedPolicy, CallError> {
-    let host = HOST.get().ok_or_else(|| crate::services::db_err(anyhow::anyhow!("Lua host is not initialized")))?;
+    let host = HOST.get().ok_or_else(host_unavailable)?;
     content::PinnedPolicy::pin(host.snapshot(), namespace)
 }
 
 pub(crate) fn admit_content(policy: &content::PinnedPolicy) -> Result<content::OwnedAdmission, CallError> {
-    Ok(HOST.get().ok_or_else(|| crate::services::db_err(anyhow::anyhow!("Lua host is not initialized")))?.admit(policy)?)
+    Ok(HOST.get().ok_or_else(host_unavailable)?.admit(policy)?)
 }
 
-pub(crate) async fn retained_content(namespace: &str, version: &str) -> Result<content::PinnedPolicy, CallError> {
-    HOST.get().ok_or_else(|| crate::services::db_err(anyhow::anyhow!("Lua host is not initialized")))?.retained(namespace, version).await
+/// Loads the complete retained content catalogue once at startup; both the
+/// enabled host and the disabled path read the same shared entries.
+pub(crate) async fn initialize_content(config: &crate::config::lua::LuaConfig, db: &Db, sde: &Sde) -> anyhow::Result<()> {
+    CATALOGUE.set(catalogue::Catalogue::load(db, config, sde).await?)
+        .map_err(|_| anyhow::anyhow!("Lua content catalogue already initialized"))
+}
+
+/// Retained adaptation definitions without any VM or database read.
+pub(crate) fn retained_adaption(namespace: &str, version: &str) -> Result<Arc<content::adaption::Definitions>, CallError> {
+    CATALOGUE.get().ok_or_else(host_unavailable)?.adaption(namespace, version)
+}
+
+/// Validate a retained identity already checked at startup/publication; no
+/// executable policy or admission is supplied.
+pub(crate) fn validate_retained_identity(namespace: &str, version: &str) -> Result<(), CallError> {
+    CATALOGUE.get().ok_or_else(host_unavailable)?.validate_identity(namespace, version)
+}
+
+pub(crate) fn retained_content(namespace: &str, version: &str) -> Result<content::PinnedPolicy, CallError> {
+    HOST.get().ok_or_else(host_unavailable)?.catalogue().resolve(namespace, version)
 }
 
 /// Narrow access to retained content policies for prepared progress consumers.
 #[derive(Clone)]
-pub(crate) struct RetainedPolicies(Arc<reload::Host>);
+pub(crate) struct RetainedPolicies {
+    pub(crate) catalogue: Arc<catalogue::Catalogue>,
+    pub(crate) reload: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl RetainedPolicies {
-    pub(crate) async fn resolve(&self, namespace: &str, version: &str) -> Result<content::PinnedPolicy, CallError> {
-        self.0.retained(namespace, version).await
+    pub(crate) fn resolve(&self, namespace: &str, version: &str) -> Result<content::PinnedPolicy, CallError> {
+        self.catalogue.resolve(namespace, version)
+    }
+    /// Immutable activation history snapshot for one namespace.
+    pub(crate) fn activations(&self, namespace: &str) -> Result<Arc<Vec<crate::dao::lua_content::activations::ActivationRow>>, CallError> {
+        self.catalogue.activations(namespace)
+    }
+    /// Publication-stability check for a prepared delivery: false when a reload
+    /// is in flight (never waits) or the namespace head moved since prepare.
+    pub(crate) fn is_current(&self, namespace: &str, ordinal: Option<i64>) -> Result<bool, CallError> {
+        let Ok(_guard) = self.reload.try_lock() else { return Ok(false) };
+        self.catalogue.head(namespace).map(|head| head == ordinal)
     }
 }
 
 pub(crate) fn retained_policies() -> Result<RetainedPolicies, CallError> {
     if !enabled() {
-        return Err(crate::services::db_err(anyhow::anyhow!("Lua host is disabled")));
+        return Err(host_unavailable());
     }
-    Ok(RetainedPolicies(HOST.get().ok_or_else(|| crate::services::db_err(anyhow::anyhow!("Lua host is not initialized")))?.clone()))
+    Ok(HOST.get().ok_or_else(host_unavailable)?.policies())
 }
 
 
 pub async fn start(config: &Config, db: &Db, sde: &Arc<Sde>, world: &Arc<World>, hub: &Arc<crate::chat::Hub>) -> anyhow::Result<()> {
     if !config.lua.enabled { return Ok(()); }
+    let catalogue = CATALOGUE.get().cloned().ok_or_else(|| anyhow::anyhow!("Lua content catalogue is not initialized"))?;
     let pilots = host::pilots::Pilots::new(db, hub.clone()).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let resources = host::Resources { db: db.clone(), sde: sde.clone(), world: world.clone(), pilots, store_value_limit_bytes: config.lua.store_value_limit_bytes };
-    let host = Arc::new(reload::Host::new(config.lua.clone(), resources).await?);
+    let host = Arc::new(reload::Host::new(config.lua.clone(), resources, catalogue).await?);
     HOST.set(host).map_err(|_| anyhow::anyhow!("Lua host already initialized"))?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     EVENTS.set(tx).map_err(|_| anyhow::anyhow!("Lua event runner already initialized"))?;
@@ -91,7 +132,10 @@ async fn invoke(c: &mut Client, host: &Arc<reload::Host>, registry: &Registry, h
 
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    dispatch_host(c, call, HOST.get()?).await
+    let Some(host) = HOST.get() else {
+        return if call.service == "devIndexManager" && sovereignty_claimed(call) { Some(Err(host_unavailable())) } else { None };
+    };
+    dispatch_host(c, call, host).await
 }
 
 async fn dispatch_host(c: &mut Client, call: &Call<'_>, host: &Arc<reload::Host>) -> Option<CallResult> {
@@ -99,7 +143,7 @@ async fn dispatch_host(c: &mut Client, call: &Call<'_>, host: &Arc<reload::Host>
     let system = c.session.int("solarsystemid");
     let registry = host.snapshot();
     if sovereignty_claimed(call) && !registry.claims.rpc.contains_key(&(call.service.to_owned(), call.method.to_owned())) {
-        return None;
+        return if call.service == "devIndexManager" { Some(Err(host_unavailable())) } else { None };
     }
     let query = if sovereignty_claimed(call) {
         match sovereignty_query(call, character, system) {
@@ -149,7 +193,7 @@ async fn dispatch_host(c: &mut Client, call: &Call<'_>, host: &Arc<reload::Host>
             let result = result.pop_front().unwrap_or(mlua::Value::Nil);
             if result.is_nil() && is_wildcard { return None; }
             if crate::services::lua_fixed_claimed(call) {
-                let mut seen = registry.overrides.lock().unwrap_or_else(|e| e.into_inner());
+                let mut seen = crate::poison::lock_or_exit(registry.overrides.lock());
                 if seen.insert(exact) { tracing::info!(script = %handler.script, "Lua overrides fixed core answer {}::{}", call.service, call.method); }
             }
             Some(value::from_lua(result).map_err(|e| CallError::Internal(e.into())))
@@ -161,7 +205,8 @@ async fn dispatch_host(c: &mut Client, call: &Call<'_>, host: &Arc<reload::Host>
 pub(crate) fn sovereignty_claimed(call: &Call<'_>) -> bool {
     matches!((call.service, call.method),
         ("sovMgr", "GetSystemSovereigntyInfo" | "GetInfrastructureHubInfo" | "GetSovStructuresInfoForSolarSystem" | "GetSovStructuresInfoForLocalSolarSystem")
-        | ("allianceRegistry", "GetAllianceSovereigntyStructuresInfo" | "GetCapitalSystemInfo"))
+        | ("allianceRegistry", "GetAllianceSovereigntyStructuresInfo" | "GetCapitalSystemInfo")
+        | ("devIndexManager", "GetDevelopmentIndicesForSystem" | "GetAllDevelopmentIndices"))
 }
 
 fn sovereignty_query(call: &Call<'_>, character: Option<i64>, system: Option<i64>) -> Result<crate::services::sovereignty::queries::Query, CallError> {
@@ -186,6 +231,10 @@ fn sovereignty_query(call: &Call<'_>, character: Option<i64>, system: Option<i64
                 _ => return Err(invalid()),
             }
         }
+        ("devIndexManager", "GetDevelopmentIndicesForSystem", [Value::Int(id)])
+            if *id > 0 && !call.bound && call.bind_params.is_none() => Query::DevelopmentIndices { system_id: *id },
+        ("devIndexManager", "GetAllDevelopmentIndices", [])
+            if !call.bound && call.bind_params.is_none() => Query::AllDevelopmentIndices,
         _ => return Err(invalid()),
     };
     Ok(query)
@@ -251,7 +300,7 @@ pub(crate) fn on_event(event: events::GameEvent) {
 struct HookGuard(std::sync::Arc<std::sync::Mutex<Option<mlua::Thread>>>);
 impl Drop for HookGuard {
     fn drop(&mut self) {
-        if let Some(thread) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() { thread.remove_hook(); }
+        if let Some(thread) = crate::poison::lock_or_exit(self.0.lock()).take() { thread.remove_hook(); }
     }
 }
 
@@ -284,5 +333,5 @@ async fn invoke_no_context(registry: &Registry, config: &crate::config::lua::Lua
     }).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-content", feature = "tests-gateway", feature = "tests-lua")))]
 pub(crate) mod tests;

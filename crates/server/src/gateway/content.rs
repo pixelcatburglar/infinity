@@ -3,10 +3,10 @@
 //! only registered content keys are available.
 use anyhow::{Context, Result};
 use prost_reflect::{DynamicMessage, ReflectMessage, Value as PV};
-use crate::cdn;
+use infinity_content::cdn;
 use super::{context::HandlerContext, message::{response_for, child, set}};
 
-/// `{checkpoint: {url, version, crc}}` pointing at crate::cdn content.
+/// `{checkpoint: {url, version, crc}}` pointing at infinity_content::cdn content.
 pub(super) fn checkpoint(ctx: &HandlerContext<'_>, request: &str, content: &str) -> Result<DynamicMessage> {
     let (data, version) = cdn::content(content).context("unknown content")?;
     tracing::debug!("gateway: checkpoint {content} ({} bytes) for {request}", data.len());
@@ -29,4 +29,4 @@ pub(super) fn checkpoint_from_metadata(ctx: &HandlerContext<'_>, request: &str, 
     Ok(rsp)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

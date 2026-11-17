@@ -121,4 +121,4 @@ pub(crate) async fn redeem(resources: &Resources, identity: &Identity, user: i64
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

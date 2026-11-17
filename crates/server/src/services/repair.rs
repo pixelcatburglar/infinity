@@ -1,13 +1,8 @@
-//! Shared persisted repair: one damage writer used by the paid repairSvc settlement
-//! and by the GM `/heal` docked path. There is no direct client mirror; callers own
-//! authorization, prices, transactions and the dispatch of queued notifications.
-//! Condition lives in game.item_attributes through the dogma checkpoint primitives;
-//! item context comes from game.items and fitted values from `services::fit`.
-//! Only hull/armor damage flows through write_damage; ship shield, armor and hull
-//! condition is written as one `save_conditions` snapshot so the shield checkpoint
-//! timestamp stays consistent. In-space condition, capacitor and heat repair are not
-//! covered here: a docked ship has no actor state and its capacitor and rack heat are
-//! already full/zero in the dogma projection, so those fields are never written.
+//! Shared persisted repair for the paid repairSvc settlement and GM `/heal`.
+//! There is no direct client mirror; callers own authorization and pricing.
+//! Item damage uses game.item_attributes and game.items; fitted values use Fit.
+//! Docked condition is saved as a snapshot; space condition uses the actor and
+//! its existing checkpoints. Capacitor and rack heat in space remain in memory.
 //! Online state, charges, weapon groups, cargo and wallets are never touched.
 use std::sync::Arc;
 use infinity_core::consts::{CATEGORY_SHIP, FLAG_HANGAR};
@@ -21,6 +16,87 @@ use crate::db::{self, executor::Executor, outbox::{self, Outbox}};
 use crate::sde::Sde;
 use crate::services::{db_err, effects::notify::attribute_change, fit::{Fit, Key}, identity::Identity, inventory::{self, destination}, market, notify_error, CallError};
 use crate::space::World;
+
+/// The flag persisted by the ship undock operation for a ship in space.
+const SPACE_SHIP_FLAG: i32 = 0;
+
+pub(super) enum SpaceHealOutcome { Complete, ModulesOnly }
+
+struct SpaceRepair {
+    patch: crate::services::fit::attributes::CommittedFitting,
+    module_changes: Vec<Value>,
+}
+crate::progress::leaf_effect!(SpaceRepair);
+
+pub(super) async fn heal_space(
+    expected: &infinity_core::session::OnlineSession, db: &db::Db, world: &World, sde: &Arc<Sde>,
+) -> Result<SpaceHealOutcome, CallError> {
+    let system = expected.system_id.filter(|id| *id > 0).ok_or_else(no_ship)?;
+    expected.ship_id.filter(|id| *id > 0).ok_or_else(no_ship)?;
+    if expected.character_id <= 0 || expected.station_id.is_some() { return Err(no_ship()); }
+    let captured = expected.clone();
+    let (generation, gate) = world.with(system, move |s| s.capture_space_heal(&captured))
+        .await.flatten().ok_or_else(refuse)?;
+    let operation_expected = expected.clone();
+    let dispatch_expected = expected.clone();
+    let ack = {
+        let _market = market::lock().await;
+        db.transaction(
+            move |tx, outbox| {
+                let expected = operation_expected.clone();
+                let sde = sde.clone();
+                Box::pin(async move { heal_space_in(tx, outbox, &expected, &sde).await })
+            },
+            |(), outbox| std::future::ready(Ok(dispatch_space_heal(world, dispatch_expected, generation, gate, outbox))),
+        ).await?
+    };
+    Ok(if matches!(ack.await, Ok(true)) { SpaceHealOutcome::Complete } else { SpaceHealOutcome::ModulesOnly })
+}
+
+async fn heal_space_in(
+    ex: &(impl Executor + ?Sized), outbox: &mut Outbox<SpaceRepair>,
+    expected: &infinity_core::session::OnlineSession, sde: &Sde,
+) -> Result<(), CallError> {
+    let owner = expected.character_id;
+    let ship = expected.ship_id.filter(|id| *id > 0 && owner > 0).ok_or_else(no_ship)?;
+    let system = expected.system_id.filter(|id| *id > 0).ok_or_else(no_ship)?;
+    if expected.station_id.is_some() { return Err(refuse()); }
+    selection::lock_character(ex, owner).await.map_err(db_err)?;
+    let current = character_ship::current(ex, owner).await.map_err(db_err)?.ok_or_else(refuse)?;
+    if current.ship != Some(ship) || current.system != Some(system) || current.station.is_some() { return Err(refuse()); }
+    let items = locked_targets(ex, sde, ship, owner, system, SPACE_SHIP_FLAG).await?;
+    let modules: Vec<_> = items.iter().filter(|item| item.item_id != ship).map(|item| item.item_id).collect();
+    let overrides = if modules.is_empty() { Vec::new() } else { dogma::overrides_for(ex, &modules).await.map_err(db_err)? };
+    let mut damage = overrides.into_iter().filter(|row| row.attribute_id == ATTR_HULL_DAMAGE).peekable();
+    let mut module_changes = Vec::new();
+    for &item in &modules {
+        let old = if damage.peek().is_some_and(|row| row.item_id == item) { damage.next().unwrap().value } else { 0.0 };
+        if old != 0.0 {
+            module_changes.push(write_damage(ex, owner, item, ATTR_HULL_DAMAGE, old, 0.0).await?.ok_or_else(refuse)?);
+        }
+    }
+    outbox.operation(SpaceRepair {
+        patch: crate::services::fit::attributes::CommittedFitting::repaired_modules(modules.into_iter()),
+        module_changes,
+    });
+    Ok(())
+}
+
+fn dispatch_space_heal(
+    world: &World, expected: infinity_core::session::OnlineSession, generation: u64,
+    actor_gate: Arc<tokio::sync::Mutex<()>>, outbox: Outbox<SpaceRepair>,
+) -> tokio::sync::oneshot::Receiver<bool> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut entries = outbox.into_entries().into_iter();
+    let Some(outbox::Effect::Operation(repair)) = entries.next() else { unreachable!("space repair operation missing") };
+    assert!(entries.next().is_none(), "unexpected space repair effect");
+    let system = expected.system_id.expect("validated space system");
+    world.post(system, move |s| {
+        let applied = s.publish_space_heal(expected, generation, actor_gate, repair.patch, repair.module_changes);
+        let _ = sender.send(applied);
+    });
+    receiver
+}
 
 /// Persist one armor or hull damage value on a locked singleton and build its
 /// `OnModuleAttributeChanges` entry. `None` means the target row was lost; the
@@ -40,13 +116,13 @@ fn not_docked() -> CallError { notify_error(messages::gm::GM_SHIP_DOCKED_REQUIRE
 /// Project the loaded rows onto the repair set: the ship row plus direct children
 /// in fitting slots. Malformed members refuse instead of being silently skipped;
 /// cargo and other non-fitted contents never join the set.
-fn targets(sde: &Sde, items: &mut Vec<GameItem>, ship: i64, owner: i64, station: i64) -> Result<(), CallError> {
+fn targets(sde: &Sde, items: &mut Vec<GameItem>, ship: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
     items.retain(|item| item.item_id == ship
         || (item.location_id == ship && inventory::is_fitting_flag(item.flag_id)));
     let mut found = false;
     for item in items.iter() {
         if item.item_id == ship {
-            if !item.singleton || item.owner_id != owner || item.location_id != station || item.flag_id != FLAG_HANGAR
+            if !item.singleton || item.owner_id != owner || item.location_id != location || item.flag_id != flag
                 || sde.types.get(item.type_id).and_then(|t| t.category_id) != Some(CATEGORY_SHIP) { return Err(refuse()); }
             found = true;
         } else if !item.singleton || item.owner_id != owner || sde.types.get(item.type_id).is_none() { return Err(refuse()); }
@@ -65,6 +141,24 @@ fn same_item(a: &GameItem, b: &GameItem) -> bool {
     a.item_id == b.item_id && a.type_id == b.type_id && a.owner_id == b.owner_id
         && a.location_id == b.location_id && a.flag_id == b.flag_id
         && a.quantity == b.quantity && a.singleton == b.singleton
+}
+
+async fn locked_targets(
+    ex: &(impl Executor + ?Sized), sde: &Sde, ship: i64, owner: i64, location: i64, flag: i32,
+) -> Result<Vec<GameItem>, CallError> {
+    let mut before = crate::dao::items::loading::load_items(ex, ItemQuery::IdOrLocation(ship)).await.map_err(db_err)?;
+    targets(sde, &mut before, ship, owner, location, flag)?;
+    let requests: Vec<_> = before.iter().map(|item| LockRequest { item_id: item.item_id, strength: LockStrength::Update }).collect();
+    let locks = destination::lock_items(ex, sde, &requests, &[]).await?;
+    if before.iter().any(|item| locks.row(item.item_id).is_none_or(|row| row.jump_clone_id.is_some() || !same_snapshot(item, row))) {
+        return Err(refuse());
+    }
+    let mut reloaded = crate::dao::items::loading::load_items(ex, ItemQuery::IdOrLocation(ship)).await.map_err(db_err)?;
+    targets(sde, &mut reloaded, ship, owner, location, flag)?;
+    if reloaded.len() != before.len() || reloaded.iter().zip(&before).any(|(a, b)| !same_item(a, b)) {
+        return Err(refuse());
+    }
+    Ok(before)
 }
 
 /// Repair the selected ship and every fitted module of a docked character in one
@@ -96,20 +190,7 @@ async fn heal_docked_in(
     selection::lock_character(ex, owner).await.map_err(db_err)?;
     let current = character_ship::current(ex, owner).await.map_err(db_err)?.ok_or_else(refuse)?;
     if current.ship != Some(ship) || current.station != Some(station) { return Err(refuse()); }
-    // Ship plus fitted children only; other direct contents are read but never locked.
-    let mut loaded = crate::dao::items::loading::load_items(ex, ItemQuery::IdOrLocation(ship)).await.map_err(db_err)?;
-    targets(&sde, &mut loaded, ship, owner, station)?;
-    let before = loaded;
-    let requests: Vec<_> = before.iter().map(|item| LockRequest { item_id: item.item_id, strength: LockStrength::Update }).collect();
-    let locks = destination::lock_items(ex, &sde, &requests, &[]).await?;
-    if before.iter().any(|item| locks.row(item.item_id).is_none_or(|row| row.jump_clone_id.is_some() || !same_snapshot(item, row))) {
-        return Err(refuse());
-    }
-    let mut reloaded = crate::dao::items::loading::load_items(ex, ItemQuery::IdOrLocation(ship)).await.map_err(db_err)?;
-    targets(&sde, &mut reloaded, ship, owner, station)?;
-    if reloaded.len() != before.len() || reloaded.iter().zip(&before).any(|(a, b)| !same_item(a, b)) {
-        return Err(refuse());
-    }
+    let before = locked_targets(ex, &sde, ship, owner, station, FLAG_HANGAR).await?;
 
     let fit = Fit::load(ex, sde, owner, ship).await?;
     let (old_shield, old_armor, old_hull) = crate::services::combat::prepare_condition_with_fit(ex, ship, &fit).await?.scalars();
@@ -142,4 +223,4 @@ async fn heal_docked_in(
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, any(feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;

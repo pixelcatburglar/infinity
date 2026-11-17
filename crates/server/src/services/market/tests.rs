@@ -18,7 +18,7 @@ async fn modify_request(c: &Client, id: i64, price: f64) -> ModifyRequest {
     let o = orders::my_order(&c.db, c.session.int("charid").unwrap(), id).await.unwrap().unwrap();
     ModifyRequest { order_id: id, new_price: price, bid: o.bid, station_id: o.at.id,
         system_id: o.at.system, old_price: o.price.wire_isk(), range: o.range,
-        remaining: i64::from(o.vol_remaining), issued: o.issued.unwrap_or_else(today),
+        remaining: i64::from(o.vol_remaining), issued: o.issued.unwrap_or_else(|| filetime_day_start(filetime_now())),
         requested_scope: o.scope }
 }
 
@@ -152,4 +152,29 @@ async fn plex_orders_match_regional_order_book() {
             assert!(rowset_args[1].items().is_some());
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated database with SDE"]
+async fn recovery_custody_is_not_a_market_sell_source() {
+    use crate::services::tests::fixture;
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let owner = fixture::create(&db).await.unwrap();
+    let (client, _peer) = crate::services::tests::client(db.clone(), owner.character).await;
+    let ty = client.sde.types.iter().next().unwrap().type_id;
+    let station = client.sde.map.stations().next().unwrap().station_id;
+    let (item, group) = fixture::recovery_custody(&db, owner.character, station, ty).await;
+    let test_db = db.clone();
+    let outcome = tokio::spawn(async move {
+        let party = TradeParty { issuer: owner.character, financial: crate::services::wallets::ownership::FinancialOwner::cash(owner.character) };
+        let result = assets::source(&test_db, &client.sde, party, item, station, i64::from(ty), 1, None).await;
+        assert!(matches!(result, Err(CallError::User { dict, .. }) if dict.iter().any(|(_, value)| *value == Value::unicode(infinity_core::messages::MARKET_SELL_ITEM_MUST_BE_IN_STATION_HANGAR))));
+        let row = test_db.query_one("SELECT owner_id,location_id FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
+        assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id")), (infinity_core::consts::NPC_CORP_INTERBUS, group));
+    }).await;
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
+    db.execute("DELETE FROM game.repairable_recovery_groups WHERE group_id=$1", &[&group]).await.unwrap();
+    fixture::cleanup(&db, owner).await.unwrap();
+    outcome.unwrap();
 }

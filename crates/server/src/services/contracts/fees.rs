@@ -89,5 +89,5 @@ pub(super) fn calculate(
     Fees { sales_tax, sales_tax_rate, sales_tax_maximum, brokers_fee, deposit }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

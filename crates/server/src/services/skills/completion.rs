@@ -138,7 +138,11 @@ pub(super) async fn advance_tx<E>(tx: &(impl Executor + ?Sized), outbox: &mut Ou
 
 pub(super) async fn finish_tx<E: From<OnlineChanged> + Send>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Arc<Sde>, fences: &online::OnlineFences, char_id: i64, now: i64, progress: &AdvanceResult, additional: &[i32]) -> Result<(), CallError> {
     reschedule(tx, char_id).await?;
-    online::reconcile_owner(tx, sde, outbox, fences, char_id).await?;
+    let inputs = online::reconcile_owner(tx, sde, outbox, fences, char_id, now).await?;
+    // The committed character domain follows every reconcile operation and
+    // precedes the display notifications. It is emitted even when nothing else
+    // changed, so remap, empty fits and owned drones still update their actors.
+    outbox.operation(OnlineChanged::Character { owner: char_id, fences: fences.clone(), inputs }.into());
     let types: BTreeSet<_> = progress.completed.iter().map(|(type_id, _)| *type_id).chain(progress.expert_skills.iter().copied()).chain(additional.iter().copied()).collect();
     if !types.is_empty() {
         let snapshot = super::effective::snapshot_at(tx, sde, char_id, now).await?;
@@ -187,4 +191,4 @@ pub(crate) fn handle(db: Db, world: Arc<World>, job: Job) -> Pin<Box<dyn Future<
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

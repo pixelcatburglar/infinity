@@ -1,5 +1,5 @@
 //! Read-only session information, GM security-status controls and the
-//! read-only queries `/where`, `/who`, `/wallet` and `/hangar`.
+//! read-only queries `/where`, `/who`, `/wallet`, `/hangar` and `/version`.
 //! Security is stored by Crimewatch and follows its normal notification path.
 //!
 //! `/where` reads the live session (`solarsystemid2` is canonical while
@@ -12,9 +12,9 @@
 //! account; the caps it prints bound client display only, never the
 //! stored values. `/hangar` lists the caller's direct `FLAG_HANGAR` ship
 //! rows at the current station: the active ship row first, the rest in
-//! item order, packed rows by exact quantity. None of them writes game
-//! data, loads systems or consults targets.
-use super::{db_err, slash_error, Client, CallError};
+//! item order, packed rows by exact quantity. None writes game data, loads
+//! systems or consults targets; `/version` needs no selected character.
+use super::{args, db_err, slash_error, Client, CallError};
 use infinity_core::consts::{CATEGORY_SHIP, CLIENT_MAX_SHORT_AMOUNT, FLAG_HANGAR, TYPE_ALLIANCE, TYPE_CHARACTER, TYPE_CORPORATION};
 use infinity_core::messages;
 use crate::{dao, db::outbox::dispatch_world, isk, services::crimewatch};
@@ -37,9 +37,7 @@ fn system_name(c: &Client, system: Option<i64>) -> Option<&str> {
 /// selected character like the other read-only self queries.
 async fn where_command(c: &Client, args: &[String]) -> Result<String, CallError> {
     no_args(args, messages::gm::GM_WHERE_USAGE)?;
-    if c.session.int("charid").is_none_or(|id| id <= 0) {
-        return Err(slash_error(messages::gm::GM_ARGS_NO_CHARACTER.into()));
-    }
+    args::positive_character(&c.session)?;
     let system = c.session.int("solarsystemid2");
     let station = c.session.int("stationid");
     Ok(messages::gm::gm_where(system, system_name(c, system), station))
@@ -80,8 +78,7 @@ async fn who(c: &Client, args: &[String]) -> Result<String, CallError> {
 /// and the PLEX vault of the authenticated account.
 async fn wallet(c: &Client, args: &[String]) -> Result<String, CallError> {
     no_args(args, messages::gm::GM_WALLET_USAGE)?;
-    let char_id = c.session.int("charid").filter(|id| *id > 0)
-        .ok_or_else(|| slash_error(messages::gm::GM_ARGS_NO_CHARACTER.into()))?;
+    let char_id = args::positive_character(&c.session)?;
     let isk = dao::wallets::characters::balance(&c.db, char_id).await.map_err(db_err)?;
     let plex = dao::accounts::plex::balance(&c.db, c.login.user_id).await.map_err(db_err)?;
     Ok(messages::gm::gm_wallet(&isk.decimal(), &plex, &isk::personal_client_cap().decimal(), CLIENT_MAX_SHORT_AMOUNT))
@@ -91,9 +88,7 @@ async fn wallet(c: &Client, args: &[String]) -> Result<String, CallError> {
 /// active ship is the same qualifying row, shown first exactly once.
 async fn hangar(c: &Client, args: &[String]) -> Result<String, CallError> {
     no_args(args, messages::gm::GM_HANGAR_USAGE)?;
-    let Some(character) = c.session.int("charid").filter(|id| *id > 0) else {
-        return Err(slash_error(messages::gm::GM_ARGS_NO_CHARACTER.into()));
-    };
+    let character = args::positive_character(&c.session)?;
     let Some(station) = c.session.int("stationid") else {
         return Err(slash_error(messages::gm::GM_SHIP_DOCKED_REQUIRED.into()));
     };
@@ -142,6 +137,10 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             "who" => who(c, args).await,
             "wallet" => wallet(c, args).await,
             "hangar" => hangar(c, args).await,
+            "version" => {
+                no_args(args, messages::gm::GM_VERSION_USAGE)?;
+                Ok(messages::gm::gm_version(crate::build_identity::VERSION, crate::build_identity::commit()))
+            }
             _ => Err(slash_error(messages::gm::GM_INFO_USAGE.into())),
         };
     }
@@ -176,5 +175,5 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
     Ok(messages::gm::gm_secstatus(char_id, status))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-slash"))]
 mod tests;

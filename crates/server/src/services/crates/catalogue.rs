@@ -16,16 +16,14 @@ use crate::services::inventory::reachability::{Endpoint, Reachability};
 use crate::services::items::load_items;
 use marshal::Value;
 
-fn invalid() -> CallError { notify_error(messages::INVALID_SOURCE) }
-
 async fn race(c: &Client, identity: &Identity) -> Result<Option<i32>, CallError> {
     if identity.char_id == 0 { return Ok(None); }
     training::race(&c.db, identity.char_id).await.map_err(db_err)?
-        .map(Some).ok_or_else(invalid)
+        .map(Some).ok_or_else(super::invalid_source)
 }
 
 pub(super) async fn directory(c: &Client, type_id: i32, custom: bool, identity: &Identity) -> CallResult {
-    let definition = c.sde.crates.get(type_id).ok_or_else(invalid)?;
+    let definition = c.sde.crates.get(type_id).ok_or_else(super::invalid_source)?;
     let race_id = race(c, identity).await?;
     let entries = definition.preview(custom, race_id)
         .map_err(|_| notify_error(messages::METADATA_UNAVAILABLE))?;
@@ -36,19 +34,19 @@ pub(super) async fn directory(c: &Client, type_id: i32, custom: bool, identity: 
 
 pub(super) async fn instance(c: &Client, item_id: i64, custom: bool) -> CallResult {
     let identity = Identity::of_client(c);
-    if identity.char_id == 0 { return Err(invalid()); }
+    if identity.char_id == 0 { return Err(super::invalid_source()); }
     let _guard = crate::services::market::lock().await;
     let item = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?
-        .into_iter().next().ok_or_else(invalid)?;
+        .into_iter().next().ok_or_else(super::invalid_source)?;
     if let Some((corp, location, flag)) = corporate_custody(&c.db, Some(&c.sde), item.item_id).await? {
-        let station = crate::services::inventory::access::custody_station(&c.db, location, flag).await?.ok_or_else(invalid)?;
+        let station = crate::services::inventory::access::custody_station(&c.db, location, flag).await?.ok_or_else(super::invalid_source)?;
         if corp != identity.corp_id || (item.owner_id != corp && item.owner_id != identity.char_id)
             || (flag == FLAG_CORP_DELIVERIES && identity.station_id != Some(location))
             || !may_view_corp_hangar(&c.db, identity.char_id, corp, station, flag).await? {
-            return Err(invalid());
+            return Err(super::invalid_source());
         }
     } else if item.owner_id != identity.char_id {
-        return Err(invalid());
+        return Err(super::invalid_source());
     }
     let endpoint = Endpoint { location: item.location_id, flag: item.flag_id };
     let reach = Reachability::capture(&identity, &c.db, &c.world, c.session.int("solarsystemid"), &[endpoint]).await?;

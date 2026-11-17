@@ -229,5 +229,5 @@ pub(crate) async fn query(c: &Client, call: &Call<'_>) -> CallResult {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

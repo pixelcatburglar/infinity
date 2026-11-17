@@ -3,6 +3,7 @@ use std::sync::Arc;
 use infinity_core::consts::CATEGORY_ENTITY;
 use crate::{
     services::combat::{damage::apply_damage_guarded, groups_health::ShipStats},
+    services::effects::registry::EffectAttribute,
     services::fit::{Fit, Key},
     space::{NpcBrain, NpcConfig, WarpState, MODE_STOP},
 };
@@ -57,8 +58,9 @@ async fn run_source(db: &crate::db::Db, world: &Arc<crate::space::World>, system
     assert_eq!(attempt.facts().actual_actor_character, None);
     assert!(attempt.facts().source_is_npc);
     assert_eq!(attempt.facts().effect_id, Some(effect_id));
-    apply_source(&SourceContext { db, world, system, source: me, target: victim, module: 0, effect, duration_ms, fit: &fit,
-        key: crate::services::fit::Key::Ship, guard: SourceGuard::Npc { source: me.id, target: victim.id, generation },
+    let inputs = crate::services::effects::parameters::capture_source(&fit, crate::services::fit::Key::Ship, effect, duration_ms).expect("real remote repair source capture");
+    apply_source(&SourceContext { db, world, system, source: me, target: victim, module: 0, effect, duration_ms,
+        inputs: &inputs, guard: SourceGuard::Npc { source: me.id, target: victim.id, generation },
         attacker: None, drone: None, phase: DronePhase::Begin }, Some(attempt)).await
 }
 

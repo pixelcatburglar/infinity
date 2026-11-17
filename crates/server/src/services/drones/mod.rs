@@ -15,5 +15,5 @@ pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     if call.service == "entity" { Some(entity::dispatch(c, call).await) } else { None }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-economy", feature = "tests-effects", feature = "tests-services", feature = "tests-ships", feature = "tests-social", feature = "tests-space", feature = "tests-slash")))]
 pub(crate) mod tests;

@@ -38,7 +38,6 @@ fn location_wire_shapes_resolve_only_canonical_custody() {
 async fn current_membership_roles_divisions_and_payer() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let baseline = super::super::tests::database_fingerprint(&db).await;
     let sde = std::sync::Arc::new(Sde::load(&db).await.unwrap());
     let station = sde.map.stations().next().expect("SDE station").station_id;
     let office_type = sde.types.iter().next().expect("SDE type").type_id;
@@ -49,7 +48,7 @@ async fn current_membership_roles_divisions_and_payer() {
     db.execute("UPDATE game.characters SET corporation_id = $1 WHERE character_id = ANY($2)", &[&corp, &vec![actor, ceo]]).await.unwrap();
     db.execute("UPDATE game.characters SET corp_roles=$2 WHERE character_id=$1", &[&ceo, &ROLE_DIRECTOR]).await.unwrap();
     let office = crate::dao::items::transfers::insert(&db, office_type, corp, station, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::offices::insert(&db, office, corp, station, 1).await.unwrap();
+    crate::dao::offices::insert(&db, office, corp, station, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let db = test_db;
@@ -94,12 +93,16 @@ async fn current_membership_roles_divisions_and_payer() {
         assert!(owner(&db, actor, corp, None).await.is_err());
         assert!(payer(&db, actor, Some(&account_value(corp, i64::from(ACCOUNT_CASH + 1)))).await.is_err());
     }).await;
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account, character: actor }, crate::services::tests::fixture::Fixture { account, character: ceo }], &[office]).await.unwrap();
     db.execute("DELETE FROM game.offices WHERE office_id = $1", &[&office]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id = $1", &[&office]).await.unwrap();
     db.execute("DELETE FROM game.corp_titles WHERE corporation_id = $1", &[&corp]).await.unwrap();
     db.execute("DELETE FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE user_id = $1", &[&account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
-    assert_eq!(super::super::tests::database_fingerprint(&db).await, baseline);
+    assert!(db.query_opt("SELECT 1 FROM game.offices WHERE office_id=$1", &[&office]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.corp_titles WHERE corporation_id=$1", &[&corp]).await.unwrap().is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap().is_none());
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     result.unwrap();
 }

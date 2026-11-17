@@ -57,6 +57,11 @@ pub(crate) async fn descendants(ex: &(impl Executor + ?Sized), roots: &[i64]) ->
     ).await?.iter().map(|row| row.get("id")).collect())
 }
 
+/// Whether a clone-marked row is immediately below any verified subtree parent.
+pub(crate) async fn has_clone_child(ex: &(impl Executor + ?Sized), parents: &[i64]) -> Result<bool, Error> {
+    Ok(ex.query_opt("SELECT 1 FROM game.items WHERE location_id = ANY($1) AND jump_clone_id IS NOT NULL LIMIT 1", &[&parents]).await?.is_some())
+}
+
 /// Read the subtree and supplied ancestors before classifying lock requests.
 pub(crate) async fn descendants_and_ancestors(ex: &(impl Executor + ?Sized), roots: &[i64], ancestors: &[i64]) -> Result<Vec<i64>, Error> {
     let mut ids = descendants(ex, roots).await?;
@@ -78,4 +83,16 @@ pub(crate) async fn move_item(ex: &(impl Executor + ?Sized), item: &Item, locati
                ) SELECT EXISTS (SELECT 1 FROM changed) AS matched",
         &[&item.item_id, &location, &flag, &owner, &singleton, &item.owner_id, &item.location_id, &item.flag_id, &item.quantity, &item.singleton, &item.type_id]).await?;
     Ok(Matched::from_row(&row).matched)
+}
+
+struct PilotedShip { ship_id: i64 }
+impl PilotedShip {
+    fn from_row(row: &Row) -> Self { Self { ship_id: row.get("ship_id") } }
+}
+
+/// Live characters currently piloting any of `ships` (game.characters.ship_id);
+/// destruction callers refuse when a subtree hull is in active use.
+pub(crate) async fn actively_piloted(ex: &(impl Executor + ?Sized), ships: &[i64]) -> Result<Vec<i64>, Error> {
+    Ok(ex.query("SELECT DISTINCT ship_id FROM game.characters WHERE ship_id = ANY($1) AND ship_id IS NOT NULL AND NOT deleted", &[&ships]).await?
+        .iter().map(|row| PilotedShip::from_row(row).ship_id).collect())
 }

@@ -28,7 +28,7 @@ enum TxError { Stale, Domain(Error) }
 impl From<crate::db::Error> for TxError { fn from(e: crate::db::Error) -> Self { Self::Domain(e.into()) } }
 impl From<Error> for TxError { fn from(e: Error) -> Self { Self::Domain(e) } }
 impl From<ApplyError> for TxError {
-    fn from(e: ApplyError) -> Self { match e { ApplyError::Reprepare => Self::Stale, ApplyError::Call(e) => Self::Domain(Error::Internal(e)) } }
+    fn from(e: ApplyError) -> Self { match e { ApplyError::Reprepare => Self::Stale, ApplyError::Call(e) | ApplyError::Permanent(e) => Self::Domain(Error::Internal(e)), ApplyError::Terminal => Self::Domain(Error::Unavailable) } }
 }
 impl TransactionError for TxError {
     fn is_retryable_transaction(&self) -> bool { match self { Self::Domain(e) => e.is_retryable_transaction(), Self::Stale => false } }
@@ -44,8 +44,8 @@ pub(crate) async fn progress(resources: &Resources, identity: &Identity, user: i
     let actor = identity.char_id;
     let config = Arc::new(config.clone());
     if target != identity.char_id { return Err(Error::Forbidden); }
-    let goal = crate::uuid_text::format(&crate::uuid_text::parse(goal, crate::uuid_text::Case::Either).ok_or(Error::Invalid)?);
-    let uuid = crate::uuid_text::format(request_uuid.try_into().map_err(|_| Error::Invalid)?);
+    let goal = infinity_content::uuid_text::format(&infinity_content::uuid_text::parse(goal, infinity_content::uuid_text::Case::Either).ok_or(Error::Invalid)?);
+    let uuid = infinity_content::uuid_text::format(request_uuid.try_into().map_err(|_| Error::Invalid)?);
     let payload = serde_json::json!({"increment": increment.to_string()});
     let current = crate::lua::content_policy(DAILY_GOALS_NAMESPACE)?;
     let _admission = crate::lua::admit_content(&current)?;
@@ -84,4 +84,4 @@ pub(crate) async fn progress(resources: &Resources, identity: &Identity, user: i
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

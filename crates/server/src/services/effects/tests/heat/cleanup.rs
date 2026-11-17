@@ -15,14 +15,14 @@ async fn primed_unfit_clears_only_after_commit() {
         && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0)
         && t.effects().iter().any(|e| e.effect_id == EFFECT_MICROWARPDRIVE)
         && t.effects().iter().any(|e| e.effect_id == OVERLOAD_SPEED)).expect("overloadable propulsion module").type_id;
-    let before = fixture::fingerprint(&db).await.unwrap();
-    let f = fixture::create(&db, hull, module, FLAG_MED_SLOT_FIRST).await.unwrap();
+    let f = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[ShipItemSpec { type_id: module, flag_id: FLAG_MED_SLOT_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] }]).await.unwrap();
+    let module_id = f.module();
     let world = World::new(db.clone(), sde.clone(), 1);
     let w = world.clone();
     let d = db.clone();
     let result = tokio::spawn(async move {
         fixture::position(&d, f.ship, SYSTEM, [0.0; 3]).await.unwrap();
-        dogma::set_override(&d, f.module, REQUIRED_THERMODYNAMICS, 0.0).await.unwrap();
+        dogma::set_override(&d, module_id, REQUIRED_THERMODYNAMICS, 0.0).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
@@ -33,19 +33,19 @@ async fn primed_unfit_clears_only_after_commit() {
         c.notify_tx = tx.clone();
         w.register_pilot(f.character, tx);
         w.add_ship(SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await.unwrap();
-        let args = [Value::Int(f.module), Value::Int(i64::from(OVERLOAD_SPEED))];
+        let args = [Value::Int(module_id), Value::Int(i64::from(OVERLOAD_SPEED))];
         call(&mut c, "dogmaIM", "Overload", &args, None).await.ok().expect("prime idle module");
-        assert!(heat::overloaded_modules().contains(&f.module));
+        assert!(heat::overloaded_modules().contains(&module_id));
         assert!(heat::ship_state(&w, SYSTEM, f.ship).await.is_none_or(|r| r.iter().all(|r| r.incoming == 0.0)));
         while rx.try_recv().is_ok() {}
         c.outbox.clear();
         let destination = Container::Item(f.ship);
-        assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &destination, f.module, Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.is_err());
-        assert!(heat::overloaded_modules().contains(&f.module));
+        assert!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &destination, module_id, Some(f.ship), Some(FLAG_HI_SLOT_FIRST), None, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.is_err());
+        assert!(heat::overloaded_modules().contains(&module_id));
         assert!(rx.try_recv().is_err());
         assert!(c.outbox.is_empty());
-        assert_eq!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &destination, f.module, Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.ok().unwrap(), Some(f.module));
-        assert!(!heat::overloaded_modules().contains(&f.module));
+        assert_eq!(inventory::movement::move_item(&crate::services::identity::Identity::of_client(&c), &c.db, &c.world, &c.sde, c.session.int("solarsystemid"), c.notify_tx.clone(), &destination, module_id, Some(f.ship), Some(FLAG_CARGO), None, |n| crate::services::effects::online::dispatch_notification(n, &c.world, &c.notify_tx, c.session.int("charid"))).await.ok().unwrap(), Some(module_id));
+        assert!(!heat::overloaded_modules().contains(&module_id));
         assert!(heat::ship_state(&w, SYSTEM, f.ship).await.is_none_or(|r| r.iter().all(|r| r.incoming == 0.0)));
     }).await;
     heat::clear_character(f.character);
@@ -54,8 +54,9 @@ async fn primed_unfit_clears_only_after_commit() {
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);
-    fixture::cleanup(&db, f).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, module_id]).await.unwrap();
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }
@@ -73,8 +74,8 @@ async fn unsupported_overload_does_not_change_state() {
         && t.effects().iter().any(|e| e.effect_id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER))
         .find_map(|t| t.effects().iter().find(|e| sde.dogma.effect(e.effect_id).is_some_and(|row| row.effect_category == Some(5)))
             .map(|e| (t.type_id, e.effect_id))).expect("unsupported mutadaptive module with overload effect");
-    let before = fixture::fingerprint(&db).await.unwrap();
-    let f = fixture::create(&db, hull, module, FLAG_MED_SLOT_FIRST).await.unwrap();
+    let f = create_ship(&db, hull, ShipLocation::Docked { station: 1 }, &[ShipItemSpec { type_id: module, flag_id: FLAG_MED_SLOT_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] }]).await.unwrap();
+    let module_id = f.module();
     let world = World::new(db.clone(), sde.clone(), 1);
     let w = world.clone();
     let d = db.clone();
@@ -89,11 +90,11 @@ async fn unsupported_overload_does_not_change_state() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = tx.clone();
         w.register_pilot(f.character, tx);
-        w.add_ship(SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await.unwrap();
+        fixture::admit(&d, &w, SYSTEM, fixture::ball(f.ship, hull, f.character, Some(f.character), 0.0)).await;
         let cap = combat::groups_health::capacitor_snapshot(&d, &w, SYSTEM, f.ship).await.ok().unwrap().unwrap().level;
-        let args = [Value::Int(f.module), Value::Int(i64::from(overload))];
+        let args = [Value::Int(module_id), Value::Int(i64::from(overload))];
         assert!(call(&mut c, "dogmaIM", "Overload", &args, None).await.is_err());
-        assert!(!heat::overloaded_modules().contains(&f.module));
+        assert!(!heat::overloaded_modules().contains(&module_id));
         assert!(heat::ship_state(&w, SYSTEM, f.ship).await.is_none_or(|r| r.iter().all(|r| r.heat == 0.0 && r.incoming == 0.0)));
         assert_eq!(combat::groups_health::capacitor_snapshot(&d, &w, SYSTEM, f.ship).await.ok().unwrap().unwrap().level, cap);
         assert!(rx.try_recv().is_err());
@@ -105,8 +106,9 @@ async fn unsupported_overload_does_not_change_state() {
     combat::forget_ship(f.ship);
     let flush = world.flush_positions().await;
     drop(world);
-    fixture::cleanup(&db, f).await.unwrap();
-    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, module_id]).await.unwrap();
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

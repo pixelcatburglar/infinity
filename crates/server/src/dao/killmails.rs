@@ -1,4 +1,4 @@
-//! Killmail, immutable war affiliation snapshots and retail prices in `game.killmails` and `game.retail_prices`.
+//! Killmail and immutable war affiliation snapshots in `game.killmails`.
 //! This DAO has no direct client mirror or wire contract; the owning service handles those.
 //! Transactions, security policy and notifications are not handled here.
 
@@ -7,21 +7,6 @@ use tokio_postgres::Row;
 
 pub(crate) mod wars;
 
-pub(crate) struct Price {
-    pub type_id: i32,
-    pub average: f64,
-}
-
-impl Price {
-    fn from_row(r: &Row) -> Self {
-        Self { type_id: r.get("type_id"), average: r.get("average") }
-    }
-}
-
-pub(crate) async fn prices(ex: &(impl Executor + ?Sized), types: &[i32]) -> Result<Vec<Price>, db::Error> {
-    let rows = ex.query("SELECT type_id, average FROM game.retail_prices WHERE type_id = ANY($1)", &[&types]).await?;
-    Ok(rows.iter().map(Price::from_row).collect())
-}
 pub(crate) async fn victim_exists(ex: &(impl Executor + ?Sized), ship: i64) -> Result<bool, db::Error> {
     Ok(ex.query_opt("SELECT 1 FROM game.killmails WHERE victim_item_id=$1", &[&ship]).await?.is_some())
 }

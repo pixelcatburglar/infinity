@@ -95,7 +95,7 @@ async fn routed_conversion_holds_merge_replay_and_refusals() -> anyhow::Result<(
         for (flag, count, wire) in [(FLAG_CARGO, 1_i64, 1_i64), (FLAG_GENERAL_MINING_HOLD, 3, 3), (FLAG_SPECIAL_ASTEROID_HOLD, i64::MAX, infinity_core::consts::CLIENT_MAX_SHORT_AMOUNT), (FLAG_SPECIALIZED_ICE_HOLD, 5, 5), (FLAG_SPECIALIZED_GAS_HOLD, 7, 7)] {
             let id = stack(&f, source_type, f.owner, f.ship, flag, count).await?;
             let admission = inventory::hold_storage::check_destination(&f.db, &f.sde, f.owner, f.ship, flag,
-                &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: count }], inventory::hold_storage::Replaced { items: &[id], reloads: &[] }, None).await;
+                &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: count }], inventory::hold_storage::Replaced { items: &[id], reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await;
             if admission.is_err() {
                 ensure!(rpc(&mut f, "CompressItemInSpace", &[Value::Int(id), Value::Int(ship)]).await.is_err(), "invalid hold admitted compression");
                 ensure!(item(&f.db, &f.sde, id).await.map_err(|e| anyhow!("load: {e:?}"))?.context("source missing after refusal")?.quantity == count, "refusal consumed source");
@@ -159,7 +159,7 @@ async fn queued_notifications_rollback_without_dispatch() -> anyhow::Result<()> 
             Box::pin(async move {
                 let locks = inventory::hold_storage::check_destination(tx, &sde, context.character, context.ship, expected_source.flag_id,
                     &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: expected_source.quantity }],
-                    inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, None).await?.unwrap();
+                    inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await?.unwrap();
                 compress_tx(tx, &sde, outbox, &context, expected_source, &locks).await?;
                 let entries = std::mem::take(outbox).into_entries();
                 let notifications: Vec<_> = entries.into_iter().filter_map(|entry| match entry { Effect::Notification(Notification::DirectClient { event, args }) => Some((event, args)), _ => None }).collect();
@@ -221,7 +221,7 @@ async fn routed_refusals_preserve_inventory_and_stale_helper_refuses() -> anyhow
         let mut outbox = Outbox::default();
         let locks = inventory::hold_storage::check_destination(&f.db, &f.sde, context.character, context.ship, expected.flag_id,
             &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: expected.quantity }],
-            inventory::hold_storage::Replaced { items: &[expected.item_id], reloads: &[] }, None).await.map_err(|e| anyhow!("capacity: {e:?}"))?.unwrap();
+            inventory::hold_storage::Replaced { items: &[expected.item_id], reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await.map_err(|e| anyhow!("capacity: {e:?}"))?.unwrap();
         ensure!(compress_tx(&f.db, &f.sde, &mut outbox, &context, SourceGuard::from(&expected), &locks).await.is_err(), "stale source admitted");
         ensure!(outbox.into_entries().is_empty(), "stale source produced notices");
         ensure!(item(&f.db, &f.sde, stale_source).await.map_err(|e| anyhow!("load: {e:?}"))?.context("refusal source missing")?.quantity == 3, "refusal changed source");
@@ -291,7 +291,7 @@ async fn helper_merge_reports_old_quantity_in_post_commit_outbox() -> anyhow::Re
             Box::pin(async move {
                 let locks = inventory::hold_storage::check_destination(tx, &sde, context.character, context.ship, expected_source.flag_id,
                     &[inventory::hold_storage::Addition { type_id: output, singleton: false, quantity: expected_source.quantity }],
-                    inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, None).await?.unwrap();
+                    inventory::hold_storage::Replaced { items: &[expected_source.item_id], reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await?.unwrap();
                 compress_tx(tx, &sde, outbox, &context, expected_source, &locks).await
             })
         }, |value, outbox: Outbox| async move { Ok::<_, CallError>((value, outbox.into_entries())) }).await.map_err(|e| anyhow!("helper: {e:?}"))?;

@@ -2,12 +2,13 @@
 # Release-only build (no debug target, per AGENT.md).
 
 FROM rust:1.97-slim-bookworm AS build
+ARG INFINITY_BUILD_COMMIT=dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked \
+    INFINITY_BUILD_COMMIT="$INFINITY_BUILD_COMMIT" cargo build --release --locked \
  && mkdir -p /out \
  && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} /out/ \;
 

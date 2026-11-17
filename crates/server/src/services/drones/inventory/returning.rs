@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use marshal::Value;
 use crate::client::Client;
-use infinity_core::consts::{dogma::ATTR_DRONE_CAPACITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_SCOOP_RANGE, FLAG_DRONE_BAY, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, OWNER_UNOWNED};
+use infinity_core::consts::{CATEGORY_DRONE, DRONE_SCOOP_RANGE, FLAG_DRONE_BAY, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, OWNER_UNOWNED};
 use crate::dao::items::{drones, loading::ItemQuery, ship as ship_dao};
 use crate::db::{Db, executor::Executor, outbox::{dispatch_world, Outbox}};
 use infinity_core::messages::drones as text;
 use crate::sde::Sde;
-use crate::services::{db_err, notify_error, Call, CallError, CallResult, fit::{Fit, Key}, items::load_items};
+use crate::services::{db_err, notify_error, Call, CallError, CallResult, fit::Fit, items::load_items};
 use crate::space::{dist, drone::DroneRecord, World, MODE_WARP};
 
 fn parse(args: &[Value]) -> Result<Vec<i64>, CallError> {
@@ -29,14 +29,6 @@ fn parse(args: &[Value]) -> Result<Vec<i64>, CallError> {
 #[derive(Clone, Copy)]
 struct Source { id: i64, owner: i64, type_id: i32, generation: u64 }
 
-async fn prepare_ship(ex: &(impl Executor + ?Sized), sde: &Sde, owner: i64, ship: i64, system: i64) -> Result<(), CallError> {
-    let unavailable = || notify_error(text::NOT_AVAILABLE);
-    if !ship_dao::lock_reload_ship(ex, ship).await.map_err(db_err)? || crate::dao::characters::selection::ship_id(ex, owner).await.map_err(db_err)? != Some(ship) { return Err(unavailable()); }
-    let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;
-    if hull.owner_id != owner || hull.location_id != system || hull.category_id != i64::from(CATEGORY_SHIP) || !hull.singleton { return Err(unavailable()); }
-    Ok(())
-}
-
 async fn lock_sources(ex: &(impl Executor + ?Sized), sde: &Sde, system: i64, sources: &[Source]) -> Result<(), CallError> {
     for source in sources {
         if !ship_dao::lock_reload_ship(ex, source.id).await.map_err(db_err)? { return Err(notify_error(text::NOT_AVAILABLE)); }
@@ -47,19 +39,20 @@ async fn lock_sources(ex: &(impl Executor + ?Sized), sde: &Sde, system: i64, sou
     Ok(())
 }
 
-async fn check_bay(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, ship: i64, capacity: f64, sources: &[Source]) -> Result<(), CallError> {
+async fn check_bay(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, capacity: crate::services::inventory::hold_storage::HoldCapacity, sources: &[Source]) -> Result<(), CallError> {
     let additions: Vec<_> = sources.iter().map(|source| crate::services::inventory::hold_storage::Addition {
         type_id: source.type_id, singleton: true, quantity: 1,
     }).collect();
-    crate::services::inventory::hold_storage::check_destination(ex, sde, owner, ship, FLAG_DRONE_BAY, &additions, Default::default(), Some(capacity)).await.map(|_| ())
+    crate::services::inventory::hold_storage::check_destination(ex, sde, owner, capacity.ship(), FLAG_DRONE_BAY, &additions, Default::default(), crate::services::inventory::hold_storage::CapacitySource::Captured(capacity)).await.map(|_| ())
 }
 
 async fn move_sources(ex: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sde, owner: i64, ship: i64, system: i64, sources: &[Source]) -> Result<(), CallError> {
     for source in sources {
         if !drones::return_to_bay(ex, source.id, source.owner, system, owner, ship).await.map_err(db_err)? { return Err(notify_error(text::NOT_AVAILABLE)); }
         let item = load_items(ex, sde, ItemQuery::Id(source.id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(text::NOT_AVAILABLE))?;
-        let changes = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(system)), (Value::Int(IX_FLAG), Value::Int(0)), (Value::Int(IX_OWNER_ID), Value::Int(source.owner))]);
-        outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), changes, Value::None]);
+        crate::services::inventory::notifications::notify_owner_item_change(outbox, &item, owner, vec![
+            (IX_LOCATION_ID, Value::Int(system)), (IX_FLAG, Value::Int(0)), (IX_OWNER_ID, Value::Int(source.owner)),
+        ]);
     }
     Ok(())
 }
@@ -102,11 +95,13 @@ pub(crate) async fn scoop(c: &mut Client, call: &Call<'_>) -> CallResult {
     let bound = call.bind_params.and_then(Value::items);
     if !call.bound || c.session.int("stationid").is_some() || !bound.is_some_and(|v| v.len() == 2 && v[0].as_int() == Some(system) && v[1].as_int() == Some(5)) { return Err(notify_error(text::NOT_IN_SPACE)); }
     let world = c.world.clone();
+    let admission = world.admission(system).map_err(db_err)?;
     let admission_ids = ids.clone();
     let market = crate::services::market::lock().await;
+    admission.check().map_err(db_err)?;
     let gate = world.lock_condition_snapshot(system).await.map_err(|error| CallError::Internal(error.into()))?;
     let fit = Fit::load_in_space(&c.db, &world, system, owner, ship).await?;
-    let capacity = fit.value(Key::Ship, ATTR_DRONE_CAPACITY);
+    let capacity = crate::services::inventory::hold_storage::HoldCapacity::capture(&fit, FLAG_DRONE_BAY)?;
     let sde = c.sde.clone();
     let (sources, transition) = world.with(system, move |s| {
         let ship_ball = s.sampled_ball(ship).filter(|b| b.char_id == Some(owner) && b.mode != MODE_WARP && b.cloak == 0).ok_or_else(|| notify_error(text::NOT_IN_SPACE))?;
@@ -138,9 +133,9 @@ pub(crate) async fn scoop(c: &mut Client, call: &Call<'_>) -> CallResult {
             let sources = sources.clone(); let sde = sde.clone(); let snapshots = snapshots.clone();
             let facts = facts.clone();
             Box::pin(async move {
-                prepare_ship(tx, &sde, owner, ship, system).await?;
+                super::prepare_ship(tx, &sde, owner, ship, system).await?;
                 lock_sources(tx, &sde, system, &sources).await?;
-                check_bay(tx, &sde, owner, ship, capacity, &sources).await?;
+                check_bay(tx, &sde, owner, capacity, &sources).await?;
                 let written = crate::services::combat::checkpoint_conditions_in(tx, outbox, system, &snapshots, facts.as_deref()).await?;
                 if facts.as_ref().is_some_and(|frame| frame.condition_rows().any(|row| !written.contains(&row.0))) {
                     return Err(CallError::Internal(anyhow::anyhow!("collateral condition was not checkpointed")));
@@ -173,7 +168,10 @@ pub(crate) async fn scoop(c: &mut Client, call: &Call<'_>) -> CallResult {
                     }
                     removed
                 }).await.unwrap_or(false);
-                if removed { if let Err(error) = dispatch_world((), outbox, world_for_job) { tracing::warn!(system, ?error, "committed drone scoop notification failed"); } Ok(Ok(())) }
+                // Committed durable facts dispatch even when the scene removal
+                // failed or the actor is gone; `removed` only gates the error.
+                if let Err(error) = dispatch_world((), outbox, world_for_job) { tracing::warn!(system, ?error, "committed drone scoop notification failed"); }
+                if removed { Ok(Ok(())) }
                 else { Ok(Err(CallError::Internal(anyhow::anyhow!("system actor stopped during committed drone scoop")))) }
             }
         }).await.and_then(|result| result);
@@ -275,8 +273,8 @@ pub(crate) async fn contact(db: &Db, world: &Arc<World>, system: i64, drone: Dro
     let world = world.clone();
     tokio::spawn(async move {
         let id = drone.id; let generation = drone.generation;
-        let Some(claimed) = world.with(system, move |s| s.drone_claim_contact(id, generation)).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))? else { return Ok(()) };
-        let result = contact_claimed(&db, &world, system, &claimed, return_to_bay).await;
+        let Some((claimed, sender)) = world.with(system, move |s| s.drone_claim_contact(id, generation).map(|claimed| { let sender = s.pilot_sender(claimed.owner); (claimed, sender) })).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))? else { return Ok(()) };
+        let result = contact_claimed(&db, &world, system, &claimed, return_to_bay, sender).await;
         if result.is_err() {
             world.with(system, move |s| {
                 if matches!(s.combat_phase(id), Some(crate::space::combat::CombatPhase::Live)) { s.drone_idle(id, generation); }
@@ -295,16 +293,17 @@ async fn contact_return_claimed(
     ship: i64,
     fit: Fit,
     transition: crate::space::system::boarding::CombatTransition,
-    market: tokio::sync::MutexGuard<'static, ()>,
+    market: crate::services::market::economy_lock::Guard,
     gate: tokio::sync::OwnedMutexGuard<()>,
+    sender: Option<crate::space::NotifyTx>,
 ) -> Result<(), CallError> {
     let id = drone.id;
     let facts = transition.facts.clone();
     let combat_generation = transition.entries[0].1.generation;
     let owner = drone.owner;
-    let capacity = fit.value(Key::Ship, ATTR_DRONE_CAPACITY);
+    let capacity = crate::services::inventory::hold_storage::HoldCapacity::capture(&fit, FLAG_DRONE_BAY)?;
     let pending = drone.pending.clone();
-    let destination = pending.as_ref().map(|pending| crate::services::mining::destination(&fit, pending.type_id));
+    let destination = pending.as_ref().map(|pending| crate::services::mining::destination(&fit, pending.type_id)).transpose()?;
     let persistent_generation = world.with(system, move |s| s.persistent_generation(id)).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?.ok_or_else(|| CallError::Internal(anyhow::anyhow!("drone generation unavailable")))?;
     let source = Source { id, owner, type_id: drone.spec.type_id, generation: persistent_generation };
     let snapshots = transition_snapshots(&transition);
@@ -323,9 +322,9 @@ async fn contact_return_claimed(
             let sde = sde.clone(); let snapshots = snapshots.clone(); let pending = pending.clone();
             let facts = facts.clone();
             Box::pin(async move {
-                prepare_ship(tx, &sde, owner, ship, system).await?;
+                super::prepare_ship(tx, &sde, owner, ship, system).await?;
                 lock_sources(tx, &sde, system, std::slice::from_ref(&source)).await?;
-                check_bay(tx, &sde, owner, ship, capacity, std::slice::from_ref(&source)).await?;
+                check_bay(tx, &sde, owner, capacity, std::slice::from_ref(&source)).await?;
                 let written = crate::services::combat::checkpoint_conditions_in(tx, outbox, system, &snapshots, facts.as_deref()).await?;
                 if facts.as_ref().is_some_and(|frame| frame.condition_rows().any(|row| !written.contains(&row.0))) {
                     return Err(CallError::Internal(anyhow::anyhow!("collateral condition was not checkpointed")));
@@ -334,7 +333,7 @@ async fn contact_return_claimed(
                     return Err(CallError::Internal(anyhow::anyhow!("drone condition was not checkpointed")));
                 }
                 let delivery = if let Some(pending) = pending.as_ref() {
-                    let outcome = crate::services::mining::deliver(tx, outbox, &sde, owner, ship, system, id, pending, destination.expect("pending mining has a destination")).await?;
+                    let outcome = crate::services::mining::deliver(tx, outbox, &sde, owner, system, id, pending, destination.expect("pending mining has a destination")).await?;
                     if let crate::services::mining::DeliveryOutcome::Full { flag } = outcome {
                         return Err(notify_error(if flag == infinity_core::consts::FLAG_CARGO { infinity_core::messages::CARGO_HOLD_FULL } else { infinity_core::messages::MINING_HOLD_FULL }));
                     }
@@ -358,25 +357,25 @@ async fn contact_return_claimed(
                         && s.commit_combat_transition(id, token)
                         && s.remove_ball(id).is_some()
                 }).await.unwrap_or(false);
+                // The committed durable facts always dispatch through the
+                // captured sender; only the scene feedback depends on `removed`.
+                if let Err(error) = crate::db::outbox::dispatch_sender((), outbox, world_for_job, sender.as_ref()) { tracing::warn!(system, ?error, "committed drone return notification failed"); }
+                if let Some(delivery) = delivery {
+                    match delivery {
+                        crate::services::mining::DeliveryOutcome::Delivered(receipt) => {
+                            if let Err(error) = crate::services::mining::delivered(&db_for_job, &world_for_job, system, owner, receipt).await { tracing::warn!(system, ?error, "committed drone delivery completion failed"); }
+                        }
+                        crate::services::mining::DeliveryOutcome::Depleted { rock } => {
+                            if let Err(error) = crate::services::mining::reconcile_depleted(&db_for_job, &world_for_job, system, rock).await { tracing::warn!(system, ?error, "depleted rock reconciliation failed"); }
+                        }
+                        crate::services::mining::DeliveryOutcome::Missing => {}
+                        crate::services::mining::DeliveryOutcome::Full { .. } => {}
+                        crate::services::mining::DeliveryOutcome::NoYield => {}
+                    }
+                }
                 let result = if !removed {
                     Err(CallError::Internal(anyhow::anyhow!("system actor stopped during committed drone return")))
-                } else {
-                    if let Err(error) = dispatch_world((), outbox, world_for_job) { tracing::warn!(system, ?error, "committed drone return notification failed"); }
-                    if let Some(delivery) = delivery {
-                        match delivery {
-                            crate::services::mining::DeliveryOutcome::Delivered(receipt) => {
-                                if let Err(error) = crate::services::mining::delivered(&db_for_job, &world_for_job, system, owner, receipt).await { tracing::warn!(system, ?error, "committed drone delivery completion failed"); }
-                            }
-                            crate::services::mining::DeliveryOutcome::Depleted { rock } => {
-                                if let Err(error) = crate::services::mining::reconcile_depleted(&db_for_job, &world_for_job, system, rock).await { tracing::warn!(system, ?error, "depleted rock reconciliation failed"); }
-                            }
-                            crate::services::mining::DeliveryOutcome::Missing => {}
-                            crate::services::mining::DeliveryOutcome::Full { .. } => {}
-                            crate::services::mining::DeliveryOutcome::NoYield => {}
-                        }
-                    }
-                    Ok(())
-                };
+                } else { Ok(()) };
                 Ok(result)
             }
         }).await.and_then(|result| result);
@@ -439,7 +438,7 @@ async fn contact_return_claimed(
     receiver.await.map_err(|error| CallError::Internal(error.into()))?
 }
 
-async fn contact_claimed(db: &Db, world: &Arc<World>, system: i64, drone: &DroneRecord, return_to_bay: bool) -> Result<(), CallError> {
+async fn contact_claimed(db: &Db, world: &Arc<World>, system: i64, drone: &DroneRecord, return_to_bay: bool, sender: Option<crate::space::NotifyTx>) -> Result<(), CallError> {
     let id = drone.id; let generation = drone.generation;
     let (drone, transition, preflight_fit, market, gate) = if return_to_bay {
         let market = crate::services::market::lock().await;
@@ -457,24 +456,24 @@ async fn contact_claimed(db: &Db, world: &Arc<World>, system: i64, drone: &Drone
     let ship = if return_to_bay { drone.target } else { drone.controller }.ok_or_else(|| notify_error(text::NOT_AVAILABLE))?;
     if let Some(transition) = transition {
         return contact_return_claimed(db, world, system, &drone, ship, preflight_fit.expect("return preflight fit"), transition,
-            market.expect("return market guard"), gate.expect("return snapshot gate")).await;
+            market.expect("return market guard"), gate.expect("return snapshot gate"), sender).await;
     }
 
     let fit = Fit::load_in_space(db, world, system, owner, ship).await?;
-    let capacity = fit.value(Key::Ship, ATTR_DRONE_CAPACITY);
+    let capacity = crate::services::inventory::hold_storage::HoldCapacity::capture(&fit, FLAG_DRONE_BAY)?;
     let source = Source { id, owner, type_id: drone.spec.type_id, generation: world.with(system, move |s| s.persistent_generation(id)).await.flatten().ok_or_else(|| notify_error(text::NOT_AVAILABLE))? };
     let pending = drone.pending.clone();
-    let destination = pending.as_ref().map(|pending| crate::services::mining::destination(&fit, pending.type_id));
+    let destination = pending.as_ref().map(|pending| crate::services::mining::destination(&fit, pending.type_id)).transpose()?;
     let sde = world.sde().clone();
     let market = crate::services::market::lock().await;
     db.transaction(|tx, outbox: &mut Outbox| {
         let source = source.clone(); let pending = pending.clone(); let sde = sde.clone();
         Box::pin(async move {
-            prepare_ship(tx, &sde, owner, ship, system).await?;
+            super::prepare_ship(tx, &sde, owner, ship, system).await?;
             lock_sources(tx, &sde, system, std::slice::from_ref(&source)).await?;
-            if return_to_bay { check_bay(tx, &sde, owner, ship, capacity, std::slice::from_ref(&source)).await?; }
+            if return_to_bay { check_bay(tx, &sde, owner, capacity, std::slice::from_ref(&source)).await?; }
             let delivery = if let Some(pending) = pending.as_ref() {
-                let outcome = crate::services::mining::deliver(tx, outbox, &sde, owner, ship, system, id, pending, destination.expect("pending mining has a destination")).await?;
+                let outcome = crate::services::mining::deliver(tx, outbox, &sde, owner, system, id, pending, destination.expect("pending mining has a destination")).await?;
                 if let crate::services::mining::DeliveryOutcome::Full { flag } = outcome {
                     return Err(notify_error(if flag == infinity_core::consts::FLAG_CARGO { infinity_core::messages::CARGO_HOLD_FULL } else { infinity_core::messages::MINING_HOLD_FULL }));
                 }
@@ -532,7 +531,7 @@ async fn contact_claimed(db: &Db, world: &Arc<World>, system: i64, drone: &Drone
                     }
                     _ => {}
                 }
-                if let Err(error) = dispatch_world((), outbox, &world) {
+                if let Err(error) = crate::db::outbox::dispatch_sender((), outbox, &world, sender.as_ref()) {
                     tracing::warn!(system, ?error, "committed drone contact notification failed");
                 }
                 drop(market);
@@ -544,4 +543,4 @@ async fn contact_claimed(db: &Db, world: &Arc<World>, system: i64, drone: &Drone
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

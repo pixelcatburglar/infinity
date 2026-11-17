@@ -111,4 +111,4 @@ async fn execute(c: &mut Client, system: i64, owner: i64, ship: i64, id: i64, co
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

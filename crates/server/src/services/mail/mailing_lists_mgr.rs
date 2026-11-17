@@ -127,5 +127,5 @@ async fn handle(c: &Client, call: &Call<'_>, count: usize) -> CallResult {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

@@ -23,5 +23,5 @@ pub(super) fn register(lua: &Lua, env: &Table, script: &str) -> Result<()> {
     env.set("log", table)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

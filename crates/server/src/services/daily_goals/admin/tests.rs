@@ -11,7 +11,7 @@ fn audit_scope_and_payload_are_typed() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated test process, dedicated INFINITY_TEST_DATABASE_URL with SDE, and external flock"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn real_qa_authority_replay_and_cascade() {
     const CHILD: &str = "INFINITY_DAILY_ADMIN_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -37,6 +37,7 @@ async fn real_qa_authority_replay_and_cascade() {
     std::fs::write(root.join("content/daily_goals/data/daily_goals.json"), data).unwrap();
     let mut host = crate::config::Config::default();
     host.lua.enabled = true; host.lua.scripts_dir = root.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&host.lua, &db, &sde).await.unwrap();
     crate::lua::start(&host, &db, &sde, &world, &hub).await.unwrap();
     let resources = Resources::from_world(&world).unwrap();
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -72,7 +73,7 @@ async fn real_qa_authority_replay_and_cascade() {
     a.unwrap(); b.unwrap();
     let first = instances::get(&db, fixture.character, id).await.unwrap().unwrap();
     assert_eq!(first.progress, 1);
-    let first_audit = receipts::audit(&db, &crate::uuid_text::format(&[1; UUID_LEN])).await.unwrap().unwrap();
+    let first_audit = receipts::audit(&db, &infinity_content::uuid_text::format(&[1; UUID_LEN])).await.unwrap().unwrap();
     assert_eq!((first_audit.actor_id, first_audit.subject_id), (fixture.character, fixture.character));
     assert!(matches(&first_audit, fixture.character, fixture.character, id, &serde_json::json!({"increment":"1"})).unwrap());
     assert!(!matches(&first_audit, fixture.account, fixture.character, id, &serde_json::json!({"increment":"1"})).unwrap());
@@ -102,10 +103,10 @@ async fn real_qa_authority_replay_and_cascade() {
     }, |(), _| async move { Ok(()) }).await;
     assert!(matches!(revoked, Err(TxError::Domain(Error::Forbidden))));
     assert!(matches!(progress(&resources, &identity, fixture.account, &[7; UUID_LEN], fixture.character, id, 1, &config, at).await, Err(Error::Forbidden)));
-    assert!(receipts::audit(&db, &crate::uuid_text::format(&[7; UUID_LEN])).await.unwrap().is_none());
+    assert!(receipts::audit(&db, &infinity_content::uuid_text::format(&[7; UUID_LEN])).await.unwrap().is_none());
     assert_eq!(instances::get(&db, fixture.character, id).await.unwrap().unwrap(), second);
     db.execute("UPDATE game.accounts SET role=$2 WHERE user_id=$1", &[&fixture.account, &ROLE_QA]).await.unwrap();
-    let rollback_id = crate::uuid_text::format(&[5; UUID_LEN]);
+    let rollback_id = infinity_content::uuid_text::format(&[5; UUID_LEN]);
     let rollback = AuditRow { audit_id: rollback_id.clone(), actor_id: fixture.character, subject_id: fixture.character, goal_id: id.clone(), operation: "progress".into(), payload: "{\"increment\":\"1\"}".into(), before_state: planned.before, after_state: planned.after, recorded_at: at };
     let rollback = Arc::new(rollback);
     let result = db.transaction::<_, _, TxError, Outbox, _, _, _>(|tx, outbox| {
@@ -138,7 +139,7 @@ async fn real_qa_authority_replay_and_cascade() {
     assert!(bonus.completed_at.is_some());
     assert!(instances::period(&db, fixture.character, "month", assigned.bounds.month_start).await.unwrap().iter().any(|g| g.progress > 0));
     assert!(notices.rx.try_recv().is_ok());
-    let audit = receipts::audit(&db, &crate::uuid_text::format(&[1; UUID_LEN])).await.unwrap().unwrap();
+    let audit = receipts::audit(&db, &infinity_content::uuid_text::format(&[1; UUID_LEN])).await.unwrap().unwrap();
     assert_ne!(audit.before_state, audit.after_state);
     db.execute("DELETE FROM game.daily_goal_admin_audit WHERE subject_id=$1", &[&fixture.character]).await.unwrap();
     db.execute("DELETE FROM game.daily_goal_rewards WHERE goal_id IN (SELECT goal_id FROM game.daily_goal_instances WHERE character_id=$1)", &[&fixture.character]).await.unwrap();

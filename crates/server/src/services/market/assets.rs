@@ -1,9 +1,11 @@
 //! Asset source, delivery and refund policy for `marketProxy`
 //! (`eve/client/script/ui/services/marketsvc.py`). Uses game item and office DAOs and SDE
 //! types. Corporate buys go to Deliveries at the fill station without an office; refunds
-//! return to the original office/flag while it remains corporate custody, otherwise to
+//! return to the original active office/flag at that station, otherwise to
 //! same-station Deliveries. Structures and shared ship bays are not market destinations
 //! or sources, and asset ownership is not implicitly transferred between owners.
+//! Corporation locks and vote-case reservations bind singleton originals only;
+//! singletons are refused below, so sell sources need no extra lock or query.
 use super::{db_err, notify_error, CallError, Order, TradeParty};
 use infinity_core::consts::{FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, CORP_HANGAR_DIVISIONS, FLAG_HANGAR};
 use crate::dao::items::loading::{Item, ItemQuery};
@@ -23,10 +25,15 @@ pub(super) async fn source(ex: &(impl Executor + ?Sized), sde: &Sde, party: Trad
         if office.is_some() || item.location_id != station || item.flag_id != FLAG_HANGAR { return Err(refuse()); }
     } else {
         if office != Some(item.location_id) || !(FLAG_CORP_SAG1..FLAG_CORP_SAG1 + CORP_HANGAR_DIVISIONS).contains(&item.flag_id)
-            || offices::office_owner(ex, item.location_id).await? != Some(party.financial.id)
-            || crate::dao::offices::station(ex, item.location_id).await.map_err(db_err)? != Some(station)
+            || offices::office_at(ex, party.financial.id, station).await? != Some(item.location_id)
             || !may_take_corp_hangar(ex, party.issuer, party.financial.id, station, item.flag_id).await? { return Err(refuse()); }
     }
+    // Corporation locks and vote-case reservations bind singleton blueprint
+    // originals only; a non-singleton blueprint stack cannot carry either fact,
+    // so no lock or reservation check is needed here. The busy-job check is the
+    // existing serialized read: install and delivery hold the blueprint's row
+    // lock through their writes, and the order's guarded quantity write in
+    // take_items revalidates owner, location, flag, singleton and quantity.
     if crate::dao::industry::has_active_blueprint_job(ex, &[item.item_id]).await.map_err(db_err)? { return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE)); }
     if item.singleton { return Err(user_error(messages::MSG_REPACKAGE_BEFORE_SELLING, vec![("item".into(), Value::Int(type_id))])); }
     Ok(item)
@@ -71,7 +78,9 @@ pub(super) async fn refund<X: Send>(ex: &(impl Executor + ?Sized), sde: &Arc<Sde
         return Ok(());
     }
     let (location, flag) = match (order.corporation_id, order.source_location_id, order.source_flag_id) {
-        (Some(corp), Some(location), Some(flag)) if offices::office_owner(ex, location).await? == Some(corp) => (location, flag),
+        (Some(corp), Some(location), Some(flag))
+            if (FLAG_CORP_SAG1..FLAG_CORP_SAG1 + CORP_HANGAR_DIVISIONS).contains(&flag)
+                && offices::office_at(ex, corp, order.at.id).await? == Some(location) => (location, flag),
         (Some(_), _, _) => (order.at.id, FLAG_CORP_DELIVERIES),
         _ => (order.at.id, FLAG_HANGAR),
     };

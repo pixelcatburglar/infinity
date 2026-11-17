@@ -232,10 +232,10 @@ async fn concurrent_personal_creates_obey_ten_plan_cap() {
     );
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     refused(first.err().or_else(|| second.err()).unwrap(), FailureCode::PreconditionFailed);
-    let rows = crate::dao::skills::plans::all(&gw.db, owner.character).await.unwrap();
+    let rows = crate::dao::skills::plans::all(&gw.db, crate::dao::skills::plans::Owner::Character(owner.character)).await.unwrap();
     assert_eq!(rows.len(), 10);
     for row in rows {
-        crate::dao::skills::plans::delete(&gw.db, owner.character, &row).await.unwrap();
+        crate::dao::skills::plans::delete(&gw.db, crate::dao::skills::plans::Owner::Character(owner.character), &row).await.unwrap();
     }
     fixture::cleanup(&gw.db, owner).await.unwrap();
 }

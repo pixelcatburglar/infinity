@@ -65,7 +65,8 @@ async fn shared_take_deadlock_retries_or_refuses_stale_closure_without_losing_re
     let f = setup().await;
     ship_configuration::patch(&f.db, f.host, f.owner.character, &Patch { maintenance_corp: Some(true), ..Patch::default() }).await.unwrap();
     let fit = crate::services::fit::Fit::load_unpiloted(&f.db, f.client.sde.clone(), f.pilot).await.unwrap();
-    let capacity = holds::effective_capacity(&fit, FLAG_SHIP_HANGAR);
+    let capacity = match holds::effective_capacity(&fit, FLAG_SHIP_HANGAR) {
+        holds::CapacityLimit::Finite(value) => value, holds::CapacityLimit::Unlimited => f64::INFINITY };
     let small_ship = f.client.sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SHIP)
         && holds::accepts(&f.client.sde, FLAG_SHIP_HANGAR, ty.type_id)
         && ty.volume.is_some_and(|volume| volume.is_finite() && volume > 0.0 && volume < capacity)).unwrap().type_id;

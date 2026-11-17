@@ -1,8 +1,8 @@
 //! Kill-right lifecycle and durable expiry, mirroring the client kill-right UI.
 //! Rights are persisted in game.kill_rights; suspect flags remain in memory.
 use super::*;
-use infinity_core::{consts::{FILETIME_DAY, FILETIME_SECOND}, messages};
-use crate::{client::filetime_now, dao::kill_rights as dao, db::{Db, executor::Executor, outbox::{dispatch_world, Outbox}}, scheduler::{self, Job}, space::World};
+use infinity_core::{consts::FILETIME_DAY, messages};
+use crate::{client::{filetime_now, filetime_ticks_from_seconds}, dao::kill_rights as dao, db::{Db, executor::Executor, outbox::{dispatch_world, Outbox}}, scheduler::{self, Job}, space::World};
 use crate::services::{db_err, keyval, market, notify_error, user_error, wallets, CallError};
 use marshal::Value;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -19,11 +19,10 @@ pub(in crate::services) const EXPIRY_KIND: &str = "kill-right-expiry";
 /// Exclusive storage limit of a nonnegative NUMERIC(36,2) sale price.
 const PRICE_STORAGE_LIMIT: f64 = 1e34;
 
-fn option_id(value: Option<i64>) -> Value { value.map(Value::Int).unwrap_or(Value::None) }
 fn row(r: &dao::KillRight) -> Value {
     keyval([("killRightID", Value::Int(r.kill_right_id)), ("fromID", Value::Int(r.from_id)),
         ("toID", Value::Int(r.to_id)), ("expiryTime", Value::Int(r.expiry)),
-        ("price", r.price.map(Value::Float).unwrap_or(Value::None)), ("restrictedTo", option_id(r.restricted_to))])
+        ("price", r.price.map(Value::Float).unwrap_or(Value::None)), ("restrictedTo", optional(r.restricted_to))])
 }
 fn viewer(c: &Client) -> Vec<i64> {
     ["charid", "corpid", "allianceid"].iter().filter_map(|key| c.session.int(key)).collect()
@@ -31,7 +30,7 @@ fn viewer(c: &Client) -> Vec<i64> {
 fn error(key: &str) -> CallError { user_error(key, vec![]) }
 fn expired() -> CallError { error(messages::MSG_KILL_RIGHT_EXPIRED) }
 fn invalid() -> CallError { error(messages::MSG_NO_VALID_KILL_RIGHT) }
-fn deadline(now: i64) -> i64 { now + crate::config::game().bounty.kill_right_suspect_secs * FILETIME_SECOND }
+fn deadline(now: i64) -> i64 { now + filetime_ticks_from_seconds(crate::config::game().bounty.kill_right_suspect_secs) }
 
 pub(super) fn sale_price(price: f64) -> Option<f64> {
     if !price.is_finite() { return None; }

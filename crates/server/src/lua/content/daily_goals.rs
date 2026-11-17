@@ -4,4 +4,4 @@
 pub(crate) mod model;
 pub(crate) mod plans;
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

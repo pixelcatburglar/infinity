@@ -18,8 +18,8 @@ impl PreparedDelivery for Plan {
         })
     }
 }
-fn prepare(_: ContentProgressResources, _: DeliveryKey) -> std::pin::Pin<Box<dyn Future<Output = Result<PrepareOutcome, CallError>> + Send>> {
-    Box::pin(async { Err(CallError::Internal(anyhow::anyhow!("unexpected preparation"))) })
+fn prepare(_: ContentProgressResources, _: DeliveryKey) -> std::pin::Pin<Box<dyn Future<Output = Result<PrepareOutcome, ApplyError>> + Send>> {
+    Box::pin(async { Err(ApplyError::Call(CallError::Internal(anyhow::anyhow!("unexpected preparation")))) })
 }
 
 #[tokio::test]
@@ -29,15 +29,16 @@ async fn prepared_mode_rejects_mismatch_and_rolls_back_stale_prelock() {
     let config = crate::config::tests::test_database();
     let db = crate::db::Db::connect(&config).await.unwrap();
     let sde = Sde::load(&db).await.unwrap();
-    let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let tx = client.transaction().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     tx.batch_execute("CREATE TEMP TABLE progress_test_effects (id bigserial) ON COMMIT DROP").await.unwrap();
     let registration = DurableRegistration { consumer_key: "prepared-test", kinds: &["SkillTrained"], mode: DeliveryMode::Prepared(prepare) };
-    register_fixture(&tx, &registration).await;
+    let registry = fixture_registry(&tx, Registry::new(vec![], vec![registration]).unwrap()).await;
     let event = GameEvent::SkillTrained { char_id: 1, type_id: 2, level: 3 };
     let entry = crate::dao::progress::JournalEvent { source_namespace: format!("prepared-test-{}", crate::handshake::random_u64()), source_key: "0".into(), schema_version: codec::SCHEMA_VERSION, kind: event.kind().into(), occurred_at: 1, recorded_at: 1, payload: codec::encode(&event).unwrap(), context: "{}".into(), origin: "test".into(), ordinal: 0, subject_character_id: Some(1) };
-    let inserted = crate::dao::progress::insert_batch(&tx, &[entry]).await.unwrap();
+    let (consumers, kinds) = registry.subscription_arrays();
+    let inserted = crate::dao::progress::insert_batch(&tx, &[entry], consumers, kinds).await.unwrap();
     let key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() };
     let foreign_before = foreign_snapshot(&tx, registration.consumer_key, &key.event_id).await;
     let plan = Arc::new(Plan { key: key.clone(), stale: true });
@@ -100,15 +101,16 @@ impl PreparedDelivery for DrainPlan {
         })
     }
 }
-fn drain_prepare(resources: ContentProgressResources, key: DeliveryKey) -> std::pin::Pin<Box<dyn Future<Output = Result<PrepareOutcome, CallError>> + Send>> {
+fn drain_prepare(resources: ContentProgressResources, key: DeliveryKey) -> std::pin::Pin<Box<dyn Future<Output = Result<PrepareOutcome, ApplyError>> + Send>> {
     Box::pin(async move {
         if MISSING_PACKAGE.load(Ordering::SeqCst) {
-            resources.policies.resolve("missing-progress-test", "missing").await?;
+            resources.policies.resolve("missing-progress-test", "missing").map_err(ApplyError::Call)?;
         }
         match crate::dao::progress::delivery(&resources.db, &key).await? {
             crate::dao::progress::DeliveryState::Pending(event) => Ok(PrepareOutcome::Ready(Arc::new(DrainPlan { key, source: event.source_namespace }))),
             crate::dao::progress::DeliveryState::Applied => Ok(PrepareOutcome::AlreadyApplied),
-            crate::dao::progress::DeliveryState::Missing => Err(CallError::Internal(anyhow::anyhow!("missing receipt"))),
+            crate::dao::progress::DeliveryState::Terminal => Err(ApplyError::Terminal),
+            crate::dao::progress::DeliveryState::Missing => Err(ApplyError::Call(CallError::Internal(anyhow::anyhow!("missing receipt")))),
         }
     })
 }
@@ -135,14 +137,16 @@ async fn real_drain_provider_prelock_claim_and_commit() {
     crate::tests::init_config();
     let config = crate::config::tests::test_database();
     let registration = DurableRegistration { consumer_key: "prepared-drain-test", kinds: &["SkillTrained"], mode: DeliveryMode::Prepared(drain_prepare) };
-    let db = crate::db::Db::connect(&config).await.unwrap().with_progress_registry(Registry::new(vec![published], vec![registration]).unwrap());
-    register_fixture(&db, &registration).await;
+    let db = crate::db::Db::connect(&config).await.unwrap();
+    let registry = fixture_registry(&db, Registry::new(vec![published], vec![registration]).unwrap()).await;
+    let db = db.with_progress_registry(registry);
+    let (consumers, kinds) = db.progress_registry().subscription_arrays();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     let event = GameEvent::SkillTrained { char_id: 1, type_id: 2, level: 3 };
     let namespace = format!("prepared-drain-{}", crate::handshake::random_u64());
     let entry = crate::dao::progress::JournalEvent { source_namespace: namespace.clone(), source_key: "0".into(), schema_version: codec::SCHEMA_VERSION, kind: event.kind().into(), occurred_at: 1, recorded_at: 1, payload: codec::encode(&event).unwrap(), context: "{}".into(), origin: "test".into(), ordinal: 0, subject_character_id: Some(1) };
-    let inserted = crate::dao::progress::insert_batch(&db, &[entry]).await.unwrap();
+    let inserted = crate::dao::progress::insert_batch(&db, &[entry], consumers, kinds).await.unwrap();
     let key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() };
     let foreign_before = foreign_snapshot(&db, registration.consumer_key, &key.event_id).await;
 
@@ -158,9 +162,12 @@ async fn real_drain_provider_prelock_claim_and_commit() {
     let mut lua_config = crate::config::Config::default();
     lua_config.lua.scripts_dir = dir.to_string_lossy().into_owned();
     let hub = crate::chat::Hub::new("test", db.clone(), world.clone());
+    crate::lua::initialize_content(&lua_config.lua, &db, &sde).await.unwrap();
     crate::lua::start(&lua_config, &db, &sde, &world, &hub).await.unwrap();
     db.execute("UPDATE game.progress_deliveries SET next_attempt_at=0 WHERE consumer_key=$1 AND event_id=$2::text::uuid", &[&key.consumer_key, &key.event_id]).await.unwrap();
     MISSING_PACKAGE.store(true, Ordering::SeqCst);
+    let resources = ContentProgressResources { db: db.clone(), sde: sde.clone(), world: world.clone(), policies: crate::lua::retained_policies().unwrap() };
+    assert!(matches!(drain_prepare(resources, key.clone()).await, Err(ApplyError::Call(_))));
     drain(db.clone(), world.clone(), drain_job()).await.unwrap();
     let row = db.query_one("SELECT state,attempts FROM game.progress_deliveries WHERE consumer_key=$1 AND event_id=$2::text::uuid", &[&key.consumer_key, &key.event_id]).await.unwrap();
     assert_eq!(row.get::<_, String>("state"), "pending");
@@ -172,7 +179,7 @@ async fn real_drain_provider_prelock_claim_and_commit() {
     let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap(); });
     let locked = client.transaction().await.unwrap();
-    crate::dao::progress::lock_pending(&locked, &key).await.unwrap().unwrap();
+    assert!(matches!(crate::dao::progress::lock_delivery(&locked, &key).await.unwrap(), crate::dao::progress::DeliveryState::Pending(_)));
     drain(db.clone(), world.clone(), drain_job()).await.unwrap();
     assert_eq!(PRELOCK_COUNT.load(Ordering::SeqCst), 1);
     assert_eq!(APPLIED_COUNT.load(Ordering::SeqCst), 0);
@@ -205,7 +212,7 @@ async fn real_drain_provider_prelock_claim_and_commit() {
     assert_eq!(PUBLISHED_COUNT.load(Ordering::SeqCst), 1);
     let retry_event = GameEvent::SkillTrained { char_id: 1, type_id: 2, level: 3 };
     let retry_entry = crate::dao::progress::JournalEvent { source_namespace: namespace.clone(), source_key: "retry".into(), schema_version: codec::SCHEMA_VERSION, kind: retry_event.kind().into(), occurred_at: 1, recorded_at: 1, payload: codec::encode(&retry_event).unwrap(), context: "{}".into(), origin: "test".into(), ordinal: 1, subject_character_id: Some(1) };
-    let retry_id = crate::dao::progress::insert_batch(&db, &[retry_entry]).await.unwrap()[0].1.clone();
+    let retry_id = crate::dao::progress::insert_batch(&db, &[retry_entry], consumers, kinds).await.unwrap()[0].1.clone();
     let retry_key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: retry_id };
     let retry_plan = Arc::new(RetryPlan { key: retry_key.clone() });
     let outcome: Result<ApplyOutcome, ApplyError> = db.transaction(

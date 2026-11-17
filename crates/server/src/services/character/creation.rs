@@ -125,5 +125,5 @@ pub(crate) async fn create(db: &Db, sde: &Arc<Sde>, user_id: i64, pilot: NewPilo
     Ok(created)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

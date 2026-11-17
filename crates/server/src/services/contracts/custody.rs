@@ -5,8 +5,10 @@
 //! exchange items also come from Deliveries. A lost source office falls back to Deliveries.
 //! Transactions and courier package authorization remain with lifecycle callers; structures
 //! are not supported.
+//! Corporation-locked and vote-reserved blueprint originals are refused inside
+//! the prepared write set, covering every hand-over and escrow destruction.
 
-use infinity_core::consts::{FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, LOCATION_JUNKYARD};
+use infinity_core::consts::{FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID};
 use crate::dao::{contracts::Contract, items::{inventory as item_inventory, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}};
 use crate::db::{executor::Executor, outbox::Outbox};
 use infinity_core::messages;
@@ -41,14 +43,16 @@ pub(super) async fn prepare<'tx>(
     let locks = inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
     let stale = || notify_error(messages::CONTRACT_ITEM_MISSING);
     if roots.iter().any(|id| closure.binary_search(id).is_err()) || captured.len() != writes.len()
-        || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row|
-            row.type_id == old.type_id && row.owner_id == old.owner_id && row.location_id == old.location_id
-            && row.flag_id == old.flag_id && row.quantity == old.quantity && row.singleton == old.singleton
-            && row.jump_clone_id == old.jump_clone_id))
+        || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row| row.same_metadata(old)))
         || item_inventory::descendants(ex, roots).await.map_err(db_err)? != closure
         || deliveries::ancestry_many(ex, &writes).await.map_err(db_err)? != lineage {
         return Err(stale());
     }
+    // Enacted corporation locks and pending vote-case reservations freeze blueprint
+    // originals anywhere in the prepared write set, which covers every closure
+    // handed over or destroyed by the lifecycle callers.
+    let blueprints = corps::item_locks::locked_blueprints(sde, &locks, &writes)?;
+    corps::item_locks::ensure_mutable(ex, &blueprints).await?;
     Ok(Preparation { locks, closure })
 }
 
@@ -73,7 +77,9 @@ pub(super) fn receiving(owner: i64, station: i64) -> Custody {
 
 pub(super) async fn issuer_return(ex: &(impl Executor + ?Sized), contract: &Contract) -> Result<Custody, CallError> {
     if !contract.for_corp { return Ok(receiving(contract.issuer, contract.start)); }
-    if contract.issuer_hangar_flag == FLAG_CORP_DELIVERIES || offices::office_owner(ex, contract.issuer_source_location).await? == Some(contract.issuer_corp) {
+    if (contract.issuer_hangar_flag == FLAG_CORP_DELIVERIES && contract.issuer_source_location == contract.start)
+        || ((FLAG_CORP_SAG1..FLAG_CORP_SAG1 + infinity_core::consts::CORP_HANGAR_DIVISIONS).contains(&contract.issuer_hangar_flag)
+            && offices::office_at(ex, contract.issuer_corp, contract.start).await? == Some(contract.issuer_source_location)) {
         return Ok(Custody { owner: contract.issuer_corp, location: contract.issuer_source_location, flag: contract.issuer_hangar_flag });
     }
     Ok(receiving(contract.issuer_corp, contract.start))
@@ -90,8 +96,7 @@ pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde,
     if old.len() != roots.len() || old.iter().any(|item| item.location_id != old_location) { return Err(notify_error(messages::CONTRACT_ITEM_MISSING)); }
     for item in &old {
         if corps::is_player_corp(item.owner_id) && item.location_id >= 0 {
-            let gone = Item { location_id: LOCATION_JUNKYARD, ..item.clone() };
-            inventory::notifications::notify_corp_item_change(ex, outbox, &gone, vec![(IX_LOCATION_ID, Value::Int(item.location_id))]).await?;
+            inventory::notifications::notify_corp_item_removed(ex, outbox, item).await?;
         }
         if !item_inventory::move_item(ex, item, destination.location, destination.flag, destination.owner, item.singleton).await.map_err(db_err)? {
             return Err(notify_error(messages::CONTRACT_ITEM_MISSING));
@@ -104,29 +109,27 @@ pub(super) async fn hand_over<X: Send>(ex: &(impl Executor + ?Sized), sde: &Sde,
         let previous = old.iter().find(|old| old.item_id == item.item_id).ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
         let change = vec![(IX_LOCATION_ID, Value::Int(previous.location_id)), (IX_OWNER_ID, Value::Int(previous.owner_id)), (IX_FLAG, Value::Int(i64::from(previous.flag_id)))];
         if !corps::is_player_corp(previous.owner_id) && (previous.owner_id != destination.owner || !docked) && previous.location_id >= 0 {
-            outbox.notify_pilot(previous.owner_id, "OnItemChange", vec![item.row(), Value::Dict(change.iter().map(|(k, v)| (Value::Int(*k), v.clone())).collect()), Value::None]);
+            inventory::notifications::notify_owner_item_change(outbox, &item, previous.owner_id, change.iter().cloned());
         }
         if corps::is_player_corp(destination.owner) {
             inventory::notifications::notify_corp_item_change(ex, outbox, &item, change).await?;
         } else if docked {
-            outbox.notify_pilot(destination.owner, "OnItemChange", vec![item.row(), Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect()), Value::None]);
+            inventory::notifications::notify_owner_item_change(outbox, &item, destination.owner, change);
         }
     }
     Ok(())
 }
 
 pub(super) async fn remove_package<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: &Item) -> Result<(), CallError> {
-    let gone = Item { location_id: LOCATION_JUNKYARD, ..item.clone() };
-    let change = vec![(IX_LOCATION_ID, Value::Int(item.location_id))];
     if corps::is_player_corp(item.owner_id) {
-        inventory::notifications::notify_corp_item_change(ex, outbox, &gone, change).await?;
+        inventory::notifications::notify_corp_item_removed(ex, outbox, item).await?;
     } else {
-        outbox.notify_pilot(item.owner_id, "OnItemChange", vec![gone.row(), Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect()), Value::None]);
+        inventory::notifications::notify_owner_item_removed(outbox, item.clone(), item.owner_id);
     }
     let changes = BTreeMap::from([(item.item_id, QuantityChange::new(item, None))]);
     if !quantities::apply(ex, &changes).await.map_err(db_err)? { return Err(notify_error(messages::CONTRACT_ITEM_MISSING)); }
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

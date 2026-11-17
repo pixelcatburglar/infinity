@@ -111,25 +111,25 @@ fn initial_rows(value: Value) -> Vec<(i64, bool)> {
 #[tokio::test]
 #[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn service_contacts_and_presence() {
-    use crate::{conn::Conn, handshake::Login, space::World, services::online_status};
+    use crate::{handshake::Login, space::World, services::online_status};
+    use infinity_wire::conn::Conn;
     use std::sync::Arc;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let now = crate::client::filetime_now();
     let account = -now;
-    let owner = 1_500_000_000 + now % 100_000_000;
-    let target = owner + 1;
-    let other = owner + 2;
-    let nonwatcher = owner + 3;
     let name = format!("contacts-test-{now}");
     let password: Vec<u8> = Vec::new();
     db.execute("INSERT INTO game.accounts (user_id,user_name,password_hash,role) VALUES ($1,$2,$3,0)", &[&account, &name, &password]).await.unwrap();
-    for (id, suffix) in [(owner, "owner"), (target, "target"), (other, "other"), (nonwatcher, "nonwatcher")] {
-        let name = format!("{name}-{suffix}");
-        db.execute("INSERT INTO game.characters (character_id,user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,$3,1,1,1,$4,0)", &[&id, &account, &name, &account]).await.unwrap();
+    let mut characters = [0_i64; 4];
+    let mut agent = 0_i64;
+    let scenario = crate::tests::catch_scenario(async {
+    for (id, suffix) in characters.iter_mut().zip(["owner", "target", "other", "nonwatcher"]) {
+        *id = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,1,1,1,$3,0) RETURNING character_id", &[&account, &format!("{name}-{suffix}"), &account]).await.unwrap().get("character_id");
     }
+    let [owner, target, other, nonwatcher] = characters;
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let agent = sde.characters.npc_characters().find(|npc| crate::services::missions::agent(npc.character_id).is_some()).expect("retail agent in SDE").character_id;
+    agent = sde.characters.npc_characters().find(|npc| crate::services::missions::agent(npc.character_id).is_some()).expect("retail agent in SDE").character_id;
     let nonagent = sde.characters.npc_characters().find(|npc| crate::services::missions::agent(npc.character_id).is_none()).expect("non-agent NPC in SDE").character_id;
     let world = World::new(db.clone(), sde.clone(), 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -209,9 +209,12 @@ async fn service_contacts_and_presence() {
     assert!(dao::list(&db, owner).await.unwrap().iter().any(|row| row.contact_id == target));
     let notices = db.query("SELECT type_id FROM game.notifications WHERE receiver_id=$1 AND sender_id=$2 ORDER BY notification_id", &[&target, &owner]).await.unwrap();
     assert_eq!(notices.iter().map(|r| r.get::<_, i32>("type_id")).collect::<Vec<_>>(), vec![CONTACT_ADD, CONTACT_EDIT]);
+    }).await;
+    let [owner, target, _, nonwatcher] = characters;
     dao::delete(&db, owner, &[agent, target]).await.unwrap();
     dao::delete(&db, nonwatcher, &[target]).await.unwrap();
     db.execute("DELETE FROM game.notifications WHERE receiver_id=$1 AND sender_id=$2", &[&target, &owner]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE user_id=$1", &[&account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    if let Err(panic) = scenario { std::panic::resume_unwind(panic); }
 }

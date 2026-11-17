@@ -1,29 +1,47 @@
-//! Real-database coverage for the reserved service account, character selection, and monotonic ID sequences on schema replay.
+//! Real-database coverage for the reserved service account, character selection, monotonic ID sequences on schema replay, and the operator integrity-check script.
 
+#[cfg(any(feature = "tests-storage", feature = "tests-runtime", feature = "tests-space"))]
 use super::*;
+#[cfg(feature = "tests-storage")]
 use crate::dao::{accounts::selection as account_selection, characters::selection as character_selection};
+#[cfg(feature = "tests-storage")]
 use crate::db::transaction::TransactionError;
+#[cfg(feature = "tests-storage")]
+use super::executor::Executor;
+#[cfg(feature = "tests-storage")]
 use std::future::Future;
 
+#[cfg(feature = "tests-storage")]
+mod corporation_ids;
+#[cfg(feature = "tests-storage")]
+mod loss_snapshot;
+#[cfg(feature = "tests-storage")]
 mod stack_quantities;
+#[cfg(feature = "tests-storage")]
+mod integrity;
 
+#[cfg(feature = "tests-storage")]
 #[derive(Debug)]
 enum Rollback {
     Database(Error),
     Observed { collisions: Vec<bool>, isolated: bool },
 }
+#[cfg(feature = "tests-storage")]
 impl From<Error> for Rollback {
     fn from(error: Error) -> Self { Self::Database(error) }
 }
+#[cfg(feature = "tests-storage")]
 impl From<tokio_postgres::Error> for Rollback {
     fn from(error: tokio_postgres::Error) -> Self { Self::Database(error.into()) }
 }
+#[cfg(feature = "tests-storage")]
 impl TransactionError for Rollback {
     fn is_retryable_transaction(&self) -> bool {
         match self { Self::Database(error) => error.is_retryable_transaction(), Self::Observed { .. } => false }
     }
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires a dedicated PostgreSQL database"]
 async fn simulated_account_startup_login_collision_and_selection() {
@@ -97,9 +115,11 @@ async fn simulated_account_startup_login_collision_and_selection() {
     assert_eq!(restored, reserved_id);
 }
 
+#[cfg(feature = "tests-storage")]
 #[derive(Clone, Copy)]
 enum ReplayFixture { Character, Corporation }
 
+#[cfg(feature = "tests-storage")]
 async fn replay_sequence_fixture(db: &Db, user_id: i64, fixture: ReplayFixture) -> anyhow::Result<()> {
     use crate::dao::{characters::creation::{self, NewCharacter}, corporations::registry::{self, NewCorporation}};
 
@@ -152,8 +172,9 @@ async fn replay_sequence_fixture(db: &Db, user_id: i64, fixture: ReplayFixture) 
     result
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
-#[ignore = "requires a dedicated PostgreSQL database; run this test alone"]
+#[ignore = "requires a dedicated PostgreSQL database; run this exact test in its own process"]
 async fn schema_replay_preserves_deleted_character_and_corporation_ids() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let suffix: i64 = db.query_one("SELECT nextval('game.accounts_user_id_seq') AS id", &[]).await.unwrap().get("id");
@@ -169,9 +190,11 @@ async fn schema_replay_preserves_deleted_character_and_corporation_ids() {
     result.unwrap();
 }
 
+#[cfg(feature = "tests-storage")]
 /// Join cancellation of every gate/client task before fixture cleanup.
 #[derive(Clone, Default)]
 struct RaceReapers(std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>);
+#[cfg(feature = "tests-storage")]
 impl RaceReapers {
     fn cancel<T: Send + 'static>(&self, task: tokio::task::JoinHandle<T>) {
         task.abort();
@@ -186,6 +209,7 @@ impl RaceReapers {
     }
 }
 
+#[cfg(feature = "tests-storage")]
 /// A real transaction holding the only selector-pool lease, without locking a game row.
 struct SelectionLeaseGate {
     release: std::sync::Arc<tokio::sync::Notify>,
@@ -194,6 +218,7 @@ struct SelectionLeaseGate {
     reapers: RaceReapers,
 }
 
+#[cfg(feature = "tests-storage")]
 impl SelectionLeaseGate {
     fn start(db: Db, reapers: RaceReapers) -> Self {
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -229,6 +254,7 @@ impl SelectionLeaseGate {
     }
 }
 
+#[cfg(feature = "tests-storage")]
 impl Drop for SelectionLeaseGate {
     fn drop(&mut self) {
         self.release.notify_one();
@@ -236,10 +262,13 @@ impl Drop for SelectionLeaseGate {
     }
 }
 
+#[cfg(feature = "tests-storage")]
 struct SelectionTask<T: Send + 'static>(Option<tokio::task::JoinHandle<T>>, RaceReapers);
+#[cfg(feature = "tests-storage")]
 impl<T: Send + 'static> Drop for SelectionTask<T> {
     fn drop(&mut self) { if let Some(task) = self.0.take() { self.1.cancel(task); } }
 }
+#[cfg(feature = "tests-storage")]
 impl<T: Send + 'static> SelectionTask<T> {
     async fn finish(&mut self) -> T {
         let result = tokio::time::timeout(std::time::Duration::from_secs(30), self.0.as_mut().unwrap()).await.expect("client task timed out").expect("client task failed");
@@ -248,6 +277,7 @@ impl<T: Send + 'static> SelectionTask<T> {
     }
 }
 
+#[cfg(feature = "tests-storage")]
 /// Preserve assertion failures while still closing real clients and releasing leases.
 async fn catch_race<F: Future>(future: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
     let mut future = std::pin::pin!(future);
@@ -258,6 +288,7 @@ async fn catch_race<F: Future>(future: F) -> Result<F::Output, Box<dyn std::any:
     }).await
 }
 
+#[cfg(feature = "tests-storage")]
 /// Observe real FIFO waiters; the timeout is a deadlock guard, not an ordering delay.
 async fn selection_waiters(db: &Db, wanted: usize, selection: &SelectionTask<(crate::client::Client, crate::services::CallResult)>) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -269,6 +300,7 @@ async fn selection_waiters(db: &Db, wanted: usize, selection: &SelectionTask<(cr
     }).await.expect("selector did not queue its checkout");
 }
 
+#[cfg(feature = "tests-storage")]
 async fn real_kick(client: &mut crate::client::Client, corp: i64, target: i64) {
     let args = [marshal::Value::Int(target)];
     let kwargs = marshal::Value::Dict(vec![]);
@@ -278,6 +310,7 @@ async fn real_kick(client: &mut crate::client::Client, corp: i64, target: i64) {
     assert!(matches!(result, Ok(marshal::Value::None)), "real kick failed: {result:?}");
 }
 
+#[cfg(feature = "tests-storage")]
 async fn assert_departure(db: &Db, target: i64, source: i64, marker: i64) -> i64 {
     let row = db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&target]).await.unwrap();
     let corporation: i64 = row.get("corporation_id");
@@ -293,12 +326,13 @@ async fn assert_departure(db: &Db, target: i64, source: i64, marker: i64) -> i64
     corporation
 }
 
+#[cfg(feature = "tests-storage")]
 async fn read_corporation_change(peer: &mut tokio::net::TcpStream, old: i64, new: i64, old_hq: i64, new_hq: Option<i64>) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let frame = crate::framing::read_frame(peer).await.unwrap().expect("client transport closed before session correction");
-            let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
-            if packet.command != crate::macho::cmd::SESSIONCHANGENOTIFICATION { continue; }
+            let frame = infinity_wire::framing::read_frame(peer).await.unwrap().expect("client transport closed before session correction");
+            let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
+            if packet.command != infinity_wire::macho::cmd::SESSIONCHANGENOTIFICATION { continue; }
             let Some(pair) = packet.body.get(1).and_then(marshal::Value::items) else { continue };
             let Some(changes) = pair.get(1) else { continue };
             let Some(change) = changes.get("corpid") else { continue };
@@ -312,6 +346,7 @@ async fn read_corporation_change(peer: &mut tokio::net::TcpStream, old: i64, new
     }).await.expect("real session-change packet was not received");
 }
 
+#[cfg(feature = "tests-storage")]
 async fn login_kick_order(kick_before_reread: bool) {
     use crate::services::tests::{self, fixture};
     use marshal::Value;
@@ -413,7 +448,7 @@ async fn login_kick_order(kick_before_reread: bool) {
                 panic!("unique live registration unavailable");
             };
             registration.wait_for_predecessor().await;
-            let mut running = SelectionTask(Some(tokio::spawn(async move { client.run(&mut registration).await })), scenario_reapers.clone());
+            let running = client.run(registration);
             let mut peer = peer;
             let checked = catch_race(async {
                 tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -426,10 +461,22 @@ async fn login_kick_order(kick_before_reread: bool) {
                 let session = world.online_session(target.character).unwrap();
                 assert_eq!((session.corporation_id, session.alliance_id, session.corporation_role), (Some(new_corp), None, 0));
             }).await;
-            let before = crate::db::outbox::tests::events(&other_db, "CharacterLoggedOff", target.character).await.len();
             use tokio::io::AsyncWriteExt;
+            if let Err(error) = checked {
+                // A caught failure releases the session cooperatively and waits
+                // on the account's completion barrier, not on a gate the
+                // session itself may still be holding.
+                drop(running);
+                let _ = peer.shutdown().await;
+                drop(peer);
+                let mut barrier = crate::live_sessions::register(target.account, true).unwrap();
+                barrier.wait_for_predecessor().await;
+                drop(barrier);
+                std::panic::resume_unwind(error);
+            }
+            let before = crate::db::outbox::tests::events(&other_db, "CharacterLoggedOff", target.character).await.len();
             let shutdown = peer.shutdown().await;
-            let cleanup = running.finish().await;
+            let cleanup = running.await;
             drop(peer);
             shutdown.expect("peer write shutdown failed");
             cleanup.expect("real client run cleanup failed");
@@ -437,12 +484,11 @@ async fn login_kick_order(kick_before_reread: bool) {
             assert_eq!(logoffs.len(), before + 1);
             assert!(matches!(logoffs.last(), Some(crate::lua::events::GameEvent::CharacterLoggedOff { user_id, char_id }) if (*user_id, *char_id) == (target.account, target.character)));
             assert!(world.online_session(target.character).is_none());
-            if let Err(error) = checked { std::panic::resume_unwind(error); }
         }
         drop(manager_peer);
     }).await;
     reapers.join().await;
-    // A failed scenario drops its gates and aborts its selector/run tasks. Wait for
+    // A failed scenario drops its gates and aborts its selector tasks. Wait for
     // their pool leases to return before removing only this test's fixtures.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while selector_db.pool.status().available != selector_db.pool.status().size || selector_db.pool.status().waiting != 0 { tokio::task::yield_now().await; }
@@ -462,18 +508,21 @@ async fn login_kick_order(kick_before_reread: bool) {
     result.unwrap();
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
 async fn real_kick_commits_before_published_selection_reread() {
     login_kick_order(true).await;
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
 async fn real_selection_reread_precedes_kick_and_client_run_delivers_session() {
     login_kick_order(false).await;
 }
 
+#[cfg(any(feature = "tests-runtime", feature = "tests-space"))]
 impl Db {
     pub(crate) fn unconnected_publication_fixture(database_trap: std::net::SocketAddr) -> Self {
         let mut config = tokio_postgres::Config::new();
@@ -481,7 +530,7 @@ impl Db {
         config.user("test").dbname("test");
         let manager = Manager::from_config(config, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Verified });
         let pool = Pool::builder(manager).max_size(1).runtime(deadpool_postgres::Runtime::Tokio1).build().unwrap();
-        Self { pool, online: Arc::new(AtomicI64::new(0)), progress_registry: Arc::new(crate::progress::Registry::default()) }
+        Self { pool, online: Arc::new(AtomicI64::new(0)), progress_registry: Arc::new(crate::progress::Registry::default()), loss_tolerant_async_commit: true }
     }
 
     pub(crate) fn assert_publication_fixture_unused(&self) {
@@ -489,4 +538,27 @@ impl Db {
         assert_eq!(status.size, 0);
         assert_eq!(status.waiting, 0);
     }
+}
+
+#[cfg(feature = "tests-storage")]
+#[tokio::test]
+#[ignore = "requires a dedicated PostgreSQL database"]
+async fn statement_cache_reuses_one_connection_across_transaction() {
+    let manager = Manager::from_config(crate::config::tests::test_database().to_pg_config().unwrap(), NoTls, ManagerConfig { recycling_method: RecyclingMethod::Verified });
+    let db = Db { pool: Pool::builder(manager).max_size(1).runtime(deadpool_postgres::Runtime::Tokio1).build().unwrap(), online: Arc::new(AtomicI64::new(0)), progress_registry: Arc::new(crate::progress::Registry::default()), loss_tolerant_async_commit: true };
+    const CACHED: &str = "SELECT $1::bigint AS statement_cache_value";
+    const RAW: &str = "SELECT $1::bigint AS statement_uncached_value";
+    const META: &str = "SELECT name || '/' || prepare_time::text AS identity FROM pg_prepared_statements WHERE statement = $1";
+    assert_eq!(db.query_one(CACHED, &[&1i64]).await.unwrap().get::<_, i64>("statement_cache_value"), 1);
+    let first: String = db.query_one(META, &[&CACHED]).await.unwrap().get("identity");
+    db.transaction::<_, _, Error, (), _, _, _>(|tx, _| { let first = first.clone(); Box::pin(async move {
+        assert_eq!(tx.query_one(CACHED, &[&2i64]).await.unwrap().get::<_, i64>("statement_cache_value"), 2);
+        assert_eq!(Executor::query(tx, CACHED, &[&3i64]).await.unwrap()[0].get::<_, i64>("statement_cache_value"), 3);
+        assert_eq!(tx.uncached().query_one(RAW, &[&4i64]).await.unwrap().get::<_, i64>("statement_uncached_value"), 4);
+        assert_eq!(tx.query_one(META, &[&CACHED]).await.unwrap().get::<_, String>("identity"), first);
+        Ok::<(), Error>(())
+    }) }, |(), ()| async move { Ok(()) }).await.unwrap();
+    assert_eq!(db.query_one(META, &[&CACHED]).await.unwrap().get::<_, String>("identity"), first);
+    assert_eq!(db.uncached().query_one(RAW, &[&5i64]).await.unwrap().get::<_, i64>("statement_uncached_value"), 5);
+    assert_eq!(db.query_one("SELECT count(*) AS count FROM pg_prepared_statements WHERE statement = $1", &[&RAW]).await.unwrap().get::<_, i64>("count"), 0);
 }

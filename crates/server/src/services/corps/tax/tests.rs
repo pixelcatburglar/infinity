@@ -10,10 +10,10 @@ fn mutation(reason: crate::lua::events::resources::LoyaltyReason, origin: crate:
     }
 }
 
-async fn settle(db: &Db, recipient: i64, gross: f64, lp: i64, issuer: i64) -> Result<Outbox<()>, CallError> {
+async fn settle(db: &Db, recipient: i64, gross: crate::isk::IskAmount, lp: i64, issuer: i64) -> Result<Outbox<()>, CallError> {
     db.transaction(|tx, outbox: &mut Outbox<()>| Box::pin(async move {
         settle_reward(tx, outbox, recipient, gross, Some(LoyaltyReward { issuer, amount: lp, mutation: mutation(crate::lua::events::resources::LoyaltyReason::MissionReward, crate::lua::events::resources::FactOrigin::Natural) })).await
-    }), |(), outbox| async move { Ok(outbox) }).await
+    }), |_, outbox| async move { Ok(outbox) }).await
 }
 async fn reset(db: &Db, member: i64, corp: i64, issuer: i64) {
     db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&member]).await.unwrap();
@@ -41,7 +41,7 @@ async fn taxable_reward_boundaries_exact_lp_and_rollback() {
         let db = test_db;
         db.execute("UPDATE game.characters SET corporation_id=$2 WHERE character_id=$1", &[&member.character, &corp]).await.unwrap();
         db.execute("UPDATE game.corporations SET tax_rate=0.1,lp_tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await.unwrap();
-        for (gross, personal, corporate) in [(99999.99,9_999_999,0), (100000.0,10_000_000,0), (100000.01,9_000_001,1_000_000), (200000.0,18_000_000,2_000_000)] {
+        for (gross, personal, corporate) in [(cents(9_999_999),9_999_999,0), (cents(10_000_000),10_000_000,0), (cents(10_000_001),9_000_001,1_000_000), (cents(20_000_000),18_000_000,2_000_000)] {
             reset(&db, member.character, corp, issuer).await;
             let before = crate::db::outbox::tests::wallet_events(&db, member.character).await.len();
             settle(&db, member.character, gross, 0, issuer).await.unwrap();
@@ -53,35 +53,45 @@ async fn taxable_reward_boundaries_exact_lp_and_rollback() {
         reset(&db, member.character, corp, issuer).await;
         db.execute("UPDATE game.corporations SET tax_rate=0 WHERE corporation_id=$1", &[&corp]).await.unwrap();
         db.transaction(|tx, outbox: &mut Outbox<()>| Box::pin(async move {
-            settle_whole_reward(tx, outbox, member.character, 9_007_199_254_740_993, None).await
-        }), |(), _| async { Ok(()) }).await.unwrap();
+            settle_reward(tx, outbox, member.character, crate::isk::IskAmount::from_whole_isk(9_007_199_254_740_993_i128).unwrap(), None).await
+        }), |_, _| async { Ok(()) }).await.unwrap();
         assert_eq!(cash(&db, member.character, corp).await, (cents(900_719_925_474_099_300), cents(0)));
+        for rate in [0.0f64, 0.1] {
+            db.execute("UPDATE game.corporations SET tax_rate=$2 WHERE corporation_id=$1", &[&corp, &rate]).await.unwrap();
+            reset(&db, member.character, corp, issuer).await;
+            let gross = cents(900_719_925_474_099_301);
+            settle(&db, member.character, gross, 0, issuer).await.unwrap();
+            let tax = crate::isk::IskAmount::from_isk(crate::services::market::round2(gross.wire_isk() * rate)).unwrap();
+            let net = gross.checked_sub(tax).unwrap();
+            assert_eq!(cash(&db, member.character, corp).await, (net, tax));
+            assert_eq!(net.checked_add(tax), Some(gross));
+        }
         db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await.unwrap();
         reset(&db, member.character, corp, issuer).await;
-        for _ in 0..2 { settle(&db, member.character, 60000.0, 0, issuer).await.unwrap(); }
+        for _ in 0..2 { settle(&db, member.character, cents(6_000_000), 0, issuer).await.unwrap(); }
         assert_eq!(cash(&db, member.character, corp).await, (cents(12_000_000), cents(0)));
         for (amount, tax) in [(9,0), (10,1), (19,1)] {
             reset(&db, member.character, corp, issuer).await;
-            settle(&db, member.character, 0.0, amount, issuer).await.unwrap();
+            settle(&db, member.character, crate::isk::IskAmount::ZERO, amount, issuer).await.unwrap();
             assert_eq!((lp(&db, member.character, issuer).await, lp(&db, corp, issuer).await), (amount-tax,tax));
         }
         for rate in [0.0f64, 1.0] {
             reset(&db, member.character, corp, issuer).await;
             db.execute("UPDATE game.corporations SET tax_rate=$2,lp_tax_rate=$2 WHERE corporation_id=$1", &[&corp, &rate]).await.unwrap();
-            settle(&db, member.character, 200000.0, 10, issuer).await.unwrap();
+            settle(&db, member.character, cents(20_000_000), 10, issuer).await.unwrap();
             assert_eq!(cash(&db, member.character, corp).await, if rate == 0.0 { (cents(20_000_000), cents(0)) } else { (cents(0), cents(20_000_000)) });
             assert_eq!((lp(&db, member.character, issuer).await, lp(&db, corp, issuer).await), ((10.0*(1.0-rate)) as i64, (10.0*rate) as i64));
             reset(&db, member.character, corp, issuer).await;
-            settle(&db, member.character, 100000.0, 0, issuer).await.unwrap();
+            settle(&db, member.character, cents(10_000_000), 0, issuer).await.unwrap();
             assert_eq!(cash(&db, member.character, corp).await, (cents(10_000_000), cents(0)));
         }
         reset(&db, member.character, corp, issuer).await;
         db.execute("UPDATE game.corporations SET tax_rate=0.1,lp_tax_rate=0.5 WHERE corporation_id=$1", &[&corp]).await.unwrap();
-        settle(&db, member.character, 0.0, i64::MAX, issuer).await.unwrap();
+        settle(&db, member.character, crate::isk::IskAmount::ZERO, i64::MAX, issuer).await.unwrap();
         assert_eq!((lp(&db, member.character, issuer).await, lp(&db, corp, issuer).await), (4611686018427387904,4611686018427387903));
         reset(&db, member.character, corp, issuer).await;
         db.execute("UPDATE game.corporations SET lp_tax_rate='NaN'::float8 WHERE corporation_id=$1", &[&corp]).await.unwrap();
-        assert!(settle(&db, member.character, 200000.0, 10, issuer).await.is_err());
+        assert!(settle(&db, member.character, cents(20_000_000), 10, issuer).await.is_err());
         assert_eq!(cash(&db, member.character, corp).await, (cents(0), cents(0)));
         assert_eq!((lp(&db, member.character, issuer).await, lp(&db, corp, issuer).await), (0,0));
         db.execute("UPDATE game.corporations SET lp_tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await.unwrap();
@@ -89,8 +99,8 @@ async fn taxable_reward_boundaries_exact_lp_and_rollback() {
         let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = dispatched.clone();
         let error = db.transaction(|tx, outbox: &mut Outbox<()>| Box::pin(async move {
-            settle_reward(tx, outbox, member.character, 200000.0, Some(LoyaltyReward { issuer, amount: 10, mutation: mutation(crate::lua::events::resources::LoyaltyReason::MissionReward, crate::lua::events::resources::FactOrigin::Natural) })).await
-        }), move |(), _| async move { flag.store(true, std::sync::atomic::Ordering::SeqCst); Ok(()) }).await;
+            settle_reward(tx, outbox, member.character, cents(20_000_000), Some(LoyaltyReward { issuer, amount: 10, mutation: mutation(crate::lua::events::resources::LoyaltyReason::MissionReward, crate::lua::events::resources::FactOrigin::Natural) })).await
+        }), move |_, _| async move { flag.store(true, std::sync::atomic::Ordering::SeqCst); Ok(()) }).await;
         assert!(error.is_err());
         assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(cash(&db, member.character, corp).await, (cents(0), cents(0)));
@@ -98,13 +108,13 @@ async fn taxable_reward_boundaries_exact_lp_and_rollback() {
         assert_eq!(lp(&db, corp, issuer).await, i64::MAX);
         reset(&db, member.character, corp, issuer).await;
         db.execute("UPDATE game.characters SET corporation_id=1 WHERE character_id=$1", &[&member.character]).await.unwrap();
-        settle(&db, member.character, 200000.0, 10, issuer).await.unwrap();
+        settle(&db, member.character, cents(20_000_000), 10, issuer).await.unwrap();
         assert_eq!(cash(&db, member.character, corp).await, (cents(20_000_000), cents(0)));
         assert_eq!(lp(&db, member.character, issuer).await, 10);
         reset(&db, member.character, corp, issuer).await;
         db.execute("UPDATE game.characters SET corporation_id=$2 WHERE character_id=$1", &[&member.character, &corp]).await.unwrap();
         db.execute("UPDATE game.corporations SET deleted=true WHERE corporation_id=$1", &[&corp]).await.unwrap();
-        settle(&db, member.character, 200000.0, 10, issuer).await.unwrap();
+        settle(&db, member.character, cents(20_000_000), 10, issuer).await.unwrap();
         assert_eq!(cash(&db, member.character, corp).await, (cents(20_000_000), cents(0)));
         assert_eq!((lp(&db, member.character, issuer).await, lp(&db, corp, issuer).await), (10,0));
         assert_eq!(crate::dao::wallets::loyalty::balance(&db, member.character, issuer).await.unwrap(), Some(10));

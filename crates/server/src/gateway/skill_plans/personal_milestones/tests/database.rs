@@ -1,4 +1,5 @@
-use super::super::{handle, uuid};
+use super::super::handle;
+use super::super::super::wire::uuid;
 use crate::gateway::{Caller, context::HandlerContext, message::message};
 use crate::services::tests::fixture;
 use bytes::Bytes;
@@ -26,7 +27,7 @@ async fn personal_milestone_create_share_update_delete() {
     let points = 1_000_000_000_i64;
     gateway.db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&owner.character, &skill, &points]).await.unwrap();
     let plan = new_uuid();
-    plans::create(&gateway.db, &plan, owner.character, "plan", "", &[skill], &[1]).await.unwrap();
+    plans::create(&gateway.db, &plan, plans::Owner::Character(owner.character), "plan", "", &[skill], &[1], None).await.unwrap();
     let create = "eve_public.character.skill.plan.milestone.CreateRequest";
     let mut req = request(create);
     let mut data = child(&req.descriptor(), "milestone").unwrap();
@@ -82,7 +83,7 @@ async fn personal_milestone_create_share_update_delete() {
     let replacement = handle(&owner_ctx, create, &req).await.unwrap();
     let replacement_id = uuid(&replacement, "milestone").unwrap();
     handle(&viewer_ctx, get, &read).await.unwrap();
-    plans::delete(&gateway.db, owner.character, &plan).await.unwrap();
+    plans::delete(&gateway.db, plans::Owner::Character(owner.character), &plan).await.unwrap();
     assert!(gateway.db.query_opt("SELECT 1 FROM game.skill_plan_milestones WHERE milestone_id=$1", &[&replacement_id]).await.unwrap().is_none());
     assert!(gateway.db.query_opt("SELECT 1 FROM game.skill_plan_milestone_progress WHERE milestone_id=$1", &[&replacement_id]).await.unwrap().is_none());
     fixture::cleanup(&gateway.db, owner).await.unwrap();
@@ -98,7 +99,7 @@ async fn concurrent_milestone_creates_obey_five_milestone_cap() {
     let skills: Vec<_> = ctx.sde.types.iter().filter(|t| validation::valid_skill(ctx.sde, t.type_id) && ctx.sde.skill_plans.requirements(t.type_id).is_empty()).take(2).map(|t| t.type_id).collect();
     assert_eq!(skills.len(), 2);
     let plan = new_uuid();
-    plans::create(&gateway.db, &plan, owner.character, "plan", "", &[skills[0], skills[0], skills[0], skills[0], skills[0], skills[1]], &[1, 2, 3, 4, 5, 1]).await.unwrap();
+    plans::create(&gateway.db, &plan, plans::Owner::Character(owner.character), "plan", "", &[skills[0], skills[0], skills[0], skills[0], skills[0], skills[1]], &[1, 2, 3, 4, 5, 1], None).await.unwrap();
     let create = "eve_public.character.skill.plan.milestone.CreateRequest";
     let make_request = |skill: i32, level: u32| {
         let mut req = request(create);
@@ -122,7 +123,7 @@ async fn concurrent_milestone_creates_obey_five_milestone_cap() {
     assert!(matches!(first.err().or_else(|| second.err()).unwrap(), GatewayError::Refused { code: FailureCode::PreconditionFailed, .. }));
     let count: i64 = gateway.db.query_one("SELECT count(*) AS n FROM game.skill_plan_milestones WHERE plan_id=$1", &[&plan]).await.unwrap().get("n");
     assert_eq!(count, 5);
-    plans::delete(&gateway.db, owner.character, &plan).await.unwrap();
+    plans::delete(&gateway.db, plans::Owner::Character(owner.character), &plan).await.unwrap();
     fixture::cleanup(&gateway.db, owner).await.unwrap();
 }
 
@@ -134,7 +135,7 @@ async fn milestone_create_settles_due_training_before_snapshot() {
     let ctx = HandlerContext::for_request(&gateway, Caller { user_id: Some(owner.account), character_id: Some(owner.character) }).await.unwrap();
     let skill = ctx.sde.types.iter().find(|t| validation::valid_skill(ctx.sde, t.type_id) && ctx.sde.skill_plans.requirements(t.type_id).is_empty()).unwrap().type_id;
     let plan = new_uuid();
-    plans::create(&gateway.db, &plan, owner.character, "plan", "", &[skill], &[1]).await.unwrap();
+    plans::create(&gateway.db, &plan, plans::Owner::Character(owner.character), "plan", "", &[skill], &[1], None).await.unwrap();
     gateway.db.execute("INSERT INTO game.skills(character_id,type_id,level,skill_points) VALUES ($1,$2,0,0)", &[&owner.character, &skill]).await.unwrap();
     gateway.db.execute("INSERT INTO game.skill_queue(character_id,position,type_id,to_level,start_sp,dest_sp,start_time,end_time) VALUES ($1,0,$2,1,0,250,1,2)", &[&owner.character, &skill]).await.unwrap();
     let create = "eve_public.character.skill.plan.milestone.CreateRequest";
@@ -152,7 +153,7 @@ async fn milestone_create_settles_due_training_before_snapshot() {
     let row = gateway.db.query_one("SELECT completed FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&owner.character, &milestone]).await.unwrap();
     assert!(row.get::<_, bool>("completed"));
     assert_eq!(gateway.db.query_one("SELECT level FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&owner.character, &skill]).await.unwrap().get::<_, i32>("level"), 1);
-    plans::delete(&gateway.db, owner.character, &plan).await.unwrap();
+    plans::delete(&gateway.db, plans::Owner::Character(owner.character), &plan).await.unwrap();
     gateway.db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&owner.character]).await.unwrap();
     fixture::cleanup(&gateway.db, owner).await.unwrap();
 }

@@ -3,6 +3,7 @@ use super::*;
 fn queued_cloak_and_position_obey_guards_and_emit_native_actions() {
     let mut s = System::new(0, Arc::default(), 1_000);
     s.insert(ball(1, Some(100), 0.0));
+    s.insert(ball(2, None, 3000.0));
     let mut own = watch(&mut s, 1, 1);
     let mut other = watch(&mut s, 2, 2);
     s.set_ball_position(1, [10.0, 20.0, 30.0], |_, _| false);
@@ -16,12 +17,14 @@ fn queued_cloak_and_position_obey_guards_and_emit_native_actions() {
     s.tick(3_000);
     assert_eq!(s.ball(1).unwrap().pos, [10.0, 20.0, 30.0]);
     assert_eq!(s.ball(1).unwrap().cloak, 1);
-    let events = own.try_recv().unwrap();
+    let events = super::events::destiny(own.try_recv().unwrap());
     assert_eq!(name(&events[0]), b"SetBallPosition");
-    assert_eq!(name(&events[1]), b"CloakBall");
-    let events = other.try_recv().unwrap();
+    assert_eq!(name(&events[1]), b"OnSpecialFX");
+    assert_eq!(name(&events[2]), b"CloakBall");
+    let events = super::events::destiny(other.try_recv().unwrap());
     assert_eq!(name(&events[0]), b"SetBallPosition");
-    assert_eq!(name(&events[1]), b"CloakBall");
+    assert_eq!(name(&events[1]), b"OnSpecialFX");
+    assert_eq!(name(&events[2]), b"CloakBall");
 }
 
 #[test]
@@ -57,7 +60,8 @@ fn queued_cloak_rechecks_obstruction_before_success_callback() {
     assert!(!called.load(Ordering::Relaxed));
     s.tick(3000);
     assert!(called.load(Ordering::Relaxed));
-    assert_eq!(name(&own.try_recv().unwrap()[0]), b"CloakBall");
+    let events = super::events::destiny(own.try_recv().unwrap());
+    assert_eq!((name(&events[0]), name(&events[1])), (b"OnSpecialFX".as_slice(), b"CloakBall".as_slice()));
 }
 
 #[test]
@@ -222,7 +226,7 @@ fn bomb_flight_and_timer_begin_at_same_boundary() {
     bomb.max_vel = 50.0;
     let fired = Arc::new(AtomicBool::new(false));
     let hit = fired.clone();
-    s.launch_bomb(bomb, [1.0, 0.0, 0.0], 500, move |_| { hit.store(true, Ordering::Relaxed); });
+    s.launch_bomb(bomb, [1.0, 0.0, 0.0], 500, 0.0, move |_, _| { hit.store(true, Ordering::Relaxed); });
     s.tick(1500);
     assert!(!fired.load(Ordering::Relaxed));
     assert_eq!(s.ball(3).unwrap().mode, MODE_STOP);
@@ -296,7 +300,7 @@ fn tractor_restores_follow_with_nonfinite_legacy_max_speed() {
         assert!(s.begin_tractor(2, 10, generation.clone(), 20.0, 0.0, 1));
         s.tick(2000);
         assert_eq!(s.ball(2).unwrap().max_vel, 20.0);
-        let begin_events = rx.try_recv().unwrap();
+        let begin_events = super::events::destiny(rx.try_recv().unwrap());
         assert_eq!(begin_events.len(), 3);
         assert_eq!(name(&begin_events[0]), b"SetMaxSpeed");
         assert_eq!(name(&begin_events[1]), b"FollowBall");
@@ -311,7 +315,7 @@ fn tractor_restores_follow_with_nonfinite_legacy_max_speed() {
         assert_eq!(restored.max_vel, 20.0);
         assert_eq!((restored.mode, restored.follow_id, restored.follow_range), (MODE_FOLLOW, 3, 12.0));
         assert_eq!(restored.speed_fraction, 0.5);
-        let events = rx.try_recv().unwrap();
+        let events = super::events::destiny(rx.try_recv().unwrap());
         assert_eq!(events.len(), 2);
         assert_eq!(name(&events[0]), b"FollowBall");
         assert_eq!(name(&events[1]), b"SetSpeedFraction");
@@ -321,4 +325,21 @@ fn tractor_restores_follow_with_nonfinite_legacy_max_speed() {
         }
         assert!(rx.try_recv().is_err());
     }
+}
+
+#[test]
+fn cancelled_pending_cloak_sends_no_fx_or_cloakball() {
+    use std::sync::atomic::AtomicBool;
+    let mut s = System::new(0, Arc::default(), 1_000);
+    s.insert(ball(1, Some(100), 0.0));
+    s.insert(ball(2, None, 3000.0));
+    let mut own = watch(&mut s, 1, 1);
+    let mut other = watch(&mut s, 2, 2);
+    let generation = Arc::new(AtomicBool::new(false));
+    assert!(s.begin_module_cloak(1, 10, generation.clone(), 0, 0, |_| true, None));
+    s.stop_module_cloak(1, 10, &generation);
+    s.tick(2_000);
+    assert!(own.try_recv().is_err() && other.try_recv().is_err(),
+        "a cancelled cloak emits neither the FX nor CloakBall");
+    assert_eq!(s.ball(1).unwrap().cloak, 0);
 }

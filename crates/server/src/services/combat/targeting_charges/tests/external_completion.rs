@@ -1,15 +1,11 @@
 //! Completion of reservations from ordinary containers in a station hangar.
 use super::*;
+use super::super::completion::apply_loads;
 use infinity_core::consts::{FLAG_HANGAR, GROUP_CARGO_CONTAINER};
 use crate::dao::items::{loading::{self, ItemQuery}, pending_reloads, transfers};
 
 /// `const.containerHangar`, used by the bound inventory protocol.
 const CONTAINER_HANGAR: i64 = 10004;
-
-async fn rows(db: &Db, owner: i64) -> Vec<(i64, i32, i64, i64, i32, i64, bool)> {
-    loading::load_items(db, ItemQuery::Owner(owner)).await.unwrap().into_iter()
-        .map(|r| (r.item_id, r.type_id, r.owner_id, r.location_id, r.flag_id, r.quantity, r.singleton)).collect()
-}
 
 async fn completion_case(removed: bool) {
     crate::tests::init_config();
@@ -20,7 +16,8 @@ async fn completion_case(removed: bool) {
     let box_type = sde.types.iter().find(|t| t.published == Some(true) && t.group_id == Some(GROUP_CARGO_CONTAINER)).unwrap().type_id;
     let station = sde.map.stations().next().unwrap().station_id;
     let flag = infinity_core::consts::FLAG_FITTING_FIRST;
-    let fixture = crate::services::effects::tests::fixture::create(&db, ship_type, module_type, flag).await.unwrap();
+    let mut fixture = crate::services::tests::fixture::create_ship(&db, ship_type, crate::services::tests::fixture::ShipLocation::Docked { station: 1 }, &[crate::services::tests::fixture::ShipItemSpec { type_id: module_type, flag_id: flag, quantity: 1, singleton: true, online: true, attributes: &[] }]).await.unwrap();
+    let module_id = fixture.module();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut client, _peer) = crate::services::tests::client(test_db.clone(), fixture.character).await;
@@ -30,10 +27,10 @@ async fn completion_case(removed: bool) {
         let source = transfers::insert(&test_db, box_type, fixture.character, parent, FLAG_CARGO, 1).await.unwrap();
         let contents = transfers::insert(&test_db, charge_type, fixture.character, source, FLAG_CARGO, 7).await.unwrap();
         test_db.execute("UPDATE game.items SET singleton=true WHERE item_id=ANY($1)", &[&&[outer, parent, source][..]]).await.unwrap();
-        let id = pending_reloads::insert(&test_db, fixture.character, fixture.ship, fixture.module, flag, charge_type, 3, FLAG_CARGO, source).await.unwrap();
+        let id = pending_reloads::insert(&test_db, fixture.character, fixture.ship, module_id, flag, charge_type, 3, FLAG_CARGO, source).await.unwrap();
         let facts = pending_reloads::for_ship(&test_db, fixture.ship).await.unwrap();
         assert_eq!(facts.len(), 1);
-        let pending = PendingLoad { owner: fixture.character, reload_ids: vec![id], external_sources: vec![source], external_facts: facts, load: (fixture.module, flag, charge_type, 3, 0) };
+        let pending = PendingLoad { owner: fixture.character, reload_ids: vec![id], external_sources: vec![source], external_facts: facts, load: (module_id, flag, charge_type, 3, 0) };
         let snapshot = loading::capacity_snapshot(&test_db, source).await.unwrap();
         let before_used = crate::services::inventory::hold_storage::container_room(&sde, snapshot.parent.as_ref().unwrap(), &snapshot.items, &snapshot.reloads).unwrap().unwrap().used;
         assert_eq!(before_used, crate::services::item_volume::item_volume(&sde, charge_type, false, 10, None).unwrap());
@@ -51,9 +48,9 @@ async fn completion_case(removed: bool) {
         }
         client.outbox.clear();
         let (notify, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let before = rows(&test_db, fixture.character).await;
+        let before = super::rows(&test_db, fixture.character).await;
         let completion = apply_loads(&test_db, &client.world, &notify, fixture.ship, vec![pending]).await;
-        assert_eq!(rows(&test_db, fixture.character).await, before);
+        assert_eq!(super::rows(&test_db, fixture.character).await, before);
         let source_row = loading::load_items(&test_db, ItemQuery::Id(source)).await.unwrap().pop().unwrap();
         let contents_row = loading::load_items(&test_db, ItemQuery::Id(contents)).await.unwrap().pop().unwrap();
         assert_eq!((source_row.location_id, contents_row.location_id, contents_row.quantity), (if removed { parent } else { station }, source, 7));
@@ -74,8 +71,9 @@ async fn completion_case(removed: bool) {
             super::charge_sync::assert_prime(&args, &sde, fixture.ship, flag, charge_type, 3);
         }
     }).await;
+    fixture.items.extend(loading::load_items(&db, ItemQuery::Owner(fixture.character)).await.unwrap().iter().map(|row| row.item_id));
     db.execute("DELETE FROM game.pending_reloads WHERE ship_id=$1", &[&fixture.ship]).await.unwrap();
-    crate::services::effects::tests::fixture::cleanup(&db, fixture).await.unwrap();
+    crate::services::tests::fixture::cleanup_ship(&db, None, fixture).await.unwrap();
     result.unwrap();
 }
 

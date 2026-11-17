@@ -140,5 +140,5 @@ async fn execute(c: &mut Client, call: &Call<'_>, action: Grant) -> CallResult {
 pub(in crate::services) async fn ship(c: &mut Client, call: &Call<'_>) -> CallResult { execute(c, call, Grant::Ship).await }
 pub(in crate::services) async fn bonus(c: &mut Client, call: &Call<'_>) -> CallResult { execute(c, call, Grant::Bonus).await }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

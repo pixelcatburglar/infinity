@@ -81,9 +81,9 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     let db = Db::connect(&cfg).await.unwrap();
     let sde = Sde::load(&db).await.unwrap();
     let type_id = sde.types.iter().next().expect("SDE types required").type_id;
-    let (mut client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let mut tx = client.transaction().await.unwrap();
+    let (client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let mut tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES (nextval('game.accounts_user_id_seq')::text, ''::bytea, 0) RETURNING user_id", &[]).await.unwrap().get("user_id");
     let a: i64 = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id, station_id, balance) VALUES ($1, nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1, 1, 100) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
     let b: i64 = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id, station_id, balance) VALUES ($1, nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1, 1, 100) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
@@ -127,7 +127,7 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     assert_eq!(characters::balance(&tx, a).await.unwrap(), crate::isk::IskAmount::from_cents(9_000).unwrap());
     assert_eq!(characters::balance(&tx, b).await.unwrap(), crate::isk::IskAmount::from_cents(11_000).unwrap());
     let invocation = (u128::from(crate::handshake::random_u64()) << u64::BITS) | u128::from(crate::handshake::random_u64());
-    let inserted = prepare_batch(&mut outbox, &tx, invocation).await.unwrap();
+    let inserted = prepare_batch(&mut outbox, &tx, invocation, &Registry::default()).await.unwrap();
     assert!(!inserted.is_empty());
     let _publication = outbox.after_commit(&Registry::default(), &inserted);
     let events: Vec<_> = outbox.into_entries().into_iter().filter_map(|entry| match entry {

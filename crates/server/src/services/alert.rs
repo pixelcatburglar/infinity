@@ -110,7 +110,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "GroupBeanDelivery" => async {
             let decoded;
             let data = match call.args.first() {
-                Some(Value::Bytes(bytes)) => { decoded = crate::framing::inflate(bytes).ok().and_then(|b| marshal::loads(&b).ok()); decoded.as_ref() }
+                Some(Value::Bytes(bytes)) => { decoded = infinity_wire::framing::inflate(bytes).ok().and_then(|b| marshal::loads(&b).ok()); decoded.as_ref() }
                 v => v,
             };
             let Some(records) = data.and_then(group) else { return Ok(Value::None); };
@@ -150,4 +150,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-services"))] mod tests;

@@ -1,10 +1,21 @@
-//! Agent manager service and dialogue.
+//! Agent manager service, dialogue and shared objective response encoding.
+//! Requesting a new mission checks the pilot's effective standing for the agent's
+//! level (standingsvc.GetEffectiveStandingWithAgent): the best of the agent's, its
+//! corporation's and its faction's standing after the Diplomacy, Connections or
+//! Criminal Connections bonus, refused outright when any of the three is -2 or
+//! worse. The bonuses are character attributes read from the pilot's character fit.
+//! An offer prices its rewards once, when it is written: Negotiation raises the
+//! ISK amount and the agent's division the LP amount, each floored to a whole
+//! number saved on the mission. Accepting or completing never re-prices it.
 //! Successful acceptance queues an event after the existing state and cargo writes.
 //! Courier and trade cargo objectives use packaged item volume from the loaded SDE,
 //! matching `agentinteraction/objectivesteps.py`; unsupported mission kinds have no cargo objective.
 //! Epic arc journal messages mirror `evemissions.common.epic_arcs_data` and use
 //! the loaded SDE journal rows.
+//! `WarpToLocation` reads its sixth positional argument as fleet formation settings
+//! only when the `fleet` argument is true; single-pilot requests ignore it.
 use super::*;
+use crate::services::fit::Fit;
 // ---------------------------------------------------------------- client shapes
 
 fn keywords(m: &Mission) -> Value {
@@ -43,6 +54,28 @@ async fn agent_location(c: &Client, agent_id: i64) -> Result<Value, CallError> {
     ]))
 }
 
+/// Encode objective details without changing the caller's objective or completion policy.
+fn objective_value(
+    m: &Mission, completion: i64, objectives: Value, dungeons: Value, system: i64,
+) -> Value {
+    Value::dict([
+        ("importantStandings", Value::Int(0)),
+        ("completionStatus", Value::Int(completion)),
+        ("missionTitleID", Value::Int(m.name_id)),
+        ("missionState", Value::Int(m.state as i64)),
+        ("objectives", objectives),
+        ("dungeons", dungeons),
+        ("locations", Value::list([Value::Int(system)])),
+        ("agentGift", Value::list([])),
+        ("normalRewards", Value::list([Value::tuple([Value::Int(TYPE_CREDITS), Value::Int(m.reward_isk), Value::None])])),
+        ("loyaltyPoints", Value::Int(m.reward_lp)),
+        ("researchPoints", Value::Int(0)),
+        ("bonusRewards", Value::list([])),
+        ("collateral", Value::list([])),
+        ("contentID", Value::Int(m.mission_id as i64)),
+    ])
+}
+
 /// GetMissionObjectiveInfo: kill missions list their site, the others their hand-in
 /// (agentDialogueUtil._ProcessObjectiveEntry: 'agent', 'transport', 'fetch').
 async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
@@ -78,22 +111,9 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
         _ => {}
     }
     let system = agent(hand_in).map(|a| a.system_id).unwrap_or(m.system_id);
-    Ok(Value::dict([
-        ("importantStandings", Value::Int(0)),
-        ("completionStatus", Value::Int(0)),
-        ("missionTitleID", Value::Int(m.name_id)),
-        ("missionState", Value::Int(m.state as i64)),
-        ("objectives", Value::List(objectives)),
-        ("dungeons", Value::list([])),
-        ("locations", Value::list([Value::Int(system)])),
-        ("agentGift", Value::list([])),
-        ("normalRewards", Value::list([Value::tuple([Value::Int(TYPE_CREDITS), Value::Int(m.reward_isk), Value::None])])),
-        ("loyaltyPoints", Value::Int(m.reward_lp)),
-        ("researchPoints", Value::Int(0)),
-        ("bonusRewards", Value::list([])),
-        ("collateral", Value::list([])),
-        ("contentID", Value::Int(m.mission_id as i64)),
-    ]))
+    Ok(objective_value(
+        m, 0, Value::List(objectives), Value::list([]), system,
+    ))
 }
 
 async fn kill_objective_info(c: &Client, m: &Mission) -> Value {
@@ -108,22 +128,9 @@ async fn kill_objective_info(c: &Client, m: &Mission) -> Value {
     if done {
         dungeon.push(("completionStatus", Value::Int(1)));
     }
-    Value::dict([
-        ("importantStandings", Value::Int(0)),
-        ("completionStatus", Value::Int(i64::from(done))),
-        ("missionTitleID", Value::Int(m.name_id)),
-        ("missionState", Value::Int(m.state as i64)),
-        ("objectives", Value::list([])),
-        ("dungeons", Value::list([Value::dict(dungeon)])),
-        ("locations", Value::list([Value::Int(m.system_id)])),
-        ("agentGift", Value::list([])),
-        ("normalRewards", Value::list([Value::tuple([Value::Int(TYPE_CREDITS), Value::Int(m.reward_isk), Value::None])])),
-        ("loyaltyPoints", Value::Int(m.reward_lp)),
-        ("researchPoints", Value::Int(0)),
-        ("bonusRewards", Value::list([])),
-        ("collateral", Value::list([])),
-        ("contentID", Value::Int(m.mission_id as i64)),
-    ])
+    objective_value(
+        m, i64::from(done), Value::list([]), Value::list([Value::dict(dungeon)]), m.system_id,
+    )
 }
 
 /// appConst.agentMissionBriefing* keys.
@@ -321,7 +328,10 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             let Some(step) = next_arc_step(c, agent.id).await? else {
                 return conversation(Value::unicode(messages::NO_CURRENT_MISSION), Value::list([]), none());
             };
-            offer_arc(c, agent, step).await?;
+            let me = c.session.int("charid").unwrap_or(0);
+            let at = filetime_now();
+            let fit = Fit::load_character_at(&c.db, c.sde.clone(), me, at).await?;
+            offer_arc(c, agent, step, &fit, at).await?;
             c.notify("OnAgentMissionChange", vec![Value::str("offered"), Value::Int(agent.id)]);
             let m = mission_with(c, agent.id).await?.ok_or_else(|| CallError::Internal(anyhow::anyhow!("offer vanished")))?;
             let (s, a) = view(c, &m, agent).await?;
@@ -330,12 +340,14 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
         (Some(ACT_REQUEST), None) => {
             let me = c.session.int("charid").unwrap_or(0);
             let needed = super::standings::required_for_level(agent.level);
-            let have = super::standings::effective(&c.db, me, agent.id, agent.corp_id, agent.faction_id).await?;
+            let at = filetime_now();
+            let fit = Fit::load_character_at(&c.db, c.sde.clone(), me, at).await?;
+            let have = super::standings::bonuses::effective(&c.db, &fit, me, agent.id, agent.corp_id, agent.faction_id).await?;
             if have < needed {
                 let text = messages::mission_standing_requirement_message(needed, have);
                 return conversation(Value::unicode(text), Value::list([]), none());
             }
-            offer(c, agent).await?;
+            offer(c, agent, &fit, at).await?;
             c.notify("OnAgentMissionChange", vec![Value::str("offered"), Value::Int(agent.id)]);
             let m = mission_with(c, agent.id).await?.ok_or_else(|| CallError::Internal(anyhow::anyhow!("offer vanished")))?;
             let (s, a) = view(c, &m, agent).await?;
@@ -387,12 +399,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             conversation(s, actions(&[(ACT_QUIT, BTN_QUIT)]), none())
         }
         (Some(ACT_DECLINE), Some(m)) if m.state == STATE_OFFERED => {
-            remove(c, agent.id).await?;
-            let me = c.session.int("charid").unwrap_or(0);
-            let mut outbox = crate::db::outbox::Outbox::default();
-            super::standings::mission_declined(&c.db, &mut outbox, me, agent.id, agent.corp_id).await?;
-            crate::db::outbox::dispatch_client((), outbox, c)?;
-            c.notify("OnAgentMissionChange", vec![Value::str("offer_declined"), Value::Int(agent.id)]);
+            end_mission(c, &m, agent, false).await?;
             let s = says(c, &m, "messages.mission.declined.agentsays", messages::MISSION_DECLINED).await?;
             conversation(s, Value::list([]), last_action(false, true, false))
         }
@@ -403,18 +410,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             conversation(s, next, last_action(true, false, false))
         }
         (Some(ACT_QUIT), Some(m)) => {
-            remove(c, agent.id).await?;
-            let me = c.session.int("charid").unwrap_or(0);
-            let mut outbox = crate::db::outbox::Outbox::default();
-            super::standings::mission_declined(&c.db, &mut outbox, me, agent.id, agent.corp_id).await?;
-            crate::db::outbox::dispatch_client((), outbox, c)?;
-            // A quit arc step can be taken up again (its fail mission, usually itself).
-            if let Some(arc) = m.arc_id {
-                set_arc_state(c, arc, m.mission_id, "quit").await?;
-                let retry = c.sde.missions.step(m.mission_id).and_then(|s| s.fail).unwrap_or(m.mission_id);
-                set_arc_state(c, arc, retry, "unlocked").await?;
-            }
-            c.notify("OnAgentMissionChange", vec![Value::str("quit"), Value::Int(agent.id)]);
+            end_mission(c, &m, agent, true).await?;
             let s = says(c, &m, "messages.mission.quitted.agentsays", messages::MISSION_QUIT).await?;
             conversation(s, Value::list([]), last_action(false, false, true))
         }
@@ -433,7 +429,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
     let kind = call.args.first().and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
     let range = call.args.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
     let order = if call.args.get(3).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
-        Some(super::super::fleets::warp::authorize(c).await?)
+        Some(super::super::fleets::warp::authorize(c, call.args.get(5)).await?)
     } else { None };
     let here = c.session.int("solarsystemid");
     match kind.as_str() {
@@ -544,5 +540,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

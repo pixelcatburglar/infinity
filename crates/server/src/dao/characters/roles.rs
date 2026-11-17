@@ -1,14 +1,25 @@
 //! SQL expression combining character role bits with held titles in `game.corp_titles`.
-//! The caller supplies the character row; this DAO has no direct client mirror or wire contract.
+//! While the member's corporation runs a CEO election (game.corporations.active_ceo_vote_id),
+//! the final global mask withholds ROLE_DIRECTOR from the sitting CEO only; stored role,
+//! title, scoped and grantable values stay intact. The caller supplies the character row;
+//! this DAO has no direct client mirror or wire contract.
 //! Owning services supply client contracts and handle role policy, transactions, refusals, notifications and World.
 
-/// Server title model: union the member's role bits with the roles of all held titles.
-pub(crate) const EFFECTIVE_ROLES_SQL: &str = "(ch.corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
-     WHERE t.corporation_id = ch.corporation_id AND NOT ch.corp_block_roles AND ch.corp_title_mask & t.title_id <> 0), 0))";
+use std::sync::LazyLock;
+
+/// Server title model: union the member's role bits with the roles of all held titles,
+/// with the Director bit withheld while the member is the CEO of a corporation that has
+/// an active CEO election. The expression reads the `co` alias supplied by
+/// CURRENT_CORPORATION_JOIN_SQL, so every consumer joins the current corporation.
+pub(crate) static EFFECTIVE_ROLES_SQL: LazyLock<String> = LazyLock::new(|| format!(
+    "((ch.corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
+         WHERE t.corporation_id = ch.corporation_id AND NOT ch.corp_block_roles AND ch.corp_title_mask & t.title_id <> 0), 0))
+     & CASE WHEN co.ceo_id = ch.character_id AND co.active_ceo_vote_id IS NOT NULL THEN ~({}::bigint) ELSE -1 END)",
+    infinity_core::consts::ROLE_DIRECTOR
+));
 
 /// Shared current corporation join; a missing or deleted corporation has no live row.
 pub(crate) const CURRENT_CORPORATION_JOIN_SQL: &str = "FROM game.characters ch LEFT JOIN game.corporations co ON co.corporation_id=ch.corporation_id AND NOT co.deleted";
-
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 
@@ -27,8 +38,9 @@ impl Authority {
     }
 }
 pub(super) fn projection(predicate: &str) -> String {
+    let effective = EFFECTIVE_ROLES_SQL.as_str();
     format!("SELECT ch.character_id, ch.corporation_id, co.ceo_id, co.station_id AS headquarters, (co.corporation_id IS NOT NULL) AS corporation_live, ch.corp_base_id, ch.corp_block_roles,
-        {EFFECTIVE_ROLES_SQL} AS roles,
+        {effective} AS roles,
         ch.corp_roles_hq | COALESCE(t.hq,0) AS roles_hq,
         ch.corp_roles_base | COALESCE(t.base,0) AS roles_base,
         ch.corp_roles_other | COALESCE(t.other,0) AS roles_other,

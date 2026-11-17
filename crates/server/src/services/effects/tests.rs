@@ -1,7 +1,7 @@
 //! Real database and system-actor regressions for effect families.
-mod area;
-pub(in crate::services) mod fixture;
-mod heat;
-mod utilities;
-mod space;
-mod salvage;
+#[cfg(feature = "tests-effects")] mod area;
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash"))] pub(in crate::services) mod fixture;
+#[cfg(feature = "tests-effects")] mod heat;
+#[cfg(feature = "tests-effects")] mod utilities;
+#[cfg(feature = "tests-effects")] mod space;
+#[cfg(feature = "tests-effects")] mod salvage;

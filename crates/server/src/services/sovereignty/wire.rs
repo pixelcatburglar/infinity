@@ -1,8 +1,9 @@
 //! Sovereignty projections for `sovereignty.data_types` and `sovSvc`.
-//! Values come from committed Hub, system, policy and history rows. Campaigns
-//! and development indices are not modelled here.
+//! Values come from committed Hub, system, policy and history rows plus the
+//! projected development view; campaigns are not modelled here.
 use marshal::{DbRowDescriptor, DbType, Value};
-use crate::{dao::sovereignty::{history::HistoryRow, policy::PolicyRow, structures::HubRow, systems::SystemRow}, services::{crowset, keyval, rowset}};
+use crate::{dao::sovereignty::{history::HistoryRow, policy::PolicyRow, structures::HubRow, systems::SystemRow}, services::{crowset, db_err, keyval, rowset, CallError}};
+use super::indices::model::DevelopmentView;
 
 fn optional(id: Option<i64>) -> Value { id.map_or(Value::None, Value::Int) }
 
@@ -21,15 +22,29 @@ pub(crate) fn hub(row: Option<&SystemRow>) -> Value {
 }
 
 /// Complete physical structure list, including unclaimed neutral Hubs.
-pub(crate) fn structures(hubs: &[HubRow], policies: &[PolicyRow]) -> Vec<Value> {
+/// `development` is `Some` only while the whole index capability serves; every
+/// Hub then requires exactly one valid view. `None` omits `defenseMultiplier`,
+/// never a fabricated value.
+pub(crate) fn structures(hubs: &[HubRow], policies: &[PolicyRow], development: Option<&[DevelopmentView]>) -> Result<Vec<Value>, CallError> {
     hubs.iter().map(|h| {
         let capital = h.system.alliance_id.is_some_and(|alliance| policies.iter().any(|p| p.alliance_id == alliance && p.current_capital_system == Some(h.system.system_id)));
-        keyval([
+        let mut fields = vec![
             ("itemID", Value::Int(h.structure.item_id)), ("typeID", Value::Int(i64::from(h.type_id))),
             ("solarSystemID", Value::Int(h.system.system_id)), ("corporationID", Value::Int(h.owner_id)),
             ("ownerID", Value::Int(h.owner_id)), ("allianceID", optional(h.system.alliance_id)),
             ("isCapital", Value::Bool(capital)), ("campaignState", Value::None), ("vulnerabilityState", Value::None),
-        ])
+        ];
+        if let Some(views) = development {
+            let mut matching = views.iter().filter(|view| view.system_id == h.system.system_id);
+            let (Some(view), None) = (matching.next(), matching.next()) else {
+                return Err(db_err(anyhow::anyhow!("development projection does not cover sovereignty Hub")));
+            };
+            if ![view.military_points, view.industrial_points, view.strategic_seconds, view.military.remainder, view.industrial.remainder, view.strategic.remainder, view.defense_multiplier].iter().all(|value| value.is_finite()) || view.military_points < 0.0 || view.industrial_points < 0.0 || view.strategic_seconds < 0.0 || view.defense_multiplier <= 0.0 {
+                return Err(db_err(anyhow::anyhow!("invalid development defense multiplier")));
+            }
+            fields.push(("defenseMultiplier", Value::Float(view.defense_multiplier)));
+        }
+        Ok(keyval(fields))
     }).collect()
 }
 

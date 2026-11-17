@@ -225,4 +225,4 @@ pub(super) fn plan_qa(state: &mut VirtualState, id: &str, amount: u64, day: i64,
     Ok(change)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

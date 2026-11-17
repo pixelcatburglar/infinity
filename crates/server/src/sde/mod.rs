@@ -11,10 +11,15 @@
 //! campaign and command-node definitions are not loaded.
 //! Achievement definitions are verified once from the retail CDN source; progress is not modeled here.
 //! Server-authored rookie fits are validated against race and inventory data at startup.
+//! Repairable-ship recovery configuration comes from `sde_native.repairabletypesconfig`,
+//! `sde_native.typerefurbishedcomponentconfig` and `sde_native.unrepairableitemsconfig`;
+//! randomized reprocessing drops are detected but not modelled.
 //! Celestial collision radii are resolved here for the wire and placement callers.
 //! Typed dogma_effect_modifiers and build_info are intentionally unused: modifiers come from dogma_effects instead.
 //! Native blueprints and stationoperations are unused under the typed-table ruling.
-pub(crate) mod achievements;
+//! The operator-imported LP store offer catalogue comes from `game.lp_offers` and is read once here.
+//! The admitted positional superweapon catalogue is the server's own embedded
+//! `content/super_weapons.json`; refused superweapon types have no row.
 pub(crate) mod characters;
 pub(crate) mod compression;
 pub(crate) mod corporations;
@@ -30,13 +35,17 @@ pub(crate) mod factions;
 pub(crate) mod graphic_locations;
 pub(crate) mod industry;
 pub(crate) mod localization;
+pub(crate) mod lp_offers;
 pub(crate) mod map;
 pub(crate) mod missions;
+pub(crate) mod prices;
 pub(crate) mod rookie_fits;
+pub(crate) mod repairable_ship;
 pub(crate) mod ship_skins;
 pub(crate) mod skill_plans;
 pub(crate) mod sovereignty;
 pub(crate) mod store;
+pub(crate) mod super_weapons;
 pub(crate) mod types;
 pub(crate) mod typelists;
 pub(crate) mod wrecks;
@@ -47,9 +56,8 @@ use std::{sync::Arc, time::Instant};
 /// Existing World wire policy for celestial radii missing from both SDE rows.
 const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
 
-#[cfg_attr(test, derive(Default))]
 pub(crate) struct Sde {
-    pub(crate) achievements: achievements::Achievements,
+    pub(crate) achievements: infinity_content::achievements::Achievements,
     pub(crate) contribution_methods: contribution_methods::ContributionMethods,
     pub(crate) types: types::Types,
     pub(crate) crates: crates::Crates,
@@ -75,6 +83,10 @@ pub(crate) struct Sde {
     pub(crate) characters: characters::Characters,
     pub(crate) rookie_fits: Arc<rookie_fits::RookieFits>,
     pub(crate) typelists: typelists::TypeLists,
+    pub(crate) prices: prices::Prices,
+    pub(crate) lp_offers: lp_offers::LpOffers,
+    pub(crate) repairable_ship: repairable_ship::RepairableShip,
+    pub(crate) super_weapons: super_weapons::SuperWeapons,
 }
 impl Sde {
     pub(crate) fn celestial_radius(&self, celestial: &map::Celestial) -> f32 {
@@ -85,9 +97,9 @@ impl Sde {
 
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
         let started = Instant::now();
-        let achievements = achievements::Achievements::load(crate::retail::cdn("achievements").ok_or_else(|| anyhow::anyhow!("missing achievements content"))?)
+        let achievements = infinity_content::achievements::Achievements::load(infinity_content::retail::cdn("achievements").ok_or_else(|| anyhow::anyhow!("missing achievements content"))?)
             .map_err(|error| error.context("loading achievement catalogue"))?;
-        let (mut types, dogma, map, factions, npc_corporations, corporation_roles, localization, wrecks, industry, ship_skins, missions, mut dungeons, characters, graphic_locations, dynamic_rows) = tokio::try_join!(
+        let (mut types, dogma, map, factions, npc_corporations, corporation_roles, localization, wrecks, industry, ship_skins, missions, mut dungeons, characters, graphic_locations, dynamic_rows, prices, lp_offers) = tokio::try_join!(
             types::Types::load(db), dogma::Dogma::load(db), map::Map::load(db),
             factions::Factions::load(db), corporations::NpcCorporations::load(db), corporation_roles::CorporationRoles::load(db), localization::Localization::load(db), wrecks::Wrecks::load(db),
             async { industry::Industry::load(db).await.map_err(anyhow::Error::from) },
@@ -96,8 +108,11 @@ impl Sde {
             characters::Characters::load(db),
             graphic_locations::GraphicLocations::load(db),
             async { crate::dao::sde::dynamic_items::load(db).await.map_err(anyhow::Error::from) },
+            prices::Prices::load(db),
+            lp_offers::LpOffers::load(db),
         )?;
         let rookie_fits = Arc::new(rookie_fits::RookieFits::load(&types, &characters)?);
+        let super_weapons = super_weapons::SuperWeapons::load(&types)?;
         let (compression, typelists, crates, (expert_systems, store), accounting, skill_plans, sovereignty, contribution_methods) = tokio::try_join!(
             compression::Compression::load(db, &types),
             typelists::TypeLists::load(db, &types),
@@ -112,11 +127,12 @@ impl Sde {
             sovereignty::Sovereignty::load(db, &types),
             contribution_methods::ContributionMethods::load(db),
         )?;
+        let repairable_ship = repairable_ship::RepairableShip::load(db, &types, &industry, &compression).await?;
         let dynamic_items = dynamic_items::DynamicItems::from_rows(dynamic_rows, &types, &dogma);
         types.index_modifiers(&dogma);
         dungeons.index_map(&map);
         tracing::info!(types = types.len(), dogma_attributes = dogma.attribute_count(), dogma_effects = dogma.effect_count(), systems = map.systems().count(), stations = map.stations().count(), celestials = map.all_celestials().count(), factions = factions.len(), npc_corporations = npc_corporations.len(), localization = localization.len(), expert_systems = expert_systems.iter().count(), accounting_entries = accounting.iter().count(), elapsed_ms = started.elapsed().as_millis(), "SDE loaded");
-        Ok(Self { achievements, contribution_methods, types, crates, compression, sovereignty, dogma, dynamic_items, expert_systems, skill_plans, accounting, map, graphic_locations, factions, npc_corporations, corporation_roles, localization, wrecks, industry, store, ship_skins, missions, dungeons, characters, rookie_fits, typelists })
+        Ok(Self { achievements, contribution_methods, types, crates, compression, sovereignty, dogma, dynamic_items, expert_systems, skill_plans, accounting, map, graphic_locations, factions, npc_corporations, corporation_roles, localization, wrecks, industry, store, ship_skins, missions, dungeons, characters, rookie_fits, typelists, prices, lp_offers, repairable_ship, super_weapons })
     }
     /// Mirrors the client's non-tradable and soulbound type-list checks.
     pub(crate) fn is_tradable(&self, type_id: i32) -> bool {
@@ -124,3 +140,6 @@ impl Sde {
         self.typelists.is_tradable(type_id, data.and_then(|ty| ty.group_id), data.and_then(|ty| ty.category_id))
     }
 }
+
+#[cfg(test)]
+mod tests;

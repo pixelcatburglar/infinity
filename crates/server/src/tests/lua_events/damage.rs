@@ -131,17 +131,17 @@ pub(super) async fn run(ctx: &super::Context) {
         let target = world.ball(SYSTEM, ship).await.unwrap();
         let event = json!({"kind":"Damaged","char_id":pilot,"ship_id":ship,"attacker_ball_id":source,"system_id":SYSTEM});
         let attempt = npc_attempt(world, source, None, None, Some(npc_type)).await;
-        weapons::turret_shot(db, world, SYSTEM, &attacker, &target, None, npc_type, false, (1.0, 1.0, 1.0, 1.0), [1.0, 0.0, 0.0, 0.0], None, attempt).await.ok().unwrap();
+        weapons::turret_shot(db, world, SYSTEM, &attacker, &target, None, npc_type, false, (1.0, 1.0, 1.0, 1.0), [1.0, 0.0, 0.0, 0.0], None, None, attempt).await.ok().unwrap();
         world.with(SYSTEM, |_| ()).await.unwrap();
         expect_events(ctx, &mut cursor, &[event.clone()]).await;
         world.with(SYSTEM, |_| ()).await.unwrap();
         assert!(world.ball(SYSTEM, ship).await.unwrap().health[0] < 1.0);
         let attempt = npc_attempt(world, source, None, None, Some(npc_type)).await;
-        weapons::turret_shot(db, world, SYSTEM, &attacker, &target, None, npc_type, false, (1.0, 1.0, 1.0, 1.0), [0.0; 4], None, attempt).await.ok().unwrap();
+        weapons::turret_shot(db, world, SYSTEM, &attacker, &target, None, npc_type, false, (1.0, 1.0, 1.0, 1.0), [0.0; 4], None, None, attempt).await.ok().unwrap();
         world.with(SYSTEM, |_| ()).await.unwrap();
         expect_events(ctx, &mut cursor, &[]).await;
         let attempt = npc_attempt(world, source, None, None, Some(npc_type)).await;
-        weapons::turret_shot(db, world, SYSTEM, &attacker, &target, None, npc_type, false, (-1.0, 1.0, 1.0, 1.0), [1.0; 4], None, attempt).await.ok().unwrap();
+        weapons::turret_shot(db, world, SYSTEM, &attacker, &target, None, npc_type, false, (-1.0, 1.0, 1.0, 1.0), [1.0; 4], None, None, attempt).await.ok().unwrap();
         expect_events(ctx, &mut cursor, &[]).await;
         let (damage_source, attempt) = admitted_source(world, source, None).await;
         assert!(apply_damage_guarded(db, world, SYSTEM, unpiloted, [1.0, 0.0, 0.0, 0.0], damage_source, false, |_| true).await.unwrap().unwrap().dealt > 0.0);
@@ -153,10 +153,9 @@ pub(super) async fn run(ctx: &super::Context) {
         world.remove_ball(SYSTEM, unpiloted).await;
         combat::forget_ship(unpiloted);
         let missile = Missile { charge, raw: [1.0, 0.0, 0.0, 0.0], aoe_cloud: 1.0, aoe_velocity: 100.0,
-            drf: 1.0, velocity: 1000.0, flight_range: 1000.0, weapon: npc_type, illegal: false };
+            drf: 1.0, velocity: 1000.0, flight_time_ms: 1_000.0, weapon: npc_type, illegal: false };
         let attempt = npc_attempt(world, source, None, None, Some(npc_type)).await;
         weapons::launch_missile(db.clone(), world.clone(), SYSTEM, attacker.clone(), target.clone(), 1, None, missile, None, attempt).await.ok().unwrap();
-        world.remove_ball(SYSTEM, source).await;
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if ctx.events().await.len() > cursor { break; }
@@ -164,6 +163,7 @@ pub(super) async fn run(ctx: &super::Context) {
             }
         }).await.expect("missile damage event");
         expect_events(ctx, &mut cursor, &[event.clone()]).await;
+        world.remove_ball(SYSTEM, source).await;
         world.add_ship(SYSTEM, attacker.clone()).await.unwrap();
         let (shots, mut rx) = tokio::sync::mpsc::unbounded_channel();
         world.with(SYSTEM, move |s| {
@@ -187,19 +187,24 @@ pub(super) async fn run(ctx: &super::Context) {
         world.with(SYSTEM, |_| ()).await.unwrap();
         expect_events(ctx, &mut cursor, &[]).await;
         assert!(crate::dao::items::dogma::set_override(db, ship, ATTR_SHIELD_EM_DAMAGE_RESONANCE, 0.0).await.unwrap());
-        let (generation, revision, projection) = world.with(SYSTEM, move |s| (s.combat_membership_generation(ship).unwrap(), s.combat_fit_revision(ship).unwrap(), s.projection_revision(ship))).await.unwrap();
         let fit = crate::services::fit::Fit::load_in_space(db, world, SYSTEM, pilot, ship).await.unwrap();
-        assert!(world.with(SYSTEM, move |s| s.replace_fitted_cache(ship, generation, revision, fit, crate::services::fit::Key::Ship, Some(projection))).await.unwrap());
+        assert!(crate::services::tests::fixture::publish_fitting(world, SYSTEM, pilot, ship, fit).await);
         let (damage_source, attempt) = admitted_source(world, source, None).await;
-        assert_eq!(apply_damage_guarded(db, world, SYSTEM, ship, [1.0, 0.0, 0.0, 0.0], damage_source, false, |_| true).await.unwrap().unwrap().dealt, 0.0);
+        let dealt = apply_damage_guarded(db, world, SYSTEM, ship, [1.0, 0.0, 0.0, 0.0], damage_source, false, |_| true).await.unwrap().unwrap().dealt;
+        drop(attempt);
+        assert!((dealt - 0.05).abs() < 1e-9, "resonance floor must pass 5% of raw damage, got {dealt}");
+        world.with(SYSTEM, |_| ()).await.unwrap();
+        expect_events(ctx, &mut cursor, &[event.clone()]).await;
+        // Control: truly zero raw damage still deals nothing and emits no event.
+        let (damage_source, attempt) = admitted_source(world, source, None).await;
+        assert_eq!(apply_damage_guarded(db, world, SYSTEM, ship, [0.0; 4], damage_source, false, |_| true).await.unwrap().unwrap().dealt, 0.0);
         drop(attempt);
         world.with(SYSTEM, |_| ()).await.unwrap();
         expect_events(ctx, &mut cursor, &[]).await;
         let resonance = sde.types.attribute(hull, ATTR_SHIELD_EM_DAMAGE_RESONANCE).unwrap();
         assert!(crate::dao::items::dogma::set_override(db, ship, ATTR_SHIELD_EM_DAMAGE_RESONANCE, resonance).await.unwrap());
-        let (generation, revision, projection) = world.with(SYSTEM, move |s| (s.combat_membership_generation(ship).unwrap(), s.combat_fit_revision(ship).unwrap(), s.projection_revision(ship))).await.unwrap();
         let fit = crate::services::fit::Fit::load_in_space(db, world, SYSTEM, pilot, ship).await.unwrap();
-        assert!(world.with(SYSTEM, move |s| s.replace_fitted_cache(ship, generation, revision, fit, crate::services::fit::Key::Ship, Some(projection))).await.unwrap());
+        assert!(crate::services::tests::fixture::publish_fitting(world, SYSTEM, pilot, ship, fit).await);
         let (damage_source, attempt) = admitted_source(world, source, None).await;
         apply_damage_guarded(db, world, SYSTEM, ship, [1e30; 4], damage_source, false, |_| true).await.unwrap().unwrap();
         drop(attempt);

@@ -28,7 +28,7 @@ async fn audit_warns_with_each_legacy_plan_identity_and_refuses_new_invalid_writ
     let mut ids = Vec::new();
     for skill in [Some(unknown), Some(unpublished), obsolete].into_iter().flatten() {
         let id = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
-        plans::create(&db, &id, owner.character, "legacy", "", &[skill], &[1]).await.unwrap();
+        plans::create(&db, &id, plans::Owner::Character(owner.character), "legacy", "", &[skill], &[1], None).await.unwrap();
         let new_id = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
         assert!(matches!(crate::services::skill_plans::personal::create(&identity, &db, &sde, &new_id, "new", "", &[skill], &[1]).await, Err(crate::services::skill_plans::Error::Precondition)));
         ids.push((id, skill));
@@ -45,19 +45,19 @@ async fn audit_warns_with_each_legacy_plan_identity_and_refuses_new_invalid_writ
     let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || capture.clone()).finish();
     super::super::audit(&db, &sde).with_subscriber(subscriber).await.unwrap();
     let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-    let matching: Vec<_> = output.lines().filter(|line| line.contains("legacy skill plan has invalid static skill sequence") && line.contains(&format!("character_id={}", owner.character))).collect();
+    let matching: Vec<_> = output.lines().filter(|line| line.contains("legacy skill plan has invalid static skill sequence") && line.contains(&format!("owner=Character({})", owner.character))).collect();
     assert_eq!(matching.len(), ids.len() + 1, "{output}");
-    assert_eq!(output.lines().filter(|line| line.contains("cyclic milestone target") && line.contains(&format!("character_id={}", owner.character)) && line.contains(&format!("plan_id={valid_id:?}"))).count(), 1, "{output}");
+    assert_eq!(output.lines().filter(|line| line.contains("cyclic milestone target") && line.contains(&format!("owner=Character({})", owner.character)) && line.contains(&format!("plan_id={valid_id:?}"))).count(), 1, "{output}");
     for (id, skill) in &ids {
         assert_eq!(matching.iter().filter(|line| line.contains(&format!("plan_id={id:?}"))).count(), 1, "{output}");
-        let stored = plans::get(&db, id, Some(owner.character)).await.unwrap().unwrap();
+        let stored = plans::get(&db, id, Some(plans::Owner::Character(owner.character))).await.unwrap().unwrap();
         assert_eq!(&stored.plan_id, id);
         assert_eq!(stored.name, "legacy");
         assert_eq!(stored.description, "");
         assert_eq!(stored.skill_ids, vec![*skill]);
         assert_eq!(stored.levels, vec![1]);
-        plans::delete(&db, owner.character, id).await.unwrap();
+        plans::delete(&db, plans::Owner::Character(owner.character), id).await.unwrap();
     }
-    plans::delete(&db, owner.character, &valid_id).await.unwrap();
+    plans::delete(&db, plans::Owner::Character(owner.character), &valid_id).await.unwrap();
     fixture::cleanup(&db, owner).await.unwrap();
 }

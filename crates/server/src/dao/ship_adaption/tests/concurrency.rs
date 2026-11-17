@@ -42,6 +42,7 @@ async fn character_lock_serializes_and_stale_revision_rolls_back() {
     assert_eq!(result.chips, vec![chips::Chip { type_id: 1, balance: 2 }]);
     db.execute("DELETE FROM game.ship_adaption_chips WHERE character_id=$1", &[&character.character]).await.unwrap();
     db.execute("DELETE FROM game.ship_adaption_characters WHERE character_id=$1", &[&character.character]).await.unwrap();
+    db.execute("DELETE FROM game.lua_content_versions WHERE namespace='ship_adaption' AND version=$1", &[&version]).await.unwrap();
     crate::services::tests::fixture::cleanup(&db, character).await.unwrap();
     drop(holder);
     holder_driver.await.unwrap();

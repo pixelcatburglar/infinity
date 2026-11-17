@@ -79,7 +79,7 @@ fn compile_payloads(payloads: &[Value]) -> Result<Vec<Regex>, String> {
 fn load_rules() -> Result<Rules, String> {
     let mut payloads = Vec::new();
     for kind in ["blocked", "intercepted"] {
-        let value = crate::retail::cached_call("bannedwords", "fetch_regexes", &[Value::str(kind)])
+        let value = infinity_content::retail::cached_call("bannedwords", "fetch_regexes", &[Value::str(kind)])
             .ok_or_else(|| format!("missing cached {kind} rules"))?;
         payloads.push(value);
     }
@@ -187,4 +187,4 @@ pub(super) fn dispatch(call: &Call<'_>) -> Option<CallResult> {
     Some(check(call, RULES.as_ref()))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-services"))] mod tests;

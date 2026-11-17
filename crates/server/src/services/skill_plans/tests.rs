@@ -12,26 +12,24 @@ async fn milestone_delivery_ack_and_snapshot_rollback_retry_and_reordering() {
     let skill = sde.types.iter().find(|t| super::validation::valid_skill(&sde, t.type_id) && sde.skill_plans.requirements(t.type_id).is_empty()).unwrap().type_id;
     let rank = crate::services::skills::training::skill_type(&sde, skill).rank;
     let points = crate::services::skills::formulas::sp_for_level(rank, 1);
-    let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let tx = client.transaction().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
     let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
-    plans::create(&tx, &plan, owner.character, "plan", "", &[skill], &[1]).await.unwrap();
+    plans::create(&tx, &plan, plans::Owner::Character(owner.character), "plan", "", &[skill], &[1], None).await.unwrap();
     plan_milestones::create(&tx, &milestone, &plan, "skill", skill, Some(1)).await.unwrap();
     tx.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,0,0)", &[&owner.character, &skill]).await.unwrap();
     super::progress::reconcile_tx(&tx, &sde, owner.character, None).await.unwrap();
     let registration = super::progress::registration();
-    tx.execute("INSERT INTO game.progress_subscriptions (consumer_key,generation,activated_at,version,enabled) VALUES ($1,1,0,1,true) ON CONFLICT (consumer_key) DO NOTHING", &[&registration.consumer_key]).await.unwrap();
-    for kind in registration.kinds {
-        tx.execute("INSERT INTO game.progress_subscription_kinds (consumer_key,kind) VALUES ($1,$2) ON CONFLICT DO NOTHING", &[&registration.consumer_key, kind]).await.unwrap();
-    }
+    let projected = crate::progress::tests::fixture_registry(&tx, progress::Registry::new(vec![], vec![registration]).unwrap()).await;
+    let (consumers, kinds) = projected.subscription_arrays();
     let namespace = format!("milestone-test-{}", crate::handshake::random_u64());
     let events = [GameEvent::SkillTrained { char_id: owner.character, type_id: skill, level: 1 }, GameEvent::SkillStateChanged { char_id: owner.character }];
     let mut keys = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let entry = journal::JournalEvent { source_namespace: namespace.clone(), source_key: index.to_string(), schema_version: progress::codec::SCHEMA_VERSION, kind: event.kind().into(), occurred_at: 1, recorded_at: 1, payload: progress::codec::encode(event).unwrap(), context: "{}".into(), origin: "test".into(), ordinal: index as i64, subject_character_id: Some(owner.character) };
-        let inserted = journal::insert_batch(&tx, &[entry]).await.unwrap();
+        let inserted = journal::insert_batch(&tx, &[entry], consumers, kinds).await.unwrap();
         keys.push(DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() });
     }
     tx.execute("UPDATE game.skills SET level=1, skill_points=$3 WHERE character_id=$1 AND type_id=$2", &[&owner.character, &skill, &points]).await.unwrap();
@@ -70,7 +68,7 @@ async fn recovery_reconciles_a_missed_skill_state_event() {
     let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, 1);
     let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
     let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
-    plans::create(&db, &plan, owner.character, "plan", "", &[skill], &[1]).await.unwrap();
+    plans::create(&db, &plan, plans::Owner::Character(owner.character), "plan", "", &[skill], &[1], None).await.unwrap();
     plan_milestones::create(&db, &milestone, &plan, "skill", skill, Some(1)).await.unwrap();
     db.execute("INSERT INTO game.skills(character_id,type_id,level,skill_points) VALUES ($1,$2,0,0)", &[&owner.character, &skill]).await.unwrap();
     super::recovery::character(&db, &sde, owner.character).await.unwrap();
@@ -79,7 +77,7 @@ async fn recovery_reconciles_a_missed_skill_state_event() {
     let row = db.query_one("SELECT completed,trained_sp FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&owner.character, &milestone]).await.unwrap();
     assert!(row.get::<_, bool>("completed"));
     assert_eq!(row.get::<_, i64>("trained_sp"), points);
-    plans::delete(&db, owner.character, &plan).await.unwrap();
+    plans::delete(&db, plans::Owner::Character(owner.character), &plan).await.unwrap();
     fixture::cleanup(&db, owner).await.unwrap();
 }
 
@@ -96,22 +94,20 @@ async fn stored_cyclic_target_delivery_is_invalid_and_acknowledged() {
     let ty = sde.types.get(cyclic).expect("Polaris skill in SDE");
     assert_eq!(ty.published, Some(false));
     assert!(sde.skill_plans.is_cyclic(cyclic));
-    let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move { connection.await.unwrap(); });
-    let tx = client.transaction().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
+    let mut wrapper = deadpool_postgres::ClientWrapper::new(client, tokio::spawn(async move { connection.await.unwrap(); }));
+    let tx = crate::db::Transaction::from(wrapper.transaction().await.unwrap());
     let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
     let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
-    plans::create(&tx, &plan, owner.character, "legacy", "", &[], &[]).await.unwrap();
+    plans::create(&tx, &plan, plans::Owner::Character(owner.character), "legacy", "", &[], &[], None).await.unwrap();
     plan_milestones::create(&tx, &milestone, &plan, "skill", cyclic, Some(1)).await.unwrap();
     crate::dao::skills::plan_progress::upsert(&tx, owner.character, &[crate::dao::skills::plan_progress::Snapshot { milestone_id: milestone.clone(), required_sp: 0, trained_sp: 0, queued_sp: 0, completed: false, valid: true }], 1).await.unwrap();
     let registration = super::progress::registration();
-    tx.execute("INSERT INTO game.progress_subscriptions (consumer_key,generation,activated_at,version,enabled) VALUES ($1,1,0,1,true) ON CONFLICT (consumer_key) DO NOTHING", &[&registration.consumer_key]).await.unwrap();
-    for kind in registration.kinds {
-        tx.execute("INSERT INTO game.progress_subscription_kinds (consumer_key,kind) VALUES ($1,$2) ON CONFLICT DO NOTHING", &[&registration.consumer_key, kind]).await.unwrap();
-    }
+    let projected = crate::progress::tests::fixture_registry(&tx, progress::Registry::new(vec![], vec![registration]).unwrap()).await;
+    let (consumers, kinds) = projected.subscription_arrays();
     let event = GameEvent::SkillStateChanged { char_id: owner.character };
     let entry = journal::JournalEvent { source_namespace: format!("milestone-cycle-test-{}", crate::handshake::random_u64()), source_key: "0".into(), schema_version: progress::codec::SCHEMA_VERSION, kind: event.kind().into(), occurred_at: 1, recorded_at: 1, payload: progress::codec::encode(&event).unwrap(), context: "{}".into(), origin: "test".into(), ordinal: 0, subject_character_id: Some(owner.character) };
-    let inserted = journal::insert_batch(&tx, &[entry]).await.unwrap();
+    let inserted = journal::insert_batch(&tx, &[entry], consumers, kinds).await.unwrap();
     let key = DeliveryKey { consumer_key: registration.consumer_key.into(), event_id: inserted[0].1.clone() };
     assert!(matches!(progress::apply_once_tx(&tx, &mut Outbox::default(), &sde, &registration, key.clone(), None, progress::ClaimMode::Blocking).await.unwrap(), ApplyOutcome::Applied));
     let row = tx.query_one("SELECT valid,completed,required_sp,trained_sp,queued_sp FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&owner.character, &milestone]).await.unwrap();
@@ -123,4 +119,43 @@ async fn stored_cyclic_target_delivery_is_invalid_and_acknowledged() {
     assert!(matches!(progress::apply_once_tx(&tx, &mut Outbox::default(), &sde, &registration, key, None, progress::ClaimMode::Blocking).await.unwrap(), ApplyOutcome::AlreadyApplied));
     tx.rollback().await.unwrap();
     fixture::cleanup(&db, owner).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn corporation_members_reconcile_independently_and_departed_viewers_stop_updating() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = crate::sde::Sde::load(&db).await.unwrap();
+    let member_a = fixture::create(&db).await.unwrap();
+    let member_b = fixture::create(&db).await.unwrap();
+    let outsider = fixture::create(&db).await.unwrap();
+    let corp: i64 = db.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES ('plan-' || nextval('game.corporations_corporation_id_seq')::text, 'SP' || currval('game.corporations_corporation_id_seq')::text, $1,$1,1,1) RETURNING corporation_id", &[&member_a.character]).await.unwrap().get("corporation_id");
+    for member in [member_a, member_b] { db.execute("UPDATE game.characters SET corporation_id=$2 WHERE character_id=$1", &[&member.character, &corp]).await.unwrap(); }
+    let skill = sde.types.iter().find(|t| super::validation::valid_skill(&sde, t.type_id) && sde.skill_plans.requirements(t.type_id).is_empty()).unwrap().type_id;
+    let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, 1);
+    let plan = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
+    let milestone = [crate::handshake::random_u64().to_be_bytes(), crate::handshake::random_u64().to_be_bytes()].concat();
+    plans::create(&db, &plan, plans::Owner::Corporation(corp), "corp plan", "", &[skill], &[1], Some(&[0u8; 16])).await.unwrap();
+    plan_milestones::create(&db, &milestone, &plan, "skill", skill, Some(1)).await.unwrap();
+    db.execute("INSERT INTO game.skills(character_id,type_id,level,skill_points) VALUES ($1,$2,1,$3)", &[&member_a.character, &skill, &points]).await.unwrap();
+    db.execute("INSERT INTO game.skills(character_id,type_id,level,skill_points) VALUES ($1,$2,0,0)", &[&member_b.character, &skill]).await.unwrap();
+    for viewer in [member_a, member_b] { super::progress::reconcile_tx(&db, &sde, viewer.character, None).await.unwrap(); }
+    assert!(snapshot(&db, &milestone, member_a.character).await);
+    assert!(!snapshot(&db, &milestone, member_b.character).await);
+    super::progress::reconcile_tx(&db, &sde, outsider.character, None).await.unwrap();
+    assert!(db.query_opt("SELECT 1 FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&outsider.character, &milestone]).await.unwrap().is_none());
+    // Leaving the corporation keeps the old snapshot but stops updating it.
+    db.execute("UPDATE game.characters SET corporation_id=1 WHERE character_id=$1", &[&member_b.character]).await.unwrap();
+    db.execute("UPDATE game.skills SET level=1, skill_points=$3 WHERE character_id=$1 AND type_id=$2", &[&member_b.character, &skill, &points]).await.unwrap();
+    super::progress::reconcile_tx(&db, &sde, member_b.character, None).await.unwrap();
+    assert!(!snapshot(&db, &milestone, member_b.character).await);
+    plans::delete(&db, plans::Owner::Corporation(corp), &plan).await.unwrap();
+    db.execute("UPDATE game.characters SET corporation_id=1 WHERE character_id=ANY($1)", &[&vec![member_a.character, member_b.character]]).await.unwrap();
+    db.execute("DELETE FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    for viewer in [member_a, member_b, outsider] { fixture::cleanup(&db, viewer).await.unwrap(); }
+}
+
+async fn snapshot(db: &crate::db::Db, milestone: &[u8], viewer: i64) -> bool {
+    db.query_one("SELECT completed FROM game.skill_plan_milestone_progress WHERE character_id=$1 AND milestone_id=$2", &[&viewer, &milestone]).await.unwrap().get("completed")
 }

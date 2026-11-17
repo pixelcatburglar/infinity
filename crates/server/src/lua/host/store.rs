@@ -155,5 +155,5 @@ pub(super) fn register(lua: &Lua, env: &Table, db: &Db, script: &str, limit: usi
     env.set("store", store)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

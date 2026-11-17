@@ -3,7 +3,7 @@
 //! occurrence periods and recorded content. Receipts remain in the progress driver.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::{dao::{daily_goals::{instances, periods}, progress::{self as journal, DeliveryState}}, progress::{ApplyError, DeliveryKey, EventEnvelope, PreparedDelivery}, services::daily_goals::{activation, Error, Resources}};
-use tokio_postgres::Transaction;
+use crate::db::Transaction;
 use super::{apply, prepare::{self, ConcretePreparedDelivery, PreparedChange, PeriodCache, MAX_PAYMENT_AFFECTED_GOALS, MAX_PAYMENT_PENDING_DELIVERIES}, source::{self, Fact}, state::{self, ReadSet}};
 /// Four ordinary slots and a bonus are assigned per daily period.
 const DAILY_SLOTS: usize = 5;
@@ -46,13 +46,13 @@ async fn preflight(resources: &Resources, owner: i64, bounds: &BTreeMap<(String,
     let rows = instances::bounded_period_union(&resources.db, owner, &days, &months, (MAX_PAYMENT_AFFECTED_GOALS + 1) as i64).await?;
     if rows.len() > MAX_PAYMENT_AFFECTED_GOALS { return Err(Error::Forbidden.into()); }
     let mut count = rows.len();
-    let mut history = activation::load(resources).await?;
+    let mut history = activation::load(resources)?;
     for ((kind, start), end) in bounds {
         let period = periods::get(&resources.db, owner, kind, *start).await?;
         let members = rows.iter().filter(|r| r.kind == *kind && r.period_start == *start).count();
         if period.is_none() {
             if members != 0 { return Err(BatchError::Reprepare); }
-            if activation::resolve(resources, &mut history, kind, *start, *end).await?.is_none() { return Err(Error::Unavailable.into()); }
+            if activation::resolve(resources, &mut history, kind, *start, *end)?.is_none() { return Err(Error::Unavailable.into()); }
             count += if kind == "day" { DAILY_SLOTS } else { MONTHLY_SLOTS };
             if count > MAX_PAYMENT_AFFECTED_GOALS { return Err(Error::Forbidden.into()); }
         } else if members != if kind == "day" { DAILY_SLOTS } else { MONTHLY_SLOTS } { return Err(BatchError::Reprepare); }
@@ -64,16 +64,16 @@ pub(crate) async fn prepare(resources: &Resources, user: i64, owner: i64, id: &s
     let target = instances::get(&resources.db, owner, id).await?.ok_or(Error::Missing)?;
     let current = periods::bounds(&resources.db, at).await?;
     if target.kind != "day" || target.category != "ordinary" || target.period_start != current.day_start || at < target.period_start || at >= target.period_end || target.voided_at.is_some() { return Err(Error::Forbidden.into()); }
-    let keys = journal::pending_for_character(&resources.db, super::CONSUMER_KEY, owner, (MAX_PAYMENT_PENDING_DELIVERIES + 1) as i64).await?;
+    let keys = journal::pending_for_character(&resources.db, super::CONSUMER_KEY, owner, (MAX_PAYMENT_PENDING_DELIVERIES + 1) as i64, resources.db.progress_registry().enabled_keys()).await?;
     if keys.len() > MAX_PAYMENT_PENDING_DELIVERIES { return Err(Error::Forbidden.into()); }
     let mut pending = Vec::with_capacity(keys.len());
     let mut bounds = BTreeMap::new();
     bounds.insert(("day".to_owned(), current.day_start), current.day_end);
     bounds.insert(("month".to_owned(), current.month_start), current.month_end);
-    let mut history = activation::load(resources).await?;
+    let mut history = activation::load(resources)?;
     let mut eligible_days = BTreeMap::new();
     for key in &keys {
-        let event = match journal::delivery(&resources.db, key).await? { DeliveryState::Pending(event) => event, DeliveryState::Applied => return Err(BatchError::Reprepare), DeliveryState::Missing => return Err(Error::Unavailable.into()) };
+        let event = match journal::delivery(&resources.db, key).await? { DeliveryState::Pending(event) => event, DeliveryState::Applied => return Err(BatchError::Reprepare), DeliveryState::Terminal | DeliveryState::Missing => return Err(Error::Unavailable.into()) };
         let mut fact = source::map(&event, &resources.sde)?;
         if let Some(fact) = &mut fact {
             if fact.character != owner { return Err(Error::Invalid.into()); }
@@ -82,7 +82,7 @@ pub(crate) async fn prepare(resources: &Resources, user: i64, owner: i64, id: &s
                 let b = periods::bounds(&resources.db, slice.occurred_at).await?;
                 let eligible = if let Some(eligible) = eligible_days.get(&b.day_start) { *eligible } else {
                     let eligible = periods::get(&resources.db, owner, "day", b.day_start).await?.is_some()
-                        || activation::resolve(resources, &mut history, "day", b.day_start, b.day_end).await?.is_some();
+                        || activation::resolve(resources, &mut history, "day", b.day_start, b.day_end)?.is_some();
                     eligible_days.insert(b.day_start, eligible);
                     eligible
                 };

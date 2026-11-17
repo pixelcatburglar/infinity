@@ -93,6 +93,6 @@ pub(in crate::services) async fn validate_and_consume<X: Send>(
     Ok(item)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-inventory"))]
 mod tests;
 

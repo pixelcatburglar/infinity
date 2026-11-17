@@ -20,5 +20,5 @@ pub(super) async fn dispatch(c: &Client, call: &Call<'_>) -> Option<CallResult> 
     }.await)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

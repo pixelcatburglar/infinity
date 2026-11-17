@@ -2,10 +2,26 @@
 //! Client ship boarding and stored-vessel operations use actor-owned condition
 //! snapshots and game item rows; no independent condition state is maintained.
 //! Restored old hull identity uses persistent membership, type and owner, not mutable motion.
+//! Membership removals retain their original observer boundary during boarding;
+//! the ego handoff then rides the scene delta as a directed transfer, so the
+//! rebound observer loses the old incarnation and gains the new one in order.
 
 use super::*;
 use crate::space::combat::{ActorConditionSnapshot, CombatPhase};
 use infinity_core::session::OnlineSession;
+
+/// A committed boundary already persisted this ship's captured loaded
+/// absolute; the replacing record reseeds from the durable fit, so release the
+/// business hold and clear settled dirt before the obligation guard runs.
+fn clear_committed_loaded(s: &mut System, ship: i64) {
+    let Some(record) = s.actor_combat.get(&ship) else { return };
+    let membership = record.membership_generation;
+    let seeds = record.loaded.values().filter(|slot| !slot.unknown).map(|slot| crate::space::combat::loaded::LoadedSeed {
+        module: slot.module, flag: slot.flag, type_id: slot.type_id,
+        quantity: slot.quantity, pending: slot.pending,
+    }).collect();
+    s.publish_loaded_absolute(ship, membership, seeds);
+}
 
 pub(crate) struct PreparedTransition {
     pub old: Option<PreparedOld>,
@@ -141,15 +157,13 @@ impl System {
             return false;
         }
         for id in old_fence.map(|f| f.0).into_iter().chain(target_fence.map(|f| f.0)) {
-            if let Some(ball) = self.take(id) {
-                if ball.cloak == 0 {
-                    let update = event(self.current_time, "RemoveBalls", vec![Value::list([Value::Int(id)])]);
-                    self.actions.push_back((self.current_time, Box::new(move |s, _| s.deliver(None, vec![update]))));
-                }
+            if let Some((_, exit)) = self.take_for_scene_exit(id) {
+                self.queue_scene_exit(exit, move |stamp|
+                    vec![event(stamp, "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
             }
         }
         if let Some((client, _)) = target.pilot {
-            if let Some((ego, _)) = self.observers.get_mut(&client) { *ego = target.id; }
+            self.set_observer_ego(client, target.id);
         }
         if let Some(old) = old {
             match old {
@@ -159,7 +173,7 @@ impl System {
                     prepared.ball.pos = snapshot_ball.pos;
                     prepared.ball.stop();
                     prepared.ball.vel = [0.0; 3];
-                    prepared.ball.speed_fraction = 0.0;
+                    clear_committed_loaded(self, snapshot_ball.id);
                     if !prepared.install_transfer(self, |s, ball| s.add_persistent_ship(ball), state) { return false; }
                 }
             }
@@ -169,6 +183,7 @@ impl System {
         target.prepared.ball.vel = [0.0; 3];
         target.prepared.ball.speed_fraction = 0.0;
         if let Some((state, _)) = target.existing {
+            clear_committed_loaded(self, target.id);
             target.prepared.install_transfer(self, |s, ball| s.add_ship(ball), state)
         } else {
             if target.pilot.is_some() { target.prepared.install(self, |s, ball| s.add_ship(ball)); }
@@ -199,15 +214,25 @@ struct BoardSettlement {
     entries: Vec<(u64, ActorConditionSnapshot)>,
     facts: Option<Arc<crate::space::snapshot::FactCheckpoint>>,
     actor_gate: Arc<tokio::sync::Mutex<()>>,
+    admission: crate::space::containment::ActorAdmission,
     receipt: Mutex<Option<(tokio::sync::oneshot::Sender<Result<Option<i64>, CallError>>, Option<CallError>)>>,
 }
 
 impl BoardSettlement {
     fn finish(&self, result: Result<Option<i64>, &'static str>) -> bool {
-        if let Some((sender, original)) = self.receipt.lock().unwrap().take() {
+        if let Some((sender, original)) = crate::poison::lock_or_exit(self.receipt.lock()).take() {
             let result = result.map_err(|message| original.unwrap_or_else(|| CallError::Internal(anyhow::anyhow!(message))));
             sender.send(result).is_ok()
         } else { false }
+    }
+
+    /// The typed retirement for a refused old generation: it overrides a
+    /// stored ordinary error so the caller sees `ActorRetiring`, not a string.
+    fn finish_retiring(&self) {
+        if let Some((_, original)) = crate::poison::lock_or_exit(self.receipt.lock()).as_mut() {
+            *original = Some(CallError::Internal(anyhow::anyhow!(crate::space::containment::ActorRetiring)));
+        }
+        self.finish(Err("space session is retiring"));
     }
 
 
@@ -287,9 +312,16 @@ impl BoardSettlement {
 
     async fn reconcile_once(&self, world: &World) -> bool {
         use crate::dao::items::boarding;
+        // A failed generation sends the typed retirement, not a stale receipt.
+        if self.admission.check().is_err() { self.finish_retiring(); return false; }
         let market = crate::services::market::lock().await;
+        if self.admission.check().is_err() { self.finish_retiring(); return false; }
         if world.system_locked(self.system, &market).await.is_err() { return false; }
         let Ok(_gate) = world.lock_condition_snapshot(self.system).await else { return false };
+        if !crate::services::combat::loaded::fresh_gate(&self.db, world, self.system,
+            &self.entries.iter().map(|(_, state)| state.item_id).collect::<Vec<_>>()).await {
+            return false;
+        }
         let old = match self.plan {
             RecoveryPlan::Board { old, .. } | RecoveryPlan::Store { old, .. } | RecoveryPlan::BoardStored { old, .. } => old,
         };
@@ -388,10 +420,10 @@ impl BoardSettlement {
                 let Ok(transition) = prepared.committed(&self.entries, self.character, Some(self.expected.clone()), &written, self.actor_gate.clone()) else { return false };
                 transition
             } else {
-                let replacement = world.systems.lock().unwrap().get(&self.system)
+                let replacement = crate::poison::lock_or_exit(world.systems.lock()).get(&self.system)
                     .is_some_and(|handle| !Arc::ptr_eq(&handle.gate, &self.actor_gate));
                 if !replacement { return false; }
-                let receiver_live = self.receipt.lock().unwrap().as_ref().is_some_and(|(sender, _)| !sender.is_closed());
+                let receiver_live = crate::poison::lock_or_exit(self.receipt.lock()).as_ref().is_some_and(|(sender, _)| !sender.is_closed());
                 if !receiver_live { self.finish(Err("ship transition caller disconnected")); return true; }
                 CommittedTransition {
                     old: Some(if matches!(self.plan, RecoveryPlan::Store { .. }) {
@@ -429,26 +461,33 @@ impl BoardSettlement {
 pub(crate) async fn settle_space<F>(
     world: Arc<World>, db: Db, sde: Arc<crate::sde::Sde>, system: i64, character: i64, client: i64,
     expected: OnlineSession, transition: CombatTransition,
-    market: tokio::sync::MutexGuard<'static, ()>, gate: tokio::sync::OwnedMutexGuard<()>,
+    market: crate::services::market::economy_lock::Guard, gate: tokio::sync::OwnedMutexGuard<()>,
+    admission: crate::space::containment::ActorAdmission,
     plan: RecoveryPlan, operation: F,
 ) -> Result<Option<i64>, CallError>
 where
-    F: for<'a, 'tx> Fn(&'a tokio_postgres::Transaction<'tx>,
+    F: for<'a, 'tx> Fn(&'a crate::db::Transaction<'tx>,
         &'a mut crate::db::outbox::Outbox<crate::services::effects::online::OnlineChanged>,
         &'a [ActorConditionSnapshot], Option<&'a crate::space::snapshot::FactCheckpoint>) -> crate::db::transaction::TxFuture<'a, (PreparedTransition, Vec<i64>), CallError>
         + Send + Sync + 'static,
 {
     use crate::services::effects::online;
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    let actor_gate = world.systems.lock().unwrap().get(&system).map(|handle| handle.gate.clone())
+    let actor_gate = crate::poison::lock_or_exit(world.systems.lock()).get(&system).map(|handle| handle.gate.clone())
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("ship transition actor stopped")))?;
+    let entries: Vec<_> = transition.entries.iter().map(|(token, state)| {
+        let mut state = state.clone();
+        state.loaded.clear();
+        (*token, state)
+    }).collect();
     let settlement = Arc::new(BoardSettlement {
         world: Arc::downgrade(&world), db: db.clone(), sde, system, character, client,
-        expected, plan, entries: transition.entries.clone(), facts: transition.facts.clone(), actor_gate, receipt: Mutex::new(Some((sender, None))),
+        expected, plan, entries, facts: transition.facts.clone(), actor_gate, admission, receipt: Mutex::new(Some((sender, None))),
     });
     let submit_world = world.clone();
-    let submitted = world.with(system, move |s| s.defer_condition_transition(transition, move |_| async move {
-        let states: Vec<_> = settlement.entries.iter().map(|(_, state)| state.clone()).collect();
+    let submitted = world.with(system, move |s| s.defer_condition_transition(transition, move |mut transition| async move {
+        let states: Vec<_> = transition.entries.iter().map(|(_, state)| state.clone()).collect();
+        let mut loaded = transition.held_loaded.take();
         if submit_world.online_session(character).as_ref() != Some(&settlement.expected) {
             let entries: Vec<_> = settlement.entries.iter().map(|(token, state)| (state.item_id, *token, state.generation)).collect();
             let actor_gate = settlement.actor_gate.clone();
@@ -462,6 +501,9 @@ where
             return;
         }
         let operation = Arc::new(operation);
+        // The guard arms right before the transaction may execute; after that
+        // an undelivered disposition invalidates instead of rolling back.
+        if let Some(hold) = loaded.as_mut() { hold.may_execute(); }
         let result: Result<i64, CallError> = db.transaction(
             |tx, outbox: &mut crate::db::outbox::Outbox<online::OnlineChanged>| {
                 let states = states.clone();
@@ -497,12 +539,18 @@ where
         ).await;
         match result {
             Ok(target) => {
+                if let Some(hold) = loaded.take() {
+                    crate::services::combat::loaded::commit_disposition(&submit_world, system, hold).await;
+                }
                 settlement.finish(Ok(Some(target)));
                 return;
             }
             Err(error) => {
-                if let Some((_, original)) = settlement.receipt.lock().unwrap().as_mut() { *original = Some(error); }
+                if let Some((_, original)) = crate::poison::lock_or_exit(settlement.receipt.lock()).as_mut() { *original = Some(error); }
             }
+        }
+        if let Some(hold) = loaded.take() {
+            crate::services::combat::loaded::unknown_disposition(&db, &submit_world, system, hold).await;
         }
         let pending = settlement.mark_pending(&submit_world).await;
         drop(gate);
@@ -516,6 +564,9 @@ where
     receiver.await.map_err(|_| CallError::Internal(anyhow::anyhow!("ship transition worker unavailable")))?
 }
 
-#[cfg(test)]
+#[path = "transitions/boundaries.rs"]
+mod boundaries;
+
+#[cfg(all(test, feature = "tests-space"))]
 #[path = "transitions/tests.rs"]
 mod tests;

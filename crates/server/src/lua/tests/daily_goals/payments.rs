@@ -27,8 +27,7 @@ pub(crate) async fn current_environment(root: &Path) -> (crate::db::Db, Resource
     authored(root, &a);
     std::fs::write(root.join("payment-version"), &a).unwrap();
     let registry = crate::progress::Registry::new(vec![], vec![crate::services::daily_goals::progress::registration()]).unwrap();
-    let (db, resources) = environment(root, false, registry).await;
-    crate::progress::tests::register_fixture(&db, &crate::services::daily_goals::progress::registration()).await;
+    let (db, resources) = environment(root, registry).await;
     let row_a = lua_content::load(&db, "daily_goals", &a).await.unwrap().unwrap();
     authored(root, &b);
     crate::lua::HOST.get().unwrap().reload().await.unwrap();
@@ -43,16 +42,11 @@ pub(crate) async fn current_environment(root: &Path) -> (crate::db::Db, Resource
     }
     let previous = bounds.month_start - FILETIME_DAY;
     assert!(previous > 0);
-    db.transaction(|tx, _: &mut ()| {
-        let row_a = row_a.clone();
-        Box::pin(async move {
-            assert!(activations::append_if_changed(tx, &row_a, previous).await?);
-            Ok::<_, crate::db::Error>(())
-        })
-    }, |(), ()| async { Ok(()) }).await.unwrap();
     authored(root, &a);
-    crate::lua::HOST.get().unwrap().reload().await.unwrap();
-    assert_eq!(activations::list(&db, "daily_goals").await.unwrap().last().unwrap().version, a);
+    crate::lua::reload::tests::publish_at(previous).await.unwrap();
+    let mut publications = activations::load_all(&db).await.unwrap().into_iter().filter(|row| row.namespace == "daily_goals").collect::<Vec<_>>();
+    publications.sort_by_key(|row| row.ordinal);
+    assert_eq!(publications.last().unwrap().version, a);
     (db, resources)
 }
 
@@ -97,6 +91,7 @@ impl PaymentFixture {
     /// Journal a fixture jump, not proof that a space actor performed one.
     pub(super) async fn publish_jump(&self, occurred_at: i64) -> crate::progress::DeliveryKey {
         use crate::{dao::progress::{self as journal, JournalEvent}, lua::events::GameEvent, progress};
+        let (consumers, kinds) = self.db.progress_registry().subscription_arrays();
         let event = GameEvent::Jumped { char_id: self.owner.character, ship_id: 1, from_system_id: 2, to_system_id: 3 };
         let occurrence = crate::dao::map_telemetry::next_occurrence(&self.db).await.unwrap();
         let source = crate::db::outbox::SourceKey::new("Jumped", occurrence);
@@ -106,7 +101,7 @@ impl PaymentFixture {
             occurred_at, recorded_at: crate::client::filetime_now(), payload: progress::codec::encode(&event).unwrap(),
             context: "{}".into(), origin: "server".into(), ordinal: 0, subject_character_id: Some(self.owner.character),
         };
-        let inserted = journal::insert_batch(&self.db, &[row]).await.unwrap();
+        let inserted = journal::insert_batch(&self.db, &[row], consumers, kinds).await.unwrap();
         assert_eq!(inserted.len(), 1);
         assert!(inserted[0].2, "fixture jump source must be unique");
         progress::DeliveryKey { consumer_key: crate::services::daily_goals::progress::registration().consumer_key.into(), event_id: inserted[0].1.clone() }
@@ -147,7 +142,7 @@ impl PaymentFixture {
     }
     pub(super) async fn cleanup(&self) {
         loop {
-            let pending = crate::dao::progress::pending_for_character(&self.db, crate::services::daily_goals::progress::registration().consumer_key, self.owner.character, 64).await.unwrap();
+            let pending = crate::dao::progress::pending_for_character(&self.db, crate::services::daily_goals::progress::registration().consumer_key, self.owner.character, 64, self.db.progress_registry().enabled_keys()).await.unwrap();
             if pending.is_empty() { break; }
             for key in pending { self.drain(&key).await; }
         }
@@ -238,7 +233,7 @@ async fn current_payment_replay_and_two_prices() {
             let assets = rewards::list(&f.db, f.owner.character, id, false).await.unwrap();
             assert!(!assets.is_empty() && assets.iter().all(|r| r.earned && r.claimed_at.is_none()));
         }
-        let pending = crate::dao::progress::pending_for_character(&f.db, crate::services::daily_goals::progress::registration().consumer_key, f.owner.character, 1).await.unwrap();
+        let pending = crate::dao::progress::pending_for_character(&f.db, crate::services::daily_goals::progress::registration().consumer_key, f.owner.character, 1, f.db.progress_registry().enabled_keys()).await.unwrap();
         assert!(pending.is_empty(), "completion facts must not create pending daily deliveries");
         assert!(f.notices.try_recv().is_ok());
     }).await;

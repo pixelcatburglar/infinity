@@ -1,5 +1,5 @@
 use super::*;
-use crate::uuid_text::{self, Case};
+use infinity_content::uuid_text::{self, Case};
 
 #[test]
 fn replay_and_all_identity_dimensions() {

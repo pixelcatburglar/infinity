@@ -63,12 +63,18 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
             (target, ATTR_ARMOR_EM_DAMAGE_RESONANCE, 1.0),
             (target, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, 1.0),
         ] { f.set(item, attr, value).await; }
+        let repair_effect = f.sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_DRONE))
+            .find_map(|t| t.effects().iter().filter_map(|e| registry::resolve(&f.sde, e.effect_id))
+                .find(|e| matches!(e.kind, EffectKind::RemoteRepair { .. })))
+            .ok_or_else(|| anyhow!("no logistics drone repair effect"))?;
+        let resistance = repair_effect.attribute(EffectAttribute::Resistance).ok_or_else(|| anyhow!("repair effect lacks resistance selector"))?;
+        f.set(target, resistance, 0.5).await;
         let target_fit = Fit::load_in_space(&f.db, &f.world, f.system, other, target).await.map_err(error)?;
         for attr in [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP] {
             ensure!((target_fit.value(Key::Ship, attr) - 1000.0).abs() < 1e-6, "unexpected fitted target HP");
         }
-        let (generation, revision, projection) = f.world.with(f.system, move |s| Some((s.combat_membership_generation(target)?, s.combat_fit_revision(target)?, s.projection_revision(target)))).await.flatten().ok_or_else(|| anyhow!("missing target fit cache"))?;
-        ensure!(f.world.with(f.system, move |s| s.replace_fitted_cache(target, generation, revision, target_fit, Key::Ship, Some(projection))).await == Some(true), "target fit publication failed");
+        ensure!((target_fit.value(Key::Ship, resistance) - 0.5).abs() < 1e-6, "target resistance selector not fitted");
+        ensure!(crate::services::tests::fixture::publish_fitting(&f.world, f.system, other, target, target_fit).await, "target fit publication failed");
         // Resizing preserves absolute HP, so the fixture explicitly starts full.
         let condition = f.world.with(f.system, move |s| {
             s.set_condition_fraction(target, 1.0);
@@ -183,7 +189,7 @@ async fn logistics_drone_repairs_fleet_pilot_layers() -> Result<()> {
                 Ok(result) => result?,
                 Err(_) => return Err(anyhow!("repair timeout: layer={layer}, phase={}, type={ty}, effect={}, amount={amount}, before={before:?}; {}", if layer == 0 { "begin" } else { "end" }, effect.id, state(&f, target, Some(drone)).await)),
             };
-            let expected = (before[layer] + amount / 1000.0).min(1.0);
+            let expected = (before[layer] + amount / 2000.0).min(1.0);
             ensure!((after[layer] - expected).abs() < 1e-6, "wrong layer repair: {before:?} -> {after:?}, expected {expected}");
             for i in 0..3 { if i != layer { ensure!((after[i] - before[i]).abs() < 1e-6, "unrelated layer changed"); } }
             if layer == 0 { ensure!(persisted_health(&f, target).await? == persisted, "repair checkpointed before periodic save"); }

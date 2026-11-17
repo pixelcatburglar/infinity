@@ -1,7 +1,7 @@
 //! Plain data access for accounts, alliances, asteroids, bills, bookmarks, bounties, calendar,
 //! characters, chat channels, client errors and crashes, contracts, corporations, dynamic items,
 //! daily goals, exploration, industry, insurance, items, kill rights, killmails, mail, market,
-//! mining ledger, missions, NPE, offices, orgs, ship SKINs, skills, store, wars and wallets.
+//! mining ledger, missions, NPE, offices, orgs, repairable-ship recovery, ship SKINs, skills, store, wars and wallets.
 //! Aggregates read and write `game` tables and use typed `sde` and `sde_native`
 //! static data; individual headers describe their sources and coverage.
 //! This layer has no direct client mirror or wire contract; owning services supply those.
@@ -32,17 +32,20 @@ pub(crate) mod kill_rights;
 pub(crate) mod killmails;
 pub(crate) mod lua_content;
 pub(crate) mod lua_store;
-pub(crate) mod lp_offers;
 pub(crate) mod mail;
 pub(crate) mod mailing_lists;
 pub(crate) mod map_telemetry;
+mod numeric;
 pub(crate) mod market;
+pub(crate) mod npc_bounties;
 pub(crate) mod mining_ledger;
 pub(crate) mod missions;
 pub(crate) mod npe;
 pub(crate) mod offices;
 pub(crate) mod orgs;
 pub(crate) mod progress;
+pub(crate) mod repairable_ship;
+pub(crate) mod schema_history;
 pub(crate) mod sde;
 pub(crate) mod shared_settings;
 pub(crate) mod ship_adaption;
@@ -55,5 +58,5 @@ pub(crate) mod trades;
 pub(crate) mod wallets;
 pub(crate) mod wars;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-economy", feature = "tests-effects", feature = "tests-inventory", feature = "tests-lua", feature = "tests-runtime", feature = "tests-services", feature = "tests-ships", feature = "tests-slash", feature = "tests-social", feature = "tests-space")))]
 pub(crate) mod tests;

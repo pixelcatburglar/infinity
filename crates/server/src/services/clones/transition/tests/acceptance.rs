@@ -5,6 +5,7 @@ use super::*;
 use infinity_core::{consts::{dogma::{ATTR_BOOSTERNESS, ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES}, FILETIME_MINUTE, FLAG_BOOSTER}};
 use crate::{db::outbox::{Effect, Notification}};
 use marshal::Value;
+use crate::dao::items::parent_locks::tests::character_before_items;
 
 fn notices(effects: &[Effect<CloneEffect>], event: &str) -> Vec<Vec<Value>> {
     effects.iter().filter_map(|effect| match effect {
@@ -13,12 +14,34 @@ fn notices(effects: &[Effect<CloneEffect>], event: &str) -> Vec<Vec<Value>> {
     }).collect()
 }
 
+fn collected_clone_notifications(
+    outbox: Outbox<CloneEffect>, world: &crate::space::World,
+) -> Vec<Effect<CloneEffect>> {
+    let mut notifications = Vec::new();
+    online::dispatch_mixed_entries((), outbox, world,
+        |effect| match effect {
+            CloneEffect::Online(change) => Ok(change),
+            other => Err(other),
+        },
+        |effect| match effect {
+            CloneEffect::Trade(effects) => crate::services::trade::dispatch((), effects, world),
+            CloneEffect::Online(_) => unreachable!("online effects were split"),
+        },
+        |notification| {
+            notifications.push(Effect::Notification(notification));
+            Ok(())
+        },
+    ).unwrap();
+    notifications
+}
+
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated database with SDE"]
 async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
+    let mut recipient = None;
     let scenario = crate::tests::catch_scenario(async {
     let (client, _peer) = client(db.clone(), f.character).await;
     let sde = client.sde.clone();
@@ -57,16 +80,26 @@ async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
     db.execute("UPDATE game.items SET singleton=true,brain_slot=$2,jump_clone_id=$3 WHERE item_id=$1", &[&target_item, &ordinary.1, &target.clone_id]).await.unwrap();
     // Overrides must be attached before the item becomes dormant.
     db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&target_item, &ATTR_FOLLOWS_JUMP_CLONES, &0.0_f64]).await.unwrap();
+    recipient = Some({
+        let market = crate::services::market::lock().await;
+        fixture::LiveRecipient::cold(&client.world, owner, None, &market).await
+    });
+    let live = recipient.as_ref().unwrap();
+    let world = &client.world;
+    let (old_implant, follower_implant, lost_booster, kept_booster) = (ids[0], ids[1], ids[2], ids[3]);
+    let metadata = (Some(now), Some(expiry), Some(retained.2.clone()));
     let fences = online::capture_online_fences(&client.world, &[owner]).await;
     let _market = crate::services::market::lock().await;
-    let (result, effects) = db.transaction(|tx, outbox: &mut Outbox<CloneEffect>| {
+    let (result, effects) = character_before_items(&db, owner, &[capsule], async { db.transaction(|tx, outbox: &mut Outbox<CloneEffect>| {
         let sde = sde.clone();
         let fences = fences.clone();
         Box::pin(async move {
             let id = Identity { char_id: owner, ship_id: Some(capsule), corp_id: 0, station_id: Some(station), system_id: None };
             jump_tx(tx, outbox, &sde, &fences, &id, station, target.clone_id, policy::service_fee(), false, now).await
         })
-    }, |result, outbox| async move { Ok((result, outbox.into_entries())) }).await.unwrap();
+    }, |result, outbox| async move {
+        Ok((result, collected_clone_notifications(outbox, world)))
+    }).await.unwrap() }).await;
     let rows = clones::clones(&db, owner).await.unwrap();
     assert_eq!(rows.len(), 1);
     let parked = custody::list(&db, owner, rows[0].clone_id).await.unwrap();
@@ -80,6 +113,17 @@ async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
     assert_eq!((kept.expires_at, kept.activated_at, kept.effect_ids), (Some(expiry), Some(now), Some(retained.2.clone())));
     assert_eq!(brain::get(&db, owner, target_item).await.unwrap().unwrap().item_id, target_item);
     assert_eq!(dogma::overrides(&db, target_item).await.unwrap()[0].value, 0.0);
+    assert_eq!(live.read(move |fit| (
+        fit.source_type(crate::services::fit::Key::Implant(old_implant)),
+        fit.source_type(crate::services::fit::Key::Implant(follower_implant)),
+        fit.source_type(crate::services::fit::Key::Booster(lost_booster)),
+        fit.source_type(crate::services::fit::Key::Implant(target_item)),
+    )).await, (None, Some(follower.0), None, Some(ordinary.0)));
+    assert_eq!(live.read(move |fit| {
+        let inputs = fit.character_inputs();
+        let row = &inputs.brain.iter().find(|row| row.item.item_id == kept_booster).unwrap().item;
+        (row.activated_at, row.expires_at, row.effect_ids.clone())
+    }).await, metadata);
     assert_eq!(notices(&effects, "OnNonDiminishingInjectionsRemoved"), vec![vec![]]);
     assert_eq!(notices(&effects, "OnNonDiminishingInjectionsAdded"), vec![vec![Value::Int(3)]]);
     assert_eq!(notices(&effects, "OnServerBoostersChanged").len(), 1);
@@ -92,12 +136,28 @@ async fn jump_moves_only_nonfollowers_and_refreshes_actual_booster_loss() {
             let id = Identity { char_id: owner, ship_id: Some(result.capsule), corp_id: 0, station_id: Some(station), system_id: None };
             jump_tx(tx, outbox, &sde, &fences, &id, station, return_clone, policy::service_fee(), false, now).await
         })
-    }, |_, outbox| async move { Ok(outbox.into_entries()) }).await.unwrap();
+    }, |_, outbox| async move {
+        Ok(collected_clone_notifications(outbox, world))
+    }).await.unwrap();
     for event in ["OnNonDiminishingInjectionsRemoved", "OnNonDiminishingInjectionsAdded", "OnServerBoostersChanged"] {
         assert!(notices(&effects, event).is_empty(), "unexpected {event}");
     }
     assert_eq!(brain::get(&db, owner, ids[3]).await.unwrap().unwrap().expires_at, Some(expiry));
+    assert_eq!(live.read(move |fit| (
+        fit.source_type(crate::services::fit::Key::Implant(old_implant)),
+        fit.source_type(crate::services::fit::Key::Implant(follower_implant)),
+        fit.source_type(crate::services::fit::Key::Booster(lost_booster)),
+        fit.source_type(crate::services::fit::Key::Implant(target_item)),
+    )).await, (Some(ordinary.0), Some(follower.0), None, None));
+    assert_eq!(live.read(move |fit| {
+        let inputs = fit.character_inputs();
+        let row = &inputs.brain.iter().find(|row| row.item.item_id == kept_booster).unwrap().item;
+        (row.activated_at, row.expires_at, row.effect_ids.clone())
+    }).await, metadata);
     }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     let owner = f.character;
     db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&owner]).await.unwrap();
     db.execute("DELETE FROM game.jump_clones WHERE owner_id=$1", &[&owner]).await.unwrap();

@@ -37,5 +37,5 @@ pub(crate) async fn keys(ex: &(impl Executor + ?Sized), script: &str, prefix: &s
     Ok(ex.query("SELECT key FROM game.lua_store WHERE script = $1 AND left(key, length($2)) = $2 ORDER BY key", &[&script, &prefix]).await?.into_iter().map(|row| row.get("key")).collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

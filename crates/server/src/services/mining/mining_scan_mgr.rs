@@ -35,4 +35,4 @@ async fn perform_scan(c: &Client) -> Value {
         .unwrap_or(Value::None)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

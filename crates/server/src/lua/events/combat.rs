@@ -181,4 +181,4 @@ pub(crate) fn encode_lua(event: &GameEvent, lua: &Lua, table: &Table) -> mlua::R
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-lua"))] mod tests;

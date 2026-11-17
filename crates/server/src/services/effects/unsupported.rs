@@ -36,7 +36,7 @@ impl State {
 
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(STATE.get_or_init(Default::default).lock())
 }
 
 /// Return the distinct refused effect names and type IDs in stable order.
@@ -56,5 +56,5 @@ pub(crate) fn refusal(effect_id: Option<i32>, effect_name: &str, type_id: i32) -
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

@@ -1,11 +1,13 @@
 //! Boundary checks for fitting resource and cascade selection.
 use super::*;
 
-mod db;
+#[cfg(feature = "tests-effects")] mod db;
+#[cfg(any(feature = "tests-effects", feature = "tests-ships"))]
 /// SDE effect category for modifiers active while a module is online.
 const ONLINE_CATEGORY: i32 = 4;
 
 
+#[cfg(any(feature = "tests-effects", feature = "tests-ships"))]
 pub(in crate::services) fn shield_extender(sde: &Sde) -> (i32, i32, bool) {
     let target = ATTR_SHIELD_CAPACITY;
     let positive = |ty: &crate::sde::types::TypeData, category: i32| {
@@ -25,7 +27,7 @@ pub(in crate::services) fn shield_extender(sde: &Sde) -> (i32, i32, bool) {
     (module.type_id, rack(&sde.types, module.type_id).unwrap().2, !positive(module, 0))
 }
 
-#[test]
+#[cfg(feature = "tests-effects")] #[test]
 fn rig_slot_vacancy_respects_full_capacity_and_gaps() {
     let first = FLAG_RIG_FIRST;
     assert_eq!(free_rack_slot(first, 0, |_| false), None);
@@ -35,14 +37,14 @@ fn rig_slot_vacancy_respects_full_capacity_and_gaps() {
     assert_eq!(free_rack_slot(first, 3, |_| true), None);
 }
 
-#[test]
+#[cfg(feature = "tests-effects")] #[test]
 fn online_tolerance_and_zero_need() {
     assert!(!resource_exceeded(1.0, 10.0 + 0.5e-6, 10.0));
     assert!(resource_exceeded(1.0, 10.0 + 2e-6, 10.0));
     assert!(!resource_exceeded(0.0, 20.0, 10.0));
 }
 
-#[test]
+#[cfg(feature = "tests-effects")] #[test]
 fn cascade_uses_worst_ratio_with_cpu_tie_and_floor() {
     assert_eq!(worse_resource(10.0, 10.0, 5.0, 10.0), None);
     assert_eq!(worse_resource(12.0, 10.0, 12.0, 10.0), Some(ATTR_CPU));
@@ -50,7 +52,7 @@ fn cascade_uses_worst_ratio_with_cpu_tie_and_floor() {
     assert_eq!(worse_resource(0.0, 0.0, 1.0, 0.0), Some(ATTR_POWER));
 }
 
-#[test]
+#[cfg(feature = "tests-effects")] #[test]
 fn cascade_prioritizes_ordinary_then_usage_then_item_id() {
     assert_eq!(most_resource([(false, 100.0, 4), (true, 2.0, 2), (true, 2.0, 3), (true, 0.0, 99)].into_iter()), Some(3));
     assert_eq!(most_resource([(true, 0.0, 1)].into_iter()), None);

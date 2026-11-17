@@ -48,5 +48,5 @@ pub(super) async fn readable_members(db: &(impl Executor + ?Sized), corp: i64, k
     corporations::readable_members(db, corp, mask).await.map_err(db_err)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

@@ -7,7 +7,7 @@ use infinity_core::{
 use crate::{
     client::Client,
     dao::items::{charges, combat as item_combat, dogma},
-    services::{combat, Call},
+    services::{combat::{self, targeting_charges::loaded}, effects::registry::EffectAttribute, Call, CallResult},
     space::{Ball, WarpState, World, MODE_STOP},
 };
 
@@ -29,10 +29,19 @@ async fn call(client: &mut Client, method: &str, args: &[Value]) -> CallResult {
     let call = Call { service: "dogmaIM", method, args, kwargs: &kwargs, bound: false, bind_params: None };
     crate::services::dogma::dispatch(client, &call).await
 }
-
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE"]
 async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
+    run_bank(None).await;
+}
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn single_and_banked_repeats_use_resident_inputs() {
+    run_bank(Some(1)).await;
+    run_bank(Some(3)).await;
+}
+
+async fn run_bank(scheduled: Option<usize>) {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
@@ -77,20 +86,35 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
     let ship: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,x,y,z) VALUES ($1,$2,1,0,1,true,0,0,0) RETURNING item_id", &[&ship_type,&character]).await.unwrap().get("item_id");
     let target: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,x,y,z) VALUES ($1,$2,1,0,1,true,0,0,0) RETURNING item_id", &[&ship_type,&character]).await.unwrap().get("item_id");
     let mut guns = Vec::new();
-    for i in 0..4 {
-        let flag = FLAG_HI_SLOT_FIRST + i;
+    for i in 0..scheduled.unwrap_or(4) {
+        let flag = FLAG_HI_SLOT_FIRST + i as i32;
         let owner = if i == 3 { ship } else { character };
         let id: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,true) RETURNING item_id", &[&gun,&owner,&ship,&flag]).await.unwrap().get("item_id");
         guns.push(id);
-        if i < 3 { db.execute("INSERT INTO game.module_charges (ship_id,flag_id,type_id,quantity) VALUES ($1,$2,$3,3)", &[&ship,&flag,&ammo]).await.unwrap(); }
+        if i < 3 { db.execute("INSERT INTO game.module_charges (ship_id,flag_id,type_id,quantity) VALUES ($1,$2,$3,$4)", &[&ship, &flag, &ammo, &(if scheduled.is_some() { 2_i64 } else { 3_i64 })]).await.unwrap(); }
     }
     // A long real cycle leaves enough time to observe the first volley and stop it.
     dogma::set_override(&db, guns[0], duration_attr, 30_000.0).await.unwrap();
     dogma::set_override(&db, ship, ATTR_CAPACITOR_CAPACITY, 1_000_000.0).await.unwrap();
     dogma::set_override(&db, ship, infinity_core::consts::dogma::ATTR_CPU_OUTPUT, 1_000_000.0).await.unwrap();
     dogma::set_override(&db, ship, infinity_core::consts::dogma::ATTR_POWER_OUTPUT, 1_000_000.0).await.unwrap();
-    item_combat::move_bank(&db, ship, guns[0], guns[1]).await.unwrap();
-    item_combat::move_bank(&db, ship, guns[0], guns[2]).await.unwrap();
+    if scheduled != Some(1) {
+        item_combat::move_bank(&db, ship, guns[0], guns[1]).await.unwrap();
+        item_combat::move_bank(&db, ship, guns[0], guns[2]).await.unwrap();
+    }
+    if scheduled.is_some() {
+        for &module in &guns {
+            for (attribute, value) in [(infinity_core::consts::dogma::ATTR_DAMAGE_MULTIPLIER, 1.0),
+                (infinity_core::consts::dogma::ATTR_TRACKING_SPEED, 1e9),
+                (infinity_core::consts::dogma::ATTR_MAX_RANGE, 1e9)] {
+                dogma::set_override(&db, module, attribute, value).await.unwrap();
+            }
+        }
+        for attribute in [infinity_core::consts::dogma::ATTR_SHIELD_CAPACITY,
+            infinity_core::consts::dogma::ATTR_ARMOR_HP, infinity_core::consts::dogma::ATTR_STRUCTURE_HP] {
+            dogma::set_override(&db, target, attribute, 1e12).await.unwrap();
+        }
+    }
     let world = World::new(db.clone(), sde.clone(), 1);
     let w = world.clone();
     let d = db.clone();
@@ -99,7 +123,7 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), d.clone(), sde,
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), d.clone(), sde,
             crate::chat::Hub::new("localhost", d.clone(), w.clone()), w.clone(), crate::handshake::Login { user_id: account, user_name: "bank-smoke".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(1))]);
         let (notify, mut notifications) = tokio::sync::mpsc::unbounded_channel();
@@ -111,13 +135,72 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         let prepared = crate::services::ship::balls::piloted(&d, w.sde().clone(), &hull, character, 0.0).await.ok().expect("prepare fitted ship");
         w.with(1, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
         drop(market);
-        w.add_ship(1, ball(target, ship_type, character, None)).await.unwrap();
+        crate::services::effects::tests::fixture::admit(&d, &w, 1, ball(target, ship_type, character, None)).await;
         let (destiny, mut events) = tokio::sync::mpsc::unbounded_channel();
         w.observe(1, character, ship, destiny).await.unwrap();
         call(&mut client, "AddTarget", &[Value::Int(target)]).await.ok().expect("target request");
         tokio::time::timeout(std::time::Duration::from_secs(90), async {
             while !combat::targeting_charges::targets_of(character).contains(&target) { assert!(w.after(1, 200).await); }
         }).await.expect("target lock");
+        if let Some(count) = scheduled {
+            let args = [Value::Int(ids[0]), Value::str(&effect_name), Value::Int(target), Value::Int(2)];
+            call(&mut client, "Activate", &args).await.expect("activate scheduled weapon");
+            let mut damage = [Vec::new(), Vec::new()];
+            for ordinal in 0..2 {
+                let mut changed = std::collections::HashSet::new();
+                let mut hits = 0;
+                tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                    while changed.len() < count || hits == 0 {
+                        let (name, args) = notifications.recv().await.expect("weapon notifications");
+                        if name == "OnModuleAttributeChanges" {
+                            let [Value::List(rows)] = args.as_slice() else { continue };
+                            for row in rows {
+                                let Value::Tuple(fields) = row else { continue };
+                                if fields.get(3).and_then(Value::as_int) != Some(i64::from(infinity_core::consts::dogma::ATTR_QUANTITY)) { continue; }
+                                let Some(Value::Tuple(key)) = fields.get(2) else { continue };
+                                if key.first().and_then(Value::as_int) != Some(ship) { continue; }
+                                let Some(flag) = key.get(1).and_then(Value::as_int) else { continue };
+                                if (i64::from(FLAG_HI_SLOT_FIRST)..i64::from(FLAG_HI_SLOT_FIRST) + count as i64).contains(&flag) {
+                                    assert_eq!(fields[5], Value::Int(1 - ordinal as i64));
+                                    assert_eq!(fields[6], Value::Int(2 - ordinal as i64));
+                                    assert!(changed.insert(flag), "member consumed twice");
+                                }
+                            }
+                        }
+                        if name == "OnDamageMessage" {
+                            if let Some(payload) = args.first().filter(|payload| payload.get("target") == Some(&Value::Int(target))) {
+                                let Some(Value::Float(amount)) = payload.get("damage") else { panic!("damage amount") };
+                                assert!(*amount > 0.0);
+                                assert_eq!(payload.get("isBanked"), Some(&Value::Bool(count > 1)), "volley report banking");
+                                damage[ordinal].push(*amount);
+                                hits += 1;
+                            }
+                        }
+                    }
+                }).await.expect("scheduled volley did not finish");
+                assert_eq!(hits, 1, "one report per volley");
+                eprintln!("weapon members={count} completed-volley={}", ordinal + 1);
+                let members = ids.clone();
+                let remaining = w.with(1, move |s| s.with_combat_fit(ship, |fit, _, _|
+                    members.iter().map(|&module| fit.source_type(Key::Charge(module))).collect::<Vec<_>>())).await.flatten().unwrap();
+                assert_eq!(remaining, vec![(ordinal == 0).then_some(ammo); count]);
+                if ordinal == 0 {
+                    for &module in &ids {
+                        crate::services::effects::tests::fixture::gm_value(&mut client, module,
+                            infinity_core::consts::dogma::ATTR_DAMAGE_MULTIPLIER, 100.0).await;
+                    }
+                }
+            }
+            assert!(damage[1].iter().all(|amount| *amount > 10.0 * damage[0].iter().copied().fold(0.0, f64::max)), "a member kept old captured damage");
+            w.flush_positions().await.unwrap();
+            for i in 0..count { assert_eq!(loaded(&d, ship, FLAG_HI_SLOT_FIRST + i as i32).await.unwrap(), None); }
+            while let Ok((name, args)) = notifications.try_recv() {
+                assert!(name != "OnDamageMessage" || args.first().and_then(|p| p.get("target")) != Some(&Value::Int(target)), "extra volley report");
+            }
+            combat::reset(&client);
+            w.unobserve(character);
+            return;
+        }
         // An unauthorized original slave may not inherit the owned master's authority.
         item_combat::move_bank(&d, ship, ids[0], ids[3]).await.unwrap();
         let args = |item| vec![Value::Int(item), Value::str(&effect_name), Value::Int(target), Value::Int(20)];
@@ -129,11 +212,8 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         d.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1 AND slave_id=$2", &[&ship,&ids[3]]).await.unwrap();
         // The foreign module was deliberately invalid; remove it from both the database fit and resident fit.
         assert_eq!(d.execute("UPDATE game.items SET location_id=$2, flag_id=$3, online=false WHERE item_id=$1 AND owner_id=$2 AND location_id=$2", &[&ids[3], &ship, &infinity_core::consts::FLAG_HANGAR]).await.unwrap(), 1);
-        let (generation, revision) = w.with(1, move |s| Some((s.combat_membership_generation(ship)?, s.combat_fit_revision(ship)?)))
-            .await.flatten().expect("resident fit generation");
         let fit = crate::services::fit::Fit::load_in_space(&d, &w, 1, character, ship).await.expect("load isolated fit");
-        let projection = fit.projection_revision();
-        assert!(w.with(1, move |s| s.replace_fitted_cache(ship, generation, revision, fit, crate::services::fit::Key::Ship, projection)).await.expect("publish isolated fit"));
+        assert!(crate::services::tests::fixture::publish_fitting(&w, 1, character, ship, fit).await, "publish isolated fit");
         for &id in &ids[..3] { dogma::set_override(&d, id, MAX_GROUP_ACTIVE, 2.0).await.unwrap(); }
         match call(&mut client, "Activate", &args(ids[1])).await {
             Err(crate::services::CallError::User { msg, dict }) => {
@@ -156,7 +236,11 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
                 || payload.get(3).and_then(Value::as_int) != Some(1)
                 || !payload.first().and_then(Value::as_int).is_some_and(|id| ids[..3].contains(&id)));
         }
-        while let Ok(batch) = events.try_recv() {
+        while let Ok(delivery) = events.try_recv() {
+            let batch = match delivery {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             for event in batch {
                 let Value::Tuple(envelope) = event else { continue };
                 let Some(Value::Tuple(call)) = envelope.get(1) else { continue };
@@ -182,7 +266,10 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let mut ready = true;
-                for i in 0..3 { ready &= loaded(&d, ship, FLAG_HI_SLOT_FIRST + i).await.ok().unwrap() == Some((ammo, 2)); }
+                for i in 0..3 {
+                    let module = ids[i];
+                    ready &= w.with(1, move |s| s.loaded_effective(ship, module)).await.flatten().map(|v| (v.1, v.2)) == Some((ammo, 2));
+                }
                 if ready { break; }
                 assert!(w.after(1, 100).await);
             }
@@ -190,7 +277,11 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         let mut seen = std::collections::HashSet::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while seen.len() < 3 {
-                for event in events.recv().await.expect("destiny observer") {
+                let batch = match events.recv().await.expect("destiny observer") {
+                    crate::space::SceneDelivery::Destiny(batch) => batch,
+                    crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+                };
+                for event in batch {
                     let Value::Tuple(envelope) = event else { continue };
                     let Some(Value::Tuple(call)) = envelope.get(1) else { continue };
                     if call.first() != Some(&Value::str("OnSpecialFX")) { continue; }
@@ -207,10 +298,16 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         tokio::time::timeout(std::time::Duration::from_secs(40), async {
             while state().active.contains_key(&ids[0]) { assert!(w.after(1, 100).await); }
         }).await.expect("master cycle retirement");
+        w.flush_positions().await.unwrap();
         for i in 0..3 { assert_eq!(loaded(&d, ship, FLAG_HI_SLOT_FIRST + i).await.ok().unwrap(), Some((ammo, 2))); }
         // A competing forced offline commits while activation is waiting for the shared lock.
         while notifications.try_recv().is_ok() {}
-        while events.try_recv().is_ok() {}
+        while let Ok(delivery) = events.try_recv() {
+            match delivery {
+                crate::space::SceneDelivery::Destiny(_) => {}
+                crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+            }
+        }
         let policy = super::super::super::online::OnlinePolicy::from_identity(&crate::services::identity::Identity::of_client(&client), client.notify_tx.clone()).ok().expect("derive online policy");
         let lock = crate::services::market::lock().await;
         let activation_args = args(ids[0]);
@@ -264,7 +361,11 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
                 || payload.get(3).and_then(Value::as_int) != Some(1)
                 || !payload.first().and_then(Value::as_int).is_some_and(|id| ids[..3].contains(&id)));
         }
-        while let Ok(batch) = events.try_recv() {
+        while let Ok(delivery) = events.try_recv() {
+            let batch = match delivery {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             for event in batch {
                 let Value::Tuple(envelope) = event else { continue };
                 let Some(Value::Tuple(call)) = envelope.get(1) else { continue };

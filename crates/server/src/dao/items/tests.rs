@@ -1,9 +1,12 @@
 //! Test-only isolated game rows for Lua mutation integration tests.
+#[cfg(feature = "tests-lua")]
 use crate::db::{Db, Error};
 
+#[cfg(feature = "tests-lua")]
 #[derive(Clone, Copy)]
 pub(super) struct Fixture { pub account: i64, pub chars: [i64; 3] }
 
+#[cfg(feature = "tests-lua")]
 pub(super) async fn create(db: &Db) -> Result<Fixture, Error> {
     db.transaction(
         |tx, _: &mut ()| Box::pin(async move {
@@ -18,6 +21,7 @@ pub(super) async fn create(db: &Db) -> Result<Fixture, Error> {
     ).await
 }
 
+#[cfg(feature = "tests-lua")]
 pub(super) async fn cleanup(db: &Db, fixture: Fixture) -> Result<(), Error> {
     db.transaction(
         |tx, _: &mut ()| Box::pin(async move {
@@ -34,6 +38,7 @@ pub(super) async fn cleanup(db: &Db, fixture: Fixture) -> Result<(), Error> {
     ).await
 }
 
+#[cfg(feature = "tests-lua")]
 pub(super) async fn hold_character(
     db: &Db,
     character: i64,
@@ -56,6 +61,7 @@ pub(super) async fn hold_character(
     ).await
 }
 
+#[cfg(feature = "tests-lua")]
 pub(super) async fn wallet_update_waiting(db: &Db, blocker_pid: i32) -> Result<bool, Error> {
     let row = db.query_one(
         "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))) AS waiting",
@@ -64,6 +70,7 @@ pub(super) async fn wallet_update_waiting(db: &Db, blocker_pid: i32) -> Result<b
     Ok(row.get("waiting"))
 }
 
+#[cfg(feature = "tests-storage")]
 #[tokio::test]
 #[ignore]
 async fn charge_quantities_round_trip_above_i32() {
@@ -76,9 +83,16 @@ async fn charge_quantities_round_trip_above_i32() {
     crate::dao::items::combat::apply_loads(&tx, ship, &[(0, 1, 1, quantity, 0), (0, 2, 1, 0, 0)]).await.unwrap();
     assert_eq!(crate::dao::items::charges::loaded(&tx, ship, 1).await.unwrap().unwrap().quantity, quantity);
     assert_eq!(crate::dao::items::charges::all(&tx, ship).await.unwrap().len(), 2);
-    assert_eq!(crate::dao::items::combat::consume_charge(&tx, ship, 1).await.unwrap().unwrap().quantity, quantity - 1);
-    let reserved = std::collections::BTreeMap::from([(1, (1, quantity - 1, 0))]);
+    let write = |type_id: i32, quantity: i64| crate::dao::items::charges::LoadedWrite { ship, module: 0, flag: 1, type_id, incarnation: 0, quantity };
+    let matched = crate::dao::items::charges::save_absolute(&tx, &[write(1, quantity - 1)]).await.unwrap();
+    assert_eq!(matched, vec![crate::dao::items::charges::LoadedSlotKey { ship, module: 0, flag: 1 }]);
+    assert_eq!(crate::dao::items::charges::loaded(&tx, ship, 1).await.unwrap().unwrap().quantity, quantity - 1);
+    assert!(crate::dao::items::charges::save_absolute(&tx, &[write(99, quantity), write(99, 0)]).await.unwrap().is_empty(), "type-guarded rows match nothing");
+    assert_eq!(crate::dao::items::charges::loaded(&tx, ship, 1).await.unwrap().unwrap().quantity, quantity - 1);
+    assert_eq!(crate::dao::items::charges::save_absolute(&tx, &[write(1, 0)]).await.unwrap().len(), 1);
+    assert!(crate::dao::items::charges::loaded(&tx, ship, 1).await.unwrap().is_none());
+    let reserved = std::collections::BTreeMap::from([(2, (1, 0, 0))]);
     assert!(crate::dao::items::combat::delete_reserved(&tx, ship, &reserved).await.unwrap());
-    assert_eq!(crate::dao::items::charges::loaded(&tx, ship, 2).await.unwrap().unwrap().quantity, 0);
+    assert!(crate::dao::items::charges::all(&tx, ship).await.unwrap().is_empty());
     tx.rollback().await.unwrap();
 }

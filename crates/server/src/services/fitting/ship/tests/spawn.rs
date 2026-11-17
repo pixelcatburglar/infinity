@@ -4,17 +4,6 @@ use infinity_core::consts::CATEGORY_SHIP;
 use crate::{client::Client, db::Db, sde::Sde, space::World};
 use marshal::Value;
 
-async fn fingerprint(db: &Db) -> Vec<(String, i64, Vec<(String, String)>)> {
-    let mut result = Vec::new();
-    for (table, key) in [("accounts", "user_id::text"), ("characters", "character_id::text"),
-        ("items", "item_id::text"), ("item_attributes", "item_id::text || ':' || attribute_id::text")] {
-        let count = db.query_one(&format!("SELECT count(*) AS n FROM game.{table}"), &[]).await.unwrap().get("n");
-        let rows = db.query(&format!("SELECT {key} AS key, md5(row_to_json(t)::text) AS hash FROM game.{table} t ORDER BY key"), &[]).await.unwrap()
-            .iter().map(|row| (row.get("key"), row.get("hash"))).collect();
-        result.push((table.to_owned(), count, rows));
-    }
-    result
-}
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database with SDE"]
@@ -87,7 +76,6 @@ async fn spawn_preserves_active_ship_and_restores_one_unpiloted_hull() {
         }
     }
     let (system, initial) = placement.expect("no precision-safe collision-free SDE system found");
-    let before = fingerprint(&db).await;
     let (account, owner, active): (i64, i64, i64) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let account = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES ('spawn-fixture-' || nextval('game.accounts_user_id_seq')::text,$1,0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
         let owner = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,solar_system_id,station_id) VALUES ($1,'spawn-fixture-' || nextval('game.characters_character_id_seq')::text,1,1,1,1,$2,NULL) RETURNING character_id", &[&account,&system]).await?.get("character_id");
@@ -112,7 +100,7 @@ async fn spawn_preserves_active_ship_and_restores_one_unpiloted_hull() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
-        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde.clone(), crate::chat::Hub::new("localhost", test_db.clone(), world.clone()), world.clone(), crate::handshake::Login { user_id: account, user_name: "spawn-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
+        let mut c = Client::new(infinity_wire::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde.clone(), crate::chat::Hub::new("localhost", test_db.clone(), world.clone()), world.clone(), crate::handshake::Login { user_id: account, user_name: "spawn-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         c.session.apply(vec![("charid", Value::Int(owner)), ("shipid", Value::Int(active)), ("solarsystemid", Value::Int(system))]);
         let id = super::super::gm_spawn_ship(&mut c, kind).await.unwrap();
         assert_eq!(c.session.int("shipid"), Some(active));
@@ -192,7 +180,10 @@ async fn spawn_preserves_active_ship_and_restores_one_unpiloted_hull() {
         assert!(after_fit > before_fit);
         let installed = racing_world.with(system, move |s| s.combat_condition_snapshot(id).unwrap().condition.stats.max[1]).await.unwrap();
         assert_eq!(installed, after_fit);
+        id
     }).await;
+    let ids: Vec<i64> = [active].into_iter().chain(result.iter().copied()).collect();
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account, character: owner }], &ids).await.unwrap();
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         tx.execute("DELETE FROM game.item_attributes WHERE item_id IN (SELECT item_id FROM game.items WHERE owner_id=$1)", &[&owner]).await?;
         tx.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&owner]).await?;
@@ -201,6 +192,6 @@ async fn spawn_preserves_active_ship_and_restores_one_unpiloted_hull() {
         tx.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await?;
         Ok::<_, crate::db::Error>(())
     }), |(), ()| async move { Ok(()) }).await.unwrap();
-    assert_eq!(fingerprint(&db).await, before);
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     result.unwrap();
 }

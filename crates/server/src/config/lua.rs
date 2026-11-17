@@ -58,5 +58,5 @@ impl LuaConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-runtime"))]
 mod tests;

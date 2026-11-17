@@ -36,7 +36,7 @@ async fn box_snapshot_counts_all_rows_reservations_and_validates_replacement() {
     assert_eq!(snapshot.items.len(), 2);
     assert_eq!(snapshot.reloads.len(), 1);
     let room = hold_storage::container_room(&sde, snapshot.parent.as_ref().unwrap(), &snapshot.items, &snapshot.reloads).unwrap().unwrap();
-    assert_eq!((room.capacity, room.used), (capacity, unit * 7.0));
+    assert_eq!((room.capacity, room.used), (super::super::holds::CapacityLimit::Finite(capacity), unit * 7.0));
     assert_eq!(item_capacity_reply(&tx, &sde, parent, Some(&expected)).await.unwrap(), keyval([("capacity", Value::Float(capacity)), ("used", Value::Float(unit * 7.0))]));
     tx.execute("UPDATE game.items SET type_id = $2 WHERE item_id = $1", &[&parent, &charge]).await.unwrap();
     assert!(item_capacity_reply(&tx, &sde, parent, Some(&expected)).await.is_err());
@@ -57,9 +57,9 @@ async fn box_snapshot_counts_all_rows_reservations_and_validates_replacement() {
     wrong_id.item_id += 1;
     assert!(item_capacity_reply(&tx, &sde, parent, Some(&wrong_id)).await.is_err());
     let replacement = [Addition { type_id: charge, singleton: false, quantity: 2 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &replacement, Replaced { items: &[first], reloads: &[] }, Some(0.0)).await.is_ok());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &replacement, Replaced { items: &[first], reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.is_ok());
     let growth = [Addition { type_id: charge, singleton: false, quantity: (capacity / unit).floor() as i64 + 1 }];
-    let error = hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &growth, Replaced { items: &[first], reloads: &[] }, None).await.err().unwrap();
+    let error = hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &growth, Replaced { items: &[first], reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.err().unwrap();
     match error {
         CallError::User { msg, dict } => {
             assert_eq!(msg, infinity_core::messages::MSG_NOT_ENOUGH_CARGO_SPACE);
@@ -68,13 +68,13 @@ async fn box_snapshot_counts_all_rows_reservations_and_validates_replacement() {
         _ => panic!("expected cargo-space refusal"),
     }
     for ids in [&[first, first][..], &[nested][..], &[i64::MAX][..]] {
-        assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &replacement, Replaced { items: ids, reloads: &[] }, None).await.is_err());
+        assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &replacement, Replaced { items: ids, reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.is_err());
     }
     let insufficient = [Addition { type_id: charge, singleton: false, quantity: 1 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &insufficient, Replaced { items: &[], reloads: &[pending] }, None).await.is_err());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &insufficient, Replaced { items: &[], reloads: &[pending] }, super::super::hold_storage::CapacitySource::Current).await.is_err());
     let overfull = (capacity / unit).floor() as i64 + 1;
     tx.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&second, &overfull]).await.unwrap();
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &replacement, Replaced { items: &[first], reloads: &[] }, None).await.is_ok());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &replacement, Replaced { items: &[first], reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.is_ok());
     let before = loading::capacity_snapshot(&tx, parent).await.unwrap();
     let used_before = hold_storage::container_room(&sde, before.parent.as_ref().unwrap(), &before.items, &before.reloads).unwrap().unwrap().used;
     let source = load_items(&tx, &sde, ItemQuery::Id(first)).await.unwrap().pop().unwrap();
@@ -93,7 +93,7 @@ async fn box_snapshot_counts_all_rows_reservations_and_validates_replacement() {
     prepared_move(&tx, &sde, &mut outbox, &whole, &Destination::owned(1, 1, FLAG_HANGAR), None, Custody::Preserve, 1).await.unwrap();
     let extracted = load_items(&tx, &sde, ItemQuery::Id(whole.item_id)).await.unwrap().pop().unwrap();
     assert_eq!((extracted.location_id, extracted.flag_id, extracted.quantity), (1, FLAG_HANGAR, 1));
-    let error = hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &insufficient, Replaced::default(), Some(f64::MAX)).await.err().unwrap();
+    let error = hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &insufficient, Replaced::default(), super::super::hold_storage::CapacitySource::Current).await.err().unwrap();
     match error {
         CallError::User { msg, dict } => {
             assert_eq!(msg, infinity_core::messages::MSG_NOT_ENOUGH_CARGO_SPACE);
@@ -186,7 +186,7 @@ async fn zero_box_moves_and_exact_fit_admission() {
     assert_eq!((remainder.quantity, remainder.flag_id, moved.quantity, moved.flag_id), (2, FLAG_CARGO, 1, FLAG_HANGAR));
     let snapshot = loading::capacity_snapshot(&tx, zero_parent).await.unwrap();
     let room = hold_storage::container_room(&sde, snapshot.parent.as_ref().unwrap(), &snapshot.items, &snapshot.reloads).unwrap().unwrap();
-    assert_eq!((room.capacity, room.used), (0.0, 3.0));
+    assert_eq!((room.capacity, room.used), (super::super::holds::CapacityLimit::Finite(0.0), 3.0));
     prepared_move(&tx, &sde, &mut outbox, &moved, &Destination::owned(1, zero_parent, FLAG_CARGO), None, Custody::Preserve, 1).await.unwrap();
     let moved = load_items(&tx, &sde, ItemQuery::Id(moved_id)).await.unwrap().pop().unwrap();
     assert_eq!((moved.quantity, moved.flag_id), (1, FLAG_CARGO));
@@ -194,12 +194,12 @@ async fn zero_box_moves_and_exact_fit_admission() {
     let extracted = load_items(&tx, &sde, ItemQuery::Id(moved_id)).await.unwrap().pop().unwrap();
     assert_eq!((extracted.location_id, extracted.quantity), (1, 1));
     let one = [Addition { type_id: charge, singleton: false, quantity: 1 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, zero_parent, FLAG_CARGO, &one, Replaced::default(), None).await.is_err());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, zero_parent, FLAG_CARGO, &one, Replaced::default(), super::super::hold_storage::CapacitySource::Current).await.is_err());
     let parent = transfers::insert(&tx, positive, 1, 1, FLAG_HANGAR, 1).await.unwrap();
     let fit = [Addition { type_id: charge, singleton: false, quantity: capacity as i64 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &fit, Replaced::default(), None).await.is_ok());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &fit, Replaced::default(), super::super::hold_storage::CapacitySource::Current).await.is_ok());
     transfers::insert(&tx, charge, 1, parent, FLAG_CARGO, capacity as i64).await.unwrap();
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &one, Replaced::default(), None).await.is_err());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &one, Replaced::default(), super::super::hold_storage::CapacitySource::Current).await.is_err());
     tx.rollback().await.unwrap();
 }
 
@@ -235,7 +235,7 @@ async fn legacy_negative_rows_count_for_display_and_deposit_admission() {
         .collect::<Vec<_>>();
     let before_rows = fingerprint(&before);
     let room = hold_storage::container_room(&sde, before.parent.as_ref().unwrap(), &before.items, &before.reloads).unwrap().unwrap();
-    assert_eq!((room.capacity, room.used), (capacity, capacity));
+    assert_eq!((room.capacity, room.used), (super::super::holds::CapacityLimit::Finite(capacity), capacity));
     assert_eq!(item_capacity_reply(&tx, &sde, parent, Some(&expected)).await.unwrap(), keyval([("capacity", Value::Float(capacity)), ("used", Value::Float(capacity))]));
     let mut outbox: Outbox = Outbox::default();
     let error = crate::services::items::deposit(&tx, &sde, &mut outbox, &Destination::owned(1, parent, FLAG_CARGO), charge, 1, 0).await.err().unwrap();
@@ -249,10 +249,10 @@ async fn legacy_negative_rows_count_for_display_and_deposit_admission() {
     assert!([parent, negative, positive].iter().all(|id| locks.is_write_locked(*id)));
     let replacements = [negative, positive];
     let equivalent = [Addition { type_id: charge, singleton: false, quantity: capacity as i64 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &equivalent, Replaced { items: &replacements, reloads: &[] }, None).await.is_ok());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &equivalent, Replaced { items: &replacements, reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.is_ok());
     tx.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&positive, &(capacity as i64)]).await.unwrap();
     let overfull = [Addition { type_id: charge, singleton: false, quantity: capacity as i64 + 1 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &overfull, Replaced { items: &replacements, reloads: &[] }, None).await.is_ok());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, parent, FLAG_CARGO, &overfull, Replaced { items: &replacements, reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.is_ok());
     drop(locks);
 
     let zero = transfers::insert(&tx, zero_type, 1, 1, FLAG_HANGAR, 1).await.unwrap();
@@ -264,9 +264,9 @@ async fn legacy_negative_rows_count_for_display_and_deposit_admission() {
     assert!([zero, zero_negative, zero_positive].iter().all(|id| locks.is_write_locked(*id)));
     let zero_snapshot = loading::capacity_snapshot(&tx, zero).await.unwrap();
     let zero_room = hold_storage::container_room(&sde, zero_snapshot.parent.as_ref().unwrap(), &zero_snapshot.items, &zero_snapshot.reloads).unwrap().unwrap();
-    assert_eq!((zero_room.capacity, zero_room.used), (0.0, 6.0));
+    assert_eq!((zero_room.capacity, zero_room.used), (super::super::holds::CapacityLimit::Finite(0.0), 6.0));
     let equivalent = [Addition { type_id: charge, singleton: false, quantity: 6 }];
-    assert!(hold_storage::check_destination(&tx, &sde, 1, zero, FLAG_CARGO, &equivalent, Replaced { items: &[zero_negative, zero_positive], reloads: &[] }, None).await.is_ok());
+    assert!(hold_storage::check_destination(&tx, &sde, 1, zero, FLAG_CARGO, &equivalent, Replaced { items: &[zero_negative, zero_positive], reloads: &[] }, super::super::hold_storage::CapacitySource::Current).await.is_ok());
     drop(locks);
     tx.rollback().await.unwrap();
     assert!(loading::load_items(&db, ItemQuery::Ids(&[parent, negative, positive, zero, zero_negative, zero_positive])).await.unwrap().is_empty());

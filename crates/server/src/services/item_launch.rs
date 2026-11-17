@@ -32,4 +32,4 @@ pub(crate) fn error_value(error: CallError) -> Result<Value, CallError> {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

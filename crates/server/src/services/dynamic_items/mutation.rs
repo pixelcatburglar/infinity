@@ -1,8 +1,9 @@
 //! Atomic ordinary mutaplasmid creation for `eve/client/script/dogma/dynamicItemSvc.py`.
 //! Uses immutable SDE mappings, game inventory and overrides, and provenance with
 //! typed factor rows in `game.dynamic_item_modifiers`. Rolls are supplied by the caller
-//! before transaction retries. Deployed entities require World removal and are
-//! unsupported; only reachable local inventory custody is accepted.
+//! before transaction retries. Damaged service life is rejected under the item
+//! fence. Deployed entities require World removal and are unsupported; only
+//! reachable local inventory custody is accepted.
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use infinity_core::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_BOOSTER, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, FLAG_IMPLANT, FLAG_PILOT, FLAG_SHIP_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, ROLE_HANGAR_CAN_TAKE_1}, messages::dynamic_items as msg};
@@ -67,7 +68,9 @@ async fn custody(ex: &(impl Executor + ?Sized), sde: &Sde, context: &Context, in
         if let Some(corp) = dao::offices::owner(ex, parent).await.map_err(db_err)? {
             let station = context.station.ok_or_else(|| notify_error(msg::OFFICE))?;
             let division = current.flag_id.checked_sub(FLAG_CORP_SAG1).filter(|division| (0..CORP_HANGAR_DIVISIONS).contains(division)).ok_or_else(|| notify_error(msg::OFFICE))?;
-            if dao::offices::at(ex, corp, station).await.map_err(db_err)? != Some(parent) || !crate::services::corps::permissions::has_at(ex, context.character, corp, station, ROLE_HANGAR_CAN_TAKE_1 << division).await? { return Err(notify_error(msg::OFFICE)); }
+            if dao::offices::active_at(ex, corp, station, crate::client::filetime_now()).await.map_err(db_err)?
+                .is_none_or(|lease| lease.office_id != parent)
+                || !crate::services::corps::permissions::has_at(ex, context.character, corp, station, ROLE_HANGAR_CAN_TAKE_1 << division).await? { return Err(notify_error(msg::OFFICE)); }
             return Ok(());
         }
         let container = item(ex, sde, parent).await?.ok_or_else(|| notify_error(msg::INACCESSIBLE))?;
@@ -112,11 +115,11 @@ pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox
     if dao::items::deliveries::ancestry(ex, source.location_id).await.map_err(db_err)? != source_lineage
         || dao::items::deliveries::ancestry(ex, mutator.location_id).await.map_err(db_err)? != mutator_lineage
         || [expected_source, expected_mutator].iter().any(|item| !locks.row(item.item_id).is_some_and(|row|
-            row.jump_clone_id.is_none() && row.type_id == item.type_id && row.owner_id == item.owner_id
-                && row.location_id == item.location_id && row.flag_id == item.flag_id
-                && row.quantity == item.quantity && row.singleton == item.singleton)) {
+            row.jump_clone_id.is_none() && row.matches_item_metadata(item))) {
         return Err(notify_error(msg::CHANGED));
     }
+    let physical = crate::dao::repairable_ship::ItemId::new(source_id).ok_or_else(|| notify_error(msg::INVALID_ITEMS))?;
+    crate::services::repairable_ship::service_life::require_pristine(ex, &[physical]).await?;
     let ids = [source_id, mutator_id];
     if !dao::trades::reserved(ex, &ids).await.map_err(db_err)?.is_empty() || dao::industry::has_active_blueprint_job(ex, &ids).await.map_err(db_err)? { return Err(notify_error(msg::RESERVED)); }
     custody(ex, sde, context, &source).await?;
@@ -137,7 +140,7 @@ pub(super) async fn create(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox
             additions.push(inventory::hold_storage::Addition { type_id: result_type, singleton: true, quantity: 1 });
         }
         inventory::hold_storage::check_destination(ex, sde, owner, location, FLAG_CARGO, &additions,
-            inventory::hold_storage::Replaced { items: &replaced, reloads: &[] }, None).await?;
+            inventory::hold_storage::Replaced { items: &replaced, reloads: &[] }, inventory::hold_storage::CapacitySource::Current).await?;
     }
     let changes = BTreeMap::from([(source_id, QuantityChange::new(&source, None)), (mutator_id, QuantityChange::new(&mutator, (mutator.quantity > 1).then_some(mutator.quantity - 1))) ]);
     if !quantities::apply(ex, &changes).await.map_err(db_err)? { return Err(notify_error(msg::CHANGED)); }

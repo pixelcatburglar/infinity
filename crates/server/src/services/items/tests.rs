@@ -22,7 +22,7 @@ async fn guarded_deposit(
     requests.extend(prep.candidate_request());
     let locks = lock_items(tx, sde, &requests, &optional).await?;
     let guard = ParentGuard::revalidate(&locks, std::slice::from_ref(snapshot))?;
-    Ok(deposit_prepared(tx, sde, outbox, &mut prep, quantity, 0, Some(&locks), Some(&guard), Default::default(), None).await?.last().clone())
+    Ok(deposit_prepared(tx, sde, outbox, &mut prep, quantity, 0, Some(&locks), Some(&guard), Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await?.last().clone())
 }
 
 #[tokio::test]
@@ -75,12 +75,15 @@ async fn parent_guard_batch_stale_hull_and_rollback() {
                 assert!(deposit(tx, &sde, outbox, &Destination::owned(owner, missing, FLAG_CARGO), kind, 1, 0).await.is_err());
                 deposit(tx, &sde, outbox, &Destination::owned(owner, station, FLAG_HANGAR), kind, 1, 0).await?;
                 let office = transfers::insert(tx, kind, corporation, station, FLAG_HANGAR, 1).await.map_err(db_err)?;
-                crate::dao::offices::insert(tx, office, corporation, station, i64::MAX).await.map_err(db_err)?;
+                crate::dao::offices::insert(tx, office, corporation, station, i64::MAX, 0).await.map_err(db_err)?;
                 deposit(tx, &sde, outbox, &Destination { item_owner: owner, capacity_owner: corporation, location: office, flag: FLAG_HANGAR }, kind, 1, 0).await.unwrap();
                 let hull = crate::dao::items::creation::rookie_ship(tx, hull_kind, owner, station, FLAG_HANGAR).await.map_err(db_err)?;
-                deposit_with_capacity(tx, &sde, outbox, &Destination::owned(owner, hull, FLAG_CARGO), kind, 1, 0, Default::default(), Some(1_000_000.0)).await?;
+                crate::dao::items::dogma::set_override(tx, hull, infinity_core::consts::dogma::ATTR_CAPACITY, 1_000_000.0).await.map_err(db_err)?;
+                let fit = crate::services::fit::Fit::load_unpiloted(tx, sde.clone(), hull).await?;
+                let source = crate::services::inventory::hold_storage::CapacitySource::Captured(crate::services::inventory::hold_storage::HoldCapacity::capture(&fit, FLAG_CARGO)?);
+                deposit_with_capacity(tx, &sde, outbox, &Destination::owned(owner, hull, FLAG_CARGO), kind, 1, 0, Default::default(), source).await?;
                 let wrong = Destination::owned(owner + 1, hull, FLAG_CARGO);
-                assert!(deposit_with_capacity(tx, &sde, outbox, &wrong, kind, 1, 0, Default::default(), Some(1_000_000.0)).await.is_err());
+                assert!(deposit_with_capacity(tx, &sde, outbox, &wrong, kind, 1, 0, Default::default(), source).await.is_err());
                 Err(CallError::Internal(anyhow::anyhow!("rollback fixture")))
             })
         },
@@ -159,7 +162,7 @@ async fn personal_office_stack_notices_follow_office_viewers() {
     fixture::assign_corporation(&db, viewer.character, corp, ROLE_HANGAR_CAN_QUERY_1).await.unwrap();
     fixture::assign_corporation(&db, denied.character, corp, 0).await.unwrap();
     let office = transfers::insert(&db, kind, corp, station, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::offices::insert(&db, office, corp, station, i64::MAX).await.unwrap();
+    crate::dao::offices::insert(&db, office, corp, station, i64::MAX, 0).await.unwrap();
     let recipients = |outbox: Outbox| -> Vec<i64> {
         outbox.into_entries().into_iter().map(|entry| match entry {
             Effect::Notification(Notification::Pilot { char_id, event, args }) => {
@@ -202,7 +205,7 @@ async fn delivery_returns_new_and_merged_rows_at_docked_and_remote_stations() {
     let kind = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_CHARGE)).unwrap().type_id;
     let fixture = fixture::create(&db).await.unwrap();
     let owner = fixture.character;
-    crate::dao::characters::ship::dock(&db, owner, docked.station_id, docked.solar_system_id.unwrap()).await.unwrap();
+    db.execute("UPDATE game.characters SET station_id=$2, solar_system_id=$3 WHERE character_id=$1", &[&owner, &docked.station_id, &docked.solar_system_id.unwrap()]).await.unwrap();
 
     for (station, expect_notice) in [(docked.station_id, true), (remote.station_id, false)] {
         let mut notices: Outbox = Outbox::default();
@@ -243,15 +246,18 @@ async fn continued_deposit_crosses_stack_boundary() {
     let mut client = lock_candidates::connection().await;
     let tx = client.transaction().await.unwrap();
     let hull = crate::dao::items::creation::rookie_ship(&tx, hull_kind, owner, station, FLAG_HANGAR).await.unwrap();
+    crate::dao::items::dogma::set_override(&tx, hull, infinity_core::consts::dogma::ATTR_CAPACITY, f64::MAX).await.unwrap();
+    let fit = crate::services::fit::Fit::load_unpiloted(&tx, sde.clone(), hull).await.unwrap();
+    let source = crate::services::inventory::hold_storage::CapacitySource::Captured(crate::services::inventory::hold_storage::HoldCapacity::capture(&fit, FLAG_CARGO).unwrap());
     let stack = transfers::insert(&tx, kind, owner, hull, FLAG_CARGO, i64::MAX - 3).await.unwrap();
     let destination = Destination::owned(owner, hull, FLAG_CARGO);
     let mut prep = DepositPreparation::capture(&tx, &sde, &destination, kind).await.unwrap();
     let requests = [LockRequest { item_id: hull, strength: LockStrength::Update }, prep.candidate_request().unwrap()];
     let locks = lock_items(&tx, &sde, &requests, &[]).await.unwrap();
     let mut outbox: Outbox = Outbox::default();
-    let first = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 1, 0, Some(&locks), None, Default::default(), Some(f64::MAX)).await.unwrap();
+    let first = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 1, 0, Some(&locks), None, Default::default(), source).await.unwrap();
     assert_eq!(first.merged.as_ref().unwrap().old_quantity, Some(i64::MAX - 3));
-    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 3, 0, Some(&locks), None, Default::default(), Some(f64::MAX)).await.unwrap();
+    let receipt = deposit_prepared(&tx, &sde, &mut outbox, &mut prep, 3, 0, Some(&locks), None, Default::default(), source).await.unwrap();
     let merged = receipt.merged.as_ref().unwrap();
     let created = receipt.created.as_ref().unwrap();
     assert_eq!((merged.item.item_id, merged.old_quantity, merged.added_quantity, merged.item.quantity), (stack, Some(i64::MAX - 2), 2, i64::MAX));

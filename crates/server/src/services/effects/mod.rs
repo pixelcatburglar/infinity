@@ -4,9 +4,11 @@
 //! `eve/client/script/dogma/clientDogmaLocation.py` supply behavior references;
 //! pythonEffects supply corresponding behavior names. Supported families,
 //! including projected effects and ECM, use the shared lifecycle and actor state;
-//! unsupported families remain visibly refused.
+//! unsupported families remain visibly refused. Cycle and source phases read
+//! typed parameter packets captured from the actor-resident fit.
 pub(crate) mod registry;
 pub(crate) mod space_source;
+pub(crate) mod parameters;
 pub(crate) mod projection;
 pub(crate) mod projected;
 pub(crate) mod range;
@@ -16,16 +18,21 @@ pub(crate) mod heat;
 pub(crate) mod unsupported;
 pub(crate) mod propulsion;
 pub(crate) mod weapons;
+pub(crate) mod spool;
+pub(in crate::services::effects) mod fx;
 pub(crate) mod hacking;
 pub(crate) mod lifecycle;
+pub(crate) mod active_cycle;
 mod fuel;
 mod entosis;
 mod behaviors;
 pub(crate) mod online;
 pub(crate) mod fitting;
 pub(crate) mod aoe;
+pub(crate) mod defenders;
+pub(crate) mod super_weapon;
 mod bombs;
-mod vorton;
+pub(crate) mod vorton;
 pub(crate) mod cloak;
 mod mjd;
 mod compression;
@@ -47,7 +54,7 @@ pub(crate) enum JammingType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EffectKind {
-    Modifiers, Turret, Missile, Smartbomb, Vorton,
+    Modifiers, Turret, Missile, Smartbomb, Vorton, SuperWeapon,
     LocalRepair { layer: usize, amount_attr: i32 },
     FueledLocalRepair { layer: usize, amount_attr: i32, charge_bonus_attr: Option<i32> },
     RemoteRepair { layer: usize },
@@ -57,4 +64,4 @@ pub(crate) enum EffectKind {
     AutoTarget, PassiveTarget, Bomb, Compression, Entosis, ProbeLaunch, Hacking, Online,
 }
 
-#[cfg(test)] pub(in crate::services) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships", feature = "tests-slash")))] pub(in crate::services) mod tests;

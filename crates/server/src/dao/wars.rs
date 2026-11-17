@@ -115,5 +115,5 @@ pub(crate) async fn set_invites_blocked(ex: &(impl Executor + ?Sized), owner: i6
     Ok(ex.execute("UPDATE game.war_invite_settings SET blocked=$2 WHERE owner_id=$1 AND blocked IS DISTINCT FROM $2", &[&owner, &blocked]).await? != 0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

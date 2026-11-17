@@ -127,4 +127,4 @@ pub(super) async fn batch(c: &Client, args: &[Value], operation: Batch) -> CallR
     }, |value, outbox| async move { dispatch_world(value, outbox, &c.world) }).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-services"))] mod tests;

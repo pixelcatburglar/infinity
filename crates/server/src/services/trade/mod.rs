@@ -14,7 +14,7 @@ use crate::{client::Client, dao::trades::Trade, db::outbox::{Effect, Outbox}, se
 static STATE: OnceLock<Mutex<HashMap<i64, Trade>>> = OnceLock::new();
 fn state() -> &'static Mutex<HashMap<i64, Trade>> { STATE.get_or_init(|| Mutex::new(HashMap::new())) }
 
-pub(crate) fn is_trade_container(id: i64) -> bool { state().lock().unwrap().contains_key(&id) }
+pub(crate) fn is_trade_container(id: i64) -> bool { crate::poison::lock_or_exit(state().lock()).contains_key(&id) }
 
 pub(crate) enum TradeEffect { Put(Trade), Remove(i64), WakeScheduler }
 crate::progress::leaf_effect!(TradeEffect);
@@ -23,8 +23,8 @@ pub(crate) fn dispatch<T>(value: T, outbox: Outbox<TradeEffect>, world: &World) 
     for effect in outbox.into_entries() {
         match effect {
             Effect::Notification(notification) => notification.dispatch(world, None)?,
-            Effect::Operation(TradeEffect::Put(trade)) => { state().lock().unwrap().insert(trade.id, trade); }
-            Effect::Operation(TradeEffect::Remove(id)) => { state().lock().unwrap().remove(&id); }
+            Effect::Operation(TradeEffect::Put(trade)) => { crate::poison::lock_or_exit(state().lock()).insert(trade.id, trade); }
+            Effect::Operation(TradeEffect::Remove(id)) => { crate::poison::lock_or_exit(state().lock()).remove(&id); }
             Effect::Operation(TradeEffect::WakeScheduler) => crate::scheduler::wake(),
         }
     }
@@ -56,4 +56,4 @@ pub(crate) async fn recover(db: &crate::db::Db, world: &World, sde: std::sync::A
     settle::recover(db, world, sde).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

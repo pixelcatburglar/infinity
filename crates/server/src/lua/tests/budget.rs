@@ -3,7 +3,7 @@
 use super::super::*;
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE; run alone"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE; run this exact test in its own process"]
 async fn rpc_and_command_budget_abort_and_later_calls_succeed() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -23,11 +23,12 @@ async fn rpc_and_command_budget_abort_and_later_calls_succeed() {
     config.lua.call_budget_instructions = 1000;
     config.lua.instruction_hook_interval = 100;
     let chat = crate::chat::Hub::new(&config.chat.domain, db.clone(), world.clone());
+    crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
     start(&config, &db, &sde, &world, &chat).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
-    let conn = crate::conn::Conn::new(stream, address);
+    let conn = infinity_wire::conn::Conn::new(stream, address);
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
     let mut client = Client::new(conn, Arc::new(config), db, sde, chat, world, login);
     let kwargs = marshal::Value::Dict(vec![]);

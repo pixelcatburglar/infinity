@@ -142,5 +142,5 @@ pub(crate) async fn clear_welcome(ex: &(impl Executor + ?Sized), id: i64) -> Res
     ex.execute("UPDATE game.mailing_lists SET welcome_title = NULL, welcome_body = NULL WHERE list_id = $1", &[&id]).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-social", feature = "tests-storage")))]
 pub(crate) mod tests;

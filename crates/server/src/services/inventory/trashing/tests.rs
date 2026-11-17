@@ -1,4 +1,4 @@
-use infinity_core::consts::{FLAG_HANGAR, IX_LOCATION_ID};
+use infinity_core::consts::{FLAG_CARGO, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, IX_LOCATION_ID};
 use crate::dao::items::loading::Item;
 use crate::db::outbox::{Effect, Notification, Outbox};
 use super::MoveEffect;
@@ -175,4 +175,92 @@ fn committed_trash_queues_old_location_removal_notification() {
     };
     assert_eq!(event, "OnItemChange");
     assert!(matches!(&args[1], marshal::Value::Dict(fields) if fields.iter().any(|(key, value)| key.as_int() == Some(IX_LOCATION_ID) && value.as_int() == Some(60003760))));
+}
+type Rx = tokio::sync::mpsc::UnboundedReceiver<(String, Vec<marshal::Value>)>;
+async fn roots_fixture() -> (crate::db::Db, crate::services::tests::fixture::Fixture, crate::client::Client, tokio::net::TcpStream, i64, i64, i64, i64) {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
+    let (client, peer) = crate::services::tests::client(db.clone(), fixture.character).await;
+    let (station, remote, system, remote_system) = { let mut stations = client.sde.map.stations().filter(|row| row.solar_system_id.is_some()); let (a, b) = (stations.next().unwrap(), stations.next().unwrap()); (a.station_id, b.station_id, a.solar_system_id.unwrap(), b.solar_system_id.unwrap()) };
+    (db, fixture, client, peer, station, remote, system, remote_system)
+}
+fn types(sde: &crate::sde::Sde) -> (i32, i32, i32, i32) { let pick = |category: i32| sde.types.iter().find(|ty| ty.category_id == Some(category) && !sde.typelists.is_untrashable(ty.type_id, ty.group_id.unwrap_or_default(), category)).unwrap().type_id;
+    (pick(infinity_core::consts::CATEGORY_SHIP), pick(infinity_core::consts::CATEGORY_MODULE), sde.types.iter().find(|ty| crate::services::inventory::hold_storage::is_ordinary_container(sde, ty.type_id)).unwrap().type_id, sde.types.iter().find(|ty| ty.category_id != Some(infinity_core::consts::CATEGORY_SHIP) && ty.category_id != Some(infinity_core::consts::CATEGORY_MODULE) && !sde.typelists.is_untrashable(ty.type_id, ty.group_id.unwrap_or_default(), ty.category_id.unwrap_or_default())).unwrap().type_id) }
+async fn item(db: &crate::db::Db, ty: i32, owner: i64, location: i64, flag: i32) -> i64 { crate::dao::items::transfers::insert(db, ty, owner, location, flag, 1).await.unwrap() }
+async fn unit(db: &crate::db::Db, ty: i32, owner: i64, location: i64, flag: i32) -> i64 { crate::dao::items::creation::rookie_ship(db, ty, owner, location, flag).await.unwrap() }
+fn session(c: &mut crate::client::Client, station: Option<i64>, system: i64) { c.session.apply(vec![("stationid", station.map_or(marshal::Value::None, marshal::Value::Int)), ("solarsystemid", marshal::Value::Int(system)), ("solarsystemid2", marshal::Value::Int(system)), ("shipid", marshal::Value::Int(station.map_or(1, |_| 0)))]); }
+/// Real `invbroker` `TrashItems` dispatch: returns the wire result value.
+async fn broker_trash(c: &mut crate::client::Client, ids: &[i64], outer: i64) -> marshal::Value {
+    let args = [marshal::Value::List(ids.iter().map(|id| marshal::Value::Int(*id)).collect()), marshal::Value::Int(outer)];
+    crate::services::inventory::inv_broker::broker(c, &crate::services::Call { service: "invbroker", method: "TrashItems", args: &args, kwargs: &marshal::Value::None, bound: true, bind_params: None }).await.unwrap().unwrap()
+}
+fn cannot_trash(value: &marshal::Value) -> bool { matches!(value, marshal::Value::List(v) if v.len() == 1 && v[0].as_text().is_some_and(|key| key == infinity_core::messages::MSG_CANNOT_TRASH_ITEM)) }
+/// Exact one-key refusal plus unchanged five-category state and silent channels.
+async fn refuse(c: &mut crate::client::Client, db: &crate::db::Db, rx: &mut Rx, ids: &[i64], outer: i64, scope: &[i64]) {
+    let before = crate::dao::tests::item_state(db, scope).await.unwrap();
+    assert!(cannot_trash(&broker_trash(c, ids, outer).await), "expected one-key CannotTrashItem business refusal");
+    assert_eq!(crate::dao::tests::item_state(db, scope).await.unwrap(), before, "refused trash changed item state");
+    assert!(rx.try_recv().is_err() && c.outbox.is_empty(), "refused trash notified");
+}
+/// Exact empty result, one OnItemChange per deleted row, and fully removed state.
+async fn trashed(c: &mut crate::client::Client, db: &crate::db::Db, rx: &mut Rx, ids: &[i64], outer: i64) {
+    let all = crate::dao::items::inventory::descendants(db, ids).await.unwrap();
+    let gone: Vec<_> = crate::services::items::load_items(db, &c.sde, crate::dao::items::loading::ItemQuery::Ids(&all)).await.unwrap()
+        .into_iter().map(|item| Item { location_id: infinity_core::consts::LOCATION_JUNKYARD, ..item }.row()).collect();
+    assert_eq!(broker_trash(c, ids, outer).await, marshal::Value::list([]));
+    let received: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).filter(|(event, _)| event == "OnItemChange").collect();
+    assert_eq!(received.len(), gone.len(), "one OnItemChange per deleted row");
+    for row in &gone { assert!(received.iter().any(|(_, args)| args.first() == Some(row))); }
+    assert_eq!(crate::dao::tests::item_state(db, &all).await.unwrap(), crate::dao::tests::item_state(db, &[]).await.unwrap(), "deleted closure left state");
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated database"]
+async fn space_can_contents_refuse_trash() {
+    let (db, f, mut c, _peer, station, _, system, _) = roots_fixture().await;
+    let (_, _, can, leaf_ty) = types(&c.sde);
+    let me = f.character;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel(); c.notify_tx = tx;
+    session(&mut c, Some(station), system);
+    let outer = unit(&db, can, me, system, 0).await;
+    let leaf = item(&db, leaf_ty, me, outer, FLAG_HANGAR).await;
+    refuse(&mut c, &db, &mut rx, &[leaf], system, &[outer, leaf]).await; // A1 real broker, true outer
+    let inner = unit(&db, can, me, outer, FLAG_HANGAR).await; let nested = item(&db, leaf_ty, me, inner, FLAG_HANGAR).await;
+    refuse(&mut c, &db, &mut rx, &[nested], system, &[inner, nested]).await; // A2 nested container
+    let docked_leaf = item(&db, leaf_ty, me, station, FLAG_HANGAR).await;
+    refuse(&mut c, &db, &mut rx, &[leaf], station, &[outer, leaf]).await; // A3 forged station outer
+    refuse(&mut c, &db, &mut rx, &[docked_leaf, leaf], station, &[outer, leaf, docked_leaf]).await; // A3 atomic mixed batch
+    crate::services::tests::fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated database"]
+async fn remote_station_items_trash_by_terminal() {
+    let (db, f, mut c, _peer, station, remote, system, remote_system) = roots_fixture().await;
+    let (hull, module, _, leaf_ty) = types(&c.sde);
+    let me = f.character;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel(); c.notify_tx = tx;
+    session(&mut c, Some(station), system); // B1 remote hangar stack, docked at A
+    let stack = item(&db, leaf_ty, me, remote, FLAG_HANGAR).await;
+    trashed(&mut c, &db, &mut rx, &[stack], remote).await;
+    let floating = item(&db, leaf_ty, me, remote, FLAG_HANGAR).await;
+    session(&mut c, None, system); // B1 same stack while in space
+    trashed(&mut c, &db, &mut rx, &[floating], remote).await;
+    let local = item(&db, leaf_ty, me, remote, FLAG_HANGAR).await;
+    session(&mut c, Some(remote), remote_system); // B1 same-station control
+    trashed(&mut c, &db, &mut rx, &[local], remote).await;
+    for space in [false, true] { // B2 inactive remote hull with cargo and a fitted module
+        let ship = unit(&db, hull, me, remote, FLAG_HANGAR).await;
+        item(&db, leaf_ty, me, ship, FLAG_CARGO).await; unit(&db, module, me, ship, FLAG_HI_SLOT_FIRST).await;
+        if space { session(&mut c, None, system); } else { session(&mut c, Some(station), system); }
+        trashed(&mut c, &db, &mut rx, &[ship], remote).await;
+    }
+    let ship = unit(&db, hull, me, remote, FLAG_HANGAR).await; // B3 cargo child alone refuses
+    let child = item(&db, leaf_ty, me, ship, FLAG_CARGO).await; let fitted = unit(&db, module, me, ship, FLAG_HI_SLOT_FIRST).await;
+    session(&mut c, Some(station), system);
+    refuse(&mut c, &db, &mut rx, &[child], remote, &[ship, child, fitted]).await;
+    session(&mut c, Some(remote), remote_system); // B3 same-station child control
+    trashed(&mut c, &db, &mut rx, &[child], remote).await;
+    crate::services::tests::fixture::cleanup(&db, f).await.unwrap();
 }

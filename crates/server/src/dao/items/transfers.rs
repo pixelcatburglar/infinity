@@ -117,4 +117,4 @@ pub(crate) async fn hand_over(ex: &(impl Executor + ?Sized), transfers: &[Transf
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

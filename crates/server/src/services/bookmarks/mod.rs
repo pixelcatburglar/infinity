@@ -104,4 +104,4 @@ fn subfolder_arg(call: &Call<'_>, i: usize) -> Option<i64> {
 
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-social"))] mod tests;

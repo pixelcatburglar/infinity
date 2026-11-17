@@ -1,11 +1,13 @@
-//! Sovereignty Hub ownership and committed actor publications.
-//! The Hub uses `game.sov_*` rows and server-authored sovereignty policy.
-//! Command-node campaigns and ordinary capital changes are not supported.
-//! Organization mutations and capture checkpoints are ordered by the canonical
-//! `registry::lock_admission` guards. Business and pure-plan `now` values stay
-//! frozen across retries; source invalidation instead samples a per-attempt
-//! linearization stamp after the mutation under those guards, rolled back if
-//! the attempt aborts.
+//! Sovereignty Hub ownership, committed actor publications and development
+//! indices. The Hub uses `game.sov_*` rows and server-authored sovereignty
+//! policy; military and industrial index points accrue from durable NPC-death
+//! and mined-volume facts under the retained `sovereignty_indices` policy
+//! package (`indices/`). Command-node campaigns and ordinary capital changes
+//! are not supported. Organization mutations and capture checkpoints are
+//! ordered by the canonical `registry::lock_admission` guards. Business and
+//! pure-plan `now` values stay frozen across retries; source invalidation
+//! instead samples a per-attempt linearization stamp after the mutation under
+//! those guards, rolled back if the attempt aborts.
 mod model;
 pub(crate) mod authority;
 pub(crate) mod policy;
@@ -15,6 +17,7 @@ pub(crate) mod capture;
 pub(crate) mod recovery;
 pub(crate) mod jobs;
 pub(crate) mod governance;
+pub(crate) mod indices;
 pub(crate) mod notifications;
 pub(crate) mod wire;
 pub(crate) mod queries;
@@ -28,10 +31,10 @@ pub(crate) fn is_stale(error: &CallError) -> bool {
 }
 
 /// Validate each distinct persisted authored identity before acquiring any guard.
-pub(crate) async fn validate_retained(identities: &[(&str, &str)]) -> Result<(), CallError> {
+pub(crate) fn validate_retained(identities: &[(&str, &str)]) -> Result<(), CallError> {
     let unique: std::collections::BTreeSet<_> = identities.iter().copied().collect();
     for (namespace, version) in unique {
-        crate::lua::retained_content(namespace, version).await?;
+        crate::lua::retained_content(namespace, version)?;
     }
     Ok(())
 }
@@ -48,5 +51,5 @@ pub(crate) async fn invalidate_sources<X: Send>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

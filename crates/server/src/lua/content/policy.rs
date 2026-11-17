@@ -94,7 +94,7 @@ impl UserData for Values {
 }
 
 fn run(lua: &Lua, package: &Package, rule: Option<Rule>, input: Option<&PolicyInput>) -> mlua::Result<Value> {
-    let source = std::str::from_utf8(&package.source).map_err(mlua::Error::external)?;
+    let source = std::str::from_utf8(&package.row.source).map_err(mlua::Error::external)?;
     let wrapper = format!(r#"local rule, input, policy = ...
         local exports = (function()
 {source}

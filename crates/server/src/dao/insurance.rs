@@ -1,5 +1,5 @@
 //! Insurance persistence for insuranceSvc (eve/client/script/ui/station/insurance).
-//! Uses game.insurance and game.retail_prices; static type data, policy and notifications
+//! Uses game.insurance; static type data, policy and notifications
 //! remain in the service. Corporate insurance is not supported there.
 
 use crate::db::{executor::Executor, Error};
@@ -27,15 +27,8 @@ impl Payout {
         Self { owner_id: row.get("owner_id"), type_id: row.get("type_id"), fraction: row.get("fraction"), end_date: row.get("end_date") }
     }
 }
-pub(crate) struct Price { pub adjusted: Option<f64>, pub average: Option<f64> }
-impl Price {
-    fn from_row(row: &tokio_postgres::Row) -> Self { Self { adjusted: row.get("adjusted"), average: row.get("average") } }
-}
 const CONTRACT_SELECT: &str = "SELECT ship_id, owner_id, fraction, start_date, end_date FROM game.insurance";
 
-pub(crate) async fn value(ex: &(impl Executor + ?Sized), type_id: i32) -> Result<Option<Price>, Error> {
-    Ok(ex.query_opt("SELECT adjusted::float8 AS adjusted, average::float8 AS average FROM game.retail_prices WHERE type_id = $1", &[&type_id]).await?.map(|r| Price::from_row(&r)))
-}
 pub(crate) async fn contract(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Option<Contract>, Error> {
     Ok(ex.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await?.map(|r| Contract::from_row(&r)))
 }

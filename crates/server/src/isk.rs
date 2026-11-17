@@ -205,7 +205,7 @@ impl mlua::IntoLua for IskAmount {
     fn into_lua(self, _: &mlua::Lua) -> mlua::Result<mlua::Value> { Ok(mlua::Value::Number(self.wire_isk())) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-runtime"))]
 mod tests;
 static PERSONAL_CAP: LazyLock<IskAmount> = LazyLock::new(|| IskAmount::from_whole_isk(CLIENT_MAX_ISK as i128).expect("valid personal client cap"));
 static CORPORATION_CAP: LazyLock<IskAmount> = LazyLock::new(|| IskAmount::from_whole_isk(CLIENT_MAX_CORP_ISK as i128).expect("valid corporation client cap"));

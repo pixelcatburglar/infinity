@@ -1,25 +1,7 @@
-//! Station delivery asset locations and shared item ancestry from `game.items`.
-//! corpmgr consumes location and count rows with station metadata from the SDE;
-//! custody and inventory movement consume ancestry. These queries do not authorize
-//! access or include structure delivery locations.
+//! Shared item ancestry and retained office metadata from `game.items` and `game.offices`.
+//! Consumers apply their own access and custody rules.
 
 use crate::db::{executor::Executor, Error};
-use infinity_core::consts::FLAG_CORP_DELIVERIES;
-
-pub(crate) struct DeliveryLocation {
-    pub location_id: i64,
-    pub item_count: i64,
-}
-
-impl DeliveryLocation {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { location_id: row.get("location_id"), item_count: row.get("item_count") }
-    }
-}
-
-pub(crate) async fn locations(ex: &(impl Executor + ?Sized), corp_id: i64) -> Result<Vec<DeliveryLocation>, Error> {
-    Ok(ex.query("SELECT location_id, count(*) AS item_count FROM game.items WHERE owner_id = $1 AND flag_id = $2 GROUP BY location_id ORDER BY location_id", &[&corp_id, &FLAG_CORP_DELIVERIES]).await?.iter().map(DeliveryLocation::from_row).collect())
-}
 
 /// Item ancestry, with UNION ensuring corrupt cycles terminate.
 #[derive(Clone, PartialEq, Eq)]
@@ -43,8 +25,21 @@ impl Ancestor {
 pub(crate) struct OfficeMetadata {
     pub corporation_id: i64,
     pub station_id: i64,
+    /// Server lease lifecycle in game.offices.lease_state (0 active, 1 impounded,
+    /// 2 released); consumers combine it with rented_until, never trust the raw state.
+    pub lease_state: i16,
+    pub rented_until: i64,
 }
 
+impl OfficeMetadata {
+    /// Same predicate as `offices::Lease::is_active`: an out-of-range state
+    /// encoding decodes to an error and can never be active.
+    pub(crate) fn is_active(&self, now: i64) -> bool {
+        crate::dao::offices::LeaseState::decode(self.lease_state)
+            .is_ok_and(|state| state == crate::dao::offices::LeaseState::Active)
+            && self.rented_until > now
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LineageRow {
     pub origin: i64,
@@ -60,17 +55,19 @@ impl LineageRow {
             office: row.get::<_, Option<i64>>("office_corporation_id").map(|corporation_id| OfficeMetadata {
                 corporation_id,
                 station_id: row.get("office_station_id"),
+                lease_state: row.get("office_lease_state"),
+                rented_until: row.get("office_rented_until"),
             }),
         }
     }
 }
 
 pub(crate) async fn ancestry_many(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<LineageRow>, Error> {
-    Ok(ex.query("WITH RECURSIVE ancestors AS (SELECT seed.origin, i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton FROM unnest($1::bigint[]) AS seed(origin) JOIN game.items i ON i.item_id = seed.origin WHERE i.jump_clone_id IS NULL UNION SELECT a.origin, i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton FROM game.items i JOIN ancestors a ON i.item_id = a.location_id WHERE i.jump_clone_id IS NULL) SELECT a.origin, a.item_id, a.type_id, a.owner_id, a.location_id, a.flag_id, a.quantity, a.singleton, o.corporation_id AS office_corporation_id, o.station_id AS office_station_id FROM ancestors a LEFT JOIN game.offices o ON o.office_id = a.item_id ORDER BY a.origin, a.item_id", &[&ids]).await?.iter().map(LineageRow::from_row).collect())
+    Ok(ex.query("WITH RECURSIVE ancestors AS (SELECT seed.origin, i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton FROM unnest($1::bigint[]) AS seed(origin) JOIN game.items i ON i.item_id = seed.origin WHERE i.jump_clone_id IS NULL UNION SELECT a.origin, i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton FROM game.items i JOIN ancestors a ON i.item_id = a.location_id WHERE i.jump_clone_id IS NULL) SELECT a.origin, a.item_id, a.type_id, a.owner_id, a.location_id, a.flag_id, a.quantity, a.singleton, o.corporation_id AS office_corporation_id, o.station_id AS office_station_id, o.lease_state AS office_lease_state, o.rented_until AS office_rented_until FROM ancestors a LEFT JOIN game.offices o ON o.office_id = a.item_id ORDER BY a.origin, a.item_id", &[&ids]).await?.iter().map(LineageRow::from_row).collect())
 }
 
 pub(crate) async fn ancestry(ex: &(impl Executor + ?Sized), id: i64) -> Result<Vec<Ancestor>, Error> {
     Ok(ancestry_many(ex, &[id]).await?.into_iter().map(|row| row.ancestor).collect())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

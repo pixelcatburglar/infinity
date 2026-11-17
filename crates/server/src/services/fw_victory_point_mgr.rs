@@ -15,5 +15,5 @@ pub(super) fn dispatch(c: &Client, call: &Call<'_>) -> Option<CallResult> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

@@ -1,6 +1,11 @@
 //! Skill queue reads, writes and finished-entry collection in `game.skill_queue`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Training timing, transactions, refusals, notifications and World are caller concerns.
+//! start_time/end_time hold the full queue state: an all-None head is paused; a
+//! Some/None head is active but blocked by a zero training rate; rows past a
+//! stopped time cursor carry no times. `active_characters` selects rows with a
+//! finite end_time, so blocked queues keep no training deadline and are not
+//! seeded for wakeup; they recover through real attribute or expiry changes.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 

@@ -44,7 +44,7 @@ pub(crate) async fn prepare(ex: &(impl Executor + ?Sized), corporation: i64, now
     }
     let identities: Vec<_> = hubs.iter().map(|hub| (hub.structure.content_namespace.as_str(), hub.structure.content_version.as_str()))
         .chain(targets.iter().map(|target| (target.content_namespace.as_str(), target.content_version.as_str()))).collect();
-    super::validate_retained(&identities).await?;
+    super::validate_retained(&identities)?;
     let owned = systems::for_alliance(ex, alliance).await.map_err(db_err)?;
     let expected = policy_dao::read(ex, alliance).await.map_err(db_err)?
         .ok_or_else(|| db_err(anyhow::anyhow!("claimed Hub policy missing")))?;

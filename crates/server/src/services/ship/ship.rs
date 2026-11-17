@@ -11,7 +11,7 @@ use super::*;
 /// The caller must hold `economy` until session updates are handled.
 pub(crate) struct Undocked {
     pub change: SessionChange,
-    pub economy: tokio::sync::MutexGuard<'static, ()>,
+    pub economy: crate::services::market::economy_lock::Guard,
 }
 
 pub(crate) async fn undock(identity: &Identity, db: &crate::db::Db, world: &space::World,
@@ -23,7 +23,9 @@ pub(crate) async fn undock(identity: &Identity, db: &crate::db::Db, world: &spac
     let spos: [f64; 3] = [required(st.x, "station x")?, required(st.y, "station y")?, required(st.z, "station z")?];
     let station_type = i32::try_from(required(st.type_id, "station type")?)
         .map_err(|_| CallError::Internal(anyhow::anyhow!("invalid SDE station type")))?;
+    let admission = world.admission(system).map_err(db_err)?;
     let economy = crate::services::market::lock().await;
+    admission.check().map_err(db_err)?;
     let mut ball = balls::selected(identity, db, world, sde, space_system, alliance_id, ship, spos).await?;
     let group = sde.types.get(ball.ball.type_id).and_then(|ty| ty.group_id);
     undock_point::prepare(&mut ball.ball, sde.graphic_locations.get(station_type), group, spos,

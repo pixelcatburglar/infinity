@@ -35,7 +35,7 @@ pub(super) async fn start_gate(f: &Fixture) -> tokio::task::JoinHandle<(Result<(
     let config = Arc::new(crate::config::Config::default());
     let chat = crate::chat::Hub::new(&config.chat.domain, r.db.clone(), r.world.clone());
     let login = crate::handshake::Login { user_id: ids.account, user_name: ids.account.to_string(), role: 0, client_id: ids.characters[2], session_id: ids.characters[2], language_id: "EN".into() };
-    let mut client = crate::client::Client::new(crate::conn::Conn::new(stream, address), config, r.db.clone(), r.sde.clone(), chat, r.world.clone(), login);
+    let mut client = crate::client::Client::new(infinity_wire::conn::Conn::new(stream, address), config, r.db.clone(), r.sde.clone(), chat, r.world.clone(), login);
     client.session.apply(vec![("charid", Value::Int(ids.characters[2])), ("corpid", Value::Int(ids.corps[2])), ("shipid", Value::Int(ids.ships[2])), ("solarsystemid", Value::Int(ids.systems[0])), ("solarsystemid2", Value::Int(ids.systems[0]))]);
     let task = tokio::spawn(async move {
         let _peer = peer;
@@ -45,7 +45,10 @@ pub(super) async fn start_gate(f: &Fixture) -> tokio::task::JoinHandle<(Result<(
     });
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let batch = destiny_rx.recv().await.expect("gate destiny channel");
+            let batch = match destiny_rx.recv().await.expect("gate destiny channel") {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             if batch.iter().any(|event| {
                 let Some(call) = event.items().and_then(|v| v.get(1)).and_then(|v| v.items()) else { return false };
                 if call.first() != Some(&Value::str("OnSpecialFX")) { return false; }
@@ -71,9 +74,9 @@ pub(super) async fn guarded_capacitor(f: &Fixture, target: usize, source: usize,
     let guard = NpcCapacitorGuard::Attack { source: source_ship, target: target_ship, source_guard: None, player: None, optimal, falloff: 0.0, offensive: false };
     let capacity = capacitor_snapshot(&r.db, &r.world, system, target_ship).await.unwrap().unwrap().capacity;
     assert!(capacity.is_finite() && capacity > 0.0);
-    let drained = drain_exact_guarded(&r.db, &r.world, system, target_ship, capacity / 4.0, guard.clone()).await.unwrap().expect("guarded drain must be admitted").0;
+    let drained = drain_exact_guarded(&r.db, &r.world, system, target_ship, capacity / 4.0, None, guard.clone()).await.unwrap().expect("guarded drain must be admitted").0;
     assert!(drained > 0.0);
-    let accepted = inject_guarded(&r.db, &r.world, system, target_ship, drained, guard).await.unwrap();
+    let accepted = inject_guarded(&r.db, &r.world, system, target_ship, drained, None, guard).await.unwrap();
     if blocked { assert_eq!(accepted, 0.0, "remote capacitor assistance must be blocked"); }
     else { assert!(accepted > 0.0, "eligible remote capacitor assistance must be admitted"); }
 }
@@ -89,9 +92,9 @@ pub(super) async fn self_capacitor(f: &Fixture, ship: usize, other: usize) {
     }).await.unwrap();
     let guard = NpcCapacitorGuard::Attack { source: ship, target: other, source_guard: None, player: None, optimal, falloff: 0.0, offensive: false };
     let capacity = capacitor_snapshot(&r.db, &r.world, system, ship).await.unwrap().unwrap().capacity;
-    let drained = drain_exact_guarded(&r.db, &r.world, system, ship, capacity / 4.0, guard.clone()).await.unwrap().expect("self drain must be admitted").0;
+    let drained = drain_exact_guarded(&r.db, &r.world, system, ship, capacity / 4.0, None, guard.clone()).await.unwrap().expect("self drain must be admitted").0;
     assert!(drained > 0.0);
-    assert!(inject_guarded(&r.db, &r.world, system, ship, drained, guard).await.unwrap() > 0.0, "self capacitor injection must remain admitted");
+    assert!(inject_guarded(&r.db, &r.world, system, ship, drained, None, guard).await.unwrap() > 0.0, "self capacitor injection must remain admitted");
 }
 
 /// Start a real SDE assistance projection before the capital link is admitted.

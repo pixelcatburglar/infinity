@@ -122,6 +122,12 @@ CREATE TABLE IF NOT EXISTS game.characters (
 
 -- dao/characters/newbie: once-per-character spare rookie kit.
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS newbie_bonus_claimed_at bigint;
+-- dao/characters/npc_control: persistent per-character NPC target-ignore switch.
+ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS gm_npc_ignored boolean NOT NULL DEFAULT false;
+
+-- dao/characters/crimewatch: persistent character safety preference.
+ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS safety_level bigint NOT NULL DEFAULT 2
+    CHECK (safety_level BETWEEN 0 AND 2);
 
 -- dao/skills/alpha_injections: persistent daily Alpha injector cooldowns.
 CREATE TABLE IF NOT EXISTS game.character_alpha_injections (
@@ -214,6 +220,13 @@ CREATE TABLE IF NOT EXISTS game.ship_dirt (
     dirt_timestamp bigint NOT NULL
 );
 
+-- dao/items/ship_kill_counts: player-kill counts follow the physical hull
+-- across ownership changes; repackaging removes the row atomically.
+CREATE TABLE IF NOT EXISTS game.ship_kill_counts (
+    ship_item_id bigint PRIMARY KEY REFERENCES game.items(item_id) ON DELETE CASCADE,
+    player_kills bigint NOT NULL CHECK (player_kills >= 0)
+);
+
 
 -- Ship SKIN licenses and applications; expiry timestamps use FILETIME.
 CREATE TABLE IF NOT EXISTS game.ship_skin_licenses (
@@ -259,6 +272,8 @@ CREATE TABLE IF NOT EXISTS game.item_attributes (
 );
 -- dao/items/dogma: FILETIME of the persisted shield charge.
 ALTER TABLE game.item_attributes ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0;
+-- dao/items/dogma: unlimited cargo-hold mode on the hull capacity override.
+ALTER TABLE game.item_attributes ADD COLUMN IF NOT EXISTS cargo_unlimited boolean NOT NULL DEFAULT false;
 
 -- dao/dynamic_items: mutation provenance; consumed inputs intentionally have no foreign keys.
 CREATE TABLE IF NOT EXISTS game.dynamic_items (
@@ -744,6 +759,22 @@ CREATE TABLE IF NOT EXISTS game.standings (
     PRIMARY KEY (char_id, from_id)
 );
 
+-- Standing change history (services/standings/mutation.rs); the client standings
+-- panel reads it newest-first through standingMgr.GetStandingTransactions.
+CREATE TABLE IF NOT EXISTS game.standing_history (
+    event_id        bigserial PRIMARY KEY,
+    char_id         bigint NOT NULL REFERENCES game.characters(character_id) ON DELETE CASCADE,
+    from_id         bigint NOT NULL,
+    old_standing    double precision NOT NULL,
+    new_standing    double precision NOT NULL,
+    event_type_id   bigint NOT NULL,
+    occurred_at     bigint NOT NULL,
+    actor_id        bigint,
+    mission_name_id bigint,
+    message         text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS standing_history_char_from_idx ON game.standing_history (char_id, from_id, event_id DESC);
+
 -- Player corporations (services/corps.rs); IDs from 98,000,000 (idCheckers.IsPlayerCorporation).
 CREATE TABLE IF NOT EXISTS game.corporations (
     corporation_id bigserial PRIMARY KEY,
@@ -767,6 +798,8 @@ CREATE TABLE IF NOT EXISTS game.corporations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_name_idx ON game.corporations (lower(name)) WHERE NOT deleted;
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_ticker_idx ON game.corporations (upper(ticker)) WHERE NOT deleted;
+-- dao/corporations: match the client's closed player-corporation ID range.
+ALTER SEQUENCE game.corporations_corporation_id_seq MAXVALUE 98999999 NO CYCLE;
 SELECT setval('game.corporations_corporation_id_seq', GREATEST((SELECT last_value FROM game.corporations_corporation_id_seq), (SELECT max(corporation_id) FROM game.corporations), 98000000), true);
 -- NULL marks a legacy corporation whose CEO's abilities have not yet been captured.
 ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS member_limit bigint CHECK (member_limit >= 0);
@@ -843,6 +876,57 @@ CREATE TABLE IF NOT EXISTS game.corp_vote_claims (
     FOREIGN KEY (case_id, holder_id) REFERENCES game.corp_vote_snapshot,
     FOREIGN KEY (case_id, character_id) REFERENCES game.corp_vote_ballots
 );
+
+-- dao/corporations/votes: vote types, blueprint reservations and CEO election bookkeeping.
+-- Existing rows are general votes; their option parameters stay NULL.
+ALTER TABLE game.corp_vote_cases ADD COLUMN IF NOT EXISTS vote_type bigint NOT NULL DEFAULT 4;
+ALTER TABLE game.corp_vote_cases ADD COLUMN IF NOT EXISTS reserved_item_id bigint;
+ALTER TABLE game.corp_vote_cases ADD COLUMN IF NOT EXISTS previous_ceo_id bigint;
+ALTER TABLE game.corp_vote_cases ADD COLUMN IF NOT EXISTS previous_ceo_was_active boolean;
+ALTER TABLE game.corp_vote_options ADD COLUMN IF NOT EXISTS parameter bigint;
+ALTER TABLE game.corp_vote_options ADD COLUMN IF NOT EXISTS parameter1 bigint;
+ALTER TABLE game.corp_vote_options ADD COLUMN IF NOT EXISTS parameter2 bigint;
+-- An item is reserved by at most one case at a time; the column clears on release.
+CREATE UNIQUE INDEX IF NOT EXISTS corp_vote_cases_reserved_item_idx
+    ON game.corp_vote_cases (reserved_item_id) WHERE reserved_item_id IS NOT NULL;
+-- Restart seeding: every unclosed case needs a close job at ends.
+CREATE INDEX IF NOT EXISTS corp_vote_cases_open_ends_idx
+    ON game.corp_vote_cases (ends) WHERE closed_at IS NULL;
+-- The corporation's active CEO election case; set only while that election runs.
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS active_ceo_vote_id bigint;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.corporations'::regclass AND conname = 'corporations_active_ceo_vote_fkey') THEN
+        ALTER TABLE game.corporations ADD CONSTRAINT corporations_active_ceo_vote_fkey FOREIGN KEY (active_ceo_vote_id) REFERENCES game.corp_vote_cases;
+    END IF;
+END $$;
+-- dao/corporations/sanctions: one decided action per case. Vote type and parameters are
+-- read from the immutable case and option rows, never duplicated here.
+CREATE TABLE IF NOT EXISTS game.corp_sanctioned_actions (
+    case_id bigint PRIMARY KEY REFERENCES game.corp_vote_cases,
+    option_id integer NOT NULL,
+    expires bigint NOT NULL,
+    acted_upon boolean NOT NULL DEFAULT false,
+    in_effect boolean NOT NULL DEFAULT false,
+    time_acted_upon bigint,
+    time_rescinded bigint,
+    expired_at bigint,
+    FOREIGN KEY (case_id, option_id) REFERENCES game.corp_vote_options
+);
+-- Restart seeding: unacted, unexpired actions need an expire job at expires.
+CREATE INDEX IF NOT EXISTS corp_sanctioned_actions_pending_idx
+    ON game.corp_sanctioned_actions (expires) WHERE NOT acted_upon AND expired_at IS NULL;
+-- Enacted blueprint lockdowns. The locked item must outlive its lock, so item deletion is
+-- restricted rather than cascading.
+CREATE TABLE IF NOT EXISTS game.corp_item_locks (
+    item_id bigint PRIMARY KEY REFERENCES game.items ON DELETE RESTRICT,
+    corporation_id bigint NOT NULL REFERENCES game.corporations,
+    station_id bigint NOT NULL,
+    case_id bigint NOT NULL UNIQUE REFERENCES game.corp_vote_cases,
+    locked_at bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS corp_item_locks_lookup_idx
+    ON game.corp_item_locks (corporation_id, station_id, item_id);
 -- A member's corporation roles (appConst.corpRole* mask), the same at every location, the
 -- roles they may grant, their titles (game.corp_titles bits) and free-text title.
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS corp_roles bigint NOT NULL DEFAULT 0;
@@ -980,6 +1064,12 @@ CREATE TABLE IF NOT EXISTS game.alliance_relationships (
 
 -- Corporation offices (services/offices.rs): office_id is the office's item (typeOffice) at
 -- the station, which holds the corporation hangar divisions' items (flagCorpSAG1-7).
+-- lease_state: 0 active, 1 impounded (inactive with retained contents), 2 released
+-- (inactive and empty); the identity row survives every state so the same
+-- corporation/station container is reused. Active additionally requires
+-- rented_until > request time; an expired Active row is logically inactive until a
+-- billing pass materializes it. state_changed_at records the server's last guarded
+-- transition; legacy rows backfill to 0 because their real transition time is unknown.
 CREATE TABLE IF NOT EXISTS game.offices (
     office_id      bigint PRIMARY KEY,
     corporation_id bigint NOT NULL,
@@ -987,9 +1077,15 @@ CREATE TABLE IF NOT EXISTS game.offices (
     rented_until   bigint NOT NULL,
     UNIQUE (corporation_id, station_id)
 );
+ALTER TABLE game.offices ADD COLUMN IF NOT EXISTS lease_state smallint NOT NULL DEFAULT 0;
+ALTER TABLE game.offices ADD COLUMN IF NOT EXISTS state_changed_at bigint NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS offices_lease_idx ON game.offices (lease_state, rented_until);
 
 -- Bills (services/bills.rs): bill_type is appConst.billType*, status appConst.bill*
--- (0 unpaid, 1 paid); external_id is what the bill is for (an office for rent).
+-- (0 unpaid, 1 paid, 2 cancelled, 4 expired; 3 is the client's billHidden and is
+-- never produced here); external_id is what the bill is for (an office for rent).
+-- period_start/period_end cover the billed office rental term [due, due+period);
+-- settled_at records when payment completed.
 CREATE TABLE IF NOT EXISTS game.bills (
     bill_id      bigserial PRIMARY KEY,
     bill_type    integer NOT NULL,
@@ -1003,6 +1099,56 @@ CREATE TABLE IF NOT EXISTS game.bills (
     status       integer NOT NULL DEFAULT 0,
     created      bigint NOT NULL
 );
+ALTER TABLE game.bills ADD COLUMN IF NOT EXISTS period_start bigint;
+ALTER TABLE game.bills ADD COLUMN IF NOT EXISTS period_end bigint;
+ALTER TABLE game.bills ADD COLUMN IF NOT EXISTS settled_at bigint;
+-- Exact 36-digit bill amounts, guarded like the wallet migrations.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'game' AND table_name = 'bills' AND column_name = 'amount'
+                 AND (data_type <> 'numeric' OR numeric_precision IS DISTINCT FROM 36 OR numeric_scale IS DISTINCT FROM 2)) THEN
+        ALTER TABLE game.bills ALTER COLUMN amount TYPE numeric(36, 2);
+    END IF;
+END $$;
+-- Legacy rental bills: an unpaid office rent bill identifies its term only when its
+-- office, debtor and station still match the current lease boundary; backfill its
+-- period, keep the lowest duplicate bill per (office, debtor, boundary) and cancel
+-- the rest. A legacy unpaid rental that cannot prove its office boundary is
+-- terminally cancelled; paid history is preserved untouched. The strict boundary
+-- policy — payment only while now < period_start — is enforced by settlement and
+-- the billing scan, not by these one-time statements.
+-- 25920000000000 is the 30-day rental period in FILETIME ticks; 9223346116854775807 is the bigint maximum minus that period, the overflow guard.
+UPDATE game.bills b SET status = 2
+ WHERE b.bill_type = 2 AND b.status = 0 AND b.period_start IS NULL
+   AND NOT EXISTS (SELECT 1 FROM game.offices o
+                   WHERE o.office_id = b.external_id AND o.corporation_id = b.debtor_id
+                     AND o.station_id = b.external_id2 AND o.rented_until = b.due
+                     AND b.due <= 9223346116854775807);
+-- Resolve duplicate legacy rows before filling a period: the partial unique
+-- index may already exist on a repeated startup.
+UPDATE game.bills b SET status = 2
+ WHERE b.bill_type = 2 AND b.status = 0 AND b.period_start IS NULL
+   AND EXISTS (SELECT 1 FROM game.bills d
+               WHERE d.bill_type = b.bill_type AND d.debtor_id = b.debtor_id
+                 AND d.external_id = b.external_id AND d.status IN (0, 1)
+                 AND ((d.period_start = b.due)
+                      OR (d.status = 0 AND d.period_start IS NULL
+                          AND d.due = b.due AND d.bill_id < b.bill_id)));
+UPDATE game.bills b SET period_start = b.due,
+       period_end = b.due + 25920000000000
+ WHERE b.bill_type = 2 AND b.status = 0 AND b.period_start IS NULL
+   AND EXISTS (SELECT 1 FROM game.offices o
+               WHERE o.office_id = b.external_id AND o.corporation_id = b.debtor_id
+                 AND o.station_id = b.external_id2 AND o.rented_until = b.due);
+UPDATE game.bills b SET status = 2
+ WHERE b.bill_type = 2 AND b.status = 0 AND b.period_start IS NOT NULL
+   AND b.bill_id <> (SELECT min(d.bill_id) FROM game.bills d
+                     WHERE d.bill_type = b.bill_type AND d.debtor_id = b.debtor_id
+                       AND d.external_id = b.external_id AND d.period_start = b.period_start
+                       AND d.status = 0);
+CREATE UNIQUE INDEX IF NOT EXISTS bills_rental_period_idx ON game.bills (bill_type, debtor_id, external_id, period_start)
+ WHERE period_start IS NOT NULL AND status IN (0, 1);
 CREATE INDEX IF NOT EXISTS bills_debtor_idx ON game.bills (debtor_id, status);
 CREATE INDEX IF NOT EXISTS bills_creditor_idx ON game.bills (creditor_id, status);
 -- Which bill types an owner pays automatically, and from which wallet division.
@@ -1013,6 +1159,7 @@ CREATE TABLE IF NOT EXISTS game.bill_autopay (
     PRIMARY KEY (owner_id, bill_type)
 );
 ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS bill_division integer NOT NULL DEFAULT 1000;
+ALTER TABLE game.alliances ADD COLUMN IF NOT EXISTS bill_division integer NOT NULL DEFAULT 1000;
 
 -- Corporation wallet divisions (services/corpwallet.rs): account_key 1000-1006.
 CREATE TABLE IF NOT EXISTS game.corp_wallets (
@@ -1218,7 +1365,7 @@ CREATE TABLE IF NOT EXISTS game.lp_balances (
     PRIMARY KEY (char_id, corp_id)
 );
 
--- LP store catalogue (dao::lp_offers); requirements retain their JSON array order.
+-- LP store catalogue (dao::sde::lp_offers); requirements retain their JSON array order.
 CREATE TABLE IF NOT EXISTS game.lp_offers (
     corporation_id bigint NOT NULL,
     offer_id bigint NOT NULL,
@@ -1231,7 +1378,8 @@ CREATE TABLE IF NOT EXISTS game.lp_offers (
     PRIMARY KEY (corporation_id, offer_id)
 );
 
--- Personal skill plans (public gateway eve_public.character.skill.plan).
+-- Personal and corporation skill plans (public gateway eve_public.character.skill.plan
+-- and eve_public.corporation.skill.plan).
 CREATE TABLE IF NOT EXISTS game.skill_plans (
     plan_id      bytea PRIMARY KEY,         -- 16-byte UUID
     character_id bigint NOT NULL REFERENCES game.characters,
@@ -1245,6 +1393,24 @@ CREATE TABLE IF NOT EXISTS game.skill_plans (
 );
 CREATE INDEX IF NOT EXISTS skill_plans_character_idx ON game.skill_plans (character_id);
 
+-- Corporation plans share the table: exactly one owner, and a corporation row carries
+-- the 16-byte career-path category (all-zero bytes mean "no category"). Definitions
+-- stay with a deleted corporation; visibility is a service concern.
+ALTER TABLE game.skill_plans ADD COLUMN IF NOT EXISTS corporation_id bigint REFERENCES game.corporations;
+ALTER TABLE game.skill_plans ADD COLUMN IF NOT EXISTS category_id bytea;
+ALTER TABLE game.skill_plans ALTER COLUMN character_id DROP NOT NULL;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.skill_plans'::regclass AND conname = 'skill_plans_owner_check') THEN
+        ALTER TABLE game.skill_plans ADD CONSTRAINT skill_plans_owner_check CHECK (
+            (character_id IS NULL) <> (corporation_id IS NULL)
+            AND (corporation_id IS NULL) = (category_id IS NULL)
+            AND (category_id IS NULL OR octet_length(category_id) = 16)
+        );
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS skill_plans_corporation_idx ON game.skill_plans (corporation_id) WHERE corporation_id IS NOT NULL;
+
 -- The client's Python 2 UCS2 ABI counts UTF-16 units; supplementary code points use two.
 CREATE OR REPLACE FUNCTION game.skill_plan_text_units(text) RETURNS integer
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
@@ -1254,7 +1420,7 @@ AS $$ SELECT char_length($1) + regexp_count($1 COLLATE "C", U&'[\+010000-\+10FFF
 DO $$
 DECLARE bad record;
 BEGIN
-    SELECT plan_id, character_id INTO bad FROM game.skill_plans
+    SELECT plan_id, character_id, corporation_id INTO bad FROM game.skill_plans
     WHERE octet_length(plan_id) <> 16 OR plan_id = decode(repeat('00', 16), 'hex')
        OR cardinality(skill_ids) <> cardinality(levels)
        OR cardinality(skill_ids) > 150
@@ -1266,7 +1432,7 @@ BEGIN
        OR EXISTS (SELECT 1 FROM unnest(levels) AS l WHERE l < 0 OR l > 5)
     LIMIT 1;
     IF FOUND THEN
-        RAISE EXCEPTION 'invalid skill plan %, character %', encode(bad.plan_id, 'hex'), bad.character_id;
+        RAISE EXCEPTION 'invalid skill plan %, owner %', encode(bad.plan_id, 'hex'), coalesce(bad.character_id::text, 'corporation ' || bad.corporation_id::text);
     END IF;
 END $$;
 DO $$
@@ -1366,6 +1532,9 @@ ALTER TABLE game.plex_vault_transactions ADD COLUMN IF NOT EXISTS order_id bigin
 ALTER TABLE game.plex_vault_transactions ADD COLUMN IF NOT EXISTS trade_id bigint;
 CREATE UNIQUE INDEX IF NOT EXISTS plex_vault_market_fill_idx ON game.plex_vault_transactions (order_id, trade_id, user_id) WHERE kind = 'market_fill';
 CREATE UNIQUE INDEX IF NOT EXISTS plex_vault_market_refund_idx ON game.plex_vault_transactions (order_id) WHERE kind = 'market_refund';
+-- Client vault history reads owned by dao/accounts/plex; covers the shared
+-- user/nonopening filter and created/id descending order.
+CREATE INDEX IF NOT EXISTS plex_vault_logged_user_created_idx ON game.plex_vault_transactions (user_id, created DESC, transaction_id DESC) WHERE kind <> 'opening';
 
 -- Redeeming queue: items owed to an account (store purchases, login rewards),
 -- turned into items when claimed onto a character.
@@ -1794,6 +1963,54 @@ CREATE TABLE IF NOT EXISTS game.sov_link_source_changes (
     PRIMARY KEY (character_id, revision),
     CONSTRAINT sov_link_source_changes_revision CHECK (revision > 0)
 );
+
+-- Sovereignty development-index points state and replay checkpoints
+-- (dao/sovereignty/development). Rows are independent of Hub deployment and
+-- claim ownership; nothing cascades from sov_systems or its deletion. A
+-- checkpoint_at marks that every fact strictly before it is already folded
+-- into the stored points, while facts at exactly checkpoint_at are not.
+CREATE TABLE IF NOT EXISTS game.sov_development (
+    system_id bigint PRIMARY KEY CHECK (system_id > 0),
+    military_points double precision NOT NULL,
+    industrial_points double precision NOT NULL,
+    evaluated_at bigint NOT NULL,
+    revision bigint NOT NULL DEFAULT 0,
+    activation_ordinal bigint NOT NULL,
+    trend_start_at bigint NOT NULL,
+    military_trend_base double precision NOT NULL,
+    industrial_trend_base double precision NOT NULL,
+    tail_occurred_at bigint,
+    tail_namespace text,
+    tail_source_key text,
+    tail_ordinal bigint,
+    tail_slice_id bigint,
+    CONSTRAINT sov_development_finite CHECK (
+        military_points >= 0 AND military_points < 'Infinity'::float8 AND
+        industrial_points >= 0 AND industrial_points < 'Infinity'::float8 AND
+        military_trend_base >= 0 AND military_trend_base < 'Infinity'::float8 AND
+        industrial_trend_base >= 0 AND industrial_trend_base < 'Infinity'::float8),
+    CONSTRAINT sov_development_state CHECK (evaluated_at > 0 AND revision >= 0 AND trend_start_at > 0 AND trend_start_at <= evaluated_at),
+    CONSTRAINT sov_development_tail_group CHECK (
+        (tail_occurred_at IS NULL AND tail_namespace IS NULL AND tail_source_key IS NULL AND tail_ordinal IS NULL AND tail_slice_id IS NULL) OR
+        (tail_occurred_at IS NOT NULL AND tail_namespace IS NOT NULL AND tail_source_key IS NOT NULL AND tail_ordinal IS NOT NULL AND tail_slice_id IS NOT NULL)),
+    FOREIGN KEY (activation_ordinal) REFERENCES game.lua_content_activations(ordinal) ON DELETE RESTRICT
+);
+CREATE TABLE IF NOT EXISTS game.sov_development_checkpoints (
+    system_id bigint NOT NULL REFERENCES game.sov_development(system_id) ON DELETE RESTRICT,
+    checkpoint_at bigint NOT NULL,
+    military_points double precision NOT NULL,
+    industrial_points double precision NOT NULL,
+    activation_ordinal bigint NOT NULL,
+    PRIMARY KEY (system_id, checkpoint_at),
+    CONSTRAINT sov_development_checkpoint_finite CHECK (
+        checkpoint_at > 0 AND
+        military_points >= 0 AND military_points < 'Infinity'::float8 AND
+        industrial_points >= 0 AND industrial_points < 'Infinity'::float8),
+    FOREIGN KEY (activation_ordinal) REFERENCES game.lua_content_activations(ordinal) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS sov_systems_claim_time_idx
+    ON game.sov_systems (system_id) WHERE claim_time IS NOT NULL;
+
 -- Direct station trades (services/trade): container IDs share the item sequence.
 CREATE TABLE IF NOT EXISTS game.trades (
     trade_id bigint PRIMARY KEY DEFAULT nextval('game.items_item_id_seq'),
@@ -1856,6 +2073,22 @@ CREATE TABLE IF NOT EXISTS game.kill_rights (
     used_at bigint
 );
 CREATE UNIQUE INDEX IF NOT EXISTS kill_rights_unused_pair ON game.kill_rights (from_id, to_id) WHERE used_at IS NULL;
+
+-- NPC bounty pools awaiting the per-character payout deadline (dao/npc_bounties.rs).
+-- One unpaid batch per character; rows carry the source system's absolute totals.
+CREATE TABLE IF NOT EXISTS game.npc_bounty_pools (
+    character_id bigint NOT NULL,
+    system_id bigint NOT NULL,
+    batch_started_at bigint NOT NULL,
+    due_at bigint NOT NULL,
+    amount numeric(36,2) NOT NULL,
+    kill_count bigint NOT NULL,
+    PRIMARY KEY (character_id, system_id),
+    CHECK (amount >= 0),
+    CHECK (kill_count >= 0),
+    CHECK (batch_started_at > 0 AND due_at > batch_started_at)
+);
+CREATE INDEX IF NOT EXISTS npc_bounty_pools_system_idx ON game.npc_bounty_pools (system_id, character_id);
 
 -- Corporate contract ownership and captured custody (dao/contracts).
 -- Defaults: 1000 is the client's master wallet key (appConst accountingKeyCash, ACCOUNT_CASH in consts.rs); 4 is the station hangar flag (inventorycommon const flagHangar, FLAG_HANGAR).
@@ -1985,18 +2218,45 @@ CREATE TABLE IF NOT EXISTS game.progress_subscription_kinds (
 CREATE TABLE IF NOT EXISTS game.progress_deliveries (
     consumer_key text NOT NULL REFERENCES game.progress_subscriptions,
     event_id uuid NOT NULL REFERENCES game.progress_events,
-    state text NOT NULL CHECK (state IN ('pending', 'applied')),
+    state text NOT NULL CHECK (state IN ('pending', 'applied', 'terminal')),
     applied_at bigint,
     next_attempt_at bigint NOT NULL,
     attempts integer NOT NULL DEFAULT 0,
+    permanent_rejections integer NOT NULL DEFAULT 0,
+    terminal_at bigint,
     last_error text,
     subject_character_id bigint,
     PRIMARY KEY (consumer_key, event_id)
 );
+ALTER TABLE game.progress_deliveries ADD COLUMN IF NOT EXISTS permanent_rejections integer NOT NULL DEFAULT 0;
+ALTER TABLE game.progress_deliveries ADD COLUMN IF NOT EXISTS terminal_at bigint;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.progress_deliveries'::regclass AND conname = 'progress_deliveries_state_check' AND pg_get_constraintdef(oid) NOT LIKE '%terminal%') THEN
+        ALTER TABLE game.progress_deliveries DROP CONSTRAINT progress_deliveries_state_check;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.progress_deliveries'::regclass AND conname = 'progress_deliveries_state_check') THEN
+        ALTER TABLE game.progress_deliveries ADD CONSTRAINT progress_deliveries_state_check CHECK (state IN ('pending', 'applied', 'terminal'));
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS progress_deliveries_subject_pending
     ON game.progress_deliveries (consumer_key, subject_character_id, state, next_attempt_at, event_id);
 CREATE INDEX IF NOT EXISTS progress_deliveries_due
     ON game.progress_deliveries (next_attempt_at, consumer_key, event_id) WHERE state = 'pending';
+-- Development-index replay over the canonical journal (dao/progress/sovereignty).
+-- The expression index keys the three fact kinds by solar system; the CASE only
+-- casts text that already validated as an unsigned bigint within range, so
+-- unrelated historical JSON values can never fail indexing or replay scans.
+CREATE INDEX IF NOT EXISTS progress_deliveries_applied_idx
+    ON game.progress_deliveries (consumer_key, event_id) WHERE state = 'applied';
+CREATE INDEX IF NOT EXISTS progress_events_development_system_idx ON game.progress_events (
+    (CASE
+        WHEN kind = 'NpcDestroyed' AND payload->'NpcDestroyed'->>'system_id' ~ '^[0-9]{1,19}$' THEN CASE WHEN (payload->'NpcDestroyed'->>'system_id')::numeric <= 9223372036854775807 THEN (payload->'NpcDestroyed'->>'system_id')::bigint END
+        WHEN kind IN ('OreMined', 'GasHarvested') AND context->>'system_id' ~ '^[0-9]{1,19}$' THEN CASE WHEN (context->>'system_id')::numeric <= 9223372036854775807 THEN (context->>'system_id')::bigint END
+    END),
+    occurred_at,
+    event_id
+) WHERE kind IN ('NpcDestroyed', 'OreMined', 'GasHarvested');
 -- End of durable progress journal and consumer receipts (dao/progress).
 
 -- Durable loss identity (dao/combat.rs).
@@ -2258,3 +2518,112 @@ BEGIN
         ALTER TABLE game.market_transactions ADD CONSTRAINT market_transactions_scope_check CHECK (market_scope IN (0, 1));
     END IF;
 END $$;
+
+-- dao/repairable_ship and dao/items/service_life: repairable-ship loss
+-- recovery. Group and member identities share one sequence in the
+-- 10,000,000,000,000-10,049,999,999,999 band, above player item and NPC
+-- temporary IDs. Historical source item and member item references carry no
+-- foreign key into game.items on purpose: the escrowed physical row is
+-- deleted on withdrawal while the recovery record must survive it.
+CREATE SEQUENCE IF NOT EXISTS game.repairable_recovery_groups_group_id_seq
+    START WITH 10000000000000 MINVALUE 10000000000000 MAXVALUE 10049999999999 NO CYCLE;
+
+-- One recovery event per lost source item. source_* columns freeze the fenced
+-- original item row shape for reconcile proofs; position_* is the sampled
+-- lethal position recorded as a loss fact, and loss_id carries the piloted
+-- loss's canonical LossSettled identity (NULL for non-player sources).
+CREATE TABLE IF NOT EXISTS game.repairable_recovery_groups (
+    group_id               bigint PRIMARY KEY DEFAULT nextval('game.repairable_recovery_groups_group_id_seq'),
+    beneficiary_id         bigint NOT NULL,
+    source_kind            smallint NOT NULL CHECK (source_kind BETWEEN 0 AND 2),
+    source_item_id         bigint NOT NULL,
+    source_owner_id        bigint NOT NULL,
+    source_type_id         integer NOT NULL,
+    source_location_id     bigint NOT NULL,
+    source_flag_id         integer NOT NULL,
+    source_quantity        bigint NOT NULL CHECK (source_quantity > 0),
+    source_singleton       boolean NOT NULL,
+    source_x               double precision,
+    source_y               double precision,
+    source_z               double precision,
+    source_brain_slot      integer,
+    source_jump_clone_id   bigint,
+    source_system_id       bigint NOT NULL,
+    occurred_at            bigint NOT NULL,
+    position_x             double precision,
+    position_y             double precision,
+    position_z             double precision,
+    loss_id                bigint,
+    destination_station_id bigint NOT NULL,
+    payment_expires_at     bigint NOT NULL CHECK (payment_expires_at > occurred_at)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS repairable_recovery_groups_source_idx
+    ON game.repairable_recovery_groups (source_item_id);
+CREATE INDEX IF NOT EXISTS repairable_recovery_groups_beneficiary_idx
+    ON game.repairable_recovery_groups (beneficiary_id);
+
+-- One escrowed recovery member. member_id and group_id come from the same
+-- sequence. status: 0 awaiting_payment, 1 delivering, 2 ready,
+-- 3 withdrawn, 4 abandoned, 5 expired; terminal statuses start at 3.
+-- last_service_life is the remaining service life before the loss, not damage.
+CREATE TABLE IF NOT EXISTS game.repairable_recovery_items (
+    member_id              bigint PRIMARY KEY DEFAULT nextval('game.repairable_recovery_groups_group_id_seq'),
+    group_id               bigint NOT NULL REFERENCES game.repairable_recovery_groups(group_id) ON DELETE CASCADE,
+    item_id                bigint NOT NULL,
+    original_owner_id      bigint NOT NULL,
+    type_id                integer NOT NULL,
+    flag_id                integer NOT NULL,
+    quantity               bigint NOT NULL CHECK (quantity > 0),
+    singleton              boolean NOT NULL,
+    last_service_life      double precision NOT NULL
+        CHECK (last_service_life >= 0.0 AND last_service_life <> 'Infinity'::float8 AND last_service_life <> 'NaN'::float8),
+    repair_completed_at    bigint NOT NULL,
+    paid_at                bigint,
+    paid_amount            numeric(36,2) CHECK (paid_amount IS NULL OR paid_amount >= 0),
+    delivery_completed_at  bigint,
+    withdraw_expires_at    bigint,
+    status                 smallint NOT NULL CHECK (status BETWEEN 0 AND 5),
+    finished_at            bigint,
+    withdrawn_item_id      bigint,
+    -- Record invariants by status: unpaid rows carry no payment or deadline
+    -- fields; active paid rows carry ordered deadlines; withdrawn keeps the
+    -- new inventory mapping; abandoned stays unpaid; every terminal row is finished.
+    CHECK (
+        (status = 0 AND paid_at IS NULL AND paid_amount IS NULL
+            AND delivery_completed_at IS NULL AND withdraw_expires_at IS NULL
+            AND withdrawn_item_id IS NULL AND finished_at IS NULL)
+        OR (status IN (1, 2) AND paid_at IS NOT NULL AND paid_amount IS NOT NULL
+            AND delivery_completed_at IS NOT NULL AND withdraw_expires_at IS NOT NULL
+            AND delivery_completed_at > repair_completed_at AND delivery_completed_at > paid_at
+            AND withdraw_expires_at > delivery_completed_at
+            AND withdrawn_item_id IS NULL AND finished_at IS NULL)
+        OR (status = 3 AND paid_at IS NOT NULL AND paid_amount IS NOT NULL
+            AND delivery_completed_at IS NOT NULL AND withdraw_expires_at IS NOT NULL
+            AND finished_at IS NOT NULL AND withdrawn_item_id IS NOT NULL)
+        OR (status = 4 AND paid_at IS NULL AND paid_amount IS NULL
+            AND finished_at IS NOT NULL AND withdrawn_item_id IS NULL)
+        OR (status = 5 AND finished_at IS NOT NULL AND withdrawn_item_id IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS repairable_recovery_items_group_idx
+    ON game.repairable_recovery_items (group_id);
+CREATE UNIQUE INDEX IF NOT EXISTS repairable_recovery_items_active_item_idx
+    ON game.repairable_recovery_items (item_id) WHERE status < 3;
+
+-- dao/items/service_life: per-physical-item service-life damage; an absent
+-- row means a pristine item.
+CREATE TABLE IF NOT EXISTS game.item_service_life (
+    item_id bigint PRIMARY KEY REFERENCES game.items(item_id) ON DELETE CASCADE,
+    damage  double precision NOT NULL
+        CHECK (damage >= 0.0 AND damage <> 'Infinity'::float8 AND damage <> 'NaN'::float8)
+);
+
+-- dao/schema_history: append-only record of which embedded schema each startup applied; history_id order is the latest row.
+CREATE TABLE IF NOT EXISTS game.schema_application_history (
+    history_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    applied_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
+    schema_hash text NOT NULL,
+    build_commit text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS schema_application_history_hash_idx
+    ON game.schema_application_history (schema_hash);

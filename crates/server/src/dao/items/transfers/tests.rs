@@ -10,9 +10,10 @@ async fn contract_handover_preserves_nested_locations() {
     let tx = client.transaction().await.unwrap();
     let db = crate::db::Db::connect(&cfg).await.unwrap();
     let sde = crate::sde::Sde::load(&db).await.unwrap();
-    let root = insert(&tx, 1, 101, 102, 4, 1).await.unwrap();
-    let container = insert(&tx, 1, 101, root, 5, 1).await.unwrap();
-    let item = insert(&tx, 1, 101, container, 6, 1).await.unwrap();
+    let type_id = sde.types.iter().find(|t| t.published == Some(true) && t.group_id.is_some() && t.category_id.is_some_and(|c| c != infinity_core::consts::CATEGORY_SHIP)).expect("published non-ship SDE type with group").type_id;
+    let root = insert(&tx, type_id, 101, 102, 4, 1).await.unwrap();
+    let container = insert(&tx, type_id, 101, root, 5, 1).await.unwrap();
+    let item = insert(&tx, type_id, 101, container, 6, 1).await.unwrap();
     let closure = crate::dao::items::inventory::descendants(&tx, &[root]).await.unwrap();
     let lineage = crate::dao::items::deliveries::ancestry_many(&tx, &closure).await.unwrap();
     let mut requests = crate::services::inventory::destination::parent_requests(

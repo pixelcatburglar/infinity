@@ -25,5 +25,5 @@ pub(crate) fn level_from_points(points: i64, rank: f64) -> i32 {
     (1 + ((points as f64 / base).ln() / (SKILL_LEVEL_BASE.ln() * SKILL_LEVEL_EXPONENT)) as i32).min(MAX_SKILL_LEVEL as i32)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-skills"))]
 mod tests;

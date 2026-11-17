@@ -17,7 +17,7 @@ pub(super) async fn validate(cx: &Ctx, _fit: &Fit, _module: &Module, effect: &Ef
     Ok(())
 }
 
-pub(super) async fn start(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     let master = cycle.modules[0].id;
     if cycle.stop.load(Ordering::Relaxed) || !state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &cycle.stop)) {
         return Ok(CycleOutcome::Stop("activation lost"));

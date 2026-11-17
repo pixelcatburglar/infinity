@@ -29,6 +29,11 @@ impl Compression {
     }
 
     pub(crate) fn get(&self, source_type: i32) -> Option<i32> { self.0.get(&source_type).copied() }
+
+    /// Every source/output pair, for building membership sets at startup.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.0.iter().map(|(&source, &output)| (source, output))
+    }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-sde"))] mod tests;

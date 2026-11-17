@@ -106,4 +106,4 @@ pub(in crate::services) async fn handle(c: &mut Client, args: &[Value], rack: bo
     Ok(result)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

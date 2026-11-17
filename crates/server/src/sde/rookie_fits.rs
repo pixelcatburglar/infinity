@@ -79,5 +79,5 @@ impl RookieFits {
     pub(crate) fn get(&self, ship_type: i32) -> Option<&RookieFit> { self.fits.get(&ship_type) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

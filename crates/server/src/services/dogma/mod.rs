@@ -28,4 +28,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     dogma_im::dispatch(c, call).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

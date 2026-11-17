@@ -73,7 +73,7 @@ pub(super) fn group_has_class(group: &str, class: &str) -> bool {
 /// Spawn the mission's NPCs around its site, unless already there.
 pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    if sites().lock().unwrap().contains_key(&(me, m.agent_id)) {
+    if crate::poison::lock_or_exit(sites().lock()).contains_key(&(me, m.agent_id)) {
         return Ok(());
     }
     let faction = c.sde.factions.get(m.faction_id);
@@ -108,12 +108,12 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
     let group = c.world.with(m.system_id, move |s| s.spawn_group(group_members, |_| {})).await
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
     info!(user = c.login.user_id, "agent {}: spawned {} NPCs for mission {} in {}", m.agent_id, spawned.len(), m.mission_id, m.system_id);
-    sites().lock().unwrap().insert((me, m.agent_id), MissionSite { system: m.system_id, npcs: spawned, group });
+    crate::poison::lock_or_exit(sites().lock()).insert((me, m.agent_id), MissionSite { system: m.system_id, npcs: spawned, group });
     Ok(())
 }
 
 pub(super) fn despawn(c: &Client, char_id: i64, agent_id: i64) {
-    if let Some(site) = sites().lock().unwrap().remove(&(char_id, agent_id)) {
+    if let Some(site) = crate::poison::lock_or_exit(sites().lock()).remove(&(char_id, agent_id)) {
         c.world.post(site.system, move |s| {
             for id in site.npcs {
                 s.remove_ball(id);
@@ -125,7 +125,7 @@ pub(super) fn despawn(c: &Client, char_id: i64, agent_id: i64) {
 /// Load the actor before the transaction; it can still stop after commit.
 pub(super) async fn preflight_clear(c: &Client, m: &Mission) -> Result<(i64, i64), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    let system = sites().lock().unwrap().get(&(me, m.agent_id))
+    let system = crate::poison::lock_or_exit(sites().lock()).get(&(me, m.agent_id))
         .map_or(m.system_id, |site| site.system);
     c.world.system(system).await.map_err(CallError::Internal)?;
     c.world.with(system, |_| ()).await
@@ -137,7 +137,7 @@ pub(super) async fn preflight_clear(c: &Client, m: &Mission) -> Result<(i64, i64
 pub(super) async fn force_clear(c: &Client, agent_id: i64, system: i64) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let key = (me, agent_id);
-    let existing = sites().lock().unwrap().get(&key).map(|site| (site.system, site.npcs.clone()));
+    let existing = crate::poison::lock_or_exit(sites().lock()).get(&key).map(|site| (site.system, site.npcs.clone()));
     if existing.as_ref().is_some_and(|site| site.0 != system) {
         return Err(CallError::Internal(anyhow::anyhow!("mission site changed system")));
     }
@@ -146,7 +146,7 @@ pub(super) async fn force_clear(c: &Client, agent_id: i64, system: i64) -> Resul
         for id in npcs { s.remove_ball(id); }
         s.spawn_group([], |_| {})
     }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
-    sites().lock().unwrap().insert(key, MissionSite { system, npcs: Vec::new(), group });
+    crate::poison::lock_or_exit(sites().lock()).insert(key, MissionSite { system, npcs: Vec::new(), group });
     Ok(())
 }
 
@@ -154,10 +154,10 @@ pub(super) async fn force_clear(c: &Client, agent_id: i64, system: i64) -> Resul
 pub(super) async fn objective_done(c: &Client, m: &Mission) -> bool {
     if m.state != STATE_ACCEPTED { return false; }
     let me = c.session.int("charid").unwrap_or(0);
-    let Some((system, group)) = sites().lock().unwrap().get(&(me, m.agent_id)).map(|site| (site.system, site.group)) else { return false };
+    let Some((system, group)) = crate::poison::lock_or_exit(sites().lock()).get(&(me, m.agent_id)).map(|site| (site.system, site.group)) else { return false };
     c.world.with(system, move |s| s.group_remaining(group) == 0).await.unwrap_or(false)
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

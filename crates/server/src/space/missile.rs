@@ -2,7 +2,7 @@
 //! Mirrors destiny LaunchMissile, MissileFollow and EvolveMissile; the client
 //! `eve/client/script/remote/michelle.py` consumes LaunchMissile and serialized missile mode.
 //! Data comes from actor-owned Ball and target snapshots; missiles are transient, with no DB tables.
-//! Impact timers remain server policy.
+//! Flight lifetime and target-only contact sweeps live in `system::missiles`.
 //! Dynamic orientation is unsupported: a stationary launcher uses default -Z.
 
 use super::*;
@@ -66,4 +66,4 @@ impl Ball {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

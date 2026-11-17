@@ -101,5 +101,5 @@ pub(super) async fn payer(ex: &(impl Executor + ?Sized), actor: i64, account: Op
     Ok((*owner, key))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

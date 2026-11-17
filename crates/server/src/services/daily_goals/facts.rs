@@ -23,7 +23,7 @@ pub(crate) fn completed(outbox: &mut Outbox, goal: &GoalRow, snapshot: &GoalSnap
 
 /// Queue only after the LP credit and guarded reward receipt both succeed.
 pub(crate) fn evermarks(outbox: &mut Outbox, goal: &GoalRow, reward: &RewardRow, at: i64) -> Result<(), Error> {
-    let uuid = crate::uuid_text::parse(&goal.goal_id, crate::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
+    let uuid = infinity_content::uuid_text::parse(&goal.goal_id, infinity_content::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
     let amount = reward.amount_units.and_then(|n| i64::try_from(n).ok()).ok_or(Error::Invalid)?;
     if reward.goal_id != goal.goal_id || goal.goal_id != ids::goal(goal.character_id, goal.period_start, &goal.version, &goal.slot_key, goal.generation) || goal.completed_at.is_none() || goal.voided_at.is_some() || reward.unit != "lp" || reward.issuer_id != Some(CORP_HERALDRY) || reward.amount_isk.is_some() || reward.type_id.is_some() || !reward.earned || reward.claimed_at != Some(at) || reward.asset_id != ids::asset(goal.character_id, goal.period_start, &goal.version, &goal.slot_key, goal.generation, &uuid, reward.reward_index) { return Err(Error::Invalid); }
     let event = GameEvent::EverMarksEarned { char_id: goal.character_id, goal_id: goal.goal_id.clone(), reward_index: reward.reward_index, asset_id: reward.asset_id.clone(), issuer_id: CORP_HERALDRY, amount, reason: EverMarkReason::DailyReward, occurred_at: at, context: context(FactOrigin::Natural) };
@@ -31,4 +31,4 @@ pub(crate) fn evermarks(outbox: &mut Outbox, goal: &GoalRow, reward: &RewardRow,
     outbox.event_from(SourceKey::canonical("EverMarksEarned", format!("{}:{}:{}", goal.goal_id, reward.reward_index, reward.asset_id), 0), event);
     Ok(())
 }
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

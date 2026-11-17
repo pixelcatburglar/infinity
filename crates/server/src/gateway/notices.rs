@@ -34,6 +34,10 @@ pub(crate) struct GatewayNotice {
     target: Target,
     uuid: Arc<[u8]>,
     payload: Arc<[u8]>,
+    /// Application excluded from delivery, and the member snapshot committed
+    /// with the write. Ordinary notices leave both unset.
+    excluded_application: Option<[u8; UUID_LEN]>,
+    allowed_characters: Option<Arc<[i64]>>,
 }
 
 impl GatewayNotice {
@@ -56,12 +60,26 @@ impl GatewayNotice {
         let len = envelope.encoded_len_with_payload(&payload).checked_add(TIMESTAMP_ENCODED_GROWTH_BUDGET)
             .ok_or_else(|| GatewayError::Internal(anyhow::anyhow!("gateway notice exceeds gRPC frame limit")))?;
         u32::try_from(len).map_err(|_| GatewayError::Internal(anyhow::anyhow!("gateway notice exceeds gRPC frame limit")))?;
-        Ok(Self { target, uuid: uuid.into(), payload: payload.into() })
+        Ok(Self { target, uuid: uuid.into(), payload: payload.into(), excluded_application: None, allowed_characters: None })
     }
 
     pub(crate) fn retarget(&self, target: Target) -> Result<Self, GatewayError> {
         validate_target(&target)?;
-        Ok(Self { target, uuid: self.uuid.clone(), payload: self.payload.clone() })
+        Ok(Self { target, uuid: self.uuid.clone(), payload: self.payload.clone(), excluded_application: self.excluded_application, allowed_characters: self.allowed_characters.clone() })
+    }
+
+    /// Narrow a corporation notice to the committed member snapshot and drop the
+    /// writing application. `members` is the sorted set the write committed.
+    pub(crate) fn restrict_corporation(mut self, origin: Option<[u8; UUID_LEN]>, members: Arc<[i64]>) -> Self {
+        self.excluded_application = origin;
+        self.allowed_characters = Some(members);
+        self
+    }
+
+    fn delivers_to(&self, application: &[u8; UUID_LEN], session: Option<&infinity_core::session::OnlineSession>) -> bool {
+        if self.excluded_application.as_ref() == Some(application) { return false; }
+        let Some(allowed) = &self.allowed_characters else { return true; };
+        session.is_some_and(|session| allowed.binary_search(&session.character_id).is_ok())
     }
 
     fn frame(&self) -> bytes::Bytes {
@@ -76,5 +94,5 @@ pub(crate) fn producer_error(error: GatewayError) -> crate::services::CallError 
     crate::services::CallError::Internal(anyhow::anyhow!("gateway notice construction failed"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-gateway"))]
 mod tests;

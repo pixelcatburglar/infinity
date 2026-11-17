@@ -1,7 +1,8 @@
 //! Real database service-path regressions; run serially against the isolated test database.
 use std::sync::Arc;
 use marshal::Value;
-use crate::{client::Client, config::{Config, deployment::DatabaseConfig}, conn::Conn, dao::{items::transfers, trades}, db::Db, handshake::Login, sde::Sde, services::{Call, CallResult}, space::World};
+use crate::{client::Client, config::{Config, deployment::DatabaseConfig}, dao::{items::transfers, trades}, db::Db, handshake::Login, sde::Sde, services::{Call, CallResult}, space::World};
+use infinity_wire::conn::Conn;
 
 async fn client(db: Db, sde: Arc<Sde>, world: Arc<World>, user: i64, character: i64, station: i64) -> (Client, tokio::net::TcpStream) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -9,6 +9,9 @@ use crate::{db::Db, lua::{host::Resources, reload::Host}, sde::Sde};
 pub(crate) struct Fixture {
     pub root: PathBuf,
     pub host: Arc<Host>,
+    /// The shared catalogue the local host was built against; tests install it
+    /// into the process startup slot to prove VM-free retained reads.
+    pub catalogue: Arc<crate::lua::catalogue::Catalogue>,
     pub chip: i32,
     pub chip2: i32,
     pub chip_unquoted: i32,
@@ -87,6 +90,7 @@ pub(crate) async fn create(db: &Db, sde: Arc<Sde>, world: Arc<crate::space::Worl
     let pilots = crate::lua::host::pilots::Pilots::new(db, hub).await.unwrap();
     let resources = Resources { db: db.clone(), sde: sde.clone(), world, pilots, store_value_limit_bytes: 65536 };
     let config = crate::config::lua::LuaConfig { scripts_dir: scripts.to_string_lossy().into_owned(), content_data_dir: Some(data.to_string_lossy().into_owned()), call_budget_ms: 30_000, ..Default::default() };
-    let host = Arc::new(Host::new(config, resources).await.unwrap());
-    Fixture { root, host, chip, chip2, chip_unquoted, injector, injector2, sde, issuer, station }
+    let catalogue = crate::lua::catalogue::Catalogue::load(&resources.db, &config, &resources.sde).await.unwrap();
+    let host = Arc::new(Host::new(config, resources, catalogue.clone()).await.unwrap());
+    Fixture { root, host, catalogue, chip, chip2, chip_unquoted, injector, injector2, sde, issuer, station }
 }

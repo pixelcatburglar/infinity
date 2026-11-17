@@ -32,7 +32,7 @@ async fn trash_ship_releases_external_zero_capacity_source_without_refund() {
     let reservation = pending_reloads::insert(&db, owner.character, ship, weapon, FLAG_HI_SLOT_FIRST, charge, 1, FLAG_CARGO, source).await.unwrap();
     let before = loading::capacity_snapshot(&db, source).await.unwrap();
     let room = hold_storage::container_room(&client.sde, before.parent.as_ref().unwrap(), &before.items, &before.reloads).unwrap().unwrap();
-    assert_eq!(room.capacity, 0.0);
+    assert_eq!(room.capacity, crate::services::inventory::holds::CapacityLimit::Finite(0.0));
     assert!(room.used > 0.0);
     assert_eq!(before.reloads.len(), 1);
     assert_eq!(before.reloads[0].reload_id, reservation);
@@ -122,7 +122,7 @@ async fn trash_weapon_releases_overfull_external_source_after_owner_change() {
         let reservation = pending_reloads::insert(&worker_db, owner.character, ship, weapon, FLAG_HI_SLOT_FIRST, charge, quantity as i64, FLAG_CARGO, source).await.unwrap();
         let before = loading::capacity_snapshot(&worker_db, source).await.unwrap();
         let room = hold_storage::container_room(&client.sde, before.parent.as_ref().unwrap(), &before.items, &before.reloads).unwrap().unwrap();
-        assert!(room.capacity > 0.0 && room.used > room.capacity);
+        assert!(matches!(room.capacity, crate::services::inventory::holds::CapacityLimit::Finite(v) if v > 0.0) && room.used > match room.capacity { crate::services::inventory::holds::CapacityLimit::Finite(v) => v, crate::services::inventory::holds::CapacityLimit::Unlimited => unreachable!() });
         let source_rows = worker_db.query_one("SELECT string_agg(row_to_json(i)::text, '' ORDER BY item_id) AS value FROM game.items i WHERE item_id=$1 OR location_id=$1", &[&source]).await.unwrap().get::<_, String>("value");
         let expected = crate::services::items::load_items(&worker_db, &client.sde, loading::ItemQuery::Id(weapon)).await.unwrap().pop().unwrap();
         let gone = Item { location_id: infinity_core::consts::LOCATION_JUNKYARD, ..expected };

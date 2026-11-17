@@ -2,6 +2,8 @@ use std::{collections::HashSet, future::Future, task::Poll};
 use marshal::Value;
 use infinity_core::{consts::{*, dogma::*}};
 use crate::{services::{Call, fit::{Fit, Key}, effects::{EffectKind, registry}}, space::drone::DroneOrder};
+use crate::dao::{items::repairable_ship as custody, repairable_ship as recovery};
+use crate::services::combat::damage;
 use super::fixture::Fixture;
 
 async fn catch_scenario(future: impl Future<Output = ()>) -> std::thread::Result<()> {
@@ -16,6 +18,8 @@ async fn catch_scenario(future: impl Future<Output = ()>) -> std::thread::Result
 
 fn combat_type(f: &Fixture) -> i32 {
     f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_DRONE)
+        && t.group_id.is_some_and(|group| f.sde.repairable_ship.enters_recovery(t.type_id, group, CATEGORY_DRONE)
+            && !f.sde.repairable_ship.unrepairable(CATEGORY_DRONE, group, t.type_id))
         && t.attribute(ATTR_DRONE_BANDWIDTH_USED).is_some_and(|v| v > 0.0)
         && t.effects().iter().any(|e| registry::resolve(&f.sde, e.effect_id).is_some_and(|e| e.kind == EffectKind::Turret)))
         .expect("published turret drone").type_id
@@ -116,6 +120,7 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
     let mut f = Fixture::new().await;
     let npc_source = crate::dao::map_telemetry::EventSource::NpcOccurrence as i16;
     let prior_occurrences: HashSet<i64> = f.db.query("SELECT source_id FROM game.map_events WHERE source=$1 AND solar_system_id=$2", &[&npc_source, &f.system]).await.unwrap().iter().map(|row| row.get("source_id")).collect();
+    let mut unowned_drone = None;
     let result = catch_scenario(async {
     let ty = combat_type(&f);
     f.train_drone(ty).await;
@@ -172,6 +177,27 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
         }
     }).await.expect("NPC wreck");
     let post_kill = crate::dao::wallets::characters::balance(&f.db, f.owner).await.unwrap();
+    let neutral = f.drone(ty, 1, true).await;
+    unowned_drone = Some(neutral);
+    let args = [Value::list([Value::tuple([Value::Int(neutral), Value::Int(1)])]), Value::None, Value::Bool(false)];
+    let Value::Dict(launched) = f.call("ship", "LaunchDrones", &args).await.ok().unwrap() else { panic!("launch mapping") };
+    assert_eq!(launched[0].1, Value::list([Value::Int(neutral)]));
+    f.call("entity", "CmdAbandonDrone", &[Value::list([Value::Int(neutral)])]).await.ok().unwrap();
+    assert_eq!(f.db.query_one("SELECT owner_id FROM game.items WHERE item_id=$1", &[&neutral]).await.unwrap().get::<_, i64>("owner_id"), OWNER_UNOWNED);
+    let (system, ship) = (f.system, f.ship);
+    assert!(f.world.with(system, move |s| s.drone(neutral).is_some_and(|d| d.owner == OWNER_UNOWNED && d.controller.is_none())).await.unwrap());
+    let generation = crate::space::targeting::next_generation();
+    let facts = f.world.with(system, move |s| s.prepare_combat_source(ship, None, None, None,
+        crate::lua::events::resources::FactOrigin::Natural, generation, 1, 1, |_| true)).await.unwrap().unwrap();
+    let outcome = damage::apply_damage_guarded(&f.db, &f.world, system, neutral, [1e30; 4],
+        damage::DamageSource { facts: Some(facts), ..Default::default() }, false,
+        move |s| s.drone(neutral).is_some_and(|d| d.owner == OWNER_UNOWNED)).await.unwrap().unwrap();
+    assert!(outcome.lethal);
+    f.world.with(system, move |s| s.retire_combat_source(generation).unwrap()).await.unwrap();
+    assert!(f.world.ball(system, neutral).await.is_none());
+    assert!(f.db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&neutral]).await.unwrap().is_none());
+    assert!(f.db.query("SELECT 1 FROM game.repairable_recovery_groups WHERE source_item_id=$1 UNION ALL SELECT 1 FROM game.repairable_recovery_items WHERE item_id=$1",
+        &[&neutral]).await.unwrap().is_empty());
     let before_items: i64 = f.db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2", &[&f.owner, &f.system]).await.unwrap().get("count");
     let pos = f.world.ball(f.system, drone).await.unwrap().pos;
     let attacker = crate::services::combat::npc::spawn(&f.db, &f.world, f.system, f.sde.types.get(npc_type).unwrap(), 1, pos, crate::space::now_ms(), Some(f.owner)).await.ok().unwrap();
@@ -180,12 +206,22 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
             assert!(f.world.ball(f.system, attacker).await.is_some());
             assert!(f.world.after(f.system, 100).await);
         }
-        while f.db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_some() {
+        while f.db.query_opt("SELECT group_id FROM game.repairable_recovery_groups WHERE source_item_id=$1", &[&drone]).await.unwrap().is_none() {
             assert!(f.world.after(f.system, 100).await);
         }
     }).await.expect("NPC brain destroys drone");
-    assert!(f.db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_none());
-    assert!(f.db.query("SELECT item_id FROM game.item_attributes WHERE item_id=$1", &[&drone]).await.unwrap().is_empty());
+    let selection = recovery::list_owned(&f.db, f.owner).await.unwrap().into_iter().find(|s| s.group.shape.item.get() == drone).unwrap();
+    assert_eq!((selection.group.kind, selection.group.beneficiary, selection.group.loss_id),
+        (recovery::SourceKind::Drone, f.owner, None));
+    assert_eq!(selection.items.len(), 1);
+    let member = &selection.items[0];
+    assert_eq!((member.item.get(), member.group, member.original_owner, member.type_id, member.flag, member.quantity, member.singleton),
+        (drone, selection.group.id, f.owner, ty, 0, 1, true));
+    let physical = custody::capture_many(&f.db, &[member.item]).await.unwrap().remove(0);
+    assert_eq!((physical.owner, physical.location, physical.type_id, physical.flag, physical.quantity, physical.singleton, physical.brain_slot, physical.jump_clone),
+        (NPC_CORP_INTERBUS, selection.group.id.get(), ty, 0, 1, true, None, None));
+    assert_eq!(f.db.query_one("SELECT value FROM game.item_attributes WHERE item_id=$1 AND attribute_id=$2",
+        &[&drone, &ATTR_EM_DAMAGE]).await.unwrap().get::<_, f64>("value"), 1_000_000_000.0);
     assert_eq!(crate::dao::wallets::characters::balance(&f.db, f.owner).await.unwrap(), post_kill);
     assert_eq!(f.db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2", &[&f.owner, &f.system]).await.unwrap().get::<_, i64>("count"), before_items - 1);
     let mut death_state = false;
@@ -201,7 +237,17 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
     }
     assert!(death_state);
     assert!(physical_source);
+    assert!(f.world.ball(f.system, f.ship).await.is_some());
+    assert!(f.db.query("SELECT 1 FROM game.repairable_recovery_groups WHERE source_item_id=$1", &[&f.ship]).await.unwrap().is_empty());
+    assert!(f.db.query("SELECT 1 FROM game.killmails WHERE victim_item_id=ANY($1) UNION ALL SELECT 1 FROM game.map_events WHERE source=$2 AND source_id=ANY($1)",
+        &[&[drone, neutral].as_slice(), &(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16)]).await.unwrap().is_empty());
     }).await;
+    if let Some(id) = unowned_drone {
+        f.world.remove_ball(f.system, id).await;
+        crate::services::combat::forget_ship(id);
+        f.db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&id]).await.unwrap();
+        crate::dao::items::inventory::delete(&f.db, id).await.unwrap();
+    }
     let occurrences: Vec<i64> = f.db.query("SELECT source_id FROM game.map_events WHERE source=$1 AND solar_system_id=$2", &[&npc_source, &f.system]).await.unwrap().iter().map(|row| row.get("source_id")).filter(|id| !prior_occurrences.contains(id)).collect();
     f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND solar_system_id=$2 AND source_id=ANY($3)", &[&npc_source, &f.system, &occurrences]).await.unwrap();
     f.cleanup().await;

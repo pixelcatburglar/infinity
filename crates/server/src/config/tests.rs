@@ -1,11 +1,15 @@
 //! Configuration loading, validation, precedence and PostgreSQL conversion tests.
 
 use super::*;
+#[cfg(feature = "tests-runtime")]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+#[cfg(feature = "tests-runtime")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "tests-runtime")]
 use std::time::Duration;
 
-#[test]
+#[cfg(feature = "tests-runtime")] #[test]
 fn world_task_capability_is_a_closed_string_on_the_wire() {
     let config = Config::default().global_config();
     assert_eq!(config.get("world_task_enabled"), Some(&marshal::Value::str("0")));
@@ -14,10 +18,13 @@ fn world_task_capability_is_a_closed_string_on_the_wire() {
     assert_eq!(decoded.get("config_vals").unwrap().get("world_task_enabled"), Some(&marshal::Value::str("0")));
 }
 
+#[cfg(feature = "tests-runtime")]
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "tests-runtime")]
 struct Fixture(PathBuf);
 
+#[cfg(feature = "tests-runtime")]
 impl Fixture {
     fn new() -> Self {
         loop {
@@ -38,10 +45,12 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 impl Drop for Fixture {
     fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
 }
 
+#[cfg(feature = "tests-runtime")]
 fn load_error(contents: &str) -> String {
     let fixture = Fixture::new();
     fixture.write(contents);
@@ -51,7 +60,7 @@ fn load_error(contents: &str) -> String {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-runtime")] #[test]
 fn market_modification_delay_defaults_loading_and_bounds() {
     let fixture = Fixture::new();
     assert_eq!(Config::load_with(&fixture.path(), |_| None).unwrap().market.modification_delay_seconds, 300);
@@ -70,6 +79,7 @@ fn market_modification_delay_defaults_loading_and_bounds() {
     assert!(load_error("[market]\nmodification_delay_seconds = '300'").contains("modification_delay_seconds"));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn global_plex_market_capability_is_a_string_on_the_wire() {
     let config = Config::default().global_config();
@@ -80,6 +90,7 @@ fn global_plex_market_capability_is_a_string_on_the_wire() {
     assert_eq!(decoded.get("config_vals").unwrap().get(key), Some(&marshal::Value::str("1")));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn lua_content_root_file_environment_and_validation() {
     let fixture = Fixture::new();
@@ -91,6 +102,7 @@ fn lua_content_root_file_environment_and_validation() {
     assert!(Config::load_with(&fixture.path(), |key| (key == "LUA_CONTENT_DATA_DIR").then(String::new)).is_err());
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn gateway_notice_capacity_file_environment_and_validation() {
     let fixture = Fixture::new();
@@ -103,6 +115,7 @@ fn gateway_notice_capacity_file_environment_and_validation() {
     assert!(Config::load_with(&fixture.path(), |key| (key == "GATEWAY_NOTICE_QUEUE_CAPACITY").then(|| "0".into())).is_err());
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn mining_progress_defaults_file_environment_and_invalid_values() {
     let fixture = Fixture::new();
@@ -134,6 +147,7 @@ fn mining_progress_defaults_file_environment_and_invalid_values() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn daily_goals_policy_defaults_overrides_and_validation() {
     let fixture = Fixture::new();
@@ -177,6 +191,7 @@ fn daily_goals_policy_defaults_overrides_and_validation() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn clone_service_fee_policy_and_legacy_keys() {
     assert_eq!(Config::default().clones.service_fee_isk, 900_000.0);
@@ -194,6 +209,7 @@ fn clone_service_fee_policy_and_legacy_keys() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn space_collision_policy_defaults_parsing_and_snapshot() {
     let fixture = Fixture::new();
@@ -210,12 +226,14 @@ fn space_collision_policy_defaults_parsing_and_snapshot() {
         assert!(load_error(&format!("[space]\ncollisions = {value}")).contains("collisions"));
     }
 }
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn client_error_mode_rejects_unknown_values() {
     assert_eq!(Config::default().telemetry.client_error_log_mode, "B");
     assert!(load_error("[telemetry]\nclient_error_log_mode = 'X'").contains("telemetry.client_error_log_mode"));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn shared_settings_policy_defaults_validation_and_snapshot() {
     let defaults = Config::default();
@@ -233,6 +251,7 @@ fn shared_settings_policy_defaults_validation_and_snapshot() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn expert_system_feature_policy_defaults_and_global_config() {
     let fixture = Fixture::new();
@@ -250,6 +269,7 @@ fn expert_system_feature_policy_defaults_and_global_config() {
     assert!(load_error("[expert_systems]\nunknown = true").contains("unknown"));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn gm_spawn_policy_rejects_invalid_limits() {
     let mut config = Config::default();
@@ -264,7 +284,22 @@ fn gm_spawn_policy_rejects_invalid_limits() {
     assert!(config.validate().is_err());
 }
 
+#[cfg(feature = "tests-runtime")] #[test]
+fn gm_performance_testing_defaults_overrides_and_snapshot() {
+    let fixture = Fixture::new();
+    assert!(!Config::load_with(&fixture.path(), |_| None).unwrap().gm.performance_testing);
+    fixture.write("[gm]\nperformance_testing = true");
+    let config = Config::load_with(&fixture.path(), |_| None).unwrap();
+    assert!(config.gm.performance_testing);
+    assert!(config.game_config().gm.performance_testing);
+    let env = |key: &str| (key == "GM_PERFORMANCE_TESTING").then(|| "false".to_owned());
+    assert!(!Config::load_with(&fixture.path(), env).unwrap().gm.performance_testing);
+    let invalid = |key: &str| (key == "GM_PERFORMANCE_TESTING").then(|| "yes".to_owned());
+    assert!(Config::load_with(&fixture.path(), invalid).err().unwrap().to_string().contains("GM_PERFORMANCE_TESTING"));
+}
 
+
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn trade_timeout_is_parsed_and_must_be_positive() {
     let fixture = Fixture::new();
@@ -275,6 +310,7 @@ fn trade_timeout_is_parsed_and_must_be_positive() {
     assert!(load_error("[trade]\nidle_timeout_secs = 9223372036854775807").contains("trade.idle_timeout_secs"));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn fleet_reconnect_policy_defaults_boundaries_and_snapshot() {
     let fixture = Fixture::new();
@@ -302,6 +338,7 @@ fn fleet_reconnect_policy_defaults_boundaries_and_snapshot() {
     assert!(load_error("[fleets]\nunknown = 1").contains("unknown"));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn map_policy_defaults_custom_bounds_and_overflow() {
     let fixture = Fixture::new();
@@ -324,6 +361,7 @@ fn map_policy_defaults_custom_bounds_and_overflow() {
     assert!(load_error("[map]\nunknown = 1").contains("unknown"));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn mining_ledger_policy_defaults_parsing_and_validation() {
     let fixture = Fixture::new();
@@ -343,6 +381,7 @@ fn mining_ledger_policy_defaults_parsing_and_validation() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn salvage_policy_parses_and_rejects_invalid_bounds() {
     let fixture = Fixture::new();
@@ -358,6 +397,7 @@ fn salvage_policy_parses_and_rejects_invalid_bounds() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn daily_gift_accepts_wide_stock_quantities() {
     let fixture = Fixture::new();
@@ -367,6 +407,7 @@ fn daily_gift_accepts_wide_stock_quantities() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn unknown_fields_are_rejected_at_every_level() {
     for (contents, key) in [
@@ -382,6 +423,7 @@ fn unknown_fields_are_rejected_at_every_level() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn invalid_numeric_values_report_field_and_value() {
     for (contents, field, value) in [
@@ -397,6 +439,8 @@ fn invalid_numeric_values_report_field_and_value() {
         ("[crimewatch]\nconcord_delay_per_security_secs = 0", "crimewatch.concord_delay_per_security_secs", "0"),
         ("[crimewatch]\nconcord_base_delay_secs = 6.5", "crimewatch.concord_base_delay_secs", "6.5"),
         ("[crimewatch]\nconcord_delay_per_security_secs = 28.5", "crimewatch.concord_delay_per_security_secs", "28.5"),
+        ("[crimewatch]\nnpc_timer_secs = 0", "crimewatch.npc_timer_secs", "0"),
+        ("[crimewatch]\ndisapproval_timer_secs = 0", "crimewatch.disapproval_timer_secs", "0"),
         ("[bounty]\nkill_right_lifetime_days = 0", "bounty.kill_right_lifetime_days", "0"),
         ("[bounty]\nkill_right_suspect_secs = 0", "bounty.kill_right_suspect_secs", "0"),
     ] {
@@ -412,6 +456,7 @@ fn invalid_numeric_values_report_field_and_value() {
     assert!(error.contains("market.sales_tax") && error.contains("inf"), "{error}");
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn representation_overflows_are_rejected_with_the_key_and_value() {
     for (contents, key, value) in [
@@ -425,6 +470,8 @@ fn representation_overflows_are_rejected_with_the_key_and_value() {
         ("[crimewatch]\nweapons_timer_secs = 9223372036854775807", "crimewatch.weapons_timer_secs", "9223372036854775807"),
         ("[crimewatch]\nconcord_base_delay_secs = 9223372036854775807", "crimewatch.concord_base_delay_secs", "9223372036854775807"),
         ("[crimewatch]\nconcord_delay_per_security_secs = 9223372036854775807", "crimewatch.concord_delay_per_security_secs", "9223372036854775807"),
+        ("[crimewatch]\nnpc_timer_secs = 9223372036854775807", "crimewatch.npc_timer_secs", "9223372036854775807"),
+        ("[crimewatch]\ndisapproval_timer_secs = 9223372036854775807", "crimewatch.disapproval_timer_secs", "9223372036854775807"),
         ("[space]\nposition_snapshot_secs = 9223372036854775807", "space.position_snapshot_secs", "9223372036854775807"),
         ("[bounty]\nkill_right_lifetime_days = 9223372036854775807", "bounty.kill_right_lifetime_days", "9223372036854775807"),
         ("[bounty]\nkill_right_suspect_secs = 9223372036854775807", "bounty.kill_right_suspect_secs", "9223372036854775807"),
@@ -440,8 +487,18 @@ fn representation_overflows_are_rejected_with_the_key_and_value() {
     config.corporations.office_rent_per_security_isk = f64::MAX;
     let error = config.validate().expect_err("overflowing rent is rejected").to_string();
     assert!(error.contains("corporations.office_rent_base_isk") && error.contains("corporations.office_rent_per_security_isk"), "{error}");
+    for (fraction, valid) in [(-0.1, false), (0.0, true), (0.5, true), (1.0, true), (1.1, false), (f64::NAN, false), (f64::INFINITY, false)] {
+        let mut config = Config::default();
+        config.corporations.office_impound_release_fraction = fraction;
+        let result = config.validate();
+        assert_eq!(result.is_ok(), valid, "fraction {fraction}");
+        if !valid {
+            assert!(result.unwrap_err().to_string().contains("corporations.office_impound_release_fraction"));
+        }
+    }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn millisecond_deadline_overflow_is_rejected_at_startup() {
     let unit = crate::space::seconds_to_ms(1.0) as i64;
@@ -452,6 +509,7 @@ fn millisecond_deadline_overflow_is_rejected_at_startup() {
     assert!(error.contains("space.position_snapshot_secs") && error.contains(&seconds.to_string()), "{error}");
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn starting_balances_accept_their_ceiling_and_reject_the_next_value() {
     let mut config = Config::default();
@@ -470,6 +528,7 @@ fn starting_balances_accept_their_ceiling_and_reject_the_next_value() {
     assert!(error.contains("characters.starting_isk") && error.contains(&next.to_string()), "{error}");
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn deployment_environment_wins_but_game_environment_is_ignored() {
     let fixture = Fixture::new();
@@ -484,6 +543,7 @@ fn deployment_environment_wins_but_game_environment_is_ignored() {
     assert_eq!(config.source(), fixture.path().to_str().unwrap());
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn logging_defaults_and_rotation_validation() {
     let fixture = Fixture::new();
@@ -504,6 +564,7 @@ fn logging_defaults_and_rotation_validation() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn logging_directory_environment_overrides_file_including_empty() {
     let fixture = Fixture::new();
@@ -518,6 +579,7 @@ fn logging_directory_environment_overrides_file_including_empty() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn missing_file_matches_complete_example_and_defaults() {
     let fixture = Fixture::new();
@@ -532,8 +594,12 @@ fn missing_file_matches_complete_example_and_defaults() {
     assert!(missing.chat == example.chat && missing.images == example.images);
     assert!(missing.gateway == example.gateway && missing.cdn == example.cdn);
     assert!(missing.game_config() == example.game_config());
+    assert_eq!((missing.crimewatch.npc_timer_secs, missing.crimewatch.disapproval_timer_secs), (300, 300));
+    fixture.write("[crimewatch]\nnpc_timer_secs = 7\ndisapproval_timer_secs = 11");
+    assert_eq!(Config::load_with(&fixture.path(), |_| None).map(|c| (c.crimewatch.npc_timer_secs, c.crimewatch.disapproval_timer_secs)).unwrap(), (7, 11));
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn malformed_values_do_not_leak_database_credentials() {
     let fixture = Fixture::new();
@@ -559,6 +625,7 @@ fn malformed_values_do_not_leak_database_credentials() {
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn database_parse_errors_report_paths_and_safe_values() {
     let fixture = Fixture::new();
@@ -578,6 +645,7 @@ fn database_parse_errors_report_paths_and_safe_values() {
     assert!(error.contains("unknown_inline"), "{error}");
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn database_individual_fields_are_required_only_without_url() {
     for field in ["host", "user", "name"] {
@@ -589,6 +657,7 @@ fn database_individual_fields_are_required_only_without_url() {
     Config::load_with(&fixture.path(), |_| None).expect("URL takes precedence over empty individual fields");
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn postgres_conversion_uses_url_or_individual_fields_and_applies_common_options() {
     let mut database = Config::default().database;
@@ -626,14 +695,69 @@ fn postgres_conversion_uses_url_or_individual_fields_and_applies_common_options(
     assert!(!error.contains("secret"), "{error}");
 }
 
+/// Runs `initialize` once per `state` on a joined scoped worker thread while
+/// concurrent callers block for the published result. A stored failure,
+/// including a worker panic, is permanent: every caller panics with the same
+/// message instead of retrying.
+fn initialize_once(state: &OnceLock<Result<(), String>>, initialize: impl FnOnce() -> Result<(), String> + Send) {
+    let result = state.get_or_init(|| std::thread::scope(|scope| match std::thread::Builder::new().spawn_scoped(scope, initialize) {
+        Ok(worker) => worker.join().unwrap_or_else(|payload| Err(panic_message(payload))),
+        Err(error) => Err(format!("spawning initialization worker: {error:#}")),
+    }));
+    if let Err(error) = result { panic!("{error}"); }
+}
+
+/// Display text for a joined worker's panic payload; a payload without a
+/// string message reports that fact instead of inventing a cause.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() { message.clone() }
+    else if let Some(message) = payload.downcast_ref::<&'static str>() { (*message).to_string() }
+    else { "initialization worker panicked with a payload that carries no message".to_string() }
+}
+
 pub(crate) fn test_database() -> deployment::DatabaseConfig {
     crate::tests::init_config();
-    deployment::DatabaseConfig {
-        url: std::env::var("INFINITY_TEST_DATABASE_URL").expect("INFINITY_TEST_DATABASE_URL must name a dedicated test database"),
-        ..Default::default()
+    let config = schema_downgrade_guard::database_config();
+    // A synchronous helper cannot block on the caller's Tokio runtime, so one
+    // worker applies the schema on its own current-thread runtime once per
+    // process; only success lets callers connect without replaying it.
+    static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
+    initialize_once(&INITIALIZED, || {
+        let initial = deployment::DatabaseConfig { schema_on_start: true, ..config.clone() };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| format!("{error:#}"))?;
+        runtime.block_on(async { crate::db::Db::connect(&initial).await.map(|_| ()).map_err(|error| format!("{error:#}")) })
+    });
+    deployment::DatabaseConfig { schema_on_start: false, ..config }
+}
+
+#[cfg(feature = "tests-runtime")]
+#[test]
+fn initialize_once_runs_work_once_and_callers_wait() {
+    let state = OnceLock::new();
+    let calls = AtomicU64::new(0);
+    let completed = AtomicBool::new(false);
+    std::thread::scope(|scope| for _ in 0..4 {
+        scope.spawn(|| { initialize_once(&state, || { calls.fetch_add(1, Ordering::Relaxed); std::thread::sleep(Duration::from_millis(50)); completed.store(true, Ordering::Release); Ok(()) }); assert!(completed.load(Ordering::Acquire)); });
+    });
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(feature = "tests-runtime")]
+#[test]
+fn initialize_once_caches_failure_and_panics_on_every_call() {
+    let state = OnceLock::new();
+    let calls = AtomicU64::new(0);
+    let call = || initialize_once(&state, || { calls.fetch_add(1, Ordering::Relaxed); panic!("injected failure") });
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&call)).unwrap_err();
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&call)).unwrap_err();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    for payload in [first, second] {
+        let message = payload.downcast::<String>().map(|text| *text).unwrap_or_default();
+        assert!(message.contains("injected failure"), "{message}");
     }
 }
 
+#[cfg(feature = "tests-runtime")]
 #[test]
 fn scheduler_validation_rejects_invalid_limits() {
     let mut config = Config::default();
@@ -648,24 +772,12 @@ fn scheduler_validation_rejects_invalid_limits() {
     assert!(config.validate().is_err());
 }
 
-#[test]
-fn combat_progress_capacity_defaults_toml_and_zero_rejection() {
-    let fixture = Fixture::new();
-    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap();
-    assert_eq!((defaults.combat.progress_key_capacity, defaults.combat.progress_pending_batches), (4096, 4));
-    fixture.write("[combat]\nprogress_key_capacity = 17\nprogress_pending_batches = 2");
-    let config = Config::load_with(&fixture.path(), |_| None).unwrap();
-    assert_eq!((config.combat.progress_key_capacity, config.combat.progress_pending_batches), (17, 2));
-    let env = Config::load_with(&fixture.path(), |key| match key {
-        "COMBAT_PROGRESS_KEY_CAPACITY" => Some("23".into()),
-        "COMBAT_PROGRESS_PENDING_BATCHES" => Some("3".into()),
-        _ => None,
-    }).unwrap();
-    assert_eq!((env.combat.progress_key_capacity, env.combat.progress_pending_batches), (23, 3));
-    for key in ["COMBAT_PROGRESS_KEY_CAPACITY", "COMBAT_PROGRESS_PENDING_BATCHES"] {
-        assert!(Config::load_with(&fixture.path(), |name| (name == key).then(|| "0".into())).is_err());
-    }
-    for key in ["progress_key_capacity", "progress_pending_batches"] {
-        assert!(load_error(&format!("[combat]\n{key} = 0")).contains(&format!("combat.{key}")));
-    }
-}
+#[cfg(feature = "tests-runtime")] mod combat_progress;
+#[cfg(feature = "tests-runtime")] mod client_write_timeout;
+#[cfg(feature = "tests-runtime")] mod resistance_floor;
+mod schema_downgrade_guard;
+#[cfg(feature = "tests-runtime")] mod async_commit;
+#[cfg(feature = "tests-runtime")] mod idle_unload;
+#[cfg(feature = "tests-runtime")] mod loaded_snapshot;
+
+#[cfg(feature = "tests-runtime")] mod bounty_pool;

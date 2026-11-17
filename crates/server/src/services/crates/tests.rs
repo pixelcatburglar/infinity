@@ -63,7 +63,9 @@ async fn dispatch_refusals_and_adjacent_methods() {
     assert_eq!(value, Value::list([]));
     preview_triples(&value);
     for args in [&[][..], &[Value::Bool(true)][..], &[Value::Int(0)][..], &[Value::Int(i64::MAX)][..]] {
-        refused(rpc(&mut client, "crateService", "GetCrate", args, false).await);
+        let Err(CallError::User { msg, dict }) = rpc(&mut client, "crateService", "GetCrate", args, false).await else { panic!("expected source refusal") };
+        assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+        assert_eq!(dict, vec![("notify".into(), Value::unicode(infinity_core::messages::crates::INVALID_SOURCE))]);
     }
     for args in [&[][..], &[Value::Bool(true)][..], &[Value::Int(0)][..], &[Value::Int(-1)][..]] {
         refused(rpc(&mut client, "crateService", "GetCrateLocation", args, false).await);
@@ -521,7 +523,10 @@ async fn opening_refuses_when_active_ship_cargo_is_full() {
     }).expect("ordinary crate with volumetric rewards");
     let (crate_type, _rewards) = definition;
     let (fill_type, fill_volume) = client.sde.types.iter().find_map(|ty| ty.volume.filter(|v| *v > 0.0).map(|v| (ty.type_id, v))).unwrap();
-    let capacity = crate::services::inventory::hold_storage::capacity(&db, &client.sde, actor.character, ship, FLAG_CARGO).await.unwrap().unwrap().0;
+    let capacity = match crate::services::inventory::hold_storage::capacity(&db, &client.sde, actor.character, ship, FLAG_CARGO).await.unwrap().unwrap().0 {
+        crate::services::inventory::holds::CapacityLimit::Finite(value) => value,
+        crate::services::inventory::holds::CapacityLimit::Unlimited => panic!("fixture cargo must be finite"),
+    };
     let fill_quantity = (capacity / fill_volume).ceil() as i64;
     let filler = transfers::insert(&db, fill_type, actor.character, ship, FLAG_CARGO, fill_quantity.max(1)).await.unwrap();
     let source = transfers::insert(&db, crate_type, actor.character, ship, FLAG_CARGO, 1).await.unwrap();

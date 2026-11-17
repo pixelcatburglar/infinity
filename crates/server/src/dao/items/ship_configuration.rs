@@ -49,4 +49,4 @@ pub(crate) async fn lock_selected(ex: &(impl Executor + ?Sized), character: i64,
     super::ship::lock_owned_at(ex, ship, character, station.unwrap_or(system), flag).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

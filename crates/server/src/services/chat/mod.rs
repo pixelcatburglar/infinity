@@ -20,4 +20,4 @@ pub(super) async fn root(c: &mut Client, call: &Call<'_>) -> Option<CallResult> 
     if call.service == "XmppChatMgr" { xmpp_chat_mgr::dispatch(c, call).await } else { None }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-social"))] mod tests;

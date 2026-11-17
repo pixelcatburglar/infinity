@@ -24,7 +24,7 @@ async fn read_rows_authorized(resources: &Resources, user: i64, character: i64, 
     let mut result = Vec::with_capacity(rows.len());
     for goal in rows {
         let key = (goal.namespace.clone(), goal.version.clone());
-        if !pins.contains_key(&key) { pins.insert(key.clone(), resources.policies.resolve(&key.0, &key.1).await?); }
+        if !pins.contains_key(&key) { pins.insert(key.clone(), resources.policies.resolve(&key.0, &key.1)?); }
         let policy = pins.get(&key).ok_or(Error::Unavailable)?.clone();
         let rewards = assets_by_goal.remove(&goal.goal_id).unwrap_or_default();
         let snapshot = frozen::validate(&goal)?;
@@ -34,7 +34,7 @@ async fn read_rows_authorized(resources: &Resources, user: i64, character: i64, 
 }
 
 pub(crate) async fn read_one(resources: &Resources, user: i64, character: i64, id: &str, at: i64) -> Result<ReadGoal, Error> {
-    crate::uuid_text::parse(id, crate::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
+    infinity_content::uuid_text::parse(id, infinity_content::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
     owner(resources, user, character).await?;
     let row = instances::get(&resources.db, character, id).await?.ok_or(Error::Missing)?;
     read_rows_authorized(resources, user, character, vec![row], at, HashMap::new()).await?.pop().ok_or(Error::Missing)
@@ -91,8 +91,8 @@ impl Token {
     fn parse(text: &str, owner: i64) -> Result<Option<Self>, Error> {
         if text.is_empty() { return Ok(None); }
         let t: Self = serde_json::from_str(text).map_err(|_| Error::Invalid)?;
-        crate::uuid_text::parse(&t.high_id, crate::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
-        crate::uuid_text::parse(&t.last_id, crate::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
+        infinity_content::uuid_text::parse(&t.high_id, infinity_content::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
+        infinity_content::uuid_text::parse(&t.last_id, infinity_content::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
         if t.owner != owner || t.version != 1 || t.high_time <= 0 || t.last_time <= 0 || (t.last_time, &t.last_id) > (t.high_time, &t.high_id) { return Err(Error::Invalid); }
         Ok(Some(t))
     }
@@ -114,7 +114,7 @@ pub(crate) async fn history(resources: &Resources, identity: &Identity, user: i6
     for (index, row) in page.iter().enumerate() { groups.entry((row.namespace.clone(), row.version.clone())).or_default().push(index); }
     let mut selected = vec![false; page.len()];
     for ((namespace, version), indexes) in groups {
-        let pin = resources.policies.resolve(&namespace, &version).await?;
+        let pin = resources.policies.resolve(&namespace, &version)?;
         for chunk in indexes.chunks(plans::MAX_PLAN_ENTRIES) {
             let input = ProjectInput { entries: chunk.iter().map(|&i| Projection { key: page[i].goal_id.clone(), selected: true }).collect() };
             let keys = plans::project(&pin, &input, None)?.keys;
@@ -130,4 +130,4 @@ pub(crate) async fn history(resources: &Resources, identity: &Identity, user: i6
     Ok(HistoryPage { ids, next_token })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

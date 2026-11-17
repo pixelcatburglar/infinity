@@ -79,6 +79,6 @@ pub(crate) async fn commit(db: &Db, world: &World, sender: &NotifyTx, sde: Arc<S
                 Ok(())
             })
         },
-        |value, outbox| async move { outbox::dispatch_sender(value, outbox, world, sender) },
+        |value, outbox| async move { outbox::dispatch_sender(value, outbox, world, Some(sender)) },
     ).await
 }

@@ -26,7 +26,7 @@ fn frozen_rewards_preserve_all_units_and_stable_asset_identity() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated test process, dedicated INFINITY_TEST_DATABASE_URL with SDE, and external flock"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process"]
 async fn real_host_assigns_thirteen_once_under_concurrent_ensure() {
     const CHILD: &str = "INFINITY_DAILY_ASSIGNMENT_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -54,6 +54,7 @@ async fn real_host_assigns_thirteen_once_under_concurrent_ensure() {
     let mut config = crate::config::Config::default();
     config.lua.enabled = true;
     config.lua.scripts_dir = root.to_string_lossy().into_owned();
+    crate::lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
     crate::lua::start(&config, &db, &sde, &world, &hub).await.expect("daily Host must start with real authored content");
     let resources = Resources::from_world(&world).unwrap();
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
@@ -64,7 +65,7 @@ async fn real_host_assigns_thirteen_once_under_concurrent_ensure() {
         system_id: None, corporation_id: None, alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     }));
     let mut notices = crate::gateway::tests::notice_stream(&world, [7; 16], fixture.character, 4);
-    let activations = crate::dao::lua_content::activations::list(&db, super::super::DAILY_GOALS_NAMESPACE).await.unwrap();
+    let activations = resources.policies.activations(super::super::DAILY_GOALS_NAMESPACE).unwrap();
     let mut earliest = i64::MAX;
     for (index, row) in activations.iter().enumerate() {
         let bounds = periods::bounds(&db, row.published_at).await.unwrap();
@@ -165,8 +166,8 @@ async fn real_host_assigns_thirteen_once_under_concurrent_ensure() {
     assert!(matches!(queries::history(&resources, &identity, fixture.account + 1, 25, &page.next_token, 100, at).await, Err(Error::Forbidden)));
     let collision_at = at + 7 * infinity_core::consts::FILETIME_DAY;
     let collision_bounds = periods::bounds(&db, collision_at).await.unwrap();
-    let mut history = activation::load(&resources).await.unwrap();
-    let token = activation::resolve(&resources, &mut history, "day", collision_bounds.day_start, collision_bounds.day_end).await.unwrap().unwrap();
+    let mut history = activation::load(&resources).unwrap();
+    let token = activation::resolve(&resources, &mut history, "day", collision_bounds.day_start, collision_bounds.day_end).unwrap().unwrap();
     let planned = prepare(&resources, &token, fixture.character, collision_at).unwrap();
     let mut conflicting = all[0].clone();
     conflicting.goal_id = planned.goals[0].0.goal_id.clone();

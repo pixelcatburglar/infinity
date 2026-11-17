@@ -2,7 +2,7 @@
 use super::*;
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE, external flock, and run alone (global Lua host)"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock; run this exact test in its own process (global Lua host)"]
 async fn lua_mail_rpc_validates_and_delivers() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -29,6 +29,7 @@ async fn lua_mail_rpc_validates_and_delivers() {
         let mut config = crate::config::Config::default();
         config.lua.enabled = true;
         config.lua.scripts_dir = test_dir.to_string_lossy().into_owned();
+        crate::lua::initialize_content(&config.lua, &test_db, &client.sde).await.unwrap();
         crate::lua::start(&config, &test_db, &client.sde, &client.world, &client.chat).await.unwrap();
         let id = rpc(&mut client, "mailFixture", "Send", &[]).await.unwrap().as_int().unwrap();
         let headers = crate::dao::mail::headers(&test_db, recipient.character, &vec![id]).await.unwrap();

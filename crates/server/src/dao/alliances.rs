@@ -10,18 +10,10 @@ use tokio_postgres::Row;
 pub(crate) mod lookup;
 pub(crate) mod wars;
 
-struct ExecutorCorp {
-    executor_corp_id: Option<i64>,
-}
-impl ExecutorCorp {
-    fn from_row(row: &Row) -> Self {
-        Self { executor_corp_id: row.get("executor_corp_id") }
-    }
-}
 
 pub(crate) async fn executor_corp(ex: &(impl Executor + ?Sized), alliance: i64) -> Result<Option<i64>, Error> {
     Ok(ex.query_opt("SELECT executor_corp_id FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&alliance])
-        .await?.and_then(|row| ExecutorCorp::from_row(&row).executor_corp_id))
+        .await?.and_then(|row| row.get::<_, Option<i64>>("executor_corp_id")))
 }
 
 pub(crate) struct Alliance {
@@ -88,11 +80,9 @@ pub(crate) async fn lock_applications(ex: &(impl Executor + ?Sized), corp: i64) 
 }
 
 
-struct CharacterId { id: i64 }
-impl CharacterId { fn from_row(r: &Row) -> Self { Self { id: r.get("character_id") } } }
 pub(crate) async fn pilots(ex: &(impl Executor + ?Sized), alliance: Option<i64>, corp: Option<i64>) -> Result<Vec<i64>, Error> {
     Ok(ex.query("SELECT ch.character_id FROM game.characters ch JOIN game.corporations co ON co.corporation_id = ch.corporation_id
-             WHERE NOT ch.deleted AND (co.alliance_id = $1 OR co.corporation_id = $2)", &[&alliance, &corp]).await?.iter().map(|r| CharacterId::from_row(r).id).collect())
+             WHERE NOT ch.deleted AND (co.alliance_id = $1 OR co.corporation_id = $2)", &[&alliance, &corp]).await?.iter().map(|r| r.get::<_, i64>("character_id")).collect())
 }
 pub(crate) async fn set_corporation_alliance(ex: &(impl Executor + ?Sized), corp: i64, alliance: Option<i64>, now: i64) -> Result<u64, Error> {
     ex.execute("UPDATE game.corporations SET alliance_id = $2, alliance_joined = $3, chosen_executor_id = NULL WHERE corporation_id = $1 AND ($2::bigint IS NULL OR (alliance_id IS NULL AND NOT deleted))", &[&corp, &alliance, &alliance.map(|_| now)]).await
@@ -100,13 +90,11 @@ pub(crate) async fn set_corporation_alliance(ex: &(impl Executor + ?Sized), corp
 pub(crate) async fn insert_history(ex: &(impl Executor + ?Sized), corp: i64, alliance: Option<i64>, now: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.alliance_history (corporation_id, alliance_id, start_date) VALUES ($1, $2, $3)", &[&corp, &alliance, &now]).await
 }
-struct AllianceId { id: Option<i64> }
-impl AllianceId { fn from_row(r: &Row) -> Self { Self { id: r.get("alliance_id") } } }
 pub(crate) async fn corporation_alliance(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Option<i64>, Error> {
-    Ok(AllianceId::from_row(&ex.query_one("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1", &[&corp]).await?).id)
+    Ok(ex.query_one("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1", &[&corp]).await?.get::<_, Option<i64>>("alliance_id"))
 }
 pub(crate) async fn live_corporation_alliance(ex: &(impl Executor + ?Sized), corp: i64) -> Result<Option<Option<i64>>, Error> {
-    Ok(ex.query_opt("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await?.map(|r| AllianceId::from_row(&r).id))
+    Ok(ex.query_opt("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await?.map(|r| r.get::<_, Option<i64>>("alliance_id")))
 }
 
 pub(crate) struct LiveCorporationAlliance {
@@ -122,16 +110,12 @@ pub(crate) async fn live_corporation_alliances(ex: &(impl Executor + ?Sized), co
     Ok(ex.query("SELECT corporation_id, alliance_id FROM game.corporations WHERE corporation_id = ANY($1) AND NOT deleted ORDER BY corporation_id", &[&corps])
         .await?.iter().map(LiveCorporationAlliance::from_row).collect())
 }
-struct Taken { value: bool }
-impl Taken { fn from_row(r: &Row) -> Self { Self { value: r.get("taken") } } }
 pub(crate) async fn name_taken(ex: &(impl Executor + ?Sized), name: &str, short_name: &str) -> Result<bool, Error> {
-    Ok(Taken::from_row(&ex.query_one("SELECT EXISTS (SELECT 1 FROM game.alliances WHERE NOT deleted AND (lower(name) = lower($1) OR upper(short_name) = $2)) AS taken", &[&name, &short_name]).await?).value)
+    Ok(ex.query_one("SELECT EXISTS (SELECT 1 FROM game.alliances WHERE NOT deleted AND (lower(name) = lower($1) OR upper(short_name) = $2)) AS taken", &[&name, &short_name]).await?.get::<_, bool>("taken"))
 }
-struct CreatedAlliance { id: i64 }
-impl CreatedAlliance { fn from_row(r: &Row) -> Self { Self { id: r.get("alliance_id") } } }
 pub(crate) async fn create(ex: &(impl Executor + ?Sized), name: &str, short_name: &str, description: &str, url: &str, corp: i64, me: i64, now: i64) -> Result<i64, Error> {
-    Ok(CreatedAlliance::from_row(&ex.query_one("INSERT INTO game.alliances (name, short_name, description, url, executor_corp_id, creator_corp_id, creator_char_id, created)
-                     VALUES ($1, $2, $3, $4, $5, $5, $6, $7) RETURNING alliance_id", &[&name, &short_name, &description, &url, &corp, &me, &now]).await?).id)
+    Ok(ex.query_one("INSERT INTO game.alliances (name, short_name, description, url, executor_corp_id, creator_corp_id, creator_char_id, created)
+                     VALUES ($1, $2, $3, $4, $5, $5, $6, $7) RETURNING alliance_id", &[&name, &short_name, &description, &url, &corp, &me, &now]).await?.get::<_, i64>("alliance_id"))
 }
 pub(crate) async fn delete_other_applications(ex: &(impl Executor + ?Sized), corp: i64, alliance: i64, open_state: i32) -> Result<Vec<Application>, Error> {
     Ok(ex.query("DELETE FROM game.alliance_applications WHERE corporation_id = $1 AND alliance_id <> $2 AND state = $3 RETURNING alliance_id, corporation_id, application_text, created, state", &[&corp, &alliance, &open_state]).await?.iter().map(Application::from_row).collect())
@@ -148,12 +132,10 @@ pub(crate) async fn corporation_membership(ex: &(impl Executor + ?Sized), corp: 
 pub(crate) async fn clear_support(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<u64, Error> {
     ex.execute("UPDATE game.corporations SET chosen_executor_id = NULL WHERE alliance_id = $1 AND chosen_executor_id = $2", &[&alliance, &corp]).await
 }
-struct CorporationId { id: i64 }
-impl CorporationId { fn from_row(r: &Row) -> Self { Self { id: r.get("corporation_id") } } }
 pub(crate) async fn next_executor(ex: &(impl Executor + ?Sized), alliance: i64) -> Result<Option<i64>, Error> {
     Ok(ex.query_opt("SELECT co.corporation_id FROM game.corporations co WHERE co.alliance_id = $1 AND NOT co.deleted
                  ORDER BY (SELECT count(*) FROM game.characters ch WHERE ch.corporation_id = co.corporation_id AND NOT ch.deleted) DESC, co.corporation_id
-                 LIMIT 1", &[&alliance]).await?.map(|r| CorporationId::from_row(&r).id))
+                 LIMIT 1", &[&alliance]).await?.map(|r| r.get::<_, i64>("corporation_id")))
 }
 pub(crate) async fn set_executor(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<u64, Error> {
     ex.execute("UPDATE game.alliances SET executor_corp_id = $2 WHERE alliance_id = $1", &[&alliance, &corp]).await
@@ -207,13 +189,11 @@ pub(crate) async fn employment(ex: &(impl Executor + ?Sized), corp: i64) -> Resu
 }
 pub(crate) struct Relationship { pub to: i64, pub value: i32 }
 impl Relationship { fn from_row(r: &Row) -> Self { Self { to: r.get("to_id"), value: r.get("relationship") } } }
-struct RelationshipValue { value: i32 }
-impl RelationshipValue { fn from_row(r: &Row) -> Self { Self { value: r.get("relationship") } } }
 pub(crate) async fn relationships(ex: &(impl Executor + ?Sized), alliance: i64) -> Result<Vec<Relationship>, Error> {
     Ok(ex.query("SELECT to_id, relationship FROM game.alliance_relationships WHERE alliance_id = $1", &[&alliance]).await?.iter().map(Relationship::from_row).collect())
 }
 pub(crate) async fn relationship(ex: &(impl Executor + ?Sized), alliance: i64, to: i64) -> Result<Option<i32>, Error> {
-    Ok(ex.query_opt("SELECT relationship FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await?.map(|r| RelationshipValue::from_row(&r).value))
+    Ok(ex.query_opt("SELECT relationship FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await?.map(|r| r.get::<_, i32>("relationship")))
 }
 pub(crate) async fn set_relationship(ex: &(impl Executor + ?Sized), alliance: i64, to: i64, value: i32) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.alliance_relationships (alliance_id, to_id, relationship) VALUES ($1, $2, $3)
@@ -221,9 +201,4 @@ pub(crate) async fn set_relationship(ex: &(impl Executor + ?Sized), alliance: i6
 }
 pub(crate) async fn delete_relationship(ex: &(impl Executor + ?Sized), alliance: i64, to: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await
-}
-struct BillAmount { amount: f64 }
-impl BillAmount { fn from_row(r: &Row) -> Self { Self { amount: r.get("amount") } } }
-pub(crate) async fn bill_amount(ex: &(impl Executor + ?Sized), bill: i64, alliance: i64) -> Result<Option<f64>, Error> {
-    Ok(ex.query_opt("SELECT amount::float8 AS amount FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &alliance]).await?.map(|r| BillAmount::from_row(&r).amount))
 }

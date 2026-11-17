@@ -2,7 +2,7 @@
 //! Client notices mirror `dailygoals/client/utils.py`; state is in daily-goal tables.
 //! Lua, actors, payment and receipt ownership remain outside this module.
 use crate::{dao::{accounts::subscriptions::{self, CloneGrade}, daily_goals::{instances::{self, ProgressUpdate}, periods, rewards}}, db::outbox::Outbox, progress::ApplyError, services::subscriptions::rules};
-use tokio_postgres::Transaction;
+use crate::db::Transaction;
 use super::{super::{facts, wire}, state::{Change, ReadSet}};
 
 fn invalid(error: super::super::Error) -> ApplyError {

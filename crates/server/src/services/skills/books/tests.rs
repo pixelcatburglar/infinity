@@ -65,7 +65,7 @@ async fn batch_refusals_and_database_failure_roll_back_consumption() {
     let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone(); let ids = ids.clone(); let fences = fences.clone();
         Box::pin(async move { inject_tx(tx, outbox, &sde, &fences, f.character, None, &ids, now, None).await.map(|_| ()) })
-    }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("book settlement failed"));
+    }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); let owners: Vec<i64> = entries.iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(crate::services::effects::online::OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); entries }) }).await.unwrap_or_else(|_| panic!("book settlement failed"));
     assert!(!effects.is_empty());
     assert!(!effects.iter().any(|e| matches!(e, crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { event, .. } | crate::db::outbox::Notification::DirectClient { event, .. }) if event == "OnNewSkillQueueSaved")));
     assert_eq!(skill_dao::current(&db, f.character).await.unwrap().len(), 2);
@@ -108,7 +108,7 @@ async fn start_training_injects_and_schedules_one_level() {
     assert!(wrong.is_err());
     let result: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { inject_tx(tx, outbox, &sde, &fences, f.character, None, &[item], now, Some(station)).await.map(|_| ()) })
-    }, |(), outbox| async move { assert!(!outbox.into_entries().iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); Ok(()) }).await;
+    }, |(), outbox| async move { let owners: Vec<i64> = outbox.into_entries().iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(crate::services::effects::online::OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); Ok(()) }).await;
     assert!(result.is_ok());
     let queued = queue::list(&db, f.character).await.unwrap();
     assert_eq!(queued.len(), 1);
@@ -166,7 +166,7 @@ async fn overdue_completion_is_merged_with_book_injection_and_start() {
         assert!(history::list(&db, f.character, 50).await.unwrap().is_empty());
         let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone(); let fences = fences.clone(); Box::pin(async move { inject_tx(tx, outbox, &sde, &fences, f.character, None, &[item], now, start.then_some(station)).await.map(|_| ()) })
-        }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("book settlement failed"));
+        }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); let owners: Vec<i64> = entries.iter().filter_map(|effect| match effect { crate::db::outbox::Effect::Operation(crate::services::effects::online::OnlineChanged::Character { owner, .. }) => Some(*owner), crate::db::outbox::Effect::Operation(_) => panic!("unexpected online reconciliation operation"), _ => None }).collect(); assert_eq!(owners, [f.character]); entries }) }).await.unwrap_or_else(|_| panic!("book settlement failed"));
         let batches: Vec<_> = effects.iter().filter_map(|e| match e { Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnServerSkillsChanged" => Some(args), _ => None }).collect();
         assert_eq!(batches.len(), 1);
         let Value::Dict(infos) = &batches[0][0] else { panic!("skills dictionary") };

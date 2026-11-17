@@ -63,7 +63,8 @@ fn client_repairable_whitelist_requires_singleton() {
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn station_settlement_is_atomic_and_checks_context() {
-    use crate::{config::{Config, deployment::DatabaseConfig}, conn::Conn, db::Db, handshake::Login, space::World};
+    use crate::{config::{Config, deployment::DatabaseConfig}, db::Db, handshake::Login, space::World};
+    use infinity_wire::conn::Conn;
     crate::tests::init_config();
     let db = Db::connect(&DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());

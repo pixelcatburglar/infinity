@@ -5,28 +5,16 @@ use infinity_core::{
 };
 use crate::{
     config::Config,
-    conn::Conn,
     db::Db,
     handshake::Login,
     sde::Sde,
     services::effects::{registry, EffectKind},
     space::{Ball, WarpState, World, MODE_STOP},
 };
+use infinity_wire::conn::Conn;
 use marshal::Value;
 
-#[derive(Clone, Copy)]
-struct Fixture { account: i64, character: i64, ship: i64, module: i64 }
-
-async fn fingerprint(db: &Db) -> Vec<String> {
-    let mut result = Vec::new();
-    for sql in [
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY user_id), '')) AS fingerprint FROM game.accounts t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id), '')) AS fingerprint FROM game.characters t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.items t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id, attribute_id), '')) AS fingerprint FROM game.item_attributes t",
-    ] { result.push(db.query_one(sql, &[]).await.unwrap().get("fingerprint")); }
-    result
-}
+use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipItemSpec, ShipLocation};
 
 fn ball(id: i64, type_id: i32, owner: i64, pos: [f64; 3], vel: [f64; 3], radius: f32) -> Ball {
     Ball { id, type_id, owner_id: owner, corp_id: 1, alliance_id: -1, char_id: None, signature_radius: Some(40.0),
@@ -49,20 +37,16 @@ async fn hit_chance_command_db_smoke() {
         && t.effects().iter().any(|e| registry::kind(&sde, e.effect_id) == Some(EffectKind::Turret)))
         .expect("turret").type_id;
     let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)).expect("ship").type_id;
-    let before = fingerprint(&db).await;
-    let f = db.transaction(|tx, _: &mut ()| Box::pin(async move {
-        let account = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('hitchance-fixture-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
-        let character = tx.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id) VALUES ($1, 'hitchance-fixture-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1) RETURNING character_id", &[&account]).await?.get("character_id");
-        let ship = tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z) VALUES ($1, $2, $3, 0, 1, true, 0, 0, 0) RETURNING item_id", &[&ship_type, &character, &1_i64]).await?.get("item_id");
-        let module = tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, online) VALUES ($1, $2, $3, $4, 1, true, true) RETURNING item_id", &[&turret, &character, &ship, &FLAG_FITTING_FIRST]).await?.get("item_id");
-        Ok::<Fixture, crate::db::Error>(Fixture { account, character, ship, module })
-    }), |f, ()| async move { Ok(f) }).await.unwrap();
+    let f = create_ship(&db, ship_type, ShipLocation::Docked { station: 1 }, &[
+        ShipItemSpec { type_id: turret, flag_id: FLAG_FITTING_FIRST, quantity: 1, singleton: true, online: true, attributes: &[] },
+    ]).await.unwrap();
+    let module = f.module();
     let world = World::new(db.clone(), sde.clone(), 1);
     let test_world = world.clone();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
         for (attr, value) in [(ATTR_TRACKING_SPEED, 0.01), (ATTR_OPTIMAL_SIG_RADIUS, 400.0), (ATTR_MAX_RANGE, 20_000.0), (ATTR_FALLOFF, 10_000.0)] {
-            assert!(crate::dao::items::dogma::set_override(&test_db, f.module, attr, value).await.unwrap());
+            assert!(crate::dao::items::dogma::set_override(&test_db, module, attr, value).await.unwrap());
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -76,7 +60,7 @@ async fn hit_chance_command_db_smoke() {
         for (distance, velocity, expected) in [(10_000.0, 0.0, 1.0), (10_000.0, 500.0, 0.0), (10_000.0, 10.0, 0.5), (30_110.0, 30.11, 0.25)] {
             test_world.add_ship(1, ball(target, ship_type, f.character, [distance, 0.0, 0.0], [0.0, velocity, 0.0], 10.0)).await.unwrap();
             let row = super::super::command(&mut client, &[target.to_string()]).await.ok().expect("hitchance command");
-            assert!(row.contains(&f.module.to_string()));
+            assert!(row.contains(&module.to_string()));
             assert!(row.contains(&turret.to_string()));
             let values: Vec<f64> = row.split('=').skip(1).map(|part| {
                 part.split(|c: char| !c.is_ascii_digit() && !matches!(c, 'e' | 'E' | '+' | '-' | '.'))
@@ -101,14 +85,9 @@ async fn hit_chance_command_db_smoke() {
     world.remove_ball(1, f.ship + 1_000_000).await;
     let flush = world.flush_positions().await;
     drop(world);
-    db.transaction(|tx, _: &mut ()| Box::pin(async move {
-        tx.execute("DELETE FROM game.item_attributes WHERE item_id = $1", &[&f.module]).await?;
-        tx.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&&[f.module, f.ship][..]]).await?;
-        tx.execute("DELETE FROM game.characters WHERE character_id = $1 AND user_id = $2", &[&f.character, &f.account]).await?;
-        tx.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&f.account]).await?;
-        Ok::<(), crate::db::Error>(())
-    }), |(), ()| async move { Ok(()) }).await.unwrap();
-    assert_eq!(fingerprint(&db).await, before);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: f.account, character: f.character }], &[f.ship, module]).await.unwrap();
+    cleanup_ship(&db, None, f).await.unwrap();
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

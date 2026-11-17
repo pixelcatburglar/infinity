@@ -52,6 +52,10 @@ async fn quantities(db: &Db, f: Fixture, kind: i32) -> Vec<i64> {
     db.query("SELECT quantity FROM game.items WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3 AND type_id = $4 ORDER BY item_id", &[&f.buyer, &f.station, &FLAG_HANGAR, &kind]).await.unwrap().iter().map(|r| r.get("quantity")).collect()
 }
 
+async fn reload_sde(client: &mut Client, db: &Db) {
+    client.sde = Arc::new(crate::sde::Sde::load(db).await.unwrap());
+}
+
 fn drain(rx: &mut mpsc::UnboundedReceiver<(String, Vec<Value>)>) -> Vec<String> {
     let mut names = Vec::new();
     while let Ok((name, _)) = rx.try_recv() { names.push(name); }
@@ -60,9 +64,9 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<(String, Vec<Value>)>) -> Vec<String> 
 async fn direct_item_notices(client: &mut Client, peer: &mut tokio::net::TcpStream) -> usize {
     assert!(!client.wait_pumping(-1, 0).await.unwrap());
     let mut count = 0;
-    while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), crate::framing::read_frame(peer)).await {
-        let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
-        if let crate::macho::Address::Broadcast { broadcast_id, .. } = packet.destination {
+    while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), infinity_wire::framing::read_frame(peer)).await {
+        let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
+        if let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = packet.destination {
             if broadcast_id.as_text().as_deref() == Some("OnItemChange") { count += 1; }
         }
     }
@@ -75,7 +79,7 @@ async fn direct_item_notices(client: &mut Client, peer: &mut tokio::net::TcpStre
 async fn committed_settlement_and_refusals_are_atomic() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let mut sde = crate::sde::Sde::load(&db).await.unwrap();
     let issuer = sde.npc_corporations.iter().next().expect("SDE NPC corporation").corporation_id;
     let station = sde.map.stations().next().expect("SDE station").station_id;
     let (cost_type, output_type) = {
@@ -83,6 +87,15 @@ async fn committed_settlement_and_refusals_are_atomic() {
         (types.next().expect("SDE cost type").type_id, types.next().expect("second SDE type").type_id)
     };
     let f = create(&db, issuer, station, cost_type, output_type).await.unwrap();
+    sde.lp_offers = crate::sde::lp_offers::LpOffers::load(&db).await.unwrap();
+    assert!(matches!(offers(&sde, f.issuer), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(offers(&sde, f.issuer).iter().map(|offer| offer.offer_id).collect::<Vec<_>>(),
+        sde.lp_offers.list(f.issuer).iter().map(|offer| offer.offer_id).collect::<Vec<_>>());
+    assert!(sde.lp_offers.get(f.issuer, f.offer).is_some() && offers(&sde, f.corp).is_empty());
+    let saved = std::mem::take(&mut sde.lp_offers);
+    assert!(matches!(offers(&sde, f.issuer), std::borrow::Cow::Owned(_)));
+    sde.lp_offers = saved;
+    let sde = Arc::new(sde);
     let test_db = db.clone();
     // The join boundary lets cleanup run even when an assertion panics.
     let result = tokio::spawn(async move {
@@ -96,13 +109,18 @@ async fn committed_settlement_and_refusals_are_atomic() {
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: f.account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
         let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, world.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, world.clone(), login);
         client.change_session(vec![("charid", Value::Int(f.buyer)), ("corpid", Value::Int(f.corp)), ("stationid", Value::Int(f.station)), ("corpAccountKey", Value::Int(i64::from(ACCOUNT_CASH)))]);
         world.register_pilot(f.buyer, buyer_tx);
         world.set_online_session(f.buyer, infinity_core::session::OnlineSession::from_session(&client.session));
         let mut member_session = infinity_core::session::OnlineSession::from_session(&client.session).expect("buyer online session");
         member_session.character_id = f.member;
         world.set_online_session(f.member, Some(member_session));
+        let notify_text = |error: &crate::services::CallError| match error {
+            crate::services::CallError::User { msg, dict } if msg == messages::MSG_CUSTOM_NOTIFY =>
+                dict.iter().find_map(|(key, value)| if key == "notify" { value.as_text().map(|text| text.into_owned()) } else { None }),
+            _ => None,
+        };
         assert!(take_offer(&mut client, f.issuer, f.offer, 2, false).await.is_ok());
         assert_eq!(quantities(&test_db, f, f.cost_type).await, vec![8]);
         assert_eq!(quantities(&test_db, f, f.output_type).await, vec![6]);
@@ -126,13 +144,23 @@ async fn committed_settlement_and_refusals_are_atomic() {
             let a = if index == 3 { f.offer } else { f.buyer };
             let b = if index == 2 { i64::from(f.cost_type) } else { f.issuer };
             test_db.execute(sql, &[&a, &b]).await.unwrap();
+            if index == 3 { reload_sde(&mut client, &test_db).await; }
             let before = snapshot(&test_db, f).await;
-            assert!(take_offer(&mut client, f.issuer, f.offer, 2, false).await.is_err(), "refusal {index}");
+            let error = take_offer(&mut client, f.issuer, f.offer, 2, false).await.unwrap_err();
+            match index {
+                0 => assert_eq!(notify_text(&error), Some(messages::loyalty_balance_message(0)), "refusal {index}: {error:?}"),
+                1 => assert!(matches!(&error, crate::services::CallError::User { msg, dict }
+                    if msg == messages::MSG_NOT_ENOUGH_MONEY
+                    && dict == &vec![("balance".into(), Value::Float(0.0)), ("amount".into(), Value::Float(40.0))]), "refusal {index}: {error:?}"),
+                2 => assert_eq!(notify_text(&error).as_deref(), Some(messages::INSUFFICIENT_ITEM_QUANTITY), "refusal {index}: {error:?}"),
+                _ => assert_eq!(notify_text(&error).as_deref(), Some(messages::loyalty::ANALYSIS_KREDITS_UNAVAILABLE), "refusal {index}: {error:?}"),
+            }
             assert_eq!(snapshot(&test_db, f).await, before, "refusal {index} mutated rows");
             assert!(drain(&mut buyer_notices).is_empty());
             assert!(drain(&mut member_notices).is_empty());
             assert_eq!(direct_item_notices(&mut client, &mut peer).await, 0);
             test_db.execute(restore, &[&a, &b]).await.unwrap();
+            if index == 3 { reload_sde(&mut client, &test_db).await; }
         }
         assert!(take_offer(&mut client, f.issuer, f.offer, 1, true).await.is_ok());
         assert_eq!(quantities(&test_db, f, f.cost_type).await, vec![5]);
@@ -153,6 +181,10 @@ async fn committed_settlement_and_refusals_are_atomic() {
         assert!(notices.iter().any(|n| n == "OnCorpLPChange"));
         // An odd whole-ISK price above f64's exact integer range must debit exactly.
         test_db.execute("UPDATE game.lp_offers SET isk_cost = 9007199254740993 WHERE corporation_id = $1 AND offer_id = $2", &[&f.issuer, &f.offer]).await.unwrap();
+        let stale = client.sde.clone();
+        reload_sde(&mut client, &test_db).await;
+        assert_eq!(stale.lp_offers.get(f.issuer, f.offer).unwrap().isk_cost, 20);
+        assert_eq!(client.sde.lp_offers.get(f.issuer, f.offer).unwrap().isk_cost, 9007199254740993);
         test_db.execute("UPDATE game.characters SET balance = 9007199254740994.01 WHERE character_id = $1", &[&f.buyer]).await.unwrap();
         test_db.execute("UPDATE game.lp_balances SET amount = 0 WHERE char_id = $1 AND corp_id = $2", &[&f.buyer, &f.issuer]).await.unwrap();
         let before = snapshot(&test_db, f).await;
@@ -173,6 +205,7 @@ async fn committed_settlement_and_refusals_are_atomic() {
 
         // Multiplication beyond the offer's integer domain must still refuse atomically.
         test_db.execute("UPDATE game.lp_offers SET isk_cost = 9223372036854775807 WHERE corporation_id = $1 AND offer_id = $2", &[&f.issuer, &f.offer]).await.unwrap();
+        reload_sde(&mut client, &test_db).await;
         let before = snapshot(&test_db, f).await;
         assert!(take_offer(&mut client, f.issuer, f.offer, 2, false).await.is_err());
         assert_eq!(snapshot(&test_db, f).await, before);
@@ -180,6 +213,7 @@ async fn committed_settlement_and_refusals_are_atomic() {
         assert!(drain(&mut member_notices).is_empty());
         assert_eq!(direct_item_notices(&mut client, &mut peer).await, 0);
         test_db.execute("UPDATE game.lp_offers SET isk_cost = 0 WHERE corporation_id = $1 AND offer_id = $2", &[&f.issuer, &f.offer]).await.unwrap();
+        reload_sde(&mut client, &test_db).await;
         test_db.execute("UPDATE game.items SET quantity = $3 WHERE owner_id = $1 AND type_id = $2", &[&f.buyer, &f.cost_type, &(i64::MAX - 1)]).await.unwrap();
         test_db.execute("UPDATE game.items SET quantity = $3 WHERE owner_id = $1 AND type_id = $2", &[&f.buyer, &f.output_type, &(i64::MAX - 1)]).await.unwrap();
         assert!(take_offer(&mut client, f.issuer, f.offer, 1, false).await.is_ok());
@@ -195,7 +229,8 @@ async fn committed_settlement_and_refusals_are_atomic() {
         client.change_session(vec![("charid", Value::Int(f.member))]);
         assert_eq!(drain(&mut member_notices), vec!["OnCharNoLongerInStation"]);
         let before = snapshot(&test_db, f).await;
-        assert!(take_offer(&mut client, f.issuer, f.offer, 1, true).await.is_err());
+        let error = take_offer(&mut client, f.issuer, f.offer, 1, true).await.unwrap_err();
+        assert_eq!(notify_text(&error).as_deref(), Some(messages::DEPARTMENT_WALLET_WITHDRAW_UNAUTHORIZED));
         assert_eq!(snapshot(&test_db, f).await, before);
         assert!(drain(&mut buyer_notices).is_empty());
         let drained = drain(&mut member_notices);

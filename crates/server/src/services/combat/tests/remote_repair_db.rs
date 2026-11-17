@@ -1,22 +1,30 @@
 //! Database-backed remote repair activation and guarded mutation regressions.
 use super::*;
+#[cfg(feature = "tests-combat")]
 use infinity_core::{
-    consts::{CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_HULL_REPAIRER, dogma::EFFECT_REMOTE_SHIELD_BOOSTER, FLAG_FITTING_FIRST},
+    consts::{CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_HULL_REPAIRER, dogma::EFFECT_REMOTE_SHIELD_BOOSTER},
 };
+use infinity_core::consts::FLAG_FITTING_FIRST;
+#[cfg(feature = "tests-combat")]
 use crate::{
     config::Config,
-    conn::Conn,
-    db::Error,
     handshake::Login,
     services::effects::registry::{self, EffectAttribute},
+};
+#[cfg(feature = "tests-combat")]
+use infinity_wire::conn::Conn;
+use crate::{
+    db::Error,
     space::{WarpState, MODE_STOP},
 };
 
-mod ancillary;
+#[cfg(feature = "tests-combat")] mod ancillary;
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-slash"))]
 #[derive(Clone, Copy)]
 pub(crate) struct Fixture { pub(crate) account: i64, pub(crate) source: i64, pub(crate) target: i64, pub(crate) ship: i64, pub(crate) victim: i64, pub(crate) module: i64 }
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-slash"))]
 pub(crate) async fn create(db: &Db, ship_type: i32, module_type: i32, system: i64) -> Result<Fixture, Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         let account = tx.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('remote-repair-fixture-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await?.get("user_id");
@@ -31,27 +39,22 @@ pub(crate) async fn create(db: &Db, ship_type: i32, module_type: i32, system: i6
     }), |f, ()| async move { Ok(f) }).await
 }
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-slash"))]
 pub(crate) async fn cleanup(db: &Db, f: Fixture) -> Result<(), Error> {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
         tx.execute("DELETE FROM game.items WHERE item_id = $1 AND owner_id = $2 AND location_id = $3", &[&f.module, &f.source, &f.ship]).await?;
         tx.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&&[f.ship, f.victim][..]]).await?;
+        crate::dao::jobs::cancel(tx, &format!("{}:{}", crate::services::skills::completion::KIND, f.source)).await?;
+        tx.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.source]).await?;
+        tx.execute("DELETE FROM game.skill_queue WHERE character_id=$1", &[&f.source]).await?;
+        tx.execute("DELETE FROM game.skills WHERE character_id=$1", &[&f.source]).await?;
         tx.execute("DELETE FROM game.characters WHERE character_id = ANY($1) AND user_id = $2", &[&&[f.source, f.target][..], &f.account]).await?;
         tx.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&f.account]).await?;
         Ok(())
     }), |(), ()| async move { Ok(()) }).await
 }
 
-pub(crate) async fn fingerprint(db: &Db) -> Result<Vec<String>, Error> {
-    let mut result = Vec::new();
-    for sql in [
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY user_id), '')) AS fingerprint FROM game.accounts t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id), '')) AS fingerprint FROM game.characters t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.items t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id, attribute_id), '')) AS fingerprint FROM game.item_attributes t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY ship_id, flag_id), '')) AS fingerprint FROM game.module_charges t",
-    ] { result.push(db.query_one(sql, &[]).await?.get("fingerprint")); }
-    Ok(result)
-}
+#[cfg(any(feature = "tests-effects", feature = "tests-slash"))]
 pub(crate) fn set_locked_target(pilot: i64, target: i64, locked: bool) {
     if locked {
         state().targets.entry(pilot).or_default().insert(target);
@@ -61,6 +64,7 @@ pub(crate) fn set_locked_target(pilot: i64, target: i64, locked: bool) {
 }
 
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-slash"))]
 pub(crate) fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
     Ball { id, type_id, owner_id: pilot, corp_id: 1, alliance_id: -1, char_id: Some(pilot), signature_radius: None,
         mode: MODE_STOP, radius: 1.0, mass: 1e6, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
@@ -70,10 +74,12 @@ pub(crate) fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
 }
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects"))]
 pub(crate) async fn condition(world: &World, system: i64, ship: i64) -> Condition {
     world.with(system, move |s| s.combat_condition_snapshot(ship).unwrap().condition).await.unwrap()
 }
 
+#[cfg(any(feature = "tests-combat", feature = "tests-effects"))]
 pub(crate) async fn install_half(world: &World, system: i64, ship: i64, fit: Fit) {
     let stats = ShipStats::from_fit(&fit, Key::Ship);
     world.with(system, move |s| {
@@ -84,6 +90,7 @@ pub(crate) async fn install_half(world: &World, system: i64, ship: i64, fit: Fit
     }).await.unwrap();
 }
 
+#[cfg(feature = "tests-combat")]
 async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -99,7 +106,6 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE, ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 10.0)))
         .max_by(|a, b| a.attribute(ATTR_CAPACITOR_CAPACITY).unwrap().total_cmp(&b.attribute(ATTR_CAPACITOR_CAPACITY).unwrap())).expect("ship with health and capacitor").type_id;
     let system = 1;
-    let before = fingerprint(&db).await.unwrap();
     let f = create(&db, ship_type, module_type, system).await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
     let test_world = world.clone();
@@ -121,14 +127,18 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         let (destiny_tx, mut destiny_rx) = tokio::sync::mpsc::unbounded_channel();
         test_world.observe(system, f.source, f.ship, destiny_tx).await.unwrap();
         let source_fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
+        let resistance = effect.attribute(crate::services::effects::registry::EffectAttribute::Resistance)
+            .expect("remote repair resistance selector");
+        crate::dao::items::dogma::set_override(&test_db, f.victim, resistance, 0.5).await.unwrap();
         let target_fit = Fit::load_in_space(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap();
+        assert_eq!(target_fit.value(Key::Ship, resistance), 0.5);
         let target_max = ShipStats::from_fit(&target_fit, Key::Ship).max;
         install_half(&test_world, system, f.ship, source_fit).await;
         install_half(&test_world, system, f.victim, target_fit).await;
         let source_before = condition(&test_world, system, f.ship).await.now;
         let target_before = condition(&test_world, system, f.victim).await.now;
         let target_db_before = crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap();
-        assert!(target_db_before.is_empty());
+        assert_eq!(target_db_before.iter().find(|row| row.attribute_id == resistance).map(|row| row.value), Some(0.5));
         let args = [Value::Int(f.module), Value::str(effect_name), Value::Int(f.victim), Value::Int(1)];
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
@@ -149,7 +159,7 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         assert_eq!(payload[3], Value::Int(1));
         let fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
         let amount = fit.value(Key::Module(f.module), [infinity_core::consts::dogma::ATTR_SHIELD_BONUS, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT, infinity_core::consts::dogma::ATTR_STRUCTURE_DAMAGE_AMOUNT][layer]);
-        let expected = (target_before[layer] + amount).min(target_max[layer]);
+        let expected = (target_before[layer] + amount * 0.5).min(target_max[layer]);
         let duration = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Duration).unwrap()).max(250.0) as u64;
         assert!(test_world.after(system, 1500).await);
         if layer == 0 {
@@ -170,16 +180,19 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
             }
             assert_eq!(stops.len(), 1, "canonical effect stop");
             let mut phases = Vec::new();
-            while let Ok(events) = destiny_rx.try_recv() {
-                for event in events {
-                    let Value::Tuple(parts) = event else { continue };
-                    let Some(Value::Tuple(call)) = parts.get(1) else { continue };
-                    if call.first() != Some(&Value::str("OnSpecialFX")) { continue; }
-                    let Some(Value::Tuple(args)) = call.get(1) else { continue };
-                    if args.first() == Some(&Value::Int(f.ship)) && args.get(1) == Some(&Value::Int(f.module))
-                        && args.get(3) == Some(&Value::Int(f.victim)) {
-                        phases.push(args[7].clone());
-                    }
+            while let Ok(delivery) = destiny_rx.try_recv() {
+                match delivery {
+                    crate::space::SceneDelivery::Destiny(events) => for event in events {
+                        let Value::Tuple(parts) = event else { continue };
+                        let Some(Value::Tuple(call)) = parts.get(1) else { continue };
+                        if call.first() != Some(&Value::str("OnSpecialFX")) { continue; }
+                        let Some(Value::Tuple(args)) = call.get(1) else { continue };
+                        if args.first() == Some(&Value::Int(f.ship)) && args.get(1) == Some(&Value::Int(f.module))
+                            && args.get(3) == Some(&Value::Int(f.victim)) {
+                            phases.push(args[7].clone());
+                        }
+                    },
+                    crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
                 }
             }
             assert_eq!(phases, vec![Value::Int(1), Value::Int(0)], "canonical FX start and stop");
@@ -189,7 +202,8 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         let target_after = condition(&test_world, system, f.victim).await;
         assert!(target_after.now[layer] > target_before[layer]);
         assert!((target_after.now[layer] - expected).abs() < 1e-7 * expected.max(1.0));
-        assert!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap().is_empty());
+        assert!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap()
+            .iter().all(|row| ![ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE].contains(&row.attribute_id)));
         let capacity = fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY);
         let need = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Discharge).unwrap());
         let remaining = state().capacitor[&f.ship].0;
@@ -199,18 +213,22 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         assert_eq!(event, "OnModuleAttributeChanges");
         let [Value::List(changes)] = payload.as_slice() else { panic!("expected target HUD changes") };
         assert_eq!(changes.len(), 3);
-        for (change, attr) in changes.iter().zip([ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE]) {
+        for (i, (change, attr)) in changes.iter().zip([ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE]).enumerate() {
             let Value::Tuple(row) = change else { panic!("expected target attribute row") };
             assert_eq!(&row[..4], &[Value::str("OnModuleAttributeChange"), Value::Int(f.target), Value::Int(f.victim), Value::Int(i64::from(attr))]);
+            if i > 0 {
+                assert_eq!(row[5], Value::Float(target_after.stats.max[i] - target_after.now[i]));
+                assert_eq!(row[6], Value::Float(target_after.stats.max[i] - target_before[i]));
+            }
         }
         let repaired = target_after.now[layer];
         state().targets.remove(&f.source);
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local,
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local,
             move |_| state().targets.get(&f.source).is_some_and(|targets| targets.contains(&f.victim))).await.ok().unwrap();
         assert_eq!(condition(&test_world, system, f.victim).await.now[layer], repaired, "lost lock");
         let old_generation = Arc::new(AtomicBool::new(false));
         state().active.insert(f.module, ActiveModule { char_id: f.source, stop: Arc::new(AtomicBool::new(false)), forced_inactive: false });
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local,
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local,
             move |_| state().active.get(&f.module).is_some_and(|active| Arc::ptr_eq(&active.stop, &old_generation))).await.ok().unwrap();
         assert_eq!(condition(&test_world, system, f.victim).await.now[layer], repaired, "stale generation");
         state().active.remove(&f.module);
@@ -230,12 +248,12 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         test_world.add_ship(system, distant).await.unwrap();
         let target_fit = Fit::load_in_space(&test_db, &test_world, system, f.target, f.victim).await.ok().unwrap();
         test_world.with(system, move |s| s.install_condition(f.victim, target_after, target_fit)).await.unwrap();
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local, move |s| {
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local, move |s| {
             s.sampled_ball(f.ship).zip(s.sampled_ball(f.victim)).is_some_and(|(a, b)| crate::space::dist(a.pos, b.pos) < 1000.0)
         }).await.ok().unwrap();
         assert_eq!(condition(&test_world, system, f.victim).await.now[layer], repaired, "out of range");
         test_world.remove_ball(system, f.victim).await;
-        damage::repair_target(&test_world, system, f.victim, layer, 1.0, crate::space::combat::RepairSource::Local, move |s| s.contains(f.victim)).await.ok().unwrap();
+        damage::repair_target(&test_world, system, f.victim, layer, 1.0, None, crate::space::combat::RepairSource::Local, move |s| s.contains(f.victim)).await.ok().unwrap();
         assert_eq!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap().iter().find(|row| row.attribute_id == [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE][layer]).unwrap().value,
             persisted, "target removed");
     }).await;
@@ -248,28 +266,32 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
     forget_ship(f.victim);
     state().targets.remove(&f.source);
     drop(world);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[
+        crate::services::tests::fixture::Fixture { account: f.account, character: f.source },
+        crate::services::tests::fixture::Fixture { account: f.account, character: f.target },
+    ], &[f.ship, f.victim, f.module]).await.unwrap();
     cleanup(&db, f).await.unwrap();
-    assert_eq!(fingerprint(&db).await.unwrap(), before);
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn remote_shield_activation_db_smoke() { run_remote_repair(EFFECT_REMOTE_SHIELD_BOOSTER, 0, false).await; }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn remote_armor_activation_db_smoke() { run_remote_repair(EFFECT_REMOTE_ARMOR_REPAIRER, 1, false).await; }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn remote_hull_activation_db_smoke() { run_remote_repair(EFFECT_REMOTE_HULL_REPAIRER, 2, false).await; }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn mutadaptive_remote_refusal_db_smoke() { run_remote_repair(EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, 1, false).await; }
 
-#[tokio::test]
+#[cfg(feature = "tests-combat")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn remote_armor_lock_loss_interruption_db_smoke() { run_remote_repair(EFFECT_REMOTE_ARMOR_REPAIRER, 1, true).await; }

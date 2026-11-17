@@ -1,4 +1,5 @@
 use super::*;
+mod npc_sleep;
 
 pub(in crate::services) async fn hacking_site(db: &Db, system: i64, container: i64) -> i64 {
     let mut site = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_RADAR, 1.0, &mut HashSet::new());
@@ -230,6 +231,58 @@ async fn hack_postclaim_error_and_stale_membership_do_not_publish() {
     state().sites.remove(&id);
     delete_site(&db, id).await.unwrap();
     crate::dao::exploration::delete_container(&db, container).await.unwrap();
+    crate::services::tests::fixture::cleanup(&db, owner).await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
+async fn gm_site_alias_lists_real_ids_and_classes() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let owner = crate::services::tests::fixture::create(&db).await.unwrap();
+    let character = owner.character;
+    let system = character * 100 + 93;
+    let base = 9_500_000_000_000 + character * 100;
+    let cases = [
+        (Kind::Anomaly, STRENGTH_ALL, None, messages::gm::GM_SITE_COMBAT),
+        (Kind::Signature, STRENGTH_RADAR, None, messages::gm::GM_SITE_DATA),
+        (Kind::Signature, STRENGTH_MAGNETOMETRIC, None, messages::gm::GM_SITE_RELIC),
+        (Kind::Signature, STRENGTH_ALL, None, ""),
+        (Kind::Anomaly, STRENGTH_ALL, Some(ARCHETYPE_ORE), messages::gm::GM_SITE_ORE),
+        (Kind::Anomaly, STRENGTH_ALL, Some(ARCHETYPE_ICE), messages::gm::GM_SITE_ICE),
+        (Kind::Signature, STRENGTH_LADAR, Some(ARCHETYPE_GAS), messages::gm::GM_SITE_GAS),
+        (Kind::Signature, STRENGTH_GRAVIMETRIC, None, messages::gm::GM_SITE_MINING),
+        (Kind::Signature, STRENGTH_WORMHOLE, None, messages::gm::GM_SITE_UNKNOWN),
+    ];
+    let mut taken = HashSet::new();
+    let (mut expected, mut sites): (Vec<String>, Vec<Site>) = cases.iter().enumerate().map(|(i, (kind, attr, archetype, what))| {
+        let mut s = new_site(system, [0.0; 3], *kind, *attr, 1.0, &mut taken);
+        s.id = base + i as i64; s.target = format!("GM-{i}"); s.archetype = *archetype;
+        let label = if *kind == Kind::Anomaly { messages::gm::GM_SITE_ANOMALY } else { messages::gm::GM_SITE_SIGNATURE };
+        (messages::gm::gm_site_row_strength(s.id, &s.target, label, *what, "", (*kind == Kind::Signature).then_some(s.ease * PERCENT_SCALE)), s)
+    }).unzip();
+    sites[3].wormhole = Some(Wormhole { type_id: 30831, dest_system: base + 90, dest_class: 3, other: base + 91, born: 1, life_minutes: 60.0, mass_max: 1.0, mass_used: 0.0, jump_mass: 1.0, nebula: 0 });
+    let w = sites[3].wormhole.as_ref().unwrap();
+    expected[3] = messages::gm::gm_site_row_strength(sites[3].id, &sites[3].target, messages::gm::GM_SITE_SIGNATURE, &messages::gm::gm_wormhole_site(w.type_id, w.dest_system, w.dest_class), "", Some(PERCENT_SCALE));
+    let alien = { let mut s = new_site(system + 1, [0.0; 3], Kind::Signature, STRENGTH_ALL, 1.0, &mut taken); s.id = base + 99; s.target = "ALIEN".into(); s };
+    let scenario_db = db.clone();
+    let result = tokio::spawn(async move {
+        { let mut st = state(); st.loaded.insert(system); for s in sites.into_iter().chain([alien]) { st.sites.insert(s.id, s); } }
+        let (mut client, _peer) = crate::services::tests::client(scenario_db.clone(), character).await;
+        client.login.role = infinity_core::consts::ROLE_GML;
+        client.session.apply(vec![("solarsystemid", Value::Int(system))]);
+        let rpc = crate::services::slash::tests::support::rpc;
+        expected.sort();
+        let text = rpc(&mut client, "/sites").await.unwrap().as_text().unwrap().into_owned();
+        assert_eq!(text, expected.join("\n"));
+        assert_eq!(text.as_str(), rpc(&mut client, "/sigs").await.unwrap().as_text().unwrap().as_ref());
+        for i in 9..51 { let mut s = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_ALL, 1.0, &mut taken); s.id = base + i as i64; expected.push(messages::gm::gm_site_row_strength(s.id, &s.target, messages::gm::GM_SITE_SIGNATURE, messages::gm::GM_SITE_COMBAT, "", Some(PERCENT_SCALE))); state().sites.insert(s.id, s); }
+        expected.sort();
+        let shown = format!("{}\n{}", expected[..50].join("\n"), messages::gm::gm_rows_truncated(1));
+        for line in ["/sites", "/sigs"] { assert_eq!(rpc(&mut client, line).await.unwrap().as_text().unwrap().as_ref(), shown.as_str()); }
+    }).await;
+    { let mut st = state(); st.sites.retain(|_, s| s.system != system && s.system != system + 1); st.loaded.remove(&system); }
     crate::services::tests::fixture::cleanup(&db, owner).await.unwrap();
     result.unwrap();
 }

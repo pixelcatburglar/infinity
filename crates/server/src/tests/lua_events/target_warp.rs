@@ -198,8 +198,10 @@ async fn player(ctx: &super::Context, cursor: &mut usize) {
         assert_eq!(args[0].as_bytes(), Some(b"otherlost".as_slice()));
         targeting_charges::add_target_ctx(&cx, target, false).await.ok().expect("second lock starts");
         world.remove_ball(SYSTEM, target).await;
-        let (_, args) = tokio::time::timeout(Duration::from_secs(120), rx.recv()).await.unwrap().unwrap();
-        assert_eq!(args[0].as_bytes(), Some(b"lost".as_slice()));
+        assert!(world.after(SYSTEM, wait_ms).await);
+        assert!(!targeting_charges::targets_of(character).contains(&target));
+        assert!(rx.try_recv().is_err());
+        assert!(target_rx.try_recv().is_err());
         world.with(SYSTEM, |_| ()).await.unwrap();
         assert_new(ctx, cursor, &[]).await;
         let row = crate::dao::items::space_ships::FreeShip { item_id: target, type_id: ty, owner_id: pilot, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };

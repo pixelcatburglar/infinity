@@ -1,8 +1,9 @@
-use anyhow::{anyhow, ensure, Result};
-use marshal::Value;
-use crate::services::{Call, CallError};
-use super::super::fixture::Fixture;
+#[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))] use anyhow::{anyhow, ensure, Result};
+#[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))] use marshal::Value;
+#[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))] use crate::services::{Call, CallError};
+#[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))] use super::super::fixture::Fixture;
 
+#[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))]
 fn call_error(error: CallError) -> anyhow::Error {
     match error {
         CallError::Internal(error) => error,
@@ -10,6 +11,7 @@ fn call_error(error: CallError) -> anyhow::Error {
     }
 }
 
+#[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))]
 pub(in crate::services) async fn form_fleet(f: &mut Fixture, other: i64, ship: i64) -> Result<i64> {
     let primary_type = f.world.ball(f.system, f.ship).await.ok_or_else(|| anyhow!("primary ship absent"))?.type_id;
     let other_ball = f.world.ball(f.system, ship).await.ok_or_else(|| anyhow!("other ship absent"))?;

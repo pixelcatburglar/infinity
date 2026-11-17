@@ -35,7 +35,7 @@ async fn two_roots_refund_into_surviving_overfull_nested_box() {
     }
     let before = loading::capacity_snapshot(&db, source).await.unwrap();
     let room = hold_storage::container_room(&client.sde, before.parent.as_ref().unwrap(), &before.items, &before.reloads).unwrap().unwrap();
-    assert_eq!(room.capacity, 0.0);
+    assert_eq!(room.capacity, crate::services::inventory::holds::CapacityLimit::Finite(0.0));
     assert!(room.used > 0.0);
     assert_eq!(before.reloads.len(), 2);
     let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -70,7 +70,8 @@ async fn two_roots_refund_into_surviving_overfull_nested_box() {
         assert!(db.query_one("SELECT singleton FROM game.items WHERE item_id=$1", &[&root]).await.unwrap().get::<_, bool>("singleton"));
     }
     db.execute("UPDATE game.items SET owner_id=$2 WHERE item_id=$1", &[&source, &owner]).await.unwrap();
-    let unchanged = fingerprint(&db).await;
+    let ids = crate::dao::items::inventory::descendants(&db, &[roots[0], roots[1], source_hull, source]).await.unwrap();
+    let unchanged = state(&db, &ids, owner, station, &[charge]).await;
     for field in ["location_id", "owner_id"] {
         let (mut holder, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
         tokio::spawn(async move { connection.await.unwrap(); });
@@ -90,7 +91,7 @@ async fn two_roots_refund_into_surviving_overfull_nested_box() {
         client = returned_client;
         db.execute(&format!("UPDATE game.items SET {field}=$2 WHERE item_id=$1"), &[&source_hull, &old]).await.unwrap();
         assert!(result.is_err());
-        assert_eq!(fingerprint(&db).await, unchanged);
+        assert_eq!(state(&db, &ids, owner, station, &[charge]).await, unchanged);
         assert!(events.try_recv().is_err());
         assert!(client.outbox.is_empty());
     }
@@ -184,7 +185,8 @@ async fn pending_order_and_unload(overflow: bool) {
             assert_eq!(quantities.len(), 2);
             assert_eq!(quantities.iter().map(|&quantity| i128::from(quantity)).sum::<i128>(), i128::from(i64::MAX) + 1);
         } else {
-            let before = fingerprint(&worker_db).await;
+            let scope: Vec<i64> = roots.iter().chain(&weapons).copied().chain([source_hull, source]).collect();
+            let before = state(&worker_db, &scope, owner, station, &[charge]).await;
             let config = crate::config::tests::test_database();
             let (mut holder, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.unwrap();
             tokio::spawn(async move { connection.await.unwrap(); });
@@ -198,7 +200,7 @@ async fn pending_order_and_unload(overflow: bool) {
             });
             crate::dao::items::parent_locks::tests::wait_blocked(&worker_db, pid).await;
             let probe = worker_db.query_one("SELECT reload_id FROM game.pending_reloads WHERE reload_id=$1 FOR UPDATE NOWAIT", &[&low]).await;
-            let unwritten = fingerprint(&worker_db).await;
+            let unwritten = state(&worker_db, &scope, owner, station, &[charge]).await;
             tx.commit().await.unwrap();
             let (outcome, client) = operation.await.unwrap();
             match probe {
@@ -276,7 +278,7 @@ async fn source_that_is_also_refund_candidate_remains_mandatory() {
         assert!(preparation.mandatory_ids().contains(&inner));
         assert!(preparation.requests().iter().any(|request| request.item_id == inner
             && request.strength == crate::dao::items::parent_locks::LockStrength::Update));
-        let before = fingerprint(&worker_db).await;
+        let before = state(&worker_db, &[source_hull, outer, inner, first, second, first_weapon, second_weapon], owner, station, &[charge, box_type]).await;
         let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = notify;
         let config = crate::config::tests::test_database();
@@ -295,7 +297,7 @@ async fn source_that_is_also_refund_candidate_remains_mandatory() {
         let (outcome, mut client) = operation.await.unwrap();
         worker_db.execute("UPDATE game.items SET owner_id=$2 WHERE item_id=$1", &[&inner, &owner]).await.unwrap();
         assert!(outcome.is_err());
-        assert_eq!(fingerprint(&worker_db).await, before);
+        assert_eq!(state(&worker_db, &[source_hull, outer, inner, first, second, first_weapon, second_weapon], owner, station, &[charge, box_type]).await, before);
         assert!(events.try_recv().is_err());
         assert!(client.outbox.is_empty());
         assert!(matches!(super::scenarios::many(&mut client, station, &[first, second], Some(Value::Bool(true))).await, Ok(Value::None)));

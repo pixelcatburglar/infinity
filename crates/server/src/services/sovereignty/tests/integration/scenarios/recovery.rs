@@ -44,8 +44,8 @@ pub(super) async fn run(f: &Fixture, mut hubs: [i64; 2]) -> [i64; 2] {
         f.install_pilot(i, i, [hub.x.unwrap(), hub.y.unwrap(), hub.z.unwrap()]).await;
     }
     let initial = super::snapshot(f, ids.systems[0]).await;
-    assert!(crate::lua::retained_content(&initial.structure.content_namespace, &initial.structure.content_version).await.is_ok());
-    assert!(crate::lua::retained_content(&initial.structure.content_namespace, "missing-fixture-version").await.is_err());
+    assert!(crate::lua::retained_content(&initial.structure.content_namespace, &initial.structure.content_version).is_ok());
+    assert!(crate::lua::retained_content(&initial.structure.content_namespace, "missing-fixture-version").is_err());
     assert_eq!(super::snapshot(f, ids.systems[0]).await, initial);
 
     // The request timestamp is the history timestamp used by the production policy.

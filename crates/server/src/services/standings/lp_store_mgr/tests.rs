@@ -1,5 +1,5 @@
 use super::*;
-use crate::dao::lp_offers::RequiredItem;
+use crate::sde::lp_offers::RequiredItem;
 
 fn offer() -> Offer {
     Offer { corporation_id: 7, offer_id: 8, type_id: 9, quantity: 3, lp_cost: 10, isk_cost: 20, ak_cost: 2,
@@ -11,7 +11,7 @@ fn item(id: i64, kind: i32, quantity: i64) -> Item {
 
 #[test]
 fn wire_preserves_requirements_and_costs() {
-    let Value::Instance(_, fields) = wire(offer()) else { panic!("expected KeyVal") };
+    let Value::Instance(_, fields) = wire(&offer()) else { panic!("expected KeyVal") };
     assert_eq!(fields.get("offerID"), Some(&Value::Int(8)));
     assert_eq!(fields.get("qty"), Some(&Value::Int(3)));
     assert_eq!(fields.get("akCost"), Some(&Value::Int(2)));

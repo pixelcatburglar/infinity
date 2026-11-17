@@ -3,11 +3,14 @@
 //! Licenses and applications are persisted in `game.ship_skin_licenses` and
 //! `game.ship_skin_applications`, items in `game.items`, and deadlines in `game.jobs`;
 //! static eligibility comes from the SDE. Structure and single-use activation are refused.
+//! The `/allskins` GM command grants permanently into the same license store
+//! and expiry cleanup; it notifies only the target and changes no RPC behavior.
 mod application;
+pub(crate) mod all_skins;
 pub(crate) mod expiry;
 pub(crate) mod state;
 mod licenses;
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-ships"))] mod tests;
 
 use std::{collections::BTreeSet, sync::Arc};
 use marshal::Value;
@@ -50,6 +53,7 @@ async fn activate(c: &mut Client, ids: Vec<i64>) -> CallResult {
             lock_character(tx, identity.char_id).await.map_err(db_err)?;
             expiry::expire_tx(tx, identity.char_id, now, &targets, outbox).await?;
             licenses::activate_tx(tx, &identity, &sde, &region, &reach, &ids, now, outbox).await?;
+            expiry::commit_changes_tx(tx, &sde, identity.char_id, now, &targets, outbox).await?;
             expiry::schedule(tx, identity.char_id).await?;
             Ok(Value::None)
         })
@@ -61,22 +65,28 @@ async fn apply(c: &mut Client, ship: i64, skin: Option<i32>) -> CallResult {
     let row = load_items(&c.db, &c.sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(text::INVALID_ITEM))?;
     let endpoint = Endpoint { location: row.item_id, flag: row.flag_id };
     let reach = Reachability::capture(&identity, &c.db, &c.world, c.session.int("solarsystemid"), &[endpoint]).await?;
-    let mut recipients = if let Some(system) = identity.system_id.filter(|_| identity.station_id.is_none()) { crate::space::ship_cosmetics::recipients(&c.world, system, ship).await } else { Vec::new() };
-    recipients.push(identity.char_id);
-    let fact = if let Some(system) = identity.system_id.filter(|_| identity.station_id.is_none()) {
-        crate::space::ship_cosmetics::current(&c.world, system, ship).await
-    } else { None }.unwrap_or(crate::space::ship_cosmetics::Ship { ship_id: ship, type_id: row.type_id, character_id: (identity.ship_id == Some(ship)).then_some(identity.char_id), is_npc: false });
-    let facts = vec![fact];
+    let fence = if let Some(system) = identity.system_id.filter(|_| identity.station_id.is_none()) {
+        crate::space::ship_cosmetics::capture(&c.world, system, ship).await
+    } else { None };
+    let fact = fence.as_ref().map(|fence| fence.fact().clone()).unwrap_or(crate::space::ship_cosmetics::Ship {
+        ship_id: ship, type_id: row.type_id,
+        character_id: (identity.ship_id == Some(ship)).then_some(identity.char_id), is_npc: false,
+    });
     let targets = expiry::prepare(&c.db, &c.world, identity.char_id).await?;
     let db = c.db.clone(); let sde = c.sde.clone(); let region = c.cfg.server.boot_region.clone(); let now = filetime_now();
     db.transaction(move |tx, outbox: &mut Outbox| {
-        let identity = identity.clone(); let sde = sde.clone(); let region = region.clone(); let reach = reach.clone(); let recipients = recipients.clone(); let facts = facts.clone(); let targets = targets.clone();
+        let identity = identity.clone(); let sde = sde.clone(); let region = region.clone(); let reach = reach.clone();
+        let fence = fence.clone(); let fact = fact.clone(); let targets = targets.clone();
         Box::pin(async move {
             lock_character(tx, identity.char_id).await.map_err(db_err)?;
             expiry::expire_tx(tx, identity.char_id, now, &targets, outbox).await?;
             if application::apply_tx(tx, &identity, &sde, &region, &reach, ship, skin, now).await?.is_some() {
-                let states = state::project(tx, &sde, &facts, now).await?;
-                for notice in crate::gateway::ship_cosmetics::notice(&states[0], &recipients)? { outbox.notify_gateway(notice); }
+                let prepared = state::prepare(tx, &sde, &[fact], now).await?.into_iter().next()
+                    .ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing prepared ship SKIN")))?;
+                match &fence {
+                    Some(fence) => outbox.ship_cosmetics(fence.committed(prepared)),
+                    None => for notice in crate::gateway::ship_cosmetics::notice(&prepared.state, &[identity.char_id])? { outbox.notify_gateway(notice); },
+                }
             }
             Ok(Value::None)
         })
@@ -163,6 +173,7 @@ async fn gm(c: &mut Client, call: &Call<'_>) -> CallResult {
                 GmAction::Give(duration) => {
                     expiry::expire_tx(tx, character, now, &targets, outbox).await?;
                     licenses::grant_tx(tx, &sde, &region, character, skin, duration, now).await?;
+                    expiry::commit_changes_tx(tx, &sde, character, now, &targets, outbox).await?;
                     outbox.notify_pilot(character, "OnSkinLicenseActivated", vec![Value::Int(i64::from(skin)), Value::Int(character)]);
                 }
                 GmAction::Expire => {

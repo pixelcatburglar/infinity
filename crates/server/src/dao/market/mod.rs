@@ -13,5 +13,5 @@ pub(crate) mod orders;
 pub(crate) mod trading;
 pub(crate) mod versions;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tests-economy", feature = "tests-storage")))]
 pub(crate) mod tests;

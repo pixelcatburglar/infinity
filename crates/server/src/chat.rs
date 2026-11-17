@@ -3,6 +3,8 @@
 //! plain TCP (the launcher disables TLS). Durable room metadata and ACLs are
 //! supplied by chat services and their DAO; real and virtual occupants are runtime
 //! state. Virtual occupants join system rooms only, not durable custom rooms.
+//! Every socket write shares the configured client write timeout; a stalled or
+//! failed write ends the whole connection.
 //! Password rooms, corporation/alliance ACLs and proxy ownership are unsupported.
 
 use infinity_core::consts::TYPE_CHARACTER;
@@ -10,6 +12,7 @@ use anyhow::Result;
 use base64::Engine;
 use quick_xml::events::Event;
 use std::collections::HashMap;
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,9 +22,10 @@ use tracing::{debug, info, warn};
 mod rooms;
 pub(crate) mod console;
 mod stanzas;
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-runtime"))]
 mod tests;
 
+use infinity_wire::conn::write_with_timeout;
 use crate::{db::Db, space::World};
 use stanzas::stanza;
 
@@ -29,6 +33,12 @@ use stanzas::stanza;
 const JSON_CONTROL_LIMIT: u32 = 0x20;
 /// XEP-0045 status code identifying the recipient's own presence.
 const MUC_SELF_PRESENCE: u16 = 110;
+/// Server policy: simultaneous chat connections.
+const MAX_CONNECTIONS: usize = 256;
+/// Server policy: simultaneous chat connections from one address.
+const MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
+/// Server policy: bound on finishing authentication after connect.
+const AUTH_TIMEOUT_SECS: u64 = 30;
 
 /// A parsed XML element (one stanza or a child of one).
 #[derive(Debug, Clone, Default)]
@@ -182,23 +192,23 @@ impl Hub {
 
     /// Issue (or reuse) the chat password for a character.
     pub fn token_for(&self, char_id: i64) -> String {
-        let mut t = self.tokens.lock().unwrap();
+        let mut t = crate::poison::lock_or_exit(self.tokens.lock());
         t.entry(char_id.to_string()).or_insert_with(|| format!("{:016x}", crate::handshake::rand_i64())).clone()
     }
 
     fn check(&self, user: &str, password: &str) -> bool {
-        self.tokens.lock().unwrap().get(user).is_some_and(|t| t == password)
+        crate::poison::lock_or_exit(self.tokens.lock()).get(user).is_some_and(|t| t == password)
     }
 
     /// What chat shows about a character (xmppchatsvc._GetPresenceUserData): affiliations,
     /// session role, and an eveowners row `[ownerID, ownerName, typeID, gender, ownerNameID]`.
     pub fn set_profile(&self, char_id: i64, name: &str, gender: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>, role: i64) {
         let info = format!("[{char_id}, {}, {TYPE_CHARACTER}, {gender}, null]", json_str(name));
-        self.profiles.lock().unwrap().insert(char_id.to_string(), Profile { info, corp, alliance, faction, role });
+        crate::poison::lock_or_exit(self.profiles.lock()).insert(char_id.to_string(), Profile { info, corp, alliance, faction, role });
     }
 
     fn profile(&self, user: &str) -> String {
-        self.profiles.lock().unwrap().get(user).map(Profile::xml).unwrap_or_default()
+        crate::poison::lock_or_exit(self.profiles.lock()).get(user).map(Profile::xml).unwrap_or_default()
     }
 
     fn conference(&self) -> String {
@@ -208,7 +218,7 @@ impl Hub {
     /// Invite a character into a session channel (`local_<systemID>`...) after a
     /// session change; invites from `admin` are joined without asking (xmppchatsvc._HandleInvite).
     pub fn invite(&self, char_id: i64, channel: &str) {
-        let users = self.users.lock().unwrap();
+        let users = crate::poison::lock_or_exit(self.users.lock());
         let Some((jid, tx)) = users.get(&format!("{char_id}@{}", self.host)) else { return };
         let _ = tx.send(format!(
             "<message from='{}' to='{}'><x xmlns='http://jabber.org/protocol/muc#user'><invite from='{}'/></x></message>",
@@ -220,20 +230,24 @@ impl Hub {
 
 }
 
-pub async fn serve(bind: String, hub: Arc<Hub>) -> Result<()> {
+pub async fn serve(bind: String, hub: Arc<Hub>, write_timeout: Duration) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     info!("chat (XMPP) listening on {bind}, domain {}", hub.host);
+    let gate = crate::admission::Admission::new(MAX_CONNECTIONS, MAX_CONNECTIONS_PER_ADDRESS);
     loop {
         let (stream, peer) = listener.accept().await?;
+        let Ok(auth_deadline) = crate::admission::deadline(std::time::Instant::now(), AUTH_TIMEOUT_SECS) else { continue };
+        let Some(permit) = gate.try_acquire(peer.ip()) else { continue };
         let hub = hub.clone();
         tokio::spawn(async move {
-            if let Err(e) = connection(stream, hub).await {
+            let _permit = permit;
+            if let Err(e) = connection(stream, hub, write_timeout, auth_deadline).await {
                 debug!("chat connection {peer} ended: {e:#}");
             }
         });
     }
-}
 
+}
 struct Conn {
     hub: Arc<Hub>,
     tx: Tx,
@@ -242,32 +256,47 @@ struct Conn {
     password: Option<String>,
 }
 
-async fn connection(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
+async fn connection(stream: TcpStream, hub: Arc<Hub>, write_timeout: Duration, auth_deadline: std::time::Instant) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(s) = rx.recv().await {
-            if wr.write_all(s.as_bytes()).await.is_err() {
-                break;
-            }
+            write_with_timeout(wr.write_all(s.as_bytes()), write_timeout).await?;
         }
+        Ok::<(), std::io::Error>(())
     });
     let mut c = Conn { hub: hub.clone(), tx, user: None, full_jid: None, password: None };
-    let result = read_loop(rd, &mut c).await;
+    // Either side ends the connection: a dead writer leaves an unbounded channel
+    // nobody drains, and a finished reader leaves nothing to deliver stanzas with.
+    let (result, writer_running) = {
+        let read = read_loop(rd, &mut c, auth_deadline);
+        tokio::pin!(read);
+        tokio::select! {
+            result = &mut read => (result, true),
+            joined = &mut writer => (match joined {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.into()),
+                Err(join) => Err(join.into()),
+            }, false),
+        }
+    };
     if let Some(jid) = &c.full_jid {
         hub.leave_all(jid, &c.tx);
         if let Some(user) = &c.user {
-            let mut users = hub.users.lock().unwrap();
+            let mut users = crate::poison::lock_or_exit(hub.users.lock());
             let key = format!("{user}@{}", hub.host);
             if users.get(&key).is_some_and(|(current, tx)| current == jid && tx.same_channel(&c.tx)) { users.remove(&key); }
         }
         info!("chat: {jid} disconnected");
     }
-    writer.abort();
+    if writer_running {
+        writer.abort();
+        let _ = writer.await;
+    }
     result
 }
 
-async fn read_loop(rd: tokio::net::tcp::OwnedReadHalf, c: &mut Conn) -> Result<()> {
+async fn read_loop(rd: tokio::net::tcp::OwnedReadHalf, c: &mut Conn, auth_deadline: std::time::Instant) -> Result<()> {
     let mut reader = quick_xml::Reader::from_reader(BufReader::new(rd));
     reader.config_mut().check_end_names = false;
     reader.config_mut().trim_text(false);
@@ -275,7 +304,14 @@ async fn read_loop(rd: tokio::net::tcp::OwnedReadHalf, c: &mut Conn) -> Result<(
     let mut stack: Vec<Element> = Vec::new();
     loop {
         buf.clear();
-        let ev = reader.read_event_into_async(&mut buf).await?;
+        // Until SASL completes, reads share the accept-time deadline; a
+        // successful auth disables it permanently, failures do not renew it.
+        let read = reader.read_event_into_async(&mut buf);
+        let ev = if c.user.is_none() {
+            tokio::time::timeout_at(auth_deadline.into(), read).await??
+        } else {
+            read.await?
+        };
         match ev {
             Event::Eof => return Ok(()),
             Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"stream:stream" => {

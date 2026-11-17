@@ -29,7 +29,7 @@ async fn fence_target(ex: &(impl Executor + ?Sized), target: &mut CaptureRow) ->
 async fn retained_for_hub(db: &crate::db::Db, hub: &HubRow) -> Result<(String, String), CallError> {
     let target = capture::read(db, hub.structure.item_id).await.map_err(db_err)?
         .ok_or_else(|| db_err(anyhow::anyhow!("Hub capture target missing")))?;
-    super::validate_retained(&[(&hub.structure.content_namespace, &hub.structure.content_version), (&target.content_namespace, &target.content_version)]).await?;
+    super::validate_retained(&[(&hub.structure.content_namespace, &hub.structure.content_version), (&target.content_namespace, &target.content_version)])?;
     Ok((target.content_namespace, target.content_version))
 }
 
@@ -144,7 +144,7 @@ async fn claim_owned(resources: super::Resources, observation: super::CaptureObs
     if let Some(hub) = &prepared_hub {
         let _ = retained_for_hub(&resources.db, hub).await?;
     }
-    super::validate_retained(&[(&target.content_namespace, &target.content_version)]).await?;
+    super::validate_retained(&[(&target.content_namespace, &target.content_version)])?;
     let alliance = winner.unwrap_or(OWNER_UNOWNED);
     let mut owned_systems = systems::for_alliance(&resources.db, alliance).await.map_err(db_err)?;
     let expected_policy = match policy_dao::read(&resources.db, alliance).await.map_err(db_err)? {

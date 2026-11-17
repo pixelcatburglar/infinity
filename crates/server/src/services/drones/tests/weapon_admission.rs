@@ -113,7 +113,7 @@ async fn two_owners_receive_drone_combat_attribution() -> Result<()> {
             .ok_or_else(|| anyhow!("missing victim condition"))?;
         let attempt = admitted(&f, guard, source, from.type_id).await?;
         weapons::turret_shot(&f.db, &f.world, f.system, &from, &target, Some(f.owner), from.type_id, false,
-            (fit.value(key, ATTR_MAX_RANGE), fit.value(key, ATTR_FALLOFF), fit.value(key, ATTR_TRACKING_SPEED), fit.value(key, ATTR_OPTIMAL_SIG_RADIUS)), raw, Some(guard), attempt).await.ok().ok_or_else(|| anyhow!("turret shot failed"))?;
+            (fit.value(key, ATTR_MAX_RANGE), fit.value(key, ATTR_FALLOFF), fit.value(key, ATTR_TRACKING_SPEED), fit.value(key, ATTR_OPTIMAL_SIG_RADIUS)), raw, Some(guard), None, attempt).await.ok().ok_or_else(|| anyhow!("turret shot failed"))?;
         ensure!(f.world.with(f.system, move |s| s.ball(victim).is_some_and(|b| b.char_id.is_none()) && s.pilot_ball(other).is_some_and(|b| b.id == other_ship)).await == Some(true), "victim entered pilot index");
         let (owner, ship) = (f.owner, f.ship);
         ensure!(f.world.with(f.system, move |s| s.drone_order(source, owner, ship, DroneOrder::ReturnHome)).await == Some(true), "recall failed");
@@ -181,7 +181,7 @@ async fn missile_generation_is_validated_at_insertion() -> Result<()> {
         let missile = || Missile { charge: charge.type_id, raw: ATTR_DAMAGE.map(|a| charge.attribute(a).unwrap_or(0.0)),
             aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(), aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(),
             drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: charge.attribute(ATTR_MAX_VELOCITY).unwrap(),
-            flight_range: charge.attribute(ATTR_MAX_VELOCITY).unwrap() * crate::space::ms_to_seconds(charge.attribute(ATTR_EXPLOSION_DELAY).unwrap()),
+            flight_time_ms: charge.attribute(ATTR_EXPLOSION_DELAY).unwrap(),
             weapon: charge.type_id, illegal: false };
         let guard = locked(&f, source, victim).await?;
         let (from, target) = f.world.with(f.system, move |s| Some((s.sampled_ball(source)?, s.sampled_ball(victim)?))).await.flatten().ok_or_else(|| anyhow!("missing drones"))?;
@@ -194,7 +194,6 @@ async fn missile_generation_is_validated_at_insertion() -> Result<()> {
         let retaliation_before = crate::services::crimewatch::retaliation_allowed(other, f.owner, crate::client::filetime_now());
         let reverse_before = crate::services::crimewatch::retaliation_allowed(f.owner, other, crate::client::filetime_now());
         let health_before = target.health;
-        let wait_ms = ((crate::space::dist(from.pos, target.pos) / missile().velocity.max(1.0)).clamp(0.5, 30.0) * 1000.0) as u64 + 1000;
         let attempt = admitted(&f, guard, source, from.type_id).await?;
         let (owner, ship) = (f.owner, f.ship);
         ensure!(f.world.with(f.system, move |s| s.drone_order(source, owner, ship, DroneOrder::ReturnHome)).await == Some(true), "recall failed");
@@ -202,7 +201,7 @@ async fn missile_generation_is_validated_at_insertion() -> Result<()> {
         let before = f.world.with(f.system, |s| s.balls().count()).await.ok_or_else(|| anyhow!("actor stopped"))?;
         weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from.clone(), target.clone(), f.owner, None, missile(), Some(guard), attempt).await.ok().ok_or_else(|| anyhow!("stale launch failed"))?;
         ensure!(f.world.with(f.system, |s| s.balls().count()).await == Some(before), "stale missile inserted");
-        ensure!(f.world.after(f.system, wait_ms).await, "actor stopped");
+        ensure!(f.world.after(f.system, 1_000).await, "actor stopped");
         ensure!(f.world.with(f.system, move |s| s.balls().count() == before && s.ball(victim).is_some_and(|b| b.health == health_before)).await == Some(true), "stale launch changed actor or target health");
         while let Ok((event, _)) = rx_victim.try_recv() {
             ensure!(event != "OnDamageMessage" && event != "OnCrimewatchEngagementCreated", "stale launch was accepted");

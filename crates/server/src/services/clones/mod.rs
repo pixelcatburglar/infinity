@@ -22,7 +22,7 @@ pub(super) enum CloneEffect {
     Online(OnlineChanged),
 }
 impl crate::progress::Prepare for CloneEffect {
-    fn prepare<'a, 'tx>(&'a mut self, tx: &'a tokio_postgres::Transaction<'tx>, context: &'a mut crate::progress::PrepareCx) -> crate::db::transaction::TxFuture<'a, (), crate::progress::PrepareError> {
+    fn prepare<'a, 'tx>(&'a mut self, tx: &'a crate::db::Transaction<'tx>, context: &'a mut crate::progress::PrepareCx) -> crate::db::transaction::TxFuture<'a, (), crate::progress::PrepareError> {
         match self {
             Self::Trade(outbox) => crate::progress::Prepare::prepare(outbox, tx, context),
             Self::Online(change) => crate::progress::Prepare::prepare(change, tx, context),

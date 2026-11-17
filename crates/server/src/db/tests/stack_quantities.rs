@@ -14,7 +14,7 @@ const COLUMNS: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
-#[ignore = "requires a dedicated PostgreSQL database; run this test alone"]
+#[ignore = "requires a dedicated PostgreSQL database; run this exact test in its own process"]
 async fn quantity_schema_replays_fresh_and_legacy() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let client = db.pool.get().await.unwrap();

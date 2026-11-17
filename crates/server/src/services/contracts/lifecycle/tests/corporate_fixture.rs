@@ -22,7 +22,7 @@ pub(super) async fn setup(db: &Db, station: i64, station_type: i32) -> Corp {
         db.execute("INSERT INTO game.corp_wallets (corporation_id,account_key,balance) VALUES ($1,$2,1000000)", &[&id, &key]).await.unwrap();
     }
     let office = transfers::insert(db, station_type, id, station, FLAG_HANGAR, 1).await.unwrap();
-    crate::dao::offices::insert(db, office, id, station, 1).await.unwrap();
+    crate::dao::offices::insert(db, office, id, station, crate::client::filetime_now() + infinity_core::consts::FILETIME_DAY, 0).await.unwrap();
     Corp { actor, ceo, id, office }
 }
 

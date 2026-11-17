@@ -137,6 +137,42 @@ async fn stale_batch_does_not_restore_moved_item() { race(false).await; }
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
 async fn stale_batch_does_not_restore_deleted_item() { race(true).await; }
 
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
+async fn cargo_mode_lifecycle_and_full_state_cas_hold() {
+    let db = database().await;
+    let fixture = Fixture::new(db.clone(), 1).await;
+    let item = fixture.items[0];
+    let result = crate::tests::catch_scenario(async {
+        // Lifecycle: absent row → unlimited keeps the persisted base → repeat
+        // is a no-op → finite set writes a new base and clears the mode → reset
+        // deletes the row; the joined witness agrees at every step.
+        let cap = infinity_core::consts::dogma::ATTR_CAPACITY;
+        assert!(set_cargo_unlimited(&db, item, 6.0).await.unwrap());
+        let replayed = Db::connect(&DatabaseConfig { schema_on_start: true, ..crate::config::tests::test_database() }).await.unwrap();
+        assert_eq!(overrides(&replayed, item).await.unwrap()[0].state(), OverrideState { value: 6.0, cargo_unlimited: true });
+        assert!(!set_cargo_unlimited(&db, item, 9.0).await.unwrap());
+        assert_eq!(overrides(&db, item).await.unwrap()[0].state(), OverrideState { value: 6.0, cargo_unlimited: true });
+        assert!(set_override(&db, item, cap, 6.0).await.unwrap());
+        assert_eq!(overrides(&db, item).await.unwrap()[0].state(), OverrideState { value: 6.0, cargo_unlimited: false });
+        assert_eq!(hull_override(&db, item, cap).await.unwrap().unwrap().state, Some(OverrideState { value: 6.0, cargo_unlimited: false }));
+        assert!(hull_override(&db, item, ATTR_HULL_DAMAGE).await.unwrap().unwrap().state.is_none());
+        clear_override(&db, item, cap).await.unwrap();
+        assert!(overrides(&db, item).await.unwrap().iter().all(|r| r.attribute_id != cap));
+        // Full-state CAS: None inserts only when absent, Some only when the
+        // row still carries both persisted fields, and a vanished row is not
+        // recreated.
+        assert!(set_override_if(&db, item, ATTR_HULL_DAMAGE, None, 5.0).await.unwrap());
+        assert!(!set_override_if(&db, item, ATTR_HULL_DAMAGE, None, 6.0).await.unwrap());
+        assert!(set_override_if(&db, item, ATTR_HULL_DAMAGE, Some(OverrideState { value: 5.0, cargo_unlimited: false }), 7.0).await.unwrap());
+        assert!(!set_override_if(&db, item, ATTR_HULL_DAMAGE, Some(OverrideState { value: 5.0, cargo_unlimited: false }), 8.0).await.unwrap());
+        assert!(!set_override_if(&db, item, ATTR_HULL_DAMAGE, Some(OverrideState { value: 7.0, cargo_unlimited: true }), 9.0).await.unwrap());
+        clear_override(&db, item, ATTR_HULL_DAMAGE).await.unwrap();
+        assert!(!set_override_if(&db, item, ATTR_HULL_DAMAGE, Some(OverrideState { value: 7.0, cargo_unlimited: false }), 9.0).await.unwrap());
+    }).await;
+    finish(fixture, result).await;
+}
+
 async fn race(delete: bool) {
     let db = database().await;
     let fixture = Fixture::new(db.clone(), 1).await;

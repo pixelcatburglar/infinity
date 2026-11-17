@@ -85,5 +85,5 @@ pub(crate) async fn delete_before(ex: &(impl Executor + ?Sized), cutoff: i64) ->
     ex.execute("DELETE FROM game.map_events WHERE event_time < $1", &[&cutoff]).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

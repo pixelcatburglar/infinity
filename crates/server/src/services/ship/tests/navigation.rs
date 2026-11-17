@@ -44,7 +44,7 @@ async fn unsupported_subject_does_not_warp_to_a_matching_ball() {
     let (stream, address) = listener.accept().await.unwrap();
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
     client.session.apply(vec![("charid", Value::Int(1)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
     let before = world.ball(system, hull).await.unwrap();
     let args = [Value::str("epinstance"), Value::Int(target_id)];

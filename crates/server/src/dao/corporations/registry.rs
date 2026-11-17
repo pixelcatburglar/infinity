@@ -3,7 +3,7 @@
 //! Client behavior is owned by corpRegistry (eve/client/script/ui/services/corporation);
 //! this module does not implement policy, notifications or transactions.
 
-use crate::dao::characters::roles::EFFECTIVE_ROLES_SQL;
+use crate::dao::characters::roles::{CURRENT_CORPORATION_JOIN_SQL, EFFECTIVE_ROLES_SQL};
 use crate::db::{self, executor::Executor};
 
 pub(crate) struct Membership {
@@ -18,7 +18,8 @@ impl Membership {
 }
 
 pub(crate) async fn membership(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Membership, db::Error> {
-    let row = ex.query_one(&format!("SELECT ch.corporation_id, {EFFECTIVE_ROLES_SQL} AS effective_roles FROM game.characters ch WHERE ch.character_id = $1"), &[&char_id]).await?;
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("SELECT ch.corporation_id, {} AS effective_roles {CURRENT_CORPORATION_JOIN_SQL} WHERE ch.character_id = $1", EFFECTIVE_ROLES_SQL.as_str()));
+    let row = ex.query_one(SQL.as_str(), &[&char_id]).await?;
     Ok(Membership::from_row(&row))
 }
 /// Lock the union of explicit and corporation-derived alliances in ascending ID order,
@@ -186,7 +187,8 @@ pub(crate) async fn old_corporation_applications(ex: &(impl Executor + ?Sized), 
 }
 
 pub(crate) async fn application_managers(ex: &(impl Executor + ?Sized), corp: i64, roles: i64) -> Result<Vec<i64>, db::Error> {
-    Ok(ex.query(&format!("SELECT ch.character_id FROM game.characters ch WHERE ch.corporation_id = $1 AND NOT ch.deleted AND ({EFFECTIVE_ROLES_SQL} & $2) <> 0 ORDER BY ch.character_id"), &[&corp, &roles]).await?.iter().map(|r| r.get("character_id")).collect())
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("SELECT ch.character_id {CURRENT_CORPORATION_JOIN_SQL} WHERE ch.corporation_id = $1 AND NOT ch.deleted AND ({} & $2) <> 0 ORDER BY ch.character_id", EFFECTIVE_ROLES_SQL.as_str()));
+    Ok(ex.query(SQL.as_str(), &[&corp, &roles]).await?.iter().map(|r| r.get("character_id")).collect())
 }
 
 

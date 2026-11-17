@@ -40,7 +40,7 @@ pub(crate) mod dogma;
 pub(crate) mod drones;
 mod dynamic_items;
 pub(crate) mod effects;
-mod exploration;
+pub(crate) mod exploration;
 mod expert_systems;
 mod event_log;
 pub(crate) mod fit;
@@ -71,6 +71,7 @@ mod planet_mgr;
 pub(crate) mod presence;
 pub(crate) mod plex_vault;
 mod repair;
+pub(crate) mod repairable_ship;
 pub(crate) mod ship;
 pub(crate) mod sovereignty;
 mod settings_sharing;
@@ -83,6 +84,7 @@ mod station;
 pub(crate) mod subscriptions;
 mod store;
 mod structure_directory;
+mod super_weapon;
 pub(crate) mod trade;
 mod universe;
 pub(crate) mod wallets;
@@ -99,23 +101,28 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
     vec![
         periodic(MARKET, market::lifecycle::expire_orders, game.market.maintenance_secs as u64),
         periodic(CONTRACTS, contracts::settle_auctions, game.contracts.maintenance_secs as u64),
-        periodic(BILLS, bills::run_billing, game.corporations.bills_maintenance_secs as u64),
+        periodic(BILLS, bills::maintenance::run_billing, game.corporations.bills_maintenance_secs as u64),
         periodic(MINING_LEDGER, mining::retention::handle, game.mining.ledger_maintenance_secs as u64),
         periodic(MINING_PROGRESS, mining::progress::handle, game.mining.progress_aggregation_secs as u64),
         periodic(MAP_HISTORY, map::retention::handle, game.map.maintenance_secs as u64),
         trade::timeout_registration(),
         crate::scheduler::register(bounty::kill_rights::EXPIRY_KIND, bounty::kill_rights::expire),
         crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
+        crate::scheduler::register(bounty::npc::KIND, bounty::npc::handle),
         crate::scheduler::register(skills::completion::KIND, skills::completion::handle),
         crate::scheduler::register(skill_plans::recovery::KIND, skill_plans::recovery::handle),
         crate::scheduler::register(industry::completion::KIND, industry::completion::handle),
         crate::scheduler::register(chat::expiry::KIND, chat::expiry::handle),
         crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
         crate::scheduler::register(corps::pending_kicks::KIND, corps::pending_kicks::handle),
+        crate::scheduler::register(corps::sanctions::KIND, corps::sanctions::handle),
         crate::scheduler::register(corps::vote_close::KIND, corps::vote_close::handle),
         crate::scheduler::register(subscriptions::deadlines::KIND, subscriptions::deadlines::handle),
         crate::scheduler::register(ship_cosmetics_mgr::expiry::KIND, ship_cosmetics_mgr::expiry::handle),
         crate::scheduler::register(skills::alpha_injections::KIND, skills::alpha_injections::handle),
+        crate::scheduler::register(repairable_ship::deadlines::PAYMENT, repairable_ship::deadlines::handle),
+        crate::scheduler::register(repairable_ship::deadlines::DELIVERY, repairable_ship::deadlines::handle),
+        crate::scheduler::register(repairable_ship::deadlines::WITHDRAW, repairable_ship::deadlines::handle),
     ]
 }
 
@@ -138,14 +145,15 @@ const SITE_DIRECTION_FLATTENING: f64 = 0.2;
 const SITE_DIRECTION_EPSILON: f64 = 1e-9;
 
 /// The pilot's ship was destroyed: eject (raised by combat through the pilot's notify channel).
-pub async fn ship_destroyed(c: &mut Client, args: &[Value]) {
+pub async fn ship_destroyed(c: &mut Client, args: &[Value]) -> anyhow::Result<()> {
     let n = |i: usize| args.get(i).and_then(|v| v.as_float()).unwrap_or(0.0);
     let ship = args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let Some(capsule) = args.get(4).and_then(Value::as_int) else { return };
+    let Some(replacement_ship) = args.get(4).and_then(Value::as_int) else { return Ok(()) };
     let home = args.get(5).and_then(Value::as_int).zip(args.get(6).and_then(Value::as_int)).zip(args.get(7).and_then(Value::as_int)).zip(args.get(8).and_then(Value::as_int)).map(|(((a, b), c), d)| (a, b, c, d));
-    if let Err(CallError::Internal(e)) = ship::lose_ship(c, ship, capsule, home, [n(1), n(2), n(3)]).await {
-        warn!(user = c.login.user_id, "ejecting from {ship} failed: {e:#}");
-    }
+    ship::lose_ship(c, ship, replacement_ship, home, [n(1), n(2), n(3)]).await.map_err(|error| match error {
+        CallError::Internal(error) => error,
+        CallError::User { msg, .. } => anyhow::anyhow!(msg),
+    })
 }
 
 pub struct Call<'a> {
@@ -229,6 +237,21 @@ pub(super) fn value_ids(v: Option<&Value>) -> Vec<i64> {
 /// Read integer IDs from an iterable client value.
 pub(super) fn value_id_list(v: Option<&Value>) -> Vec<i64> {
     v.and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect()
+}
+
+pub(super) fn value_int(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Int(id)) => Some(*id),
+        _ => None,
+    }
+}
+
+pub(super) fn value_positive_id(value: Option<&Value>) -> Option<i64> {
+    value_int(value).filter(|id| *id > 0)
+}
+
+pub(super) fn arg_int(call: &Call<'_>, index: usize) -> i64 {
+    call.args.get(index).and_then(Value::as_int).unwrap_or(0)
 }
 
 fn unit_from_bits(bits: u64) -> f64 {
@@ -358,7 +381,7 @@ pub(crate) fn lua_fixed_claimed(call: &Call<'_>) -> bool { fixed::root(call).is_
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     // What the retail server answered for this build, where the client cached it.
     if !crate::lua::sovereignty_claimed(call) {
-        if let Some(v) = crate::retail::cached_call(call.service, call.method, call.args) {
+        if let Some(v) = infinity_content::retail::cached_call(call.service, call.method, call.args) {
             return Ok(v);
         }
     }
@@ -369,6 +392,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         if crate::lua::sovereignty_claimed(call) {
             return Err(CallError::Internal(anyhow::anyhow!("sovereignty content unavailable")));
         }
+        if let Some(reply) = super_weapon::dispatch(c, call).await { return reply; }
         if let Some(reply) = fixed::root(call) { return reply; }
         if let Some(reply) = chat::root(c, call).await { return reply; }
         if let Some(reply) = station::root(c, call).await { return reply; }
@@ -391,6 +415,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 
         _ => {
             if let Some(r) = world_tasks::dispatch(c, call) { return r; }
+            if let Some(r) = repairable_ship::dispatch(c, call).await { return r; }
             if let Some(r) = ship_adaption::dispatch(c, call).await { return r; }
             if let Some(r) = amplification_matrix::dispatch(c, call) { return r; }
             if let Some(r) = brawl::dispatch(c, call) { return r; }

@@ -14,4 +14,4 @@ pub(crate) fn range_multiplier(distance: f64, optimal: f64, falloff: f64) -> f64
     FALLOFF_STRENGTH.powf(ratio * ratio)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

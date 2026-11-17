@@ -3,13 +3,14 @@ use super::*;
 use crate::services::combat::groups_health::tests::drain_exact;
 use std::sync::{Arc, atomic::AtomicBool};
 use infinity_core::{
-    consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_QUANTITY, dogma::ATTR_RECHARGE_RATE, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_POWER_BOOSTER, FLAG_FITTING_FIRST},
+    consts::{dogma::ATTR_CAPACITOR_BONUS, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_QUANTITY, dogma::ATTR_RECHARGE_RATE, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_POWER_BOOSTER, FLAG_FITTING_FIRST},
 };
 use crate::{
     db::{Db, Error},
-    services::{combat, effects::{lifecycle::{ActivationOwner, CycleOutcome}, registry}},
+    services::{combat, effects::{lifecycle::{ActivationOwner, CycleOutcome}, registry}, fit::Key},
     space::{Ball, World, WarpState, MODE_STOP},
 };
+use crate::services::combat::targeting_charges::loaded;
 
 #[derive(Clone, Copy)]
 struct Fixture { account: i64, character: i64, ship: i64, module: i64 }
@@ -36,17 +37,6 @@ async fn cleanup(db: &Db, f: Fixture) -> Result<(), Error> {
         tx.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&f.account]).await?;
         Ok(())
     }), |(), ()| async move { Ok(()) }).await
-}
-
-async fn fingerprint(db: &Db) -> Result<Vec<String>, Error> {
-    let mut values = Vec::new();
-    for sql in [
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY user_id), '')) AS fingerprint FROM game.accounts t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY character_id), '')) AS fingerprint FROM game.characters t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY item_id), '')) AS fingerprint FROM game.items t",
-        "SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY ship_id, flag_id), '')) AS fingerprint FROM game.module_charges t",
-    ] { values.push(db.query_one(sql, &[]).await?.get("fingerprint")); }
-    Ok(values)
 }
 
 fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
@@ -95,9 +85,8 @@ async fn cap_booster_db_smoke() {
         && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v.is_finite() && v > 0.0)
         && t.attribute(ATTR_RECHARGE_RATE).is_some_and(|v| v.is_finite() && v > 0.0)).expect("ship with capacitor").type_id;
     let system = 1;
-    let before = fingerprint(&db).await.unwrap();
     let fixture = create(&db, ship_type, module_type, charge_type, system).await.unwrap();
-    let world = World::new(db.clone(), sde.clone(), 1);
+    let world = World::new(crate::services::effects::tests::fixture::cycle_observer(db.clone()), sde.clone(), 1);
     let test_world = world.clone();
     let test_db = db.clone();
     let result = tokio::spawn(async move {
@@ -108,6 +97,9 @@ async fn cap_booster_db_smoke() {
         let capacity = fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY);
         let bonus = fit.value(Key::Charge(fixture.module), ATTR_CAPACITOR_BONUS);
         assert!(capacity.is_finite() && capacity > 0.0 && bonus.is_finite() && bonus > 0.0);
+        let install = Fit::load(&test_db, test_world.sde().clone(), fixture.character, fixture.ship).await.ok().expect("resident fit");
+        let condition = crate::services::combat::prepare_condition_with_fit(&test_db, fixture.ship, &install).await.ok().expect("resident condition");
+        test_world.with(system, move |s| s.install_condition(fixture.ship, condition.into_condition(), install)).await.unwrap();
         let empty_type = test_world.sde().types.iter().find(|ty| ty.attribute(ATTR_CAPACITOR_CAPACITY).unwrap_or(0.0) <= 0.0).expect("SDE type with no capacitor").type_id;
         let mut empty = ball(-9_001_001, empty_type, fixture.character);
         empty.char_id = None;
@@ -116,7 +108,7 @@ async fn cap_booster_db_smoke() {
             source: fixture.ship, target: -9_001_001, source_guard: None, player: None,
             optimal: 100.0, falloff: 0.0, offensive: false,
         };
-        assert_eq!(drain_exact_guarded(&test_db, &test_world, system, -9_001_001, 10.0, admitted).await.ok().unwrap().unwrap().0, 0.0);
+        assert_eq!(drain_exact_guarded(&test_db, &test_world, system, -9_001_001, 10.0, None, admitted).await.ok().unwrap().unwrap().0, 0.0);
         test_world.remove_ball(system, -9_001_001).await;
         combat::forget_ship(-9_001_001);
         let stale = NpcCapacitorGuard::Attack {
@@ -124,19 +116,34 @@ async fn cap_booster_db_smoke() {
             source_guard: Some(crate::services::effects::space_source::SourceGuard::Drone { source: fixture.ship, target: fixture.ship, generation: 0 }),
             player: None, optimal: 100.0, falloff: 0.0, offensive: true,
         };
-        assert!(drain_exact_guarded(&test_db, &test_world, system, fixture.ship, 0.0, stale).await.ok().unwrap().is_none());
+        assert!(drain_exact_guarded(&test_db, &test_world, system, fixture.ship, 0.0, None, stale).await.ok().unwrap().is_none());
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: fixture.character, ship_id: fixture.ship, system_id: system };
         let module = Module { id: fixture.module, type_id: module_type, flag: FLAG_FITTING_FIRST };
         let stop = Arc::new(AtomicBool::new(false));
+        combat::state().active.insert(fixture.module, combat::ActiveModule { char_id: fixture.character, stop: stop.clone(), forced_inactive: false });
+        combat::state().activation_generation.insert(fixture.module, stop.clone());
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![module], effect, target: None, repeat: 1,
             stop: stop.clone(), owner: ActivationOwner { master: fixture.module, generation: stop, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
-            started: 0, charge_type: None, cycles: 0, duration_ms: 0.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
+            started: 0, charge_type: None, cycles: 0, duration_ms: 0.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
+            source_membership: None, target_type: None,
+            inputs: crate::services::effects::parameters::CycleInputs::default() };
+        let reuse = std::mem::take(&mut cycle.inputs);
+        let mut cycle = test_world.with(system, move |s| {
+            let mut cycle = cycle;
+            cycle.inputs = s.with_combat_fit(fixture.ship, |fit, _, stamp| {
+                cycle.source_membership = Some(stamp.membership);
+                crate::services::effects::parameters::capture_cycle(fit, &cycle, stamp, reuse)
+            }).expect("resident booster fit").expect("cycle inputs");
+            cycle
+        }).await.expect("system actor stopped");
         assert_eq!(loaded(&test_db, fixture.ship, FLAG_FITTING_FIRST).await.ok().unwrap(), Some((charge_type, 2)));
         assert!(validate(&cx, &fit, &cycle.modules[0], &cycle.effect, None).await.is_ok());
         for remaining in [1, 0] {
             assert!(drain_exact(&test_db, &test_world, system, fixture.ship, capacity * 0.75).await.ok().unwrap() > 0.0);
             let _ = rx.try_recv().expect("drain notification");
-            assert_eq!(start(&cx, &fit, &mut cycle).await.ok().expect("booster start"), CycleOutcome::Continue);
+            cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
+            assert_eq!(start(&cx, &mut cycle).await.ok().expect("booster start"), CycleOutcome::Continue);
+            test_world.flush_positions().await.unwrap();
             assert_eq!(loaded(&test_db, fixture.ship, FLAG_FITTING_FIRST).await.ok().unwrap(), if remaining == 0 { None } else { Some((charge_type, remaining)) });
             let key = Value::tuple([Value::Int(fixture.ship), Value::Int(i64::from(FLAG_FITTING_FIRST)), Value::Int(i64::from(charge_type))]);
             let (new, old) = change(rx.try_recv().expect("quantity notification"), fixture.character, key, ATTR_QUANTITY);
@@ -147,16 +154,55 @@ async fn cap_booster_db_smoke() {
             assert!((new - (old + bonus).min(capacity)).abs() <= capacity * 1e-10);
         }
         assert!(validate(&cx, &fit, &cycle.modules[0], &cycle.effect, None).await.is_err());
-        assert_eq!(start(&cx, &fit, &mut cycle).await.ok().expect("empty booster start"), CycleOutcome::Stop("out of charges"));
+        cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
+        assert_eq!(start(&cx, &mut cycle).await.ok().expect("empty booster start"), CycleOutcome::Stop("out of charges"));
         assert!(rx.try_recv().is_err());
+        test_db.execute("INSERT INTO game.module_charges (ship_id,flag_id,type_id,quantity) VALUES ($1,$2,$3,2)",
+            &[&fixture.ship, &FLAG_FITTING_FIRST, &charge_type]).await.unwrap();
+        let duration = cycle.effect.attribute(registry::EffectAttribute::Duration).expect("booster duration");
+        crate::dao::items::dogma::set_override(&test_db, fixture.module, duration, 2000.0).await.unwrap();
+        crate::services::effects::tests::fixture::publish_fit(&test_db, &test_world, system, fixture.character, fixture.ship).await;
+        // The durable row alone does not arm the actor: publish the committed
+        // absolute a real reload would, then run two true cycles.
+        test_world.with(system, move |s| {
+            let membership = s.combat_membership_generation(fixture.ship).expect("resident ship");
+            assert!(s.publish_loaded_absolute(fixture.ship, membership, vec![crate::space::combat::loaded::LoadedSeed {
+                module: fixture.module, flag: FLAG_FITTING_FIRST, type_id: Some(charge_type), quantity: 2, pending: false }]));
+        }).await.unwrap();
+        cycle.repeat = 2;
+        cycle.cycles = 0;
+        cycle.stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        cycle.owner.armed = true;
+        cycle.owner.world = Arc::downgrade(&test_world);
+        cycle.owner.system = system;
+        combat::state().active.insert(fixture.module, combat::ActiveModule {
+            char_id: fixture.character, stop: cycle.stop.clone(), forced_inactive: false });
+        combat::state().activation_generation.insert(fixture.module, cycle.stop.clone());
+        crate::services::effects::tests::fixture::clear_cycles(fixture.module);
+        test_world.with(system, move |s| {
+            let now = s.now_ms();
+            crate::services::effects::lifecycle::cycle_start(s, cycle, now);
+        }).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while crate::services::effects::tests::fixture::completed_cycles(fixture.module) < 2 {
+                assert!(test_world.after(system, 100).await);
+            }
+        }).await.expect("two scheduled booster cycles");
+        assert_eq!(crate::services::effects::tests::fixture::completed_cycles(fixture.module), 2);
+        test_world.flush_positions().await.unwrap();
+        assert_eq!(loaded(&test_db, fixture.ship, FLAG_FITTING_FIRST).await.unwrap(), None);
+        crate::services::effects::tests::fixture::clear_cycles(fixture.module);
     }).await;
     world.remove_ball(system, fixture.ship).await;
     world.unregister_pilot_generation(fixture.character, None);
     let flush = world.flush_positions().await;
     combat::forget_ship(fixture.ship);
+    combat::state().active.remove(&fixture.module);
+    combat::state().activation_generation.remove(&fixture.module);
     drop(world);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[crate::services::tests::fixture::Fixture { account: fixture.account, character: fixture.character }], &[fixture.ship, fixture.module]).await.unwrap();
     cleanup(&db, fixture).await.unwrap();
-    assert_eq!(fingerprint(&db).await.unwrap(), before);
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

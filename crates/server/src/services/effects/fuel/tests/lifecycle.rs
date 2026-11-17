@@ -107,7 +107,11 @@ async fn scenario_run(scenario: Scenario, recorded: Arc<Mutex<Ids>>) {
         let condition = Condition { now: stats.max.map(|value| value * 0.5), stats, shield_at: crate::client::filetime_now() + 60 * infinity_core::consts::FILETIME_SECOND };
         world.with(1, move |s| s.install_condition(ids.ship, condition, fit)).await.unwrap();
         Some(before)
-    } else { None };
+    } else {
+        let condition = crate::services::combat::prepare_condition_with_fit(&db, ids.ship, &fit).await.ok().expect("resident condition").into_condition();
+        world.with(1, move |s| s.install_condition(ids.ship, condition, fit)).await.unwrap();
+        None
+    };
     let effect_id = effect.id;
     let cx = Ctx { db: db.clone(), world: world.clone(), notify: sender, char_id: ids.owner, ship_id: ids.ship, system_id: 1 };
     let generation = Arc::new(AtomicBool::new(false));
@@ -118,7 +122,8 @@ async fn scenario_run(scenario: Scenario, recorded: Arc<Mutex<Ids>>) {
     }).collect();
     let owner = ActivationOwner { master: ids.module, generation: generation.clone(), armed: true,
         combat_generations, pending_combat: None, world: Arc::downgrade(&world), system: 1 };
-    let cycle = Cycle { cx, modules, effect, target: None, repeat: 2, stop: generation, owner, started: 1, charge_type: None, cycles: 0, duration_ms: 500.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false };
+    let cycle = Cycle { cx, modules, effect, target: None, repeat: 2, stop: generation, owner, started: 1, charge_type: None, cycles: 0, duration_ms: 500.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
+        source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
     world.with(1, move |s| { let now = s.now_ms(); cycle_start(s, cycle, now); }).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -132,7 +137,10 @@ async fn scenario_run(scenario: Scenario, recorded: Arc<Mutex<Ids>>) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let speed = world.with(1, move |s| s.ball(ids.ship).map(|ball| f64::from(ball.max_vel))).await.unwrap().unwrap();
-                events.extend(std::iter::from_fn(|| destiny_rx.try_recv().ok()).flatten());
+                events.extend(std::iter::from_fn(|| destiny_rx.try_recv().ok()).flat_map(|delivery| match delivery {
+                    crate::space::SceneDelivery::Destiny(batch) => batch,
+                    crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+                }));
                 let mut boosted = false;
                 let restored = events.iter().any(|event| {
                     let value = match event {
@@ -167,7 +175,10 @@ async fn scenario_run(scenario: Scenario, recorded: Arc<Mutex<Ids>>) {
     let notices: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
     assert_eq!(notices.iter().filter(|(name, args)| name == "OnGodmaShipEffect" && args.first() == Some(&Value::Int(ids.module)) && args.get(1) == Some(&Value::Int(effect_id)) && args.get(3) == Some(&Value::Int(0))).count(), 1);
     let item_notices: Vec<_> = notices.iter().filter(|(name, _)| name == "OnItemChange").collect();
-    events.extend(std::iter::from_fn(|| destiny_rx.try_recv().ok()).flatten());
+    events.extend(std::iter::from_fn(|| destiny_rx.try_recv().ok()).flat_map(|delivery| match delivery {
+        crate::space::SceneDelivery::Destiny(batch) => batch,
+        crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+    }));
     let calls: Vec<_> = events.iter().filter_map(|event| match event {
         Value::Tuple(stamped) => match stamped.get(1) { Some(Value::Tuple(call)) => Some(call), _ => None },
         _ => None,
@@ -199,6 +210,9 @@ async fn scenario_run(scenario: Scenario, recorded: Arc<Mutex<Ids>>) {
         if matches!(scenario, Scenario::Propulsion) {
             assert!(speeds.iter().any(|speed| *speed > baseline_speed));
             assert!(speeds.iter().any(|speed| (*speed - baseline_speed).abs() <= baseline_speed * 1e-10));
+            assert!(speeds.windows(2).any(|pair| pair[0] > baseline_speed
+                && (pair[1] - baseline_speed).abs() <= baseline_speed * 1e-10),
+                "no SetMaxSpeed boost followed by baseline restore: {speeds:?}");
         }
         assert_eq!(item_notices.len(), 2);
         for (notice, old) in item_notices.iter().zip([6_i64, 4]) {

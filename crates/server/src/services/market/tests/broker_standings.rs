@@ -106,7 +106,7 @@ async fn broker_standings_placement_and_repricing() {
                         ("typeID", Value::Int(order.type_id.into())), ("range", Value::Int(order.range)),
                         ("orderID", Value::Int(order.id)), ("volEntered", Value::Int(order.vol_entered.into())),
                         ("minVolume", Value::Int(order.min_volume.into())), ("bid", Value::Bool(order.bid)),
-                        ("issueDate", Value::Int(order.issued.unwrap_or_else(today))), ("duration", Value::Int(order.duration)),
+                        ("issueDate", Value::Int(order.issued.unwrap_or_else(|| filetime_day_start(filetime_now())))), ("duration", Value::Int(order.duration)),
                         ("stationID", Value::Int(order.at.id)), ("regionID", Value::Int(order.at.region)),
                         ("solarSystemID", Value::Int(order.at.system)), ("constellationID", Value::Int(order.at.constellation)),
                         ("jumps", Value::Int(0)),

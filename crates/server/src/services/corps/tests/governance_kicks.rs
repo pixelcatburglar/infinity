@@ -80,7 +80,7 @@ async fn issuer_revocation_and_stale_work_preserve_replacement_intent() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run alone"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run this exact test in its own process"]
 async fn held_hq_role_kick_persists_pending_without_delivery() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -135,7 +135,7 @@ async fn held_hq_role_kick_persists_pending_without_delivery() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run alone"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run this exact test in its own process"]
 async fn all_scoped_direct_and_grantable_rights_defer_real_kick() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -197,7 +197,7 @@ async fn all_scoped_direct_and_grantable_rights_defer_real_kick() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and a fresh isolated test process"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL; run this exact test in its own process"]
 async fn nondefault_cooldown_drives_real_admission_and_restart() {
     use std::{fs, path::PathBuf};
     let path: PathBuf = std::env::temp_dir().join(format!("infinity-corp-config-{}", std::process::id()));
@@ -208,6 +208,7 @@ async fn nondefault_cooldown_drives_real_admission_and_restart() {
     fs::remove_file(&path).ok();
     let database = crate::config::deployment::DatabaseConfig {
         url: std::env::var("INFINITY_TEST_DATABASE_URL").expect("INFINITY_TEST_DATABASE_URL must name a dedicated test database"),
+        schema_downgrade_guard: false,
         ..Default::default()
     };
     let db = Db::connect(&database).await.unwrap();
@@ -250,7 +251,7 @@ async fn nondefault_cooldown_drives_real_admission_and_restart() {
 }
 
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run alone"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock; run this exact test in its own process"]
 async fn due_space_job_waits_for_current_generation_logoff_once() {
     use infinity_core::session::OnlineSession;
     use crate::{chat::Hub, services::{identity::Identity, presence}};

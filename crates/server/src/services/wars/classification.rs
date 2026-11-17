@@ -38,5 +38,5 @@ pub(crate) async fn index(ex: &(impl Executor + ?Sized), kill_id: i64, victim_co
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

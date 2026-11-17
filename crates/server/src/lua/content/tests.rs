@@ -5,9 +5,8 @@ use super::*;
 fn package(source: &[u8]) -> Arc<Package> {
     let data = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/lua/content/sovereignty/data/policy.json")).to_vec();
     Arc::new(Package {
-        namespace: "sovereignty".into(), version: "1".into(), fingerprint: [0; 32],
-        registration: Vec::new(), source: source.to_vec(),
-        domain: PackageDomain::Sovereignty(policy::Values::parse(&data, "1").unwrap()), data,
+        row: package_row("sovereignty".into(), "1".into(), Vec::new(), source.to_vec(), data.clone()).unwrap(),
+        domain: PackageDomain::Sovereignty(policy::Values::parse(&data, "1").unwrap()),
         config: LuaConfig { call_budget_instructions: 10_000, instruction_hook_interval: 100, ..Default::default() },
     })
 }
@@ -107,7 +106,7 @@ fn duplicate_unknown_and_late_registrations_fail() {
     env.set("register", register.clone()).unwrap();
     let definitions = Arc::new(Mutex::new(ContentDefinitions::default()));
     let open = Arc::new(AtomicBool::new(true));
-    super::register(&lua, &register, definitions, open.clone(), &root, "sovereignty_content", source.to_vec(), &LuaConfig::default(), None, Arc::new(crate::sde::Sde::default())).unwrap();
+    super::register(&lua, &register, definitions, open.clone(), &root, "sovereignty_content", source.to_vec(), &LuaConfig::default(), None, Arc::new(crate::sde::Sde::default()), Arc::new(CanonicalPackages::default())).unwrap();
     lua.load(source.as_slice()).set_environment(env.clone()).exec().unwrap();
     assert!(lua.load(source.as_slice()).set_environment(env.clone()).exec().is_err());
     assert!(lua.load("register.content{key='other',schema_version=1,content_version='1',datasets={},state_schema='sovereignty_policy_v1',operations={},progress_rules={}}").set_environment(env.clone()).exec().is_err());
@@ -195,7 +194,9 @@ fn content_handles_are_immutable_and_load_only() {
     let open = Arc::new(AtomicBool::new(true));
     install_data(&lua, &env, None, open.clone()).unwrap();
     assert!(lua.load("return content.data('shipadaptionnodes') == nil").set_environment(env.clone()).eval::<bool>().unwrap());
-    let bundle = Arc::new(bundle::Bundle { manifest: Vec::new(), files: Default::default(), parsed: Default::default(), chip_types: Vec::new() });
+    assert!(lua.load("return content.data('sovereigntyindices') == nil").set_environment(env.clone()).eval::<bool>().unwrap());
+    assert!(lua.load("return content.data('not_a_dataset')").set_environment(env.clone()).eval::<Value>().is_err());
+    let bundle = Arc::new(bundle::Bundle { manifest: Vec::new(), files: Default::default(), parsed: [("shipadaptionnodes".to_owned(), vec![])].into_iter().collect(), chip_types: Vec::new() });
     install_data(&lua, &env, Some(bundle), open.clone()).unwrap();
     assert!(lua.load("local x = content.data('shipadaptionnodes'); x.name = 'other'").set_environment(env.clone()).exec().is_err());
     open.store(false, Ordering::Release);

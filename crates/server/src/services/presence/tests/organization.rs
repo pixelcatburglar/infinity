@@ -44,7 +44,12 @@ async fn affiliation_reaches_running_actor_without_loading_offline_system() {
         }
         let (destiny, mut updates) = tokio::sync::mpsc::unbounded_channel();
         test_world.observe(system_id, observer, other_hull, destiny).await.unwrap();
-        while updates.try_recv().is_ok() {}
+        while let Ok(delivery) = updates.try_recv() {
+            match delivery {
+                crate::space::SceneDelivery::Destiny(_) => {}
+                crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+            }
+        }
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let identity = Identity { char_id: pilot, corp_id: 1, ship_id: Some(hull), station_id: None, system_id: Some(system_id) };
         let previous = OnlineSession { character_id: pilot, user_id: Some(account), session_id: 1, ship_id: Some(hull), station_id: None, system_id: Some(system_id), corporation_id: Some(1), alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
@@ -60,7 +65,10 @@ async fn affiliation_reaches_running_actor_without_loading_offline_system() {
         let (updated, untouched, upper_tick) = test_world.with(system_id, move |s| (s.pilot_ball(pilot).unwrap().clone(), s.pilot_ball(observer).unwrap().clone(), s.current_time())).await.unwrap();
         assert_eq!((updated.id, updated.corp_id, updated.alliance_id), (hull, corp, alliance));
         assert_eq!((untouched.id, untouched.corp_id, untouched.alliance_id), (other_hull, 1, -1));
-        let event = std::iter::from_fn(|| updates.try_recv().ok()).flatten().find(|v| v.items().and_then(|parts| parts.get(1)).and_then(Value::items).and_then(|call| call.first()).and_then(Value::as_text).is_some_and(|name| name == "OnSlimItemChange")).unwrap();
+        let event = std::iter::from_fn(|| updates.try_recv().ok()).flat_map(|delivery| match delivery {
+            crate::space::SceneDelivery::Destiny(batch) => batch,
+            crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+        }).find(|v| v.items().and_then(|parts| parts.get(1)).and_then(Value::items).and_then(|call| call.first()).and_then(Value::as_text).is_some_and(|name| name == "OnSlimItemChange")).unwrap();
         let parts = event.items().unwrap();
         let tick = parts[0].as_int().unwrap();
         assert!((lower_tick..=upper_tick).contains(&tick));

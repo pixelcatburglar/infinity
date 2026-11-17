@@ -37,11 +37,11 @@ fn compressed_group_roundtrip_and_limits() {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&marshal::dumps(&group)).unwrap();
     let compressed = encoder.finish().unwrap();
-    assert_eq!(marshal::loads(&crate::framing::inflate(&compressed).unwrap()).unwrap(), group);
-    assert!(crate::framing::inflate(b"not zlib").is_err());
+    assert_eq!(marshal::loads(&infinity_wire::framing::inflate(&compressed).unwrap()).unwrap(), group);
+    assert!(infinity_wire::framing::inflate(b"not zlib").is_err());
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&vec![0; crate::framing::MAX_PACKET + 1]).unwrap();
-    assert!(crate::framing::inflate(&encoder.finish().unwrap()).is_err());
+    encoder.write_all(&vec![0; infinity_wire::framing::MAX_PACKET + 1]).unwrap();
+    assert!(infinity_wire::framing::inflate(&encoder.finish().unwrap()).is_err());
 }
 
 #[test]

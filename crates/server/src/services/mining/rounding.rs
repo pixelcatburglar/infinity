@@ -75,5 +75,5 @@ pub(crate) fn mining_result(
     Ok(MiningResult { normal_quantity, wasted_quantity, critical_hit_quantity })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

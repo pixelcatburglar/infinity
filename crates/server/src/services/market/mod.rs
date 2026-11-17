@@ -27,12 +27,15 @@
 //! their journal captions identify the authorizing actor, while trade entries identify financial owners.
 //! Escrow consumption itself does not move cash or produce a wallet journal entry.
 //! Committed fills and newly resting orders queue Lua events.
+//! Process-wide economy serialization is unchanged; its gate also keeps windowed
+//! wait/hold/caller diagnostics, summarized in the server log (see
+//! economy_lock).
 
 use crate::dao::market::orders::{self, Order, Station};
 use crate::dao::market::trading as trading_dao;
 use crate::dao::market::listings::{self, Area};
 use super::{crowset, db_err, keyval, notify_error, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_day_start, filetime_now, Client};
 use infinity_core::consts::FILETIME_DAY;
 use infinity_core::consts::{OWNER_SCC, REF_BROKER_FEE, REF_MARKET_ESCROW, REF_MARKET_TRANSACTION};
 use crate::dao::wallets::{accounts, journal::Entry};
@@ -87,6 +90,7 @@ pub(crate) struct ModifyRequest {
     pub(crate) range: i64, pub(crate) remaining: i64, pub(crate) issued: i64,
     pub(crate) requested_scope: orders::MarketScope,
 }
+pub(crate) mod economy_lock;
 mod fees;
 pub(crate) mod lifecycle;
 mod lists;
@@ -162,17 +166,22 @@ fn valid_duration(duration: i64, now: i64) -> bool {
 
 
 
-fn today() -> i64 {
-    filetime_now() / FILETIME_DAY * FILETIME_DAY
-}
-
 
 // ---------------------------------------------------------------- trading
 
-/// Trades run one at a time, so each sees the book as the last one left it.
-pub(crate) async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(Default::default).lock().await
+/// Trades run one at a time, so each sees the book as the last one left it. The
+/// caller location is captured synchronously so diagnostics name the site that
+/// asked for the lock; the returned future performs initialization, timing and
+/// the actual lock wait on first poll.
+#[track_caller]
+pub(crate) fn lock() -> impl std::future::Future<Output = economy_lock::Guard> + Send {
+    let caller = std::panic::Location::caller();
+    async move {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        economy_lock::acquire(
+            LOCK.get_or_init(Default::default), economy_lock::state(), caller,
+        ).await
+    }
 }
 
 
@@ -257,7 +266,7 @@ fn order_keyval(o: &Order) -> Value {
         ("minVolume", Value::Int(o.min_volume)),
         ("bid", Value::Bool(o.bid)),
         ("duration", Value::Int(o.duration)),
-        ("issueDate", Value::Int(o.issued.unwrap_or_else(today))),
+        ("issueDate", Value::Int(o.issued.unwrap_or_else(|| filetime_day_start(filetime_now())))),
     ])
 }
 
@@ -265,5 +274,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     market_proxy::dispatch(c, call).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

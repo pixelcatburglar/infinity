@@ -1,11 +1,13 @@
 //! Ship health and memory-only capacitor state; routing lives in the parent module.
 //! The client reads capacitor charge through clientDogmaLocation; player attributes come
-//! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
-//! Ordinary warp debits the same balance synchronously at its activation boundary.
+//! from the actor's resident fit through the shared gate and NPC attributes from the SDE.
+//! Capacitor state is not persisted; ordinary warp debits and GM refills use the same
+//! in-memory authority.
 //! Guarded capacitor mutations validate source and range in the system actor; remote
 //! injections also respect active Entosis assistance restrictions on capital hulls.
 //! NPC death is journaled before native removal; bounty and wreck processing follow separately.
-//! NPC bounty net and corporation tax commit together; wallet notices and events follow commit.
+//! NPC bounty joins the pilot's per-character batch pool; wallet, tax, journal
+//! and security settle at the batch deadline. Wreck and loot are unchanged.
 //! NPC repairs use actor-owned condition and are not persisted. Persistent ships and
 //! drones publish live condition from their actor and checkpoint it in batches.
 //! Positive pilot damage with a supplied source ball emits after actor health update or actual removal.
@@ -14,6 +16,9 @@ use infinity_core::consts::CATEGORY_MODULE;
 pub(crate) mod death;
 pub(crate) use death::settle_npc_loss;
 
+/// Server loot policy: wreck loot candidates are priced from the loot minimum up to
+/// the bounty, but never below this ceiling, so a tiny bounty still samples a modest range.
+const NPC_LOOT_MINIMUM_CEILING: f64 = 50_000.0;
 
 // ---------------------------------------------------------------- capacitor and hit points
 
@@ -30,15 +35,15 @@ pub(crate) fn recharge(level: f64, max: f64, tau_ms: f64, dt: f64) -> f64 {
 
 
 /// Use `amount` of the ship's capacitor; false (and nothing used) when there isn't enough.
-pub(in crate::services) fn drain_capacitor(cx: &Ctx, fit: &Fit, amount: f64) -> bool {
+/// `capacity` and `tau` are the typed values the capture or gate already supplied.
+pub(in crate::services) fn drain_capacitor(cx: &Ctx, capacity: f64, tau: f64, amount: f64) -> bool {
     if !amount.is_finite() || amount <= 0.0 {
         return true;
     }
-    let (max, tau) = (fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(Key::Ship, ATTR_RECHARGE_RATE));
     let now = filetime_now();
     let current = {
         let mut st = state();
-        let result = mutate(&mut st.capacitor, cx.ship_id, max, tau, now, Operation::RefuseDrain(amount));
+        let result = mutate(&mut st.capacitor, cx.ship_id, capacity, tau, now, Operation::RefuseDrain(amount));
         if result.amount < amount {
             return false;
         }
@@ -60,6 +65,7 @@ enum Operation {
     Inject(f64),
     Drain(f64),
     RefuseDrain(f64),
+    Fill,
 }
 
 struct Mutation {
@@ -91,9 +97,16 @@ fn mutate(entries: &mut HashMap<i64, (f64, i64)>, ship: i64, capacity: f64, tau:
             }
             (before - amount, amount)
         }
+        Operation::Fill => (capacity, capacity - before),
     };
     entries.insert(ship, (after, now));
     Mutation { before, after, amount }
+}
+/// Fill a ship's capacitor after applying all recharge elapsed since its anchor.
+pub(crate) fn fill_capacitor(ship: i64, capacity: f64, tau: f64, at: i64) -> (f64, f64) {
+    let mut st = state();
+    let result = mutate(&mut st.capacitor, ship, capacity, tau, at, Operation::Fill);
+    (result.before, result.after)
 }
 /// Result of an atomic recharge and partial capacitor debit for warp.
 pub(crate) struct WarpCapacitorDrain {
@@ -141,12 +154,16 @@ pub(crate) enum NpcCapacitorGuard {
     Assistance { source: i64, hostile: i64, target: i64, generation: u64, optimal: f64, falloff: f64 },
     DroneAssistance { source: i64, target: i64, generation: u64, optimal: f64, falloff: f64, owner: i64 },
     Attack { source: i64, target: i64, source_guard: Option<crate::services::effects::space_source::SourceGuard>, player: Option<(i64, i64, std::sync::Arc<std::sync::atomic::AtomicBool>)>, optimal: f64, falloff: f64, offensive: bool },
+    /// One superweapon's warmup neutralization: only the firing activation's
+    /// generation and source identity are required, never a target lock.
+    SuperWeapon { source: i64, character: i64, module: i64, generation: std::sync::Arc<std::sync::atomic::AtomicBool> },
 }
 
 impl NpcCapacitorGuard {
     fn source(&self) -> i64 {
         match self {
-            Self::Assistance { source, .. } | Self::DroneAssistance { source, .. } | Self::Attack { source, .. } => *source,
+            Self::Assistance { source, .. } | Self::DroneAssistance { source, .. } | Self::Attack { source, .. }
+            | Self::SuperWeapon { source, .. } => *source,
         }
     }
 
@@ -185,66 +202,122 @@ impl NpcCapacitorGuard {
                     let distance = (crate::space::dist(me.pos, other.pos) - f64::from(me.radius) - f64::from(other.radius)).max(0.0);
                     crate::services::effects::npc_capacitor::in_range(distance, optimal, falloff)
                 }),
+            Self::SuperWeapon { source, character, module, generation } =>
+                !generation.load(std::sync::atomic::Ordering::Relaxed)
+                && s.pilot_ball(character).is_some_and(|ball| ball.id == source && ball.mode != crate::space::MODE_WARP)
+                && state().active.get(&module).is_some_and(|active| std::sync::Arc::ptr_eq(&active.stop, &generation)),
         }
     }
 }
 
 
-async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op: Operation, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64, Option<i64>)>, CallError> {
-    let Some((type_id, pilot)) = world.with(system, move |s| s.ball(ship).map(|b| (b.type_id, b.char_id))).await.flatten() else {
-        return Ok(None);
-    };
-    let (capacity, tau, revision) = if let Some(pilot) = pilot {
-        let fit = Fit::load_in_space(db, world, system, pilot, ship).await?;
-        (fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(Key::Ship, ATTR_RECHARGE_RATE), fit.projection_revision())
+/// One capacitor operation executed inside the system actor's own turn: the
+/// gate prepares current defense with the same body membership; a miss refuses.
+fn capacitor_operation_in_actor(s: &mut crate::space::System, sde: &crate::sde::Sde, ship: i64, op: Operation, resistance_attribute: Option<i32>, guard: Option<NpcCapacitorGuard>) -> Option<(CapacitorSnapshot, f64, Option<i64>)> {
+    let ball = s.ball(ship)?;
+    let (type_id, pilot) = (ball.type_id, ball.char_id);
+    let drone = s.drone(ship);
+    // Player-piloted ships, owned drones and persistent unpiloted hulls with a
+    // resident record read through the fit gate; a gate miss refuses instead of
+    // falling back. NPCs and unowned drones keep the original SDE type values.
+    let resident = pilot.is_some()
+        || drone.as_ref().is_some_and(|drone| drone.owner != infinity_core::consts::OWNER_UNOWNED)
+        || (drone.is_none() && s.persistent_generation(ship).is_some());
+    let (capacity, tau) = if resident {
+        s.with_combat_fit(ship, |fit, key, _| {
+            (fit.value(key, ATTR_CAPACITOR_CAPACITY), fit.value(key, ATTR_RECHARGE_RATE))
+        })?
     } else {
-        (attr(world.sde(), type_id, ATTR_CAPACITOR_CAPACITY, 0.0), attr(world.sde(), type_id, ATTR_RECHARGE_RATE, 0.0), None)
+        (attr(sde, type_id, ATTR_CAPACITOR_CAPACITY, 0.0), attr(sde, type_id, ATTR_RECHARGE_RATE, 0.0))
     };
     let capacity = if capacity.is_finite() { capacity.max(0.0) } else { 0.0 };
-    Ok(world.with(system, move |s| {
-        let ball = s.ball(ship)?;
-        if (ball.type_id, ball.char_id) != (type_id, pilot)
-            || revision.is_some_and(|revision| s.projection_revision(ship) != revision)
-            || guard.as_ref().is_some_and(|guard| !guard.valid(s))
-            || matches!(op, Operation::Inject(_)) && guard.as_ref().is_some_and(|guard|
-                guard.source() != ship && crate::space::sovereignty::links::assistance_blocked(s, ship))
-        {
-            return None;
+    // The gate may have expired inputs or rebased outputs; re-read the ball
+    // identity and guards inside the same actor turn before mutating.
+    let ball = s.ball(ship)?;
+    if (ball.type_id, ball.char_id) != (type_id, pilot)
+        || guard.as_ref().is_some_and(|guard| !guard.valid(s))
+        || matches!(op, Operation::Inject(_)) && guard.as_ref().is_some_and(|guard|
+            guard.source() != ship && crate::space::sovereignty::links::assistance_blocked(s, ship))
+    {
+        return None;
+    }
+    let op = match resistance_attribute {
+        Some(attribute) => {
+            let factor = s.with_combat_fit(ship, |fit, key, _| fit.value(key, attribute)).unwrap_or(1.0);
+            match op { Operation::Inject(amount) => Operation::Inject(amount * factor), Operation::Drain(amount) => Operation::Drain(amount * factor), other => other }
         }
-        let result = {
-            let mut st = state();
-            mutate(&mut st.capacitor, ship, capacity, tau, filetime_now(), op)
-        };
-        if let Some(pilot) = pilot.filter(|_| result.amount > 0.0) {
-            let change = attribute_change(pilot, Value::Int(ship), ATTR_CHARGE, Value::Float(result.after), Value::Float(result.before));
-            s.notify_pilot(pilot, "OnModuleAttributeChanges", vec![Value::list([change])]);
-        }
-        if let Some(NpcCapacitorGuard::Attack { source, target, offensive: true, .. }) = &guard {
-            if ship == *target { s.drone_attack(*source, *target); }
-        }
-        Some((CapacitorSnapshot { capacity, level: result.after }, result.amount, s.combat_owner(ship)))
-    }).await.flatten())
+        None => op,
+    };
+    let result = {
+        let mut st = state();
+        mutate(&mut st.capacitor, ship, capacity, tau, filetime_now(), op)
+    };
+    if let Some(pilot) = pilot.filter(|_| result.amount > 0.0) {
+        let change = attribute_change(pilot, Value::Int(ship), ATTR_CHARGE, Value::Float(result.after), Value::Float(result.before));
+        s.notify_pilot(pilot, "OnModuleAttributeChanges", vec![Value::list([change])]);
+    }
+    if let Some(NpcCapacitorGuard::Attack { source, target, offensive: true, .. }) = &guard {
+        if ship == *target { s.drone_attack(*source, *target); }
+    }
+    Some((CapacitorSnapshot { capacity, level: result.after }, result.amount, s.combat_owner(ship)))
+}
+
+async fn capacitor_operation(_db: &Db, world: &World, system: i64, ship: i64, op: Operation, resistance_attribute: Option<i32>, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64, Option<i64>)>, CallError> {
+    let sde = world.sde().clone();
+    Ok(world.with(system, move |s| capacitor_operation_in_actor(s, &sde, ship, op, resistance_attribute, guard)).await.flatten())
 }
 
 /// Return the current capacitor for a ship present in the system.
 pub(crate) async fn capacitor_snapshot(db: &Db, world: &World, system: i64, ship: i64) -> Result<Option<CapacitorSnapshot>, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None).await?.map(|(snapshot, _, _)| snapshot))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None, None).await?.map(|(snapshot, _, _)| snapshot))
 }
 
 /// Inject energy, returning the amount accepted.
 pub(crate) async fn inject(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None, None).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
 /// Inject energy only while the source and range guard remain valid.
-pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), Some(guard)).await?.map_or(0.0, |(_, amount, _)| amount))
+pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, resistance_attribute: Option<i32>, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), resistance_attribute, Some(guard)).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
 /// Drain only while the guarded attack remains valid. `None` means refused;
 /// an accepted drain can have a zero amount.
-pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<Option<(f64, Option<i64>)>, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), Some(guard)).await?.map(|(_, amount, owner)| (amount, owner)))
+pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, resistance_attribute: Option<i32>, guard: NpcCapacitorGuard) -> Result<Option<(f64, Option<i64>)>, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), resistance_attribute, Some(guard)).await?.map(|(_, amount, owner)| (amount, owner)))
+}
+
+/// One superweapon warmup neutralization inside the system actor's own turn:
+/// every ball inside `radius` of `center` except `source` loses `amount`
+/// scaled by its signature factor against `signature_radius` and by its fitted
+/// resistance attribute `resistance_attr`, through the same resident-fit gate
+/// and pilot notifications as every other capacitor debit. The
+/// source-generation `guard` admits each debit; no target lock is required and
+/// nothing here touches the database.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drain_area_in_actor(
+    s: &mut crate::space::System, sde: &crate::sde::Sde,
+    source: i64, center: crate::space::V3, radius: f64, amount: f64,
+    signature_radius: f64, resistance_attr: i32, guard: &NpcCapacitorGuard,
+) {
+    if !radius.is_finite() || radius < 0.0 || !amount.is_finite() || amount <= 0.0 { return; }
+    let victims: Vec<i64> = s.balls()
+        .filter(|ball| ball.id != source)
+        .filter(|ball| s.sample_position(ball.id).is_some_and(|pos| crate::space::dist(pos, center) <= radius))
+        .map(|ball| ball.id)
+        .collect();
+    for victim in victims {
+        let signature = s.sampled_ball(victim)
+            .map(|ball| crate::services::effects::weapons::target_signature(sde, &ball))
+            .unwrap_or(0.0);
+        let factor = if signature_radius > 0.0 { (signature / signature_radius).clamp(0.0, 1.0) } else { 1.0 };
+        let resistance = s.with_combat_fit(victim, |fit, key, _stamp| fit.value(key, resistance_attr))
+            .unwrap_or_else(|| attr(sde, s.ball(victim).map(|ball| ball.type_id).unwrap_or(0), resistance_attr, 0.0));
+        let scaled = amount * factor * (1.0 - resistance).max(0.0);
+        if scaled <= 0.0 { continue; }
+        capacitor_operation_in_actor(s, sde, victim, Operation::Drain(scaled), None, Some(guard.clone()));
+    }
 }
 
 /// A ship's hit points and resistances, from its fit.
@@ -326,9 +399,7 @@ pub(crate) async fn set_damage(c: &Client, system: i64, ship: i64, char_id: i64,
         Some((old, now))
     }).await.flatten();
     if let Some((old, now)) = changed {
-        let ids = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
-        let changes = (0..3).map(|i| attribute_change(char_id, Value::Int(ship), ids[i],
-            Value::Float(now[i]), Value::Float(old[i]))).collect();
+        let changes = health_changes(char_id, ship, now, old);
         c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
     }
     Ok(())
@@ -348,35 +419,43 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
     if let Some(pilot) = killer.filter(|_| bounty > 0.0) {
         let payout = bounty_payout(bounty, crate::config::game().combat.bounty_multiplier)
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("nonfinite bounty payout for NPC type {}", npc.type_id)))?;
-        if payout > 0.0 {
-            let _lock = super::super::market::lock().await;
-            db.transaction(
-                |tx, outbox: &mut Outbox| Box::pin(async move {
-                    super::super::corps::tax::settle_reward(tx, outbox, pilot, payout, None).await
-                }),
-                |value, outbox| async move { dispatch_world(value, outbox, world) },
-            ).await?;
-            info!("{pilot} earned {payout:.0} ISK bounty for {}", npc.type_id);
+        let rounded_payout = super::super::market::round2(payout);
+        if !rounded_payout.is_finite() {
+            return Err(CallError::Internal(anyhow::anyhow!("corporation reward overflow")));
         }
-        super::super::crimewatch::npc_killed(db, world, pilot).await?;
+        // A zero multiplier or a payout rounding to zero cents still counts as
+        // one kill for the batch's security settlement.
+        let gross = crate::isk::IskAmount::from_isk(rounded_payout)?;
+        // The kill records into the character's durable batch; wallet, tax,
+        // journal and security settle at the batch deadline. A pool record
+        // failure must not prevent the wreck below.
+        match world.record_npc_bounty(system, pilot, npc.type_id, gross, filetime_now()).await {
+            Ok(()) => info!("{pilot} earned {payout:.0} ISK bounty for {}", npc.type_id),
+            Err(error) => warn!("bounty pool record for {pilot}: {}", match error {
+                CallError::Internal(e) => format!("{e:#}"),
+                CallError::User { msg, .. } => msg,
+            }),
+        }
     }
     let sde = world.sde();
     let Some(npc_type) = sde.types.get(npc.type_id) else { return Ok(()) };
     let Some(wreck_type) = npc_type.group_id.and_then(|group| sde.wrecks.get(group, npc_type.race_id.unwrap_or(0))) else { return Ok(()) };
     let owner = killer.unwrap_or(npc.owner_id);
-    spawn_wreck(db, world, system, wreck_type, owner, npc.corp_id, npc.pos, Some(bounty)).await?;
+    spawn_wreck(db, world, system, wreck_type, owner, npc.corp_id, npc.pos, Some(npc.id), Some(bounty)).await?;
     Ok(())
 }
 
-/// Create an inventory-backed wreck with the normal NPC loot selection.
-pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type: i32, owner: i64, corp: i64, pos: crate::space::V3, bounty: Option<f64>) -> Result<i64, CallError> {
+/// Create an inventory-backed wreck, linking a destroyed source ship when supplied,
+/// with the normal NPC loot selection.
+pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type: i32, owner: i64, corp: i64, pos: crate::space::V3, source_ship: Option<i64>, bounty: Option<f64>) -> Result<i64, CallError> {
     let sde = world.sde();
     let radius = sde.types.get(wreck_type).and_then(|t| t.radius).unwrap_or(100.0);
     let wreck_id = crate::dao::items::creation::positioned(db, wreck_type, owner, system, pos).await.map_err(db_err)?;
     // Loot: one or two modules or ammo stacks that traded on Serenity, worth up to the bounty.
     let picks = 1 + (rand01() * 2.0) as i64;
-    let mut loot: Vec<_> = if let Some(bounty) = bounty { crate::dao::items::combat::loot(db, bounty).await.map_err(db_err)? } else { Vec::new() }.into_iter()
-        .filter_map(|r| sde.types.get(r.type_id).and_then(|t| loot_category(t.published, t.category_id).map(|category| (r.type_id, category))))
+    let mut loot: Vec<_> = bounty.into_iter()
+        .flat_map(|bounty| sde.prices.average_between(crate::sde::prices::LOOT_MINIMUM_AVERAGE, loot_ceiling(bounty)))
+        .filter_map(|row| sde.types.get(row.type_id).and_then(|t| loot_category(t.published, t.category_id).map(|category| (row.type_id, category))))
         .collect();
     for i in 0..(picks as usize).min(loot.len()) {
         let j = i + (rand01() * (loot.len() - i) as f64) as usize;
@@ -387,6 +466,9 @@ pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type:
         let quantity: i64 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i64 } else { 1 };
         crate::dao::items::combat::insert_loot(db, type_id, owner, wreck_id, quantity).await.map_err(db_err)?;
     }
+    let mut slim = Vec::with_capacity(1 + usize::from(source_ship.is_some()));
+    slim.push(("isEmpty", Value::Bool(loot.is_empty())));
+    if let Some(source_ship) = source_ship { slim.push(("launcherID", Value::Int(source_ship))); }
     let ball = Ball {
         id: wreck_id,
         type_id: wreck_type,
@@ -419,20 +501,26 @@ pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type:
         cloak_until: 0,
         health: [1.0; 3],
         launcher: 0,
-        slim: vec![("isEmpty", Value::Bool(loot.is_empty()))],
+        slim,
     };
     world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     debug!("wreck {wreck_id} ({wreck_type}) with {} loot stacks", loot.len());
     Ok(wreck_id)
 }
 
+/// Upper price bound of one NPC's loot candidates. A NaN static bounty stays NaN: prices
+/// keep PostgreSQL float ordering, where NaN sorts above every number, so the range is open-ended.
+fn loot_ceiling(bounty: f64) -> f64 {
+    if bounty.is_nan() { bounty } else { bounty.max(NPC_LOOT_MINIMUM_CEILING) }
+}
+
 fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> {
     category.filter(|&id| published == Some(true) && (id == CATEGORY_MODULE || id == CATEGORY_CHARGE))
 }
 
-#[cfg(test)] mod loot_tests;
-#[cfg(test)] pub(in crate::services) mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod loot_tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;
 
 
 
-#[cfg(test)] mod damage_tests;
+#[cfg(all(test, feature = "tests-combat"))] mod damage_tests;

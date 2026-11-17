@@ -79,7 +79,7 @@ async fn scenario(pending_cap: bool) {
         assert_states(f, &keys[1..], false).await;
         if pending_cap {
             assert_eq!(instances::get(&f.db, f.owner.character, &target.goal_id).await.unwrap().unwrap().progress, 1);
-            assert_eq!(journal::pending_for_character(&f.db, &keys[0].consumer_key, f.owner.character, 14).await.unwrap().len(), 13);
+            assert_eq!(journal::pending_for_character(&f.db, &keys[0].consumer_key, f.owner.character, 14, f.db.progress_registry().enabled_keys()).await.unwrap().len(), 13);
         } else {
             assert_eq!(rows(f, &bounds).await, before);
             let old_rows = instances::period(&f.db, f.owner.character, "day", old.day_start).await.unwrap();
@@ -98,7 +98,7 @@ async fn scenario(pending_cap: bool) {
         assert_states(f, &keys, true).await;
         assert!(completion(f, &target.goal_id).await);
         if pending_cap {
-            let uuid = crate::uuid_text::parse(&target.goal_id, crate::uuid_text::Case::Either).unwrap();
+            let uuid = infinity_content::uuid_text::parse(&target.goal_id, infinity_content::uuid_text::Case::Either).unwrap();
             let mut progress = Vec::new();
             while let Ok(frame) = notices.rx.try_recv() {
                 let (_, message) = crate::gateway::tests::decode_notice(&frame);

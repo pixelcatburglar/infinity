@@ -47,6 +47,9 @@ pub struct CorporationsConfig {
     pub office_slots_per_station: i64,
     /// Server minimum office rent.
     pub office_rent_base_isk: f64,
+    /// Server policy: fraction of the current rent charged to release impounded
+    /// office contents (default half); re-renting pays one period of rent without a separate release fee.
+    pub office_impound_release_fraction: f64,
     /// Additional office rent in ISK at security 1.
     pub office_rent_per_security_isk: f64,
     /// Server billing maintenance cadence in services/bills.rs.
@@ -55,6 +58,9 @@ pub struct CorporationsConfig {
     pub advance_billing_days: i64,
     /// Server policy: delay after all corporation rights are removed before exit.
     pub role_removal_cooldown_secs: i64,
+    /// Server policy: window after a decided vote closes during which the active CEO
+    /// may execute its sanctioned action (corp_ui_sanctionableactions expiry).
+    pub vote_action_window_secs: i64,
 }
 
 impl Default for CorporationsConfig {
@@ -65,10 +71,12 @@ impl Default for CorporationsConfig {
             max_bulletins: 10,
             office_slots_per_station: 24,
             office_rent_base_isk: 100000.0,
+            office_impound_release_fraction: 0.5,
             office_rent_per_security_isk: 900000.0,
             bills_maintenance_secs: 600,
             advance_billing_days: 7,
             role_removal_cooldown_secs: 86400,
+            vote_action_window_secs: 604800,
         }
     }
 }
@@ -81,12 +89,15 @@ impl CorporationsConfig {
         anyhow::ensure!(self.office_slots_per_station > 0, "corporations.office_slots_per_station={} is outside its valid domain", self.office_slots_per_station);
         anyhow::ensure!(self.office_rent_base_isk.is_finite() && self.office_rent_base_isk >= 0.0, "corporations.office_rent_base_isk={} is outside its valid domain", self.office_rent_base_isk);
         anyhow::ensure!(self.office_rent_per_security_isk.is_finite() && self.office_rent_per_security_isk >= 0.0, "corporations.office_rent_per_security_isk={} is outside its valid domain", self.office_rent_per_security_isk);
+        anyhow::ensure!(self.office_impound_release_fraction.is_finite() && (0.0..=1.0).contains(&self.office_impound_release_fraction), "corporations.office_impound_release_fraction={} is outside its valid domain", self.office_impound_release_fraction);
         anyhow::ensure!((self.office_rent_base_isk + self.office_rent_per_security_isk).is_finite(), "corporations.office_rent_base_isk={} plus corporations.office_rent_per_security_isk={} must be finite", self.office_rent_base_isk, self.office_rent_per_security_isk);
         anyhow::ensure!(self.bills_maintenance_secs > 0, "corporations.bills_maintenance_secs={} is outside its valid domain", self.bills_maintenance_secs);
         anyhow::ensure!(self.advance_billing_days > 0, "corporations.advance_billing_days={} is outside its valid domain", self.advance_billing_days);
         anyhow::ensure!(self.role_removal_cooldown_secs > 0, "corporations.role_removal_cooldown_secs={} is outside its valid domain", self.role_removal_cooldown_secs);
         super::duration("corporations.role_removal_cooldown_secs", self.role_removal_cooldown_secs, infinity_core::consts::FILETIME_SECOND, true)?;
         super::duration("corporations.advance_billing_days", self.advance_billing_days, infinity_core::consts::FILETIME_DAY, true)?;
+        anyhow::ensure!(self.vote_action_window_secs > 0, "corporations.vote_action_window_secs={} is outside its valid domain", self.vote_action_window_secs);
+        super::duration("corporations.vote_action_window_secs", self.vote_action_window_secs, infinity_core::consts::FILETIME_SECOND, true)?;
         Ok(())
     }
 }
@@ -234,6 +245,9 @@ impl CalendarConfig {
     }
 }
 
+/// Shortest nonzero idle window. A shorter cycle would reload cold systems under the shared economy lock too often.
+const MIN_IDLE_UNLOAD_SECS: i64 = 60;
+
 /// Space configuration.
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -242,6 +256,11 @@ pub struct SpaceConfig {
     pub position_snapshot_secs: i64,
     /// Server policy: mailbox depth above which a space actor logs a warning.
     pub mailbox_budget: i64,
+    /// Consecutive seconds without pilots or observers before an idle unload attempt.
+    /// Zero disables it. A restart is required.
+    pub idle_unload_secs: i64,
+    /// Consecutive unflushed loaded-snapshot periods before new loaded use pauses.
+    pub loaded_snapshot_failure_periods: i64,
     /// Server memory budget for unacknowledged sovereignty capture segments per system.
     pub sovereignty_max_pending_segments: usize,
     /// Server policy: optional sphere collisions; detailed collision shapes are unavailable.
@@ -255,6 +274,8 @@ impl Default for SpaceConfig {
             mailbox_budget: 10000,
             sovereignty_max_pending_segments: 1024,
             collisions: false,
+            idle_unload_secs: 1800,
+            loaded_snapshot_failure_periods: 3,
         }
     }
 }
@@ -265,6 +286,11 @@ impl SpaceConfig {
         super::milliseconds("space.position_snapshot_secs", self.position_snapshot_secs)?;
         anyhow::ensure!(self.mailbox_budget > 0, "space.mailbox_budget={} is outside its valid domain", self.mailbox_budget);
         anyhow::ensure!(self.sovereignty_max_pending_segments > 0, "space.sovereignty_max_pending_segments must be positive");
+        anyhow::ensure!(
+            self.idle_unload_secs == 0 || self.idle_unload_secs >= MIN_IDLE_UNLOAD_SECS,
+            "space.idle_unload_secs={} is outside its valid domain", self.idle_unload_secs
+        );
+        anyhow::ensure!(self.loaded_snapshot_failure_periods > 0, "space.loaded_snapshot_failure_periods={} is outside its valid domain", self.loaded_snapshot_failure_periods);
         Ok(())
     }
 }

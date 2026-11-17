@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use prost_reflect::DynamicMessage;
 use super::{context::HandlerContext, error::{FailureCode, GatewayError}, message::{message, msg_field, response_name}};
-use infinity_core::{consts::UUID_LEN, messages::gateway as text};
+use infinity_core::consts::UUID_LEN;
 use crate::{lua::gateway::{self, GatewayInvocationIdentity, GatewayMode, GatewayOperation}, services::daily_goals::{self as daily, Error, Resources}, space::World};
 
 pub(crate) const ADMIN_PROGRESS: &str = "eve_public.dailygoal.api.admin.ProgressRequest";
@@ -32,26 +32,26 @@ pub(super) fn validate() -> anyhow::Result<()> {
 
 pub(super) fn unavailable(name: &str, correlation_uuid: &[u8]) -> GatewayError {
     if name == ADMIN_PROGRESS && correlation_uuid.len() != UUID_LEN {
-        GatewayError::refusal(FailureCode::BadRequest, text::INVALID_REQUEST)
+        GatewayError::refusal(FailureCode::BadRequest)
     } else if supported(name) {
         GatewayError::Internal(anyhow::anyhow!("daily goal gateway unavailable"))
     } else {
-        GatewayError::refusal(FailureCode::NotImplemented, text::NOT_IMPLEMENTED)
+        GatewayError::refusal(FailureCode::NotImplemented)
     }
 }
 
 fn error(error: Error) -> GatewayError {
     match error {
-        Error::Invalid => GatewayError::refusal(FailureCode::BadRequest, text::INVALID_REQUEST),
-        Error::Unauthenticated => GatewayError::refusal(FailureCode::Unauthorized, text::UNAUTHORIZED),
-        Error::Missing => GatewayError::refusal(FailureCode::NotFound, text::NOT_FOUND),
-        Error::Forbidden => GatewayError::refusal(FailureCode::Forbidden, text::FORBIDDEN),
+        Error::Invalid => GatewayError::refusal(FailureCode::BadRequest),
+        Error::Unauthenticated => GatewayError::refusal(FailureCode::Unauthorized),
+        Error::Missing => GatewayError::refusal(FailureCode::NotFound),
+        Error::Forbidden => GatewayError::refusal(FailureCode::Forbidden),
         Error::Unavailable => GatewayError::Internal(anyhow::anyhow!("daily goals unavailable")),
         Error::Internal(error) => GatewayError::Internal(anyhow::anyhow!("daily goals: {error:?}")),
     }
 }
 
-fn invalid() -> GatewayError { GatewayError::refusal(FailureCode::BadRequest, text::INVALID_REQUEST) }
+fn invalid() -> GatewayError { GatewayError::refusal(FailureCode::BadRequest) }
 
 fn goal_id(req: &DynamicMessage) -> Result<String, GatewayError> {
     if !req.has_field_by_name("goal") { return Err(invalid()); }
@@ -59,7 +59,7 @@ fn goal_id(req: &DynamicMessage) -> Result<String, GatewayError> {
     let value = goal.get_field_by_name("uuid").ok_or_else(invalid)?;
     let bytes: &[u8] = value.as_bytes().ok_or_else(invalid)?;
     let uuid: &[u8; UUID_LEN] = bytes.try_into().map_err(|_| invalid())?;
-    Ok(crate::uuid_text::format(uuid))
+    Ok(infinity_content::uuid_text::format(uuid))
 }
 
 enum Operation {
@@ -135,4 +135,4 @@ pub(super) async fn handle(ctx: &HandlerContext<'_>, world: &Arc<World>, name: &
     gateway::invoke_gateway(name, request, invocation, mode, operation).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

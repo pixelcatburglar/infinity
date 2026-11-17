@@ -50,5 +50,5 @@ pub(super) fn war_list(rows: &[War]) -> Value {
     Value::list(rows.iter().map(war))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

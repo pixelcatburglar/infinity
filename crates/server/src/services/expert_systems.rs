@@ -30,6 +30,6 @@ pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-skills"))]
 #[path = "expert_systems/tests.rs"]
 mod tests;

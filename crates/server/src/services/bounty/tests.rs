@@ -45,6 +45,10 @@ fn bounty_wire_row_identifies_unknown_and_affiliations() {
     assert_eq!(state.get("bounty"), Some(&Value::Float(0.0)));
     assert_eq!(state.get("corporationID"), Some(&Value::None));
     assert_eq!(state.get("allianceID"), Some(&Value::None));
+    let affiliated = Bounty { target_id: 42, amount: 0.0, corporation_id: Some(7), alliance_id: Some(9) };
+    let Value::Instance(_, state) = bounties::row(&affiliated) else { panic!("expected KeyVal"); };
+    assert_eq!(state.get("corporationID"), Some(&Value::Int(7)));
+    assert_eq!(state.get("allianceID"), Some(&Value::Int(9)));
 }
 
 #[test]
@@ -213,12 +217,12 @@ async fn payout_handler_commits_wallet_pool_notifications_and_replay() {
     }
     dao::add(&db, victim, bounties::CHARACTER, 10_000_000.0, MAX_BOUNTY).await.unwrap();
     dao::contribute(&db, victim, hunter, 10_000_000.0, now).await.unwrap();
-    let world = World::new(db.clone(), std::sync::Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
-    let (payout_tx, mut payout_rx) = tokio::sync::mpsc::unbounded_channel();
-    world.register_pilot(hunter, payout_tx);
     let inserted = db.execute("INSERT INTO game.retail_prices (type_id,average,adjusted) VALUES ($1,$2,$2) ON CONFLICT DO NOTHING", &[&ship_type, &20_000_000.0_f64]).await.unwrap();
     price_created = inserted == 1;
     assert_eq!(inserted, 1, "isolated price fixture must not overwrite an existing price");
+    let world = World::new(db.clone(), std::sync::Arc::new(crate::sde::Sde::load(&db).await.unwrap()), 0);
+    let (payout_tx, mut payout_rx) = tokio::sync::mpsc::unbounded_channel();
+    world.register_pilot(hunter, payout_tx);
     let ship = account + 4;
     db.execute("INSERT INTO game.items (item_id,type_id,owner_id,location_id,flag_id,singleton) VALUES ($1,$2,$3,0,0,true)", &[&ship, &ship_type, &victim]).await.unwrap();
     let source = crate::services::combat::damage::DamageSource { attacker_id: Some(hunter), ..Default::default() };
@@ -229,11 +233,13 @@ async fn payout_handler_commits_wallet_pool_notifications_and_replay() {
         context: crate::lua::events::resources::FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: Some(hunter), ship_type_id: Some(1), system_id: None, station_id: None, origin: crate::lua::events::resources::FactOrigin::Natural },
         exact_damage: { let mut sum = crate::lua::events::combat::amount::ExactBinarySum::default(); assert!(sum.try_add(100.0)); sum },
     }];
+    let sde = world.sde().clone();
     let result: Result<(), CallError> = db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| {
         let source = source.clone();
         let contributions = contributions.to_vec();
+        let sde = sde.clone();
         Box::pin(async move {
-            crate::services::crimewatch::ship_lost_in(tx, outbox, 0, victim, corp, ship, ship_type, &Lost::new(), &source, now, &contributions).await.map(|_| ())
+            crate::services::crimewatch::ship_lost_in(tx, outbox, &sde.prices, 0, victim, corp, ship, ship_type, &Lost::new(), &source, now, &contributions).await.map(|_| ())
         })
     }, |value, outbox| { let world = world.clone(); async move { crate::db::outbox::dispatch_world(value, outbox, &world) } }).await;
     assert!(result.is_ok());
@@ -309,7 +315,8 @@ async fn rpc(c: &mut Client, service: &str, method: &str, args: &[Value]) -> Cal
 #[tokio::test]
 #[ignore = "requires a dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn service_placement_sale_purchase_and_consumption() {
-    use crate::{conn::Conn, dao::{bounties as pools, kill_rights as rights, wallets::characters}, handshake::Login, space::World};
+    use crate::{dao::{bounties as pools, kill_rights as rights, wallets::characters}, handshake::Login, space::World};
+    use infinity_wire::conn::Conn;
     use std::sync::Arc;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();

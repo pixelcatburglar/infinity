@@ -1,6 +1,9 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 mod drone;
+mod ignore;
+mod sleep;
+#[path = "spool/tests.rs"] mod spool;
 
 fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     Ball {
@@ -161,16 +164,21 @@ fn target_loss_stops_and_notifies_beyond_double_aggro() {
     let (mut s, _, mut notify) = setup(Some(HOSTILE_TO_ALL));
     s.insert(ball(1, Some(10), 50.0));
     let (tx, mut events) = mpsc::unbounded_channel();
-    s.observe(1, 1, tx);
+    let (completed_1, mut completion_1) = tokio::sync::oneshot::channel();
+    s.observe(1, 1, tx, completed_1);
+    s.apply_scene_prefix(crate::space::collision::enabled());
+    assert_eq!(completion_1.try_recv(), Ok(true));
+    crate::space::system::tests::events::initial_state(&mut events);
+    crate::space::system::tests::events::fleet_snapshot(&mut events);
     s.tick(0);
     s.command(1, |b, _, _| { b.pos = [201.0, 0.0, 0.0]; vec![] });
     s.tick(1000);
-    events.try_recv().unwrap();
+    let _ = crate::space::system::tests::events::destiny(events.try_recv().unwrap());
     assert!(s.brains[&1000].target.is_none());
     s.tick(2000);
     assert_eq!(s.ball(1000).unwrap().mode, MODE_STOP);
     assert_eq!(s.ball(1000).unwrap().speed_fraction, 1.0);
-    let batch = events.try_recv().unwrap();
+    let batch = crate::space::system::tests::events::destiny(events.try_recv().unwrap());
     assert!(batch.iter().any(|v| {
         let Value::Tuple(parts) = v else { return false };
         let Value::Tuple(call) = &parts[1] else { return false };
@@ -234,7 +242,7 @@ fn projected_cycles_are_independent_and_stale_jobs_cannot_restore_effects() {
     assert!(s.npc_projection_valid(1000, 1, generation));
     s.upsert_projection(1, Projection { source_ship: 1000, source_module: first,
         source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     s.tick(deadline + 1000);
     assert!(matches!(jobs.try_recv().unwrap(), NpcAction::Effect { source_module, .. } if source_module == first));
     assert!(jobs.try_recv().is_err());
@@ -258,7 +266,7 @@ fn departing_npc_removes_its_projections_and_invalidates_jobs() {
     let generation = s.brains[&1000].target_generation;
     s.upsert_projection(1, Projection { source_ship: 1000, source_module: -1,
         source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     s.remove_ball(1000);
     assert!(s.projections_on(1).is_empty());
     assert!(!s.npc_projection_valid(1000, 1, generation));
@@ -444,7 +452,7 @@ fn jam_drops_completed_lock_and_invalidates_queued_projection() {
     assert!(s.npc_projection_valid(id, 1, shot_generation));
     s.upsert_projection(1, Projection { source_ship: id, source_module, source_type: 1,
         effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
-        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, scramble: None });
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None });
     assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otheradd".as_slice()));
     crate::services::combat::jamming::apply(&mut s, 1, -8_901_002, id, 4000.0);
     assert!(s.brains[&id].target.is_none());
@@ -515,7 +523,7 @@ fn lock_rejects_sampled_out_of_range_even_when_endpoint_is_inside() {
 #[tokio::test]
 async fn deferred_jobs_progress_while_npc_effects_remain_fifo() {
     let mut s = System::default();
-    start_worker(&mut s);
+    worker::start(&mut s, false);
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let release = Arc::new(Mutex::new(Some(release_rx)));

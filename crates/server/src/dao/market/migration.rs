@@ -3,10 +3,10 @@
 //! settle principal or reconstruct historical trades.
 use anyhow::{bail, Result};
 use infinity_core::consts::{CORP_HANGAR_DIVISIONS, FILETIME_DAY, FLAG_CORP_SAG1, TYPE_PLEX};
-use tokio_postgres::Transaction;
+use crate::db::executor::Executor;
 
 /// Apply the market cutover inside the caller's schema transaction, before market seeding.
-pub(crate) async fn migrate(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) async fn migrate(tx: &(impl Executor + ?Sized)) -> Result<()> {
     if cutover_complete(tx).await? {
         return Ok(());
     }
@@ -53,12 +53,12 @@ pub(crate) async fn migrate(tx: &Transaction<'_>) -> Result<()> {
     if let Some(row) = invalid {
         bail!("legacy PLEX order {} has inconsistent ownership, principal or expiry", row.get::<_, i64>("order_id"));
     }
-    tx.batch_execute(
+    tx.execute(
         "CREATE TEMP TABLE market_cutover_books (market_scope smallint, type_id integer, region_key bigint,
-             PRIMARY KEY (market_scope, type_id, region_key)) ON COMMIT DROP"
+             PRIMARY KEY (market_scope, type_id, region_key)) ON COMMIT DROP", &[]
     ).await?;
     let now = crate::client::filetime_now();
-    let today = now / FILETIME_DAY * FILETIME_DAY;
+    let today = crate::client::filetime_day_start(now);
     tx.execute(
         "WITH anchored AS (
              UPDATE game.market_orders SET issued = $2
@@ -107,7 +107,7 @@ pub(crate) async fn migrate(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn cutover_complete(tx: &Transaction<'_>) -> Result<bool> {
+async fn cutover_complete(tx: &(impl Executor + ?Sized)) -> Result<bool> {
     let exists: bool = tx.query_one(
         "SELECT to_regclass('game.market_cutover_complete') IS NOT NULL AS exists", &[],
     ).await?.get("exists");
@@ -120,12 +120,12 @@ async fn cutover_complete(tx: &Transaction<'_>) -> Result<bool> {
 }
 
 /// Refuse a startup with schema application disabled unless the cutover is already complete.
-pub(crate) async fn validate(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) async fn validate(tx: &(impl Executor + ?Sized)) -> Result<()> {
     if !cutover_complete(tx).await? {
         bail!("market cutover is incomplete; enable schema_on_start to apply game_schema.sql and complete the cutover");
     }
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

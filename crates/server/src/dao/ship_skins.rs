@@ -22,6 +22,18 @@ impl License {
     }
 }
 
+/// The changed skin IDs of one bulk permanent grant, the strict `RETURNING
+/// skin_id` projection of `grant_permanent_licenses`.
+pub(crate) struct GrantedSkin {
+    pub skin_id: i32,
+}
+
+impl GrantedSkin {
+    fn from_row(row: &Row) -> Self {
+        Self { skin_id: row.get("skin_id") }
+    }
+}
+
 pub(crate) struct Application {
     pub ship_item_id: i64,
     pub type_id: i32,
@@ -48,6 +60,9 @@ pub(crate) struct ShipState {
     pub owner_id: i64,
     pub character_id: Option<i64>,
     pub skin_id: Option<i32>,
+    /// The effective license deadline (FILETIME); `NULL` when the application
+    /// has no live license or the license is permanent.
+    pub expires_at: Option<i64>,
 }
 
 impl ShipState {
@@ -55,7 +70,7 @@ impl ShipState {
         Self {
             ship_item_id: row.get("ship_item_id"), type_id: row.get("type_id"),
             owner_id: row.get("owner_id"), character_id: row.get("character_id"),
-            skin_id: row.get("skin_id"),
+            skin_id: row.get("skin_id"), expires_at: row.get("expires_at"),
         }
     }
 }
@@ -104,8 +119,18 @@ pub(crate) async fn insert_license(ex: &(impl Executor + ?Sized), character_id: 
     Ok(ex.execute("INSERT INTO game.ship_skin_licenses (character_id, skin_id, expires_at) VALUES ($1,$2,$3) ON CONFLICT (character_id, skin_id) DO NOTHING", &[&character_id, &skin_id, &expires_at]).await? == 1)
 }
 
+/// One conditional upsert for a bulk permanent grant: each candidate is
+/// inserted when missing or set permanent when still finite, and only those
+/// changed rows are returned. Already-permanent rows fail the `WHERE` guard,
+/// so they are neither updated nor returned. `RETURNING` gives no order; the
+/// caller sorts and needs no row count or license pre-read. The caller
+/// guarantees candidate eligibility, uniqueness and the character lock.
+pub(crate) async fn grant_permanent_licenses(ex: &(impl Executor + ?Sized), character_id: i64, skin_ids: &[i32]) -> Result<Vec<GrantedSkin>, Error> {
+    Ok(ex.query("INSERT INTO game.ship_skin_licenses AS existing (character_id, skin_id, expires_at) SELECT $1, candidate.skin_id, NULL FROM unnest($2::int[]) AS candidate(skin_id) ON CONFLICT (character_id, skin_id) DO UPDATE SET expires_at = NULL WHERE existing.expires_at IS NOT NULL RETURNING skin_id", &[&character_id, &skin_ids]).await?.iter().map(GrantedSkin::from_row).collect())
+}
+
 pub(crate) async fn states_for_ships(ex: &(impl Executor + ?Sized), ship_ids: &[i64], now: i64) -> Result<Vec<ShipState>, Error> {
-    Ok(ex.query("SELECT i.item_id AS ship_item_id, i.type_id, i.owner_id, a.character_id, a.skin_id FROM game.items i LEFT JOIN (game.ship_skin_applications a JOIN game.ship_skin_licenses l ON l.character_id=a.character_id AND l.skin_id=a.skin_id AND (l.expires_at IS NULL OR l.expires_at >= $2)) ON a.ship_item_id=i.item_id AND a.character_id=i.owner_id AND i.singleton AND i.jump_clone_id IS NULL WHERE i.item_id=ANY($1) ORDER BY i.item_id", &[&ship_ids, &now]).await?.iter().map(ShipState::from_row).collect())
+    Ok(ex.query("SELECT i.item_id AS ship_item_id, i.type_id, i.owner_id, a.character_id, a.skin_id, l.expires_at FROM game.items i LEFT JOIN (game.ship_skin_applications a JOIN game.ship_skin_licenses l ON l.character_id=a.character_id AND l.skin_id=a.skin_id AND (l.expires_at IS NULL OR l.expires_at >= $2)) ON a.ship_item_id=i.item_id AND a.character_id=i.owner_id AND i.singleton AND i.jump_clone_id IS NULL WHERE i.item_id=ANY($1) ORDER BY i.item_id", &[&ship_ids, &now]).await?.iter().map(ShipState::from_row).collect())
 }
 
 pub(crate) async fn set_application(ex: &(impl Executor + ?Sized), character_id: i64, expected_ship: &Item, skin_id: i32, now: i64) -> Result<bool, Error> {
@@ -117,5 +142,5 @@ pub(crate) async fn clear_application(ex: &(impl Executor + ?Sized), character_i
     Ok(Matched::from_row(&row).matched)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

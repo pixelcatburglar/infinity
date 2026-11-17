@@ -21,7 +21,7 @@ fn warmup_and_renewal_preserve_the_original_source_proof() {
         contributor: CaptureContributor { character_id: 3, ship_id: 4, module_id: 5,
             corporation_id: 6, alliance_id: 7, source_revision: 8 },
         membership_generation: 9, activation: Arc::new(AtomicBool::new(false)),
-        range_m: 1.0, scoring: true, expires_sim: 50,
+        range_m: 1.0, scoring: true, expires_sim: 50, publication_pending: false,
     };
     super::next_cycle(&mut proof, 0, 100.0);
     assert!(!proof.scoring);

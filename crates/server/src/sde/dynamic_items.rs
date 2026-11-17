@@ -122,5 +122,5 @@ impl DynamicItems {
     pub(crate) fn get(&self, mutator: i32) -> Option<&Mutation> { self.0.get(&mutator) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

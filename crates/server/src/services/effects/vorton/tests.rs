@@ -46,6 +46,22 @@ fn arc_limit_includes_primary_and_handles_invalid_values() {
     assert_eq!(secondary_count(2.9), 1);
 }
 
+#[test]
+fn vorton_application_uses_each_target_signature_and_absolute_speed() {
+    let raw = [100.0, 50.0, 25.0, 10.0];
+    // Same raw and charge operands; only the target's signature and speed differ.
+    let slow_large = vorton_application(raw, 400.0, 100.0, 450.0, 200.0, 5.5);
+    let fast_small = vorton_application(raw, 40.0, 900.0, 450.0, 200.0, 5.5);
+    assert_ne!(slow_large, fast_small);
+    for (applied, base) in slow_large.iter().chain(&fast_small).zip(raw) {
+        assert!(*applied >= 0.0 && *applied < base);
+    }
+    // The application is deterministic: no miss or wrecking roll exists.
+    assert_eq!(vorton_application(raw, 40.0, 900.0, 450.0, 200.0, 5.5), fast_small);
+    // A large stationary target applies the unscaled raw volley.
+    assert_eq!(vorton_application(raw, 4000.0, 0.0, 450.0, 200.0, 5.5), raw);
+}
+
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE; run serially"]
 async fn chain_weapon_types_have_both_arc_attributes() {

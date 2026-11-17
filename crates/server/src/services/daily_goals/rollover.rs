@@ -65,4 +65,4 @@ fn run_batch(db: Db, world: Arc<World>, job: Job, batch: usize) -> Pin<Box<dyn F
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

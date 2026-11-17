@@ -81,5 +81,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     Some(query(c, call).await)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

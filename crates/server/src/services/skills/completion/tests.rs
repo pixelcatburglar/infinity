@@ -1,6 +1,7 @@
 //! Durable queue completion and replay regressions.
 use super::*;
 mod reconciliation;
+mod actor_inputs;
 mod expert_expiry;
 use crate::services::tests::{client, fixture};
 
@@ -31,7 +32,9 @@ async fn apply(db: &Db, sde: &Arc<Sde>, character: i64, through: i64) -> Vec<cra
             finish_tx(tx, outbox, &sde, &fences, character, through, &progress, &[]).await?;
             Ok(())
         })
-    }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("advancing timeline"))
+    }, |(), outbox| async move {
+        Ok::<_, CallError>(fixture::collected_notifications(outbox, &world))
+    }).await.unwrap_or_else(|_| panic!("advancing timeline"))
 }
 
 fn notices(entries: &[crate::db::outbox::Effect<crate::services::effects::online::OnlineChanged>], name: &str) -> usize {
@@ -450,8 +453,8 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
                     for skill in c.sde.types.iter().filter(|s| s.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()) {
                         let mut row = queue::QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut slower = row.clone();
-                        let Ok(old_end) = super::super::training::schedule(&c.sde, &mut row, &old, start) else { continue };
-                        let Ok(new_end) = super::super::training::schedule(&c.sde, &mut slower, &new, start) else { continue };
+                        let Ok(Some(old_end)) = super::super::training::schedule(&c.sde, &mut row, &old, start) else { continue };
+                        let Ok(Some(new_end)) = super::super::training::schedule(&c.sde, &mut slower, &new, start) else { continue };
                         if old_end <= expiry || new_end <= old_end { continue; }
                         let banked = super::super::training::points_at(0, row.dest_sp, start, old_end, expiry);
                         if banked <= 0 || banked >= row.dest_sp { continue; }
@@ -537,7 +540,9 @@ async fn committed_effects_follow_timeline() {
                 finish_tx(tx, outbox, &sde, &fences, f.character, 250, &progress, &[]).await?;
                 Ok(plan)
             })
-        }, |plan, outbox| async move { Ok::<_, CallError>((plan, { let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries })) }).await.unwrap_or_else(|_| panic!("applying timeline"));
+        }, |plan, outbox| async move {
+            Ok::<_, CallError>((plan, fixture::collected_notifications(outbox, &world)))
+        }).await.unwrap_or_else(|_| panic!("applying timeline"));
         let actual: Vec<String> = effects.iter().map(|effect| match effect {
             Effect::Notification(Notification::Pilot { char_id, event, args }) if *char_id == f.character && event == "OnItemChange" => {
                 let Value::DbRow { descriptor, .. } = &args[0] else { panic!("item notice is not a row") };

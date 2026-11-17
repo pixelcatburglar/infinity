@@ -1,7 +1,8 @@
 //! Player corporations (corpRegistry, bound per corporation; eve/client/script/ui/services/corporation).
 //!
 //! A character with Corporation Management can found a corporation (game.corporations, IDs
-//! from 98,000,000 like the live server's) for appConst.corporationStartupCost while docked,
+//! from the client's closed player-corporation range 98,000,000..=98,999,999) for
+//! appConst.corporationStartupCost while docked,
 //! and becomes its CEO with every role. Others join by application (or invitation) that the
 //! corporation's personnel managers, or the character, accept; members leave, or directors
 //! kick them, back to their school's NPC corporation. Membership changes reach an online
@@ -14,13 +15,17 @@
 //! Members have global, HQ, base and other role scopes, including title grants; delayed
 //! kick intents use the shared exit policy and durable scheduler.
 //! Static NPC corporations and schools come from the startup SDE. Alliances are
-//! services/alliances; titles, wallet divisions, offices, shares and general votes are supported.
+//! services/alliances; titles, wallet divisions, offices and shares are supported, and
+//! votes cover general questions, CEO elections, share issuance, member expulsion and
+//! blueprint lockdowns with sanctioned actions.
 //! The required management skill level and initial share issuance are operator policies.
+//! `is_player_corp` classifies only that closed ID range; it is not a general owner
+//! resolver, and looking up historical owner IDs outside it as corporations is not supported.
 
 use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
 use super::alliances;
 use crate::client::{filetime_now, Client};
-use infinity_core::consts::{ACCOUNT_CASH, CORPORATION_TYPE_PLAYER, CORP_DIVISION_NAME_COUNT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR, TYPE_CHARACTER};
+use infinity_core::consts::{ACCOUNT_CASH, CORPORATION_TYPE_PLAYER, CORP_DIVISION_NAME_COUNT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, MAX_PLAYER_CORPORATION_ID, MIN_PLAYER_CORPORATION_ID, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR, TYPE_CHARACTER};
 use crate::dao::corporations::registry;
 use crate::db::Db;
 use crate::db::executor::Executor;
@@ -64,8 +69,6 @@ const CTV_SET: i64 = 3;
 const TITLE_COUNT: usize = 16;
 /// Server policy: maximum returned historical corporation applications.
 const OLD_APPLICATION_LIMIT: i64 = 100;
-/// Player corporation IDs (idCheckers.IsPlayerCorporation).
-const FIRST_PLAYER_CORP: i64 = 98_000_000;
 
 /// Migrate legacy folded masks exactly once before serving corporation operations.
 pub(crate) async fn initialize(db: &Db, sde: &Sde) -> Result<(), CallError> {
@@ -105,10 +108,12 @@ pub(crate) async fn initialize(db: &Db, sde: &Sde) -> Result<(), CallError> {
         }),
         |(), _| async { crate::scheduler::wake(); Ok(()) },
     ).await?;
+    vote_close::seed(db).await?;
+    sanctions::seed(db).await?;
     Ok(())
 }
 pub fn is_player_corp(id: i64) -> bool {
-    id >= FIRST_PLAYER_CORP
+    id >= MIN_PLAYER_CORPORATION_ID && id <= MAX_PLAYER_CORPORATION_ID
 }
 
 /// The corporation `char_id` is in, and their role mask (titles included).
@@ -288,8 +293,13 @@ mod notifications;
 mod abilities;
 pub(crate) mod shares;
 mod dividends;
+mod ceo;
 pub(crate) mod votes;
+mod vote_request;
 pub(crate) mod vote_close;
+pub(crate) mod sanctions;
+pub(crate) mod item_locks;
+pub(crate) mod item_locking;
 pub(crate) mod alliance_corp_registry;
 mod roles;
 mod members;
@@ -299,7 +309,8 @@ use roles::{delete_title, execute_actions, info_window_data, potential_ceos, res
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if let Some(result) = alliance_corp_registry::dispatch(c, call).await { return Some(result); }
     if let Some(result) = corp_registry::dispatch(c, call).await { return Some(result); }
+    if let Some(result) = item_locking::dispatch(c, call).await { return Some(result); }
     votes::dispatch(c, call).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-social"))] mod tests;

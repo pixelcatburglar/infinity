@@ -99,7 +99,6 @@ async fn delete(c: &Client, event: i64, me: i64) -> CallResult {
 }
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = c.session.int("charid").unwrap_or(0);
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     Some(match call.method {
         "CreatePersonalEvent" => create(c, call, me).await,
         "CreateCorporationEvent" => {
@@ -108,16 +107,16 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             create(c, call, corp).await
         }
         "EditPersonalEvent" | "EditCorporationEvent" => edit(c, call).await,
-        "DeleteEvent" => delete(c, int(0), me).await,
-        "SendEventResponse" => dao::set_response(&c.db, int(0), me, int(2) as i32).await.map(|_| Value::None).map_err(db_err),
+        "DeleteEvent" => delete(c, crate::services::arg_int(call, 0), me).await,
+        "SendEventResponse" => dao::set_response(&c.db, crate::services::arg_int(call, 0), me, crate::services::arg_int(call, 2) as i32).await.map(|_| Value::None).map_err(db_err),
         "GetResponsesForCharacter" => match dao::character_responses(&c.db, me).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| keyval([("eventID", Value::Int(r.event_id)), ("status", Value::Int(r.status))])))), Err(e) => Err(db_err(e)),
         },
-        "GetResponsesToEvent" => match dao::event_responses(&c.db, int(0)).await {
+        "GetResponsesToEvent" => match dao::event_responses(&c.db, crate::services::arg_int(call, 0)).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| keyval([("characterID", Value::Int(r.char_id)), ("status", Value::Int(r.status))])))), Err(e) => Err(db_err(e)),
         },
         "UpdateEventParticipants" => {
-            let event = int(0);
+            let event = crate::services::arg_int(call, 0);
             let owner = match dao::owner(&c.db, event).await { Ok(r) => r, Err(e) => return Some(Err(db_err(e))) };
             if owner != Some(me) { return Some(Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED))); }
             for g in value_id_list(call.args.get(1)) {

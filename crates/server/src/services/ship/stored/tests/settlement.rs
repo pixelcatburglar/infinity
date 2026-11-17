@@ -268,7 +268,7 @@ async fn pending_take(method: &str, outside_weapon: bool, refuse: bool, late_ski
             assert_eq!(changes[0].1[1], Value::Dict(vec![(Value::Int(infinity_core::consts::IX_STACK_SIZE), Value::Int(2))]));
             assert!(!std::iter::from_fn(|| actor_rx.try_recv().ok()).any(|(event, args)| event == "OnItemChange" && args.first() == Some(&private)));
             for packet in &b.f.client.outbox[packet_count..] {
-                if matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. }
+                if matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. }
                     if broadcast_id.as_text().as_deref() == Some("OnItemChange")) {
                     let envelope = packet.body[0].items().unwrap();
                     let payload = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();

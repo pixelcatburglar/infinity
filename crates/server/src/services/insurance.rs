@@ -37,10 +37,10 @@ const INSURER: i64 = 1000132;
 const QUOTE_TOLERANCE_ISK: f64 = 1.0;
 
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
-async fn value(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, type_id: i32) -> Result<f64, CallError> {
-    let Some(ty) = sde.types.get(type_id).filter(|t| t.category_id == Some(CATEGORY_SHIP)) else { return Ok(0.0); };
-    let price = insurance::value(db, type_id).await.map_err(db_err)?;
-    Ok(price_value(price.as_ref().and_then(|p| p.adjusted), price.as_ref().and_then(|p| p.average), ty.base_price))
+fn value(sde: &crate::sde::Sde, type_id: i32) -> f64 {
+    let Some(ty) = sde.types.get(type_id).filter(|t| t.category_id == Some(CATEGORY_SHIP)) else { return 0.0; };
+    let price = sde.prices.get(type_id);
+    price_value(price.map(|p| p.adjusted), price.map(|p| p.average), ty.base_price)
 }
 
 fn price_value(adjusted: Option<f64>, average: Option<f64>, base: Option<f64>) -> f64 {
@@ -70,7 +70,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     if item.owner_id != me || !item.singleton || item.category_id != CATEGORY_SHIP as i64 {
         return Err(notify_error(messages::INSURANCE_REQUIRES_OWN_ASSEMBLED_SHIP));
     }
-    let full = value(db, &c.sde, item.type_id).await?;
+    let full = value(&c.sde, item.type_id);
     let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
         return Err(notify_error(messages::INSURANCE_QUOTE_EXPIRED));
     };
@@ -101,7 +101,7 @@ pub(crate) async fn ship_destroyed_in<X: Send>(
     let Some(r) = insurance::take_payout(ex, ship).await.map_err(db_err)? else { return Ok(crate::isk::IskAmount::ZERO) };
     let (owner, type_id, fraction, end) = (r.owner_id, r.type_id, r.fraction, r.end_date);
     if end < now { return Ok(crate::isk::IskAmount::ZERO); }
-    let payout = super::market::round2(value(ex, sde, type_id).await? * fraction);
+    let payout = super::market::round2(value(sde, type_id) * fraction);
     let posted = crate::isk::IskAmount::from_isk(payout)?;
     super::wallets::credit(ex, outbox, owner, posted).await?;
     let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
@@ -116,15 +116,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = c.session.int("charid").unwrap_or(0);
     let db = &c.db;
     Some(match call.method {
-        "GetInsurancePrice" => value(db, &c.sde, call.args.first().and_then(|v| v.as_int()).unwrap_or(0) as i32).await.map(Value::Float),
+        "GetInsurancePrice" => Ok(Value::Float(value(&c.sde, call.args.first().and_then(|v| v.as_int()).unwrap_or(0) as i32))),
         "GetInsurancePrices" => {
             let types = value_id_list(call.args.first());
             let mut out = vec![];
             for t in types {
-                match value(db, &c.sde, t as i32).await {
-                    Ok(v) => out.push((Value::Int(t), Value::Float(v))),
-                    Err(e) => return Some(Err(e)),
-                }
+                out.push((Value::Int(t), Value::Float(value(&c.sde, t as i32))));
             }
             Ok(Value::Dict(out))
         }
@@ -160,4 +157,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

@@ -1,6 +1,6 @@
 //! Industry persistence for blueprints, jobs and materials.
 //! The owning services support `eve/client/script/industry`; this DAO has no wire contract.
-//! Uses `game.items`, `game.blueprints`, `game.industry_jobs`, `game.retail_prices`
+//! Uses `game.items`, `game.blueprints` and `game.industry_jobs`.
 //! Custody and payer fields are persisted; policy, transactions and notifications remain with callers.
 //! Installed jobs transition to ready only when due; cancellation is installed-only.
 
@@ -23,7 +23,6 @@ const JOB_SELECT: &str = "SELECT job_id, installer_id, owner_id, activity_id, bl
         wallet_owner_id, wallet_account_key, blueprint_location_id, blueprint_flag_id
     FROM game.industry_jobs";
 const COUNTS_SQL: &str = "SELECT activity_id, count(*) AS count FROM game.industry_jobs WHERE installer_id = $1 AND status = $2 GROUP BY 1";
-const PRICES_SQL: &str = "SELECT type_id, adjusted FROM game.retail_prices WHERE type_id = ANY($1)";
 const AVAILABLE_SQL: &str = "SELECT type_id, LEAST(sum(quantity), $4::bigint)::bigint AS quantity FROM game.items
              WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3 AND NOT singleton GROUP BY type_id";
 const BUSY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = ANY($1) AND status = ANY($2)) AS exists";
@@ -32,7 +31,7 @@ const INSERT_JOB_SQL: &str = "INSERT INTO game.industry_jobs (installer_id, owne
                                                          time_seconds, start_date, end_date, status, input_location_id, input_flag_id, output_location_id, output_flag_id,
                                                          wallet_owner_id, wallet_account_key, blueprint_location_id, blueprint_flag_id)
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) RETURNING job_id";
-const DELETE_BLUEPRINT_SQL: &str = "DELETE FROM game.blueprints WHERE item_id = $1";
+const DELETE_BLUEPRINT_SQL: &str = "DELETE FROM game.blueprints WHERE item_id = ANY($1)";
 const INSERT_COPY_SQL: &str = "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, true) RETURNING item_id";
 const DELIVER_SQL: &str = "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1 AND status = $6";
 const CANCEL_SQL: &str = "UPDATE game.industry_jobs SET status = $2, completed_date = $3, completed_by = $4 WHERE job_id = $1 AND status = $5";
@@ -80,8 +79,6 @@ impl Job {
 }
 struct CountRow { activity_id: i32, count: i64 }
 impl CountRow { fn from_row(r: &Row) -> Self { Self { activity_id: r.get("activity_id"), count: r.get("count") } } }
-struct PriceRow { type_id: i32, adjusted: f64 }
-impl PriceRow { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), adjusted: r.get("adjusted") } } }
 struct AvailableRow { type_id: i32, quantity: i64 }
 impl AvailableRow { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), quantity: r.get("quantity") } } }
 struct BusyRow { exists: bool }
@@ -121,9 +118,6 @@ pub(crate) async fn jobs_by_owner(ex: &(impl Executor + ?Sized), owner: i64, com
 pub(crate) async fn job_counts(ex: &(impl Executor + ?Sized), installer: i64, installed_status: i32) -> Result<HashMap<i32, i64>, db::Error> {
     Ok(ex.query(COUNTS_SQL, &[&installer, &installed_status]).await?.iter().map(|r| { let r = CountRow::from_row(r); (r.activity_id, r.count) }).collect())
 }
-pub(crate) async fn prices(ex: &(impl Executor + ?Sized), ids: &[i32]) -> Result<HashMap<i32, f64>, db::Error> {
-    Ok(ex.query(PRICES_SQL, &[&ids]).await?.iter().map(|r| { let r = PriceRow::from_row(r); (r.type_id, r.adjusted) }).collect())
-}
 pub(crate) async fn available(ex: &(impl Executor + ?Sized), owner: i64, station: i64, flag: i32) -> Result<HashMap<i32, i64>, db::Error> {
     Ok(ex.query(AVAILABLE_SQL, &[&owner, &station, &flag, &MAX_STACK_QUANTITY]).await?.iter().map(|r| { let r = AvailableRow::from_row(r); (r.type_id, r.quantity) }).collect())
 }
@@ -134,9 +128,12 @@ pub(crate) async fn has_active_blueprint_job(ex: &(impl Executor + ?Sized), ids:
 pub(crate) async fn insert_job(ex: &(impl Executor + ?Sized), job: &Job) -> Result<i64, db::Error> {
     Ok(JobIdRow::from_row(&ex.query_one(INSERT_JOB_SQL, &[&job.installer, &job.owner, &job.activity, &job.blueprint_id, &job.blueprint_type, &job.blueprint_copy, &job.facility, &job.system, &job.runs, &job.licensed_runs, &job.product_type, &job.optional_type, &job.cost, &job.probability, &job.time, &job.start, &job.end, &job.status, &job.input_location, &job.input_flag, &job.output_location, &job.output_flag, &job.wallet_owner, &job.wallet_account_key, &job.blueprint_location, &job.blueprint_flag]).await?).job_id)
 }
+pub(crate) async fn delete_blueprint_state(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<u64, db::Error> {
+    ex.execute(DELETE_BLUEPRINT_SQL, &[&ids]).await
+}
 pub(crate) async fn delete_blueprint_item(ex: &(impl Executor + ?Sized), item_id: i64) -> Result<(), db::Error> {
     crate::dao::items::inventory::delete(ex, item_id).await?;
-    ex.execute(DELETE_BLUEPRINT_SQL, &[&item_id]).await?; Ok(())
+    delete_blueprint_state(ex, &[item_id]).await?; Ok(())
 }
 pub(crate) async fn insert_copy(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, station: i64, flag: i32, quantity: i64) -> Result<i64, db::Error> {
     Ok(ItemIdRow::from_row(&ex.query_one(INSERT_COPY_SQL, &[&type_id, &owner, &station, &flag, &quantity]).await?).item_id)

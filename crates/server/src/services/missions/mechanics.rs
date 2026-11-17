@@ -7,7 +7,81 @@
 //! Basic mission rewards and placement are operator policy, not a client-provided generator;
 //! complete live-server mission layouts and mechanics are not reproduced.
 //! Committed mission completions and reward wallet changes queue Lua events.
+//! Every mission ending — completion, decline or quit — journals its standing
+//! change inside the same transaction as the mission row and arc state through the
+//! shared `services::standings::mutation` writer, so standing value, history row,
+//! mission removal and arc updates commit or roll back together; `despawn` and
+//! `OnAgentMissionChange` only run after that commit.
+//! Offers freeze their integer gross ISK and LP on the mission row through
+//! `reward_quote`: the character's effective `negotiationPercentage` (Negotiation)
+//! decides the ISK factor, and the issuing agent's NPC division picks the
+//! Connections skill whose effective level adds a tenth of the base LP each.
+//! Saved amounts are never repriced. Completion reads the pilot's current
+//! Social/booster standing-gain multiplier from one Fit before the market lock,
+//! then only scales the positive configured gain rates inside the settlement
+//! transaction.
 use super::*;
+use crate::services::fit::{Fit, Key};
+use infinity_core::consts::dogma::ATTR_SKILL_LEVEL;
+
+/// SDE dgmAttributeTypes.negotiationPercentage: the character's effective agent-pay
+/// factor; Negotiation (invTypes 3356) raises it through effects 403/404.
+const ATTR_MISSION_PAY_FACTOR: i32 = 355;
+/// NPC division (client npccorporationdivisions) selects the Connections skill (SDE
+/// invTypes) whose effective level adds one tenth of the base LP per level.
+const DIVISION_LP_SKILL: [(i64, i32); 3] = [(22, 3894), (23, 3893), (24, 3895)];
+/// The whole-LP divisor: base LP times (DIVISOR + level) over DIVISOR.
+const LP_LEVEL_DIVISOR: i128 = 10;
+
+/// One integer gross quote frozen into an offer: ISK by the effective negotiation
+/// pay factor (floored once, exact integers when the factor is one), LP by the
+/// division Connections skill's effective level (a tenth of base each). Unknown
+/// divisions keep the base LP. Negative or non-finite inputs are refused, never
+/// truncated into a written reward.
+fn reward_quote(fit: &Fit, division: i64, (isk, lp): (i64, i64)) -> Result<(i64, i64), CallError> {
+    let isk = quote_isk(fit.value(Key::Char, ATTR_MISSION_PAY_FACTOR), isk)?;
+    let lp = match DIVISION_LP_SKILL.iter().find(|(d, _)| *d == division) {
+        Some(&(_, skill)) => quote_lp(effective_level(fit, skill)?, lp)?,
+        None => quote_lp(0, lp)?,
+    };
+    Ok((isk, lp))
+}
+
+/// An effective Connections level; non-integral or negative values are data
+/// faults, not quotes.
+fn effective_level(fit: &Fit, skill: i32) -> Result<i64, CallError> {
+    let level = fit.value(Key::Skill(skill), ATTR_SKILL_LEVEL);
+    if !level.is_finite() || level < 0.0 || level.fract() != 0.0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid effective skill level {level}")));
+    }
+    Ok(level as i64)
+}
+
+/// `base` scaled by the negotiated factor, floored once; identity keeps the
+/// exact integer and an infinite or out-of-range result is refused.
+fn quote_isk(factor: f64, base: i64) -> Result<i64, CallError> {
+    if base < 0 || !factor.is_finite() || factor <= 0.0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid mission ISK quote")));
+    }
+    if factor == 1.0 { return Ok(base); }
+    let scaled = (base as f64 * factor).floor();
+    if !(i64::MIN as f64..-(i64::MIN as f64)).contains(&scaled) {
+        return Err(CallError::Internal(anyhow::anyhow!("mission ISK reward out of range")));
+    }
+    Ok(scaled as i64)
+}
+
+/// `base` plus `level` tenths of itself in integer arithmetic.
+fn quote_lp(level: i64, base: i64) -> Result<i64, CallError> {
+    if base < 0 || level < 0 {
+        return Err(CallError::Internal(anyhow::anyhow!("invalid mission LP quote")));
+    }
+    let scaled = i128::from(base)
+        .checked_mul(LP_LEVEL_DIVISOR + i128::from(level))
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("mission LP reward out of range")))?
+        / LP_LEVEL_DIVISOR;
+    i64::try_from(scaled).map_err(|_| CallError::Internal(anyhow::anyhow!("mission LP reward out of range")))
+}
 /// (ISK, LP) rewards by agent level.
 fn rewards(level: i64) -> (i64, i64) {
     let index = if (1..=4).contains(&level) { (level - 1) as usize } else { 4 };
@@ -65,7 +139,9 @@ fn eligible_kill(m: &crate::sde::missions::Mission, dungeon: &crate::sde::dungeo
 }
 
 /// Offer one of the build's kill missions at the agent's level, sited in the agent's system.
-pub(super) async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
+/// `fit` is the pilot's character snapshot at `at`; the quote it yields is frozen
+/// on the row and never recomputed on view, acceptance or completion.
+pub(super) async fn offer(c: &Client, agent: &Agent, fit: &Fit, at: i64) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let level = agent.level.clamp(1, 5) as i32;
     let candidates: Vec<_> = c.sde.missions.iter().filter_map(|m| {
@@ -77,11 +153,11 @@ pub(super) async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
     let dungeon_id = pick.dungeon_id.unwrap_or(0);
     let faction_id = dungeon.faction_id.unwrap_or(0);
     let pos = mission_site_position(c, agent.system_id);
-    let (isk, lp) = rewards(agent.level);
+    let (isk, lp) = reward_quote(fit, agent.division_id, rewards(agent.level))?;
     crate::dao::missions::offer(&c.db, &crate::dao::missions::Offer {
         character_id: me, agent_id: agent.id, mission_id: pick.mission_id, dungeon_id,
         faction_id, state: STATE_OFFERED, system_id: agent.system_id, pos,
-        reward_isk: isk, reward_lp: lp, offered_at: filetime_now(),
+        reward_isk: isk, reward_lp: lp, offered_at: at,
     }).await.map_err(db_err)?;
     info!(user = c.login.user_id, "agent {}: offered mission {} (dungeon {})", agent.id, pick.mission_id, dungeon_id);
     Ok(())
@@ -104,23 +180,18 @@ pub(super) async fn next_arc_step(c: &Client, agent_id: i64) -> Result<Option<i3
     Ok(c.sde.missions.steps().find(|s| s.agent == agent_id && (unlocked.contains(&s.mission_id) || (s.start && !begun.contains(&s.arc)))).map(|s| s.mission_id))
 }
 
-pub(super) async fn set_arc_state(c: &Client, arc: i64, mission: i32, state: &str) -> Result<(), CallError> {
-    let me = c.session.int("charid").unwrap_or(0);
-    let stamp = if state == "unlocked" { None } else { Some(filetime_now()) };
-    crate::dao::missions::set_arc_state(&c.db, me, arc, mission, state, stamp).await.map_err(db_err)?;
-    Ok(())
-}
 
 /// Offer an epic arc step: its content (kill site, courier cargo, trade goods...) and
-/// rewards come from the mission's own data.
-pub(super) async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Result<(), CallError> {
+/// rewards come from the mission's own data, quoted and frozen like a basic offer.
+pub(super) async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32, fit: &Fit, at: i64) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let Some(step) = c.sde.missions.step(mission_id) else { return Ok(()) };
     let r = c.sde.missions.get(mission_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing mission {mission_id}")))?;
     let dungeon_id = r.dungeon_id.unwrap_or(0);
     let faction_id = r.dungeon_id.and_then(|id| c.sde.dungeons.get(i64::from(id))).and_then(|d| d.faction_id).or(r.faction_id).unwrap_or(0);
-    let reward_isk = if r.reward_type == Some(TYPE_CREDITS as i32) { r.reward_quantity.expect("credit reward quantity is NULL") } else { 0 };
-    let reward_lp = r.reward_lp.unwrap_or(0);
+    let base_isk = if r.reward_type == Some(TYPE_CREDITS as i32) { r.reward_quantity.expect("credit reward quantity is NULL") } else { 0 };
+    let base_lp = r.reward_lp.unwrap_or(0);
+    let (reward_isk, reward_lp) = reward_quote(fit, agent.division_id, (base_isk, base_lp))?;
     let kind = Kind::of_template(r.template.as_deref().unwrap_or_default());
     // Talk-to-agent and courier steps end at the agent of the step that follows.
     let dest = match kind {
@@ -134,7 +205,7 @@ pub(super) async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Res
         offer: crate::dao::missions::Offer {
             character_id: me, agent_id: agent.id, mission_id, dungeon_id,
             faction_id, state: STATE_OFFERED, system_id: agent.system_id, pos,
-            reward_isk, reward_lp, offered_at: filetime_now(),
+            reward_isk, reward_lp, offered_at: at,
         },
         kind: kind.code(), arc_id: step.arc, dest_agent: dest, cargo_type, cargo_qty,
     }).await.map_err(db_err)?;
@@ -261,8 +332,12 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
     let offered_interaction = m.state == STATE_OFFERED && m.kind == Kind::Interaction;
     let reward_isk = m.reward_isk;
     let reward_lp = m.reward_lp;
+    let name_id = (m.name_id != 0).then_some(m.name_id);
     let (agent_id, corp, faction, level, station) = (agent.id, agent.corp_id, agent.faction_id, agent.level, agent.station_id);
     let stamp = filetime_now();
+    // The positive standing gain is quoted once from the pilot's current skills and
+    // boosters, before the market lock; only the scalar crosses into the transaction.
+    let gain_multiplier = standings::mutation::mission_gain_multiplier(&Fit::load_character_at(&c.db, c.sde.clone(), me, stamp).await?);
     let arc_states = arc.map(|_| {
         let mut states = vec![(mission_id, "completed", Some(stamp))];
         states.extend(unlocked.into_iter().map(|id| (id, "unlocked", None)));
@@ -277,6 +352,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
             let arc_states = arc_states.clone();
             let sde = sde.clone();
             Box::pin(async move {
+                standings::mutation::mission_completed(tx, outbox, me, agent_id, corp, faction, level, gain_multiplier, name_id, stamp).await?;
                 use crate::dao::items::parent_locks::{LockRequest, LockStrength};
                 let goods = if let Some(cargo) = cargo {
                     Some(plan_goods(tx, &sde, me, station, ship, cargo).await?)
@@ -316,11 +392,13 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 if offered_interaction {
                     outbox.event(crate::lua::events::GameEvent::MissionAccepted { char_id: me, agent_id: mission_agent, mission_id });
                 }
-                if crate::dao::missions::remove_accepted(tx, me, mission_agent, mission_id, STATE_ACCEPTED).await.map_err(db_err)? == 0 {
+                if crate::dao::missions::remove_observed(tx, me, mission_agent, mission_id, STATE_ACCEPTED).await.map_err(db_err)? == 0 {
                     return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
                 }
                 outbox.operation(());
-                crate::services::corps::tax::settle_whole_reward(tx, outbox, me, reward_isk, Some(crate::services::corps::tax::LoyaltyReward {
+                let gross = crate::isk::IskAmount::from_whole_isk(i128::from(reward_isk))
+                    .ok_or(crate::isk::AmountError)?;
+                crate::services::corps::tax::settle_reward(tx, outbox, me, gross, Some(crate::services::corps::tax::LoyaltyReward {
                     issuer: corp, amount: reward_lp,
                     mutation: super::standings::LoyaltyMutation {
                         reason: crate::lua::events::resources::LoyaltyReason::MissionReward,
@@ -328,10 +406,9 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                         context: crate::lua::events::resources::FactContext { corporation_id: None, alliance_id: None, faction_id: None, ship_id: fact_ship, ship_type_id: None, system_id: fact_system, station_id: fact_station, origin: crate::lua::events::resources::FactOrigin::Natural },
                     },
                 })).await?;
-                super::standings::mission_completed(tx, outbox, me, agent_id, corp, faction, level).await?;
                 if let Some(arc) = arc {
                     if let Some((preparation, qty)) = &mut reward_plan {
-                        super::items::deposit_prepared(tx, &sde, outbox, preparation, *qty, 0, locks.as_ref(), None, Default::default(), None).await?;
+                        super::items::deposit_prepared(tx, &sde, outbox, preparation, *qty, 0, locks.as_ref(), None, Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await?;
                     }
                     for &(id, state, state_stamp) in arc_states.as_ref().unwrap().iter() {
                         if offered_interaction && id == mission_id && state == "completed" {
@@ -345,19 +422,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 Ok(())
             })
         },
-        |(), outbox| {
-            let client = &mut *c;
-            async move {
-                let world = client.world.clone();
-                for entry in outbox.into_entries() {
-                    match entry {
-                        crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
-                        crate::db::outbox::Effect::Operation(()) => despawn(client, me, mission_agent),
-                    }
-                }
-                Ok(())
-            }
-        },
+        |(), outbox| dispatch_mission_outbox(c, me, mission_agent, outbox),
     ).await?;
     info!(user = c.login.user_id, "agent {}: mission {} completed at {}, {} ISK", mission_agent, mission_id, agent_id, reward_isk);
     Ok(())
@@ -383,5 +448,60 @@ pub(super) async fn remove(c: &Client, agent_id: i64) -> Result<(), CallError> {
     Ok(())
 }
 
+/// Dispatch a committed mission transaction's outbox: notifications go to the
+/// world/client and each `()` operation despawns the mission's site actor.
+/// Shared by `finish` and `end_mission` so the post-commit path stays single.
+async fn dispatch_mission_outbox(c: &mut Client, me: i64, agent_id: i64, outbox: crate::db::outbox::Outbox<()>) -> Result<(), CallError> {
+    let world = c.world.clone();
+    for entry in outbox.into_entries() {
+        match entry {
+            crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
+            crate::db::outbox::Effect::Operation(()) => despawn(c, me, agent_id),
+        }
+    }
+    Ok(())
+}
 
-#[cfg(test)] mod tests;
+/// End a mission without paying it: decline an offer or quit an accepted one.
+/// The standing loss, the guarded removal of the observed mission row, a quit
+/// step's arc updates, the despawn operation and `OnAgentMissionChange` are one
+/// transaction; a zero-row removal refuses the whole batch so standing is never
+/// charged for a mission that is already gone. Despawn and notifications run
+/// only after commit. `quit == true` journals a failed mission, not a declined
+/// one; a quit arc step's retry (usually itself) is unlocked again.
+pub(super) async fn end_mission(c: &mut Client, mission: &Mission, agent: &Agent, quit: bool) -> Result<(), CallError> {
+    let me = c.session.int("charid").unwrap_or(0);
+    let (agent_id, corp) = (agent.id, agent.corp_id);
+    let (mission_id, state) = (mission.mission_id, mission.state);
+    let name_id = (mission.name_id != 0).then_some(mission.name_id);
+    let stamp = filetime_now();
+    // A quit arc step can be taken up again (its fail mission, usually itself);
+    // declining an offer never touches arc progress.
+    let arc = if quit { mission.arc_id.map(|arc| (arc, c.sde.missions.step(mission_id).and_then(|s| s.fail).unwrap_or(mission_id))) } else { None };
+    let db = c.db.clone();
+    db.transaction(
+        move |tx, outbox: &mut crate::db::outbox::Outbox<()>| {
+            Box::pin(async move {
+                standings::mutation::mission_declined(tx, outbox, me, agent_id, corp, name_id, quit, stamp).await?;
+                if crate::dao::missions::remove_observed(tx, me, agent_id, mission_id, state).await.map_err(db_err)? == 0 {
+                    return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
+                }
+                if let Some((arc, retry)) = arc {
+                    // Ascending mission_id order; equal ids keep quit-then-unlocked.
+                    let mut writes = [(mission_id, "quit", Some(stamp)), (retry, "unlocked", None)];
+                    writes.sort_by_key(|write| write.0);
+                    for (id, state, state_stamp) in writes {
+                        crate::dao::missions::set_arc_state(tx, me, arc, id, state, state_stamp).await.map_err(db_err)?;
+                    }
+                }
+                outbox.operation(());
+                outbox.notify_client("OnAgentMissionChange", vec![Value::str(if quit { "quit" } else { "offer_declined" }), Value::Int(agent_id)]);
+                Ok(())
+            })
+        },
+        |(), outbox| dispatch_mission_outbox(c, me, agent_id, outbox),
+    ).await
+}
+
+
+#[cfg(all(test, feature = "tests-content"))] mod tests;

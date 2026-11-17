@@ -19,13 +19,21 @@ fn invalid_delegation(s: &crate::space::System, drone: &DroneRecord) -> bool {
     } else { false }
 }
 
-pub(crate) fn spec(fit: &Fit, key: Key, type_id: i32) -> Result<DroneSpec, CallError> {
+/// The first supported effect on the drone's type, from its fitted data.
+fn type_effect(fit: &Fit, type_id: i32) -> Option<registry::Effect> {
     let sde = fit.sde();
-    let effect = sde.types.effects(type_id).iter().filter_map(|row| registry::resolve(sde, row.effect_id)).find(|effect| supported(effect.kind));
-    let duration_ms = effect.as_ref().map_or(0.0, |effect| {
-        let attr = effect.attribute(EffectAttribute::Duration).unwrap_or(ATTR_RATE_OF_FIRE);
-        fit.value(key, attr)
-    });
+    sde.types.effects(type_id).iter().filter_map(|row| registry::resolve(sde, row.effect_id)).find(|effect| supported(effect.kind))
+}
+
+/// The drone effect's cycle duration: its Duration attribute or rate of fire.
+fn duration_ms(fit: &Fit, key: Key, effect: &registry::Effect) -> f64 {
+    let attr = effect.attribute(EffectAttribute::Duration).unwrap_or(ATTR_RATE_OF_FIRE);
+    fit.value(key, attr)
+}
+
+pub(crate) fn spec(fit: &Fit, key: Key, type_id: i32) -> Result<DroneSpec, CallError> {
+    let effect = type_effect(fit, type_id);
+    let duration_ms = effect.as_ref().map_or(0.0, |effect| duration_ms(fit, key, effect));
     let optimal_range = effect.as_ref().and_then(|effect| effect.attribute(EffectAttribute::Range))
         .map_or_else(|| fit.value(key, ATTR_MAX_RANGE), |attr| fit.value(key, attr));
     Ok(DroneSpec {
@@ -41,11 +49,35 @@ pub(crate) fn spec(fit: &Fit, key: Key, type_id: i32) -> Result<DroneSpec, CallE
     })
 }
 
+/// One phase's captured effect and inputs from the prepared resident fit.
+struct CapturedPhase {
+    effect: registry::Effect,
+    duration_ms: f64,
+    inputs: Result<crate::services::effects::parameters::SourceInputs, CallError>,
+}
+
+/// Borrow the resident fit once for this phase: the drone type's first
+/// supported effect and its current duration select the real capture. The
+/// outer `None` is a missing or stale actor record; the inner `None` is a
+/// phase with no runnable effect this turn.
+fn capture_phase_inputs(s: &mut crate::space::System, id: i64, type_id: i32) -> Option<Option<CapturedPhase>> {
+    s.with_combat_fit(id, move |fit, key, _| {
+        let effect = type_effect(fit, type_id)?;
+        let duration_ms = duration_ms(fit, key, &effect);
+        if !(duration_ms.is_finite() && duration_ms >= 1.0) { return None; }
+        let inputs = effects::parameters::capture_source(fit, key, &effect, duration_ms);
+        Some(CapturedPhase { effect, duration_ms, inputs })
+    })
+}
+
+
 pub(crate) fn effects(db: Db, world: Weak<World>, system: i64) -> DroneEffects {
     Arc::new(move |s, action| -> Option<crate::space::NpcFuture> {
+        let mut membership = None;
         let attempt = if let DroneAction::Cycle { drone, target, phase } = &action {
             let id = drone.id;
             let generation = drone.generation;
+            membership = s.combat_membership_generation(id);
             if s.drone_current(id, generation) && s.drone(id).is_some_and(|current| invalid_delegation(s, &current)) {
                 s.drone_idle(id, generation);
                 return None;
@@ -81,7 +113,7 @@ pub(crate) fn effects(db: Db, world: Weak<World>, system: i64) -> DroneEffects {
                 DroneAction::Cycle { drone, .. } | DroneAction::Contact { drone, .. } => (drone.id, drone.generation),
             };
             let result = match action {
-                DroneAction::Cycle { drone, target, phase } => cycle(&db, &world, system, drone, target, phase, attempt).await,
+                DroneAction::Cycle { drone, target, phase } => cycle(&db, &world, system, drone, target, phase, membership, attempt).await,
                 DroneAction::Contact { drone, return_to_bay } => crate::services::drones::inventory::returning::contact(&db, &world, system, drone, return_to_bay).await,
             };
             if let Err(error) = result {
@@ -102,67 +134,54 @@ pub(crate) fn effects(db: Db, world: Weak<World>, system: i64) -> DroneEffects {
 }
 
 async fn cycle(db: &Db, world: &Arc<World>, system: i64, drone: DroneRecord, target: i64, phase: DronePhase,
-    attempt: Option<effects::space_source::PreparedCombatAttempt>) -> Result<(), CallError> {
+    membership: Option<u64>, attempt: Option<effects::space_source::PreparedCombatAttempt>) -> Result<(), CallError> {
     let id = drone.id;
     let generation = drone.generation;
-    let Some((current, actor_generation, fit_revision)) = world.with(system, move |s| {
-        if !s.drone_current(id, generation) { return None; }
-        let current = s.drone(id)?;
-        if invalid_delegation(s, &current) {
-            s.drone_idle(id, generation);
-            return None;
-        }
-        if !s.drone_valid(id, target, generation) { return None; }
-        Some((current, s.combat_membership_generation(id)?, s.combat_fit_revision(id)?))
-    }).await.flatten() else { return Ok(()) };
-    let Some(controller) = current.controller else { return Ok(()) };
-    let fit = Fit::drone_in_space(db, world, system, current.owner, id).await?;
-    let refreshed = spec(&fit, Key::Drone(id), current.spec.type_id)?;
-    let Some(effect_id) = refreshed.effect_id else {
-        return Err(crate::services::notify_error(infinity_core::messages::drones::NOT_AVAILABLE));
-    };
-    if drone.spec.effect_id != Some(effect_id) { return Ok(()); }
-    let Some(effect) = registry::resolve(world.sde(), effect_id) else {
-        return Err(effects::unsupported::refusal(Some(effect_id), world.sde().dogma.effect(effect_id).and_then(|row| row.name.as_deref()).unwrap_or("unknown"), current.spec.type_id));
-    };
-    let kinematics = effects::propulsion::kinematics(&fit, Key::Drone(id));
-    let ship_revision = fit.projection_revision();
-    let drone_revision = fit.drone_projection_revision();
     let guard = SourceGuard::Drone { source: id, target, generation };
-    let Some((source, victim, current)) = world.with(system, move |s| {
-        if !s.drone_current(id, generation) { return None; }
-        let d = s.drone(id)?;
-        if invalid_delegation(s, &d) {
+    enum PhaseGate {
+        Unavailable,
+        Ready { captured: CapturedPhase, source: crate::space::Ball, victim: crate::space::Ball },
+    }
+    let Some((current, gate)) = world.with(system, move |s| {
+        if !s.drone_current(id, generation) || s.combat_membership_generation(id) != membership { return None; }
+        let before = s.drone(id)?;
+        if invalid_delegation(s, &before) {
             s.drone_idle(id, generation);
             return None;
         }
         if !guard.valid(s) { return None; }
-        if d.controller != Some(controller) { return None; }
-        if ship_revision != Some(s.projection_revision(controller)) || drone_revision != Some(s.projection_revision(id)) {
-            s.refresh_projection_target(id);
-            return None;
+        let type_id = before.spec.type_id;
+        // The gate's prepare publishes expiry outputs first; the phase effect
+        // and its duration are evaluated on the prepared fit, never on the
+        // possibly stale record values held by the queued action.
+        let captured = capture_phase_inputs(s, id, type_id);
+        let current = s.drone(id)?;
+        if !s.drone_current(id, generation) || s.combat_membership_generation(id) != membership
+            || invalid_delegation(s, &current) || !guard.valid(s)
+            || current.owner != before.owner || current.controller != before.controller { return None; }
+        let Some(captured) = captured else { return None };
+        let Some(phase) = captured else { return Some((current, PhaseGate::Unavailable)) };
+        match current.spec.effect_id {
+            Some(spec_id) if spec_id != phase.effect.id as i32 => return None,
+            Some(_) => {}
+            None => return Some((current, PhaseGate::Unavailable)),
         }
-        if !s.drone_refresh(id, generation, refreshed, kinematics, ship_revision.map(|revision| (controller, revision))) || !s.drone_valid(id, target, generation) { return None; }
-        Some((s.sampled_ball(id)?, s.sampled_ball(target)?, s.drone(id)?))
+        let (source, victim) = s.sampled_ball(id).zip(s.sampled_ball(target))?;
+        Some((current, PhaseGate::Ready { captured: phase, source, victim }))
     }).await.flatten() else { return Ok(()) };
-    if attempt.as_ref().is_some_and(|attempt| attempt.facts().effect_id != Some(effect.id)) { return Ok(()); }
+    let PhaseGate::Ready { captured: CapturedPhase { effect, duration_ms, inputs }, source, victim } = gate else {
+        return Err(crate::services::notify_error(infinity_core::messages::drones::NOT_AVAILABLE));
+    };
+    if drone.spec.effect_id != Some(effect.id as i32) { return Ok(()); }
+    let inputs = inputs?;
+    if attempt.as_ref().is_some_and(|attempt| attempt.facts().effect_id != Some(effect.id)) { return Ok(()) }
     let cx = SourceContext {
         db, world, system, source: &source, target: &victim, module: id, effect: &effect,
-        duration_ms: current.spec.duration_ms, fit: &fit, key: Key::Drone(id),
+        duration_ms, inputs: &inputs,
         guard: SourceGuard::Drone { source: id, target, generation }, attacker: Some(current.owner),
         drone: Some(&current), phase,
     };
-    let result = effects::space_source::apply(&cx, attempt).await;
-    let owner = current.owner;
-    world.with(system, move |s| {
-        if s.drone_current(id, generation)
-            && s.drone(id).is_some_and(|d| d.owner == owner && d.controller == Some(controller))
-            && ship_revision == Some(s.projection_revision(controller))
-            && drone_revision == Some(s.projection_revision(id)) {
-            s.replace_fitted_cache(id, actor_generation, fit_revision, fit, Key::Drone(id), drone_revision);
-        }
-    }).await;
-    result
+    effects::space_source::apply(&cx, attempt).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

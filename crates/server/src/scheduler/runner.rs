@@ -1,6 +1,8 @@
 //! Supervised `game.jobs` workers; no client service is mirrored.
-//! Dropping the JoinSet aborts handlers; lease renewal and cross-process exclusion
-//! are unsupported.
+//! On shutdown the runner stops claiming new jobs, but a claim batch that has
+//! already returned is registered in full and drained through the existing
+//! JoinSet and `finish` write-back. Dropping the JoinSet aborts handlers; lease
+//! renewal and cross-process exclusion are unsupported.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::{ensure, Result};
 use tokio::{sync::watch, task::{Id, JoinHandle, JoinSet}};
@@ -47,9 +49,10 @@ pub(crate) fn start(db: Db, world: Arc<World>, registrations: Vec<Registration>,
                 drop(active_ids);
                 match claims {
                     Ok(claims) => for claim in claims {
-                        if *shutdown.borrow() { break; }
+                        // A completed claim already marked every returned row running,
+                        // so shutdown must not drop the unregistered rest of the batch.
                         if let Some(reg) = handlers.get(claim.job.kind.as_str()) {
-                            let handler = reg.handler;
+                            let (handler, kind) = (reg.handler, reg.kind);
                             let metadata = ActiveClaim {
                                 id: claim.job.id.clone(),
                                 token: claim.token,
@@ -57,7 +60,8 @@ pub(crate) fn start(db: Db, world: Arc<World>, registrations: Vec<Registration>,
                                 interval_secs: reg.interval_secs,
                             };
                             let (task_db, task_world, job) = (db.clone(), world.clone(), claim.job);
-                            let handle = tasks.spawn(async move { handler(task_db, task_world, job).await });
+                            let handle = tasks.spawn(crate::runtime_watchdog::watch("scheduler", kind,
+                                async move { handler(task_db, task_world, job).await }));
                             active.insert(handle.id(), metadata);
                         } else {
                             let due = now.saturating_add(jobs::duration_ticks(settings.retry_base_secs));
@@ -116,5 +120,5 @@ async fn finish(db: &Db, settings: &SchedulerConfig, active: &mut HashMap<Id, Ac
     match updated { Ok(0) => debug!(job = %claim.id, "stale scheduler outcome"), Err(error) => warn!(job = %claim.id, "scheduler outcome write failed: {error}"), _ => () }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

@@ -1,6 +1,8 @@
 //! Ship hold and ordinary container capacity for invCache inventories.
 //! Reads game.items and reservations, and fitted dogma for ship holds.
 //! Shared-bay permissions and in-space maintenance operations are handled elsewhere.
+//! A hull's ordinary cargo may carry the persisted unlimited mode; every other
+//! hold, container and destination stays a real finite capacity.
 
 use std::sync::Arc;
 use std::collections::BTreeMap;
@@ -8,8 +10,9 @@ use infinity_core::consts::{dogma::ATTR_CAPACITY, CARGO_CONTAINER_GROUPS, CATEGO
 use crate::dao::items::{loading::{self, GameItem, ItemQuery}, pending_reloads::{self, PendingReload}, ship};
 use crate::db::executor::Executor;
 use crate::sde::Sde;
-use crate::services::{db_err, item_volume::{item_volume, stack_size}, fit::Fit, CallError};
-use super::holds;
+use crate::services::{db_err, item_volume::{item_volume, stack_size}, fit::{Fit, Key}, CallError};
+use crate::dao::items::dogma::OverrideState;
+use super::holds::{self, CapacityLimit};
 
 pub(crate) struct Addition {
     pub(crate) type_id: i32,
@@ -43,10 +46,10 @@ pub(crate) fn container_room(sde: &Sde, parent: &GameItem, items: &[GameItem], r
             .map(|item| (item.type_id, item.singleton, item.quantity))
             .chain(reloads.iter().filter(|row| row.source_location_id == parent.item_id)
                 .map(|row| (row.type_id, false, row.quantity))) )?;
-    Ok(Some(Room { capacity, used }))
+    Ok(Some(Room { capacity: CapacityLimit::Finite(capacity), used }))
 }
 
-async fn effective(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, ship: i64, flag: i32) -> Result<f64, CallError> {
+pub(crate) async fn effective(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, ship: i64, flag: i32) -> Result<CapacityLimit, CallError> {
     let fit = if crate::dao::characters::selection::ship_id(ex, owner).await.map_err(db_err)? == Some(ship) {
         Fit::load(ex, sde.clone(), owner, ship).await?
     } else {
@@ -86,19 +89,73 @@ fn total_volume(sde: &Sde, flag: i32, rows: impl Iterator<Item = (i32, bool, i64
     }
     Ok(total)
 }
-pub(crate) struct Room { pub(crate) capacity: f64, pub(crate) used: f64 }
+/// A ship hold's admission limit with the persisted override state observed at
+/// capture time. Fields stay private: snapshots come only from a real ship
+/// `Fit`, never from an arbitrary caller-supplied number.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldCapacity {
+    ship: i64,
+    flag: i32,
+    attribute: i32,
+    limit: CapacityLimit,
+    observed: Option<OverrideState>,
+}
+
+impl HoldCapacity {
+    /// Bind one hold's limit and persisted override state from an in-hand fit.
+    /// Special bays always capture a finite limit; the cargo mode only applies
+    /// to the ordinary cargo flag of a real ship.
+    pub(crate) fn capture(fit: &Fit, flag: i32) -> Result<Self, CallError> {
+        let ship = fit.ship_id().ok_or_else(|| crate::services::notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+        let hold = holds::descriptor(flag)
+            .ok_or_else(|| crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]))?;
+        Ok(Self { ship, flag, attribute: hold.attribute, limit: holds::effective_capacity(fit, flag), observed: fit.override_state(Key::Ship, hold.attribute) })
+    }
+
+    pub(crate) fn ship(&self) -> i64 { self.ship }
+    pub(crate) fn flag(&self) -> i32 { self.flag }
+
+    /// Whether the persisted row still matches the state seen at capture.
+    fn matches(&self, hull: &GameItem, state: Option<OverrideState>) -> bool {
+        self.ship == hull.item_id && self.observed == state
+    }
+}
+
+/// Where a destination check reads the hull's capacity: re-evaluated from the
+/// current database under the hull lock, or pre-validated against a snapshot
+/// taken earlier from a real ship fit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CapacitySource {
+    Current,
+    Captured(HoldCapacity),
+}
+
+pub(crate) struct Room { pub(crate) capacity: CapacityLimit, pub(crate) used: f64 }
 
 impl Room {
     pub(crate) fn units(&self, sde: &Sde, flag: i32, type_id: i32, singleton: bool, requested: i64) -> Result<i64, CallError> {
-        if !self.capacity.is_finite() || self.capacity < 0.0 || !self.used.is_finite() || self.used < 0.0 {
-            return Err(crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
-        }
+        let refuse = || crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]);
+        if !self.used.is_finite() || self.used < 0.0 { return Err(refuse()); }
+        let capacity = match self.capacity {
+            CapacityLimit::Unlimited => {
+                // Quota is waived only after the same unit and occupancy
+                // validation a finite hold performs; the post-write volume
+                // must stay finite as well.
+                let unit = volume(sde, flag, type_id, singleton, 1)?;
+                holds::check(sde, flag, type_id, singleton, requested.max(1), self.capacity, self.used)?;
+                if requested <= 0 { return Ok(0); }
+                if !(self.used + unit * requested as f64).is_finite() { return Err(refuse()); }
+                return Ok(requested);
+            }
+            CapacityLimit::Finite(value) => value,
+        };
+        if !capacity.is_finite() || capacity < 0.0 { return Err(refuse()); }
         let unit = volume(sde, flag, type_id, singleton, 1)?;
-        let admission_capacity = if self.capacity > 0.0 { self.capacity.max(unit) } else { self.capacity };
-        holds::check(sde, flag, type_id, singleton, 1, admission_capacity, 0.0)?;
+        let admission_capacity = if capacity > 0.0 { capacity.max(unit) } else { capacity };
+        holds::check(sde, flag, type_id, singleton, 1, CapacityLimit::Finite(admission_capacity), 0.0)?;
         if requested <= 0 { return Ok(0); }
         if unit <= 0.0 { return Ok(requested); }
-        Ok((((self.capacity - self.used).max(0.0) / unit).floor() as i64).min(requested))
+        Ok((((capacity - self.used).max(0.0) / unit).floor() as i64).min(requested))
     }
 }
 
@@ -122,18 +179,23 @@ fn validate_hull(sde: &Sde, hull: &GameItem, owner: i64) -> Result<(), CallError
     Ok(())
 }
 
-pub(crate) async fn room(ex: &(impl Executor + ?Sized), sde: &Sde, owner: i64, location: i64, flag: i32, capacity: f64) -> Result<Room, CallError> {
+/// The current room of a ship hold bound by an earlier snapshot. The hull lock
+/// must be acquired by this function; the snapshot's ship, flag, attribute and
+/// observed override state are re-verified against the joined witness row
+/// before the captured limit is trusted.
+pub(crate) async fn room(ex: &(impl Executor + ?Sized), sde: &Sde, owner: i64, snapshot: &HoldCapacity) -> Result<Room, CallError> {
     let refuse = || crate::services::notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
-    if !ship::lock_reload_ship(ex, location).await.map_err(db_err)? { return Err(refuse()); }
-    let hull = loading::load_items(ex, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
-    validate_hull(sde, &hull, owner)?;
-    let items = loading::load_items(ex, ItemQuery::LocationFlags(location, &[flag])).await.map_err(db_err)?;
-    let used = used(ex, sde, location, flag, &items).await?;
-    Ok(Room { capacity, used })
+    if !ship::lock_reload_ship(ex, snapshot.ship).await.map_err(db_err)? { return Err(refuse()); }
+    let bound = crate::dao::items::dogma::hull_override(ex, snapshot.ship, snapshot.attribute).await.map_err(db_err)?.ok_or_else(refuse)?;
+    if !snapshot.matches(&bound.item, bound.state) { return Err(refuse()); }
+    validate_hull(sde, &bound.item, owner)?;
+    let items = loading::load_items(ex, ItemQuery::LocationFlags(snapshot.ship, &[snapshot.flag])).await.map_err(db_err)?;
+    let used = used(ex, sde, snapshot.ship, snapshot.flag, &items).await?;
+    Ok(Room { capacity: snapshot.limit, used })
 }
 
 
-pub(crate) async fn capacity<'tx>(ex: &'tx (impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, location: i64, flag: i32) -> Result<Option<(f64, f64, crate::dao::items::parent_locks::LockedItems<'tx>)>, CallError> {
+pub(crate) async fn capacity<'tx>(ex: &'tx (impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, location: i64, flag: i32) -> Result<Option<(CapacityLimit, f64, crate::dao::items::parent_locks::LockedItems<'tx>)>, CallError> {
     let Some(hull) = loading::load_items(ex, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
     if !ship_category(sde, &hull)? { return Ok(None); }
     if !ship::lock_reload_ship(ex, location).await.map_err(db_err)? {
@@ -181,8 +243,23 @@ fn replacement_volume(sde: &Sde, flag: i32, items: &[GameItem], reloads: &[Pendi
     Ok((removed, added))
 }
 
-pub(crate) async fn check_destination<'tx>(ex: &'tx (impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, location: i64, flag: i32, additions: &[Addition], replaced: Replaced<'_>, capacity: Option<f64>) -> Result<Option<crate::dao::items::parent_locks::LockedItems<'tx>>, CallError> {
+pub(crate) async fn check_destination<'tx>(ex: &'tx (impl Executor + ?Sized), sde: &Arc<Sde>, owner: i64, location: i64, flag: i32, additions: &[Addition], replaced: Replaced<'_>, source: CapacitySource) -> Result<Option<crate::dao::items::parent_locks::LockedItems<'tx>>, CallError> {
+    let refuse = || crate::services::notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
+    // A captured snapshot only applies to its own hull, flag and hold
+    // attribute; any other destination, including the static/non-hull/box
+    // early exits below, is refused rather than silently re-evaluated.
+    let snapshot = match source {
+        CapacitySource::Captured(snapshot) => {
+            if snapshot.ship != location || snapshot.flag != flag
+                || holds::descriptor(flag).map(|hold| hold.attribute) != Some(snapshot.attribute) {
+                return Err(refuse());
+            }
+            Some(snapshot)
+        }
+        CapacitySource::Current => None,
+    };
     let Some(parent) = loading::load_items(ex, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next() else {
+        if snapshot.is_some() { return Err(refuse()); }
         if crate::services::items::is_static_location(sde, location) { return Ok(None); }
         if !replaced.items.is_empty() || !replaced.reloads.is_empty() {
             return Err(crate::services::notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
@@ -190,23 +267,31 @@ pub(crate) async fn check_destination<'tx>(ex: &'tx (impl Executor + ?Sized), sd
         return Ok(None);
     };
     let is_hull = ship_category(sde, &parent)?;
+    // A captured snapshot is refused on every non-hull destination: ordinary
+    // boxes keep their static rule for Current, never for a bound token.
+    if !is_hull {
+        if snapshot.is_some() { return Err(refuse()); }
+    }
     let is_box = !is_hull && is_ordinary_container(sde, parent.type_id);
-    if !is_hull && !is_box || is_hull && super::is_fitting_flag(flag) { return Ok(None); }
-    let refuse = || crate::services::notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
-    let parent = if is_hull {
+    if !is_hull && !is_box || is_hull && super::is_fitting_flag(flag) {
+        return Ok(None);
+    }
+    let (parent, hull_capacity) = if is_hull {
         if !ship::lock_reload_ship(ex, location).await.map_err(db_err)? { return Err(refuse()); }
-        let hull = loading::load_items(ex, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
-        validate_hull(sde, &hull, owner)?;
-        hull
-    } else { parent };
-    let flag = if is_box { FLAG_CARGO } else { flag };
-    let hull_capacity = if is_hull {
-        let value = match capacity { Some(value) => value, None => effective(ex, sde, owner, location, flag).await? };
-        if !value.is_finite() || value < 0.0 {
-            return Err(crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
+        if let Some(snapshot) = snapshot {
+            // The joined witness replaces the plain hull read: ship, attribute
+            // and complete persisted state must match the captured fit.
+            let bound = crate::dao::items::dogma::hull_override(ex, location, snapshot.attribute).await.map_err(db_err)?.ok_or_else(refuse)?;
+            if !snapshot.matches(&bound.item, bound.state) { return Err(refuse()); }
+            validate_hull(sde, &bound.item, owner)?;
+            (bound.item, snapshot.limit)
+        } else {
+            let hull = loading::load_items(ex, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
+            validate_hull(sde, &hull, owner)?;
+            (hull, effective(ex, sde, owner, location, flag).await?)
         }
-        Some(value)
-    } else { None };
+    } else { (parent, CapacityLimit::Finite(0.0)) };
+    let flag = if is_box { FLAG_CARGO } else { flag };
     let items = if is_box { loading::load_items(ex, ItemQuery::Location(location)).await }
         else { loading::load_items(ex, ItemQuery::LocationFlags(location, &[flag])).await }.map_err(db_err)?;
     let mut reloads = if is_box || !replaced.reloads.is_empty() {
@@ -216,8 +301,14 @@ pub(crate) async fn check_destination<'tx>(ex: &'tx (impl Executor + ?Sized), sd
     let (removed, added) = replacement_volume(sde, flag, &items, &reloads, additions, replaced)?;
     for item in additions { holds::admission(sde, flag, item.type_id, item.singleton, item.quantity)?; }
     let box_room = if is_box { Some(container_room(sde, &parent, &items, &reloads)?.ok_or_else(refuse)?) } else { None };
-    let capacity = match &box_room { Some(room) => room.capacity, None => hull_capacity.ok_or_else(refuse)? };
-    if added <= removed && (is_box || capacity > 0.0 || additions.is_empty()) {
+    let capacity = match &box_room { Some(room) => room.capacity, None => hull_capacity };
+    // Finite keeps its original early return; Unlimited always computes the
+    // real occupied volume because the quota is the only thing waived.
+    let finite_early_return = match capacity {
+        CapacityLimit::Finite(cap) => is_box || cap > 0.0 || additions.is_empty(),
+        CapacityLimit::Unlimited => false,
+    };
+    if added <= removed && finite_early_return {
         return Ok(if is_hull { Some(crate::dao::items::parent_locks::LockedItems::held_hull(ex, &parent)) } else { None });
     }
     let occupied = if let Some(room) = box_room {
@@ -228,14 +319,24 @@ pub(crate) async fn check_destination<'tx>(ex: &'tx (impl Executor + ?Sized), sd
         total_volume(sde, flag, items.iter().map(|item| (item.type_id, item.singleton, item.quantity))
             .chain(reloads.iter().map(|row| (row.type_id, false, row.quantity))) )?
     };
-    if capacity <= 0.0 || occupied > capacity || added - removed > capacity - occupied {
-        if let Some(item) = additions.first() {
+    // An invalid occupied or resulting volume refuses outright under either
+    // mode; Unlimited skips only the quota comparison itself.
+    let exceeded = match capacity {
+        CapacityLimit::Unlimited => !(occupied.is_finite() && occupied >= 0.0
+            && ((occupied - removed).max(0.0) + added).is_finite()),
+        CapacityLimit::Finite(capacity) => capacity <= 0.0 || occupied > capacity || added - removed > capacity - occupied,
+    };
+    if exceeded {
+        if let (CapacityLimit::Finite(capacity), Some(item)) = (capacity, additions.first()) {
             let free = (capacity - (occupied - removed).max(0.0)).max(0.0);
             return Err(holds::full_error(flag, item.type_id, free, added));
+        }
+        if capacity == CapacityLimit::Unlimited {
+            return Err(crate::services::user_error(infinity_core::messages::MSG_CANNOT_STORE_DESTINATION_RESTRICTED, vec![]));
         }
         return Ok(if is_hull { Some(crate::dao::items::parent_locks::LockedItems::held_hull(ex, &parent)) } else { None });
     }
     Ok(if is_hull { Some(crate::dao::items::parent_locks::LockedItems::held_hull(ex, &parent)) } else { None })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

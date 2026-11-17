@@ -60,5 +60,5 @@ fn handle<'a>(call: &Call<'_>, lookup: impl FnOnce(i64) -> Option<&'a Celestial>
     Some(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

@@ -10,35 +10,82 @@
 //! commands issued by menus echo their results like typed commands.
 //! Wallet commands write exact values through the character and account DAOs to
 //! `game.characters` and `game.accounts`; client wallet displays are clamped to
-//! their protocol limits. Corporation wallets and target writes are unsupported.
+//! their protocol limits. Corporation ISK wallets and target writes are unsupported.
 //! ISK wallet events retain exact balances and deltas; only client displays are capped.
 //! `/addisk` accepts signed deltas; the other wallet commands remain nonnegative.
+//! Loyalty commands write exact i64 balances to `game.lp_balances`; the corporation
+//! EverMarks commands act on the caller's real database corporation as a loyalty
+//! owner key, unrelated to the unsupported corporation ISK wallet.
 //!
 //! Type and celestial data come from the startup SDE snapshot; item positions,
 //! per-item dogma base overrides and wallet balances come from game data.
 //! Dogma overrides require singleton items; modules and hull-foreign attributes
 //! have limited client display support. Unsupported commands return a slash error.
+//! Space `/heal` commits fitted-module repair before guarded actor resource recovery;
+//! a changed live target is reported as a module-only result.
+//! `/suicide` takes no arguments and destroys the caller's current in-space
+//! ship or capsule through the shared guarded loss path.
 //! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
 //! Quoted arguments are grouped by the shared parser. Skill, item, NPC, social
 //! and exploration commands delegate to their owning services and game data.
+//! `/sysjunkclear` and `/testclear` permanently destroy live wreck and ordinary
+//! container trees through the shared inventory lifecycle.
+//! `/sigscan` and `/sigs` alias `/scanall` and `/sites`; `/overlayrefresh`
+//! resends the caller's loaded scan overlay (the client drops stale sites)
+//! without loading systems, generating sites or granting scan authorization.
 //! Item creation accepts case-insensitive k/m/b/t quantity suffixes and exact
 //! decimal fractions when the resulting total is a positive integer.
 //! Durable job inspection and control use `game.jobs`; job payloads are not displayed.
-//! `/where`, `/who`, `/wallet` and `/hangar` are read-only: they inspect the live
-//! session, the online pilot registry, exact balances and the station hangar
-//! without writing game data. Stations have no name projection, so the hangar
-//! and location reports name the station by ID. Listings are limited to 50 rows;
-//! full help remains available. Teleport
-//! extensions are not supported here. Hit-chance diagnostics use live space snapshots.
+//! `/where`, `/who`, `/wallet`, `/hangar` and `/version` are read-only: they
+//! inspect the live session, the online pilot registry, exact balances, the
+//! station hangar and the compile-time build identity without writing game
+//! data. Stations have no name projection, so the hangar and location reports
+//! name the station by ID. Listings are limited to 50 rows;
+//! full help remains available. `/tr` accepts station, live-ball, system,
+//! celestial and stored-item destinations; name lookup, coordinates, offsets,
+//! bookmarks and other pilots are not supported. Hit-chance diagnostics use
+//! live space snapshots.
+//! Standing writes run through the shared mutation writer so each value, its
+//! history row and the target notification commit in one transaction.
+//! `/unfit` removes fitted high/mid/low slot modules (one, by ID/type/name, or
+//! `all`); rigs and subsystems stay fitted and are refused when selected
+//! directly.
+//! `/dirt` inspects and rewrites persisted hull dirt timestamps through the
+//! shared appearance service; `/killmark` and `/killmarks` do the same for
+//! hull player-kill counts. A write commits before any live slim update.
+//! `/announce` sends ephemeral game notifications to the online pilot snapshot.
+//! `/shutdown` schedules, replaces, cancels or reports the in-memory planned shutdown.
+//! `/allskins` grants a target the complete ordinary region-visible SKIN set
+//! permanently in one transaction; the online target gets one activation
+//! notice per changed SKIN, and a repeat grants nothing.
+//! `/cwatch` and `/naughty` reach the shared Crimewatch control service: they
+//! report or reset the caller's own combat timers, persist the caller's safety
+//! preference and request the ordinary CONCORD response in high-sec. Clearing
+//! timers preserves safety, security status, engagements and kill rights and
+//! cancels a still-pending CONCORD response.
+//! `/invu` reads or rewrites the caller's persistent NPC target-ignore flag on
+//! `game.characters`; a committed change publishes to every loaded system
+//! before the reply, so owned remote drones and future cold loads follow it.
+//! `/effect` sends bounded private visual-effect previews to the caller's
+//! current destiny observer from the shared catalogue; one-shot pulses can
+//! never be stopped, and replies report sends, not rendered state.
+//! `/loadsys` and `/loadallsys` preload public solar systems through the
+//! shared world loader: the caller's current system plus its direct stargate
+//! destinations, or the complete public static-map set. Neither takes
+//! arguments; `/loadallsys` has no position or character requirement.
+//! `/loadallsys` and the explicit strict-idle `/unloadallsys` require
+//! performance-testing mode; unloading does not run automatically.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
 use crate::client::Client;
-use infinity_core::consts::{CLIENT_MAX_ISK, CLIENT_MAX_SHORT_AMOUNT, FLAG_CARGO, FLAG_HANGAR, GM_ROLES, GROUP_PLANET};
+use infinity_core::consts::{CLIENT_MAX_ISK, CLIENT_MAX_SHORT_AMOUNT, FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
 use infinity_core::messages;
 use marshal::Value;
 use tracing::info;
 mod args;
+mod all_skins;
+mod announce;
 mod feedback;
 mod dogma;
 mod jobs;
@@ -46,16 +93,22 @@ mod effects;
 mod skills;
 mod items;
 mod npc;
+mod debris;
 mod combat;
+mod death;
 mod social;
 mod info;
 mod wormholes;
 mod expert_systems;
 mod hitchance;
 mod subscriptions;
+mod transport;
+mod appearance;
+mod npc_control;
+mod world;
+mod crimewatch;
+mod shutdown;
 
-/// Server design: clearance in metres when teleporting to an item.
-const TELEPORT_CLEARANCE: f64 = 5000.0;
 
 /// `game_schema.sql`: character balance is numeric(36, 2).
 const ISK_INTEGER_DIGITS: usize = 34;
@@ -79,11 +132,15 @@ const QUANTITY_BILLION: i64 = 1_000_000_000;
 const QUANTITY_TRILLION: i64 = 1_000_000_000_000;
 
 const COMMANDS: &[(&str, &str)] = &[
+    ("announce", messages::gm::GM_HELP_ANNOUNCE),
     ("tr", messages::gm::GM_HELP_TELEPORT),
     ("wh", messages::gm::GM_HELP_WORMHOLE),
     ("wormhole", messages::gm::GM_HELP_WORMHOLE),
     ("scanall", messages::gm::GM_HELP_SCAN_ALL),
+    ("sigscan", messages::gm::GM_HELP_SIGSCAN),
     ("sites", messages::gm::GM_HELP_SITES),
+    ("sigs", messages::gm::GM_HELP_SIGS),
+    ("overlayrefresh", messages::gm::GM_HELP_OVERLAY_REFRESH),
     ("create", messages::gm::GM_HELP_CREATE),
     ("createitem", messages::gm::GM_HELP_CREATE_ITEM),
     ("setisk", messages::gm::GM_HELP_SET_ISK),
@@ -92,19 +149,27 @@ const COMMANDS: &[(&str, &str)] = &[
     ("addplex", messages::gm::GM_HELP_ADD_PLEX),
     ("clonegrade", messages::gm::GM_HELP_CLONE_GRADE),
     ("heal", messages::gm::GM_HELP_HEAL),
+    ("dirt", messages::gm::GM_HELP_DIRT),
+    ("killmark", messages::gm::GM_HELP_KILLMARKS),
+    ("killmarks", messages::gm::GM_HELP_KILLMARKS),
     ("dogma", messages::gm::GM_HELP_DOGMA),
     ("jobs", messages::scheduler::HELP),
     ("expertsystem", messages::gm::GM_HELP_EXPERT_SYSTEM),
     ("effects", messages::gm::GM_HELP_EFFECTS),
+    ("effect", messages::gm::GM_HELP_EFFECT),
     ("hitchance", messages::gm::GM_HELP_HITCHANCE),
     ("giveskill", messages::gm::GM_HELP_GIVESKILL),
     ("allskills", messages::gm::GM_HELP_ALLSKILLS),
+    ("allskins", messages::gm::GM_HELP_ALLSKINS),
     ("removeskill", messages::gm::GM_HELP_REMOVESKILL),
     ("givestarterskills", messages::gm::GM_HELP_GIVESTARTERSKILLS),
+    ("backintime", messages::gm::GM_HELP_BACK_IN_TIME),
+    ("setattr", messages::gm::GM_HELP_SETATTR),
     ("ship", messages::gm::GM_HELP_SHIP),
     ("spawn", messages::gm::GM_HELP_SPAWN),
     ("fit", messages::gm::GM_HELP_FIT),
     ("unload", messages::gm::GM_HELP_UNLOAD),
+    ("unfit", messages::gm::GM_HELP_UNFIT),
     ("load", messages::gm::GM_HELP_LOAD),
     ("online", messages::gm::GM_HELP_ONLINE),
     ("iteminfo", messages::gm::GM_HELP_ITEMINFO),
@@ -114,10 +179,25 @@ const COMMANDS: &[(&str, &str)] = &[
     ("npcclear", messages::gm::GM_HELP_NPCCLEAR),
     ("wreck", messages::gm::GM_HELP_WRECK),
     ("container", messages::gm::GM_HELP_CONTAINER),
+    ("sysjunkclear", messages::gm::GM_HELP_SYSJUNKCLEAR),
+    ("testclear", messages::gm::GM_HELP_TESTCLEAR),
+    ("loadsys", messages::gm::GM_HELP_LOADSYS),
+    ("loadallsys", messages::gm::GM_HELP_LOADALLSYS),
+    ("unloadallsys", messages::gm::GM_HELP_UNLOADALLSYS),
+    ("suicide", messages::gm::GM_HELP_SUICIDE),
     ("dmg", messages::gm::GM_HELP_DMG),
+    ("invu", messages::gm::GM_HELP_INVU),
+    ("cwatch", messages::gm::GM_HELP_CWATCH),
+    ("naughty", messages::gm::GM_HELP_NAUGHTY),
     ("lp", messages::gm::GM_HELP_LP),
     ("addlp", messages::gm::GM_HELP_ADDLP),
     ("setlp", messages::gm::GM_HELP_SETLP),
+    ("evermarks", messages::gm::GM_HELP_EVERMARKS),
+    ("corpevermarks", messages::gm::GM_HELP_CORPEVERMARKS),
+    ("addevermarks", messages::gm::GM_HELP_ADDEVERMARKS),
+    ("setevermarks", messages::gm::GM_HELP_SETEVERMARKS),
+    ("addcorpevermarks", messages::gm::GM_HELP_ADDCORPEVERMARKS),
+    ("setcorpevermarks", messages::gm::GM_HELP_SETCORPEVERMARKS),
     ("secstatus", messages::gm::GM_HELP_SECSTATUS),
     ("missioncomplete", messages::gm::GM_HELP_MISSIONCOMPLETE),
     ("corpcreate", messages::gm::GM_HELP_CORPCREATE),
@@ -126,10 +206,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("session", messages::gm::GM_HELP_SESSION),
     ("setstanding", messages::gm::GM_HELP_SETSTANDING),
     ("where", messages::gm::GM_HELP_WHERE),
+    ("version", messages::gm::GM_HELP_VERSION),
     ("who", messages::gm::GM_HELP_WHO),
     ("wallet", messages::gm::GM_HELP_WALLET),
     ("hangar", messages::gm::GM_HELP_HANGAR),
+    ("maxagentstandings", messages::gm::GM_HELP_MAXAGENTSTANDINGS),
+    ("fullstandings", messages::gm::GM_HELP_FULLSTANDINGS),
     ("help", messages::gm::GM_HELP_HELP),
+    ("shutdown", messages::gm::GM_HELP_SHUTDOWN),
 ];
 
 fn slash_error(text: String) -> CallError {
@@ -182,58 +266,7 @@ async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError>
     row.map(|t| (t.type_id, t.name.as_ref().expect("type name").clone())).ok_or_else(|| slash_error(messages::gm::gm_unknown_type(arg)))
 }
 
-/// /tr me <destination>
-async fn tr(c: &mut Client, args: &[String]) -> Result<String, CallError> {
-    let dest = match args {
-        [me, dest, ..] if me == "me" => dest.as_str(),
-        [dest] if dest != "me" => dest.as_str(),
-        _ => return Err(slash_error(messages::gm::GM_TELEPORT_USAGE.into())),
-    };
-    let Ok(id) = dest.parse::<i64>() else { return Err(slash_error(messages::gm::gm_invalid_id(dest))) };
-    if c.session.int("stationid").is_some() {
-        return Err(slash_error(messages::GM_UNDOCK_FIRST.into()));
-    }
-    let here = c.session.int("solarsystemid").unwrap_or(0);
-    // Something in this system's ballpark.
-    if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.position_at(s.now_ms()), b.radius))).await.flatten() {
-        let pos = [ball_pos[0] + radius as f64 + TELEPORT_CLEARANCE, ball_pos[1], ball_pos[2]];
-        super::ship::teleport(c, here, pos).await?;
-        return Ok(messages::gm::gm_teleported(id));
-    }
-    // SQL's descending boolean order puts NULL group IDs before planets.
-    if (30_000_000..33_000_000).contains(&id) {
-        let priority = c.sde.map.celestials(id)
-            .map(|p| (p.group_id.is_none(), p.group_id == Some(i64::from(GROUP_PLANET))))
-            .max();
-        let candidates = || c.sde.map.celestials(id).filter(|p| {
-            Some((p.group_id.is_none(), p.group_id == Some(i64::from(GROUP_PLANET)))) == priority
-        });
-        let count = candidates().count();
-        let p = candidates().nth((super::rand01() * count as f64) as usize)
-            .ok_or_else(|| slash_error(messages::gm::gm_unknown_system(id)))?;
-        let p = (p.x.expect("celestial x"), p.y.expect("celestial y"), p.z.expect("celestial z"), f64::from(c.sde.celestial_radius(p)));
-        let pos = [p.0 + p.3 + 100_000.0, p.1, p.2];
-        super::ship::teleport(c, id, pos).await?;
-        return Ok(messages::gm::gm_teleported_to_system(id));
-    }
-    // A station, planet, moon, gate...
-    if let Some(p) = c.sde.map.celestial(id) {
-        let pos = [p.x.expect("celestial x") + f64::from(c.sde.celestial_radius(p)) + TELEPORT_CLEARANCE, p.y.expect("celestial y"), p.z.expect("celestial z")];
-        super::ship::teleport(c, p.solar_system_id.expect("celestial system"), pos).await?;
-        return Ok(messages::gm::gm_teleported(id));
-    }
-    // A character in space, or an item floating somewhere.
-    let at = crate::dao::items::social::position(&c.db, id).await.map_err(db_err)?;
-    if let Some(r) = at {
-        let system = r.location_id;
-        let pos = [r.x + TELEPORT_CLEARANCE, r.y, r.z];
-        let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.position_at(s.now_ms()))).await.flatten();
-        let pos = live.map(|p| [p[0] + TELEPORT_CLEARANCE, p[1], p[2]]).unwrap_or(pos);
-        super::ship::teleport(c, system, pos).await?;
-        return Ok(messages::gm::gm_teleported_in_system(id, system));
-    }
-    Err(slash_error(messages::gm::gm_target_not_found(id)))
-}
+
 
 fn create_quantity(arg: Option<&str>) -> Result<i64, CallError> {
     let Some(arg) = arg else { return Ok(1) };
@@ -415,10 +448,12 @@ async fn heal(c: &mut Client) -> Result<String, CallError> {
         super::repair::heal_docked(&super::identity::Identity::of_client(c), &c.db, &c.world, &c.sde).await?;
         return Ok(messages::gm::GM_HEALED_DOCKED.into());
     }
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Err(slash_error(messages::gm::GM_DOGMA_NO_SHIP.into())) };
-    super::combat::gm_repair(&c.world, system, c.session.int("charid").unwrap_or(0), ship).await?;
-    super::ship::send_state(c).await?;
-    Ok(messages::gm::GM_REPAIRED.into())
+    let expected = infinity_core::session::OnlineSession::from_session(&c.session)
+        .ok_or_else(|| slash_error(messages::gm::GM_DOGMA_NO_SHIP.into()))?;
+    match super::repair::heal_space(&expected, &c.db, &c.world, &c.sde).await? {
+        super::repair::SpaceHealOutcome::Complete => Ok(messages::gm::GM_HEALED_SPACE.into()),
+        super::repair::SpaceHealOutcome::ModulesOnly => Ok(messages::gm::GM_HEAL_MODULES_ONLY.into()),
+    }
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -459,10 +494,12 @@ async fn execute(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
     info!(user = c.login.user_id, "slash: /{line}");
     let result = match command.as_str() {
-        "tr" => tr(c, args).await,
+        "announce" => announce::command(c, args),
+        "tr" => transport::command(c, args).await,
         "wh" | "wormhole" => wormholes::command(c, &command, args).await,
-        "scanall" => super::exploration::gm_scan_all(c).await,
-        "sites" => super::exploration::gm_sites(c).await,
+        "scanall" | "sigscan" => super::exploration::gm_scan_all(c).await,
+        "sites" | "sigs" => super::exploration::gm_sites(c).await,
+        "overlayrefresh" => if args.is_empty() { super::exploration::gm_overlay_refresh(c) } else { Err(slash_error(messages::gm::GM_OVERLAY_REFRESH_USAGE.into())) },
         "create" | "createitem" => create(c, args).await,
         "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, args, &command).await,
         "clonegrade" => subscriptions::run(c, args).await,
@@ -470,26 +507,36 @@ async fn execute(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "dogma" => dogma::command(c, args).await,
         "jobs" => jobs::command(&c.db, args).await,
         "effects" => effects::command(args),
+        "effect" => effects::visual_command(c, args).await,
         "hitchance" => hitchance::command(c, args).await,
         "expertsystem" => expert_systems::command(c, args).await,
-        "giveskill" | "allskills" | "removeskill" | "givestarterskills" => skills::command(c, &command, args).await,
+        "giveskill" | "allskills" | "removeskill" | "givestarterskills" | "backintime" | "setattr" => skills::command(c, &command, args).await,
+        "allskins" => all_skins::command(c, args).await,
         // eve/devtools/script/dna.py:118-124 creates and returns the item ID without boarding; the caller must board separately.
         "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),
-        "ship" | "fit" | "unload" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
+        "ship" | "fit" | "unload" | "unfit" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
         "entity" | "npc" | "npcclear" | "wreck" | "container" => npc::command(c, &command, args).await,
+        "sysjunkclear" | "testclear" => debris::command(c, &command, args).await,
+        "loadsys" | "loadallsys" | "unloadallsys" => world::command(c, &command, args).await,
+        "suicide" => death::command(c, args).await,
         "dmg" => combat::command(c, &command, args).await,
-        "lp" | "addlp" | "setlp" | "missioncomplete" | "corpcreate" | "setalliance" | "joinalliance" => social::command(c, &command, args).await,
-        "secstatus" | "session" | "where" | "who" | "wallet" | "hangar" => info::command(c, &command, args).await,
-        "setstanding" => social::command(c, &command, args).await,
+        "invu" => npc_control::command(c, args).await,
+        "cwatch" | "naughty" => crimewatch::command(c, &command, args).await,
+        "dirt" => appearance::command(c, args).await,
+        "killmark" | "killmarks" => appearance::killmarks(c, args).await,
+        "lp" | "addlp" | "setlp" | "evermarks" | "corpevermarks" | "addevermarks" | "setevermarks" | "addcorpevermarks" | "setcorpevermarks" | "missioncomplete" | "corpcreate" | "setalliance" | "joinalliance" => social::command(c, &command, args).await,
+        "secstatus" | "session" | "where" | "who" | "wallet" | "hangar" | "version" => info::command(c, &command, args).await,
+        "setstanding" | "maxagentstandings" | "fullstandings" => social::command(c, &command, args).await,
         "help" => Ok(help()),
+        "shutdown" => shutdown::command(c, args),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };
-    let listing = matches!(command.as_str(), "sites" | "session" | "lp" | "iteminfo" | "typeinfo")
+    let listing = matches!(command.as_str(), "sites" | "sigs" | "session" | "lp" | "iteminfo" | "typeinfo")
         || (matches!(command.as_str(), "wh" | "wormhole") && args.first().is_some_and(|s| s.eq_ignore_ascii_case("status")))
         || (command == "dogma" && args.get(1).is_some_and(|s| s == "list"));
     let header = matches!(command.as_str(), "session" | "lp" | "typeinfo");
     Some(result.map(|text| Value::unicode(if listing { limit_list(text, header) } else { text })))
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-content", feature = "tests-effects", feature = "tests-inventory", feature = "tests-ships", feature = "tests-slash", feature = "tests-social")))]
+pub(in crate::services) mod tests;

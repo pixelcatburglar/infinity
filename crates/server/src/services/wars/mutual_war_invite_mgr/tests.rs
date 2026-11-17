@@ -58,7 +58,7 @@ async fn mutual_authority_transactions_and_durable_deadlines() {
     let (a,b) = (corps[0],corps[1]);
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=ANY($2)", &[&a,&chars[0..3].to_vec()]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=ANY($2)", &[&b,&chars[3..5].to_vec()]).await.unwrap();
-    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=$2", &[&infinity_core::consts::ROLE_DIRECTOR,&chars[1]]).await.unwrap();
+    db.execute("UPDATE game.characters SET corp_roles=$1 WHERE character_id=ANY($2)", &[&infinity_core::consts::ROLE_DIRECTOR,&vec![chars[0],chars[1],chars[3]]]).await.unwrap();
     let alliance: i64 = db.query_one("INSERT INTO game.alliances (name,short_name,executor_corp_id,creator_corp_id,creator_char_id,created) VALUES ('war-test-' || nextval('game.alliances_alliance_id_seq')::text,'W' || currval('game.alliances_alliance_id_seq')::text,$1,$1,$2,1) RETURNING alliance_id", &[&a,&chars[0]]).await.unwrap().get("alliance_id");
     let test_db = db.clone(); let actors = chars.clone();
     let result = tokio::spawn(async move {
@@ -76,7 +76,7 @@ async fn mutual_authority_transactions_and_durable_deadlines() {
         let cfg = Arc::new(crate::config::Config::default());
         let hub = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
         let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let mut c = Client::new(crate::conn::Conn::new(stream,address), cfg, test_db.clone(), sde, hub, world.clone(), login);
+        let mut c = Client::new(infinity_wire::conn::Conn::new(stream,address), cfg, test_db.clone(), sde, hub, world.clone(), login);
         let (ceo,director,member,other,outsider) = (actors[0],actors[1],actors[2],actors[3],actors[4]);
         assert!(super::super::authority::require_owner(&test_db,ceo,a).await.is_ok());
         assert!(super::super::authority::require_owner(&test_db,director,a).await.is_ok());

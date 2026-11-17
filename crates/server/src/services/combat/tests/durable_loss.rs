@@ -3,6 +3,7 @@ use super::*;
 use infinity_core::{consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, TYPE_CAPSULE}};
 use crate::{dao::{characters, insurance, items}, services::combat::damage::DamageSource};
 use crate::tests::catch_scenario;
+use std::future::Future;
 
 struct Fixture {
     db: Db,
@@ -28,6 +29,7 @@ impl Fixture {
         let sde = Arc::new(Sde::load(&db).await.unwrap());
         let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)
             && t.type_id != TYPE_CAPSULE && t.base_price.is_some_and(|v| v > 1.0)
+            && t.group_id.is_some_and(|g| sde.repairable_ship.enters_recovery(t.type_id, g, CATEGORY_SHIP) && !sde.repairable_ship.unrepairable(CATEGORY_SHIP, g, t.type_id))
             && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE,
                 ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE]
                 .iter().all(|&a| t.attribute(a).unwrap_or(0.0) > 0.0)).unwrap().type_id;
@@ -40,11 +42,12 @@ impl Fixture {
             })).expect("published turret module");
         let row = sde.map.systems().find(|s| s.constellation_id.is_some() && s.region_id.is_some()).unwrap();
         let (system, constellation, region) = (row.solar_system_id, row.constellation_id.unwrap(), row.region_id.unwrap());
+        let home = sde.map.stations().find(|s| s.solar_system_id.is_some() && s.constellation_id.is_some() && s.region_id.is_some()).unwrap().station_id;
         let (account, owner, attackers, ship, attacker_ships, modules) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
             let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await?.get("user_id");
             let mut characters = Vec::new();
             for _ in 0..3 {
-                characters.push(tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id,constellation_id,region_id,balance) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,NULL,$2,$3,$4,0) RETURNING character_id", &[&account, &system, &constellation, &region]).await?.get::<_, i64>("character_id"));
+                characters.push(tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id,station_id,solar_system_id,constellation_id,region_id,balance,home_station_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1,NULL,$2,$3,$4,0,$5) RETURNING character_id", &[&account, &system, &constellation, &region, &home]).await?.get::<_, i64>("character_id"));
             }
             let owner = characters[0];
             let ship = items::creation::positioned(tx, ship_type, owner, system, [0.0; 3]).await?;
@@ -105,16 +108,17 @@ impl Fixture {
     }
 
     async fn insured(&self) -> f64 {
-        let price = insurance::value(&self.db, self.ship_type).await.unwrap();
+        let price = self.world.sde().prices.get(self.ship_type);
         let base = self.world.sde().types.get(self.ship_type).unwrap().base_price;
-        let price = price.as_ref().and_then(|p| p.adjusted).filter(|v| *v != 0.0)
-            .or_else(|| price.as_ref().and_then(|p| p.average).filter(|v| *v != 0.0)).or(base).unwrap();
+        let price = price.map(|p| p.adjusted).filter(|v| *v != 0.0)
+            .or_else(|| price.map(|p| p.average).filter(|v| *v != 0.0)).or(base).unwrap();
         let now = filetime_now();
         insurance::insure(&self.db, self.ship, self.owner, self.ship_type, 1.0, now, now + 3600 * FILETIME_SECOND).await.unwrap();
         crate::services::market::round2(price)
     }
 
     async fn cleanup(self) {
+        crate::services::tests::fixture::cleanup_recovery(&self.db, self.owner).await.unwrap();
         if let Some(ship) = characters::selection::ship_id(&self.db, self.owner).await.unwrap() { self.world.remove_ball(self.system, ship).await; }
         self.world.remove_ball(self.system, self.ship).await;
         self.world.unregister_pilot_generation(self.owner, None);
@@ -155,6 +159,15 @@ async fn assert_loss(f: &Fixture, payout: f64, winner: &damage::DamageOutcome, s
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].get::<_, String>("source_namespace"), "business");
     assert_eq!(journal[0].get::<_, String>("source_key"), format!("ShipLost:{}", f.ship));
+    let groups = crate::dao::repairable_ship::list_owned(&f.db, f.owner).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!((group.group.kind, group.group.shape.item.get(), group.group.loss_id), (crate::dao::repairable_ship::SourceKind::PilotedShip, f.ship, Some(f.ship)));
+    assert_eq!(group.items.len(), 1);
+    assert_eq!(group.items[0].item.get(), f.ship);
+    let custody = crate::dao::items::repairable_ship::capture_many(&f.db, &[group.items[0].item]).await.unwrap();
+    assert_eq!((custody.len(), custody[0].owner, custody[0].location), (1, infinity_core::consts::NPC_CORP_INTERBUS, group.group.id.get()));
+    assert!(f.db.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&format!("{}:{}", crate::services::repairable_ship::deadlines::PAYMENT, group.items[0].id.get())]).await.unwrap().is_some());
     let capsule = characters::selection::ship_id(&f.db, f.owner).await.unwrap().unwrap();
     assert_ne!(capsule, f.ship);
     assert_eq!(f.db.query("SELECT item_id FROM game.items WHERE owner_id=$1 AND type_id=$2", &[&f.owner, &TYPE_CAPSULE]).await.unwrap().len(), 1);
@@ -216,26 +229,39 @@ async fn serialization_failure_inside_loss_retries_real_damage_once() {
     f.world.set_online_session(f.owner, Some(infinity_core::session::OnlineSession { character_id: f.owner, user_id: None, session_id: 1, ship_id: Some(f.ship), station_id: None, system_id: Some(f.system), corporation_id: Some(1), alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 }));
     f.db.execute(&format!("CREATE SEQUENCE {sequence}"), &[]).await.unwrap();
     sequence_created = true;
-    f.db.execute(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.victim_item_id = {} AND nextval('{sequence}') = 1 THEN RAISE EXCEPTION 'fixture serialization failure' USING ERRCODE = '40001'; END IF; RETURN NEW; END $$", f.ship), &[]).await.unwrap();
+    f.db.execute(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.victim_item_id = {} THEN IF NOT EXISTS (SELECT 1 FROM game.repairable_recovery_groups g JOIN game.repairable_recovery_items m ON m.group_id=g.group_id JOIN game.item_service_life l ON l.item_id=m.item_id WHERE g.source_item_id=NEW.victim_item_id AND m.item_id=NEW.victim_item_id) THEN RAISE EXCEPTION 'capture missing'; END IF; IF nextval('{sequence}') = 1 THEN RAISE EXCEPTION 'fixture serialization failure' USING ERRCODE = '40001'; END IF; END IF; RETURN NEW; END $$", f.ship), &[]).await.unwrap();
     function_created = true;
     f.db.execute(&format!("CREATE TRIGGER {name} BEFORE INSERT ON game.killmails FOR EACH ROW EXECUTE FUNCTION {function}()"), &[]).await.unwrap();
     trigger_created = true;
     let ship = f.ship;
     let prehit = f.world.with(f.system, move |s| s.combat_condition_snapshot(ship).unwrap().condition).await.unwrap();
+    let original = crate::dao::items::repairable_ship::capture_many(&f.db, &[crate::dao::repairable_ship::ItemId::new(f.ship).unwrap()]).await.unwrap().remove(0);
     let result = f.hit(0, [1e30; 4], true).await;
     let count: i64 = f.db.query_one(&format!("SELECT last_value FROM {sequence}"), &[]).await.unwrap().get("last_value");
     let winner = result.ok().unwrap().unwrap();
     assert_eq!(count, 2);
     assert!(winner.lethal && winner.dealt > 0.0);
     assert_loss(&f, payout, &winner, &f.source(0)).await;
+    let selection = crate::dao::repairable_ship::list_owned(&f.db, f.owner).await.unwrap().remove(0);
+    let lethal_at = match crate::db::outbox::tests::events(&f.db, "LossSettled", f.owner).await.as_slice() { [crate::lua::events::GameEvent::LossSettled { occurred_at, .. }] => *occurred_at, events => panic!("expected one LossSettled event, got {events:?}") };
+    assert_eq!((&selection.group.shape, selection.group.beneficiary, selection.group.system), (&original, f.owner, f.system));
+    assert_eq!(selection.group.occurred_at, lethal_at);
+    assert_eq!(selection.group.payment_expires_at, lethal_at + crate::config::game().repairable_ship.payment_retention_days * infinity_core::consts::FILETIME_DAY);
+    assert_eq!(selection.items[0].repair_completed_at, lethal_at + crate::client::filetime_ticks_from_ms(crate::space::seconds_to_ms_f64(f.world.sde().repairable_ship.repair_seconds(f.ship_type).unwrap())));
     let later = f.hit(1, [0.0; 4], true).await.ok().unwrap();
     assert!(later.is_none());
     assert_loss(&f, payout, &winner, &f.source(0)).await;
     let mut destroyed = 0;
     let mut changes = 0;
+    let mut recovery_notices = [0, 0];
     while let Ok((event, payload)) = receiver.try_recv() {
         destroyed += usize::from(event == "__ship_destroyed");
+        if event == "__ship_destroyed" {
+            assert_eq!(selection.group.position, std::array::from_fn(|i| match &payload[i + 1] { Value::Float(value) => Some(*value), _ => panic!("expected destroyed ship position") }));
+        }
         changes += usize::from(event == "OnModuleAttributeChanges");
+        recovery_notices[0] += usize::from(event == "OnItemServiceLifeDamageChanged");
+        recovery_notices[1] += usize::from(event == "OnAddRecoveryGroup");
         if event == "OnModuleAttributeChanges" {
             let [Value::List(rows)] = payload.as_slice() else { panic!("expected change list") };
             let ids = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
@@ -257,6 +283,7 @@ async fn serialization_failure_inside_loss_retries_real_damage_once() {
             }
         }
     }
+    assert_eq!(recovery_notices, [1, 1]);
     assert_eq!((destroyed, changes), (1, 1));
     }).await;
     let mut cleanup_errors = Vec::new();
@@ -430,6 +457,54 @@ async fn checkpoint_location_miss_keeps_condition_dirty_until_retry() {
         assert_ne!(rows.iter().map(|r| (r.attribute_id, r.value, r.updated_at)).collect::<Vec<_>>(), before);
     }).await;
     f.db.execute("UPDATE game.items SET location_id=$2 WHERE item_id=$1", &[&f.ship, &f.system]).await.unwrap();
+    f.cleanup().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn loss_fault_leaves_captured_slot_unknown_until_fresh_reseed() {
+    let f = Fixture::new().await;
+    let (name, function) = (format!("durable_loss_loaded_{}", f.ship), format!("game.durable_loss_loaded_fn_{}", f.ship));
+    let charge_type = f.world.sde().types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE)).unwrap().type_id;
+    let module = items::creation::rookie_ship(&f.db, f.weapon_type, f.owner, f.ship, FLAG_HI_SLOT_FIRST).await.unwrap();
+    crate::dao::items::combat::apply_loads(&f.db, f.ship, &[(module, FLAG_HI_SLOT_FIRST, charge_type, 8, 0)]).await.unwrap();
+    let key = items::charges::LoadedSlotKey { ship: f.ship, module, flag: FLAG_HI_SLOT_FIRST };
+    let result = catch_scenario(async {
+        let fit = Fit::load_in_space(&f.db, &f.world, f.system, f.owner, f.ship).await.ok().unwrap();
+        f.db.execute(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture loaded loss fault'; END $$"), &[]).await.unwrap();
+        f.db.execute(&format!("CREATE TRIGGER {name} BEFORE UPDATE ON game.module_charges FOR EACH ROW WHEN (NEW.ship_id = {}) EXECUTE FUNCTION {function}()", f.ship), &[]).await.unwrap();
+        f.world.with(f.system, move |s| {
+            let stats = ShipStats::from_fit(&fit, Key::Ship);
+            s.install_condition(f.ship, Condition { now: stats.max, stats, shield_at: filetime_now() }, fit);
+            let permit = s.hold_loaded_use(f.ship, module).unwrap();
+            assert!(s.consume_loaded(permit).is_some()); }).await.unwrap();
+        let (mut client, connection) = crate::config::tests::test_database().to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(async move { let _ = connection.await; });
+        let hull = client.transaction().await.unwrap();
+        crate::dao::items::ship::lock_reload_ship(&hull, f.ship).await.unwrap();
+        let hull_pid: i32 = hull.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
+        let mut hit = std::pin::pin!(f.hit(0, [1e30; 4], true));
+        loop {
+            std::future::poll_fn(|cx| { assert!(hit.as_mut().poll(cx).is_pending()); std::task::Poll::Ready(()) }).await;
+            if f.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE 'SELECT item_id FROM game.items%') AS blocked", &[&hull_pid]).await.unwrap().get::<_, bool>("blocked") { break; }
+            tokio::task::yield_now().await; }
+        assert_eq!(f.world.with(f.system, move |s| (s.unknown_loaded_keys().contains(&key), s.loaded_effective(f.ship, module).is_none())).await.unwrap(), (true, true));
+        hull.commit().await.unwrap();
+        let error = hit.await.unwrap_err();
+        assert!(format!("{error:?}").contains("fixture loaded loss fault"));
+        assert!(crate::db::outbox::tests::events(&f.db, "ShipLost", f.owner).await.is_empty());
+        assert_eq!(f.world.with(f.system, move |s| s.loaded_effective(f.ship, module)).await.unwrap().map(|v| (v.1, v.2)), Some((charge_type, 8)));
+        f.db.execute(&format!("DROP TRIGGER {name} ON game.module_charges"), &[]).await.unwrap();
+        assert!(matches!(f.world.with(f.system, move |s| s.combat_phase(f.ship)).await.unwrap(), Some(crate::space::combat::CombatPhase::Dying { .. })));
+        let [(item, generation, token)] = f.world.with(f.system, move |s| s.pending_reconciliations()).await.unwrap()[..] else { panic!("expected one retained dying loss") };
+        assert!(f.world.with(f.system, move |s| s.player_loss_context(item, token, generation).is_some_and(|context| crate::poison::lock_or_exit(context.recovery_source.lock()).is_none())).await.unwrap());
+        assert_eq!(characters::selection::ship_id(&f.db, f.owner).await.unwrap(), Some(f.ship));
+        assert!(crate::db::outbox::tests::events(&f.db, "ShipLost", f.owner).await.is_empty());
+        assert_eq!(f.db.query_one("SELECT count(*) AS killmail_count FROM game.killmails WHERE victim_item_id=$1", &[&f.ship]).await.unwrap().get::<_, i64>("killmail_count"), 0); }).await;
+    f.db.execute(&format!("DROP TRIGGER IF EXISTS {name} ON game.module_charges"), &[]).await.unwrap();
+    f.db.execute("DELETE FROM game.module_charges WHERE ship_id=$1", &[&f.ship]).await.unwrap();
+    f.db.execute(&format!("DROP FUNCTION IF EXISTS {function}()"), &[]).await.unwrap();
     f.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

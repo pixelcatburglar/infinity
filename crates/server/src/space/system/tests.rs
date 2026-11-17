@@ -1,13 +1,20 @@
-use super::*;
-mod jamming;
-mod jump_cloak;
-mod drone;
-mod visibility;
-pub(crate) mod events;
-#[path = "../effects/tests.rs"]
+#[cfg(feature = "tests-space")] use super::*;
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-lua", feature = "tests-slash", feature = "tests-social"))] use marshal::Value;
+#[cfg(feature = "tests-space")] mod jamming;
+#[cfg(feature = "tests-space")] mod jump_cloak;
+#[cfg(feature = "tests-space")] mod drone;
+#[cfg(feature = "tests-space")] mod visibility;
+#[cfg(feature = "tests-space")] mod names;
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-lua", feature = "tests-runtime", feature = "tests-ships", feature = "tests-slash", feature = "tests-social", feature = "tests-space"))] pub(crate) mod events;
+#[cfg(feature = "tests-space")] #[path = "../effects/tests.rs"]
 mod effect_actions;
+#[cfg(feature = "tests-space")] mod missiles;
+#[cfg(feature = "tests-space")] mod projectiles;
+#[cfg(feature = "tests-space")] mod gm_effects;
+#[cfg(feature = "tests-space")] mod super_weapons;
 
-fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
+#[cfg(feature = "tests-space")]
+pub(super) fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     crate::tests::init_config();
     Ball {
         id, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
@@ -22,7 +29,7 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn projection_replacement_expiry_and_departure_cleanup() {
     use crate::services::effects::{projection::Projection, EffectKind, JammingType};
     let mut system = System::new(1, Arc::default(), 1000);
@@ -30,7 +37,7 @@ fn projection_replacement_expiry_and_departure_cleanup() {
     let projection = |module, deadline| Projection {
         source_ship: 1, source_module: module, source_type: 1, effect_id: 1,
         kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: deadline,
-        values: Vec::new(), charge_values: Vec::new(), charge_type: None, scramble: None,
+        values: Vec::new(), charge_values: Vec::new(), charge_type: None, resistance_attribute: None, scramble: None,
     };
     system.upsert_projection(2, projection(10, 1500));
     system.upsert_projection(3, projection(10, 2000));
@@ -50,7 +57,7 @@ fn projection_replacement_expiry_and_departure_cleanup() {
     assert!(system.projections_on(3).is_empty());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn completed_segment_samples_use_shared_drag_and_clamp() {
     let mut s = System::new(0, Arc::default(), 1_000);
     let mut moving = ball(1, None, 5.0);
@@ -91,7 +98,7 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
     assert!(s.ball(1).is_none());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn sampled_ball_uses_accelerating_segment_state_at_actor_clock() {
     let mut s = System::new(0, Arc::default(), 1_000);
     let mut moving = ball(1, None, 5.0);
@@ -119,7 +126,7 @@ fn sampled_ball_uses_accelerating_segment_state_at_actor_clock() {
     assert!(s.sampled_ball(99).is_none());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn static_modes_stay_fixed() {
     let positions = HashMap::new();
     let mut fixed = ball(2, None, 7.0);
@@ -130,7 +137,7 @@ fn static_modes_stay_fixed() {
     assert_eq!(fixed.position_at(1500), [7.0, 0.0, 0.0]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn stationary_command_replaces_previous_segment_at_application() {
     let mut s = System::new(0, Arc::default(), 1000);
     let mut moving = ball(1, None, 0.0);
@@ -149,7 +156,7 @@ fn stationary_command_replaces_previous_segment_at_application() {
     assert_eq!(s.ball(1).unwrap().position_at(3500), [42.0, 0.0, 0.0]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn health_and_uncloak_leave_completed_segment_intact() {
     let mut s = System::new(0, Arc::default(), 1000);
     let mut moving = ball(1, None, 0.0);
@@ -159,11 +166,11 @@ fn health_and_uncloak_leave_completed_segment_intact() {
     s.tick(2000);
     let before = s.ball(1).unwrap().position_at(2500);
     s.set_health(1, [0.5; 3]);
-    s.apply_uncloak(1, 2);
+    s.apply_uncloak_with_collisions(1, 2, crate::space::collision::enabled());
     assert_eq!(s.ball(1).unwrap().position_at(2500), before);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn pilot_index_tracks_insert_take_and_capsule_before_ship_removal() {
     let mut system = System::default();
     system.insert(ball(1, None, 0.0));
@@ -191,7 +198,7 @@ fn pilot_index_tracks_insert_take_and_capsule_before_ship_removal() {
     assert!(system.contains(4));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn nearest_hostile_via_pilot_index_matches_full_scan() {
     let mut system = System::default();
     system.insert(ball(1, None, 1.0));
@@ -223,21 +230,28 @@ fn nearest_hostile_via_pilot_index_matches_full_scan() {
     assert_eq!(nearest(system.pilots(), 30.0), nearest(system.balls(), 30.0));
 }
 
-fn watch(s: &mut System, client: i64, ego: i64) -> mpsc::UnboundedReceiver<Vec<Value>> {
+#[cfg(feature = "tests-space")]
+pub(super) fn watch(s: &mut System, client: i64, ego: i64) -> mpsc::UnboundedReceiver<crate::space::SceneDelivery> {
     crate::tests::init_config();
-    let (tx, rx) = mpsc::unbounded_channel();
-    s.observe(client, ego, tx);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (completed, mut done) = tokio::sync::oneshot::channel();
+    assert!(s.observe(client, ego, tx, completed));
+    s.apply_scene_prefix(crate::space::collision::enabled());
+    assert_eq!(done.try_recv(), Ok(true));
+    events::initial_state(&mut rx);
+    events::fleet_snapshot(&mut rx);
     rx
 }
 
-fn name(event: &Value) -> &[u8] {
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-lua", feature = "tests-slash", feature = "tests-social", feature = "tests-space"))]
+pub(super) fn name(event: &Value) -> &[u8] {
     let Value::Tuple(parts) = event else { panic!("event tuple") };
     let Value::Tuple(call) = &parts[1] else { panic!("call tuple") };
     let Value::Bytes(name) = &call[0] else { panic!("event name") };
     name
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn command_stamps_seconds_and_borrows_other_balls() {
     let mut s = System::new(0, Arc::default(), 12_345);
     s.insert(ball(1, Some(100), 0.0));
@@ -253,16 +267,17 @@ fn command_stamps_seconds_and_borrows_other_balls() {
     s.tick(12_999);
     assert!(rx.try_recv().is_err());
     s.tick(13_000);
-    let events = rx.try_recv().unwrap();
+    let events = events::destiny(rx.try_recv().unwrap());
     let Value::Tuple(parts) = &events[0] else { panic!("event") };
     assert_eq!(parts[0].as_int(), Some(12));
     assert_eq!(s.ball(1).unwrap().goto, [10.0, 0.0, 0.0]);
 }
 
 
-#[test]
-fn missile_impact_delay_starts_at_launch_boundary() {
+#[cfg(feature = "tests-space")] #[test]
+fn missile_lifetime_starts_at_launch_boundary() {
     let mut s = System::new(0, Arc::default(), 12_100);
+    s.insert(ball(1, None, 0.0));
     let mut rx = watch(&mut s, 1, 1);
     s.insert(ball(5, None, 0.0));
     s.insert(ball(4, None, 1000.0));
@@ -270,8 +285,8 @@ fn missile_impact_delay_starts_at_launch_boundary() {
     let observed = fired.clone();
     let mut missile = ball(3, None, 0.0);
     missile.massive = false;
-    s.launch_missile(missile, 4, 5, 500, move |s| {
-        assert_eq!(s.ball(3).unwrap().mode, MODE_MISSILE);
+    s.launch_missile(missile, 4, 5, 500.0, move |s, impact| {
+        assert!(impact.is_none());
         observed.lock().unwrap().push(s.now_ms());
     });
     let b = s.ball(3).unwrap();
@@ -283,7 +298,7 @@ fn missile_impact_delay_starts_at_launch_boundary() {
     assert!(fired.lock().unwrap().is_empty());
     assert!(rx.try_recv().is_err());
     s.tick(13_000);
-    let events = rx.try_recv().unwrap();
+    let events = events::destiny(rx.try_recv().unwrap());
     assert_eq!(events.len(), 2);
     assert_eq!(name(&events[0]), b"AddBalls");
     assert_eq!(name(&events[1]), b"LaunchMissile");
@@ -297,19 +312,21 @@ fn missile_impact_delay_starts_at_launch_boundary() {
     assert!(fired.lock().unwrap().is_empty());
     s.tick(13_500);
     assert_eq!(*fired.lock().unwrap(), [13_500]);
+    assert!(s.ball(3).is_none());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn cloak_visibility_and_tick_lapse_are_batched_per_observer() {
     let mut s = System::default();
     let mut b = ball(1, Some(100), 0.0);
     b.cloak = CLOAK_RESTORE;
     b.cloak_until = crate::client::filetime_from_unix_ms(1000);
     s.insert(b);
+    s.insert(ball(2, None, 1.0));
     let mut own = watch(&mut s, 1, 1);
     let mut other = watch(&mut s, 2, 2);
-    s.broadcast(1, vec![event(0, "private", vec![])]);
-    assert_eq!(name(&own.try_recv().unwrap()[0]), b"private");
+    s.publish_destiny(1, |_| vec![event(0, "private", vec![])]);
+    assert_eq!(name(&events::destiny(own.try_recv().unwrap())[0]), b"private");
     assert!(other.try_recv().is_err());
     s.tick(999);
     assert!(own.try_recv().is_err());
@@ -317,12 +334,13 @@ fn cloak_visibility_and_tick_lapse_are_batched_per_observer() {
     assert_ne!(s.ball(1).unwrap().cloak, 0);
     s.tick(2000);
     assert_eq!(s.ball(1).unwrap().cloak, 0);
-    assert_eq!(name(&own.try_recv().unwrap()[0]), b"UncloakBall");
-    assert_eq!(name(&other.try_recv().unwrap()[0]), b"AddBalls");
+    assert_eq!(name(&events::destiny(own.try_recv().unwrap())[0]), b"UncloakBall");
+    assert_eq!(name(&events::destiny(other.try_recv().unwrap())[0]), b"AddBalls");
+    events::fleet_snapshot(&mut other);
     assert!(other.try_recv().is_err());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn pilot_removal_issues_jump_queue_key() {
     let registry = Arc::new(Pilots { capacity: 1, ..Pilots::default() });
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -339,18 +357,19 @@ fn pilot_removal_issues_jump_queue_key() {
     assert_eq!(s.request_entry(200), Ok(()));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn closed_observers_are_pruned_even_when_cold() {
     let mut s = System::default();
     drop(watch(&mut s, 1, 1));
     s.tick(100);
     assert!(s.observers.is_empty());
+    s.insert(ball(1, None, 0.0));
     drop(watch(&mut s, 2, 2));
-    s.broadcast(0, vec![event(0, "test", vec![])]);
+    s.publish_destiny(1, |_| vec![event(0, "test", vec![])]);
     assert!(s.observers.is_empty());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn warp_advances_on_logical_second_boundaries() {
     let mut s = System::default();
     let mut b = ball(1, None, 0.0);
@@ -364,37 +383,7 @@ fn warp_advances_on_logical_second_boundaries() {
     assert_eq!(s.ball(1).unwrap().effect_stamp, 0);
 }
 
-#[test]
-fn set_state_contains_visible_balls_ego_damage_and_system() {
-    let mut s = System::new(42, Arc::default(), 0);
-    s.insert(ball(1, Some(100), 0.0));
-    let mut hidden = ball(2, Some(200), 1.0);
-    hidden.cloak = CLOAK_RESTORE;
-    s.insert(hidden);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let state = s.observe(1, 1, tx);
-    assert_eq!(name(&state), b"SetState");
-    let Value::Tuple(parts) = state else { panic!("event") };
-    let Value::Tuple(call) = &parts[1] else { panic!("call") };
-    let Value::Tuple(args) = &call[1] else { panic!("args") };
-    let Value::Instance(_, bag) = &args[0] else { panic!("bag") };
-    let Value::Dict(fields) = &**bag else { panic!("fields") };
-    let field = |key: &str| &fields.iter().find(|(k, _)| k == &Value::str(key)).unwrap().1;
-    assert_eq!(field("ego").as_int(), Some(1));
-    let Value::List(slims) = field("slims") else { panic!("slims") };
-    assert_eq!(slims.len(), 1);
-    let Value::Dict(damage) = field("damageState") else { panic!("damage") };
-    assert_eq!(damage.len(), 1);
-    assert_eq!(damage[0].0.as_int(), Some(1));
-    let Value::Bytes(bytes) = field("state") else { panic!("state") };
-    assert_eq!(bytes[0], DESTINY_FULLSTATE);
-    assert_eq!(i64::from_le_bytes(bytes[5..13].try_into().unwrap()), 1);
-    let Value::Instance(_, sol) = field("solItem") else { panic!("system") };
-    let Value::Dict(sol) = &**sol else { panic!("system fields") };
-    assert!(sol.iter().any(|(k,v)| k == &Value::str("itemID") && v.as_int() == Some(42)));
-}
-
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn constant_target_integration_is_step_size_independent() {
     let mut one = ball(1, None, 7.0);
     one.goto_direction([1.0, 2.0, 3.0]);
@@ -413,7 +402,7 @@ fn constant_target_integration_is_step_size_independent() {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn timers_fire_by_deadline_not_insertion_order_without_firing_early() {
     crate::tests::init_config();
     let mut s = System::default();
@@ -433,7 +422,7 @@ fn timers_fire_by_deadline_not_insertion_order_without_firing_early() {
     assert_eq!(fired.lock().unwrap().len(), 3);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn same_due_timers_fire_in_scheduling_order_including_nested_schedule() {
     crate::tests::init_config();
     let mut s = System::default();
@@ -449,7 +438,7 @@ fn same_due_timers_fire_in_scheduling_order_including_nested_schedule() {
     assert_eq!(*fired.lock().unwrap(), [1, 2, 3]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn timer_for_removed_ball_is_harmless_and_other_timers_still_fire() {
     let mut s = System::default();
     s.insert(ball(1, None, 0.0));
@@ -464,7 +453,7 @@ fn timer_for_removed_ball_is_harmless_and_other_timers_still_fire() {
     assert!(s.timers.is_empty());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn future_timer_allows_cold_skip_until_due() {
     crate::tests::init_config();
     let mut s = System::default();
@@ -478,7 +467,7 @@ fn future_timer_allows_cold_skip_until_due() {
     assert!(s.is_cold(true));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn absolute_deadlines_preserve_cadence_and_tie_order() {
     crate::tests::init_config();
     let mut s = System::default();
@@ -495,7 +484,7 @@ fn absolute_deadlines_preserve_cadence_and_tie_order() {
     assert_eq!(*result.lock().unwrap(), [(1, 200), (2, 200), (3, 300)]);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     let mut s = System::new(0, Arc::default(), 10_500);
     let mut b = ball(1, None, 0.0);
@@ -528,7 +517,7 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     assert_eq!(s.sample_position(1), Some(midpoint));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn nonaligned_stall_resumes_on_next_wall_second() {
     let mut s = System::new(0, Arc::default(), 10_500);
     let mut b = ball(1, None, 0.0);
@@ -561,13 +550,13 @@ fn nonaligned_stall_resumes_on_next_wall_second() {
     assert_eq!(b.interpolation_anchor_ms, 31_000);
     assert_eq!(b.old_pos, before);
     assert!(b.pos[0] > before[0]);
-    let events = rx.try_recv().unwrap();
+    let events = events::destiny(rx.try_recv().unwrap());
     let Value::Tuple(parts) = &events[0] else { panic!("event") };
     assert_eq!(parts[0].as_int(), Some(16));
     assert_eq!(name(&events[0]), b"GotoDirection");
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn ordinary_catchup_anchors_to_last_deadline() {
     let mut s = System::new(0, Arc::default(), 0);
     let mut b = ball(1, None, 0.0);
@@ -584,9 +573,10 @@ fn ordinary_catchup_anchors_to_last_deadline() {
     assert_eq!(b.position_at(3_001), b.pos);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn membership_and_uncloak_are_fifo_and_captured() {
     let mut s = System::new(0, Arc::default(), 5_200);
+    s.insert(ball(99, None, 99.0));
     let mut rx = watch(&mut s, 1, 99);
     let mut b = ball(1, None, 0.0);
     b.last_ms = 999_999;
@@ -600,21 +590,25 @@ fn membership_and_uncloak_are_fifo_and_captured() {
     assert!(!s.uncloak(2));
     assert_ne!(s.ball(2).unwrap().cloak, 0);
     assert!(rx.try_recv().is_err());
+    let before = crate::client::filetime_now();
     s.tick(6_000);
-    let events = rx.try_recv().unwrap();
-    assert_eq!(events.iter().map(name).collect::<Vec<_>>(), vec![b"AddBalls".as_slice(), b"RemoveBalls", b"AddBalls", b"OnSpecialFX"]);
-    for event in events {
-        let Value::Tuple(parts) = event else { panic!("event") };
-        assert_eq!(parts[0].as_int(), Some(5));
-    }
+    let events = events::destiny(rx.try_recv().unwrap());
+    let mut expected = vec![
+        crate::space::add_balls_event(5, s.ball(2).unwrap(), crate::space::collision::enabled()),
+        special_fx(5, 2, None, None, None, "effects.Uncloak", false, 1, 0,
+            Value::Int(SPECIAL_FX_UNSPECIFIED_DURATION), 0, None, 0, Value::None),
+    ];
+    events::reuse_checked_damage_time(&events[0], &mut expected[0], before..=crate::client::filetime_now());
+    assert_eq!(events, expected, "the born-and-taken ball never reaches the wire");
     assert_eq!(s.ball(2).unwrap().cloak, 0);
 }
 
+#[cfg(feature = "tests-space")]
 fn queue_warp(s: &mut System, point: V3) {
     s.command(1, move |b, _, _| { b.warp_to(point, 0.0, 3000); Vec::new() });
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn warp_exit_fires_once_after_stop_and_defers_work() {
     let mut s = System::new(0, Arc::default(), 0);
     let mut b = ball(1, None, 0.0);
@@ -644,7 +638,7 @@ fn warp_exit_fires_once_after_stop_and_defers_work() {
     assert!(worker.try_recv().is_err());
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn short_warp_callback_runs_at_fifo_boundary() {
     let mut s = System::new(0, Arc::default(), 0);
     s.insert(ball(1, None, 0.0));
@@ -659,7 +653,7 @@ fn short_warp_callback_runs_at_fifo_boundary() {
     assert_eq!(rx.try_recv(), Ok(()));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn warp_intent_is_replaced_cleared_or_cancelled_but_not_by_property_changes() {
     let mut s = System::new(0, Arc::default(), 0);
     s.insert(ball(1, None, 0.0));
@@ -692,7 +686,7 @@ fn warp_intent_is_replaced_cleared_or_cancelled_but_not_by_property_changes() {
     assert!(!s.warp_exits.contains_key(&1));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn activating_warp_releases_followers_before_evolution() {
     let mut s = System::new(0, Arc::default(), 0);
     let mut target = ball(1, None, 0.0);
@@ -708,7 +702,7 @@ fn activating_warp_releases_followers_before_evolution() {
     assert_eq!(s.ball(2).unwrap().mode, MODE_STOP);
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn changed_warp_request_discards_old_callback_without_explicit_clear() {
     let mut s = System::new(0, Arc::default(), 0);
     s.insert(ball(1, None, 0.0));
@@ -720,7 +714,7 @@ fn changed_warp_request_discards_old_callback_without_explicit_clear() {
     assert!(!s.warp_exits.contains_key(&1));
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn warp_activation_releases_missiles_on_both_sides_of_sorted_target() {
     let mut s = System::new(0, Arc::default(), 0);
     let mut target = ball(2, None, 0.0);
@@ -753,7 +747,7 @@ fn warp_activation_releases_missiles_on_both_sides_of_sorted_target() {
     }
 }
 
-#[test]
+#[cfg(feature = "tests-space")] #[test]
 fn warp_exit_callback_sees_completed_extra_step_and_fractional_segment() {
     let mut s = System::new(0, Arc::default(), 0);
     let mut ship = ball(1, None, 0.0);

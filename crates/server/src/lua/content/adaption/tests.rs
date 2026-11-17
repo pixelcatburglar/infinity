@@ -182,8 +182,8 @@ fn retained_catalogue_reopens_without_bundle_directory() {
     };
     let data = serde_json::to_vec(&envelope).unwrap();
     let source = b"return {InjectChips=function() end, ChipExchange=function() end}".to_vec();
-    let package = super::super::build_package(&lua, "ship_adaption".into(), version, b"registration".to_vec(), source, data, &config, &sde, super::super::daily_goals::model::ValidationContext::Retained).unwrap();
-    let row = package.row();
+    let package = super::super::build_package(&lua, super::super::package_row("ship_adaption".into(), version, b"registration".to_vec(), source, data).unwrap(), &config, &sde, super::super::daily_goals::model::ValidationContext::Retained, None).unwrap();
+    let row = (*package.row).clone();
     let reopened = super::super::decode_retained_adaption(&row, &config, &sde).unwrap();
     assert_eq!(reopened.message("refused"), Some("text"));
     assert_eq!(reopened.quote(1, 1), Some(2));
@@ -214,10 +214,10 @@ fn repository_policy_plans_exact_quantities_quotes_and_checked_totals() {
     };
     let make_pin = |definitions: Definitions| {
         let package = super::super::Package {
-            namespace: "ship_adaption".into(), version: "test".into(), fingerprint: [0; 32], registration: vec![],
-            source: include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/lua/content/ship_adaption/policy.lua")).to_vec(),
-            data: vec![], config: crate::config::lua::LuaConfig::default(),
-            domain: super::super::PackageDomain::Adaption { definitions: std::sync::Arc::new(definitions), bundle: std::sync::Arc::new(fixture()) },
+            row: super::super::package_row("ship_adaption".into(), "test".into(), vec![],
+                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/lua/content/ship_adaption/policy.lua")).to_vec(), vec![]).unwrap(),
+            config: crate::config::lua::LuaConfig::default(),
+            domain: super::super::PackageDomain::Adaption(std::sync::Arc::new(definitions)),
         };
         let mut content = super::super::ContentDefinitions::default();
         content.packages.insert("ship_adaption".into(), std::sync::Arc::new(package));
@@ -276,9 +276,9 @@ fn malformed_authored_plans_are_closed_and_integer_only() {
     ] {
         let source = format!("return {{InjectChips=function() return {result} end, ChipExchange=function() return {result} end}}");
         let package = super::super::Package {
-            namespace: "ship_adaption".into(), version: "test".into(), fingerprint: [0; 32], registration: vec![],
-            source: source.into_bytes(), data: vec![], config: crate::config::lua::LuaConfig::default(),
-            domain: super::super::PackageDomain::Adaption { definitions: definitions.clone(), bundle: Arc::new(fixture()) },
+            row: super::super::package_row("ship_adaption".into(), "test".into(), vec![], source.into_bytes(), vec![]).unwrap(),
+            config: crate::config::lua::LuaConfig::default(),
+            domain: super::super::PackageDomain::Adaption(definitions.clone()),
         };
         let mut content = super::super::ContentDefinitions::default();
         content.packages.insert("ship_adaption".into(), Arc::new(package));

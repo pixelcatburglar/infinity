@@ -37,4 +37,4 @@ fn booster_record(row: brain::BrainItem) -> (Value, Value) {
     ]))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

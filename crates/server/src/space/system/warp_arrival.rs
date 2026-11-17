@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ARRIVAL: AtomicU64 = AtomicU64::new(1);
 
+/// Once-only warp arrival work, not a due timer; mailbox jobs use `actor::Job`.
+pub(crate) type ArrivalCallback = Box<dyn FnOnce(&mut System) + Send>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct WarpArrivalId(u64);
 
 pub(super) struct ArrivalEntry {
-    callback: Timer,
+    callback: ArrivalCallback,
     references: usize,
 }
 
@@ -27,13 +29,13 @@ impl Drop for WarpArrivalGuard {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.upgrade() {
             let id = self.id;
-            let _ = sender.send(Box::new(move |system| system.release_warp_arrival(id)));
+            let _ = sender.send(actor::Job::new(move |system| system.release_warp_arrival(id)));
         }
     }
 }
 
 impl World {
-    pub(crate) async fn begin_warp_arrival(&self, system: i64, callback: Timer) -> Option<WarpArrivalGuard> {
+    pub(crate) async fn begin_warp_arrival(&self, system: i64, callback: ArrivalCallback) -> Option<WarpArrivalGuard> {
         let handle = self.running(system)?;
         let sender = handle.tx.downgrade();
         handle.with(move |actor| {
@@ -44,7 +46,7 @@ impl World {
 }
 
 impl System {
-    pub(crate) fn register_warp_arrival(&mut self, callback: Timer) -> WarpArrivalId {
+    pub(crate) fn register_warp_arrival(&mut self, callback: ArrivalCallback) -> WarpArrivalId {
         let id = WarpArrivalId(NEXT_ARRIVAL.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("warp arrival identifier exhausted"));
         self.warp_arrivals.insert(id, ArrivalEntry { callback, references: 1 });
@@ -68,4 +70,4 @@ impl System {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

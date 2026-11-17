@@ -1,8 +1,9 @@
 //! Exploration site, wormhole, scan and probe persistence, including site position repair.
 //! The owning services support `eve/client/script/parklife`; this DAO has no wire contract.
 //! Uses `game.exploration_sites`, `game.exploration_scanned`, `game.exploration_systems`,
-//! `game.agent_missions`, `game.asteroids`, `game.items`, `game.module_charges`
-//! and `game.retail_prices`. Simulation, policy, transactions and notifications remain with callers.
+//! `game.agent_missions`, `game.asteroids`, `game.items` and `game.module_charges`.
+//! Loot prices are static data read from `Sde`, never queried at runtime.
+//! Simulation, policy, transactions and notifications remain with callers.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
@@ -86,7 +87,7 @@ pub(crate) async fn delete_sites(ex: &(impl Executor + ?Sized), ids: &mut Vec<i6
 pub(crate) async fn is_scanned(ex: &(impl Executor + ?Sized), char_id: i64, site_id: i64) -> Result<bool, Error> { Ok(ex.query_opt("SELECT 1 FROM game.exploration_scanned WHERE character_id = $1 AND site_id = $2", &[&char_id, &site_id]).await?.is_some()) }
 pub(crate) async fn mark_scanned(ex: &(impl Executor + ?Sized), char_id: i64, site_id: i64) -> Result<bool, Error> { Ok(ex.execute("INSERT INTO game.exploration_scanned (character_id, site_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&char_id, &site_id]).await? == 1) }
 pub(crate) async fn next_site_id(ex: &(impl Executor + ?Sized)) -> Result<i64, Error> { Ok(SiteId::from_row(&ex.query_one("SELECT GREATEST(nextval('game.exploration_site_seq'), COALESCE((SELECT max(site_id) + 1 FROM game.exploration_sites), 0)) AS site_id", &[]).await?).site_id) }
-pub(crate) async fn delete_expired(ex: &(impl Executor + ?Sized), now: i64) -> Result<(), Error> { ex.execute("DELETE FROM game.exploration_sites WHERE wh_born IS NOT NULL AND wh_born + (wh_life_minutes * 60 * 10000000)::bigint < $1", &[&now]).await?; Ok(()) }
+pub(crate) async fn delete_expired(ex: &(impl Executor + ?Sized), now: i64) -> Result<(), Error> { ex.execute("DELETE FROM game.exploration_sites WHERE wh_born IS NOT NULL AND wh_born + (wh_life_minutes * 60 * $2::bigint)::bigint < $1", &[&now, &infinity_core::consts::FILETIME_SECOND]).await?; Ok(()) }
 pub(crate) async fn is_generated(ex: &(impl Executor + ?Sized), system: i64) -> Result<bool, Error> { Ok(ex.query_opt("SELECT 1 FROM game.exploration_systems WHERE system_id = $1", &[&system]).await?.is_some()) }
 pub(crate) async fn mark_generated(ex: &(impl Executor + ?Sized), system: i64, now: i64) -> Result<(), Error> { ex.execute("INSERT INTO game.exploration_systems (system_id, generated_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&system, &now]).await?; Ok(()) }
 pub(crate) async fn module_flag(ex: &(impl Executor + ?Sized), module: i64, ship: i64) -> Result<Option<i32>, Error> { Ok(ex.query_opt("SELECT flag_id FROM game.items WHERE item_id = $1 AND location_id = $2", &[&module, &ship]).await?.as_ref().map(|r| ModuleFlag::from_row(r).flag_id)) }
@@ -97,9 +98,6 @@ pub(crate) async fn consume_probes(ex: &(impl Executor + ?Sized), ship: i64, fla
 pub(crate) async fn delete_container(ex: &(impl Executor + ?Sized), id: i64) -> Result<(), Error> { ex.execute("DELETE FROM game.items WHERE location_id = $1 OR item_id = $1", &[&id]).await?; Ok(()) }
 pub(crate) async fn insert_container(ex: &(impl Executor + ?Sized), type_id: i32, system: i64, pos: [f64; 3]) -> Result<i64, Error> { Ok(ItemId::from_row(&ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z)
                  VALUES ($1, 1, $2, 0, 1, true, $3, $4, $5) RETURNING item_id", &[&type_id, &system, &pos[0], &pos[1], &pos[2]]).await?).item_id) }
-pub(crate) struct Loot { pub(crate) type_id: i32, pub(crate) average: f64 }
-impl Loot { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), average: r.get("average") } } }
-pub(crate) async fn loot(ex: &(impl Executor + ?Sized), value: f64) -> Result<Vec<Loot>, Error> { Ok(ex.query("SELECT type_id, average FROM game.retail_prices WHERE average BETWEEN 1000 AND $1", &[&value]).await?.iter().map(Loot::from_row).collect()) }
 pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), type_id: i32, id: i64, quantity: i64) -> Result<(), Error> { ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, 1, $2, 0, $3)", &[&type_id, &id, &quantity]).await?; Ok(()) }
 pub(crate) struct Container { pub(crate) item_id: i64, pub(crate) type_id: i32, pub(crate) pos: [f64; 3] }
 impl Container { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), pos: [r.get("x"), r.get("y"), r.get("z")] } } }

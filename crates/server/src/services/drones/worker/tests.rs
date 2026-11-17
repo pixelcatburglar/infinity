@@ -41,7 +41,7 @@ async fn persisted_drone_types_always_have_a_physical_spec() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
-async fn phase_rebases_worker_fit_without_replacing_live_condition() {
+async fn phase_without_input_changes_keeps_fit_revision_and_condition() {
     use infinity_core::consts::{CATEGORY_DRONE, dogma::*};
     use crate::services::drones::tests::fixture::Fixture;
     use marshal::Value;
@@ -92,11 +92,25 @@ async fn phase_rebases_worker_fit_without_replacing_live_condition() {
         }).await.unwrap().unwrap().unwrap();
         assert!(hit.dealt > 0.0 && !hit.lethal);
         let before = f.world.with(system, move |s| s.combat_condition_snapshot(id).unwrap()).await.unwrap();
-        let fit_revision = f.world.with(system, move |s| s.combat_fit_revision(id).unwrap()).await.unwrap();
-        cycle(&f.db, &f.world, system, drone.clone(), target, DronePhase::End, None).await.ok().unwrap();
+        let (fit_revision, membership) = f.world.with(system, move |s| (s.combat_fit_revision(id).unwrap(), s.combat_membership_generation(id))).await.unwrap();
+        cycle(&f.db, &f.world, system, drone.clone(), target, DronePhase::End, membership, None).await.ok().unwrap();
         let (after, next_revision) = f.world.with(system, move |s| (s.combat_condition_snapshot(id).unwrap(), s.combat_fit_revision(id).unwrap())).await.unwrap();
-        assert!(next_revision > fit_revision, "phase did not publish its loaded fit");
+        assert_eq!(next_revision, fit_revision, "a phase without input changes does not publish a new fit");
         assert_eq!(after.condition.now, before.condition.now);
+        f.client.login.role = infinity_core::consts::GM_ROLES;
+        let effect = registry::resolve(&f.sde, drone.spec.effect_id.unwrap()).expect("live turret effect");
+        let capture = { let effect = effect.clone();
+            move |s: &mut crate::space::System| s.with_combat_fit(id, move |fit, key, _| {
+                crate::services::effects::parameters::capture_source(fit, key, &effect, duration_ms(fit, key, &effect))
+            }) };
+        let before_inputs = f.world.with(system, capture.clone()).await.flatten().expect("resident drone fit").unwrap();
+        let kwargs = Value::Dict(vec![]);
+        let args = [Value::str(format!("/dogma {id} {ATTR_MAX_RANGE} 42.0"))];
+        let command = crate::services::Call { service: "slash", method: "SlashCmd", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+        crate::services::slash::dispatch(&mut f.client, &command).await.expect("slash dispatch").ok().expect("dogma command");
+        let after_inputs = f.world.with(system, capture).await.flatten().expect("resident drone fit").unwrap();
+        let turret = |inputs: &crate::services::effects::parameters::SourceInputs| match inputs { crate::services::effects::parameters::SourceInputs::Turret(inputs) => inputs.parameters, _ => unreachable!("turret drone") };
+        assert_ne!(turret(&before_inputs), turret(&after_inputs), "a published override must change the next phase's captured parameters");
         for cancellation in 0..3 {
             assert!(f.world.with(system, move |s| s.drone_order(id, owner, ship, DroneOrder::Engage(target))).await.unwrap());
             let generation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -133,8 +147,8 @@ async fn phase_rebases_worker_fit_without_replacing_live_condition() {
         assert!(f.world.with(system, move |s| s.prepare_body_combat_source(id, None, None, Some(ty),
             crate::lua::events::resources::FactOrigin::Natural,
             move |s| SourceGuard::Drone { source: id, target, generation }.valid(s))).await.unwrap().is_err());
-        let revision_before_stale_end = f.world.with(system, move |s| s.combat_fit_revision(id)).await.unwrap();
-        cycle(&f.db, &f.world, system, drone, target, DronePhase::End, None).await.ok().unwrap();
+        let (revision_before_stale_end, membership) = f.world.with(system, move |s| (s.combat_fit_revision(id), s.combat_membership_generation(id))).await.unwrap();
+        cycle(&f.db, &f.world, system, drone, target, DronePhase::End, membership, None).await.ok().unwrap();
         assert_eq!(f.world.with(system, move |s| s.combat_fit_revision(id)).await.unwrap(), revision_before_stale_end);
     }).await;
     f.cleanup().await;
@@ -213,7 +227,73 @@ async fn delayed_worker_repair_retains_actor_admitted_source() {
         end.await;
         let after = f.world.with(system, move |s| s.combat_condition_snapshot(ship).unwrap().condition.now[1]).await.unwrap();
         assert!(after > before, "the pre-admitted cast did not repair");
+        let callback = effects(f.db.clone(), Arc::downgrade(&f.world), system);
+        let begin = f.world.with(system, {
+            let callback = callback.clone();
+            move |s| {
+                let drone = s.drone(id).unwrap();
+                callback(s, DroneAction::Cycle { drone, target: ship, phase: DronePhase::Begin }).expect("admitted begin")
+            }
+        }).await.unwrap();
+        begin.await;
+        f.client.login.role = infinity_core::consts::GM_ROLES;
+        let kwargs = Value::Dict(vec![]);
+        let args = [Value::str(format!("/dogma {id} {} 5.0", ATTR_ARMOR_DAMAGE_AMOUNT))];
+        let command = crate::services::Call { service: "slash", method: "SlashCmd",
+            args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+        crate::services::slash::dispatch(&mut f.client, &command).await.expect("slash dispatch").ok().expect("dogma command");
+        let end = f.world.with(system, move |s| {
+            let drone = s.drone(id).unwrap();
+            callback(s, DroneAction::Cycle { drone, target: ship, phase: DronePhase::End })
+        }).await.unwrap().expect("admitted end");
+        let before_second = f.world.with(system, move |s| s.combat_condition_snapshot(ship).unwrap().condition.now[1]).await.unwrap();
+        end.await;
+        let second = f.world.with(system, move |s| s.combat_condition_snapshot(ship).unwrap().condition.now[1]).await.unwrap();
+        assert!(second - before_second > 3.0 * (after - before), "a published override must change the applied repair");
     }).await;
     f.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn drone_phase_capture_consumes_due_character_inputs_before_timer() {
+    use crate::services::fit::{Fit, Key};
+    use crate::services::effects::parameters::SourceInputs;
+    use infinity_core::consts::{CATEGORY_DRONE, CATEGORY_SHIP, dogma::ATTR_DAMAGE_MULTIPLIER};
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let hull = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
+    let ty = sde.types.iter().find(|ty| ty.category_id == Some(CATEGORY_DRONE)
+        && ty.effects().iter().filter_map(|row| registry::resolve(&sde, row.effect_id))
+            .any(|effect| effect.kind == EffectKind::Turret)).unwrap().type_id;
+    let id = -986_301;
+    let key = Key::Drone(id);
+    let mut fit = Fit::for_space_type(sde.clone(), hull, vec![]);
+    fit.include_drone(id, ty, vec![]);
+    let (fit, active, expired) = crate::services::effects::tests::fixture::due_fit(
+        fit, &sde, |fit| crate::services::combat::ATTR_DAMAGE.iter()
+            .map(|&attribute| fit.value(key, attribute)).sum::<f64>()
+            * fit.value(key, ATTR_DAMAGE_MULTIPLIER).max(0.0));
+    assert_ne!(active, expired);
+    let spec = spec(&fit, key, ty).unwrap();
+    let stats = crate::services::combat::groups_health::ShipStats::from_fit(&fit, key);
+    let world = crate::space::World::new(db.clone(), sde, 1);
+    let mut system = crate::space::System::default();
+    system.insert(crate::services::effects::tests::fixture::ball(id, ty, 1, None, 0.0));
+    system.register_drone(id, spec, effects(db, Arc::downgrade(&world), 1), None, Some(1), false);
+    system.install_condition_with_key(id, crate::services::combat::groups_health::Condition {
+        now: stats.max, stats, shield_at: 0 }, fit, key);
+    assert_eq!(system.combat_fit_revision(id), Some(0));
+    let captured = capture_phase_inputs(&mut system, id, ty).unwrap().unwrap();
+    let SourceInputs::Turret(values) = captured.inputs.unwrap() else { panic!("turret phase") };
+    assert!((values.raw.iter().sum::<f64>() - expired).abs() < expired.abs() * 1e-10);
+    assert!(system.combat_fit_revision(id).unwrap() > 0);
+    let revision = system.combat_fit_revision(id);
+    let captured = capture_phase_inputs(&mut system, id, ty).unwrap().unwrap();
+    let SourceInputs::Turret(values) = captured.inputs.unwrap() else { panic!("turret phase") };
+    assert!((values.raw.iter().sum::<f64>() - expired).abs() < expired.abs() * 1e-10);
+    assert_eq!(system.combat_fit_revision(id), revision);
+    crate::services::combat::forget_ship(id);
 }

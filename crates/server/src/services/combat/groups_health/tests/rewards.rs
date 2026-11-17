@@ -53,7 +53,7 @@ async fn run_case(case: Case) -> Result<()> {
     result
 }
 
-async fn npc(f: &Fixture, taxable: bool) -> Result<(crate::space::Ball, f64)> {
+async fn npc(f: &Fixture, taxable: bool) -> Result<(crate::space::Ball, crate::isk::IskAmount)> {
     let multiplier = crate::config::game().combat.bounty_multiplier;
     let (kind, payout) = f.sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_ENTITY))
         .filter_map(|t| {
@@ -66,7 +66,7 @@ async fn npc(f: &Fixture, taxable: bool) -> Result<(crate::space::Ball, f64)> {
     let mut ball = f.world.ball(f.system, f.ship).await.ok_or_else(|| anyhow!("fixture ship missing"))?;
     ball.type_id = kind;
     ball.char_id = None;
-    Ok((ball, payout))
+    Ok((ball, crate::isk::IskAmount::from_isk(crate::services::market::round2(payout))?))
 }
 
 async fn balances(f: &Fixture, corp: i64) -> Result<(String, String)> {
@@ -83,11 +83,21 @@ fn wallet_notices(receiver: &mut Notices) -> Vec<Vec<Value>> {
     notices
 }
 
-fn expected_notices(owner: i64, corp: i64, personal: f64, corporate: f64, net: f64, tax: f64) -> Vec<Vec<Value>> {
+fn expected_notices(owner: i64, corp: i64, net: crate::isk::IskAmount, tax: crate::isk::IskAmount) -> Vec<Vec<Value>> {
     let mut notices = Vec::new();
-    if net > 0.0 { notices.push(vec![Value::str("cash"), Value::Int(owner), Value::Float(personal)]); }
-    if tax > 0.0 { notices.push(vec![Value::str("cash"), Value::Int(corp), Value::Float(corporate)]); }
+    if !net.is_zero() { notices.push(vec![Value::str("cash"), Value::Int(owner), Value::Float(net.client_isk(crate::isk::personal_client_cap()))]); }
+    if !tax.is_zero() { notices.push(vec![Value::str("cash"), Value::Int(corp), Value::Float(tax.client_isk(crate::isk::corporation_client_cap()))]); }
     notices
+}
+
+async fn batch_started(f: &Fixture) -> Result<i64> {
+    Ok(f.db.query_one("SELECT batch_started_at FROM game.npc_bounty_pools WHERE character_id=$1 LIMIT 1", &[&f.owner]).await?.get("batch_started_at"))
+}
+
+async fn settle(f: &Fixture) -> Result<()> {
+    f.world.flush_positions().await?;
+    let started = batch_started(f).await?;
+    crate::services::bounty::npc::settle_due(&f.db, &f.world, (f.owner, started), i64::MAX / 4).await.map_err(|e| anyhow!("settle: {e:?}"))
 }
 
 async fn split(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
@@ -98,14 +108,20 @@ async fn split(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
         f.db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&f.owner]).await?;
         f.db.execute("UPDATE game.corp_wallets SET balance=0 WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?;
         reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
-        let tax = if taxable { crate::services::market::round2(payout * rate) } else { 0.0 };
-        let net = payout - tax;
-        let expected_personal = crate::services::market::round2(net);
-        let expected_corp = crate::services::market::round2(tax);
+        // The kill records the pool notice only; wallet and tax wait for the
+        // batch deadline, and the durable checkpoint rides the same writer.
+        let (name, _) = receiver.try_recv().map_err(|_| anyhow!("pool notice missing"))?;
+        ensure!(name == "OnBountyAddedToPayout", "expected pool notice, got {name}");
+        ensure!(wallet_notices(receiver).is_empty(), "wallet notified before the batch deadline");
         let (personal, corporate) = balances(f, corp).await?;
-        ensure!(personal == format!("{expected_personal:.2}") && corporate == format!("{expected_corp:.2}"), "wrong split at rate {rate}: {personal}, {corporate}");
-        ensure!((expected_personal + expected_corp - crate::services::market::round2(payout)).abs() < 0.001, "split does not add to payout");
-        ensure!(wallet_notices(receiver) == expected_notices(f.owner, corp, expected_personal, expected_corp, net, tax), "wrong wallet notices at rate {rate}");
+        ensure!(personal == "0.00" && corporate == "0.00", "wallet credited before the batch deadline: {personal}, {corporate}");
+        settle(f).await?;
+        let tax = if taxable { crate::isk::IskAmount::from_isk(crate::services::market::round2(payout.wire_isk() * rate))? } else { crate::isk::IskAmount::ZERO };
+        let net = payout.checked_sub(tax).ok_or_else(|| anyhow!("tax exceeds payout"))?;
+        let (personal, corporate) = balances(f, corp).await?;
+        ensure!(personal == net.decimal() && corporate == tax.decimal(), "wrong split at rate {rate}: {personal}, {corporate}");
+        ensure!(net.checked_add(tax) == Some(payout), "split does not add to payout");
+        ensure!(wallet_notices(receiver) == expected_notices(f.owner, corp, net, tax), "wrong wallet notices at rate {rate}");
     }
     }
     Ok(())
@@ -116,26 +132,29 @@ async fn overflow(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> 
     f.db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await?;
     f.db.execute("UPDATE game.corp_wallets SET balance='9999999999999999999999999999999999.99'::numeric WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?;
     let before = balances(f, corp).await?;
-    let items: i64 = f.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1", &[&f.owner]).await?.get("n");
-    let error = reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.err().ok_or_else(|| anyhow!("corporate overflow unexpectedly succeeded"))?;
-    match &error {
-        CallError::User { msg, dict } => {
-            assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
-            assert_eq!(dict, &vec![("notify".into(), Value::unicode(infinity_core::messages::wallets::AMOUNT_TOO_LARGE))]);
-        }
-        CallError::Internal(error) => panic!("expected wallet overflow refusal, got {error:#}"),
-    }
+    // Fixture NPC types have no SDE wreck mapping, so reward_kill returns before spawn_wreck.
+    reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
+    let (name, _) = receiver.try_recv().map_err(|_| anyhow!("pool notice missing"))?;
+    ensure!(name == "OnBountyAddedToPayout", "expected pool notice, got {name}");
+    settle(f).await.err().ok_or_else(|| anyhow!("corporate overflow unexpectedly succeeded"))?;
     ensure!(balances(f, corp).await? == before, "overflow did not roll back both balances");
-    ensure!(receiver.try_recv().is_err(), "failed reward emitted a notice");
-    let after: i64 = f.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1", &[&f.owner]).await?.get("n");
-    ensure!(after == items, "failed reward created items");
+    ensure!(receiver.try_recv().is_err(), "failed payout emitted a notice");
+    ensure!(batch_started(f).await.is_ok(), "unpaid batch was deleted");
     Ok(())
 }
 
+
 async fn postcommit(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
     let (ball, payout) = npc(f, true).await?;
+    let tax = crate::isk::IskAmount::from_isk(crate::services::market::round2(payout.wire_isk() * 0.1))?;
+    let net = payout.checked_sub(tax).ok_or_else(|| anyhow!("tax exceeds payout"))?;
     f.db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await?;
     f.db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&f.owner]).await?;
+    reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
+    let (name, _) = receiver.try_recv().map_err(|_| anyhow!("pool notice missing"))?;
+    ensure!(name == "OnBountyAddedToPayout", "expected pool notice, got {name}");
+    f.world.flush_positions().await?;
+    let started = batch_started(f).await?;
     let config = crate::config::tests::test_database().to_pg_config()?;
     let (observer, observer_connection) = config.connect(tokio_postgres::NoTls).await?;
     let observer_driver = tokio::spawn(observer_connection);
@@ -146,8 +165,8 @@ async fn postcommit(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()
     tx.query_one("SELECT balance FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$2 FOR UPDATE", &[&corp, &ACCOUNT_CASH]).await?;
     let db = f.db.clone();
     let world = f.world.clone();
-    let (system, owner) = (f.system, f.owner);
-    let mut task = tokio::spawn(async move { reward_kill(&db, &world, system, &ball, Some(owner)).await });
+    let owner = f.owner;
+    let mut task = tokio::spawn(async move { crate::services::bounty::npc::settle_due(&db, &world, (owner, started), i64::MAX / 4).await });
     let blocked = tokio::time::timeout(WAIT, async {
         loop {
             let found: bool = observer.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))) AS blocked", &[&pid]).await?.get("blocked");
@@ -164,11 +183,9 @@ async fn postcommit(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()
         async {
             let notice = tokio::time::timeout(WAIT, receiver.recv()).await?.ok_or_else(|| anyhow!("wallet receiver closed"))?;
             ensure!(notice.0 == "OnAccountChange", "first reward notice was not a wallet notice");
-            let tax = crate::services::market::round2(payout * 0.1);
-            let personal = crate::services::market::round2(payout - tax);
             let row = observer.query_one("SELECT ch.balance::text AS personal, cw.balance::text AS corporate FROM game.characters ch JOIN game.corp_wallets cw ON cw.corporation_id=ch.corporation_id WHERE ch.character_id=$1 AND cw.account_key=$2", &[&owner, &ACCOUNT_CASH]).await?;
-            ensure!(row.get::<_, String>("personal") == format!("{personal:.2}") && row.get::<_, String>("corporate") == format!("{tax:.2}"), "notice arrived before both balances committed");
-            ensure!(notice.1 == vec![Value::str("cash"), Value::Int(owner), Value::Float(personal)], "unexpected first wallet notice");
+            ensure!(row.get::<_, String>("personal") == net.decimal() && row.get::<_, String>("corporate") == tax.decimal(), "notice arrived before both balances committed");
+            ensure!(notice.1 == vec![Value::str("cash"), Value::Int(owner), Value::Float(net.client_isk(crate::isk::personal_client_cap()))], "unexpected first wallet notice");
             Ok::<(), anyhow::Error>(())
         }.await
     } else { Ok(()) };
@@ -184,8 +201,7 @@ async fn postcommit(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()
     release?;
     observed?;
     completion?;
-    let tax = crate::services::market::round2(payout * 0.1);
-    ensure!(wallet_notices(receiver) == vec![vec![Value::str("cash"), Value::Int(corp), Value::Float(tax)]], "missing or duplicate corporate notice");
+    ensure!(wallet_notices(receiver) == vec![vec![Value::str("cash"), Value::Int(corp), Value::Float(tax.client_isk(crate::isk::corporation_client_cap()))]], "missing or duplicate corporate notice");
     Ok(())
 }
 
@@ -200,3 +216,19 @@ async fn npc_reward_corporate_overflow_rolls_back() -> Result<()> { run_case(Cas
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
 async fn npc_reward_notices_follow_commit() -> Result<()> { run_case(Case::Postcommit).await }
+
+// Producer rounding is per kill: reward_kill converts each payout through
+// round2(bounty_payout(..)) -> IskAmount, then integer cents accumulate. A zero
+// multiplier still yields Some(0.0), so the kill reaches the security-count branch.
+#[test]
+fn npc_bounty_rounding_is_per_kill() -> Result<()> {
+    let payout = |bounty: f64, multiplier: f64| -> Result<crate::isk::IskAmount> {
+        let raw = bounty_payout(bounty, multiplier).ok_or_else(|| anyhow!("nonfinite payout"))?;
+        Ok(crate::isk::IskAmount::from_isk(crate::services::market::round2(raw))?)
+    };
+    let two_kills = payout(0.006, 1.0)?.checked_add(payout(0.006, 1.0)?).ok_or_else(|| anyhow!("cents overflow"))?;
+    ensure!(two_kills.decimal() == "0.02", "two 0.006 kills each round to one cent, got {}", two_kills.decimal());
+    ensure!(payout(0.006 + 0.006, 1.0)?.decimal() == "0.01", "aggregating before rounding would pay one cent");
+    ensure!(payout(1.0, 0.0)? == crate::isk::IskAmount::ZERO, "zero multiplier still yields a countable kill");
+    Ok(())
+}

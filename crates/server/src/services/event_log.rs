@@ -55,4 +55,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-services"))] mod tests;

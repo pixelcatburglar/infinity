@@ -10,7 +10,7 @@ fn context(ship: i64) -> FactContext {
 
 #[test]
 fn valuation_distinguishes_missing_and_priced_zero() {
-    let items = vec![(2, infinity_core::consts::FLAG_CARGO, false, 3), (3, infinity_core::consts::FLAG_FITTING_FIRST, true, 1)];
+    let items = vec![(2, infinity_core::consts::FLAG_CARGO, false, 3), (3, infinity_core::consts::FLAG_FITTING_FIRST, true, 1), (4, infinity_core::consts::FLAG_IMPLANT, true, 1)];
     let prices = HashMap::from([(1, 2.5), (2, 0.0)]);
     let value = valuation(1, &items, &prices, 9, crate::isk::IskAmount::parse_decimal("1.25").unwrap()).unwrap();
     assert_eq!(value.components[0].category, ValuationCategory::Hull);
@@ -19,6 +19,8 @@ fn valuation_distinguishes_missing_and_priced_zero() {
     assert_eq!(value.components[1].unit_price, Some(BinaryAmount::from_f64(0.0).unwrap()));
     assert_eq!(value.components[2].category, ValuationCategory::Fitting);
     assert_eq!(value.components[2].unit_price, None);
+    assert_eq!(value.components[3].category, ValuationCategory::DestroyedImplant);
+    assert_eq!(value.components[3].type_id, 4);
     assert_eq!(value.npc_insurance_paid, crate::isk::IskAmount::parse_decimal("1.25").unwrap());
 }
 

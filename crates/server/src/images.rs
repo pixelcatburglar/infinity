@@ -2,7 +2,7 @@
 //! fetches `<Character|Corporation|Alliance|Type|Render>/<id>_<size>.<jpg|png>`.
 //! Images live under a data directory; `PUT` stores one (used to publish the
 //! portraits the client renders locally at character creation). It also serves
-//! the content CDN under `/content/` (crate::cdn).
+//! the content CDN under `/content/` (infinity_content::cdn).
 //!
 //! A size that isn't stored is served from the nearest stored size of the same image.
 //! Images of things that exist on CCP's servers under the same IDs (NPC characters such
@@ -11,10 +11,11 @@
 //! never fetched: their IDs are this server's own. Upload limits and upstream timeouts
 //! are configured at startup.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::time::Instant;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
@@ -26,6 +27,28 @@ const SIZES: [u32; 6] = [32, 64, 128, 256, 512, 1024];
 const FIRST_PLAYER_ID: u64 = 90_000_000;
 /// Upstream type icon maximum size, in pixels.
 const MAX_TYPE_ICON_SIZE: u32 = 64;
+/// Server policy: simultaneous connections on the image listener.
+const IMAGE_MAX_CONNECTIONS: usize = 256;
+/// Server policy: simultaneous image-listener connections from one address.
+const IMAGE_MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
+/// Server policy: simultaneous connections on the content CDN listener.
+const CDN_MAX_CONNECTIONS: usize = 256;
+/// Server policy: simultaneous CDN connections from one address.
+const CDN_MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
+/// Server policy: bound on one HTTP request line, terminator included.
+const HTTP_REQUEST_LINE_LIMIT_BYTES: usize = 8192;
+/// Server policy: bound on all HTTP headers, terminators and the final blank
+/// line included.
+const HTTP_HEADER_LIMIT_BYTES: usize = 32768;
+/// Server policy: bound on reading the request line, headers and bounded body.
+const HTTP_READ_TIMEOUT_SECS: u64 = 10;
+
+/// Which listener accepted a connection; selects its log label and bounds.
+#[derive(Clone, Copy)]
+pub(crate) enum ListenerKind {
+    Images,
+    Cdn,
+}
 
 /// The upstream image server, if any.
 #[derive(Clone)]
@@ -69,22 +92,42 @@ impl Upstream {
     }
 }
 
-/// Serve on `bind`; `name` labels this listener's request log lines ("images", "cdn").
-pub async fn serve(name: &'static str, bind: String, root: PathBuf, upstream: Upstream, upload_limit_bytes: usize) -> Result<()> {
+/// Serve on `bind`; `kind` selects the request-log label ("images", "cdn") and
+/// this listener's fixed admission bounds.
+pub(crate) async fn serve(kind: ListenerKind, bind: String, root: PathBuf, upstream: Upstream, upload_limit_bytes: usize) -> Result<()> {
     for k in KINDS {
         tokio::fs::create_dir_all(root.join(k)).await?;
     }
     let listener = TcpListener::bind(&bind).await?;
+    let (name, maximum, per_address) = match kind {
+        ListenerKind::Images => ("images", IMAGE_MAX_CONNECTIONS, IMAGE_MAX_CONNECTIONS_PER_ADDRESS),
+        ListenerKind::Cdn => ("cdn", CDN_MAX_CONNECTIONS, CDN_MAX_CONNECTIONS_PER_ADDRESS),
+    };
+    let gate = crate::admission::Admission::new(maximum, per_address);
     info!("{name}: listening on {bind}, storing images in {}", root.display());
     loop {
         let (stream, peer) = listener.accept().await?;
+        let Ok(read_deadline) = crate::admission::deadline(Instant::now(), HTTP_READ_TIMEOUT_SECS) else { continue };
+        let Some(permit) = gate.try_acquire(peer.ip()) else { continue };
         let (root, upstream) = (root.clone(), upstream.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, &root, name, peer, &upstream, upload_limit_bytes).await {
+            let _permit = permit;
+            if let Err(e) = handle(stream, &root, name, peer, &upstream, upload_limit_bytes, read_deadline).await {
                 warn!("{name}: request from {peer} failed: {e:#}");
             }
         });
     }
+}
+
+/// Read one LF-terminated line of at most `limit` bytes, terminator included,
+/// appending to `out`. Rejects an overlong line and EOF without a terminator.
+async fn bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R, out: &mut Vec<u8>, limit: usize) -> Result<()> {
+    let bound = u64::try_from(limit).ok().and_then(|n| n.checked_add(1)).context("line limit overflows")?;
+    let start = out.len();
+    reader.take(bound).read_until(b'\n', out).await?;
+    let line = &out[start..];
+    anyhow::ensure!(line.last() == Some(&b'\n') && line.len() <= limit, "line exceeds {limit} bytes or lacks a terminator");
+    Ok(())
 }
 
 /// One request, for the log line written with its response.
@@ -151,21 +194,27 @@ async fn find(file: &Path, upstream: &Upstream) -> Option<Vec<u8>> {
     Some(data)
 }
 
-async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: std::net::SocketAddr, upstream: &Upstream, upload_limit_bytes: usize) -> Result<()> {
+async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: std::net::SocketAddr, upstream: &Upstream, upload_limit_bytes: usize, read_deadline: Instant) -> Result<()> {
     let mut reader = BufReader::new(&mut stream);
+    let deadline = tokio::time::Instant::from_std(read_deadline);
     // Read raw bytes: a request line or header may not be UTF-8.
     let mut raw = Vec::new();
-    reader.read_until(b'\n', &mut raw).await?;
+    tokio::time::timeout_at(deadline, bounded_line(&mut reader, &mut raw, HTTP_REQUEST_LINE_LIMIT_BYTES)).await??;
     let line = String::from_utf8_lossy(&raw).into_owned();
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/").to_string());
     let mut content_length = 0usize;
+    let mut headers = Vec::new();
     loop {
-        let mut raw = Vec::new();
-        if reader.read_until(b'\n', &mut raw).await? == 0 || raw == b"\r\n" || raw == b"\n" {
+        // Every header line and the closing blank line share the total budget.
+        let before = headers.len();
+        let remaining = HTTP_HEADER_LIMIT_BYTES.checked_sub(before).context("headers exceed the total budget")?;
+        tokio::time::timeout_at(deadline, bounded_line(&mut reader, &mut headers, remaining)).await??;
+        let line = &headers[before..];
+        if line == b"\r\n" || line == b"\n" {
             break;
         }
-        let h = String::from_utf8_lossy(&raw);
+        let h = String::from_utf8_lossy(line);
         if let Some((k, v)) = h.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
@@ -176,7 +225,7 @@ async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: st
     let mut body = Vec::new();
     if upload && content_length > 0 && content_length <= upload_limit_bytes {
         body = vec![0u8; content_length];
-        reader.read_exact(&mut body).await?;
+        tokio::time::timeout_at(deadline, reader.read_exact(&mut body)).await??;
     }
     drop(reader);
     let req = Req { name, peer, method: &method, path: &path };
@@ -184,7 +233,7 @@ async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: st
         warn!("{name}: {peer} {method} {path}: body of {content_length} bytes rejected (limit {upload_limit_bytes})");
     }
     if let Some(name) = path.strip_prefix("/content/") {
-        return match crate::cdn::content(name.split('?').next().unwrap_or("")) {
+        return match infinity_content::cdn::content(name.split('?').next().unwrap_or("")) {
             Some((data, _)) if matches!(method.as_str(), "GET" | "HEAD") => {
                 respond(&mut stream, &req, "200 OK", "application/octet-stream", data, method == "HEAD").await
             }
@@ -216,3 +265,6 @@ async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: st
         }
     }
 }
+
+#[cfg(all(test, any(feature = "tests-runtime", feature = "tests-sde")))]
+mod tests;

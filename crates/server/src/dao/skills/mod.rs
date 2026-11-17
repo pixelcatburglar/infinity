@@ -7,6 +7,7 @@
 
 pub(crate) mod alpha_injections;
 pub(crate) mod expert_systems;
+pub(crate) mod formations;
 pub(crate) mod history;
 pub(crate) mod levels;
 pub(crate) mod plan_milestones;

@@ -18,8 +18,6 @@ const PLACED_CHARACTER: i32 = 112;
 const PLACED_CORPORATION: i32 = 113;
 const PLACED_ALLIANCE: i32 = 114;
 
-fn optional(id: Option<i64>) -> Value { id.map(Value::Int).unwrap_or(Value::None) }
-
 pub(super) fn row(b: &dao::Bounty) -> Value {
     keyval([("targetID", Value::Int(b.target_id)), ("bounty", Value::Float(b.amount)),
         ("corporationID", optional(b.corporation_id)), ("allianceID", optional(b.alliance_id))])

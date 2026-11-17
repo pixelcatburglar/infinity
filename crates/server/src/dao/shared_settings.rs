@@ -27,5 +27,5 @@ pub(crate) async fn get(ex: &(impl Executor + ?Sized), key: &LinkKey<'_>) -> Res
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

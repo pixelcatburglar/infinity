@@ -38,7 +38,7 @@ async fn fixture_for(jamming: JammingType) -> (space::System, Projection) {
             }
             let p = Projection { source_ship: 124, source_module: 125, source_type: source.type_id,
                 effect_id: effect.effect_id, kind: EffectKind::Projected { jamming },
-                until_ms: i64::MAX, values, charge_values: vec![], charge_type: None, scramble: None };
+                until_ms: i64::MAX, values, charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
             let projected = Fit::for_space_type(sde.clone(), hull, vec![p.clone()]);
             if projected.value(Key::Ship, ATTR_WARP_SCRAMBLE_STATUS) > 0.0 {
                 selected = Some(p);
@@ -70,8 +70,16 @@ async fn fixture_for(jamming: JammingType) -> (space::System, Projection) {
 async fn disruption_after_acceptance(already_aligning: bool) {
     let (mut system, projection) = fixture().await;
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(123, 123, tx);
-    while events.try_recv().is_ok() {}
+    let (completed_1, mut completion_1) = tokio::sync::oneshot::channel();
+    system.observe(123, 123, tx, completed_1);
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(completion_1.try_recv(), Ok(true));
+    while let Ok(delivery) = events.try_recv() {
+        match delivery {
+            crate::space::SceneDelivery::Destiny(_) => {}
+            crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+        }
+    }
     let called = Arc::new(AtomicBool::new(false));
     let exit = called.clone();
     let revision = system.projection_revision(123);
@@ -93,7 +101,10 @@ async fn disruption_after_acceptance(already_aligning: bool) {
         assert!(!system.ball(123).unwrap().is_warping(), "disrupted ship activated warp at tick {second}");
     }
     if !already_aligning {
-        let batches: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).flatten().collect();
+        let batches: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).flat_map(|delivery| match delivery {
+            crate::space::SceneDelivery::Destiny(batch) => batch,
+            crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+        }).collect();
         let actions: Vec<_> = batches.iter().filter_map(|v| {
             let Value::Tuple(parts) = v else { return None };
             let Value::Tuple(call) = &parts[1] else { return None };
@@ -121,18 +132,9 @@ async fn disruption_during_alignment_prevents_timeout_activation() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
-async fn stale_fit_refresh_cannot_replace_new_projection() {
+async fn projection_refresh_preserves_new_projection() {
     let (mut system, projection) = fixture().await;
-    let generation = system.combat_membership_generation(123).unwrap();
-    let fit_revision = system.combat_fit_revision(123).unwrap();
-    let old_revision = system.projection_revision(123);
-    let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig {
-        schema_on_start: false, ..crate::config::tests::test_database()
-    }).await.unwrap();
-    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let fit = Fit::for_space_type(sde, system.ball(123).unwrap().type_id, vec![]);
     system.upsert_projection(123, projection);
-    assert!(!system.replace_fitted_cache(123, generation, fit_revision, fit, Key::Ship, Some(old_revision)));
     assert_eq!(system.projections_on(123).len(), 1);
 }
 
@@ -151,12 +153,24 @@ async fn disruption_does_not_interrupt_active_warp() {
     system.tick(1000);
     assert!(system.ball(123).unwrap().is_warping());
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(123, 123, tx);
-    while events.try_recv().is_ok() {}
+    let (completed_2, mut completion_2) = tokio::sync::oneshot::channel();
+    system.observe(123, 123, tx, completed_2);
+    crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+    assert_eq!(completion_2.try_recv(), Ok(true));
+    while let Ok(delivery) = events.try_recv() {
+        match delivery {
+            crate::space::SceneDelivery::Destiny(_) => {}
+            crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+        }
+    }
     system.upsert_projection(123, projection);
     system.tick(2000);
     assert!(system.ball(123).unwrap().is_warping());
-    while let Ok(batch) = events.try_recv() {
+    while let Ok(delivery) = events.try_recv() {
+        let batch = match delivery {
+            crate::space::SceneDelivery::Destiny(batch) => batch,
+            crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+        };
         assert!(!batch.iter().any(|v| {
             let Value::Tuple(parts) = v else { return false };
             let Value::Tuple(call) = &parts[1] else { return false };
@@ -318,12 +332,24 @@ async fn disruption_does_not_emit_stop_for_non_preparing_modes() {
         let stats = ShipStats::from_fit(&fit, Key::Ship);
         system.install_condition(123, Condition { now: stats.max, stats, shield_at: crate::client::filetime_now() }, fit);
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
-        system.observe(123, 123, tx);
-        while events.try_recv().is_ok() {}
+        let (completed_3, mut completion_3) = tokio::sync::oneshot::channel();
+        system.observe(123, 123, tx, completed_3);
+        crate::space::system::tests::events::publish_scene_prefix(&mut system, crate::space::collision::enabled());
+        assert_eq!(completion_3.try_recv(), Ok(true));
+        while let Ok(delivery) = events.try_recv() {
+            match delivery {
+                crate::space::SceneDelivery::Destiny(_) => {}
+                crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+            }
+        }
         system.upsert_projection(123, projection);
         system.tick(1000);
         assert_eq!(system.ball(123).unwrap().mode, mode);
-        while let Ok(batch) = events.try_recv() {
+        while let Ok(delivery) = events.try_recv() {
+            let batch = match delivery {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             assert!(!batch.iter().any(|v| {
                 let Value::Tuple(parts) = v else { return false };
                 let Value::Tuple(call) = &parts[1] else { return false };

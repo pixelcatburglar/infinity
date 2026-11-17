@@ -1,6 +1,6 @@
 //! Mutation regressions using the loaded SDE and a dedicated disposable database.
 use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
-use infinity_core::{consts::{dogma::ATTR_HULL_DAMAGE, CATEGORY_SHIP, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_SHIP_HANGAR, CARGO_CONTAINER_GROUPS}};
+use infinity_core::{consts::{dogma::{ATTR_HULL_DAMAGE, EFFECT_LO_POWER, EFFECT_HI_POWER, EFFECT_MED_POWER}, CATEGORY_SHIP, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HANGAR, FLAG_SHIP_HANGAR, CARGO_CONTAINER_GROUPS}};
 use crate::{dao::{dynamic_items, items::dogma}, db::{Db, outbox::Outbox}, sde::Sde, services::{CallError, fit::base_attribute, keyval, market}};
 use marshal::Value;
 use super::{dynamic_item_service, mutation::{self, Context}};
@@ -10,7 +10,7 @@ mod fitting;
 mod container_capacity;
 
 /// Client dogma rack effects: loPower, hiPower and medPower.
-const MODULE_RACK_EFFECTS: [(i32, i32); 3] = [(11, FLAG_FITTING_FIRST), (12, infinity_core::consts::FLAG_HI_SLOT_FIRST), (13, infinity_core::consts::FLAG_MED_SLOT_FIRST)];
+const MODULE_RACK_EFFECTS: [(i32, i32); 3] = [(EFFECT_LO_POWER, FLAG_FITTING_FIRST), (EFFECT_HI_POWER, infinity_core::consts::FLAG_HI_SLOT_FIRST), (EFFECT_MED_POWER, infinity_core::consts::FLAG_MED_SLOT_FIRST)];
 
 struct Fixture {
     db: Db, sde: Arc<Sde>, account: i64, owner: i64, station: i64, ship: i64,
@@ -154,6 +154,12 @@ async fn creation_persists_info_and_rejections_and_injected_failure_roll_back() 
         assert!(matches!(f.create(context.clone(), f.mutator, f.source, false, dispatched.clone()).await, Err(CallError::User { .. })));
         assert_eq!(f.fingerprint().await, before);
         f.db.execute("DELETE FROM game.item_attributes WHERE item_id=$1 AND attribute_id=$2", &[&f.source, &ATTR_HULL_DAMAGE]).await.unwrap();
+        f.db.execute("INSERT INTO game.item_service_life (item_id,damage) VALUES ($1,1)", &[&f.source]).await.unwrap();
+        let before = f.fingerprint().await;
+        assert!(matches!(f.create(context.clone(), f.mutator, f.source, false, dispatched.clone()).await, Err(CallError::User { .. })));
+        assert_eq!(f.fingerprint().await, before);
+        assert!(f.db.query_opt("SELECT item_id FROM game.item_service_life WHERE item_id=$1 AND damage=1", &[&f.source]).await.unwrap().is_some());
+        f.db.execute("DELETE FROM game.item_service_life WHERE item_id=$1", &[&f.source]).await.unwrap();
         // The same production core must accept local ship cargo, and reject a ship
         // whose actual row is remote or foreign even when the context names it.
         f.db.execute("UPDATE game.items SET location_id=$2,flag_id=$3 WHERE item_id=$1", &[&f.source, &f.ship, &FLAG_CARGO]).await.unwrap();
@@ -222,7 +228,7 @@ async fn creation_persists_info_and_rejections_and_injected_failure_roll_back() 
         let persisted: BTreeMap<_, _> = dogma::overrides(&reopened, result).await.unwrap().into_iter().map(|r| (r.attribute_id, r.value)).collect();
         assert_eq!(persisted, attributes);
         let map = |values: &BTreeMap<i32, f64>| Value::Dict(values.iter().map(|(&id, &value)| (Value::Int(i64::from(id)), Value::Float(value))).collect());
-        assert_eq!(dynamic_item_service::info(&reopened, &f.sde, result).await.ok().unwrap(), keyval([
+        assert_eq!(dynamic_item_service::info(&reopened, &f.sde, result, f.owner).await.ok().unwrap(), keyval([
             ("itemID", Value::Int(result)), ("typeID", Value::Int(i64::from(f.result_type))),
             ("sourceTypeID", Value::Int(i64::from(f.source_type))), ("mutatorTypeID", Value::Int(i64::from(f.mutator_type))),
             ("modifiers", map(&factors)), ("attributes", map(&attributes)), ("damaged", Value::Float(0.0)),
@@ -230,12 +236,12 @@ async fn creation_persists_info_and_rejections_and_injected_failure_roll_back() 
         dogma::set_override(&f.db, result, ATTR_HULL_DAMAGE, 1.0).await.unwrap();
         let mut damaged = attributes.clone();
         damaged.insert(ATTR_HULL_DAMAGE, 1.0);
-        assert_eq!(dynamic_item_service::info(&reopened, &f.sde, result).await.ok().unwrap(), keyval([
+        assert_eq!(dynamic_item_service::info(&reopened, &f.sde, result, f.owner).await.ok().unwrap(), keyval([
             ("itemID", Value::Int(result)), ("typeID", Value::Int(i64::from(f.result_type))),
             ("sourceTypeID", Value::Int(i64::from(f.source_type))), ("mutatorTypeID", Value::Int(i64::from(f.mutator_type))),
             ("modifiers", map(&factors)), ("attributes", map(&damaged)), ("damaged", Value::Float(1.0)),
         ]));
-        assert!(matches!(dynamic_item_service::info(&reopened, &f.sde, i64::MAX).await, Err(CallError::User { .. })));
+        assert!(matches!(dynamic_item_service::info(&reopened, &f.sde, i64::MAX, f.owner).await, Err(CallError::User { .. })));
     }).await;
     f.cleanup().await;
     outcome.unwrap();

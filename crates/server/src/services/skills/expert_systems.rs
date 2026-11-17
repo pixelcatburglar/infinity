@@ -126,4 +126,4 @@ where F: FnMut(Notification) -> Result<(), CallError> + Send {
     Ok(if add { messages::gm::gm_expert_system_added(type_id) } else { messages::gm::gm_expert_system_removed(type_id) })
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

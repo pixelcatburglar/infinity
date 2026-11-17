@@ -3,6 +3,7 @@
 use super::*;
 use marshal::Value;
 use crate::client::BRAIN_REFRESH;
+mod reset;
 
 fn entry(position: i32, type_id: i32, start: Option<i64>, end: Option<i64>) -> queue::QueueEntry {
     queue::QueueEntry { position, type_id, to_level: 1, start_sp: 0, dest_sp: 100, start_time: start, end_time: end }
@@ -21,6 +22,67 @@ fn removing_paused_entry_preserves_unrelated_paused_entry() {
     let rows = vec![entry(0, 1, None, None), entry(1, 2, None, None)];
     let kept = retain_queue(rows, &[1].into_iter().collect(), 20);
     assert_eq!((kept[0].position, kept[0].type_id, kept[0].start_time), (0, 2, None));
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL and loaded SDE"]
+async fn removing_blocked_queue_entries_preserves_active_intent() {
+    let mut config = crate::config::tests::test_database();
+    config.schema_on_start = false;
+    let db = crate::db::Db::connect(&config).await.expect("database pool");
+    let sde = std::sync::Arc::new(Sde::load(&db).await.expect("loaded SDE"));
+    let fixture = crate::services::tests::fixture::create(&db).await.expect("character fixture");
+    let character = fixture.character;
+    let result = tokio::spawn(async move {
+    let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(async move { connection.await.expect("connection"); });
+    let tx = client.transaction().await.expect("transaction");
+    let mut skills = sde.types.iter()
+        .filter(|t| t.category_id == Some(CATEGORY_SKILL) && t.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some())
+        .map(|t| t.type_id);
+    let (a, b, removed, c) = (skills.next().unwrap(), skills.next().unwrap(), skills.next().unwrap(), skills.next().unwrap());
+    let now = filetime_now();
+    let mut progress = AdvanceResult::default();
+    for skill in [a, b, removed, c] {
+        training::set_level(&tx, character, skill, 0, 0).await.expect("seed skill");
+    }
+    // Case 0 deletes the blocked head (a: Some/None); case 1 deletes the future
+    // blocker (b: Some/None) behind a finite head. Both must retime the kept
+    // queue from now instead of dropping the active intent.
+    for (rows, types, expected) in [
+        (vec![entry(0, a, Some(now - 10), None), entry(1, b, None, None), entry(2, removed, None, None), entry(3, c, None, None)], [a].into_iter().collect::<BTreeSet<i32>>(), vec![b, removed, c]),
+        (vec![entry(0, a, Some(now - 10), Some(now + 10)), entry(1, b, Some(now + 10), None), entry(2, removed, None, None), entry(3, c, None, None)], [b].into_iter().collect::<BTreeSet<i32>>(), vec![a, removed, c]),
+    ] {
+        for row in &rows {
+            queue::insert(&tx, character, row).await.expect("insert queue");
+        }
+        clean_queue(&tx, &sde, character, &types, now, &mut progress).await.expect("clean queue");
+        let kept = queue::list(&tx, character).await.expect("kept queue");
+        assert_eq!(kept.iter().map(|r| r.type_id).collect::<Vec<_>>(), expected);
+        let attrs = crate::services::skills::attributes::character_attributes_at(&tx, &sde, character, now).await.expect("character attributes");
+        let mut timed = kept.clone();
+        crate::services::skills::training::schedule_queue(&sde, &mut timed, &attrs, Some(now)).expect("reference schedule");
+        assert!(kept == timed, "removed blocker must retime the kept queue from now with real attributes");
+        if expected[0] == a {
+            // The surviving finite head banks half its interval at now.
+            assert_eq!(training::current(&tx, character).await.expect("read skills").iter().find(|s| s.type_id == a).unwrap().skill_points, 50);
+            assert_eq!(kept[0].start_sp, 50);
+        }
+        queue::clear(&tx, character).await.expect("clear queue");
+        for row in [entry(0, a, None, None), entry(1, b, None, None)] {
+            queue::insert(&tx, character, &row).await.expect("insert paused queue");
+        }
+        clean_queue(&tx, &sde, character, &types, now, &mut progress).await.expect("clean paused queue");
+        let kept = queue::list(&tx, character).await.expect("kept paused queue");
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].start_time, kept[0].end_time), (None, None));
+        queue::clear(&tx, character).await.expect("clear queue");
+    }
+    assert!(progress.queue_changed);
+    tx.rollback().await.expect("rollback");
+    }).await;
+    crate::services::tests::fixture::cleanup(&db, fixture).await.expect("cleanup fixture");
+    result.expect("database test");
 }
 
 fn assert_changed_batch(outbox: Outbox<crate::services::effects::online::OnlineChanged>, character: i64, expected: &[i32]) {

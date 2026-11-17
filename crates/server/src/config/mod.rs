@@ -8,6 +8,7 @@ pub mod game;
 pub mod map;
 pub mod scheduler;
 pub mod lua;
+pub mod progress;
 pub mod shared_settings;
 
 use anyhow::{bail, Context, Result};
@@ -43,11 +44,13 @@ pub struct Config {
     pub map: map::MapConfig,
     pub shared_settings: shared_settings::SharedSettingsConfig,
     pub game: NestedGameConfig,
+    pub progress: progress::ProgressConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
     pub trade: game::economy::TradeConfig,
     pub repair: game::economy::RepairConfig,
+    pub repairable_ship: game::repairable_ship::RepairableShipConfig,
     pub store: game::economy::StoreConfig,
     pub missions: game::world::MissionsConfig,
     pub standings: game::world::StandingsConfig,
@@ -86,6 +89,7 @@ impl PartialEq for Config {
             && self.scheduler == other.scheduler
             && self.lua == other.lua
             && self.bounty == other.bounty
+            && self.progress == other.progress
             && self.map == other.map
             && self.shared_settings == other.shared_settings
             && self.game == other.game
@@ -95,6 +99,7 @@ impl PartialEq for Config {
             && self.trade == other.trade
             && self.store == other.store
             && self.repair == other.repair
+            && self.repairable_ship == other.repairable_ship
             && self.missions == other.missions
             && self.standings == other.standings
             && self.combat == other.combat
@@ -199,6 +204,8 @@ impl Config {
         override_env!("DATABASE_USER", config.database.user);
         override_env!("DATABASE_NAME", config.database.name);
         override_env!("DATABASE_POOL_SIZE", config.database.pool_size);
+        override_env!("DATABASE_SCHEMA_DOWNGRADE_GUARD", config.database.schema_downgrade_guard);
+        override_env!("DATABASE_LOSS_TOLERANT_ASYNC_COMMIT", config.database.loss_tolerant_async_commit);
         override_env!("CHAT_BIND", config.chat.bind);
         override_env!("CHAT_DOMAIN", config.chat.domain);
         override_env!("IMAGE_BIND", config.images.bind);
@@ -208,6 +215,10 @@ impl Config {
         override_env!("GATEWAY_BIND", config.gateway.bind);
         override_env!("GATEWAY_NOTICE_QUEUE_CAPACITY", config.gateway.notice_queue_capacity);
         override_env!("CDN_BIND", config.cdn.bind);
+        override_env!("GM_PERFORMANCE_TESTING", config.gm.performance_testing);
+        override_env!("SPACE_IDLE_UNLOAD_SECS", config.space.idle_unload_secs);
+        override_env!("SPACE_LOADED_SNAPSHOT_FAILURE_PERIODS", config.space.loaded_snapshot_failure_periods);
+        override_env!("PROGRESS_PERMANENT_RETRY_LIMIT", config.progress.permanent_retry_limit);
         if let Some(value) = env("LUA_CONTENT_DATA_DIR") { config.lua.content_data_dir = Some(value); }
         override_env!("MINING_PROGRESS_AGGREGATION_SECS", config.mining.progress_aggregation_secs);
         override_env!("MINING_PROGRESS_BATCH_ROWS", config.mining.progress_batch_rows);
@@ -260,6 +271,7 @@ impl Config {
             trade: self.trade.clone(),
             store: self.store.clone(),
             repair: self.repair.clone(),
+            repairable_ship: self.repairable_ship.clone(),
             missions: self.missions.clone(),
             standings: self.standings.clone(),
             combat: self.combat.clone(),
@@ -269,6 +281,7 @@ impl Config {
             salvage: self.salvage.clone(),
             exploration: self.exploration.clone(),
             industry: self.industry.clone(),
+            progress: self.progress.clone(),
             fleets: self.fleets.clone(),
             corporations: self.corporations.clone(),
             contracts: self.contracts.clone(),

@@ -1,9 +1,12 @@
 //! Transaction-local authority for the account PLEX vault used by vgs and vaultManager.
 //! Persists exact balances and an append-only ledger in game.accounts and
-//! game.plex_vault_transactions. Inventory conversion and transaction ownership belong
-//! to callers; projected balances are only for the client protocol.
-use infinity_core::consts::CLIENT_MAX_SHORT_AMOUNT;
-use crate::{client::filetime_now, dao::{accounts::plex, characters::persistence}, db::{executor::Executor, outbox::Outbox}, services::{db_err, CallError}};
+//! game.plex_vault_transactions; the `kind = 'opening'` baseline is internal and
+//! excluded from every ledger read. Committed rows feed the Macho
+//! OnAurumChangeFromVgs event and the gateway BalanceChangedNotice, and the
+//! gateway vault handlers read them back. Client-facing amounts are the clamped
+//! signed projection below; stored balances and deltas stay exact.
+use infinity_core::consts::{CLIENT_MAX_SHORT_AMOUNT, PLEX_HUNDREDTHS};
+use crate::{client::filetime_now, dao::{accounts::plex, characters::persistence}, db::{executor::Executor, outbox::Outbox}, gateway::{notices::producer_error, plex::balance_changed_notice}, services::{db_err, CallError}};
 use marshal::Value;
 
 /// The numeric(36,0) account storage limit.
@@ -44,12 +47,13 @@ pub(crate) async fn change_in<X: Send>(ex: &(impl Executor + ?Sized), outbox: &m
     let before: i128 = before_text.parse().map_err(|e| CallError::Internal(anyhow::anyhow!("invalid PLEX balance: {e}")))?;
     let Some(after) = next_balance(before, change) else { return Ok(None) };
     let Some(delta) = after.checked_sub(before) else { return Ok(None) };
-    if !plex::update(ex, user_id, &before_text, &after.to_string()).await.map_err(db_err)? { return Ok(None) }
+    let after_text = after.to_string();
+    if !plex::update(ex, user_id, &before_text, &after_text).await.map_err(db_err)? { return Ok(None) }
     let now = filetime_now();
     plex::opening(ex, user_id, &before_text, now).await.map_err(db_err)?;
     let (order_id, trade_id) = context.kind.market_ids();
-    plex::append(ex, user_id, actor_char_id, &delta.to_string(), &after.to_string(), context.kind.as_str(), now, context.item_id, context.reference, order_id, trade_id).await.map_err(db_err)?;
-    let projected = after.min(i128::from(CLIENT_MAX_SHORT_AMOUNT)) as i64;
+    let transaction_id = plex::append(ex, user_id, actor_char_id, &delta.to_string(), &after_text, context.kind.as_str(), now, context.item_id, context.reference, order_id, trade_id).await.map_err(db_err)?;
+    let projected = projected_whole(after);
     let chars = persistence::names(ex, user_id).await.map_err(db_err)?;
     if let VaultAudience::UnpublishedCaller { .. } = audience {
         outbox.notify_client("OnAurumChangeFromVgs", vec![Value::dict([("userid", Value::Int(user_id)), ("balance", Value::Int(projected))])]);
@@ -60,10 +64,20 @@ pub(crate) async fn change_in<X: Send>(ex: &(impl Executor + ?Sized), outbox: &m
             outbox.notify_pilot(character.character_id, "OnAurumChangeFromVgs", vec![Value::dict([("userid", Value::Int(user_id)), ("balance", Value::Int(projected))])]);
         }
     }
+    outbox.notify_gateway(balance_changed_notice(user_id, transaction_id, now, delta, after).map_err(producer_error)?);
     Ok(Some(VaultEntry { balance: after, projected }))
 }
 
 pub(crate) struct VaultEntry { pub balance: i128, pub projected: i64 }
+
+/// Signed projection to the client whole-PLEX range; storage is unaffected.
+fn projected_whole(whole: i128) -> i64 {
+    whole.clamp(-i128::from(CLIENT_MAX_SHORT_AMOUNT), i128::from(CLIENT_MAX_SHORT_AMOUNT)) as i64
+}
+/// The same projection in hundredths for the gateway wire messages.
+pub(crate) fn projected_cents(whole: i128) -> i64 {
+    projected_whole(whole) * PLEX_HUNDREDTHS
+}
 fn next_balance(before: i128, change: VaultChange) -> Option<i128> {
     let after = match change { VaultChange::Add(delta) => before.checked_add(delta), VaultChange::Set(value) => Some(value) }?;
     (0..=MAX_BALANCE).contains(&after).then_some(after)
@@ -71,4 +85,4 @@ fn next_balance(before: i128, change: VaultChange) -> Option<i128> {
 
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

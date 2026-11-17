@@ -78,12 +78,12 @@ fn book_rows_preserve_widths_locations_and_separate_sides() {
 
 #[test]
 fn npc_issue_date_uses_utc_day_fallback_and_preserves_persisted_date() {
-    let before = today();
+    let before = filetime_day_start(filetime_now());
     let mut npc = order(false);
     npc.char_id = None;
     npc.issued = None;
     let book = book_rows(&[npc.clone()]);
-    let after = today();
+    let after = filetime_day_start(filetime_now());
     let (header, rows) = rowset(&book.items().unwrap()[0]);
     let issued = header.get(&rows[0], "issueDate").unwrap();
     assert!(before > 0);

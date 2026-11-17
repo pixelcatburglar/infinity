@@ -137,5 +137,5 @@ impl Definition {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

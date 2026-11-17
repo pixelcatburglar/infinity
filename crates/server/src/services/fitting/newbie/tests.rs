@@ -24,7 +24,7 @@ async fn client(db: Db, sde: Arc<Sde>, f: fixture::Fixture, station: i64, system
     let (stream, address) = listener.accept().await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
     let chat = crate::chat::Hub::new("localhost", db.clone(), world.clone());
-    let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), db, sde, chat, world,
+    let mut c = Client::new(infinity_wire::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), db, sde, chat, world,
         crate::handshake::Login { user_id: f.account, user_name: "grant-fixture".into(), role: 0, client_id: f.account, session_id: f.account, language_id: "EN".into() });
     c.session.apply(vec![("userid", Value::Int(f.account)), ("charid", Value::Int(f.character)), ("shipid", Value::Int(ship)), ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system))]);
     c.world.register_pilot(f.character, c.notify_tx.clone());
@@ -72,12 +72,12 @@ fn item_packets(c: &Client, session_expected: bool) -> Vec<Value> {
     let mut rows = Vec::new();
     let mut session = false;
     for packet in &c.outbox {
-        let packet = crate::macho::Packet::from_value(&marshal::loads(&marshal::dumps(&packet.to_value())).unwrap()).unwrap();
-        if packet.command == crate::macho::cmd::SESSIONCHANGENOTIFICATION {
+        let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&marshal::dumps(&packet.to_value())).unwrap()).unwrap();
+        if packet.command == infinity_wire::macho::cmd::SESSIONCHANGENOTIFICATION {
             assert!(!session);
             session = true;
         }
-        if let crate::macho::Address::Broadcast { broadcast_id, .. } = &packet.destination {
+        if let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = &packet.destination {
             if broadcast_id.as_text().as_deref() == Some("OnItemChange") {
                 assert!(!session, "inventory must precede session change");
                 let envelope = packet.body[0].items().unwrap();

@@ -2,6 +2,7 @@
 //! LIKE is server-side: literal contains/prefix/suffix patterns escape SQL wildcards;
 //! the explicit LIKE operator accepts SQL `%` and `_` pattern syntax.
 use infinity_core::{consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH, ROLE_DIRECTOR}};
+use crate::dao::characters::roles::{CURRENT_CORPORATION_JOIN_SQL, EFFECTIVE_ROLES_SQL};
 use crate::{db::{self, executor::Executor}};
 use tokio_postgres::types::ToSql;
 
@@ -37,8 +38,11 @@ pub(crate) async fn query(ex: &(impl Executor + ?Sized), corp: i64, clauses: &[C
             let scope = match clause.property { "roles" | "grantableRoles" => 0, "rolesAtHQ" | "grantableRolesAtHQ" => 1, "rolesAtBase" | "grantableRolesAtBase" => 2, _ => 3 };
             let regular = *mask & valid[scope] & !ROLE_DIRECTOR != 0;
             let ceo_director = scope == 0 && *mask & valid[scope] & ROLE_DIRECTOR != 0;
-            let director = if regular { format!("ch.corp_roles & {ROLE_DIRECTOR} <> 0") } else if ceo_director {
-                format!("ch.corp_roles & {ROLE_DIRECTOR} <> 0 AND EXISTS (SELECT 1 FROM game.corporations co WHERE co.corporation_id=ch.corporation_id AND NOT co.deleted AND co.ceo_id=ch.character_id)")
+            // Implied Director inheritance follows the same effective mask as the authority
+            // projection, so a CEO whose election freeze withholds the bit no longer matches.
+            let effective_director = EFFECTIVE_ROLES_SQL.as_str();
+            let director = if regular { format!("({effective_director} & {ROLE_DIRECTOR}) <> 0") } else if ceo_director {
+                format!("({effective_director} & {ROLE_DIRECTOR}) <> 0 AND co.ceo_id = ch.character_id")
             } else { "false".to_owned() };
             let test = if implied { format!("({effective} & ${index}::bigint <> 0 OR ({director}))") } else { format!("({effective} & ${index}::bigint <> 0)") };
             if clause.operator == 8 { format!("NOT {test}") } else { test }
@@ -61,7 +65,7 @@ pub(crate) async fn query(ex: &(impl Executor + ?Sized), corp: i64, clauses: &[C
         expression = if expression.is_empty() { condition } else { format!("({expression} {} {condition})", if clause.join == 1 { "OR" } else { "AND" }) };
     }
     let filter = if expression.is_empty() { String::new() } else { format!(" AND ({expression})") };
-    let sql = format!("SELECT ch.character_id FROM game.characters ch WHERE ch.corporation_id=$1 AND NOT ch.deleted AND $2::bigint IS NOT NULL AND $3::bigint IS NOT NULL{filter} ORDER BY ch.character_id");
+    let sql = format!("SELECT ch.character_id {CURRENT_CORPORATION_JOIN_SQL} WHERE ch.corporation_id=$1 AND NOT ch.deleted AND $2::bigint IS NOT NULL AND $3::bigint IS NOT NULL{filter} ORDER BY ch.character_id");
     let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|arg| &**arg as &(dyn ToSql + Sync)).collect();
-    Ok(ex.query(&sql, &refs).await?.iter().map(|row| CharacterId::from_row(row).id).collect())
+    Ok(ex.uncached().query(&sql, &refs).await?.iter().map(|row| CharacterId::from_row(row).id).collect())
 }

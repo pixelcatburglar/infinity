@@ -9,9 +9,41 @@ license.workspace = true
 name = "infinity-server"
 path = "src/main.rs"
 
+[features]
+# Test-compilation domains: each gates the test modules under one set of
+# source paths (the domain table lives in docs/development.md). They only
+# select which server test code compiles; production code never depends on
+# them. The default keeps every domain on, so plain builds and CI are
+# unchanged; --no-default-features --features tests-<domain> selects less.
+default = ["tests-all"]
+tests-all = [
+    "tests-effects", "tests-combat", "tests-ships", "tests-inventory",
+    "tests-skills", "tests-economy", "tests-social", "tests-content",
+    "tests-slash", "tests-services", "tests-space", "tests-lua",
+    "tests-storage", "tests-gateway", "tests-sde", "tests-runtime",
+]
+tests-effects = []
+tests-combat = []
+tests-ships = []
+tests-inventory = []
+tests-skills = []
+tests-economy = []
+tests-social = []
+tests-content = []
+tests-slash = []
+tests-services = []
+tests-space = []
+tests-lua = []
+tests-storage = []
+tests-gateway = []
+tests-sde = []
+tests-runtime = []
+
 [dependencies]
 marshal = { path = "../marshal" }
 infinity-core = { path = "../core" }
+infinity-content = { path = "../content" }
+infinity-wire = { path = "../wire" }
 mlua = { version = "0.12", features = ["lua54", "vendored", "async", "send", "macros", "anyhow"] }
 anyhow.workspace = true
 deadpool-postgres.workspace = true
@@ -21,7 +53,6 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 flate2 = "1"
-flatbuffers = "=25.2.10"
 fancy-regex = "0.14.0"
 base64 = "0.22"
 bytes = "1"

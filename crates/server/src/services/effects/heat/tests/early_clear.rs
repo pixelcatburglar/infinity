@@ -58,6 +58,7 @@ fn cycle(cx: &Ctx, effect: &registry::Effect, module_type: i32, generation: Arc<
             pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1_000.0, nominal_start: nominal,
         other: None, repair_amount: 0.0, illegal: false,
+        source_membership: None, target_type: None, inputs: Default::default(),
     }
 }
 

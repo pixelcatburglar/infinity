@@ -119,7 +119,7 @@ async fn timed_item_batch_consumes_each_and_extends_once() {
     assert_eq!(activate(&mut c, ids.clone()).await.unwrap(), Value::None);
     assert_eq!(c.outbox.len(), 2);
     for packet in &c.outbox {
-        let crate::macho::Address::Broadcast { broadcast_id, .. } = &packet.destination else { panic!("expected item broadcast") };
+        let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = &packet.destination else { panic!("expected item broadcast") };
         assert_eq!(broadcast_id.as_text().as_deref(), Some("OnItemChange"));
     }
     assert_eq!(rx.try_recv().unwrap(), ("OnSkinLicenseActivated".to_string(), vec![Value::Int(i64::from(skin)), Value::Int(fixture.character)]));

@@ -1,8 +1,15 @@
+#[cfg(feature = "tests-slash")]
 use super::*;
-pub(in crate::services::slash) mod support;
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-content", feature = "tests-inventory", feature = "tests-ships", feature = "tests-slash", feature = "tests-social"))]
+pub(in crate::services) mod support;
+#[cfg(feature = "tests-slash")]
 mod feedback;
+#[cfg(feature = "tests-slash")]
 mod stack_quantities;
+#[cfg(feature = "tests-slash")]
+mod standings;
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn list_limit_preserves_boundary_and_counts_omissions() {
     let rows = vec!["row"; LIST_ROW_LIMIT].join("\n");
@@ -17,6 +24,7 @@ fn list_limit_preserves_boundary_and_counts_omissions() {
     assert_eq!(finish_list(rendered.clone(), 2), format!("{rendered}\n{}", messages::gm::gm_rows_truncated(2)));
 }
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn isk_grammar_and_argument_count() {
     let parse = |args: &[&str]| parse_amount(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), ISK_INTEGER_DIGITS, ISK_DECIMALS, false);
@@ -34,6 +42,7 @@ fn isk_grammar_and_argument_count() {
     assert!(parse(&["1.234"]).is_none());
 }
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn isk_command_decimal_boundary_is_exact() {
     let maximum = "9999999999999999999999999999999999.99";
@@ -41,6 +50,7 @@ fn isk_command_decimal_boundary_is_exact() {
     assert_eq!(crate::isk::IskAmount::parse_decimal(&parsed).unwrap().decimal(), maximum);
     assert!(parse_amount(&["10000000000000000000000000000000000".into()], ISK_INTEGER_DIGITS, ISK_DECIMALS, false).is_none());
 }
+#[cfg(feature = "tests-slash")]
 
 #[test]
 fn addisk_signed_grammar_preserves_digit_limit() {
@@ -54,6 +64,7 @@ fn addisk_signed_grammar_preserves_digit_limit() {
     }
 }
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn plex_grammar_and_argument_count() {
     let parse = |args: &[&str]| parse_amount(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), PLEX_DIGITS, 0, false);
@@ -67,6 +78,7 @@ fn plex_grammar_and_argument_count() {
     assert!(parse(&["1", "2"]).is_none());
 }
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn exact_balance_clamp_and_echo() {
     let isk_cap = format!("{CLIENT_MAX_ISK:.0}");
@@ -85,6 +97,7 @@ fn exact_balance_clamp_and_echo() {
     assert_eq!(messages::gm::gm_plex_balance("1000", Some(999)), "vault 1000 PLEX (client shows 999)");
 }
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn dogma_grammar() {
     use dogma::{Action, Target};
@@ -106,13 +119,14 @@ fn dogma_grammar() {
     }
 }
 
+#[cfg(feature = "tests-slash")]
 #[test]
 fn dogma_runtime_and_character_attributes_are_denied_for_all_actions() {
     use dogma::{denied, Action};
     for args in [&["ship", "skillPoints"][..], &["ship", "skillPoints", "1"][..], &["ship", "skillPoints", "reset"][..]] {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
         let (_, action) = dogma::parse(&owned).unwrap();
-        assert_eq!(match action { Action::Query(a) | Action::Set(a, _) | Action::Reset(a) => a, Action::List => panic!("expected attribute action") }, "skillPoints");
+        assert_eq!(match action { Action::Query(a) | Action::Set(a, _) | Action::Reset(a) | Action::Unlimited(a) => a, Action::List => panic!("expected attribute action") }, "skillPoints");
         assert_eq!(denied(9999, |name, id| name == "skillPoints" && id == 9999), Some(messages::gm::GM_DOGMA_RUNTIME));
         for id in [164, 165, 166, 167, 168] {
             assert_eq!(denied(id, |_, _| false), Some(messages::gm::GM_DOGMA_CHARACTER));
@@ -124,6 +138,7 @@ fn dogma_runtime_and_character_attributes_are_denied_for_all_actions() {
     }
 }
 
+#[cfg(feature = "tests-slash")]
 async fn isk_command(client: &mut Client, command: &str, amount: &str) -> CallResult {
     let args = [Value::unicode(format!("/{command} {amount}"))];
     let kwargs = Value::Dict(vec![]);
@@ -131,6 +146,7 @@ async fn isk_command(client: &mut Client, command: &str, amount: &str) -> CallRe
     execute(client, &call).await.unwrap()
 }
 
+#[cfg(feature = "tests-slash")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn gm_isk_preserves_cents_above_cap_and_rolls_back_overflow() {
@@ -181,7 +197,7 @@ async fn gm_isk_preserves_cents_above_cap_and_rolls_back_overflow() {
             assert_eq!(events.len(), before_count + 1);
             assert!(matches!(events.last(), Some(GameEvent::WalletChanged { balance, delta: actual, .. }) if *balance == expected && *actual == IskAmount::parse_decimal(delta).unwrap()));
             assert_eq!(client.outbox.len(), 1);
-            assert!(matches!(&client.outbox[0].destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAccountChange")));
+            assert!(matches!(&client.outbox[0].destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAccountChange")));
             client.outbox.clear();
         }
         assert!(isk_command(&mut client, "setisk", "-1").await.is_err());
@@ -215,6 +231,7 @@ async fn gm_isk_preserves_cents_above_cap_and_rolls_back_overflow() {
     result.unwrap();
 }
 
+#[cfg(feature = "tests-slash")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn gm_plex_wallet_uses_exact_ledger_and_refuses_overflow_atomically() {
@@ -246,7 +263,7 @@ async fn gm_plex_wallet_uses_exact_ledger_and_refuses_overflow_atomically() {
         assert!(receiver.try_recv().is_err());
         assert_eq!(client.outbox.len(), 1);
         let packet = &client.outbox[0];
-        assert!(matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAurumChangeFromVgs")));
+        assert!(matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAurumChangeFromVgs")));
         let envelope = packet.body[0].items().unwrap();
         assert_eq!(marshal::loads(envelope[1].as_bytes().unwrap()).unwrap(), Value::tuple([Value::Int(1), Value::tuple([notice])]));
         client.outbox.clear();
@@ -272,7 +289,7 @@ async fn gm_plex_wallet_uses_exact_ledger_and_refuses_overflow_atomically() {
         assert!(receiver.try_recv().is_err());
         assert_eq!(client.outbox.len(), 1);
         let packet = &client.outbox[0];
-        assert!(matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAurumChangeFromVgs")));
+        assert!(matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAurumChangeFromVgs")));
         let envelope = packet.body[0].items().unwrap();
         assert_eq!(marshal::loads(envelope[1].as_bytes().unwrap()).unwrap(), Value::tuple([Value::Int(1), Value::tuple([notice])]));
         client.outbox.clear();
@@ -282,6 +299,7 @@ async fn gm_plex_wallet_uses_exact_ledger_and_refuses_overflow_atomically() {
     fixture.cleanup(&db).await.unwrap();
 }
 
+#[cfg(feature = "tests-slash")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn gm_loyalty_adjustment_does_not_emit_earnings() {
@@ -292,12 +310,36 @@ async fn gm_loyalty_adjustment_does_not_emit_earnings() {
     let result = tokio::spawn(async move {
         let (mut client, _peer) = crate::services::tests::client(test_db.clone(), fixture.character).await;
         let issuer = client.sde.npc_corporations.iter().next().expect("SDE NPC corporation").corporation_id;
-        social::command(&mut client, "setlp", &[issuer.to_string(), "7".into()]).await.unwrap();
-        social::command(&mut client, "addlp", &[issuer.to_string(), "2".into()]).await.unwrap();
-        assert_eq!(crate::services::standings::lp_balance(&test_db, fixture.character, issuer).await.unwrap(), 9);
+        social::command(&mut client, "setlp", &[issuer.to_string(), "9007199254740993".into()]).await.unwrap();
+        social::command(&mut client, "addlp", &[issuer.to_string(), "-2".into()]).await.unwrap();
+        assert_eq!(crate::services::standings::lp_balance(&test_db, fixture.character, issuer).await.unwrap(), 9007199254740991);
         assert!(crate::db::outbox::tests::events(&test_db, "LoyaltyPointsEarned", fixture.character).await.is_empty());
     }).await;
     db.execute("DELETE FROM game.lp_balances WHERE char_id=$1", &[&fixture.character]).await.unwrap();
+    crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
+    result.unwrap();
+}
+
+#[cfg(feature = "tests-slash")]
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn announce_is_registered_in_help_and_autocomplete() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
+    let result = crate::tests::catch_scenario(async {
+        let (mut client, _peer) = crate::services::tests::client(db.clone(), fixture.character).await;
+        client.login.role = GM_ROLES;
+        let help = support::rpc(&mut client, "/help").await.unwrap();
+        assert!(help.as_text().unwrap().lines().any(|line| line == messages::gm::GM_HELP_ANNOUNCE));
+        match support::rpc(&mut client, "/").await.unwrap_err() {
+            CallError::User { msg, dict } => {
+                assert_eq!(msg, messages::MSG_SLASH_ERROR);
+                assert!(dict.iter().any(|(key, value)| key == "reason" && value.as_text().is_some_and(|text| text.contains(&messages::gm::gm_command_name("announce")))));
+            }
+            other => panic!("expected slash error, got {other:?}"),
+        }
+    }).await;
     crate::services::tests::fixture::cleanup(&db, fixture).await.unwrap();
     result.unwrap();
 }

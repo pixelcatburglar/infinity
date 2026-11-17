@@ -168,7 +168,9 @@ pub(in crate::services) async fn gm_spawn_ship(c: &mut Client, type_id: i32) -> 
     }
     let system = c.session.int("solarsystemid").ok_or_else(|| db_err(anyhow::anyhow!("missing spawn system")))?;
     let active = c.session.int("shipid").ok_or_else(|| db_err(anyhow::anyhow!("missing active ship")))?;
+    let admission = c.world.admission(system).map_err(db_err)?;
     let _lock = crate::services::market::lock().await;
+    admission.check().map_err(db_err)?;
     let pilot = c.world.with(system, move |s| {
         let id = s.pilot_ball(owner)?.id;
         if id != active { return None; }
@@ -194,4 +196,4 @@ pub(in crate::services) async fn gm_spawn_ship(c: &mut Client, type_id: i32) -> 
 }
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

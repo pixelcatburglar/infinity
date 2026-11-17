@@ -20,7 +20,7 @@ impl RewardRow {
     }
     fn from_row(r: &tokio_postgres::Row) -> Result<Self, db::Error> {
         let isk: Option<&str> = r.try_get("amount_isk")?; let units: Option<&str> = r.try_get("amount_units")?;
-        let row = Self { goal_id:r.try_get("goal_id")?, reward_index:r.try_get("reward_index")?, asset_id:r.try_get("asset_id")?, unit:r.try_get("unit")?, amount_isk:isk.map(IskAmount::parse_decimal).transpose().map_err(|e|db::Error::Progress(e.into()))?, amount_units:units.map(str::parse).transpose().map_err(|e: std::num::ParseIntError|db::Error::Progress(e.into()))?, issuer_id:r.try_get("issuer_id")?, type_id:r.try_get("type_id")?, omega_required:r.try_get("omega_required")?, earned:r.try_get("earned")?, claimed_at:r.try_get("claimed_at")?, location_id:r.try_get("location_id")?, item_id:r.try_get("item_id")?, plex_reference:r.try_get("plex_reference")?, revision:r.try_get("revision")? };
+        let row = Self { goal_id:r.try_get("goal_id")?, reward_index:r.try_get("reward_index")?, asset_id:r.try_get("asset_id")?, unit:r.try_get("unit")?, amount_isk:isk.map(crate::dao::numeric::parse_isk).transpose()?, amount_units:units.map(str::parse).transpose().map_err(|e: std::num::ParseIntError|db::Error::Progress(e.into()))?, issuer_id:r.try_get("issuer_id")?, type_id:r.try_get("type_id")?, omega_required:r.try_get("omega_required")?, earned:r.try_get("earned")?, claimed_at:r.try_get("claimed_at")?, location_id:r.try_get("location_id")?, item_id:r.try_get("item_id")?, plex_reference:r.try_get("plex_reference")?, revision:r.try_get("revision")? };
         row.validate()?;
         Ok(row)
     }

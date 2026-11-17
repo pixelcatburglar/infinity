@@ -411,4 +411,4 @@ async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             Ok(Value::None)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

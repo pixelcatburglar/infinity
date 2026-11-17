@@ -37,7 +37,7 @@ impl World {
     }
 
     pub(crate) async fn add_persistent_ship_locked(&self, system: i64, ship: crate::services::ship::balls::PreparedShip,
-        market: &tokio::sync::MutexGuard<'static, ()>) -> anyhow::Result<()> {
+        market: &crate::services::market::economy_lock::Guard) -> anyhow::Result<()> {
         self.system_locked(system, market).await?;
         let installed = self.with(system, move |s| {
             if s.contains(ship.ball.id) { return false; }
@@ -49,4 +49,4 @@ impl World {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

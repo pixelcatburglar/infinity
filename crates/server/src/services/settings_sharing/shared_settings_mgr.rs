@@ -69,5 +69,5 @@ async fn handle(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

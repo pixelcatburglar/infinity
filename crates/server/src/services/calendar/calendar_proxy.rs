@@ -3,12 +3,11 @@
 use super::*;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     Some(match call.method {
         "GetEventList" => {
             let me = c.session.int("charid").unwrap_or(0);
             let corp = c.session.int("corpid").unwrap_or(0);
-            match dao::event_list(&c.db, me, corp, int(0) as i32, int(1) as i32, RESPONSE_DELETED, FILETIME_UNIX_EPOCH, FILETIME_SECOND).await {
+            match dao::event_list(&c.db, me, corp, crate::services::arg_int(call, 0) as i32, crate::services::arg_int(call, 1) as i32, RESPONSE_DELETED, FILETIME_UNIX_EPOCH, FILETIME_SECOND).await {
                 Ok(rows) => {
                     let header = DbRowDescriptor::new([
                         ("eventID", DbType::I4), ("ownerID", DbType::I4), ("eventDateTime", DbType::FileTime), ("dateModified", DbType::FileTime),
@@ -20,8 +19,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 Err(e) => Err(db_err(e)),
             }
         }
-        "GetEventDetails" => match dao::details(&c.db, int(0)).await {
-            Ok(Some(r)) => Ok(keyval([("eventID", Value::Int(int(0))), ("eventText", Value::unicode(r.description)), ("creatorID", Value::Int(r.creator_id)), ("ownerID", Value::Int(r.owner_id))])),
+        "GetEventDetails" => match dao::details(&c.db, crate::services::arg_int(call, 0)).await {
+            Ok(Some(r)) => Ok(keyval([("eventID", Value::Int(crate::services::arg_int(call, 0))), ("eventText", Value::unicode(r.description)), ("creatorID", Value::Int(r.creator_id)), ("ownerID", Value::Int(r.owner_id))])),
             Ok(None) => Ok(Value::None),
             Err(e) => Err(db_err(e)),
         },

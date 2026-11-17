@@ -44,5 +44,5 @@ pub(super) async fn client(db: Db, sde: Arc<Sde>, world: Arc<World>, hub: Arc<Hu
     let (stream, address) = listener.accept().await.unwrap();
     let cfg = Arc::new(crate::config::Config::default());
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-    (Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, hub, world, login), peer)
+    (Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, hub, world, login), peer)
 }

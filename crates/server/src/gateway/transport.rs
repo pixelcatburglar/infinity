@@ -46,7 +46,7 @@ fn checked_messages(buf: &mut BytesMut) -> Result<Vec<Bytes>, ()> {
 }
 
 fn application_uuid(headers: &http::HeaderMap) -> Option<[u8; UUID_LEN]> {
-    crate::uuid_text::parse(headers.get("application_instance_uuid")?.to_str().ok()?, crate::uuid_text::Case::Lowercase)
+    infinity_content::uuid_text::parse(headers.get("application_instance_uuid")?.to_str().ok()?, infinity_content::uuid_text::Case::Lowercase)
 }
 
 fn ok_headers() -> http::Response<()> {
@@ -157,4 +157,4 @@ async fn stream(path: String, application: Option<[u8; UUID_LEN]>, mut body: h2:
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

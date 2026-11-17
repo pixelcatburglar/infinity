@@ -74,7 +74,7 @@ struct HomeStationId { home_station_id: Option<i64> }
 impl HomeStationId {
     fn from_row(r: &Row) -> Self { Self { home_station_id: r.get("home_station_id") } }
 }
-pub(crate) async fn home_station_id(ex: &impl Executor, id: i64) -> Result<Option<i64>, Error> {
+pub(crate) async fn home_station_id(ex: &(impl Executor + ?Sized), id: i64) -> Result<Option<i64>, Error> {
     let row = ex.query_opt("SELECT home_station_id FROM game.characters WHERE character_id = $1", &[&id]).await?;
     Ok(row.as_ref().and_then(|r| HomeStationId::from_row(r).home_station_id))
 }
@@ -135,7 +135,7 @@ impl Location {
         }
     }
 }
-pub(crate) async fn locations(ex: &impl Executor, ids: &[i64]) -> Result<Vec<Location>, Error> {
+pub(crate) async fn locations(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<Location>, Error> {
     let rows = ex.query(
         "SELECT item_id, name, type_id FROM game.items WHERE item_id = ANY($1::bigint[])",
         &[&ids],

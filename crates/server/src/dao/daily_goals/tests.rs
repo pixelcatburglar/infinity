@@ -150,6 +150,8 @@ async fn frozen_rows_guards_history_and_receipts() {
         r.unit = unit.into(); r.amount_isk = None; r.amount_units = Some(max);
         r.issuer_id = (unit == "lp").then_some(1); r.type_id = (unit == "item").then_some(item_type);
         assert!(rewards::insert(&db,owner,&r).await.unwrap());
+        let readback = rewards::list(&db,owner,&ids[0],false).await.unwrap();
+        assert!(readback.iter().find(|row| row.reward_index == r.reward_index).unwrap().amount_isk.is_none());
         assert!(db.execute("UPDATE game.daily_goal_rewards SET amount_units=$3::text::numeric WHERE goal_id=$1::text::uuid AND reward_index=$2", &[&r.goal_id,&r.reward_index,&(max + 1).to_string()]).await.is_err());
         assert!(db.execute("UPDATE game.daily_goal_rewards SET amount_units=1.5 WHERE goal_id=$1::text::uuid AND reward_index=$2", &[&r.goal_id,&r.reward_index]).await.is_err());
         r.amount_units = Some(max + 1);

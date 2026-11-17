@@ -35,6 +35,7 @@ pub(crate) struct EffectRow {
     pub(crate) disallow_auto_repeat: bool, pub(crate) electronic_chance: bool, pub(crate) propulsion_chance: bool,
     pub(crate) discharge_attribute_id: Option<i32>, pub(crate) range_attribute_id: Option<i32>,
     pub(crate) falloff_attribute_id: Option<i32>, pub(crate) tracking_attribute_id: Option<i32>,
+    pub(crate) resistance_attribute_id: Option<i32>,
 }
 impl EffectRow {
     fn from_row(row: &Row) -> Self {
@@ -50,11 +51,12 @@ impl EffectRow {
             propulsion_chance: row.get("propulsion_chance"), discharge_attribute_id: row.get("discharge_attribute_id"),
             range_attribute_id: row.get("range_attribute_id"), falloff_attribute_id: row.get("falloff_attribute_id"),
             tracking_attribute_id: row.get("tracking_attribute_id"),
+            resistance_attribute_id: row.get("resistance_attribute_id"),
         }
     }
 }
 pub(crate) async fn effects(ex: &(impl Executor + ?Sized)) -> Result<Vec<EffectRow>, db::Error> {
-    Ok(ex.query("SELECT effect_id, name, guid, effect_category, duration_attribute_id, fitting_usage_chance_attribute_id, COALESCE(is_offensive, false) AS is_offensive, COALESCE(is_assistance, false) AS is_assistance, COALESCE(disallow_auto_repeat, false) AS disallow_auto_repeat, COALESCE(electronic_chance, false) AS electronic_chance, COALESCE(propulsion_chance, false) AS propulsion_chance, discharge_attribute_id, range_attribute_id, falloff_attribute_id, tracking_speed_attribute_id AS tracking_attribute_id FROM sde.dogma_effects ORDER BY effect_id", &[]).await?.iter().map(EffectRow::from_row).collect())
+    Ok(ex.query("SELECT effect_id, name, guid, effect_category, duration_attribute_id, fitting_usage_chance_attribute_id, COALESCE(is_offensive, false) AS is_offensive, COALESCE(is_assistance, false) AS is_assistance, COALESCE(disallow_auto_repeat, false) AS disallow_auto_repeat, COALESCE(electronic_chance, false) AS electronic_chance, COALESCE(propulsion_chance, false) AS propulsion_chance, discharge_attribute_id, range_attribute_id, falloff_attribute_id, tracking_speed_attribute_id AS tracking_attribute_id, resistance_attribute_id FROM sde.dogma_effects ORDER BY effect_id", &[]).await?.iter().map(EffectRow::from_row).collect())
 }
 /// Server sentinel for an absent modifier operation, outside supported operations.
 const MISSING_MODIFIER_OPERATION: i32 = -100;

@@ -2,9 +2,16 @@
 //! Client commands are in eve/client/script/ui/services/menuSvcExtras/droneFunctions.py.
 //! Uses actor state, drone specs and shared Sde; no tables directly.
 //! Orders and controller state are not restored after restart.
+//! Each brain carries its real owner's projected GM NPC-ignore scalar, which
+//! outlives the owner's pilot presence and is cleared when the drone is abandoned.
+//! Abandoning also detaches the owner domain from the drone's resident fit:
+//! its own node, overrides, condition and incoming projections are kept, and
+//! the old owner still receives the final own-fit attribute delta before the
+//! state change that unloads the drone client-side.
 
 use super::*;
 use infinity_core::consts::{*, dogma::*};
+use crate::space::combat::inputs::FitDeltaSources;
 use crate::space::targeting::next_generation as generation;
 
 /// Server movement policy: converge inside the action/contact boundary, not at it.
@@ -23,9 +30,20 @@ pub(in crate::space) struct DroneBrain {
     contact_claimed: Option<u64>,
     kinematics: Option<crate::services::effects::propulsion::Kinematics>,
     announced: bool,
+    npc_ignored: bool,
 }
 
 impl System {
+    /// The real owner's NPC-ignore flag projected onto this brain; cleared on abandon.
+    pub(in crate::space) fn drone_npc_ignored(&self, id: i64) -> bool {
+        self.drones.get(&id).is_some_and(|b| b.npc_ignored)
+    }
+    /// Apply the committed flag to every brain whose record still names `owner`.
+    pub(in crate::space) fn set_owned_drone_npc_ignored(&mut self, owner: i64, ignored: bool) {
+        for brain in self.drones.values_mut().filter(|b| b.record.owner == owner) {
+            brain.npc_ignored = ignored;
+        }
+    }
     pub(crate) fn drone(&self, id: i64) -> Option<DroneRecord> { self.drones.get(&id).map(|b| b.record.clone()) }
     pub(crate) fn drone_store_combat_attempt(&mut self, id: i64, generation: u64, attempt: crate::services::effects::space_source::PreparedCombatAttempt) {
         if let Some(brain) = self.drones.get_mut(&id).filter(|b| b.record.generation == generation) {
@@ -75,11 +93,12 @@ impl System {
         }
         let valid = self.complete_drone_launch_reservation(token, owner, controller);
         for (prepared, changed) in entries.into_iter().zip(dirty) {
-            let PreparedDrone { ball, spec, condition, fit, key } = prepared;
+            let PreparedDrone { ball, spec, condition, fit, key, npc_ignored } = prepared;
             if self.drones.contains_key(&ball.id) { continue; }
             let id = ball.id;
             self.add_ship(ball);
             self.register_drone(id, spec, effects.clone(), valid.then_some(controller), valid.then_some(owner), false);
+            if let Some(brain) = self.drones.get_mut(&id) { brain.npc_ignored = npc_ignored; }
             self.install_condition_with_key(id, condition.into_condition(), fit, key);
             if changed {
                 if let Some(generation) = self.combat_membership_generation(id) {
@@ -89,15 +108,16 @@ impl System {
             self.queue_drone_announcement(id);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.queue_drone_launch_ack(tx);
+        self.queue_destiny_flush(tx);
         Ok(rx)
     }
     pub(crate) fn restore_drone(&mut self, prepared: PreparedDrone, effects: DroneEffects) {
-        let PreparedDrone { ball, spec, condition, fit, key } = prepared;
+        let PreparedDrone { ball, spec, condition, fit, key, npc_ignored } = prepared;
         let id = ball.id;
         if self.drones.contains_key(&id) { return; }
         self.insert(ball);
         self.register_drone(id, spec, effects, None, None, true);
+        if let Some(brain) = self.drones.get_mut(&id) { brain.npc_ignored = npc_ignored; }
         self.install_condition_with_key(id, condition.into_condition(), fit, key);
     }
     pub(crate) fn register_drone(&mut self, id: i64, spec: DroneSpec, effects: DroneEffects, controller: Option<i64>, controller_owner: Option<i64>, announced: bool) {
@@ -106,7 +126,7 @@ impl System {
         self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
         self.snapshot_positions.insert(id, (self.snapshot_generation, pos));
         if self.snapshot_due == 0 { self.snapshot_due = self.ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND)); }
-        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, combat_attempt: None, contact_queued: false, contact_claimed: None, kinematics: None, announced });
+        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, combat_attempt: None, contact_queued: false, contact_claimed: None, kinematics: None, announced, npc_ignored: owner != OWNER_UNOWNED && self.pilot_npc_ignored(owner) });
     }
     fn notify_drone(&self, d: &DroneRecord) {
         if self.drones.get(&d.id).is_none_or(|b| !b.announced) { return; }
@@ -269,10 +289,26 @@ impl System {
         let Some(d) = self.drone(id) else { return };
         self.remove_projections_from(id);
         crate::services::combat::jamming::clear(self, id);
-        self.set_ball_owner(id, OWNER_UNOWNED);
         let b = self.drones.get_mut(&id).unwrap();
-        b.record.owner = OWNER_UNOWNED; b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.pending = None; b.record.state = DRONE_STATE_IDLE; b.locked = false;
+        b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.pending = None; b.record.state = DRONE_STATE_IDLE; b.locked = false;
         b.combat_attempt = None;
+        b.npc_ignored = false;
+        // The final own-fit delta must reach the old owner before the state
+        // change unloads the drone client-side, so the real owner stays on
+        // the ball and the record until that publication completes. The
+        // receipt begins under this abandon's new generation and still
+        // captures the pre-expiry, pre-detach values.
+        let publication = self.prepare_fit_publication(id, Some(FitDeltaSources::Current));
+        // The owner's ship and character domain detach; the drone keeps its own
+        // node, overrides, condition and incoming projections.
+        if let Some(record) = self.actor_combat.get_mut(&id) {
+            record.fit.strip_to_own_drone(id);
+            record.fit_revision = record.fit_revision.saturating_add(1);
+        }
+        self.rebase_fitted_outputs(id);
+        if let Some((_, _, Some(receipt))) = publication { self.finish_fit_delta(receipt, None); }
+        self.set_ball_owner(id, OWNER_UNOWNED);
+        self.drones.get_mut(&id).unwrap().record.owner = OWNER_UNOWNED;
         self.notify_pilot(d.owner, "OnDroneStateChange", crate::services::effects::notify::drone_state(id, None, None, DRONE_STATE_IDLE, d.spec.type_id, None, None));
         self.notify_pilot(d.owner, "OnDroneActivityChange", crate::services::effects::notify::drone_activity(id, None, None));
         self.drone_stop(id);

@@ -1,6 +1,6 @@
 //! Share ledger for corpRegistry share panels in `eve/client/script/ui/services/corporation`.
-//! Uses game corporations, characters, holdings and transfer receipts. Issuance changes,
-//! policy, transactions and notifications are not implemented here.
+//! Uses game corporations, characters, holdings and transfer receipts. Issuance changes go
+//! through the guarded `issue` statement; policy, transactions and notifications are not implemented here.
 use crate::db::{self, executor::Executor};
 
 pub(crate) struct Holding {
@@ -39,6 +39,20 @@ pub(crate) async fn issued_total(ex: &(impl Executor + ?Sized), corp: i64) -> Re
 }
 pub(crate) async fn lock_issuer(ex: &(impl Executor + ?Sized), corp: i64) -> Result<bool, db::Error> {
     Ok(ex.query_opt("SELECT corporation_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted FOR UPDATE", &[&corp]).await?.is_some())
+}
+/// Atomically grow the issued total and the issuer's treasury holding in one statement.
+/// Callers hold the issuer lock. False means the issuer is missing, its issuance was never
+/// initialized, the amount is not positive, or either resulting balance exceeds bigint range.
+pub(crate) async fn issue(ex: &(impl Executor + ?Sized), corp: i64, quantity: i64) -> Result<bool, db::Error> {
+    Ok(ex.execute("WITH issuer AS (UPDATE game.corporations c SET issued_shares = (c.issued_shares::numeric + $2::numeric)::bigint
+            WHERE c.corporation_id = $1 AND NOT c.deleted AND c.issued_shares IS NOT NULL AND $2::bigint > 0
+                AND c.issued_shares::numeric + $2::numeric <= 9223372036854775807::numeric
+                AND COALESCE((SELECT s.shares FROM game.corp_shares s WHERE s.corporation_id = c.corporation_id AND s.shareholder_id = c.corporation_id), 0)::numeric + $2::numeric <= 9223372036854775807::numeric
+            RETURNING c.corporation_id)
+        INSERT INTO game.corp_shares (corporation_id, shareholder_id, shares)
+        SELECT i.corporation_id, i.corporation_id, (COALESCE((SELECT s.shares FROM game.corp_shares s WHERE s.corporation_id = i.corporation_id AND s.shareholder_id = i.corporation_id), 0)::numeric + $2::numeric)::bigint
+        FROM issuer i
+        ON CONFLICT (corporation_id, shareholder_id) DO UPDATE SET shares = EXCLUDED.shares", &[&corp, &quantity]).await? == 1)
 }
 pub(crate) async fn valid_holder(ex: &(impl Executor + ?Sized), holder: i64) -> Result<bool, db::Error> {
     Ok(ex.query_opt("SELECT 1 WHERE EXISTS (SELECT 1 FROM game.characters WHERE character_id = $1 AND NOT deleted) OR EXISTS (SELECT 1 FROM game.corporations WHERE corporation_id = $1 AND NOT deleted)", &[&holder]).await?.is_some())

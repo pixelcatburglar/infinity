@@ -109,4 +109,4 @@ pub(super) fn close(system: &mut System) {
     system.sovereignty.links.inflight = None;
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

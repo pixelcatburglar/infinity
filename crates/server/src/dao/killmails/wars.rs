@@ -31,5 +31,5 @@ pub(crate) async fn killmails(ex: &(impl Executor + ?Sized), war_id: i64) -> Res
     Ok(rows.iter().map(|r| IndexedKillmail { projection: Projection::from_row(r), killmail: Killmail::from_row(r) }).collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-storage"))]
 mod tests;

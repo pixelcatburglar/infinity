@@ -43,6 +43,7 @@ fn burnout_reduces_later_chances_and_burnt_source_still_deals_owed_damage() {
     let source = |module| super::super::SourceSnapshot {
         module, flag, heat: 1.0, master: module, capacity: 1.0,
         attenuation: 1.0, heat_damage: 1.0, generation: Arc::new(AtomicBool::new(false)),
+        reset_epoch: 0, sampled_at: 0,
     };
     let sources = [source(1), source(2)];
     let mut damage = [

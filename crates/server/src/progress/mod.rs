@@ -1,18 +1,21 @@
 //! Durable progress event registration and delivery.
 //! The client does not consume this journal; Lua observes committed source events.
 //! Domain-specific progress consumers and retention are not provided here.
-//! Polling is scoped to registered durable keys. After successful startup
-//! reconciliation this does not exclude any enabled production subscription.
+//! Enabled durable subscriptions are reconciled once at startup into an
+//! immutable projection; receipt creation and polling use only that snapshot,
+//! so a database `enabled` change applies at the next restart. A receipt whose
+//! consumer keeps rejecting it permanently turns terminal and stays recorded
+//! until an operator reschedules it; see docs/database.md.
 
 pub(crate) mod codec;
 pub(crate) mod migration;
 
 use std::{collections::HashSet, future::Future};
 use crate::{db::{outbox::Outbox, transaction::TxFuture}, lua::events::GameEvent, sde::Sde, services::CallError};
-use tokio_postgres::Transaction;
+use crate::db::Transaction;
 
 pub(crate) type LiveHandler = fn(&GameEvent);
-pub(crate) type DurableHandler = for<'a, 'tx> fn(&'a Transaction<'tx>, &'a mut Outbox, &'a Sde, &'a EventEnvelope) -> TxFuture<'a, (), CallError>;
+pub(crate) type DurableHandler = for<'a, 'tx> fn(&'a Transaction<'tx>, &'a mut Outbox, &'a Sde, &'a EventEnvelope) -> TxFuture<'a, (), ApplyError>;
 
 #[derive(Clone, Copy)]
 pub(crate) struct DurableRegistration {
@@ -32,7 +35,7 @@ pub(crate) struct ContentProgressResources {
     pub policies: crate::lua::RetainedPolicies,
 }
 
-pub(crate) type PrepareDelivery = fn(ContentProgressResources, DeliveryKey) -> std::pin::Pin<Box<dyn Future<Output = Result<PrepareOutcome, CallError>> + Send>>;
+pub(crate) type PrepareDelivery = fn(ContentProgressResources, DeliveryKey) -> std::pin::Pin<Box<dyn Future<Output = Result<PrepareOutcome, ApplyError>> + Send>>;
 pub(crate) enum PrepareOutcome { Ready(std::sync::Arc<dyn PreparedDelivery>), AlreadyApplied }
 pub(crate) trait PreparedDelivery: Send + Sync {
     fn key(&self) -> &DeliveryKey;
@@ -42,13 +45,28 @@ pub(crate) trait PreparedDelivery: Send + Sync {
     fn apply<'a, 'tx>(&'a self, tx: &'a Transaction<'tx>, outbox: &'a mut Outbox, sde: &'a Sde, event: &'a EventEnvelope) -> TxFuture<'a, (), ApplyError>;
 }
 
+/// The classified result of applying one receipt: `Reprepare` and `Call` are
+/// transient and retry with bounded backoff, `Permanent` consumes the receipt's
+/// capped rejection budget until it turns `Terminal`, and `Terminal` reports a
+/// receipt already terminal rather than a new failure.
 #[derive(Debug)]
-pub(crate) enum ApplyError { Reprepare, Call(CallError) }
+pub(crate) enum ApplyError { Reprepare, Call(CallError), Permanent(CallError), Terminal }
 impl From<CallError> for ApplyError { fn from(error: CallError) -> Self { Self::Call(error) } }
 impl From<crate::db::Error> for ApplyError { fn from(error: crate::db::Error) -> Self { Self::Call(error.into()) } }
 impl crate::db::transaction::TransactionError for ApplyError {
     fn is_retryable_transaction(&self) -> bool {
-        match self { Self::Reprepare => false, Self::Call(error) => crate::db::transaction::TransactionError::is_retryable_transaction(error) }
+        match self { Self::Call(error) => crate::db::transaction::TransactionError::is_retryable_transaction(error), _ => false }
+    }
+}
+impl ApplyError {
+    /// Fold a non-reprepare apply failure back into its call error; `Reprepare`
+    /// and `Terminal` have no call error and surface as explicit internal faults.
+    pub(crate) fn into_call(self) -> CallError {
+        match self {
+            Self::Call(error) | Self::Permanent(error) => error,
+            Self::Reprepare => CallError::Internal(anyhow::anyhow!("progress apply required repreparation")),
+            Self::Terminal => CallError::Internal(anyhow::anyhow!("progress receipt is terminal")),
+        }
     }
 }
 #[derive(Clone, Copy)]
@@ -62,9 +80,11 @@ impl std::fmt::Display for RegisterError {
 impl std::error::Error for RegisterError {}
 #[derive(Clone)]
 pub struct Registry {
-    live: Vec<LiveHandler>,
-    durable: Vec<DurableRegistration>,
-    durable_keys: std::sync::Arc<[&'static str]>,
+    live: std::sync::Arc<[LiveHandler]>,
+    durable: std::sync::Arc<[DurableRegistration]>,
+    enabled_keys: std::sync::Arc<[&'static str]>,
+    subscription_consumers: std::sync::Arc<[&'static str]>,
+    subscription_kinds: std::sync::Arc<[&'static str]>,
 }
 pub struct AfterCommitHandle {
     state: std::sync::Arc<std::sync::Mutex<AfterCommitState>>,
@@ -87,10 +107,7 @@ impl AfterCommitHandle {
             Ok(state) => state,
             Err(_) => panic!("after-commit publication handle still referenced"),
         };
-        let AfterCommitState { registry, actions } = match state.into_inner() {
-            Ok(state) => state,
-            Err(_) => panic!("after-commit publication lock poisoned"),
-        };
+        let AfterCommitState { registry, actions } = crate::poison::lock_or_exit(state.into_inner());
         for action in actions {
             match action {
                 AfterCommitAction::Event(event) => registry.publish_committed(&event),
@@ -113,15 +130,54 @@ impl Registry {
                 }
             }
         }
-        let durable_keys = durable.iter().map(|r| r.consumer_key).collect();
-        Ok(Self { live, durable, durable_keys })
+        Ok(Self {
+            live: live.into(), durable: durable.into(),
+            enabled_keys: std::sync::Arc::default(),
+            subscription_consumers: std::sync::Arc::default(),
+            subscription_kinds: std::sync::Arc::default(),
+        })
+    }
+    /// Install the immutable enabled projection read back by startup
+    /// reconciliation. Every declared consumer must have a row whose kind set
+    /// equals the code declaration; only enabled consumers enter the
+    /// projections, borrowing the declaration strings once.
+    pub(crate) fn with_subscriptions(mut self, rows: &[crate::dao::progress::SubscriptionRow]) -> Result<Self, RegisterError> {
+        let mut enabled_keys = Vec::new();
+        let mut consumers = Vec::new();
+        let mut kinds = Vec::new();
+        for registration in self.durable.iter() {
+            let Some(row) = rows.iter().find(|row| row.consumer_key == registration.consumer_key) else {
+                return Err(RegisterError(format!("missing subscription row for {}", registration.consumer_key)));
+            };
+            if row.kinds.len() != registration.kinds.len()
+                || !registration.kinds.iter().all(|kind| row.kinds.iter().any(|stored| stored.as_str() == *kind)) {
+                return Err(RegisterError(format!("subscription kinds for {} do not match the declared set", registration.consumer_key)));
+            }
+            if row.enabled {
+                enabled_keys.push(registration.consumer_key);
+                for kind in registration.kinds {
+                    consumers.push(registration.consumer_key);
+                    kinds.push(*kind);
+                }
+            }
+        }
+        self.enabled_keys = enabled_keys.into();
+        self.subscription_consumers = consumers.into();
+        self.subscription_kinds = kinds.into();
+        Ok(self)
+    }
+    /// Enabled consumer keys of the installed projection.
+    pub(crate) fn enabled_keys(&self) -> &[&str] { &self.enabled_keys }
+    /// Paired (consumer, kind) projection borrowed from the declarations.
+    pub(crate) fn subscription_arrays(&self) -> (&[&str], &[&str]) {
+        (&self.subscription_consumers, &self.subscription_kinds)
     }
     pub(crate) fn durable(&self) -> &[DurableRegistration] { &self.durable }
     pub(crate) fn registration(&self, key: &str) -> Option<&DurableRegistration> {
         self.durable.iter().find(|r| r.consumer_key == key)
     }
     pub(crate) fn publish_committed(&self, event: &GameEvent) {
-        for handler in &self.live {
+        for handler in self.live.iter() {
             if std::panic::catch_unwind(|| handler(event)).is_err() {
                 tracing::warn!(kind = event.kind(), "progress observer panicked");
             }
@@ -129,7 +185,14 @@ impl Registry {
     }
 }
 impl Default for Registry {
-    fn default() -> Self { Self { live: Vec::new(), durable: Vec::new(), durable_keys: std::sync::Arc::default() } }
+    fn default() -> Self {
+        Self {
+            live: std::sync::Arc::default(), durable: std::sync::Arc::default(),
+            enabled_keys: std::sync::Arc::default(),
+            subscription_consumers: std::sync::Arc::default(),
+            subscription_kinds: std::sync::Arc::default(),
+        }
+    }
 }
 
 pub(crate) fn publish_live(registry: &Registry, event: &GameEvent) {
@@ -138,6 +201,7 @@ pub(crate) fn publish_live(registry: &Registry, event: &GameEvent) {
     }
 }
 
+#[derive(PartialEq)]
 pub(crate) struct EventEnvelope {
     pub event_id: String,
     pub event: GameEvent,
@@ -180,17 +244,21 @@ pub(crate) async fn apply_once_tx(
                 return match crate::dao::progress::delivery(tx, &key).await? {
                     crate::dao::progress::DeliveryState::Applied => Ok(ApplyOutcome::AlreadyApplied),
                     crate::dao::progress::DeliveryState::Pending(_) => Ok(ApplyOutcome::NotClaimed),
+                    crate::dao::progress::DeliveryState::Terminal => Err(ApplyError::Terminal),
                     crate::dao::progress::DeliveryState::Missing => Err(CallError::Internal(anyhow::anyhow!("progress delivery does not exist")).into()),
                 };
             }
         }
         _ => return Err(CallError::Internal(anyhow::anyhow!("progress delivery mode or key mismatch")).into()),
     }
-    let Some(event) = crate::dao::progress::lock_pending(tx, &key).await? else {
-        return Ok(ApplyOutcome::AlreadyApplied);
+    let event = match crate::dao::progress::lock_delivery(tx, &key).await? {
+        crate::dao::progress::DeliveryState::Pending(event) => event,
+        crate::dao::progress::DeliveryState::Applied => return Ok(ApplyOutcome::AlreadyApplied),
+        crate::dao::progress::DeliveryState::Terminal => return Err(ApplyError::Terminal),
+        crate::dao::progress::DeliveryState::Missing => return Err(CallError::Internal(anyhow::anyhow!("progress delivery does not exist")).into()),
     };
     let applied = match (registration.mode, prepared) {
-        (DeliveryMode::Direct(handler), None) => handler(tx, outbox, sde, &event).await.map_err(ApplyError::Call),
+        (DeliveryMode::Direct(handler), None) => handler(tx, outbox, sde, &event).await,
         (DeliveryMode::Prepared(_), Some(plan)) => plan.apply(tx, outbox, sde, &event).await,
         _ => unreachable!(),
     };
@@ -241,10 +309,11 @@ pub trait AfterCommit: Send {
     fn after_commit(&mut self, registry: &Registry, committed: &HashSet<String>) -> AfterCommitHandle;
 }
 
-pub(crate) async fn prepare_batch<O: Prepare>(outbox: &mut O, tx: &Transaction<'_>, invocation: u128) -> Result<HashSet<String>, PrepareError> {
+pub(crate) async fn prepare_batch<O: Prepare>(outbox: &mut O, tx: &Transaction<'_>, invocation: u128, registry: &Registry) -> Result<HashSet<String>, PrepareError> {
     let mut context = PrepareCx { invocation, namespace: None, ordinal: 0, events: Vec::new() };
     outbox.prepare(tx, &mut context).await?;
-    let inserted = crate::dao::progress::insert_batch(tx, &context.events).await?;
+    let (consumers, kinds) = registry.subscription_arrays();
+    let inserted = crate::dao::progress::insert_batch(tx, &context.events, consumers, kinds).await?;
     Ok(inserted.into_iter().filter_map(|(key, _, is_new)| is_new.then_some(key)).collect())
 }
 
@@ -271,7 +340,7 @@ impl AfterCommit for std::convert::Infallible {
 macro_rules! leaf_effect {
     ($type:ty) => {
         impl crate::progress::Prepare for $type {
-            fn prepare<'a, 'tx>(&'a mut self, _: &'a tokio_postgres::Transaction<'tx>, _: &'a mut crate::progress::PrepareCx)
+            fn prepare<'a, 'tx>(&'a mut self, _: &'a crate::db::Transaction<'tx>, _: &'a mut crate::progress::PrepareCx)
                 -> crate::db::transaction::TxFuture<'a, (), crate::progress::PrepareError> {
                 Box::pin(async { Ok(()) })
             }
@@ -296,15 +365,25 @@ pub(crate) fn lua_observer(event: &GameEvent) {
     crate::lua::on_event(event.clone());
 }
 
-pub(crate) async fn reconcile(db: &crate::db::Db) -> Result<(), crate::db::Error> {
+/// Reconcile declared subscriptions, then install the resulting immutable
+/// enabled projection. The snapshot is installed only after the transaction
+/// succeeded; the returned `Db` carries it while the pre-reconcile `Db` keeps
+/// the declaration-only registry.
+pub(crate) async fn reconcile(db: crate::db::Db) -> Result<crate::db::Db, crate::db::Error> {
     let registry = db.progress_registry.clone();
-    db.transaction(
+    let rows = db.transaction(
         |tx, _: &mut ()| {
             let registry = registry.clone();
             Box::pin(async move { crate::dao::progress::reconcile(tx, &registry).await })
         },
-        |(), ()| async { Ok(()) },
-    ).await
+        |rows, ()| async move { Ok(rows) },
+    ).await?;
+    let projected = registry.as_ref().clone().with_subscriptions(&rows)
+        .map_err(|error| crate::db::Error::Progress(anyhow::anyhow!(error.to_string())))?;
+    for row in rows.iter().filter(|row| !row.enabled) {
+        tracing::info!(consumer = %row.consumer_key, "progress consumer disabled");
+    }
+    Ok(db.with_progress_registry(projected))
 }
 
 pub(crate) async fn seed(db: &crate::db::Db) -> Result<(), crate::db::Error> {
@@ -315,64 +394,93 @@ pub(crate) async fn seed(db: &crate::db::Db) -> Result<(), crate::db::Error> {
     Ok(())
 }
 
+/// Record one failed delivery pass after the apply transaction returned;
+/// only an update that actually turned the receipt terminal warns once.
+async fn record_failure(
+    db: &crate::db::Db, attempt: &crate::dao::progress::DeliveryAttempt,
+    error: ApplyError, permanent_retry_limit: i32,
+) -> Result<(), crate::db::Error> {
+    let permanent = matches!(error, ApplyError::Permanent(_));
+    if let Some(update) = crate::dao::progress::failed(
+        db, attempt, crate::client::filetime_now(), &format!("{error:?}"),
+        permanent, permanent_retry_limit,
+    ).await? {
+        if update.terminal {
+            tracing::warn!(consumer = %attempt.key.consumer_key, event_id = %attempt.key.event_id,
+                attempts = update.attempts, permanent_rejections = update.permanent_rejections,
+                permanent_retry_limit, ?error, "progress delivery terminal");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn drain(db: crate::db::Db, world: std::sync::Arc<crate::space::World>, _: crate::scheduler::Job)
     -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
     Box::pin(async move {
-        let due = crate::dao::progress::due(&db, crate::client::filetime_now(), DRAIN_BATCH, &db.progress_registry().durable_keys).await?;
-        for key in due {
+        let permanent_retry_limit = crate::config::game().progress.permanent_retry_limit;
+        let due = crate::dao::progress::due(&db, crate::client::filetime_now(), DRAIN_BATCH, db.progress_registry().enabled_keys()).await?;
+        for attempt in due {
+            let key = &attempt.key;
             let registration = db.progress_registry().registration(&key.consumer_key).copied()
                 .ok_or_else(|| anyhow::anyhow!("missing progress consumer {}", key.consumer_key))?;
-            let sde = world.sde().clone();
-            let plan = match registration.mode {
-                DeliveryMode::Direct(_) => Ok(None),
-                DeliveryMode::Prepared(prepare) => {
-                    let resources = crate::lua::retained_policies().map(|policies| ContentProgressResources {
-                        db: db.clone(), sde: sde.clone(), world: world.clone(), policies,
-                    });
-                    match resources {
-                        Err(error) => Err(error),
-                        Ok(resources) => match prepare(resources, key.clone()).await {
-                            Ok(PrepareOutcome::Ready(plan)) => Ok(Some(plan)),
-                            Ok(PrepareOutcome::AlreadyApplied) => match crate::dao::progress::delivery(&db, &key).await {
-                                Ok(crate::dao::progress::DeliveryState::Applied) => continue,
-                                Ok(_) => Err(CallError::Internal(anyhow::anyhow!("unproven applied progress delivery"))),
-                                Err(error) => Err(error.into()),
-                            },
+            crate::runtime_watchdog::watch("progress", registration.consumer_key, async {
+                let sde = world.sde().clone();
+                let plan = match registration.mode {
+                    DeliveryMode::Direct(_) => Ok(None),
+                    DeliveryMode::Prepared(prepare) => {
+                        let resources = crate::lua::retained_policies().map(|policies| ContentProgressResources {
+                            db: db.clone(), sde: sde.clone(), world: world.clone(), policies,
+                        }).map_err(ApplyError::Call);
+                        match resources {
                             Err(error) => Err(error),
-                        },
+                            Ok(resources) => match prepare(resources, key.clone()).await {
+                                Ok(PrepareOutcome::Ready(plan)) => Ok(Some(plan)),
+                                Ok(PrepareOutcome::AlreadyApplied) => match crate::dao::progress::delivery(&db, key).await {
+                                    Ok(crate::dao::progress::DeliveryState::Applied) => return Ok(()),
+                                    Ok(crate::dao::progress::DeliveryState::Terminal) => return Ok(()),
+                                    Ok(_) => Err(ApplyError::Call(CallError::Internal(anyhow::anyhow!("unproven applied progress delivery")))),
+                                    Err(error) => Err(error.into()),
+                                },
+                                Err(error) => Err(error),
+                            },
+                        }
+                    }
+                };
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(ApplyError::Terminal) => return Ok(()),
+                    Err(error) => {
+                        record_failure(&db, &attempt, error, permanent_retry_limit).await?;
+                        return Ok(());
+                    }
+                };
+                let dispatch_world = world.clone();
+                let result: Result<(), ApplyError> = db.transaction(
+                    |tx, outbox: &mut Outbox| {
+                        let key = key.clone();
+                        let sde = sde.clone();
+                        let plan = plan.clone();
+                        Box::pin(async move {
+                            if matches!(registration.mode, DeliveryMode::Direct(_))
+                                && !crate::dao::progress::try_claim(tx, &key, crate::client::filetime_now()).await? {
+                                return Ok(());
+                            }
+                            apply_once_tx(tx, outbox, &sde, &registration, key, plan.as_deref(), ClaimMode::Background).await?;
+                            Ok(())
+                        })
+                    },
+                    |(), outbox| async move { crate::db::outbox::dispatch_world((), outbox, &dispatch_world).map_err(ApplyError::Call) },
+                ).await;
+                if let Err(error) = result {
+                    if !matches!(error, ApplyError::Terminal) {
+                        record_failure(&db, &attempt, error, permanent_retry_limit).await?;
                     }
                 }
-            };
-            let plan = match plan {
-                Ok(plan) => plan,
-                Err(error) => {
-                    crate::dao::progress::failed(&db, &key, crate::client::filetime_now(), &format!("{error:?}")).await?;
-                    continue;
-                }
-            };
-            let dispatch_world = world.clone();
-            let result: Result<(), ApplyError> = db.transaction(
-                |tx, outbox: &mut Outbox| {
-                    let key = key.clone();
-                    let sde = sde.clone();
-                    let plan = plan.clone();
-                    Box::pin(async move {
-                        if matches!(registration.mode, DeliveryMode::Direct(_))
-                            && !crate::dao::progress::try_claim(tx, &key, crate::client::filetime_now()).await? {
-                            return Ok(());
-                        }
-                        apply_once_tx(tx, outbox, &sde, &registration, key, plan.as_deref(), ClaimMode::Background).await?;
-                        Ok(())
-                    })
-                },
-                |(), outbox| async move { crate::db::outbox::dispatch_world((), outbox, &dispatch_world).map_err(ApplyError::Call) },
-            ).await;
-            if let Err(error) = result {
-                crate::dao::progress::failed(&db, &key, crate::client::filetime_now(), &format!("{error:?}")).await?;
-            }
+                Ok::<(), anyhow::Error>(())
+            }).await?;
         }
         Ok(())
     })
 }
 
-#[cfg(test)] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-content", feature = "tests-economy", feature = "tests-gateway", feature = "tests-lua", feature = "tests-skills", feature = "tests-storage")))] pub(crate) mod tests;

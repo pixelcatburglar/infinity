@@ -15,7 +15,7 @@ fn grouping_preserves_exact_slices_and_historical_dimensions() {
     assert!(group(vec![bad]).is_err());
 }
 
-async fn insert(tx: &tokio_postgres::Transaction<'_>, character: i64, time: i64, corp: i64) -> Result<i64, CallError> {
+async fn insert(tx: &crate::db::Transaction<'_>, character: i64, time: i64, corp: i64) -> Result<i64, CallError> {
     Ok(tx.query_one("INSERT INTO game.character_mining_ledger (character_id,event_time,solar_system_id,type_id,quantity,quantity_wasted,progress_aggregated,source_ship_id,source_ship_type_id,corporation_id,resource_kind,unit_volume_m3) VALUES ($1,$2,8,9,2,0,false,10,11,$3,'ore',1.5) RETURNING log_id", &[&character, &time, &corp]).await.map_err(db_err)?.get("log_id"))
 }
 

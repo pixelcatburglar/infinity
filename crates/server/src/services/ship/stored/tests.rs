@@ -7,6 +7,8 @@ use infinity_core::consts::dogma::{ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEV
 use crate::dao::items::{creation, loading::{load_items, ItemQuery}, ship_configuration::{self, Patch}, space_ships::FreeShip};
 use crate::services::{Call, CallResult, drones::tests::fixture::Fixture};
 use marshal::Value;
+use crate::dao::items::parent_locks::tests::character_before_items;
+use crate::tests::catch_scenario;
 
 struct BayFixture {
     f: Fixture,
@@ -47,10 +49,13 @@ impl BayFixture {
         f.world.set_online_session(f.owner, Some(online));
         let row = FreeShip { item_id: old, type_id: kind, owner_id: f.owner, corporation_id: 1, alliance_id: -1, pos };
         let pilot = super::super::balls::piloted(&f.db, f.sde.clone(), &row, f.owner, 0.0).await.unwrap();
+        let active_radius = f64::from(pilot.ball.radius);
         f.world.with(f.system, move |s| pilot.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
         f.world.observe(f.system, f.client.login.client_id, old, f.client.destiny_tx.clone()).await.unwrap();
-        let host = creation::positioned(&f.db, host_kind, host_owner, f.system, pos).await.unwrap();
-        let row = FreeShip { item_id: host, type_id: host_kind, owner_id: host_owner, corporation_id: 1, alliance_id: -1, pos };
+        // Host sits stopped at a non-overlapping positive surface gap inside maintenance range.
+        let host_pos = [active_radius + f64::from(super::super::balls::radius(&f.sde, host_kind).unwrap()) + 500.0, 0.0, 0.0];
+        let host = creation::positioned(&f.db, host_kind, host_owner, f.system, host_pos).await.unwrap();
+        let row = FreeShip { item_id: host, type_id: host_kind, owner_id: host_owner, corporation_id: 1, alliance_id: -1, pos: host_pos };
         let ball = super::super::balls::unpiloted(&f.db, f.sde.clone(), &row).await.unwrap();
         f.world.with(f.system, move |s| ball.install(s, |s, ball| s.add_persistent_ship(ball))).await.unwrap();
         f.db.transaction(|tx, _: &mut ()| Box::pin(async move {
@@ -76,6 +81,11 @@ impl BayFixture {
         drop(market);
         let fixture = Self { f, host, host_owner, host_pilot, kind, notices: Vec::new() };
         assert!(active_armor_hull(&fixture, fixture.f.ship).await.is_some(), "live actor condition");
+        let motionless = fixture.f.world.with(fixture.f.system, move |s| [fixture.f.ship, fixture.host].iter()
+            .all(|&id| s.ball(id).is_some_and(|b| b.mode == crate::space::MODE_STOP && b.vel == [0.0; 3]))).await.unwrap();
+        let gap = surface_gap(&fixture, fixture.f.ship, fixture.host).await;
+        assert!(motionless && gap > 0.0 && gap <= infinity_core::consts::MAX_CARGO_CONTAINER_TRANSFER_DISTANCE,
+            "fixture hulls must be stopped inside maintenance range: motionless={motionless} gap={gap}");
         fixture
     }
 
@@ -176,6 +186,25 @@ async fn replace_ball_preserving_condition(f: &BayFixture, ball: crate::space::B
     }).await.unwrap();
 }
 
+/// Sampled surface gap between two live balls at the actor's current clock.
+async fn surface_gap(b: &BayFixture, x: i64, y: i64) -> f64 {
+    b.f.world.with(b.f.system, move |s| {
+        let (x, y) = (s.ball(x).unwrap(), s.ball(y).unwrap());
+        crate::space::dist(x.position_at(s.now_ms()), y.position_at(s.now_ms()))
+            - f64::from(x.radius) - f64::from(y.radius)
+    }).await.unwrap()
+}
+
+/// Clone a ball with stopped kinematics for condition-preserving replacement.
+fn stopped(mut ball: crate::space::Ball) -> crate::space::Ball {
+    ball.stop();
+    ball.vel = [0.0; 3];
+    ball.old_vel = [0.0; 3];
+    ball.old_pos = ball.pos;
+    ball.segment_acceleration = None;
+    ball
+}
+
 async fn row(f: &BayFixture, id: i64) -> crate::dao::items::loading::GameItem {
     load_items(&f.f.db, ItemQuery::Id(id)).await.unwrap().pop().expect("item row")
 }
@@ -211,62 +240,68 @@ async fn assert_cargo(f: &BayFixture, id: i64, ship: i64, owner: i64) {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn store_switches_to_capsule_and_removes_stored_world_hull() {
     let mut b = BayFixture::new().await;
-    let old = b.f.ship;
-    let host = b.host;
-    let content = cargo(&b, old, b.f.owner).await;
-    state(b.call("StoreVessel", &[Value::Int(host)]).await.unwrap());
+    let result = catch_scenario(async {
+    let (old, host, owner, db) = (b.f.ship, b.host, b.f.owner, b.f.db.clone());
+    let content = cargo(&b, old, owner).await;
+    state(character_before_items(&db, owner, &[old, host], async { b.call("StoreVessel", &[Value::Int(host)]).await.unwrap() }).await);
     let capsule = b.f.client.session.int("shipid").unwrap();
     assert_ne!(capsule, old);
     let saved = row(&b, old).await;
-    assert_eq!((saved.owner_id, saved.location_id, saved.flag_id, saved.singleton, saved.quantity), (b.f.owner, host, FLAG_SHIP_HANGAR, true, 1));
+    assert_eq!((saved.owner_id, saved.location_id, saved.flag_id, saved.singleton, saved.quantity), (owner, host, FLAG_SHIP_HANGAR, true, 1));
     assert_eq!(row(&b, capsule).await.type_id, TYPE_CAPSULE);
     assert!(b.f.world.ball(b.f.system, old).await.is_none());
-    assert_cargo(&b, content, old, b.f.owner).await;
+    assert_cargo(&b, content, old, owner).await;
     assert!(crate::dao::items::dogma::overrides(&b.f.db, old).await.unwrap().iter().any(|a| a.attribute_id == infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE && a.value == 1.0));
     selected(&b, capsule).await;
+    }).await;
     b.cleanup().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn board_stored_takes_hull_and_retains_previous_unpiloted() {
     let mut b = BayFixture::new().await;
-    let old = b.f.ship;
-    let host = b.host;
+    let result = catch_scenario(async {
+    let (old, host, owner, db) = (b.f.ship, b.host, b.f.owner, b.f.db.clone());
     let target = b.stored(b.host_owner).await;
     let content = cargo(&b, target, b.host_owner).await;
     assert!(crate::dao::items::dogma::set_override(&b.f.db, target, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE, 1.0).await.unwrap());
-    state(b.call("BoardStoredShip", &[Value::Int(host), Value::Int(target)]).await.unwrap());
+    state(character_before_items(&db, owner, &[old, host, target], async { b.call("BoardStoredShip", &[Value::Int(host), Value::Int(target)]).await.unwrap() }).await);
     let item = row(&b, target).await;
-    assert_eq!((item.owner_id, item.location_id, item.flag_id), (b.f.owner, b.f.system, 0));
-    assert_cargo(&b, content, target, b.f.owner).await;
+    assert_eq!((item.owner_id, item.location_id, item.flag_id), (owner, b.f.system, 0));
+    assert_cargo(&b, content, target, owner).await;
     assert!(crate::dao::items::dogma::overrides(&b.f.db, target).await.unwrap().iter().any(|a| a.attribute_id == infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE && a.value == 1.0));
     let old_ball = b.f.world.ball(b.f.system, old).await.unwrap();
     assert_eq!(old_ball.char_id, None);
     assert!(!old_ball.interactive);
     selected(&b, target).await;
+    }).await;
     b.cleanup().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn launch_stored_takes_hull_without_switching_ego() {
     let mut b = BayFixture::new().await;
-    let old = b.f.ship;
-    let host = b.host;
+    let result = catch_scenario(async {
+    let (old, host, owner, db) = (b.f.ship, b.host, b.f.owner, b.f.db.clone());
     let target = b.stored(b.host_owner).await;
     let content = cargo(&b, target, b.host_owner).await;
     assert!(crate::dao::items::dogma::set_override(&b.f.db, target, infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE, 1.0).await.unwrap());
-    assert_eq!(b.call("LaunchFromContainer", &[Value::Int(host), Value::Int(target)]).await.unwrap(), Value::None);
+    assert_eq!(character_before_items(&db, owner, &[old, host, target], async { b.call("LaunchFromContainer", &[Value::Int(host), Value::Int(target)]).await.unwrap() }).await, Value::None);
     let item = row(&b, target).await;
-    assert_eq!((item.owner_id, item.location_id, item.flag_id), (b.f.owner, b.f.system, 0));
-    assert_cargo(&b, content, target, b.f.owner).await;
+    assert_eq!((item.owner_id, item.location_id, item.flag_id), (owner, b.f.system, 0));
+    assert_cargo(&b, content, target, owner).await;
     assert!(crate::dao::items::dogma::overrides(&b.f.db, target).await.unwrap().iter().any(|a| a.attribute_id == infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE && a.value == 1.0));
     let ball = b.f.world.ball(b.f.system, target).await.unwrap();
-    assert_eq!((ball.owner_id, ball.char_id, ball.interactive), (b.f.owner, None, false));
+    assert_eq!((ball.owner_id, ball.char_id, ball.interactive), (owner, None, false));
     assert!(ball.pos.iter().all(|v| v.is_finite()));
     selected(&b, old).await;
+    }).await;
     b.cleanup().await;
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
 
 #[tokio::test]
@@ -334,18 +369,27 @@ async fn stale_binding_hidden_host_and_outside_range_are_atomic() {
         assert_eq!(b.f.client.outbox.len(), queued);
         selected(&b, old).await;
     }
-    let pilot = b.f.world.ball(b.f.system, old).await.unwrap();
-    let original = b.f.world.ball(b.f.system, host).await.unwrap();
-    let mut hidden = original.clone();
-    hidden.cloak = 1;
-    let mut far = original.clone();
-    let distance = infinity_core::consts::MAX_CARGO_CONTAINER_TRANSFER_DISTANCE + f64::from(pilot.radius) + f64::from(far.radius) + 1.0;
-    far.pos = [pilot.pos[0] + distance, pilot.pos[1], pilot.pos[2]];
-    far.old_pos = far.pos;
-    for ball in [hidden, far] {
-        replace_ball_preserving_condition(&b, ball).await;
+    for outside in [false, true] {
+        if !outside {
+            let mut hidden = b.f.world.ball(b.f.system, host).await.unwrap();
+            hidden.cloak = 1;
+            replace_ball_preserving_condition(&b, stopped(hidden)).await;
+        }
         let queued = b.f.client.outbox.len();
         for method in ["StoreVessel", "BoardStoredShip", "LaunchFromContainer"] {
+            if outside {
+                let (pilot, mut far) = b.f.world.with(b.f.system, move |s| {
+                    (s.sampled_ball(old).unwrap(), s.sampled_ball(host).unwrap())
+                }).await.unwrap();
+                far.pos = [pilot.pos[0] + infinity_core::consts::MAX_CARGO_CONTAINER_TRANSFER_DISTANCE
+                    + f64::from(pilot.radius) + f64::from(far.radius) + 500.0, pilot.pos[1], pilot.pos[2]];
+                far.cloak = 0;
+                replace_ball_preserving_condition(&b, stopped(pilot)).await;
+                replace_ball_preserving_condition(&b, stopped(far)).await;
+                assert!(b.f.world.after(b.f.system, 1000).await, "system actor stopped during evolution window");
+                assert!(surface_gap(&b, old, host).await > infinity_core::consts::MAX_CARGO_CONTAINER_TRANSFER_DISTANCE,
+                    "sampled surface gap before {method} is inside maintenance range");
+            }
             let args = if method == "StoreVessel" { vec![Value::Int(host)] } else { vec![Value::Int(host), Value::Int(target)] };
             b.refuse(method, &args, None).await;
             assert_eq!(b.f.client.outbox.len(), queued);
@@ -498,7 +542,7 @@ async fn launch_accepts_exact_surface_range() {
         let pilot_pos = s.sample_position(old).unwrap();
         let distance = infinity_core::consts::MAX_CARGO_CONTAINER_TRANSFER_DISTANCE
             + f64::from(s.ball(old).unwrap().radius) + f64::from(s.ball(host).unwrap().radius);
-        // Coincident fixture hulls separate along X, leaving Y exact for the boundary.
+        // Stopped placement along Y leaves the sampled surface gap at the exact boundary.
         let host_pos = [pilot_pos[0], pilot_pos[1] + distance, pilot_pos[2]];
         s.command(old, move |ball, _, _| {
             ball.stop();

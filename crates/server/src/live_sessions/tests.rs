@@ -22,6 +22,34 @@ async fn replacement_cancels_and_waits_for_completion() {
     timeout(Duration::from_secs(1), second.wait_for_predecessor()).await.unwrap();
     drop(second);
     assert!(!contains(account));
+    // The caller guard's transition loses to no one: whichever reason arrives
+    // first is the one the registry keeps.
+    let account = -81011;
+    let first = register(account, true).unwrap();
+    drop(first.caller_guard());
+    let mut second = register(account, true).unwrap();
+    assert_eq!(*first.cancelled.borrow(), StopReason::CallerDropped);
+    drop(first);
+    timeout(Duration::from_secs(1), second.wait_for_predecessor()).await.unwrap();
+    drop(second);
+    assert!(!contains(account));
+    let first = register(account, true).unwrap();
+    let guard = first.caller_guard();
+    let mut second = register(account, true).unwrap();
+    drop(guard);
+    assert_eq!(*first.cancelled.borrow(), StopReason::Replaced);
+    drop(first);
+    timeout(Duration::from_secs(1), second.wait_for_predecessor()).await.unwrap();
+    drop(second);
+    assert!(!contains(account));
+    let account = -81012;
+    let first = register(account, true).unwrap();
+    first.record_cleanup(true, true);
+    let mut second = register(account, true).unwrap();
+    still_waiting(&mut second).await;
+    drop(first);
+    timeout(Duration::from_secs(1), second.wait_for_predecessor()).await.unwrap();
+    drop(second);
 }
 
 #[tokio::test]

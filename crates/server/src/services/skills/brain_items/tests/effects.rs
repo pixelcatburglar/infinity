@@ -27,6 +27,8 @@ async fn real_activation_draws_select_penalty_in_fit_and_brain_traversal() {
     db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&other.character, &STATION]).await.unwrap();
     let now = filetime_now();
     let mut exercised = false;
+    let mut recipient = None;
+    let scenario = crate::tests::catch_scenario(async {
     'types: for data in c.sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_IMPLANT) && t.group_id == Some(GROUP_BOOSTER)
         && t.attribute(ATTR_BOOSTERNESS).is_some_and(|v| v > 0.0 && v.fract() == 0.0)
         && t.attribute(ATTR_BOOSTER_DURATION).is_some_and(|v| v > 0.0 && v.is_finite())
@@ -47,9 +49,24 @@ async fn real_activation_draws_select_penalty_in_fit_and_brain_traversal() {
                 let a = item(&db, selected.character, data.type_id, STATION, 1).await;
                 let b = item(&db, other.character, data.type_id, STATION, 1).await;
                 for id in [a, b] { db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,10)", &[&id, &modifier.modifying]).await.unwrap(); }
-                let on = candidates(&c.sde, data.type_id).into_iter().map(|(id, _)| (id, if id == effect_id { 0.0 } else { 0.999999999999 })).collect();
+                let on: Vec<_> = candidates(&c.sde, data.type_id).into_iter().map(|(id, _)| (id, if id == effect_id { 0.0 } else { 0.999999999999 })).collect();
                 let off = candidates(&c.sde, data.type_id).into_iter().map(|(id, _)| (id, 0.999999999999)).collect();
-                let left = activate(&db, &c.sde, selected.character, a, Some(STATION), now, true, on).await;
+                crate::dao::characters::selection::set_ship(&db, selected.character, ship_a).await.unwrap();
+                let world = crate::space::World::new(db.clone(), c.sde.clone(), 1);
+                recipient = Some(crate::services::tests::fixture::LiveRecipient::cold(&world, selected.character, None, &_market).await);
+                let live = recipient.as_ref().unwrap();
+                let fences = crate::services::effects::online::capture_online_fences(&world, &[selected.character]).await;
+                let dispatch_world = &world;
+                let left = db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
+                    let sde = c.sde.clone();
+                    let draws = on.clone();
+                    let fences = fences.clone();
+                    Box::pin(async move {
+                        activate_tx(tx, outbox, &sde, &fences, selected.character, None, a, Some(STATION), now, &draws, true).await
+                    })
+                }, |value, outbox| async move {
+                    Ok((value, crate::services::tests::fixture::collected_notifications(outbox, dispatch_world)))
+                }).await;
                 let right = activate(&db, &c.sde, other.character, b, Some(STATION), now, true, off).await;
                 if left.is_ok() && right.is_ok() {
                     let la = brain::get(&db, selected.character, a).await.unwrap().unwrap();
@@ -65,14 +82,39 @@ async fn real_activation_draws_select_penalty_in_fit_and_brain_traversal() {
                     let wire_yes = wire_contains(&yes, selected.character, data.type_id, modifier.modified, modifier.op);
                     let wire_no = wire_contains(&no, other.character, data.type_id, modifier.modified, modifier.op);
                     if selected_id && unselected_id && changed && wire_yes && !wire_no { assert!(present && absent); exercised = true; }
+                    if exercised {
+                        let (ty, modified, op) = (data.type_id, modifier.modified, modifier.op);
+                        let expected = (yes.value(Key::Ship, modified), wire_yes);
+                        assert_eq!(live.read(move |fit|
+                            (fit.value(Key::Ship, modified), wire_contains(fit, selected.character, ty, modified, op))).await, expected);
+                        let metadata = (la.activated_at, la.expires_at, la.effect_ids);
+                        assert!(metadata.2.as_ref().is_some_and(|ids| !ids.is_empty() && ids.contains(&effect_id)));
+                        for _ in 0..2 {
+                            assert_eq!(live.read(move |fit| {
+                                let inputs = fit.character_inputs();
+                                let row = &inputs.brain.iter().find(|row| row.item.item_id == a).expect("selected booster").item;
+                                (row.activated_at, row.expires_at, row.effect_ids.clone())
+                            }).await, metadata);
+                        }
+                    }
                 }
+                recipient.take().unwrap().close().await;
+                db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&selected.character]).await.unwrap();
                 for id in [a, b, ship_a, ship_b] { db.execute("DELETE FROM game.items WHERE item_id=$1", &[&id]).await.unwrap(); }
                 for character in [selected.character, other.character] { crate::scheduler::cancel(&db, &format!("{}:{character}", completion::KIND)).await.unwrap(); }
                 if exercised { break 'types; }
             }
         }
     }
+    }).await;
+    if let Some(live) = recipient {
+        live.close().await;
+    }
+    db.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&selected.character]).await.unwrap();
     cleanup(&db, other).await;
     cleanup(&db, selected).await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
     assert!(exercised, "test SDE has no applicable chance modifier with distinct real activation outcomes");
 }

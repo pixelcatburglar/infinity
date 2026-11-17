@@ -3,9 +3,12 @@
 //! The client binds one `agentMgr` moniker per agent (eveMoniker.GetAgent) and talks
 //! through `DoAction(actionID) -> ((agentSays, [(actionID, button)]), lastActionInfo)`,
 //! then renders the briefing (GetMissionBriefingInfo), objectives
-//! (GetMissionObjectiveInfo) and journal bookmarks (GetMyJournalDetails).
-//!
-//! Agents come from the retail agent list (crate::retail). Basic agents offer the
+//! (GetMissionObjectiveInfo) and journal bookmarks (GetMyJournalDetails). Offers
+//! freeze the integer gross ISK and LP on the mission row: Negotiation scales the
+//! ISK quote and the issuing agent's division (Distribution, Mining, Security)
+//! scales the LP quote; acceptance and in-flight offers are never repriced, and
+//! completion pays the saved amounts.
+//! Agents come from the retail agent list (infinity_content::retail). Basic agents offer the
 //! shared SDE's kill missions whose dungeon difficulty matches the agent's level.
 //! `GetDisabledMissions` returns an empty list. Agent info uses the retail agent
 //! list; unbound or non-agent info requests return None.
@@ -33,7 +36,7 @@ mod sites;
 use mechanics::*;
 pub(crate) use gm::force_complete;
 use sites::{despawn, ensure_site, objective_done};
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 use sites::{group_has_class, spawn_classes};
 use super::{combat, inventory, items, off_surface, ship, site_position, standings};
 
@@ -86,6 +89,9 @@ pub(super) static NEXT_NPC_ID: AtomicI64 = AtomicI64::new(9_000_000_000_000);
 pub struct Agent {
     pub id: i64,
     pub type_id: i64,
+    /// The agent's NPC division (retail `divisionID`): it picks the LP Connections
+    /// skill applied to its offers' reward quote.
+    pub division_id: i64,
     pub level: i64,
     pub station_id: i64,
     pub system_id: i64,
@@ -99,11 +105,11 @@ fn agents() -> &'static HashMap<i64, Agent> {
     static AGENTS: OnceLock<HashMap<i64, Agent>> = OnceLock::new();
     AGENTS.get_or_init(|| {
         let mut out = HashMap::new();
-        let Some(Value::Instance(_, state)) = crate::retail::cached_call("agentMgr", "GetAgents", &[]) else { return out };
+        let Some(Value::Instance(_, state)) = infinity_content::retail::cached_call("agentMgr", "GetAgents", &[]) else { return out };
         for line in state.get("lines").and_then(|l| l.items()).unwrap_or_default() {
             let Some(f) = line.items() else { continue };
             let n = |i: usize| f.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-            out.insert(n(0), Agent { id: n(0), type_id: n(1), level: n(3), station_id: n(4), system_id: n(10), corp_id: n(6), faction_id: n(9) });
+            out.insert(n(0), Agent { id: n(0), type_id: n(1), division_id: n(2), level: n(3), station_id: n(4), system_id: n(10), corp_id: n(6), faction_id: n(9) });
         }
         out
     })
@@ -207,4 +213,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

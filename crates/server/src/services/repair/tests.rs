@@ -1,18 +1,35 @@
 use super::*;
-use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_SUBSYSTEM, FLAG_CARGO, FLAG_HI_SLOT_FIRST, FLAG_RIG_FIRST, FLAG_SUBSYSTEM_FIRST, GM_ROLES};
-use infinity_core::consts::dogma::{ATTR_ARMOR_HP, ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_HEAT_HI, ATTR_HEAT_LOW, ATTR_HEAT_MED, ATTR_MASS, ATTR_RECHARGE_RATE, ATTR_SHIELD_RECHARGE_RATE, ATTR_STRUCTURE_HP};
-use crate::config::deployment::DatabaseConfig;
-use crate::db::Db;
-use crate::services::{tests::fixture, value_field, wallets, Call};
+#[cfg(feature = "tests-ships")] use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_SUBSYSTEM, FLAG_CARGO, FLAG_HI_SLOT_FIRST, FLAG_RIG_FIRST, FLAG_SUBSYSTEM_FIRST, GM_ROLES};
+#[cfg(feature = "tests-ships")] use infinity_core::consts::dogma::{ATTR_ARMOR_HP, ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_HEAT_HI, ATTR_HEAT_LOW, ATTR_HEAT_MED, ATTR_MASS, ATTR_RECHARGE_RATE, ATTR_SHIELD_RECHARGE_RATE, ATTR_STRUCTURE_HP};
+#[cfg(feature = "tests-ships")] use crate::config::deployment::DatabaseConfig;
+#[cfg(feature = "tests-ships")] use crate::db::Db;
+#[cfg(feature = "tests-ships")] use crate::services::{tests::fixture, value_field, wallets, Call};
 use crate::space::World;
-use crate::tests::init_config;
+#[cfg(feature = "tests-ships")] use crate::tests::init_config;
 
+#[cfg(feature = "tests-ships")] mod space;
+
+#[cfg(any(feature = "tests-ships", feature = "tests-effects"))]
+/// Queue the production publication after the fixture's module writes commit.
+/// The caller holds the market guard and releases it before awaiting the receiver.
+pub(in crate::services) fn queue_space_heal(
+    world: &World, expected: infinity_core::session::OnlineSession, generation: u64,
+    actor_gate: Arc<tokio::sync::Mutex<()>>, modules: &[i64],
+) -> tokio::sync::oneshot::Receiver<bool> {
+    let patch = crate::services::fit::attributes::CommittedFitting::repaired_modules(modules.iter().copied());
+    let mut outbox = Outbox::default();
+    outbox.operation(super::SpaceRepair { patch, module_changes: Vec::new() });
+    super::dispatch_space_heal(world, expected, generation, actor_gate, outbox)
+}
+
+#[cfg(feature = "tests-ships")]
 /// Insert one singleton item and return its ID.
 async fn item(db: &Db, type_id: i32, owner: i64, location: i64, flag: i32) -> i64 {
     db.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
         &[&type_id, &owner, &location, &flag]).await.unwrap().get("item_id")
 }
 
+#[cfg(feature = "tests-ships")]
 /// Dock the fixture character in a damaged ship carrying a burnt hi-slot module,
 /// a damaged rig and subsystem, and a damaged cargo twin. Real categories are
 /// required: every fitted member is covered, cargo is not.
@@ -53,6 +70,7 @@ async fn docked_ship(db: &Db, sde: Arc<Sde>, owner: i64) -> (i64, i64, [i64; 3],
     (station, ship, modules.try_into().unwrap(), cargo, hp, shield_cap)
 }
 
+#[cfg(feature = "tests-ships")]
 /// The SDE slot effect ID that fits a flag family, from dgmEffects' slot flags.
 fn slot_effect(dogma: &crate::sde::dogma::Dogma, flag: i32) -> Option<i32> {
     let name = match flag {
@@ -63,6 +81,7 @@ fn slot_effect(dogma: &crate::sde::dogma::Dogma, flag: i32) -> Option<i32> {
     dogma.effects_by_name(name).next().map(|effect| effect.effect_id)
 }
 
+#[cfg(feature = "tests-ships")]
 /// Route `/heal` for `owner` through the real dispatch chain and return the reply.
 async fn routed_heal(db: &Db, sde: Arc<Sde>, world: Arc<World>, owner: i64, station: i64, ship: i64, role: i64) -> Result<Value, CallError> {
     let (mut c, _peer) = crate::services::tests::client(db.clone(), 0).await;
@@ -70,16 +89,16 @@ async fn routed_heal(db: &Db, sde: Arc<Sde>, world: Arc<World>, owner: i64, stat
     c.world = world;
     c.login.role = role;
     c.session.apply(vec![("charid", Value::Int(owner)), ("stationid", Value::Int(station)), ("shipid", Value::Int(ship))]);
-    crate::services::dispatch(&mut c, &Call { service: "slash", method: "SlashCmd",
-        args: &[Value::unicode("/heal")], kwargs: &Value::Dict(vec![]), bound: false, bind_params: None }).await
+    crate::services::slash::tests::support::rpc(&mut c, "/heal").await
 }
 
+#[cfg(feature = "tests-ships")]
 fn attribute_of(info: &Value, attribute: i32) -> Option<f64> {
     let Value::Dict(attrs) = value_field(info, "attributes")? else { return None };
     attrs.iter().find(|(k, _)| k.as_int() == Some(i64::from(attribute))).and_then(|(_, v)| v.as_float())
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-ships")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn station_heal_repairs_fitted_damage_and_preserves_state() {
     init_config();
@@ -94,16 +113,14 @@ async fn station_heal_repairs_fitted_damage_and_preserves_state() {
     assert!(routed_heal(&db, sde.clone(), World::new(db.clone(), sde.clone(), 1), fixture.character, station, ship, GM_ROLES).await.is_err());
     db.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&fixture.character, &ship]).await.unwrap();
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let world = World::new(db.clone(), sde.clone(), 1);
-    world.register_pilot(fixture.character, sender);
     let (mut c, _peer) = crate::services::tests::client(db.clone(), 0).await;
     c.sde = sde.clone();
     c.world = world;
     c.login.role = GM_ROLES;
     c.session.apply(vec![("charid", Value::Int(fixture.character)), ("stationid", Value::Int(station)), ("shipid", Value::Int(ship))]);
-    crate::services::dispatch(&mut c, &Call { service: "slash", method: "SlashCmd",
-        args: &[Value::unicode("/heal")], kwargs: &Value::Dict(vec![]), bound: false, bind_params: None }).await.ok().unwrap();
+    let mut receiver = crate::services::slash::tests::support::register_online(&c.world, infinity_core::session::OnlineSession::from_session(&c.session).unwrap());
+    assert_eq!(crate::services::slash::tests::support::wire(crate::services::slash::tests::support::rpc(&mut c, "/heal").await), crate::services::slash::tests::support::wire(Ok(Value::unicode(messages::gm::GM_HEALED_DOCKED))));
 
     let rows = dogma::overrides(&db, ship).await.unwrap();
     let shield = rows.iter().find(|r| r.attribute_id == ATTR_SHIELD_CHARGE).unwrap();
@@ -152,7 +169,7 @@ async fn station_heal_repairs_fitted_damage_and_preserves_state() {
     fixture::cleanup(&db, fixture).await.unwrap();
 }
 
-#[tokio::test]
+#[cfg(feature = "tests-ships")] #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn station_heal_rolls_back_conditions_modules_and_notifications() {
     init_config();

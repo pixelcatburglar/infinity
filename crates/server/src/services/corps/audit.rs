@@ -44,5 +44,5 @@ pub(crate) async fn member_history(c: &Client, call: &Call<'_>) -> CallResult {
     ).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

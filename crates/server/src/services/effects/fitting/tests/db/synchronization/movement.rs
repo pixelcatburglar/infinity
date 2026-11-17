@@ -15,13 +15,13 @@ async fn plate_install_remove_and_move_between_hulls() {
     let f = MovementFixture::create(ATTR_ARMOR_HP).await;
     let db = f.client.db.clone();
     let world = f.client.world.clone();
-    let rows = f.rows;
+    let rows = crate::services::tests::fixture::ShipFixture { items: f.rows.items.clone(), ..f.rows };
     let task = tokio::spawn(async move {
         let mut f = f;
         let ship = f.rows.ship;
         let other = f.second_ship;
-        let owner = f.rows.owner;
-        let module = f.rows.modules[0];
+        let owner = f.rows.character;
+        let module = f.rows.module();
         let base = f.value(ship, ATTR_ARMOR_HP).await;
         let other_base = f.value(other, ATTR_ARMOR_HP).await;
         for _ in 0..2 {
@@ -78,9 +78,9 @@ async fn plate_install_remove_and_move_between_hulls() {
                 && args.iter().any(|arg| matches!(arg, Value::List(rows) if rows.iter().any(|row|
                     matches!(row, Value::Tuple(fields) if fields.get(2) == Some(&Value::Int(hull))))))).count(), 1);
         }
-        let before = super::super::fixture::fingerprint(&f.client.db).await.unwrap();
+        let before = crate::dao::tests::item_state(&f.client.db, &[ship, other, module]).await.unwrap();
         assert!(f.move_to(ship, ship, f.slot).await.is_err());
-        assert_eq!(super::super::fixture::fingerprint(&f.client.db).await.unwrap(), before);
+        assert_eq!(crate::dao::tests::item_state(&f.client.db, &[ship, other, module]).await.unwrap(), before);
         assert!(f.drain().is_empty());
         assert_eq!(f.move_to(ship, other, f.slot).await.ok().flatten(), Some(module));
         if f.requires_online { f.online(ship).await; }
@@ -88,7 +88,8 @@ async fn plate_install_remove_and_move_between_hulls() {
         assert_eq!(f.value(other, ATTR_ARMOR_HP).await, other_base);
     });
     let result = task.await;
-    super::super::fixture::cleanup(&db, &world, rows).await.unwrap();
+    world.unobserve(rows.character);
+    crate::services::tests::fixture::cleanup_ship(&db, Some(world.as_ref()), rows).await.unwrap();
     result.unwrap();
 }
 
@@ -98,12 +99,12 @@ async fn shield_extender_unfit_checkpoints_and_reload_preserves_damage() {
     let f = MovementFixture::create(ATTR_SHIELD_CAPACITY).await;
     let db = f.client.db.clone();
     let world = f.client.world.clone();
-    let rows = f.rows;
+    let rows = crate::services::tests::fixture::ShipFixture { items: f.rows.items.clone(), ..f.rows };
     let task = tokio::spawn(async move {
         let mut f = f;
         let ship = f.rows.ship;
-        let owner = f.rows.owner;
-        let module = f.rows.modules[0];
+        let owner = f.rows.character;
+        let module = f.rows.module();
         let small = f.value(ship, ATTR_SHIELD_CAPACITY).await;
         assert_eq!(f.move_to(ship, ship, f.slot).await.ok().flatten(), Some(module));
         if f.requires_online { f.online(ship).await; }
@@ -165,6 +166,7 @@ async fn shield_extender_unfit_checkpoints_and_reload_preserves_damage() {
         assert!(events.iter().all(|(name, _)| name != "OnGodmaPrimeLocation"));
     });
     let result = task.await;
-    super::super::fixture::cleanup(&db, &world, rows).await.unwrap();
+    world.unobserve(rows.character);
+    crate::services::tests::fixture::cleanup_ship(&db, Some(world.as_ref()), rows).await.unwrap();
     result.unwrap();
 }

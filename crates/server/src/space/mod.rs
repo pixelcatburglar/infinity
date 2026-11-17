@@ -1,4 +1,5 @@
 //! Per-system ball state, destiny wire snapshots and event broadcasting.
+//! Observer snapshots and incremental events use one ordered Destiny channel.
 //! `eve/client/script/remote/michelle.py:491-532` consumes destiny updates;
 //! `eve/client/script/parklife/autopilot.py:260-261,329-332` consumes gate
 //! destinations. The binary layout follows carbonengine destiny `Thunkers.cpp`
@@ -21,42 +22,57 @@
 //! frozen inputs, using the same native `Ballpark::Integrate` arithmetic as ticks
 //! and a wall-clock anchor, not fractional destiny stamps or separate substeps.
 //! Sampled balls carry position and velocity from the same instant.
+//! Observer bindings partition each system's scene into coarse grid bubbles;
+//! the initial SetState and every later Add/Remove ride the same ordered
+//! channel through one boundary projection per bubble. Five production call
+//! sites bind an observer through `send_state`: the beyonce session bind,
+//! `UpdateStateRequest`, boarding finish, a same-system teleport and the
+//! post-loss capsule.
 //!
 //! GOTO stores an absolute point; direction commands project from the current
 //! position while their events retain the raw direction. `Ballpark::WarpTo`
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
 //! strictly below 100 km, without WarpFX.
 //!
-//! Missile flight uses native steering; the gameplay impact timer is separate.
+//! Missile flight uses native steering and actor-owned target contact and expiry.
 //! Warp follows native alignment and acceleration. Legacy scalar-sphere collisions
-//! are authoritative; bump events, orientations, formations, miniballs, AddBalls2
-//! and unsupported ball modes are not implemented.
+//! are authoritative; bump events, orientations, continuous native
+//! formation-follow, miniballs, AddBalls2 and unsupported ball modes are not
+//! implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 //! Shared special effects follow fxSequencer.OnSpecialFX's 14-field protocol.
+//! GM slash commands can batch-preload public solar systems through
+//! `preload`; it reuses this module's one cold-load authority without adding
+//! a second initialization path or changing actor lifetimes.
 
-use infinity_core::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
+use infinity_core::consts::{AU, CATEGORY_SHIP, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
 use crate::db::Db;
 use crate::sde::Sde;
 use anyhow::Result;
-use marshal::{DbRowDescriptor, DbType, Value};
+use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing::info;
 
 mod actor;
+pub(crate) mod containment;
+mod attribution;
 pub(crate) mod asteroids;
 pub(crate) mod ship_cosmetics;
 pub(crate) mod system;
 mod projections;
+pub(crate) mod preload;
 mod npc;
 pub(crate) mod drone;
 pub(crate) mod combat;
+pub(crate) mod damageable;
 pub(crate) mod sovereignty;
 pub(crate) mod combat_facts;
 pub(crate) mod targeting;
 mod warpin;
 pub(crate) mod snapshot;
+pub(crate) mod bounties;
+pub(crate) mod unload;
 mod persistent_ships;
 mod stop;
 mod goto;
@@ -66,6 +82,7 @@ mod missile;
 pub(crate) mod collision;
 mod warp;
 mod wire;
+mod loading;
 pub use warp::{WarpOutcome, WarpState};
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
@@ -128,6 +145,12 @@ pub(crate) fn add(a: V3, b: V3) -> V3 {
 pub(crate) fn scale(a: V3, s: f64) -> V3 {
     [a[0] * s, a[1] * s, a[2] * s]
 }
+pub(crate) fn cross(a: V3, b: V3) -> V3 {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+pub(crate) fn dot(a: V3, b: V3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
 fn len(a: V3) -> f64 {
     (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
 }
@@ -136,7 +159,7 @@ pub fn dist(a: V3, b: V3) -> f64 {
     len(sub(a, b))
 }
 /// Carbonengine Vector3d normalization preserves a zero vector.
-fn norm(a: V3) -> V3 {
+pub(crate) fn norm(a: V3) -> V3 {
     let l = len(a);
     if l == 0.0 { a } else { scale(a, 1.0 / l) }
 }
@@ -331,7 +354,15 @@ impl Ball {
 }
 
 
-pub type DestinyTx = mpsc::UnboundedSender<Vec<Value>>;
+
+/// One ordered scene delivery on a client's ballpark channel: a native Destiny
+/// event batch, or a scene-bound notification that must keep its position in
+/// the channel's order (the fleet snapshot after SetState, Add or Remove).
+pub enum SceneDelivery {
+    Destiny(Vec<Value>),
+    Notify { event: &'static str, args: Vec<Value> },
+}
+pub type DestinyTx = mpsc::UnboundedSender<SceneDelivery>;
 /// A client's notification channel: (event, args) scattered on its client.
 pub type NotifyTx = mpsc::UnboundedSender<(String, Vec<Value>)>;
 
@@ -346,12 +377,15 @@ struct JumpQueue {
     keys: HashMap<i64, i64>,
 }
 
+
 /// AddBalls for one ball.
 fn add_balls_event(tick: i64, ball: &Ball, collisions: bool) -> Value {
     let mut state = vec![DESTINY_BALLS];
     state.extend_from_slice(&(tick as i32).to_le_bytes());
     ball.write(&mut state, collisions);
-    let chunk = Value::tuple([Value::str(state), Value::list([ball.slim_item()]), Value::Dict(vec![])]);
+    // michelle.py AddBalls: free balls carry their current three-layer damage.
+    let damage = if ball.free { vec![(Value::Int(ball.id), ball.damage_state())] } else { Vec::new() };
+    let chunk = Value::tuple([Value::str(state), Value::list([ball.slim_item()]), Value::Dict(damage)]);
     event(tick, "AddBalls", vec![chunk])
 }
 
@@ -360,18 +394,42 @@ pub fn event(tick: i64, name: &str, args: Vec<Value>) -> Value {
     Value::tuple([Value::Int(tick), Value::tuple([Value::str(name), Value::Tuple(args)])])
 }
 
-/// Existing server wire policy for an unspecified travel effect duration.
+/// fxSequencer.py: nonpositive durations select the effect classification's default.
 pub(crate) const SPECIAL_FX_UNSPECIFIED_DURATION: i64 = -1;
 
-/// Encode the 14 arguments consumed by spaceMgr/fxSequencer.OnSpecialFX.
-pub(crate) fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Option<i64>,
-    guid: &str, start: i64, active: i64, duration: i64, graphic_info: Option<Value>) -> Value {
-    event(tick, "OnSpecialFX", vec![
-        Value::Int(ship), Value::None, Value::None,
+/// Module identity sent on OnSpecialFX: the real fitted item when one fired,
+/// or only a compatible type when no module item exists.
+#[derive(Clone, Copy)]
+pub(crate) struct FxModule {
+    pub(crate) item: Option<i64>,
+    pub(crate) type_id: i32,
+}
+
+
+/// Encode fxSequencer.OnSpecialFX's 14 arguments without normalizing values.
+/// Duration is an Int for space transitions and a Float for module/GM effects.
+/// Replay start_time is FILETIME; time_from_start is a phase in 100 ns ticks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn special_fx(
+    stamp: i64, ship: i64, module: Option<FxModule>, target: Option<i64>, other_type: Option<i64>,
+    guid: &str, offensive: bool, start: i64, active: i64, duration: Value, repeat: i64,
+    start_time: Option<i64>, time_from_start: i64, graphic_info: Value,
+) -> Value {
+    event(stamp, "OnSpecialFX", vec![
+        Value::Int(ship),
+        module.and_then(|m| m.item).map(Value::Int).unwrap_or(Value::None),
+        module.map(|m| Value::Int(i64::from(m.type_id))).unwrap_or(Value::None),
         target.map(Value::Int).unwrap_or(Value::None),
-        other.map(Value::Int).unwrap_or(Value::None), Value::str(guid),
-        Value::Bool(false), Value::Int(start), Value::Int(active), Value::Int(duration),
-        Value::Int(0), Value::None, Value::Int(0), graphic_info.unwrap_or(Value::None),
+        other_type.map(Value::Int).unwrap_or(Value::None),
+        Value::str(guid),
+        Value::Bool(offensive),
+        Value::Int(start),
+        Value::Int(active),
+        duration,
+        Value::Int(repeat),
+        start_time.map(Value::Int).unwrap_or(Value::None),
+        Value::Int(time_from_start),
+        graphic_info,
     ])
 }
 
@@ -384,11 +442,11 @@ pub struct Pilots {
 }
 impl Pilots {
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) {
-        self.notify.lock().unwrap().insert(char_id, (tx, None));
+        crate::poison::lock_or_exit(self.notify.lock()).insert(char_id, (tx, None));
     }
 
     pub(crate) fn set_online_session(&self, char_id: i64, session: Option<infinity_core::session::OnlineSession>) {
-        let mut notify = self.notify.lock().unwrap();
+        let mut notify = crate::poison::lock_or_exit(self.notify.lock());
         let Some(entry) = notify.get_mut(&char_id) else { return };
         if let (Some(live), Some(next)) = (entry.1.as_ref(), session.as_ref()) {
             if live.session_id != next.session_id { return; }
@@ -399,11 +457,11 @@ impl Pilots {
     }
 
     pub(crate) fn online_session(&self, char_id: i64) -> Option<infinity_core::session::OnlineSession> {
-        self.notify.lock().unwrap().get(&char_id).filter(|(tx, _)| !tx.is_closed()).and_then(|(_, session)| session.clone()).filter(|s| s.character_id == char_id)
+        crate::poison::lock_or_exit(self.notify.lock()).get(&char_id).filter(|(tx, _)| !tx.is_closed()).and_then(|(_, session)| session.clone()).filter(|s| s.character_id == char_id)
     }
 
     pub(crate) fn replace_online_session(&self, character: i64, expected: Option<&infinity_core::session::OnlineSession>, next: Option<infinity_core::session::OnlineSession>) -> bool {
-        let mut notify = self.notify.lock().unwrap();
+        let mut notify = crate::poison::lock_or_exit(self.notify.lock());
         match notify.get_mut(&character) {
             Some((tx, session)) if !tx.is_closed() => {
                 if expected.is_none() || session.as_ref() != expected { return false; }
@@ -416,7 +474,7 @@ impl Pilots {
     }
 
     pub(crate) fn station_guests(&self, station_id: i64) -> Vec<infinity_core::session::OnlineSession> {
-        self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, session))| {
+        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, (tx, session))| {
             session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id && s.station_id == Some(station_id)).cloned()
         }).collect()
     }
@@ -425,35 +483,35 @@ impl Pilots {
     /// result is instantaneous: a session may change or disconnect before the caller uses it.
     /// No ordering is imposed; callers sort outside the lock.
     pub(crate) fn online_sessions(&self) -> Vec<infinity_core::session::OnlineSession> {
-        self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, session))| {
+        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, (tx, session))| {
             session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id).cloned()
         }).collect()
     }
 
     pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: Option<i64>) -> bool {
-        let mut notify = self.notify.lock().unwrap();
+        let mut notify = crate::poison::lock_or_exit(self.notify.lock());
         let Some((_, session)) = notify.get(&char_id) else { return false };
         if let Some(sid) = session_id {
             if session.as_ref().is_none_or(|live| live.session_id != sid) { return false; }
         }
         notify.remove(&char_id);
         drop(notify);
-        for q in self.queues.lock().unwrap().values_mut() {
+        for q in crate::poison::lock_or_exit(self.queues.lock()).values_mut() {
             q.waiting.retain(|c| *c != char_id);
         }
         true
     }
 
     pub fn is_online(&self, char_id: i64) -> bool {
-        self.notify.lock().unwrap().get(&char_id).is_some_and(|(tx, _)| !tx.is_closed())
+        crate::poison::lock_or_exit(self.notify.lock()).get(&char_id).is_some_and(|(tx, _)| !tx.is_closed())
     }
 
     pub fn online_pilots(&self) -> Vec<i64> {
-        self.notify.lock().unwrap().iter().filter_map(|(&id, (tx, _))| (!tx.is_closed()).then_some(id)).collect()
+        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, (tx, _))| (!tx.is_closed()).then_some(id)).collect()
     }
 
     pub fn notify_pilot(&self, char_id: i64, event: &str, args: Vec<Value>) {
-        if let Some((tx, _)) = self.notify.lock().unwrap().get(&char_id) {
+        if let Some((tx, _)) = crate::poison::lock_or_exit(self.notify.lock()).get(&char_id) {
             let _ = tx.send((event.to_string(), args));
         }
     }
@@ -465,7 +523,7 @@ impl Pilots {
             return Ok(());
         }
         {
-            let mut queues = self.queues.lock().unwrap();
+            let mut queues = crate::poison::lock_or_exit(self.queues.lock());
             let q = queues.entry(system_id).or_default();
             let now = crate::client::filetime_now();
             q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * FILETIME_SECOND);
@@ -481,7 +539,7 @@ impl Pilots {
             }
         }
         self.pump_queue(system_id, population);
-        let queues = self.queues.lock().unwrap();
+        let queues = crate::poison::lock_or_exit(self.queues.lock());
         let Some(q) = queues.get(&system_id) else { return Err(1) };
         if q.keys.contains_key(&char_id) {
             // Room opened while queueing: the key is theirs, the next attempt goes through.
@@ -498,7 +556,7 @@ impl Pilots {
             return;
         }
         let (update, recipients) = {
-            let mut queues = self.queues.lock().unwrap();
+            let mut queues = crate::poison::lock_or_exit(self.queues.lock());
             let Some(q) = queues.get_mut(&system_id) else { return };
             let now = crate::client::filetime_now();
             q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * FILETIME_SECOND);
@@ -530,18 +588,31 @@ pub struct World {
     sde: Arc<Sde>,
     progress_registry: Arc<crate::progress::Registry>,
     systems: Arc<Mutex<HashMap<i64, SystemHandle>>>,
+    /// Quiescent, explicitly marked NPC cohorts of cleanly stopped actors,
+    /// restored by the same system's next cold load; same-process only.
+    sleeping_npcs: Mutex<HashMap<i64, system::npc_sleep::SleepingNpcs>>,
     observers: Mutex<HashMap<i64, i64>>,
     pilots: Arc<Pilots>,
+    bindings: Arc<containment::Pilots>,
     weak: std::sync::Weak<World>,
     notice_hub: crate::gateway::notices::NoticeHub,
     sovereignty_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Derived development-index capability, installed at startup and on
+    /// publication; a cache only, the database stays authoritative.
+    indices: Mutex<crate::services::sovereignty::indices::model::IndexCapability>,
+    /// Shared NPC bounty batch coordination; live amounts stay with each
+    /// system's actor, this only carries identity and payout ownership.
+    pub(crate) bounties: Arc<bounties::Coordinator>,
 }
 impl World {
     pub fn new(db: Db, sde: Arc<Sde>, capacity: usize) -> Arc<Self> {
         let progress_registry = db.progress_registry.clone();
         Arc::new_cyclic(|weak| Self { db, sde, progress_registry, systems: Default::default(),
-            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }),
-            weak: weak.clone(), notice_hub: crate::gateway::notices::NoticeHub::new(), sovereignty_ready: Default::default() })
+            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }), bindings: Default::default(),
+            sleeping_npcs: Default::default(),
+            weak: weak.clone(), notice_hub: crate::gateway::notices::NoticeHub::new(), sovereignty_ready: Default::default(), bounties: Arc::new(bounties::Coordinator::new()),
+            indices: Mutex::new(crate::services::sovereignty::indices::model::IndexCapability::Unavailable(
+                crate::services::sovereignty::indices::model::IndexUnavailable::HostUnavailable)) })
     }
     pub(crate) fn notice_hub(&self) -> crate::gateway::notices::NoticeHub { self.notice_hub.clone() }
     pub(crate) fn progress_registry(&self) -> &crate::progress::Registry { &self.progress_registry }
@@ -562,136 +633,30 @@ impl World {
     pub fn is_online(&self, char_id: i64) -> bool { self.pilots.is_online(char_id) }
     pub fn online_pilots(&self) -> Vec<i64> { self.pilots.online_pilots() }
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) { self.pilots.notify_pilot(char_id, name, args); }
-    /// Start the destination before removing a jumping ship from its source.
-    /// Construction is serialized with the live-handle check.
-    pub async fn system(&self, system_id: i64) -> Result<()> {
-        if self.running(system_id).is_some() { return Ok(()); }
-        let market = crate::services::market::lock().await;
-        self.system_locked(system_id, &market).await
-    }
-
-    /// Load a system while the caller holds the existing market guard.
-    pub(crate) async fn system_locked(&self, system_id: i64, _market: &tokio::sync::MutexGuard<'static, ()>) -> Result<()> {
-        if self.running(system_id).is_some() { return Ok(()); }
-        let restored = crate::services::drones::inventory::restore_specs(&self.db, self.sde.clone(), system_id).await
-            .map_err(|error| match error {
-                crate::services::CallError::Internal(error) => error,
-                crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-            })?;
-        let persistent_ships = self.restore_persistent_ships(system_id).await?;
-        let (sovereignty, policies) = sovereignty::cold(self, system_id).await?;
-        let inputs = Arc::new(asteroids::cold_inputs(&self.sde, system_id).map_err(|error| match error {
-            crate::services::CallError::Internal(error) => error,
-            crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-        })?);
-        let now = crate::client::filetime_now();
-        let asteroid_batch = self.db.transaction::<_, _, crate::services::CallError, crate::db::outbox::Outbox<()>, _, _, _>(
-            |tx, _| {
-                let inputs = inputs.clone();
-                let sde = self.sde.clone();
-                Box::pin(async move { asteroids::prepare(tx, &sde, system_id, now, &inputs).await })
-            },
-            |batch, _| async move { Ok(batch) },
-        ).await.map_err(|error| match error {
-            crate::services::CallError::Internal(error) => error,
-            crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-        })?;
-        let mut systems = self.systems.lock().unwrap();
-        if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
-        if systems.contains_key(&system_id) { return Ok(()); }
-        let tick = now_ms();
-        let mut system = System::new(system_id, self.pilots.clone(), tick);
-        system.progress_registry = self.progress_registry.clone();
-        system.world = self.weak.clone();
-        system.projection_sde = Some(self.sde.clone());
-        for r in self.sde.map.celestials(system_id) {
-            let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
-            if self.sde.types.get(type_id).is_none() { continue; }
-            let id = r.item_id;
-            let pos: V3 = [r.x.expect("NULL celestial x"), r.y.expect("NULL celestial y"), r.z.expect("NULL celestial z")];
-            let group = r.group_id.unwrap_or(0) as i32;
-            let category = r.group_id.and_then(|id| i32::try_from(id).ok())
-                .and_then(|id| self.sde.types.group(id)).and_then(|g| g.category_id).unwrap_or(0);
-            let radius = self.sde.celestial_radius(r);
-            let owner = self.sde.map.station(id).and_then(|s| s.owner_id).unwrap_or(1);
-            if let Some(point) = warpin::warp_in_point(id, category, group, pos, f64::from(radius)) {
-                system.set_warp_in(id, point);
-            }
-            let mut slim = Vec::new();
-            let gate = self.sde.map.stargate(id);
-            if let (Some(dest_gate), Some(dest_sys)) = (gate.and_then(|g| g.dest_stargate_id), gate.and_then(|g| g.dest_solar_system_id)) {
-                // A row: unpacked as (destGate, destSystem) by subwaySvc.GetPriorityLoads,
-                // read as .toCelestialID / .locationID elsewhere.
-                let jump = DbRowDescriptor::new([("toCelestialID", DbType::I4), ("locationID", DbType::I4)])
-                    .row(&[Value::Int(dest_gate), Value::Int(dest_sys)]);
-                slim.push(("jumps", Value::list([jump])));
-                // clientControllerRegistry.StargateSetup indexes these (stage, maximum) pairs.
-                let pair = || Value::tuple([Value::Int(0), Value::Int(1)]);
-                slim.push(("destinationCorruptionStageAndMaximum", pair()));
-                slim.push(("localCorruptionStageAndMaximum", pair()));
-                slim.push(("destinationSuppressionStageAndMaximum", pair()));
-                slim.push(("localSuppressionStageAndMaximum", pair()));
-            }
-            system.insert(
-                Ball {
-                    id,
-                    type_id,
-                    owner_id: owner,
-                    corp_id: owner,
-                    alliance_id: -1,
-                    char_id: None,
-                    signature_radius: None,
-                    mode: MODE_RIGID,
-                    radius,
-                    mass: CELESTIAL_STATIC_MASS,
-                    max_vel: 0.0,
-                    agility: 1.0,
-                    speed_fraction: 0.0,
-                    pos,
-                    vel: V3::default(),
-                    old_pos: pos,
-                    old_vel: V3::default(),
-                    segment_acceleration: None,
-                    goto: V3::default(),
-                    follow_id: 0,
-                    follow_range: 0.0,
-                    free: false,
-                    global: true,
-                    massive: true,
-                    interactive: false,
-                    warp: WarpState::default(),
-                    last_ms: tick,
-                    interpolation_anchor_ms: tick,
-                    effect_stamp: 0,
-                    cloak: 0,
-                    cloak_until: 0,
-                    health: [1.0; 3],
-                    launcher: 0,
-                    slim,
-                },
-            );
-        }
-        sovereignty::initialize(&mut system, sovereignty, policies, self.sovereignty_ready.clone())?;
-        let effects = crate::services::drones::worker::effects(self.db.clone(), self.weak.clone(), system_id);
-        for prepared in restored { system.restore_drone(prepared, effects.clone()); }
-        for ship in persistent_ships {
-            if !system.contains(ship.ball.id) { ship.install(&mut system, |s, ball| s.add_persistent_ship(ball)); }
-        }
-        info!("loaded solar system {system_id} with {} celestials", system.balls().count());
-        system.install_cold_asteroids(asteroid_batch);
-
-        let handle = actor::start(system, system_id, Arc::downgrade(&self.systems), self.db.clone());
-        systems.insert(system_id, handle);
-        Ok(())
-    }
     fn running(&self, id: i64) -> Option<SystemHandle> {
-        let mut systems = self.systems.lock().unwrap();
-        if systems.get(&id).is_some_and(|h| h.is_closed()) { systems.remove(&id); }
-        systems.get(&id).cloned()
+        // A closed survivor is either an explicit stop in flight or a failed
+        // tombstone; only its supervisor removes it, never a lazy sweep here.
+        crate::poison::lock_or_exit(self.systems.lock()).get(&id).filter(|handle| !handle.is_closed()).cloned()
+    }
+    /// Refuse new loaded use in every running system, then wait until admitted
+    /// finite work has settled; callers flush afterwards inside their own
+    /// timeout. Business transactions holding the gate complete on their own.
+    pub async fn quiesce_loaded(&self) {
+        let handles: Vec<_> = crate::poison::lock_or_exit(self.systems.lock()).values().filter(|h| !h.is_closed()).cloned().collect();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut armed = 0usize;
+        for handle in &handles {
+            let tx = tx.clone();
+            if handle.send(actor::Job::new(move |s| { s.begin_loaded_quiesce(); s.drain_loaded(tx); })).is_ok() {
+                armed += 1;
+            }
+        }
+        drop(tx);
+        while armed > 0 && rx.recv().await.is_some() { armed -= 1; }
     }
     /// Flush persistent positions in running systems without loading any systems.
     pub async fn flush_positions(&self) -> Result<u64> {
-        let handles: Vec<_> = self.systems.lock().unwrap().values().filter(|h| !h.is_closed()).cloned().collect();
+        let handles: Vec<_> = crate::poison::lock_or_exit(self.systems.lock()).values().filter(|h| !h.is_closed()).cloned().collect();
         let mut flushes = tokio::task::JoinSet::new();
         for handle in handles {
             flushes.spawn(snapshot::flush(handle, self.db.clone()));
@@ -714,25 +679,74 @@ impl World {
     }
     /// No implicit loading; no-op if the system is not running.
     pub fn post(&self, id: i64, f: impl FnOnce(&mut System) + Send + 'static) {
-        if let Some(handle) = self.running(id) { let _ = handle.send(Box::new(f)); }
+        self.post_named(id, std::any::type_name_of_val(&f), f);
     }
     /// No implicit loading; no-op if the system is not running. The delay starts
     /// when the actor processes this message; the closure runs on a due tick.
     pub fn schedule(&self, system: i64, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
-        self.post(system, move |s| s.schedule(delay_ms, f));
+        let name = std::any::type_name_of_val(&f);
+        self.post_named(system, name, move |s| s.schedule_named(delay_ms, name, f));
     }
     /// Wait for a timer tick without loading a missing system.
     pub async fn after(&self, system: i64, delay_ms: u64) -> bool {
         actor::after(self.running(system), delay_ms).await
     }
+    /// Prepare the ship's SKIN projection once for a raw admission, while the
+    /// caller holds the market guard that serializes cosmetics producers.
+    /// Non-ship balls never query. PreparedShip admissions carry their own
+    /// projection and do not pass through this path.
+    async fn prepare_ship_skin(&self, ball: &Ball) -> Result<Option<ship_cosmetics::PreparedSkin>> {
+        if self.sde.types.get(ball.type_id).and_then(|t| t.category_id) != Some(CATEGORY_SHIP) { return Ok(None); }
+        let fact = ship_cosmetics::Ship { ship_id: ball.id, type_id: ball.type_id, character_id: ball.char_id, is_npc: false };
+        crate::services::ship_cosmetics_mgr::state::prepare(&self.db, &self.sde, &[fact], crate::client::filetime_now()).await
+            .map(|mut prepared| prepared.pop())
+            .map_err(|error| match error {
+                crate::services::CallError::Internal(error) => error,
+                crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+            })
+    }
+    async fn deliver_ship(&self, system: i64, ball: Ball, prepared: Option<ship_cosmetics::PreparedSkin>) -> Result<()> {
+        let ship = ball.id;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_to_loaded(system, actor::Job::new(move |s| {
+            s.add_ship(ball);
+            if let (Some(token), Some(prepared)) = (s.capture_ball(ship), prepared) { s.install_skin(token, prepared); }
+            let _ = tx.send(());
+        })).await?;
+        rx.await.map_err(|_| anyhow::anyhow!("system actor stopped"))
+    }
     pub async fn add_ship(&self, system: i64, ball: Ball) -> Result<()> {
+        // Only a real ship pays for the cosmetics cold sequence; everything
+        // else keeps the original load path with no market guard at all.
+        if self.sde.types.get(ball.type_id).and_then(|t| t.category_id) == Some(CATEGORY_SHIP) {
+            let admission = self.admission(system).map_err(|error| anyhow::anyhow!(error))?;
+            let market = crate::services::market::lock().await;
+            admission.check()?;
+            self.system_locked(system, &market).await?;
+            let prepared = self.prepare_ship_skin(&ball).await?;
+            return self.deliver_ship(system, ball, prepared).await;
+        }
         self.system(system).await?;
-        self.with(system, move |s| s.add_ship(ball)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+        self.deliver_ship(system, ball, None).await
+    }
+
+    /// Explicit NPC admission: installs the canonical no_skin projection in
+    /// the same actor job as the Add, with no NPC-specific or personal SKIN
+    /// preparation. Reuses the existing system loading and delivery path
+    /// unchanged.
+    pub(crate) async fn add_npc_ship(&self, system: i64, ball: Ball) -> Result<()> {
+        let prepared = ship_cosmetics::PreparedSkin::npc(&ball);
+        self.deliver_ship(system, ball, Some(prepared)).await
     }
     pub(crate) async fn add_ship_locked(&self, system: i64, ball: Ball,
-        market: &tokio::sync::MutexGuard<'static, ()>) -> Result<()> {
+        market: &crate::services::market::economy_lock::Guard) -> Result<()> {
         self.system_locked(system, market).await?;
-        self.with(system, move |s| s.add_ship(ball)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+        let prepared = self.prepare_ship_skin(&ball).await?;
+        let ship = ball.id;
+        self.with(system, move |s| {
+            s.add_ship(ball);
+            if let (Some(token), Some(prepared)) = (s.capture_ball(ship), prepared) { s.install_skin(token, prepared); }
+        }).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
     }
     pub async fn remove_ball(&self, system: i64, id: i64) -> Option<Ball> {
         self.with(system, move |s| s.remove_ball(id)).await.flatten()
@@ -743,21 +757,39 @@ impl World {
     pub async fn request_entry(&self, system: i64, pilot: i64) -> Result<(), i64> {
         self.with(system, move |s| s.request_entry(pilot)).await.unwrap_or(Err(1))
     }
-    pub fn broadcast(&self, system: i64, about: i64, factory: impl FnOnce(i64) -> Vec<Value> + Send + 'static) {
-        self.post(system, move |s| s.broadcast(about, factory(s.current_time())));
+    /// Scene-bound updates for every observer whose delivered scene covers
+    /// `about`; a factory that encodes nothing when its scene is empty.
+    pub(crate) fn publish_destiny(&self, system: i64, about: i64, factory: impl FnOnce(i64) -> Vec<Value> + Send + 'static) {
+        let name = std::any::type_name_of_val(&factory);
+        self.post_named(system, name, move |s| s.publish_destiny(about, factory));
     }
-    pub async fn observe(&self, system: i64, client: i64, ego: i64, tx: DestinyTx) -> Result<Value> {
+    /// Bind one client's ballpark channel to a system and ego. The same client
+    /// binds serially: the previous system's `unobserve` is awaited before the
+    /// new job is sent, and a failed bind cleans the map inside this future
+    /// before it returns, so a later bind cannot interleave. The reply rides
+    /// the actor job: `Ok` only after the actor's pending initial actually
+    /// delivered its SetState; a refused channel, a dropped sender or a dead
+    /// actor all fail the future. `send_to_loaded` resends only an unsent job.
+    pub async fn observe(&self, system: i64, client: i64, ego: i64, tx: DestinyTx) -> Result<()> {
         self.system(system).await?;
-        let previous = self.observers.lock().unwrap().insert(client, system);
+        let previous = crate::poison::lock_or_exit(self.observers.lock()).insert(client, system);
         if let Some(previous) = previous.filter(|&p| p != system) {
             self.with(previous, move |s| s.unobserve(client)).await;
         }
-        self.with(system, move |s| s.observe(client, ego, tx)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let sent = self.send_to_loaded(system, actor::Job::new(move |s| { let _ = s.observe(client, ego, tx, reply); })).await;
+        if sent.is_ok() && rx.await == Ok(true) { return Ok(()); }
+        let mut observers = crate::poison::lock_or_exit(self.observers.lock());
+        if observers.get(&client) == Some(&system) { observers.remove(&client); }
+        Err(anyhow::anyhow!("system actor stopped or observer channel closed"))
     }
+    /// Drop one client's binding map entry and post its unobserve; only the
+    /// map serializes same-client binds, so a posted teardown of the previous
+    /// system can never remove the newer entry's registration.
     pub fn unobserve(&self, client: i64) {
-        let system = self.observers.lock().unwrap().remove(&client);
+        let system = crate::poison::lock_or_exit(self.observers.lock()).remove(&client);
         if let Some(system) = system { self.post(system, move |s| s.unobserve(client)); }
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

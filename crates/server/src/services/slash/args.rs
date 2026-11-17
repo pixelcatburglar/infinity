@@ -4,6 +4,7 @@
 //! Quotes group text but shell escapes and single-quote syntax are not supported.
 use super::{slash_error, CallError, Client};
 use infinity_core::messages;
+use infinity_core::session::Session;
 use crate::{dao, services::db_err};
 
 pub(super) fn tokenize(line: &str) -> Result<Vec<String>, CallError> {
@@ -23,6 +24,10 @@ pub(super) fn tokenize(line: &str) -> Result<Vec<String>, CallError> {
     if quoted { return Err(slash_error(messages::gm::GM_ARGS_UNCLOSED_QUOTE.into())); }
     if started { words.push(word); }
     Ok(words)
+}
+
+pub(super) fn positive_i64(text: &str) -> Option<i64> {
+    text.parse::<i64>().ok().filter(|id| *id > 0)
 }
 
 pub(super) struct Args<'a> { values: &'a [String] }
@@ -52,9 +57,27 @@ impl<'a> Args<'a> {
     }
 }
 
+fn no_character() -> CallError { slash_error(messages::gm::GM_ARGS_NO_CHARACTER.into()) }
+
+pub(super) fn selected_character(session: &Session) -> Result<i64, CallError> {
+    session.int("charid").ok_or_else(no_character)
+}
+
+pub(super) fn positive_character(session: &Session) -> Result<i64, CallError> {
+    let id = selected_character(session)?;
+    (id > 0).then_some(id).ok_or_else(no_character)
+}
+
+// `solarsystemid2` is the session's canonical system; only a caller who is
+// not docked may fall back to `solarsystemid`.
+pub(super) fn current_system(session: &Session) -> Option<i64> {
+    session.int("solarsystemid2")
+        .or_else(|| session.int("stationid").is_none().then(|| session.int("solarsystemid")).flatten())
+}
+
 pub(super) async fn target(c: &Client, text: &str) -> Result<i64, CallError> {
     if text.eq_ignore_ascii_case("me") {
-        return c.session.int("charid").ok_or_else(|| slash_error(messages::gm::GM_ARGS_NO_CHARACTER.into()));
+        return selected_character(&c.session);
     }
     dao::characters::lookup::find(&c.db, text, text.parse().ok()).await.map_err(db_err)?
         .ok_or_else(|| slash_error(messages::gm::gm_args_unknown_target(text)))
@@ -72,5 +95,5 @@ pub(super) async fn owner(c: &Client, text: &str) -> Result<i64, CallError> {
     Err(slash_error(messages::gm::gm_args_unknown_owner(text)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-slash"))]
 mod tests;

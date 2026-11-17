@@ -6,12 +6,12 @@
 //! quantities stay exact (see `cap_client_quantity`).
 use crate::services::{db_err, item_descriptor, keyval, CallError};
 use crate::services::{combat, fit, skills};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_from_unix_ms, filetime_now, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::services::items::load_items;
-use crate::dao::items::{charges, dogma as dogma_dao};
+use crate::dao::items::dogma as dogma_dao;
 use crate::sde::Sde;
-use infinity_core::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, CLIENT_MAX_SHORT_AMOUNT, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, GROUP_CHARACTER, SINGLETON_QUANTITY, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
+use infinity_core::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_CURRENT, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_MAX_TIMESTAMP, dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, CLIENT_MAX_SHORT_AMOUNT, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, GROUP_CHARACTER, SINGLETON_QUANTITY, TYPE_CHARACTER, TYPE_PLASTIC_WRAP};
 use marshal::Value;
 use std::collections::BTreeMap;
 
@@ -100,6 +100,25 @@ pub(super) fn active_effect(item_id: i64, char_id: i64, ship_id: i64, effect_id:
 
 pub(super) fn online_effect(item_id: i64, char_id: i64, ship_id: i64) -> Vec<(Value, Value)> {
     vec![active_effect(item_id, char_id, ship_id, EFFECT_ONLINE)]
+}
+
+/// The same activeEffects tuple for one Running duration-bounded activation,
+/// with the recorded FILETIME start, frozen duration in milliseconds and the
+/// activation's repeat counter. Pending and Cooling records are never listed.
+fn running_effect(item_id: i64, char_id: i64, ship_id: i64, effect: i64, start: i64, duration_ms: f64, repeat: i64) -> (Value, Value) {
+    let env = [
+        Value::Int(item_id),
+        Value::Int(char_id),
+        Value::Int(ship_id),
+        Value::None,
+        Value::None,
+        Value::list([]),
+        Value::Int(effect),
+        Value::Int(filetime_from_unix_ms(start)),
+        Value::Float(duration_ms),
+        Value::Int(repeat),
+    ];
+    (Value::Int(effect), Value::tuple(env))
 }
 
 async fn heat_snapshot(c: &Client, ship: i64, fit: &fit::Fit) -> Vec<crate::services::effects::heat::RackSnapshot> {
@@ -239,6 +258,13 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
     } else {
         combat::prepare_condition_with_fit(&c.db, ship_id, &fit).await?.scalars()
     };
+    // The actor's generation-fenced ramp readouts prime the disintegrator
+    // attributes a cold fit cannot know; a cold load never overwrites them.
+    let spool_readouts = if let Some(system) = system {
+        c.world.with(system, move |s| s.spool_readouts(ship_id)).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     for item in items {
         let mut attrs = type_attributes(&c.sde, item.type_id);
         // Supply fitted values for ship and module attributes, including HUD maxima.
@@ -252,7 +278,7 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
         if let Some(key) = key {
             overlay_overrides(&mut attrs, fit.overrides(key).iter().copied());
             for (attr, value) in attrs.iter_mut() {
-                *value = fit.value(key, *attr as i32);
+                *value = fit.wire_value(key, *attr as i32);
             }
         }
         let mut active = if online.contains(&item.item_id) {
@@ -269,6 +295,9 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
             }
         }
         attrs.entry(ATTR_MASS as i64).or_insert(0.0); // mass is always present
+        if let Some((effect, start, duration_ms, repeat)) = crate::services::effects::active_cycle::running_effect(item.item_id) {
+            active.push(running_effect(item.item_id, char_id, ship_id, effect, start, duration_ms, repeat));
+        }
         if item.item_id == ship_id {
             attrs.insert(ATTR_CHARGE as i64, cap);
             attrs.insert(ATTR_SHIELD_CHARGE as i64, shield);
@@ -279,12 +308,24 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
         for k in [ATTR_HULL_DAMAGE as i64, ATTR_ARMOR_DAMAGE as i64, i64::from(ATTR_HEAT_LOW), i64::from(ATTR_HEAT_MED), i64::from(ATTR_HEAT_HI)] {
             attrs.entry(k).or_insert(0.0);
         }
+        // A disintegrator module's displayed ramp attributes come from the
+        // actor readout when present and read as zero otherwise.
+        if item.location_id == ship_id && item.item_id != ship_id
+            && c.sde.types.effects(item.type_id).iter().any(|effect| effect.effect_id == EFFECT_TARGET_DISINTEGRATOR_ATTACK)
+        {
+            let (bonus, max_at) = spool_readouts.iter()
+                .find(|(module, _, _)| *module == item.item_id)
+                .map(|(_, bonus, max_at)| (*bonus, *max_at))
+                .unwrap_or((0.0, 0));
+            attrs.insert(i64::from(ATTR_DAMAGE_MULTIPLIER_BONUS_CURRENT), bonus);
+            attrs.insert(i64::from(ATTR_DAMAGE_MULTIPLIER_BONUS_MAX_TIMESTAMP), max_at as f64);
+        }
         out.push((Value::Int(item.item_id), info(item.row(), item.item_id, attrs, active)));
     }
     // Loaded charges are sublocations, not items: godma (UpdateItem) files an entry keyed
     // (shipID, flagID, typeID) with no invItem under the ship, with its quantity attribute;
     // the HUD reads a launcher's charge from there.
-    let charges = charges::positive(&c.db, ship_id).await.map_err(db_err)?;
+    let charges = crate::services::combat::loaded::rows(&c.db, &c.world, c.session.int("solarsystemid"), ship_id).await?.into_iter().filter(|r| r.quantity > 0).collect::<Vec<_>>();
     for r in charges {
         let (flag, type_id, qty) = (r.flag_id, r.type_id, r.quantity);
         let key = combat::targeting_charges::charge_key(ship_id, flag, type_id);

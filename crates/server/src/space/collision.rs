@@ -99,8 +99,6 @@ pub(super) fn apply(scratch: &[Snapshot], balls: &mut HashMap<i64, Ball>) {
     }
 }
 
-fn dot(a: V3, b: V3) -> f64 { a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
-
 fn swept_aabb(p0: V3, p1: V3, q0: V3, q1: V3, radius: f64) -> bool {
     if !radius.is_finite() || radius < 0.0
         || p0.iter().chain(p1.iter()).chain(q0.iter()).chain(q1.iter()).any(|v| !v.is_finite()) {
@@ -120,7 +118,11 @@ fn quadratic(a: f64, b: f64, c: f64) -> Option<f64> {
     Some((-b - det.sqrt()) * 0.5 / a)
 }
 
-fn collide_two_spheres(p0: V3, p1: V3, q0: V3, q1: V3, radius: f64) -> Option<f64> {
+pub(super) fn collide_two_spheres(p0: V3, p1: V3, q0: V3, q1: V3, radius: f64) -> Option<f64> {
+    if !radius.is_finite() || radius < 0.0
+        || p0.iter().chain(p1.iter()).chain(q0.iter()).chain(q1.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
     let offset = sub(p0, q0);
     let offset2 = dot(offset, offset);
     if offset2 <= radius * radius { return Some(0.0); }
@@ -187,4 +189,4 @@ fn potential(mut me: Snapshot, mut other: Snapshot, depth: usize, state: &mut Fo
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

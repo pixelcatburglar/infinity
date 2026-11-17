@@ -30,6 +30,6 @@ async fn checkpoint_uses_loaded_catalogue_metadata() {
     assert_eq!(version.get_field_by_name("prerelease_tags").unwrap().as_ref(), &Value::List(Vec::new()));
     assert_eq!(version.get_field_by_name("build_tags").unwrap().as_ref(), &Value::List(Vec::new()));
     let crc = msg_field(&cp, "crc").unwrap();
-    let bytes = crate::cdn::content("achievements").unwrap().0;
-    assert_eq!(crc.get_field_by_name("crc").unwrap().as_ref(), &Value::U32(crate::cdn::crc32(bytes)));
+    let bytes = infinity_content::cdn::content("achievements").unwrap().0;
+    assert_eq!(crc.get_field_by_name("crc").unwrap().as_ref(), &Value::U32(infinity_content::cdn::crc32(bytes)));
 }

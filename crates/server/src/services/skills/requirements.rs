@@ -8,4 +8,4 @@ pub(crate) fn requirements(sde: &Sde, type_id: i32) -> impl Iterator<Item = (i32
     sde.skill_plans.requirements(type_id).iter().copied()
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

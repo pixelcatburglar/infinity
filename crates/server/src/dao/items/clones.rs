@@ -26,11 +26,11 @@ pub(crate) async fn implant_types(ex: &(impl Executor + ?Sized), owner: i64) -> 
     Ok(ex.query("SELECT DISTINCT type_id FROM game.items WHERE owner_id=$1 AND location_id=$1 AND flag_id=$2 ORDER BY type_id", &[&owner, &FLAG_IMPLANT]).await?.iter().map(|r| r.get("type_id")).collect())
 }
 pub(crate) async fn overrides(ex: &(impl Executor + ?Sized), owner: i64, clone: i64, ids: &[i64]) -> Result<Vec<AttributeOverride>, db::Error> {
-    Ok(ex.query("SELECT a.item_id, a.attribute_id, a.value, a.updated_at FROM game.item_attributes a JOIN game.items i ON i.item_id=a.item_id WHERE i.owner_id=$1 AND i.jump_clone_id=$2 AND i.item_id=ANY($3) ORDER BY a.item_id, a.attribute_id", &[&owner, &clone, &ids]).await?.iter().map(AttributeOverride::from_row).collect())
+    Ok(ex.query("SELECT a.item_id, a.attribute_id, a.value, a.updated_at, a.cargo_unlimited FROM game.item_attributes a JOIN game.items i ON i.item_id=a.item_id WHERE i.owner_id=$1 AND i.jump_clone_id=$2 AND i.item_id=ANY($3) ORDER BY a.item_id, a.attribute_id", &[&owner, &clone, &ids]).await?.iter().map(AttributeOverride::from_row).collect())
 }
 /// Delete only the owner's currently boarded capsule.
 pub(crate) async fn delete_capsule(ex: &(impl Executor + ?Sized), owner: i64, ship: i64, capsule_type: i32) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.items i WHERE i.item_id=$2 AND i.owner_id=$1 AND i.type_id=$3 AND i.jump_clone_id IS NULL AND EXISTS (SELECT 1 FROM game.characters c WHERE c.character_id=$1 AND c.ship_id=i.item_id)", &[&owner, &ship, &capsule_type]).await
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

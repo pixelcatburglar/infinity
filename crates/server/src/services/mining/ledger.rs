@@ -41,4 +41,4 @@ async fn get_character_logs(c: &Client, call: &Call<'_>) -> CallResult {
     Ok(Value::List(rows.into_iter().map(row).collect()))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

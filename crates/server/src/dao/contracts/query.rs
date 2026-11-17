@@ -54,7 +54,7 @@ pub(crate) async fn owner(ex: &(impl Executor + ?Sized), f: Owner) -> Result<Vec
     sql += &if f.status == f.outstanding { format!(" AND c.status = {}", f.outstanding) } else if f.status == f.in_progress { format!(" AND c.status = {}", f.in_progress) } else if f.status == f.finished { format!(" AND c.status NOT IN ({}, {})", f.outstanding, f.in_progress) } else { format!(" AND c.status = {}", arg(&mut params, f.status)) };
     match f.kind { None | Some(-1) => {}, Some(t) if t == f.all => {}, Some(t) if t == f.combined => sql += &format!(" AND c.type IN ({}, {})", f.exchange, f.auction), Some(t) => sql += &format!(" AND c.type = {}", arg(&mut params, t as i32)) }
     if let Some(before) = f.before { sql += &format!(" AND c.contract_id < {}", arg(&mut params, before)); }
-    run(ex, &sql, &params, &format!("ORDER BY c.contract_id DESC LIMIT {}", f.num)).await
+    run(&ex.uncached(), &sql, &params, &format!("ORDER BY c.contract_id DESC LIMIT {}", f.num)).await
 }
 
 pub(crate) enum Filter { Id(i64), Issuer(i64, i32), Package(i64, i32), Attention(i64, i64, i32, i32, i32, i64), Bidding(i64, i32), InProgress(i64, i32), Assigned(i64, i64, i32, i64) }

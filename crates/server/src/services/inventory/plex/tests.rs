@@ -3,14 +3,14 @@ use super::*;
 
 #[test]
 fn quantity_requires_positive_i64_integer() {
-    assert_eq!(quantity(None), None);
-    assert_eq!(quantity(Some(&Value::Int(0))), None);
-    assert_eq!(quantity(Some(&Value::Int(-1))), None);
-    assert_eq!(quantity(Some(&Value::Int(i64::from(i32::MAX) + 1))), Some(i64::from(i32::MAX) + 1));
-    assert_eq!(quantity(Some(&Value::Bool(true))), None);
-    assert_eq!(quantity(Some(&Value::str("1"))), None);
-    assert_eq!(quantity(Some(&Value::Int(1))), Some(1));
-    assert_eq!(quantity(Some(&Value::Int(i64::MAX))), Some(i64::MAX));
+    assert_eq!(crate::services::value_positive_id(None), None);
+    assert_eq!(crate::services::value_positive_id(Some(&Value::Int(0))), None);
+    assert_eq!(crate::services::value_positive_id(Some(&Value::Int(-1))), None);
+    assert_eq!(crate::services::value_positive_id(Some(&Value::Int(i64::from(i32::MAX) + 1))), Some(i64::from(i32::MAX) + 1));
+    assert_eq!(crate::services::value_positive_id(Some(&Value::Bool(true))), None);
+    assert_eq!(crate::services::value_positive_id(Some(&Value::str("1"))), None);
+    assert_eq!(crate::services::value_positive_id(Some(&Value::Int(1))), Some(1));
+    assert_eq!(crate::services::value_positive_id(Some(&Value::Int(i64::MAX))), Some(i64::MAX));
 }
 
 use infinity_core::consts::GM_ROLES;
@@ -45,7 +45,7 @@ fn deposit(station: i64, item: i64, quantity: i64) -> Vec<Value> {
 
 fn assert_no_direct_completion(client: &Client) {
     assert!(!client.outbox.iter().any(|packet| matches!(&packet.destination,
-        crate::macho::Address::Broadcast { broadcast_id, .. }
+        infinity_wire::macho::Address::Broadcast { broadcast_id, .. }
             if matches!(broadcast_id.as_text().as_deref(), Some("OnPlexItemAddedToInventory" | "OnPlexDeposited")))));
 }
 
@@ -253,7 +253,7 @@ async fn unpublished_selected_and_online_actor_receive_clamped_account_notice() 
     assert!(pilot_rx.try_recv().is_err());
     assert_eq!(client.outbox.len(), 1);
     let packet = &client.outbox[0];
-    assert!(matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAurumChangeFromVgs")));
+    assert!(matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnAurumChangeFromVgs")));
     let envelope = packet.body[0].items().unwrap();
     assert_eq!(marshal::loads(envelope[1].as_bytes().unwrap()).unwrap(), Value::tuple([Value::Int(1), Value::tuple([notice])]));
     assert!(receiver.try_recv().is_err());

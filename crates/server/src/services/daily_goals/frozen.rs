@@ -14,7 +14,7 @@ pub(crate) fn snapshot(sde: &Sde, template: &Template) -> Result<GoalSnapshot, E
 }
 
 pub(crate) fn rewards(goal: &GoalRow, template: &Template) -> Result<Vec<RewardRow>, Error> {
-    let uuid = crate::uuid_text::parse(&goal.goal_id, crate::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
+    let uuid = infinity_content::uuid_text::parse(&goal.goal_id, infinity_content::uuid_text::Case::Lowercase).ok_or(Error::Invalid)?;
     template.rewards.iter().enumerate().map(|(index, reward)| {
         let index = i32::try_from(index).map_err(|_| Error::Invalid)?;
         let (unit, amount_isk, amount_units, issuer_id, type_id) = match reward {

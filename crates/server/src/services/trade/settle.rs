@@ -1,6 +1,8 @@
 //! Atomic trade settlement and cancellation over `game.trades`, `game.trade_items`
 //! and character wallets. `pvptradesvc.py` consumes the emitted events.
 //! Terminal transitions cancel durable idle jobs in the same transaction.
+//! Returns and settlements collect the staged closure and ancestry, lock once at
+//! final strength, and refuse corporation-locked or vote-reserved originals.
 use infinity_core::{consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_OWNER_ID}};
 use crate::{dao::{items::{loading::ItemQuery, transfers}, trades::{self, Trade}}, db::{executor::Executor, outbox::Outbox, Db}, sde::Sde, services::{db_err, items::load_items, market, wallets, CallError}, space::World};
 use std::sync::Arc;
@@ -30,6 +32,29 @@ async fn changes(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<T
 pub(super) async fn abort(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, trade: &mut Trade, notify: bool) -> Result<(), CallError> {
     let roots = trades::items(ex, trade.id).await.map_err(db_err)?;
     let ids: Vec<_> = roots.iter().map(|item| item.id).collect();
+    // Returning to the origin is the same custody mutation as settling: collect
+    // the complete closure and ancestry, lock once at final strength, then
+    // revalidate and screen before any relocate runs.
+    let all = trades::descendants(ex, &ids).await.map_err(db_err)?;
+    let captured = crate::dao::items::parent_locks::capture(ex, &all).await.map_err(db_err)?;
+    let ancestry = crate::dao::items::deliveries::ancestry_many(ex, &ids).await.map_err(db_err)?;
+    let mut requests: Vec<_> = all.iter().map(|&item_id| crate::dao::items::parent_locks::LockRequest {
+        item_id, strength: crate::dao::items::parent_locks::LockStrength::Update,
+    }).collect();
+    requests.extend(ancestry.iter().filter(|row| !all.contains(&row.ancestor.item_id)).map(|row| crate::dao::items::parent_locks::LockRequest {
+        item_id: row.ancestor.item_id,
+        strength: if sde.types.get(row.ancestor.type_id).is_some_and(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP)) {
+            crate::dao::items::parent_locks::LockStrength::Update
+        } else { crate::dao::items::parent_locks::LockStrength::Share },
+    }));
+    let locks = crate::services::inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
+    if captured.len() != all.len() || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row| row.same_metadata(old)))
+        || trades::descendants(ex, &ids).await.map_err(db_err)? != all
+        || crate::dao::items::deliveries::ancestry_many(ex, &ids).await.map_err(db_err)? != ancestry {
+        return Err(CallError::Internal(anyhow::anyhow!("trade item metadata changed")));
+    }
+    let blueprints = crate::services::corps::item_locks::locked_blueprints(sde, &locks, &all)?;
+    crate::services::corps::item_locks::ensure_mutable(ex, &blueprints).await?;
     let before = load_items(ex, sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
     if notify && before.len() != roots.len() {
         return Err(CallError::Internal(anyhow::anyhow!("trade item missing or type absent from SDE")));
@@ -82,16 +107,17 @@ pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &
         } else { crate::dao::items::parent_locks::LockStrength::Share },
     }));
     let locks = crate::services::inventory::destination::lock_items(ex, sde, &requests, &[]).await?;
-    if captured.len() != all.len() || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row|
-        row.type_id == old.type_id && row.owner_id == old.owner_id && row.location_id == old.location_id
-        && row.flag_id == old.flag_id && row.quantity == old.quantity && row.singleton == old.singleton
-        && row.jump_clone_id == old.jump_clone_id)) {
+    if captured.len() != all.len() || captured.iter().any(|old| !locks.row(old.item_id).is_some_and(|row| row.same_metadata(old))) {
         return Err(CallError::Internal(anyhow::anyhow!("trade item metadata changed")));
     }
     if trades::descendants(ex, &ids).await.map_err(db_err)? != all
         || crate::dao::items::deliveries::ancestry_many(ex, &ids).await.map_err(db_err)? != ancestry {
         return Err(CallError::Internal(anyhow::anyhow!("trade item closure changed")));
     }
+    // Enacted corporation locks and pending vote-case reservations freeze
+    // blueprint originals anywhere in the settled closure.
+    let blueprints = crate::services::corps::item_locks::locked_blueprints(sde, &locks, &all)?;
+    crate::services::corps::item_locks::ensure_mutable(ex, &blueprints).await?;
     let before = load_items(ex, sde, ItemQuery::Ids(&all)).await.map_err(db_err)?;
     if before.len() != all.len() {
         return Err(CallError::Internal(anyhow::anyhow!("trade item type missing from SDE")));

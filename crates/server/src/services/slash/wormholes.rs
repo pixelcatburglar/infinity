@@ -35,5 +35,5 @@ pub(super) async fn command(c: &mut Client, _command: &str, args: &[String]) -> 
     else { Err(slash_error(messages::gm::GM_WH_USAGE.into())) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-slash"))]
 mod tests;

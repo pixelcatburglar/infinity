@@ -73,4 +73,4 @@ pub(in crate::services) async fn permissions_many(ex: &(impl Executor + ?Sized),
     }
     Ok(result)
 }
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-inventory"))] mod tests;

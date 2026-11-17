@@ -1,17 +1,26 @@
 //! Synthetic static data shared by database-free combat tests.
 //! No client data is copied; the single ship type supplies only combat attributes.
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 use std::sync::Arc;
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 use super::{TypeData, Types};
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 use infinity_core::consts::{CATEGORY_SHIP, dogma::*};
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 use crate::sde::Sde;
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 const TEST_TYPE_ID: i32 = 1;
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 const TEST_HITPOINTS: f64 = 100.0;
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 const TEST_RECHARGE_MS: f64 = 1000.0;
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 const TEST_RESONANCE: f64 = 1.0;
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 pub(crate) fn combat_fixture() -> Arc<Sde> {
     let mut attributes = vec![
         (ATTR_STRUCTURE_HP, TEST_HITPOINTS),
@@ -48,6 +57,7 @@ pub(crate) fn combat_fixture() -> Arc<Sde> {
     Arc::new(Sde { types, ..Default::default() })
 }
 
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-inventory", feature = "tests-space", feature = "tests-lua"))]
 /// Add synthetic types for actor placement tests without loading a database.
 pub(crate) fn placement_fixture(groups: &[(i32, Option<i32>)]) -> Arc<Sde> {
     let mut sde = Arc::try_unwrap(combat_fixture()).ok().unwrap();
@@ -65,6 +75,7 @@ pub(crate) fn placement_fixture(groups: &[(i32, Option<i32>)]) -> Arc<Sde> {
     Arc::new(sde)
 }
 
+#[cfg(any(feature = "tests-inventory", feature = "tests-lua"))]
 /// Add attributes to synthetic placement types, without loading client data.
 pub(crate) fn attribute_fixture(groups: &[(i32, Option<i32>)], attributes: &[(i32, Vec<(i32, f64)>)]) -> Arc<Sde> {
     let mut sde = Arc::try_unwrap(placement_fixture(groups)).ok().unwrap();
@@ -75,6 +86,7 @@ pub(crate) fn attribute_fixture(groups: &[(i32, Option<i32>)], attributes: &[(i3
     }
     Arc::new(sde)
 }
+#[cfg(feature = "tests-inventory")]
 /// Add synthetic capacity and volume fields to placement types.
 pub(crate) fn capacity_fixture(groups: &[(i32, Option<i32>)], fields: &[(i32, Option<f64>, Option<f64>)], attributes: &[(i32, Vec<(i32, f64)>)]) -> Arc<Sde> {
     let mut sde = Arc::try_unwrap(attribute_fixture(groups, attributes)).ok().unwrap();
@@ -87,6 +99,7 @@ pub(crate) fn capacity_fixture(groups: &[(i32, Option<i32>)], fields: &[(i32, Op
 }
 
 
+#[cfg(any(feature = "tests-effects", feature = "tests-space"))]
 /// A synthetic overload modifier raises the hull's armor hitpoints by 50.
 pub(crate) fn overload_fixture() -> Arc<Sde> {
     use crate::sde::dogma::tests::{overload_fixture, BONUS_ATTRIBUTE, OVERLOAD_EFFECT};

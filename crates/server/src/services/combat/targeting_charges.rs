@@ -9,51 +9,104 @@
 //! Cold reload and unload collect their existing item writes and parent lineages before
 //! the shared hull-first lock acquisition; prepared deposits never select a later stack.
 //! Replacement reloads validate net cargo contents including reserved source space.
-//! First insertion primes the complete charge sublocation; positive refills send only
-//! quantity changes. Cold insertions and removals publish fitted topology, not shots.
+//! First insertion and a completion that finds the magazine empty prime the
+//! complete charge sublocation; positive same-type refills send only quantity
+//! changes. Completion counts the charge currently loaded plus surviving
+//! reservations. A different charge type, or a module no longer at its original
+//! ship and fitting slot for the reservation owner, rolls the completion back
+//! and keeps the reservations. Cold insertions and removals publish fitted
+//! topology, not shots.
 //! Client behavior for these notifications has not yet been verified.
 //! Reload timer markers are memory-only; newer starts return older reservations, and startup recovery returns pending charges to their sources rather than resuming timers.
 //! Accepted targeting attempts cancel arrival jump cloak before the lock timer.
 //! A jam clears completed and pending locks and refuses new lock transitions;
 //! acquisition is possible again when the jam expires. Locks are not resumed
 //! after restart.
-//! Lock range and capacity are evaluated at acquisition; completion rechecks the
-//! sampled positions and current lock count against that same fitted snapshot.
+//! Lock capacity is checked at acquisition and at completion; lock range and
+//! live actor visibility are re-evaluated at admission, at the scheduled
+//! completion and on every existing system tick, which drops completed locks
+//! that no longer qualify.
 //! Announced player locks remember their recipient until removal; passive locks
 //! send no target-side acquisition or loss notification.
+//! A queued lock failure keeps the failed UI attempt's identity: it ends that
+//! wait past a different internal pending, but not a current UI or completed lock.
 //! Cycle-owned attempts require an active, unstopped generation at acquisition;
 //! completion only requires that generation not to have been stopped.
 use super::*;
 use super::charge_reservations::reserve_load;
 use crate::services::effects::online::{self, OnlineChanged};
 mod reloading;
+pub(crate) mod completion;
+pub(crate) mod locking;
 
 // ---------------------------------------------------------------- targeting
+
+/// The one cancellation publication for a discarded pending attempt: the
+/// connection that started it through the targeting UI gets a single internal
+/// failure request carrying the failed attempt's identity; attempts without a
+/// UI owner end silently.
+pub(super) fn publish_pending_failure(character: i64, target: i64, lock: &mut PendingLock) {
+    if let Some(owner) = lock.ui_owner.take() {
+        let _ = owner.send(crate::client::target_lock_failure(character, target, lock.attempt));
+    }
+}
+
+/// Run `emit` only while the failed attempt's pair holds no completed lock and
+/// no still-current pending attempt the answer could cancel: a queued failure
+/// is dropped while the same attempt or a different UI-owned attempt is
+/// pending, or a completed lock exists, but a different internal attempt does
+/// not protect the old wait. Check and emit share one State lock hold.
+pub(crate) fn with_pending_failure_current(failure: crate::client::TargetLockFailure, emit: impl FnOnce()) -> bool {
+    let st = state();
+    if st.targets.get(&failure.character).is_some_and(|targets| targets.contains(&failure.target))
+        || st.locking.get(&(failure.character, failure.target))
+            .is_some_and(|current| current.attempt == failure.attempt || current.ui_owner.is_some())
+    {
+        return false;
+    }
+    emit();
+    true
+}
+
 
 pub(crate) fn targets_of(char_id: i64) -> Vec<i64> {
     state().targets.get(&char_id).map(|t| t.iter().copied().collect()).unwrap_or_default()
 }
 
 pub(in crate::services) fn cancel_target(character: i64, target: i64) {
-    state().locking.remove(&(character, target));
+    if let Some(mut lock) = state().locking.remove(&(character, target)) {
+        publish_pending_failure(character, target, &mut lock);
+    }
 }
 
 pub(crate) fn has_target(character: i64, target: i64) -> bool {
     state().targets.get(&character).is_some_and(|targets| targets.contains(&target))
 }
 
+/// Ok(None): the character has no completed lock; Ok(Some(id)): exactly one;
+/// Err(()): more than one. Pending lock attempts never count.
+pub(crate) fn sole_target(character: i64) -> Result<Option<i64>, ()> {
+    let state = state();
+    let mut targets = state.targets.get(&character).into_iter().flatten();
+    let Some(&target) = targets.next() else { return Ok(None) };
+    if targets.next().is_some() { return Err(()) }
+    Ok(Some(target))
+}
+
 impl State {
-    pub(super) fn begin_lock(&mut self, ship: i64, pilot: i64, target: i64, attempt: u64, now: i64) -> bool {
+    pub(super) fn begin_lock(&mut self, ship: i64, pilot: i64, target: i64, attempt: u64, now: i64, ui_owner: Option<crate::space::NotifyTx>) -> bool {
         if jamming::jammed_in(self, ship, now) { return false; }
-        self.locking.insert((pilot, target), attempt);
+        self.locking.insert((pilot, target), PendingLock { attempt, ui_owner });
         true
     }
 
     pub(super) fn complete_lock(&mut self, ship: i64, pilot: i64, target: i64, attempt: u64, now: i64, present: bool) -> (bool, bool) {
-        let wanted = self.locking.get(&(pilot, target)) == Some(&attempt);
-        if wanted { self.locking.remove(&(pilot, target)); }
+        let wanted = self.locking.get(&(pilot, target)).is_some_and(|lock| lock.attempt == attempt);
+        let removed = if wanted { self.locking.remove(&(pilot, target)) } else { None };
         let completed = wanted && present && !jamming::jammed_in(self, ship, now);
-        if completed { self.targets.entry(pilot).or_default().insert(target); }
+        if completed {
+            self.targets.entry(pilot).or_default().insert(target);
+        } else if let Some(mut lock) = removed { publish_pending_failure(pilot, target, &mut lock); }
         (wanted, completed)
     }
 }
@@ -72,99 +125,37 @@ fn targeters_in(st: &State, ship: i64) -> Vec<i64> {
 /// `OnTarget('add', targetID)`.
 pub(in crate::services) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some(cx) = ctx(c) else { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])) };
-    add_target_ctx(&cx, target, false).await
+    add_target_impl(&cx, target, false, None, Some(cx.notify.clone())).await
 }
 
 pub(crate) async fn add_target_ctx(cx: &Ctx, target: i64, silent: bool) -> CallResult {
-    add_target_impl(cx, target, silent, None).await
+    add_target_impl(cx, target, silent, None, None).await
 }
 
 pub(in crate::services) async fn add_target_for_cycle(cx: &Ctx, target: i64, silent: bool, module: i64, generation: Arc<AtomicBool>) -> CallResult {
-    add_target_impl(cx, target, silent, Some((module, generation))).await
+    // A passive lock answers the client's own targeting request, so it owns the
+    // UI's waiting state; an automatic cycle's attempt does not.
+    add_target_impl(cx, target, silent, Some((module, generation)), silent.then(|| cx.notify.clone())).await
 }
 
-async fn add_target_impl(cx: &Ctx, target: i64, silent: bool, owner: Option<(i64, Arc<AtomicBool>)>) -> CallResult {
+async fn add_target_impl(cx: &Ctx, target: i64, silent: bool, owner: Option<(i64, Arc<AtomicBool>)>, ui_owner: Option<crate::space::NotifyTx>) -> CallResult {
     crate::services::effects::cloak::before_lock(cx).await?;
-    let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else {
-        return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
+    let request = locking::LockRequest {
+        character: cx.char_id,
+        ship: cx.ship_id,
+        system: cx.system_id,
+        target,
+        silent,
+        owner,
+        ui_owner,
+        notify: cx.notify.clone(),
     };
-    if ship.char_id != Some(cx.char_id) || (ship.cloak != 0 && ship.cloak != crate::space::CLOAK_RESTORE) || t.cloak != 0 || target == ship_id {
-        return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
-    }
-    let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
-    let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
-    let gap = dist(ship.pos, t.pos) - t.radius as f64;
-    if gap > range {
-        let text = messages::target_lock_range(metres_to_km(gap), metres_to_km(range));
-        return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(text))]));
-    }
-    // The ship's limit, capped by the pilot's (Targeting skills).
-    let pilot_limit = fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS);
-    let ship_limit = fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS);
-    let max_targets = if pilot_limit > 0.0 { ship_limit.min(pilot_limit) } else { ship_limit } as usize;
-    let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(cx.world.sde(), t.type_id, ATTR_SIGNATURE_RADIUS, t.radius as f64));
-    let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
-    let char_id = cx.char_id;
-    let acquisition_owner = owner.clone();
-    let current = cx.world.with(cx.system_id, move |s| {
-        if !s.contains(ship_id) || !s.contains(target) || jamming::is_jammed(ship_id, s.now_ms()) {
-            return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
-        }
-        let mut st = state();
-        if !lock_owner_valid(&st, acquisition_owner.as_ref()) {
-            return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
-        }
-        let current: Vec<_> = st.targets.get(&char_id).map(|targets| targets.iter().copied().collect()).unwrap_or_default();
-        if current.contains(&target) || st.locking.contains_key(&(char_id, target)) {
-            return Ok((false, st.locking.contains_key(&(char_id, target)), current));
-        }
-        if current.len() >= max_targets.max(1) {
-            return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::target_limit(max_targets.max(1))))]));
-        }
-        if !st.begin_lock(ship_id, char_id, target, attempt, s.now_ms()) {
-            return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
-        }
-        drop(st);
-        s.drop_jump_cloak(ship_id);
-        Ok((true, true, current))
-    }).await.ok_or_else(|| user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]))??;
-    if !current.0 {
-        return Ok(Value::tuple([Value::Bool(current.1), Value::list(current.2.into_iter().map(Value::Int))]));
-    }
-    debug!("locking {target} in {delay}ms");
-    let current = current.2;
-    let world = cx.world.clone();
-    let cx = cx.clone();
-    world.schedule(cx.system_id, delay, move |s| {
-        let valid = !jamming::is_jammed(ship_id, s.now_ms()) && s.sampled_ball(ship_id).zip(s.sampled_ball(target)).is_some_and(|(ship, t)|
-            ship.char_id == Some(cx.char_id) && ship.cloak == 0 && t.cloak == 0
-                && dist(ship.pos, t.pos) - t.radius as f64 <= range);
-        let pilot = s.ball(target).and_then(|ball| ball.char_id);
-        let (still_wanted, added) = {
-            let mut st = state();
-            let result = finish_lock(&mut st, ship_id, cx.char_id, target, attempt, s.now_ms(), valid, max_targets, owner.as_ref());
-            if result.1 && !silent {
-                if let Some(pilot) = pilot { st.announced_locks.insert((cx.char_id, target), (ship_id, pilot)); }
-            }
-            result
-        };
-        if added {
-            if let Some(char_id) = pilot {
-                crate::progress::publish_live(s.progress_registry(), &crate::lua::events::GameEvent::Targeted {
-                    char_id, by_ball_id: ship_id, system_id: cx.system_id,
-                });
-            }
-            notify_lock(target, ship_id, silent, |args| cx.notify("OnTarget", args), |args| {
-                if let Some(pilot) = pilot {
-                    s.notify_pilot(pilot, "OnTarget", args);
-                }
-            });
-        } else if still_wanted {
-            cx.notify("OnTarget", vec![Value::str("lost"), Value::Int(target), Value::None]);
-        }
-    });
-    Ok(Value::tuple([Value::Bool(true), Value::list(current.into_iter().map(Value::Int))]))
+    let sde = cx.world.sde().clone();
+    // Ball positions, scene membership and the resident fitted locking limits
+    // are read in one actor turn, which also registers the completion timer.
+    cx.world.with(cx.system_id, move |s| locking::add_in_system(s, &sde, request))
+        .await
+        .ok_or_else(|| user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]))?
 }
 
 fn lock_owner_valid(st: &State, owner: Option<&(i64, Arc<AtomicBool>)>) -> bool {
@@ -186,17 +177,25 @@ fn notify_lock(target: i64, ship: i64, silent: bool, owner: impl FnOnce(Vec<Valu
 pub(crate) fn drop_targets(identity: &Identity, world: &World, space_system: Option<i64>, targets: &[i64], mut notify: impl FnMut(&str, Vec<Value>)) {
     let char_id = identity.char_id;
     if char_id == 0 { return; }
-    let (removed, notices) = {
+    let (removed, pending, notices) = {
         let mut st = state();
-        for target in targets { st.locking.remove(&(char_id, *target)); }
+        let mut pending = Vec::new();
+        for target in targets {
+            if let Some(mut lock) = st.locking.remove(&(char_id, *target)) {
+                publish_pending_failure(char_id, *target, &mut lock);
+                pending.push(*target);
+            }
+        }
         let removed: Vec<_> = targets.iter().copied().filter(|t| st.targets.get_mut(&char_id).is_some_and(|set| set.remove(t))).collect();
         let notices = take_announced(&mut st, |ch, target| ch == char_id && targets.contains(&target));
-        (removed, notices)
+        (removed, pending, notices)
     };
     notify_lost(world, notices);
     remove_target_projections(identity, world, space_system, removed);
     for t in targets {
-        notify("OnTarget", vec![Value::str("lost"), Value::Int(*t), Value::None]);
+        if !pending.contains(t) {
+            notify("OnTarget", vec![Value::str("lost"), Value::Int(*t), Value::None]);
+        }
     }
 }
 
@@ -225,18 +224,17 @@ fn notify_lost(world: &World, notices: Vec<(i64, i64)>) {
     }
 }
 
-pub(super) fn clear_character_lock_state(st: &mut State, character: i64) -> (HashSet<i64>, HashSet<i64>, Vec<(i64, i64)>) {
-    let mut pending = HashSet::new();
-    st.locking.retain(|&(ch, target), _| {
-        if ch == character { pending.insert(target); false } else { true }
+pub(super) fn clear_character_lock_state(st: &mut State, character: i64) -> (HashSet<i64>, Vec<(i64, i64)>) {
+    st.locking.retain(|&(ch, target), lock| {
+        if ch == character { publish_pending_failure(ch, target, lock); false } else { true }
     });
     let targets = st.targets.remove(&character).unwrap_or_default();
     let notices = take_announced(st, |ch, _| ch == character);
-    (targets, pending, notices)
+    (targets, notices)
 }
 
 pub(in crate::services) fn clear_character_locks(world: &World, character: i64) -> Vec<i64> {
-    let (targets, _, notices) = clear_character_lock_state(&mut state(), character);
+    let (targets, notices) = clear_character_lock_state(&mut state(), character);
     notify_lost(world, notices);
     targets.into_iter().collect()
 }
@@ -265,7 +263,9 @@ pub(in crate::services) fn clear_locks_on(world: &World, system: i64, ship: i64,
 }
 
 fn clear_lock_state(st: &mut State, ship: i64, owner: i64) -> (Vec<i64>, HashSet<i64>) {
-    st.locking.retain(|(character, target), _| *character != owner && *target != ship);
+    st.locking.retain(|&(character, target), lock| {
+        if character == owner || target == ship { publish_pending_failure(character, target, lock); false } else { true }
+    });
     let outgoing = st.targets.remove(&owner).unwrap_or_default();
     let incoming = st.targets.iter_mut()
         .filter_map(|(&character, targets)| targets.remove(&ship).then_some(character)).collect();
@@ -276,7 +276,9 @@ fn clear_lock_state(st: &mut State, ship: i64, owner: i64) -> (Vec<i64>, HashSet
 pub(super) fn forget_target(world: &World, target: i64) {
     let (holders, notices) = {
         let mut st = state();
-        st.locking.retain(|(_, t), _| *t != target);
+        st.locking.retain(|&(character, t), lock| {
+            if t == target { publish_pending_failure(character, t, lock); false } else { true }
+        });
         let holders: Vec<i64> = st.targets.iter_mut().filter_map(|(ch, set)| set.remove(&target).then_some(*ch)).collect();
         let notices = take_announced(&mut st, |_, t| t == target);
         (holders, notices)
@@ -334,10 +336,10 @@ async fn unload_to<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbo
     let Some((type_id, qty)) = loaded(db, ship, module.flag_id).await? else { return Ok(None) };
     if prep.type_id != type_id { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
     crate::services::inventory::hold_storage::check_destination(db, sde, prep.destination.capacity_owner, prep.destination.location, prep.destination.flag,
-        &[crate::services::inventory::hold_storage::Addition { type_id, singleton: false, quantity: i64::from(qty) }], Default::default(), None).await?;
+        &[crate::services::inventory::hold_storage::Addition { type_id, singleton: false, quantity: i64::from(qty) }], Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await?;
     crate::dao::items::combat::delete_charge(db, ship, module.flag_id).await.map_err(db_err)?;
     outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
-    deposit_prepared(db, sde, outbox, prep, qty, ship, Some(locks), parent, Default::default(), None).await.map(Some)
+    deposit_prepared(db, sde, outbox, prep, qty, ship, Some(locks), parent, Default::default(), crate::services::inventory::hold_storage::CapacitySource::Current).await.map(Some)
 }
 
 // Unlike value_ids, scalar module IDs accept Bool through as_int; lists take precedence.
@@ -430,6 +432,16 @@ fn compatible_charge(sde: &Sde, module_type: i32, charge: &Item) -> bool {
         size.and_then(|id| module.attribute(id)), size.and_then(|id| charge_type.attribute(id)))
 }
 
+/// Whether the module type declares charge compatibility: any positive charge
+/// group or a positive charge size. Unknown types conservatively require one.
+pub(crate) fn requires_loaded_charge(sde: &Sde, module_type: i32) -> bool {
+    let Some(module) = sde.types.get(module_type) else { return true };
+    CHARGE_GROUP_ATTRIBUTES.iter().flat_map(|name| sde.dogma.attributes_by_name(name))
+        .any(|attr| module.attribute(attr.attribute_id).is_some_and(|value| value > 0.0))
+        || sde.dogma.attributes_by_name("chargeSize").next()
+            .and_then(|attr| module.attribute(attr.attribute_id)).is_some_and(|value| value > 0.0)
+}
+
 pub(super) type ReservedLoad = (i64, i32, i32, i64, i64);
 
 #[derive(Clone)]
@@ -456,111 +468,6 @@ pub(super) fn clear_reload_markers(reloading: &mut HashMap<i64, i64>, ids: &[i64
     }
 }
 
-/// Put loaded charges in their modules and tell the client.
-async fn apply_loads(db: &Db, world: &World, notify: &NotifyTx, ship: i64, mut loads: Vec<PendingLoad>) -> Result<(), CallError> {
-    loads.sort_by_key(|load| load.reload_ids.first().copied());
-    let mut owners: Vec<_> = loads.iter().filter(|load| load.load.4 == 0).map(|load| load.owner).collect();
-    owners.sort_unstable();
-    owners.dedup();
-    let fences = if owners.is_empty() { None } else { Some(online::capture_online_fences(world, &owners).await) };
-    let sde = world.sde().clone();
-    db.transaction(
-        |tx, outbox: &mut Outbox<OnlineChanged>| {
-            let loads = loads.clone();
-            let notify = notify.clone();
-            let fences = fences.clone();
-            let sde = sde.clone();
-            Box::pin(async move {
-                let mut locations: Vec<_> = loads.iter().flat_map(|load| load.external_sources.iter().copied())
-                    .filter(|&location| location != ship && !is_static_location(&sde, location)).collect();
-                let external = !locations.is_empty();
-                let exists = if external {
-                    let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
-                    locations.sort_unstable();
-                    locations.dedup();
-                    let mut lineages = Vec::new();
-                    let mut requests = vec![LockRequest { item_id: ship, strength: LockStrength::Update }];
-                    for &location in &locations {
-                        let ancestry = crate::dao::items::deliveries::ancestry(tx, location).await.map_err(db_err)?;
-                        requests.extend(destination::parent_requests(&sde, ancestry.iter().map(|row| (row.item_id, row.type_id)), LockStrength::Update, LockStrength::Share)?);
-                        if ancestry.iter().any(|row| row.item_id == location) {
-                            requests.push(LockRequest { item_id: location, strength: LockStrength::Update });
-                        }
-                        lineages.push((location, ancestry));
-                    }
-                    let locks = destination::lock_items(tx, &sde, &requests, &[]).await?;
-                    for (location, ancestry) in &lineages {
-                        if crate::dao::items::deliveries::ancestry(tx, *location).await.map_err(db_err)? != *ancestry {
-                            return Err(refuse());
-                        }
-                    }
-                    locks.is_write_locked(ship)
-                } else {
-                    crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?
-                };
-                let mut entries: Vec<(i64, ReservedLoad)> = Vec::new();
-                for pending in loads {
-                    let mut quantity = 0_i128;
-                    let mut owner = None;
-                    for id in pending.reload_ids {
-                        match crate::dao::items::pending_reloads::take(tx, id).await.map_err(db_err)? {
-                            Some(row) => {
-                                if external && (row.owner_id != pending.owner || row.ship_id != ship
-                                    || row.module_id != pending.load.0 || row.flag_id != pending.load.1 || row.type_id != pending.load.2
-                                    || (row.source_location_id != ship && !is_static_location(&sde, row.source_location_id)
-                                        && !pending.external_facts.iter().any(|fact| fact == &row))
-                                    || pending.external_facts.iter().find(|fact| fact.reload_id == id).is_some_and(|fact| *fact != row)) {
-                                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-                                }
-                                if row.source_location_id != ship && !is_static_location(&sde, row.source_location_id)
-                                    && !pending.external_sources.contains(&row.source_location_id) {
-                                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-                                }
-                                quantity = quantity.checked_add(i128::from(row.quantity)).ok_or_else(|| CallError::Internal(anyhow::anyhow!("reload quantity overflow")))?;
-                                owner = Some(row.owner_id);
-                            }
-                            None if external => return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)),
-                            None => {}
-                        }
-                    }
-                    if !exists || quantity == 0 { continue; }
-                    let (module, flag, type_id, _, have) = pending.load;
-                    let total = i128::from(have).checked_add(quantity).ok_or_else(|| CallError::Internal(anyhow::anyhow!("reload quantity overflow")))?;
-                    let now = i64::try_from(total).map_err(|_| CallError::Internal(anyhow::anyhow!("reload quantity overflow")))?;
-                    entries.push((owner.unwrap(), (module, flag, type_id, now, have)));
-                }
-                if !entries.is_empty() {
-                    entries.sort_by_key(|(_, load)| load.1);
-                    let actual_owner = entries[0].0;
-                    let before = if entries.iter().any(|(_, load)| load.4 == 0) {
-                        Some(online::fitting::capture(tx, &sde, fences.as_ref().expect("cold candidate fences"), actual_owner, ship).await?)
-                    } else { None };
-                    let loads: Vec<ReservedLoad> = entries.iter().map(|(_, load)| *load).collect();
-                    crate::dao::items::combat::apply_loads(tx, ship, &loads).await.map_err(db_err)?;
-                    for (owner, (module, flag, type_id, now, have)) in entries {
-                        if have == 0 {
-                            outbox.notify_sender(notify.clone(), "OnGodmaPrimeItem", vec![Value::Int(ship), crate::services::dogma::info::charge_info(&sde, ship, flag, type_id, now)]);
-                        } else {
-                            outbox.notify_sender(notify.clone(), "OnModuleAttributeChanges", vec![quantity_change(owner, ship, flag, type_id, now as i64, have as i64)]);
-                        }
-                        debug!("loaded {now} x {type_id} into module {module}");
-                    }
-                    if let Some(before) = before {
-                        let final_fit = Fit::load(tx, sde.clone(), actual_owner, ship).await?;
-                        online::fitting::finish(tx, before, final_fit, outbox).await?;
-                    }
-                    return Ok(Some(actual_owner));
-                }
-                Ok(None)
-            })
-        },
-        |value, outbox| async move {
-            online::dispatch_mixed_entries(value, outbox, world, Ok, |_| unreachable!(),
-                |n| online::dispatch_notification(n, world, notify, value))
-        },
-    ).await.map(|_| ())
-}
-
 /// UnloadAmmo(shipID, moduleID | [moduleIDs], destination[, quantity]); destination is a
 /// container ID or (containerID, ownerID, flag).
 pub(in crate::services) async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
@@ -583,7 +490,6 @@ pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, mod
     let owner = identity.char_id;
     let refuse = || notify_error(messages::INSUFFICIENT_AMMUNITION);
     if owner == 0 { return Err(refuse()); }
-    let _market = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
     let container = if identity.station_id == Some(location) {
@@ -597,13 +503,24 @@ pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, mod
         load_items(&db, &sde, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next()
     };
     let fences = online::capture_online_fences(&c.world, &[owner]).await;
-    db.transaction(
+    let armed = super::loaded::LoadedHolds::arm(&c.world, &identity.system_id.map(|system| (system, ship)).into_iter().collect::<Vec<_>>(), notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let _market = crate::services::market::lock().await;
+    let mut holds = super::loaded::LoadedHolds::lock(&c.world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
+    let settle = holds.settle_rows();
+    let engaged_ship = holds.held(ship);
+    let charge_view = holds.view(ship);
+    let world = c.world.clone();
+    let notify = c.notify_tx.clone();
+    holds.may_execute();
+    let result = db.transaction(
         |tx, outbox: &mut Outbox<OnlineChanged>| {
             let modules = modules.clone();
             let sde = sde.clone();
             let reach = reach.clone();
             let audience = audience.clone();
             let container = container.clone();
+            let settle = settle.clone();
+            let charge_view = charge_view.clone();
             let ancestry = ancestry.clone();
             let parent = parent.clone();
             let fences = fences.clone();
@@ -616,7 +533,7 @@ pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, mod
                     for &id in &ids {
                         if let Some(module) = load_items(tx, &sde, ItemQuery::IdAt(id, ship)).await.map_err(db_err)?.into_iter().next() {
                             if module.owner_id != owner || !super::super::inventory::is_fitting_flag(module.flag_id) { return Err(refuse()); }
-                            let charge = loaded(tx, ship, module.flag_id).await?;
+                            let charge = if engaged_ship { charge_view.get(&module.flag_id).copied() } else { loaded(tx, ship, module.flag_id).await? };
                             let (prep, canonical) = if let Some((type_id, _)) = charge {
                                 if let Some(index) = selected.iter().position(|(_, _, prep, _): &(Item, _, Option<DepositPreparation>, _)| prep.as_ref().is_some_and(|prep| prep.destination == destination && prep.type_id == type_id)) {
                                     (None, Some(index))
@@ -659,6 +576,8 @@ pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, mod
                 for (m, ids) in &banks {
                     if bank(tx, ship, *m).await? != *ids { return Err(refuse()); }
                 }
+                // The charge-row drift reads below compare against the settled absolute.
+                crate::services::combat::loaded::settle_in(tx, &settle).await?;
                 for (module, charge, _, _) in &selected {
                     let current = load_items(tx, &sde, ItemQuery::IdAt(module.item_id, ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
                     if current.owner_id != module.owner_id || current.type_id != module.type_id || current.flag_id != module.flag_id
@@ -691,15 +610,20 @@ pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, mod
                     let final_fit = Fit::load(tx, sde.clone(), owner, ship).await?;
                     online::fitting::finish(tx, before, final_fit, outbox).await?;
                 }
-                Ok(Value::None)
+                let touched: Vec<_> = selected.iter().filter(|(_, charge, _, _)| charge.is_some())
+                    .map(|(module, _, _, _)| (module.item_id, module.flag_id)).collect();
+                let seeds = super::loaded::seed_entries(tx, ship, &touched).await?;
+                Ok((Value::None, seeds))
             })
         },
         |value, outbox| async move {
-            online::dispatch_mixed_entries(value, outbox, &c.world, Ok, |_| unreachable!(),
-                |n| online::dispatch_notification(n, &c.world, &c.notify_tx, Some(owner)))
+            online::dispatch_mixed_entries(value, outbox, &world, Ok, |_| unreachable!(),
+                |n| online::dispatch_notification(n, &world, &notify, Some(owner)))
         },
-    ).await
+    ).await;
+    let seeds = match &result { Ok((_, seeds)) => vec![(ship, seeds.clone())], _ => Vec::new() };
+    holds.finish(&c.db, &c.world, result, &seeds).await.map(|(value, _)| value)
 }
 
 
-#[cfg(test)] pub(in crate::services) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;

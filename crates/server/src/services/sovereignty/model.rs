@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use crate::{db::Db, sde::Sde, space::World};
 use crate::dao::sovereignty::{capture::CaptureRow, policy::PolicyRow, sources::SourceChange, structures::HubRow, systems::SystemRow};
+use super::indices::model::DevelopmentPublication;
 
 #[derive(Debug)]
 pub(crate) struct StalePlan;
@@ -80,6 +81,8 @@ pub(crate) struct CommittedPublication {
     pub sources: Vec<SourceChange>,
     pub hubs: Vec<HubPublication>,
     pub capitals: Vec<CapitalPublication>,
+    /// Committed development-index rows carried by the same outbox variant.
+    pub development: Vec<DevelopmentPublication>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

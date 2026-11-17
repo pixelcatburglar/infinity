@@ -151,5 +151,5 @@ pub(crate) fn encode_content_text(response: Response<'_>) -> Result<String> {
     Ok(result.to_text_format())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;

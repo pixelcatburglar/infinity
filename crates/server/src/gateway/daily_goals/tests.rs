@@ -67,7 +67,7 @@ async fn actual_gateway_routes_and_qa_preflight() {
     let version = format!("gateway-{}", crate::handshake::random_u64());
     source(&root, &version, false);
     let registry = crate::progress::Registry::new(vec![], vec![daily::progress::registration()]).unwrap();
-    let (db, resources) = environment(&root, false, registry).await;
+    let (db, resources) = environment(&root, registry).await;
     let owner = fixture::create(&db).await.unwrap();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     resources.world.register_pilot(owner.character, tx);
@@ -76,18 +76,12 @@ async fn actual_gateway_routes_and_qa_preflight() {
         station_id: None, system_id: None, corporation_id: None, alliance_id: None,
         faction_id: None, fleet_id: None, role: 0, corporation_role: 0,
     }));
-    let package = crate::dao::lua_content::load(&db, "daily_goals", &version).await.unwrap().unwrap();
     let second = format!("{version}-other");
     source(&root, &second, false);
     reload().await;
     let bounds = crate::dao::daily_goals::periods::bounds(&db, crate::client::filetime_now()).await.unwrap();
-    db.transaction(|tx, _: &mut ()| {
-        let package = package.clone();
-        Box::pin(async move {
-            crate::dao::lua_content::activations::append_if_changed(tx, &package, bounds.month_start - infinity_core::consts::FILETIME_DAY).await?;
-            Ok::<_, crate::db::Error>(())
-        })
-    }, |(), ()| async { Ok(()) }).await.unwrap();
+    source(&root, &version, false);
+    crate::lua::reload::tests::publish_at(bounds.month_start - infinity_core::consts::FILETIME_DAY).await.unwrap();
     source(&root, &version, false);
     reload().await;
     let gateway = Gateway::new(db.clone(), resources.world.clone(), Arc::new(crate::config::Config::default()));
@@ -175,7 +169,7 @@ async fn actual_gateway_routes_and_qa_preflight() {
             reload().await;
             let rejected_uuid = [20 + index as u8; UUID_LEN];
             assert_eq!(handle_request(&qa_gateway, envelope(&admin, owner.account, owner.character, rejected_uuid.to_vec()), None).await.status_code, 500);
-            assert!(crate::dao::daily_goals::receipts::audit(&db, &crate::uuid_text::format(&rejected_uuid)).await.unwrap().is_none());
+            assert!(crate::dao::daily_goals::receipts::audit(&db, &infinity_content::uuid_text::format(&rejected_uuid)).await.unwrap().is_none());
             let mut after = crate::dao::daily_goals::instances::period(&db, owner.character, "day", bounds.day_start).await.unwrap();
             after.sort_by(|a, b| a.goal_id.cmp(&b.goal_id));
             assert_eq!(after, before);
@@ -189,9 +183,9 @@ async fn actual_gateway_routes_and_qa_preflight() {
         let response = handle_request(&qa_gateway, envelope(&admin, owner.account, owner.character, correlation.to_vec()), None).await;
         assert_eq!(response.status_code, 200);
         assert_eq!(response.correlation_uuid, correlation);
-        let audit = crate::dao::daily_goals::receipts::audit(&db, &crate::uuid_text::format(&correlation)).await.unwrap().unwrap();
+        let audit = crate::dao::daily_goals::receipts::audit(&db, &infinity_content::uuid_text::format(&correlation)).await.unwrap().unwrap();
         assert_eq!(audit.actor_id, owner.character);
-        assert!(crate::dao::daily_goals::receipts::audit(&db, &crate::uuid_text::format(&[9; UUID_LEN])).await.unwrap().is_none());
+        assert!(crate::dao::daily_goals::receipts::audit(&db, &infinity_content::uuid_text::format(&[9; UUID_LEN])).await.unwrap().is_none());
         let rows = crate::dao::daily_goals::instances::period(&db, owner.character, "day", bounds.day_start).await.unwrap();
         let mut committed = rows.clone();
         committed.sort_by(|a, b| a.goal_id.cmp(&b.goal_id));
@@ -202,8 +196,8 @@ async fn actual_gateway_routes_and_qa_preflight() {
         assert_eq!(replayed, committed);
         let ordinary: Vec<_> = rows.iter().filter(|row| row.category == "ordinary").collect();
         assert!(ordinary.len() >= 2);
-        let first_id = crate::uuid_text::parse(&ordinary[0].goal_id, crate::uuid_text::Case::Either).unwrap();
-        let second_id = crate::uuid_text::parse(&ordinary[1].goal_id, crate::uuid_text::Case::Either).unwrap();
+        let first_id = infinity_content::uuid_text::parse(&ordinary[0].goal_id, infinity_content::uuid_text::Case::Either).unwrap();
+        let second_id = infinity_content::uuid_text::parse(&ordinary[1].goal_id, infinity_content::uuid_text::Case::Either).unwrap();
         let mut finish = with_goal(ADMIN_PROGRESS, first_id.to_vec());
         let mut character = child(&finish.descriptor(), "character").unwrap();
         set(&mut character, "sequential", Value::U32(u32::try_from(owner.character).unwrap())).unwrap();

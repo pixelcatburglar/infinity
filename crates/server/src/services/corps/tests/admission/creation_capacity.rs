@@ -318,4 +318,73 @@ async fn all_management_skill_level_combinations_use_sde_bonuses() {
     result.unwrap();
 }
 
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL and external flock"]
+async fn last_corporation_id_allocates_max_then_refuses_next_founder() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let first = fixture::create(&db).await.unwrap();
+    let second = fixture::create(&db).await.unwrap();
+    let test_db = db.clone();
+    let row = test_db.query_one("SELECT last_value,is_called FROM game.corporations_corporation_id_seq", &[]).await.unwrap();
+    let (saved_value, saved_called) = (row.get::<_, i64>("last_value"), row.get::<_, bool>("is_called"));
+    const FOUNDER_STATE: &str = "SELECT (SELECT balance::text FROM game.characters WHERE character_id=$1) || '|' || (SELECT corporation_id FROM game.characters WHERE character_id=$1) || '|' || (SELECT corp_roles FROM game.characters WHERE character_id=$1) || '|' || (SELECT count(*) FROM game.employment_history WHERE char_id=$1) || '|' || (SELECT count(*) FROM game.corp_shares WHERE shareholder_id=$1) || '|' || (SELECT count(*) FROM game.corp_member_events WHERE character_id=$1 OR issuer_id=$1) || '|' || (SELECT count(*) FROM game.corp_role_history WHERE character_id=$1 OR issuer_id=$1) || '|' || (SELECT count(*) FROM game.corporations WHERE creator_id=$1 OR ceo_id=$1) AS state";
+    let result = crate::tests::catch_scenario(async {
+        let (mut first_client, _first_peer) = tests::client(test_db.clone(), first.character).await;
+        let (mut second_client, _second_peer) = tests::client(test_db.clone(), second.character).await;
+        let skill = super::super::super::SKILL_CORPORATION_MANAGEMENT;
+        let level = i32::try_from(crate::config::game().corporations.min_management_skill_level).unwrap().max(1);
+        let starting = super::super::super::STARTUP_COST * 2;
+        for (client, founder) in [(&mut first_client, first.character), (&mut second_client, second.character)] {
+            client.session.apply(vec![("corpid", Value::Int(1)), ("stationid", Value::Int(1))]);
+            test_db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0)", &[&founder, &skill, &level]).await.unwrap();
+            test_db.execute("UPDATE game.characters SET balance=$2::text::numeric WHERE character_id=$1", &[&founder, &starting.to_string()]).await.unwrap();
+        }
+        let first_ticker = unique_ticker(&test_db, &first_client.sde, first.character).await;
+        let mut seed = second.character;
+        let second_ticker = loop {
+            let ticker = unique_ticker(&test_db, &first_client.sde, seed).await;
+            if ticker != first_ticker { break ticker; }
+            seed += 1;
+        };
+        let args = |character: i64, ticker: String| [Value::unicode(format!("Fixture Boundary {character}")), Value::unicode(ticker), Value::unicode("description"), Value::unicode(""), Value::Float(0.0), Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::None, Value::Bool(true), Value::Bool(false), Value::Float(0.0)];
+        let second_state = test_db.query_one(FOUNDER_STATE, &[&second.character]).await.unwrap().get::<_, String>("state");
+        test_db.query_one("SELECT setval('game.corporations_corporation_id_seq', $1, true)", &[&(infinity_core::consts::MAX_PLAYER_CORPORATION_ID - 1)]).await.unwrap();
+        let corp = rpc(&mut first_client, "AddCorporation", &args(first.character, first_ticker), 1).await.unwrap().as_int().unwrap();
+        assert_eq!(corp, infinity_core::consts::MAX_PLAYER_CORPORATION_ID);
+        assert_eq!(corp_of(&test_db, first.character).await, corp);
+        assert_eq!(crate::services::wallets::balance(&test_db, first.character).await.unwrap(), crate::isk::IskAmount::from_whole_isk(starting).unwrap().checked_sub(crate::isk::IskAmount::from_whole_isk(super::super::super::STARTUP_COST).unwrap()).unwrap());
+        let shares: i64 = test_db.query_one("SELECT shares FROM game.corp_shares WHERE corporation_id=$1 AND shareholder_id=$1", &[&corp]).await.unwrap().get("shares");
+        assert_eq!(shares, crate::config::game().corporations.initial_shares);
+        let events: Vec<i32> = test_db.query("SELECT event_type_id FROM game.corp_member_events WHERE corporation_id=$1 AND character_id=$2 ORDER BY event_type_id", &[&corp, &first.character]).await.unwrap().iter().map(|row| row.get("event_type_id")).collect();
+        assert_eq!(events, [super::super::super::audit::CREATED, super::super::super::audit::BECAME_CEO, super::super::super::audit::JOINED]);
+        let error = rpc(&mut second_client, "AddCorporation", &args(second.character, second_ticker), 1).await.unwrap_err();
+        match error {
+            crate::services::CallError::User { msg, dict } => {
+                assert_eq!(msg, infinity_core::messages::MSG_CUSTOM_NOTIFY);
+                assert_eq!(dict, vec![("notify".to_owned(), Value::unicode(infinity_core::messages::corporations::CORPORATION_IDS_EXHAUSTED))]);
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
+        assert_eq!(test_db.query_one(FOUNDER_STATE, &[&second.character]).await.unwrap().get::<_, String>("state"), second_state, "refused founding changed the second founder");
+        assert_eq!(corp_of(&test_db, first.character).await, corp);
+        assert!(test_db.query_one("SELECT NOT deleted AS live FROM game.corporations WHERE corporation_id=$1", &[&corp]).await.unwrap().get::<_, bool>("live"));
+        let row = test_db.query_one("SELECT last_value,is_called FROM game.corporations_corporation_id_seq", &[]).await.unwrap();
+        assert_eq!((row.get::<_, i64>("last_value"), row.get::<_, bool>("is_called")), (infinity_core::consts::MAX_PLAYER_CORPORATION_ID, true), "exhausted sequence moved");
+    }).await;
+    let cleanup = crate::tests::catch_scenario(async {
+        let founders = vec![first.character, second.character];
+        test_db.execute("DELETE FROM game.corp_member_events WHERE character_id=ANY($1) OR issuer_id=ANY($1)", &[&founders]).await.unwrap();
+        test_db.execute("DELETE FROM game.corp_role_history WHERE character_id=ANY($1) OR issuer_id=ANY($1)", &[&founders]).await.unwrap();
+        cleanup_founder(&test_db, first, &[second]).await;
+    }).await;
+    // The saved sequence state is restored even when the scenario or cleanup
+    // failed; the readback asserts restoration before a panic is resumed.
+    test_db.query_one("SELECT setval('game.corporations_corporation_id_seq', $1, $2)", &[&saved_value, &saved_called]).await.unwrap();
+    let row = test_db.query_one("SELECT last_value,is_called FROM game.corporations_corporation_id_seq", &[]).await.unwrap();
+    assert_eq!((row.get::<_, i64>("last_value"), row.get::<_, bool>("is_called")), (saved_value, saved_called), "corporation sequence not restored");
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+}
+
 mod exit_boundaries;

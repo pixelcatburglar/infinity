@@ -146,5 +146,5 @@ pub(crate) async fn send_mail(db: &Db, world: &World, me: i64, _corpid: Option<i
     ).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

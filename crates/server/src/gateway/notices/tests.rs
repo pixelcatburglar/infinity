@@ -268,3 +268,61 @@ async fn bind_compare_and_swap_preserves_concurrent_replacement() {
     hub.dispatch(notice(Target::Character(9)), |id| (id == winner.character_id).then(|| winner.clone()));
     assert!(stream.rx.try_recv().is_ok());
 }
+
+#[tokio::test]
+async fn dropped_corporation_publication_is_removed_on_the_next_acquire() {
+    let hub = NoticeHub::new();
+    drop(hub.corporation_publication(20).await);
+    let held = hub.corporation_publication(21).await;
+    assert_eq!(hub.publication_corporations(), vec![21]);
+    drop(held);
+}
+
+#[tokio::test]
+async fn corporation_filters_follow_retarget_and_ordinary_notices_do_not_gain_them() {
+    use std::sync::Arc;
+    let hub = NoticeHub::new();
+    let origin = [1u8; 16];
+    let other = [2u8; 16];
+    let member = session();
+    let outsider = OnlineSession { character_id: 8, user_id: Some(-9), session_id: 2, corporation_id: Some(10), ..session() };
+    let departed = OnlineSession { character_id: 7, corporation_id: Some(99), ..session() };
+    let origin_lease = hub.lease(origin);
+    origin_lease.bind(&member, |id| (id == member.character_id).then(|| member.clone()));
+    let mut origin_stream = hub.register(origin, 4);
+    let other_lease = hub.lease(other);
+    other_lease.bind(&member, |id| (id == member.character_id).then(|| member.clone()));
+    let mut other_stream = hub.register(other, 4);
+    let outsider_app = [3u8; 16];
+    let outsider_lease = hub.lease(outsider_app);
+    outsider_lease.bind(&outsider, |id| (id == outsider.character_id).then(|| outsider.clone()));
+    let mut outsider_stream = hub.register(outsider_app, 4);
+    let resolve = |id| if id == member.character_id { Some(member.clone()) } else if id == outsider.character_id { Some(outsider.clone()) } else { None };
+    hub.dispatch(notice(Target::Corporation(10)), resolve);
+    let delivered = decode(&origin_stream.rx.try_recv().unwrap());
+    assert!(matches!(delivered.target_group.unwrap().target, Some(Target::Corporation(10))));
+    assert!(origin_stream.rx.try_recv().is_err());
+    let delivered = decode(&other_stream.rx.try_recv().unwrap());
+    assert!(matches!(delivered.target_group.unwrap().target, Some(Target::Corporation(10))));
+    assert!(other_stream.rx.try_recv().is_err());
+    let delivered = decode(&outsider_stream.rx.try_recv().unwrap());
+    assert!(matches!(delivered.target_group.unwrap().target, Some(Target::Corporation(10))));
+    assert!(outsider_stream.rx.try_recv().is_err());
+    let restricted = notice(Target::Corporation(10)).restrict_corporation(Some(origin), Arc::from([member.character_id]));
+    hub.dispatch(restricted, resolve);
+    assert!(origin_stream.rx.try_recv().is_err());
+    let delivered = decode(&other_stream.rx.try_recv().unwrap());
+    assert!(matches!(delivered.target_group.unwrap().target, Some(Target::Corporation(10))));
+    assert!(outsider_stream.rx.try_recv().is_err());
+    hub.dispatch(notice(Target::Corporation(10)).restrict_corporation(Some(origin), Arc::from([member.character_id])), |_| None);
+    assert!(other_stream.rx.try_recv().is_err());
+    let departed_app = [4u8; 16];
+    let departed_lease = hub.lease(departed_app);
+    departed_lease.bind(&departed, |_| Some(departed.clone()));
+    let mut departed_stream = hub.register(departed_app, 4);
+    let retargeted = notice(Target::Corporation(10)).restrict_corporation(Some(origin), Arc::from([member.character_id])).retarget(Target::Corporation(99)).unwrap();
+    hub.dispatch(retargeted, |_| Some(departed.clone()));
+    let delivered = decode(&departed_stream.rx.try_recv().unwrap());
+    assert!(matches!(delivered.target_group.unwrap().target, Some(Target::Corporation(99))));
+    assert!(origin_stream.rx.try_recv().is_err());
+}

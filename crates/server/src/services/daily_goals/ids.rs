@@ -29,7 +29,7 @@ pub(crate) fn entropy(character: i64, start: i64, version: &str, generation: i64
 
 fn uuid(hash: Sha256) -> String {
     let digest = hash.finalize();
-    crate::uuid_text::format((&digest[..UUID_LEN]).try_into().expect("SHA-256 UUID length"))
+    infinity_content::uuid_text::format((&digest[..UUID_LEN]).try_into().expect("SHA-256 UUID length"))
 }
 
 pub(crate) fn goal(character: i64, start: i64, version: &str, slot: &str, generation: i64) -> String {
@@ -47,4 +47,4 @@ pub(crate) fn asset(character: i64, start: i64, version: &str, slot: &str, gener
 }
 
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

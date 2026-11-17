@@ -42,7 +42,7 @@ fn producer_drop_releases_on_its_pinned_weak_mailbox() {
     let (tx, mut rx) = mpsc::unbounded_channel::<actor::Job>();
     let guard = WarpArrivalGuard { id, sender: tx.downgrade() };
     drop(guard);
-    rx.try_recv().unwrap()(&mut system);
+    rx.try_recv().unwrap().run(&mut system);
     assert!(system.warp_arrivals.is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     drop(tx);
@@ -70,7 +70,7 @@ async fn cancelled_registration_reply_releases_the_producer_reference() {
     let handle = actor::SystemHandle {
         tx,
         gate: Arc::new(tokio::sync::Mutex::new(())),
-        written: Arc::new(AtomicU64::new(0)),
+        state: Arc::new(actor::lifecycle::ActorState::default()),
     };
     let mailbox = handle.tx.clone();
     let weak = handle.tx.downgrade();
@@ -78,8 +78,8 @@ async fn cancelled_registration_reply_releases_the_producer_reference() {
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let actor = std::thread::spawn(move || {
         let mut system = System::new(1, Arc::default(), 0);
-        rx.blocking_recv().unwrap()(&mut system);
-        rx.blocking_recv().unwrap()(&mut system);
+        rx.blocking_recv().unwrap().run(&mut system);
+        rx.blocking_recv().unwrap().run(&mut system);
         system.warp_arrivals.is_empty()
     });
     let waiter = tokio::spawn(async move {
@@ -124,13 +124,37 @@ fn cancelled_unpolled_registration_enqueues_nothing() {
     let handle = actor::SystemHandle {
         tx,
         gate: Arc::new(tokio::sync::Mutex::new(())),
-        written: Arc::new(AtomicU64::new(0)),
+        state: Arc::new(actor::lifecycle::ActorState::default()),
     };
     let drops = Arc::new(AtomicUsize::new(0));
     let marker = DropCount(drops.clone());
-    let callback: Timer = Box::new(move |_| drop(marker));
+    let callback: ArrivalCallback = Box::new(move |_| drop(marker));
     let future = async move { handle.with(move |s| s.register_warp_arrival(callback)).await };
     drop(future);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn failed_direct_attempt_counts_one_copy() {
+    let mut system = System::new(1, Arc::default(), 0);
+    let rx = crate::space::system::tests::watch(&mut system, 1, 2);
+    let token = system.observer_token(1).unwrap(); drop(rx);
+    let before = system.attribution.delivery.copies;
+    assert!(!system.emit_before(DestinyAudience::Observer(token), vec![Value::Int(1)], u64::MAX));
+    assert!(system.observer_ego(1).is_none());
+    assert!(!system.emit_before(DestinyAudience::Observer(token), vec![Value::Int(1)], u64::MAX));
+    assert_eq!(system.attribution.delivery.copies, before + 1);
+}
+
+#[test]
+fn false_behavior_scan_stays_in_behavior() {
+    crate::tests::init_config(); let mut s = System::new(1, Arc::default(), 0);
+    for id in 0..4096 { s.insert(crate::space::system::tests::ball(-1 - id, None, 0.0)); }
+    let start = std::time::Instant::now(); s.tick_with_collisions(1_000, false);
+    let p = &s.attribution.phase_ns;
+    assert!(p[attribution::Phase::Behavior as usize] > 0
+        && p[attribution::Phase::Collisions as usize] == 0 && p[attribution::Phase::Positions as usize] == 0);
+    assert_eq!(s.attribution.steps, 1);
+    assert!(p.iter().sum::<u128>() <= start.elapsed().as_nanos());
 }

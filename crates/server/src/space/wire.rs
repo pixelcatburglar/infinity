@@ -1,7 +1,7 @@
 //! Destiny ball wire encoding, damage state and slim items.
 //! Mirrors carbonengine destiny `Thunkers.cpp` WriteBallToStream, consumed by
 //! `eve/client/script/remote/michelle.py`; data comes from transient Ball state.
-//! Miniballs, dynamical orientation, formations and unsupported ball modes are not implemented.
+//! Miniballs, dynamical orientation, continuous native formation-follow and unsupported ball modes are not implemented.
 
 use super::{Ball, collision, DAMAGE_STATE_SHIELD_RECHARGE_TAU, FLAG_FREE, FLAG_GLOBAL,
     FLAG_INTERACTIVE, FLAG_MASSIVE, MODE_FOLLOW, MODE_GOTO, MODE_MISSILE, MODE_ORBIT,

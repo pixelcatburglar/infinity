@@ -1,9 +1,13 @@
 //! GM skill commands forwarded by the slash service.
 //! Skills and queues are persisted and notified by the skills service.
 //! Quoted skill and character names are parsed by the shared argument parser.
+//! `/setattr` writes all five base attributes through the shared respec
+//! transaction and reports the integer base that was stored.
+//! `/backintime` irreversibly restores the race's trained starter set and
+//! discards the whole queue and free skill points.
 use super::{args::{self, Args}, slash_error, CallError, Client};
 use infinity_core::messages;
-use crate::{services::skills::gm::{self, Change}};
+use crate::{services::skills::{gm::{self, Change}, respec}};
 
 use infinity_core::consts::dogma::MAX_SKILL_LEVEL as MAX_LEVEL;
 
@@ -15,7 +19,17 @@ fn level(text: Option<&str>) -> Result<i32, CallError> {
     }
 }
 
+async fn set_attributes(c: &mut Client, args: &[String]) -> Result<String, CallError> {
+    if !(1..=2).contains(&args.len()) { return Err(slash_error(messages::gm::GM_SETATTR_USAGE.into())); }
+    let parsed = Args::new(args);
+    let value = parsed.f64(0).map_err(|_| slash_error(messages::gm::GM_SETATTR_USAGE.into()))?;
+    let target = if args.len() == 2 { parsed.target(c, 1).await? } else { args::target(c, "me").await? };
+    let base = respec::gm_set_attributes(&c.db, &c.world, &c.sde, target, value).await?;
+    Ok(messages::gm::gm_setattr_done(target, base))
+}
+
 pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> Result<String, CallError> {
+    if command == "setattr" { return set_attributes(c, args).await; }
     let invalid = || slash_error(messages::gm::gm_skill_usage(command));
     let parsed = Args::new(args);
     let (target, change) = match command {
@@ -57,10 +71,17 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             parsed.required(0).map_err(|_| invalid())?;
             (parsed.target(c, 0).await?, Change::Starters)
         }
+        "backintime" if args.len() <= 1 => {
+            let target = if args.is_empty() { args::target(c, "me").await? } else {
+                parsed.required(0).map_err(|_| invalid())?;
+                parsed.target(c, 0).await?
+            };
+            (target, Change::ResetToStarters)
+        }
         _ => return Err(invalid()),
     };
     gm::apply(c, target, change).await?;
     Ok(messages::gm::gm_skill_done(command, target))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-slash"))] mod tests;

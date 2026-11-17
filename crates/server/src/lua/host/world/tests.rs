@@ -56,9 +56,11 @@ async fn world_host_routes_notifications_and_refuses_missing_system() {
         .expect("dedicated SDE must contain an entity type").type_id;
     let (destiny_tx, mut destiny_rx) = tokio::sync::mpsc::unbounded_channel();
     world.observe(1, 1, 1, destiny_tx).await.unwrap();
+    crate::space::system::tests::events::initial_state(&mut destiny_rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut destiny_rx);
     lua.globals().set("npc_type", type_id).unwrap();
     assert!(lua.load("return world.schedule(1, 0, 'spawn_npc', {type_id=npc_type,corp=1,position={100,200,300}})").eval_async::<bool>().await.unwrap());
-    tokio::time::timeout(std::time::Duration::from_secs(10), destiny_rx.recv()).await.expect("spawn did not broadcast").expect("observer closed");
+    crate::space::system::tests::events::destiny(tokio::time::timeout(std::time::Duration::from_secs(10), destiny_rx.recv()).await.expect("spawn did not broadcast").expect("observer closed"));
     let id = world.with(1, move |s| s.balls().find(|b| b.type_id == type_id && b.owner_id == 1).map(|b| b.id)).await.unwrap().expect("spawned NPC not present");
     lua.globals().set("npc_id", id).unwrap();
     let ball = lua.load("return world.ball(1, npc_id)").eval_async::<Table>().await;

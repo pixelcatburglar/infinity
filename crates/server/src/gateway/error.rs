@@ -17,6 +17,19 @@ impl FailureCode {
         };
         u32::from(status.as_u16())
     }
+    /// Exact ASCII status token for `status_message`; requestBroker.py logs it
+    /// as a byte string, so these stay machine-style, never localised.
+    pub(super) fn status_text(&self) -> &'static str {
+        match self {
+            Self::BadRequest => "BAD_REQUEST",
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::Forbidden => "FORBIDDEN",
+            Self::NotFound => "NOT_FOUND",
+            Self::PreconditionFailed => "PRECONDITION_FAILED",
+            Self::NotImplemented => "NOT_IMPLEMENTED",
+            Self::Internal => "INTERNAL_ERROR",
+        }
+    }
 }
 #[derive(Debug)]
 pub(crate) enum GatewayError {
@@ -30,7 +43,7 @@ impl From<crate::db::Error> for GatewayError {
 }
 
 impl GatewayError {
-    pub(super) fn refusal(code: FailureCode, message: &'static str) -> Self {
-        Self::Refused { code, message }
+    pub(super) fn refusal(code: FailureCode) -> Self {
+        Self::Refused { code, message: code.status_text() }
     }
 }

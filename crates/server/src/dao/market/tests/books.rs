@@ -163,7 +163,7 @@ async fn global_history_uses_weighted_numeric_utc_days() {
     let person = fixture::create(&db).await.unwrap();
     let work = db.clone();
     let result = tokio::spawn(async move {
-        let day = filetime_now() / FILETIME_DAY * FILETIME_DAY;
+        let day = crate::client::filetime_day_start(filetime_now());
         let max = "9999999999999999999999999999999999.99";
         for (station, date, quantity, price) in [(a, day - 3*FILETIME_DAY, 1, "10"), (b, day - 3*FILETIME_DAY + 1, 3, "30"), (b, day, 2, max)] {
             trading::record(&work, &NewTransaction { type_id: TYPE_PLEX, quantity, price: money(price), buyer: person.character, seller: person.character, station: station.id, region: station.region, date, buyer_account_id: None, seller_account_id: None, order_id: None, scope: MarketScope::GlobalPlex, buy_order_id: None, sell_order_id: None, buyer_vault_user_id: None, seller_vault_user_id: None }).await.unwrap();
@@ -291,6 +291,60 @@ async fn market_rpc_global_books_quotes_and_history_arity() {
         assert!(services::dispatch(&mut c, &call("GetOrders", &[Value::None], &kwargs)).await.is_err());
         assert!(services::dispatch(&mut c, &call("GetOrders", &[Value::Int(i64::from(TYPE_PLEX)), Value::None], &kwargs)).await.is_err());
     }).await;
+    cleanup(&db, &[person]).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE, empty global PLEX book and external flock"]
+async fn deadline_read_paths_preserve_nulls_and_wide_arithmetic() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let (probe, _peer) = client(db.clone(), 1).await;
+    let (a, _b) = isolated_stations(&db, &probe.sde).await;
+    let person = fixture::create(&db).await.unwrap();
+    let npc_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+    let work = db.clone();
+    let captured = npc_ids.clone();
+    let result = tokio::spawn(async move {
+        let now = filetime_now();
+        // An otherwise unused test type avoids interference with seeded NPC orders.
+        let ty = i32::MAX;
+        for (issued, duration, expires, visible, expired, next, crossed) in [
+            (Some(now), 30, Some(now + FILETIME_DAY), true, false, Some(now + FILETIME_DAY), None),
+            (Some(now - 100 * FILETIME_DAY), 30, Some(now + FILETIME_DAY), true, false, Some(now + FILETIME_DAY), None),
+            (Some(now), 30, Some(now - 1), false, true, None, Some(now - 1)),
+            (Some(now - FILETIME_DAY), 1, None, false, true, None, Some(now)),
+            (None, 30, None, false, false, None, None),
+            (Some(0), i64::from(i32::MAX), None, true, false, Some(i64::MAX), None),
+            (Some(0), i64::from(i32::MIN), None, false, true, None, Some(i64::MIN)),
+        ] {
+            let mut o = order(&work, person, a, ty, false, "10", now, expires).await;
+            (o.issued, o.duration) = (issued, duration);
+            orders::insert(&work, &o).await.unwrap();
+            let book = snap(&work, ty, a.region, now).await;
+            assert_eq!(book.rows.iter().any(|r| r.id == o.id), visible);
+            assert_eq!((book.next_visible_expiry, book.latest_crossed_expiry), (next, crossed));
+            assert_eq!(orders::asks(&work, now, FILETIME_DAY, ty, a.region, money("100")).await.unwrap().iter().any(|r| r.id == o.id), visible);
+            assert_eq!(listings::orders(&work, now, FILETIME_DAY, ty, Area::Region, a.region, None).await.unwrap().iter().any(|r| r.order_id == o.id), visible);
+            assert_eq!(!listings::best_asks(&work, now, FILETIME_DAY, Area::Region, a.region, Some(ty)).await.unwrap().is_empty(), visible);
+            assert_eq!(orders::expired(&work, FILETIME_DAY, now).await.unwrap().iter().any(|r| r.id == o.id), expired);
+            work.execute("DELETE FROM game.market_orders WHERE order_id=$1", &[&o.id]).await.unwrap();
+        }
+        let mut npc = order(&work, person, a, ty, false, "10", now, Some(now - 1)).await;
+        npc.char_id = None;
+        orders::insert(&work, &npc).await.unwrap();
+        captured.lock().unwrap().push(npc.id);
+        assert!(snap(&work, ty, a.region, now).await.rows.iter().any(|r| r.id == npc.id));
+        assert!(orders::asks(&work, now, FILETIME_DAY, ty, a.region, money("100")).await.unwrap().iter().any(|r| r.id == npc.id));
+        assert!(listings::orders(&work, now, FILETIME_DAY, ty, Area::Region, a.region, None).await.unwrap().iter().any(|r| r.order_id == npc.id));
+        assert!(!listings::best_asks(&work, now, FILETIME_DAY, Area::Region, a.region, Some(ty)).await.unwrap().is_empty());
+        assert!(!orders::expired(&work, FILETIME_DAY, now).await.unwrap().iter().any(|r| r.id == npc.id));
+    }).await;
+    // NPC rows match no fixture character, so they are removed by captured order_id.
+    for id in std::mem::take(&mut *npc_ids.lock().unwrap()) {
+        db.execute("DELETE FROM game.market_orders WHERE order_id=$1", &[&id]).await.unwrap();
+    }
     cleanup(&db, &[person]).await;
     result.unwrap();
 }

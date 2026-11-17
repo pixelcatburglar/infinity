@@ -2,7 +2,9 @@
 //! Shared exploration state and data sources are documented in the parent module.
 
 use super::*;
-use infinity_core::consts::CATEGORY_ENTITY;
+use infinity_core::consts::{CATEGORY_ENTITY, FACTION_BLOOD_RAIDER_COVENANT, FACTION_SANSHAS_NATION, FACTION_SERPENTIS};
+use crate::sde::prices::LOOT_MINIMUM_AVERAGE;
+use crate::space::system::npc_sleep::NpcSpawnOrigin;
 
 
 // ---------------------------------------------------------------- site content
@@ -23,9 +25,9 @@ pub(super) fn rat_prefix(faction: i64) -> &'static str {
     match faction {
         FACTION_GURISTAS => "Asteroid Guristas",
         FACTION_ANGEL_CARTEL => "Asteroid Angel Cartel",
-        500012 => "Asteroid Blood Raiders",
-        500019 => "Asteroid Sansha's Nation",
-        500020 => "Asteroid Serpentis",
+        FACTION_BLOOD_RAIDER_COVENANT => "Asteroid Blood Raiders",
+        FACTION_SANSHAS_NATION => "Asteroid Sansha's Nation",
+        FACTION_SERPENTIS => "Asteroid Serpentis",
         _ => "Asteroid Rogue Drone",
     }
 }
@@ -70,23 +72,47 @@ pub(super) async fn spawn_site_npcs(db: &Db, world: &Arc<World>, user_id: i64, s
     if let Some(s) = state().sites.get_mut(&site.id) {
         s.npcs = Some(spawned.clone());
     }
-    track_site_clearance(db.clone(), world.clone(), site.id, site.system, spawned);
+    track_site_clearance(db.clone(), world.clone(), site.id, site.system, spawned,
+        Some(NpcSpawnOrigin::Exploration(site.id)));
     Ok(())
 }
 
-/// Both combat sites and mined-out fields linger and replace after their group clears.
-pub(super) fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, system: i64, members: Vec<i64>) {
-    let completion_world = world.clone();
+/// Whether `site_id` still names a live combat site of `system` holding an
+/// in-space roster: same system, no wormhole, not a mining field or hack site,
+/// dungeon-backed, with a non-empty `npcs` list. Read-only under the short
+/// state lock: it never spawns, loads or clears, and says nothing about which
+/// members survive; live membership is proven by the actor itself.
+pub(crate) fn npc_sleep_origin_matches(system: i64, site_id: i64) -> bool {
+    state().sites.get(&site_id).is_some_and(|site|
+        site.system == system && site.wormhole.is_none() && site.mining_field().is_none()
+            && !site.is_hack_site() && site.dungeon_id.is_some()
+            && site.npcs.as_ref().is_some_and(|npcs| !npcs.is_empty()))
+}
+
+/// Both combat sites and mined-out fields linger and replace after their group
+/// clears. `origin` marks a live, non-empty NPC group for the in-process sleep
+/// store in the same actor turn; a refused mark keeps the strict blocker and
+/// rolls nothing back. Long-lived callbacks hold only a `Weak<World>`: the
+/// deferred replacement upgrades it only when it actually runs, so a sleeping
+/// payload never forms a strong World reference cycle.
+pub(super) fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, system: i64, members: Vec<i64>, origin: Option<NpcSpawnOrigin>) {
+    let weak = Arc::downgrade(&world);
     world.post(system, move |s| {
-        s.spawn_group(members, move |s| {
+        let group = s.spawn_group(members, move |s| {
             s.schedule(seconds_to_ms(crate::config::game().npc.cleared_site_linger_secs as f64), move |s| {
                 s.defer(async move {
-                    if let Err(e) = replace_site(&db, &completion_world, site_id).await {
+                    let Some(world) = weak.upgrade() else { return };
+                    if let Err(e) = replace_site(&db, &world, site_id).await {
                         warn!("replacing site {site_id}: {}", err_text(e));
                     }
                 });
             });
         });
+        if let Some(origin) = origin {
+            if s.group_remaining(group) != 0 && !s.mark_npc_group_sleepable(group, origin) {
+                warn!(system, site_id, group, "site NPC group refused sleep marking");
+            }
+        }
     });
 }
 
@@ -399,9 +425,9 @@ pub(super) fn container_prefix(faction: i64) -> &'static str {
     match faction {
         FACTION_GURISTAS => "Guristas",
         FACTION_ANGEL_CARTEL => "Angel",
-        500012 => "Blood",
-        500019 => "Sansha",
-        500020 => "Serpentis",
+        FACTION_BLOOD_RAIDER_COVENANT => "Blood",
+        FACTION_SANSHAS_NATION => "Sansha",
+        FACTION_SERPENTIS => "Serpentis",
         _ => "Sleeper",
     }
 }
@@ -503,7 +529,7 @@ pub(super) async fn spawn_containers(db: &Db, world: &Arc<World>, user_id: i64, 
         let pos = [site.pos[0] + v[0] * d, site.pos[1] + v[1] * d * 0.3, site.pos[2] + v[2] * d];
         let id = crate::dao::exploration::insert_container(db, type_id, site.system, pos).await.map_err(db_err)?;
         let stacks = 2 + (rand01() * 2.0) as i64;
-        let rows = crate::dao::exploration::loot(db, value).await.map_err(db_err)?;
+        let rows = sde.prices.average_between(LOOT_MINIMUM_AVERAGE, value).collect::<Vec<_>>();
         let loot = select_loot(rows, stacks as usize, |r| world.sde().types.get(r.type_id)
             .is_some_and(|t| t.published == Some(true) && t.group_id.is_some_and(|g| groups.contains(&g))), rand01);
         for r in &loot {
@@ -534,5 +560,5 @@ pub(super) async fn restore_containers(db: &Db, world: &World, site: &Site, ids:
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

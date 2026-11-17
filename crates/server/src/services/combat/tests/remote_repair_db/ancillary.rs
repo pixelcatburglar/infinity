@@ -41,7 +41,6 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         && t.attribute([ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP][layer]).is_some_and(|v| v > raw_amount)
         && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > raw_need)).expect("ship with sufficient health and capacitor").type_id;
     let system = 1;
-    let before = fingerprint(&db).await.unwrap();
     let f = create(&db, ship_type, module_type, system).await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
     let test_world = world.clone();
@@ -136,12 +135,16 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
     state().targets.remove(&f.source);
     state().reloading.remove(&f.module);
     drop(world);
+    let rows = crate::services::tests::fixture::capture_fixture_rows(&db, &[
+        crate::services::tests::fixture::Fixture { account: f.account, character: f.source },
+        crate::services::tests::fixture::Fixture { account: f.account, character: f.target },
+    ], &[f.ship, f.victim, f.module]).await.unwrap();
     db.execute("DELETE FROM game.pending_reloads WHERE ship_id = $1", &[&f.ship]).await.unwrap();
     db.execute("DELETE FROM game.module_charges WHERE ship_id = $1", &[&f.ship]).await.unwrap();
     db.execute("DELETE FROM game.item_attributes WHERE item_id = ANY($1)", &[&&[f.module, f.ship, f.victim][..]]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE location_id = $1 AND flag_id = $2", &[&f.ship, &FLAG_CARGO]).await.unwrap();
     cleanup(&db, f).await.unwrap();
-    assert_eq!(fingerprint(&db).await.unwrap(), before);
+    crate::services::tests::fixture::assert_fixture_removed(&db, &rows).await.unwrap();
     flush.unwrap();
     result.unwrap();
 }

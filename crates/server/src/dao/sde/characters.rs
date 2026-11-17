@@ -1,7 +1,7 @@
 //! Startup projections for character creation and NPC identities.
 //! This DAO has no direct client mirror; character selection and skill services consume the data.
 //! Sources: typed `sde.chr_races`, `sde.chr_bloodlines`, `sde.npc_characters` and `sde_native.schools`.
-//! Other character and school fields are not loaded.
+//! NPC rows also project the agent marker and deletion flag; other character and school fields are not loaded.
 
 use crate::{db::{executor::Executor, Error}, sde::characters::{Bloodline, NpcCharacter, Race, School, StartingSkill}};
 use tokio_postgres::Row;
@@ -24,7 +24,7 @@ impl Bloodline {
 }
 impl NpcCharacter {
     fn from_row(row: &Row) -> Self {
-        Self { character_id: row.get("character_id"), corporation_id: row.get("corporation_id"), name: row.get("name"), gender: row.get("gender"), name_id: row.get("name_id") }
+        Self { character_id: row.get("character_id"), corporation_id: row.get("corporation_id"), name: row.get("name"), gender: row.get("gender"), name_id: row.get("name_id"), is_agent: row.get("is_agent"), deleted: row.get("deleted") }
     }
 }
 impl School {
@@ -43,7 +43,7 @@ pub(crate) async fn bloodlines(ex: &(impl Executor + ?Sized)) -> Result<Vec<Bloo
     Ok(ex.query("SELECT bloodline_id::bigint AS bloodline_id, charisma, intelligence, memory, perception, willpower FROM sde.chr_bloodlines ORDER BY bloodline_id", &[]).await?.iter().map(Bloodline::from_row).collect())
 }
 pub(crate) async fn npc_characters(ex: &(impl Executor + ?Sized)) -> Result<Vec<NpcCharacter>, Error> {
-    Ok(ex.query("SELECT character_id::bigint AS character_id, (data->>'corporationID')::bigint AS corporation_id, data->'name'->>'en' AS name, (data->>'gender')::boolean::int AS gender, (data->>'nameID')::bigint AS name_id FROM sde.npc_characters ORDER BY character_id", &[]).await?.iter().map(NpcCharacter::from_row).collect())
+    Ok(ex.query("SELECT character_id::bigint AS character_id, (data->>'corporationID')::bigint AS corporation_id, data->'name'->>'en' AS name, (data->>'gender')::boolean::int AS gender, (data->>'nameID')::bigint AS name_id, COALESCE(jsonb_typeof(data->'agent') = 'object', false) AS is_agent, COALESCE((data->>'deleted')::boolean, false) AS deleted FROM sde.npc_characters ORDER BY character_id", &[]).await?.iter().map(NpcCharacter::from_row).collect())
 }
 pub(crate) async fn schools(ex: &(impl Executor + ?Sized)) -> Result<Vec<School>, Error> {
     Ok(ex.query("SELECT key::bigint AS school_id, (data->>'raceID')::int AS race_id, (data->>'corporationID')::bigint AS corporation_id, ARRAY(SELECT station::bigint FROM jsonb_array_elements_text(data->'startingStations') WITH ORDINALITY AS s(station, ordinal) ORDER BY ordinal) AS starting_stations FROM sde_native.schools ORDER BY key::bigint", &[]).await?.iter().map(School::from_row).collect())

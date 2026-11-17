@@ -3,7 +3,7 @@
 //! CloakBall and UncloakBall own visibility. Cooldowns are transient actor state.
 //! An active Entosis link prevents module cloak activation until link cleanup.
 use std::sync::{Arc, atomic::Ordering};
-use super::{EffectKind, lifecycle::{self, Cycle, CycleOutcome, Module}, registry::Effect};
+use super::{EffectKind, lifecycle::{self, Cycle, CycleOutcome, Module}, parameters::MasterPacket, registry::Effect};
 use infinity_core::messages;
 use crate::services::{combat::{self, Ctx, targeting_charges::clear_locks_on}, fit::{Fit, Key}, notify_error, CallError};
 use crate::space::System;
@@ -14,10 +14,6 @@ const ATTR_CAN_CLOAK: i32 = 1163;
 const ATTR_DISALLOW_CLOAKING: i32 = 2454;
 /// dogma/const.py: attributeDisallowEarlyDeactivation.
 const ATTR_DISALLOW_EARLY_DEACTIVATION: i32 = 906;
-/// dogma/const.py: attributeModuleReactivationDelay, milliseconds.
-const ATTR_REACTIVATION_DELAY: i32 = 669;
-/// dogma/const.py: attributeTargetingDelay, milliseconds.
-const ATTR_TARGETING_DELAY: i32 = 560;
 
 
 pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Effect, _target: Option<i64>) -> Result<(), CallError> {
@@ -33,6 +29,7 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Eff
     let status = cx.world.with(cx.system_id, move |s| {
         if crate::space::sovereignty::links::blocks(s, ship) { 4 }
         else if s.ball(ship).is_none_or(|b| b.cloak != 0) || s.has_module_cloak(ship) { 1 }
+        else if s.super_weapon_jump_cloak_until(ship).is_some_and(|until| until > s.now_ms()) { 5 }
         else if !s.cloak_reactivation_ready(id) { 2 }
         else if s.cloak_obstructed(ship) { 3 }
         else { 0 }
@@ -42,6 +39,7 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Eff
         2 => Err(notify_error(messages::effects::CLOAK_REACTIVATION_DELAY)),
         3 => Err(notify_error(messages::effects::CLOAK_TOO_CLOSE)),
         4 => Err(notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED)),
+        5 => Err(notify_error(messages::super_weapon::CLOAK_LOCKED)),
         _ => Ok(()),
     }
 }
@@ -62,12 +60,13 @@ pub(in crate::services) async fn before_activate(cx: &Ctx, _module: i64, kind: E
     Ok(())
 }
 
-pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
+pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     if cycle.cycles != 0 { return Ok(CycleOutcome::Continue); }
     let module = cycle.modules[0].id;
-    let duration = |attr| fit.value(Key::Module(module), attr).max(0.0) as i64;
-    let reactivation = duration(ATTR_REACTIVATION_DELAY);
-    let targeting = duration(ATTR_TARGETING_DELAY);
+    let Some(MasterPacket::Cloak(inputs)) = cycle.inputs.frame.as_ref().map(|frame| &frame.packet) else {
+        return Err(CallError::Internal(anyhow::anyhow!("cloak cycle captured without cloak inputs")));
+    };
+    let (reactivation, targeting) = (inputs.reactivation_ms, inputs.targeting_ms);
     let generation = cycle.stop.clone();
     let ship = cx.ship_id;
     let cleanup_cx = cx.clone();

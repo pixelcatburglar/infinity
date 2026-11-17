@@ -6,11 +6,9 @@
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 
-struct Member { id: i64 }
-impl Member { fn from_row(r: &Row) -> Self { Self { id: r.get("id") } } }
 pub(crate) async fn members(ex: &(impl Executor + ?Sized), target_id: i64, kind: i16) -> Result<Vec<i64>, db::Error> {
     let rows = ex.query("SELECT c.character_id AS id FROM game.characters c LEFT JOIN game.corporations corp ON corp.corporation_id = c.corporation_id AND NOT corp.deleted WHERE NOT c.deleted AND (($2::smallint = 1 AND c.character_id = $1) OR ($2::smallint = 2 AND c.corporation_id = $1) OR ($2::smallint = 3 AND corp.alliance_id = $1)) ORDER BY c.character_id", &[&target_id, &kind]).await?;
-    Ok(rows.iter().map(|r| Member::from_row(r).id).collect())
+    Ok(rows.iter().map(|r| r.get::<_, i64>("id")).collect())
 }
 
 pub(crate) struct Bounty {
@@ -44,14 +42,10 @@ pub(crate) async fn pools(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<
     Ok(rows.iter().map(Pool::from_row).collect())
 }
 
-struct PayoutLimit { cents: i64 }
-impl PayoutLimit {
-    fn from_row(r: &Row) -> Self { Self { cents: r.get("cents") } }
-}
 /// Compute the payout cap in numeric arithmetic; ISK has 100 cents per unit.
 pub(crate) async fn payout_limit(ex: &(impl Executor + ?Sized), available_cents: i64, isk_lost: f64, fraction: f64) -> Result<i64, db::Error> {
     let row = ex.query_one("SELECT LEAST($1::bigint::numeric, FLOOR(GREATEST($2::float8::numeric, 0) * $3::float8::numeric * 100))::bigint AS cents", &[&available_cents, &isk_lost, &fraction]).await?;
-    Ok(PayoutLimit::from_row(&row).cents)
+    Ok(row.get::<_, i64>("cents"))
 }
 
 pub(crate) struct Contribution {
@@ -111,5 +105,5 @@ pub(crate) async fn record_payout(ex: &(impl Executor + ?Sized), killmail_id: i6
 }
 pub(crate) async fn placers(ex: &(impl Executor + ?Sized), target_ids: &[i64]) -> Result<Vec<i64>, db::Error> {
     let rows = ex.query("SELECT DISTINCT placer_id AS id FROM game.bounty_contributions WHERE target_id = ANY($1) ORDER BY id", &[&target_ids]).await?;
-    Ok(rows.iter().map(|r| Member::from_row(r).id).collect())
+    Ok(rows.iter().map(|r| r.get::<_, i64>("id")).collect())
 }

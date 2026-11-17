@@ -18,4 +18,4 @@ pub(crate) fn build(item: i64, char_id: i64, ship: i64, target: Option<i64>, oth
     ])
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

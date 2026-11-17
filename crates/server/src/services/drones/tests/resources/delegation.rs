@@ -99,6 +99,8 @@ async fn fleet_assist_and_guard_follow_admitted_nonweapon_attacks() -> Result<()
         f.set(delegate_ship, ATTR_MAX_TARGET_RANGE, 100_000.0).await;
         f.set(delegate_ship, ATTR_SCAN_RESOLUTION, 1_000_000.0).await;
         if let Some(attr) = web_effect.attribute(EffectAttribute::Range) { f.set(module, attr, 100_000.0).await; }
+        let fit = crate::services::fit::Fit::load_in_space(&f.db, &f.world, f.system, delegate, delegate_ship).await.map_err(|e| anyhow!("delegate fit: {e:?}"))?;
+        ensure!(crate::services::tests::fixture::publish_fitting(&f.world, f.system, delegate, delegate_ship, fit).await, "delegate fit publication failed");
         let npc_type = f.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY) && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0))
             .ok_or_else(|| anyhow!("no NPC target"))?.type_id;
         let npc = crate::services::combat::npc::spawn(&f.db, &f.world, f.system, f.sde.types.get(npc_type).unwrap(), 1, [1000.0, 0.0, 0.0], crate::space::now_ms(), None).await.map_err(call_error)?;

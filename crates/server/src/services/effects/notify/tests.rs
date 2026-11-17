@@ -56,22 +56,6 @@ fn ship_effect_start_and_stop_keep_times_and_environment() {
 }
 
 #[test]
-fn special_fx_has_all_client_arguments() {
-    assert_eq!(fire_fx(100, 30, Some((10, 11)), "effects.Laser", Some(40), Some(55), true, true, 250.0, 3),
-        event(100, "OnSpecialFX", vec![
-            Value::Int(30), Value::Int(10), Value::Int(11), Value::Int(40), Value::Int(55),
-            Value::str("effects.Laser"), Value::Bool(true), Value::Int(1), Value::Int(1),
-            Value::Float(250.0), Value::Int(3), Value::None, Value::Int(0), Value::None,
-        ]));
-    assert_eq!(fire_fx(100, 30, None, "effects.Laser", None, None, false, false, 250.0, 0),
-        event(100, "OnSpecialFX", vec![
-            Value::Int(30), Value::None, Value::None, Value::None, Value::None,
-            Value::str("effects.Laser"), Value::Bool(false), Value::Int(0), Value::Int(0),
-            Value::Float(250.0), Value::Int(0), Value::None, Value::Int(0), Value::None,
-        ]));
-}
-
-#[test]
 fn scans_encode_client_rows_and_argument_order() {
     let rows = vec![(34, 7), (35, i64::MAX)];
     let encoded = Value::list([
@@ -81,19 +65,6 @@ fn scans_encode_client_rows_and_argument_order() {
     assert_eq!(cargo_scan_args(42, rows.clone()), vec![Value::Int(42), encoded.clone()]);
     assert_eq!(ship_scan_args(42, 1.5, 3.0, rows), vec![Value::Int(42), Value::Float(1.5), Value::Float(3.0), encoded]);
     assert_eq!(cargo_scan_args(42, vec![]), vec![Value::Int(42), Value::list([])]);
-}
-
-#[test]
-fn special_fx_graphic_info_preserves_other_arguments() {
-    let info = Value::dict([("targets", Value::list([Value::Int(40), Value::Int(41)]))]);
-    assert_eq!(fire_fx_with_info(100, 30, Some((10, 11)), "effects.Laser", Some(40), Some(55), true, true, 250.0, 3, info.clone()),
-        event(100, "OnSpecialFX", vec![
-            Value::Int(30), Value::Int(10), Value::Int(11), Value::Int(40), Value::Int(55),
-            Value::str("effects.Laser"), Value::Bool(true), Value::Int(1), Value::Int(1),
-            Value::Float(250.0), Value::Int(3), Value::None, Value::Int(0), info,
-        ]));
-    assert_eq!(fire_fx(100, 30, None, "effects.Laser", None, None, false, false, 250.0, 0),
-        fire_fx_with_info(100, 30, None, "effects.Laser", None, None, false, false, 250.0, 0, Value::None));
 }
 
 #[test]

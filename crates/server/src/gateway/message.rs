@@ -1,11 +1,16 @@
 //! Descriptor and message helpers for `requestBroker.py:_send_request` payloads.
 //! Uses embedded descriptors and server-generated UUIDs, not World or DAO data;
 //! descriptor lookup and field helpers do not implement missing services.
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use prost::Message;
-use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Value as PV};
+use prost_reflect::{DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, Value as PV};
 use std::sync::OnceLock;
 use tracing::warn;
+use crate::client;
+
+/// Inclusive seconds bounds of google.protobuf.Timestamp (years 0001 through 9999).
+pub(crate) const TIMESTAMP_MIN: i64 = -62_135_596_800;
+pub(crate) const TIMESTAMP_MAX: i64 = 253_402_300_799;
 
 /// RFC 4122 version field in the seventh UUID byte.
 pub(super) const UUID_VERSION_INDEX: usize = 6;
@@ -102,4 +107,27 @@ pub(crate) fn set(m: &mut DynamicMessage, field: &str, v: PV) -> Result<()> {
     m.try_set_field_by_name(field, v).with_context(|| format!("setting {}.{field}", m.descriptor().full_name()))
 }
 
-#[cfg(test)] mod tests;
+pub(crate) fn nested(m: &mut DynamicMessage, name: &str, value: DynamicMessage) -> Result<()> { set(m, name, PV::Message(value)) }
+pub(crate) fn named(name: &str) -> Result<DynamicMessage> { Ok(DynamicMessage::new(message(name).with_context(|| format!("missing {name}"))?)) }
+pub(crate) fn sequential(parent: &mut DynamicMessage, field: &str, id: u64) -> Result<()> {
+    let descriptor = child(&parent.descriptor(), field)?.descriptor();
+    let kind = descriptor.get_field_by_name("sequential").context("missing sequential identifier")?.kind();
+    let value = match kind {
+        Kind::Uint32 => PV::U32(u32::try_from(id)?),
+        Kind::Int32 => PV::I32(i32::try_from(id)?),
+        Kind::Uint64 => PV::U64(id),
+        _ => bail!("unsupported identifier wire type"),
+    };
+    let value = identifier(&parent.descriptor(), field, value)?;
+    nested(parent, field, value)
+}
+pub(crate) fn timestamp(parent: &mut DynamicMessage, field: &str, time: i64) -> Result<()> {
+    let (seconds, nanos) = client::unix_parts_from_filetime(time);
+    ensure!((TIMESTAMP_MIN..=TIMESTAMP_MAX).contains(&seconds), "timestamp out of range");
+    let mut value = child(&parent.descriptor(), field)?;
+    set(&mut value, "seconds", PV::I64(seconds))?;
+    set(&mut value, "nanos", PV::I32(nanos))?;
+    nested(parent, field, value)
+}
+
+#[cfg(all(test, feature = "tests-gateway"))] mod tests;

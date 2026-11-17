@@ -2,14 +2,11 @@
 //! Mirrors dailygoals/client/utils.py; this module performs no gameplay matching.
 use anyhow::{bail, Context, Result};
 use prost_reflect::{DynamicMessage, ReflectMessage, Value};
-use crate::{gateway::message::{child, set}, lua::content::daily_goals::model::{Category, Matcher, Method, Owner}};
+use crate::{gateway::message::{child, nested, sequential, set}, lua::content::daily_goals::model::{Category, Matcher, Method, Owner}};
 
-fn nested(parent: &mut DynamicMessage, name: &str, value: DynamicMessage) -> Result<()> {
-    set(parent, name, Value::Message(value))
-}
 fn uuid(parent: &mut DynamicMessage, name: &str, text: &str) -> Result<()> {
     let mut id = child(&parent.descriptor(), name)?;
-    let bytes = crate::uuid_text::parse(text, crate::uuid_text::Case::Either).context("invalid authored goal UUID")?;
+    let bytes = infinity_content::uuid_text::parse(text, infinity_content::uuid_text::Case::Either).context("invalid authored goal UUID")?;
     set(&mut id, "uuid", Value::Bytes(bytes.to_vec().into()))?;
     nested(parent, name, id)
 }
@@ -44,7 +41,7 @@ fn matcher(entry: &mut DynamicMessage, field: &str, value: &Matcher, exact: &str
         }
     };
     if id == 0 { bail!("zero contribution identifier"); }
-    super::sequential(&mut m, name, id)?;
+    sequential(&mut m, name, id)?;
     nested(entry, field, m)
 }
 fn owner(entry: &mut DynamicMessage, value: Owner) -> Result<()> {

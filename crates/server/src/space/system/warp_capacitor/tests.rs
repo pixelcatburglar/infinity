@@ -64,10 +64,17 @@ fn partial_correction_has_completed_stamp_and_preserves_identity() {
     let id = -930_006;
     let mut system = fixture(id, 0.000001, 0.25);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    system.observe(1, id, tx);
+    let (completed, _done) = tokio::sync::oneshot::channel();
+    system.observe(1, id, tx, completed);
+    system.apply_scene_prefix(crate::space::collision::enabled());
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
     assert!(system.queue_warp(id, 3000, WarpDestination::Exact([AU, 0.0, 0.0]), None));
     system.tick(1000);
-    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).flatten().collect();
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).flat_map(|delivery| match delivery {
+        crate::space::SceneDelivery::Destiny(batch) => batch,
+        crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+    }).collect();
     let additions: Vec<_> = events.iter().filter_map(|value| {
         let fields = value.items()?;
         let call = fields.get(1)?.items()?;
@@ -347,11 +354,18 @@ fn catchup_and_clamp_emit_one_correction_at_its_own_step() {
         let id = -930_200 - sequence;
         let mut system = fixture(id, 0.000001, 0.25);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        system.observe(1, id, tx);
+        let (completed, _done) = tokio::sync::oneshot::channel();
+        system.observe(1, id, tx, completed);
+        system.apply_scene_prefix(crate::space::collision::enabled());
+        crate::space::system::tests::events::initial_state(&mut rx);
+        crate::space::system::tests::events::fleet_snapshot(&mut rx);
         assert!(system.queue_warp(id, 3000, WarpDestination::Exact([AU, 0.0, 0.0]), None));
         system.tick_with_collisions(due * 1000, collisions);
         assert_eq!(system.current_time(), if due > 5 { 1 } else { due });
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).flatten().collect();
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).flat_map(|delivery| match delivery {
+            crate::space::SceneDelivery::Destiny(batch) => batch,
+            crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+        }).collect();
         let corrections: Vec<_> = events.iter().filter(|event| {
             event.items().and_then(|fields| fields.get(1)).and_then(Value::items)
                 .and_then(|call| call.first()).and_then(Value::as_text).as_deref() == Some("AddBalls")
@@ -375,7 +389,11 @@ fn callback_motion_uses_completed_stamp_after_partial_correction() {
     let stats = ShipStats::from_fit(&fit, Key::Ship);
     system.install_condition(full, Condition { now: stats.max, stats, shield_at: crate::client::filetime_now() }, fit);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    system.observe(1, partial, tx);
+    let (completed, _done) = tokio::sync::oneshot::channel();
+    system.observe(1, partial, tx, completed);
+    system.apply_scene_prefix(crate::space::collision::enabled());
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
     let arrival = system.register_warp_arrival(Box::new(move |s| {
         assert_eq!(s.current_time(), 1);
         s.command(full, move |ball, stamp, _| {
@@ -389,7 +407,10 @@ fn callback_motion_uses_completed_stamp_after_partial_correction() {
     }, Some(arrival)));
     system.release_warp_arrival(arrival);
     system.tick(2000);
-    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).flatten().collect();
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).flat_map(|delivery| match delivery {
+        crate::space::SceneDelivery::Destiny(batch) => batch,
+        crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); Vec::new() }
+    }).collect();
     let positions: Vec<_> = events.iter().filter_map(|event| {
         let fields = event.items()?;
         let call = fields.get(1)?.items()?;

@@ -1,4 +1,5 @@
 use super::*;
+mod unfit;
 
 #[test]
 fn ammunition_requires_matching_group_and_optional_size() {

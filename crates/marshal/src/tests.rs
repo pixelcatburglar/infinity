@@ -67,6 +67,51 @@ fn containers_roundtrip() {
     roundtrip(Value::Callback(Box::new(Value::str(dumps(&Value::tuple([Value::str("N=1:2"), Value::Int(5)]))))));
 }
 
+fn stream_wrapped(v: Value) -> Value {
+    Value::SubStream(dumps(&v))
+}
+
+#[test]
+fn debug_bounds_nested_stream_expansion() {
+    // Each level wraps the previous stream as one SubStream object.
+    let mut b = dumps(&Value::str("inner"));
+    for _ in 0..2000 {
+        b = dumps(&Value::SubStream(b));
+    }
+    let s = format!("{:?}", loads(&b).unwrap());
+    // Four decoded levels, then the byte-count form covers the rest.
+    assert_eq!(s.matches("Stream(").count(), 5);
+    assert!(s.ends_with(" bytes)))))"), "{s}");
+    assert!(!s.contains("inner"));
+    assert!(s.len() < 1000);
+}
+
+#[test]
+fn debug_single_stream() {
+    assert_eq!(format!("{:?}", stream_wrapped(Value::str("inner"))), "Stream('inner')");
+    assert_eq!(format!("{:?}", Value::SubStream(vec![0xFF, 1])), "Stream(2 bytes)");
+}
+
+#[test]
+fn debug_stream_depth_survives_containers() {
+    let w = || stream_wrapped(Value::str("inner"));
+    let shapes = [
+        Value::tuple([w()]),
+        Value::list([w()]),
+        Value::dict([("k", w())]),
+        Value::instance("C", [("x", w())]),
+        Value::Reduce { data: Box::new(w()), list: vec![], dict: vec![] },
+        Value::Callback(Box::new(w())),
+    ];
+    // No remaining depth: containers pass it through, streams stay opaque.
+    assert_eq!(format!("{:?}", Repr(&shapes[0], 0)), "(Stream(12 bytes),)");
+    for v in &shapes[1..] {
+        let s = format!("{:?}", Repr(v, 0));
+        assert!(s.contains("Stream(") && s.contains(" bytes)"), "{s}");
+        assert!(!s.contains("inner"), "{s}");
+    }
+}
+
 #[test]
 fn dict_writes_value_before_key() {
     let b = dumps(&Value::dict([("k", Value::Int(7))]));
@@ -91,6 +136,58 @@ fn shared_slots_follow_the_map() {
     let a = Value::list([Value::Int(10)]);
     let c = Value::list([Value::Int(20)]);
     assert_eq!(loads(&b).unwrap(), Value::tuple([a.clone(), c.clone(), c, a]));
+}
+
+// Version-0 stream: a TUPLE of `rows` DBROWs that all reference one
+// `cols`-column I8 descriptor marked shared; packed row data is empty.
+fn shared_dbrows(cols: usize, rows: usize) -> Vec<u8> {
+    let d = DbRowDescriptor::new((0..cols).map(|i| (format!("c{i}"), DbType::I8)));
+    let mut desc = dumps(&d.to_value());
+    desc.drain(..5); // strip signature and shared count
+    desc[0] |= tag::SHARED_FLAG;
+    let mut b = vec![tag::SIGNATURE, 1, 0, 0, 0, tag::TUPLE, 0xFF];
+    b.extend_from_slice(&(rows as i32).to_le_bytes());
+    b.push(tag::DBROW);
+    b.extend_from_slice(&desc);
+    b.push(0); // empty packed data
+    for _ in 1..rows {
+        b.extend_from_slice(&[tag::DBROW, tag::REFERENCE, 1, 0]);
+    }
+    b.extend_from_slice(&1i32.to_le_bytes()); // shared map: one slot
+    b
+}
+
+#[test]
+fn shared_reference_chain_is_bounded() {
+    // 23 shared objects, each a TUPLE2 holding the previous level twice.
+    let mut b = vec![tag::SIGNATURE];
+    b.extend_from_slice(&23i32.to_le_bytes());
+    b.extend_from_slice(&[tag::TUPLE, 23, tag::LIST1 | tag::SHARED_FLAG, tag::INT_1]);
+    for level in 1..=22u8 {
+        b.extend_from_slice(&[tag::TUPLE2 | tag::SHARED_FLAG, tag::REFERENCE, level, tag::REFERENCE, level]);
+    }
+    for slot in 1..=23i32 {
+        b.extend_from_slice(&slot.to_le_bytes());
+    }
+    assert!(matches!(loads(&b), Err(Error::TooLarge)));
+}
+
+#[test]
+fn many_rows_over_wide_shared_descriptor_is_bounded() {
+    assert!(matches!(loads(&shared_dbrows(2048, 512)), Err(Error::TooLarge)));
+}
+
+#[test]
+fn many_rows_share_one_descriptor() {
+    let d = DbRowDescriptor::new((0..10).map(|i| (format!("c{i}"), DbType::I8)));
+    let data_len = d.layout().data_len;
+    let Value::Tuple(rows) = loads(&shared_dbrows(10, 2000)).unwrap() else { panic!() };
+    assert_eq!(rows.len(), 2000);
+    for row in [&rows[0], &rows[1999]] {
+        let Value::DbRow { data, objects, .. } = row else { panic!() };
+        assert_eq!(data.len(), data_len);
+        assert!(objects.is_empty());
+    }
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Transaction-local fitting snapshots and terminal publications. Effective values
 //! use the dogma Fit evaluator; stored condition is sampled from game.items.
 //! Live condition is owned by the system actor, not sampled here.
+//! A hull capacity mode change additionally republishes the owner's brain.
 
 use std::sync::Arc;
 use infinity_core::consts::dogma::{ATTR_ARMOR_DAMAGE, ATTR_ARMOR_HP, ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_HULL_DAMAGE, ATTR_RECHARGE_RATE, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SHIELD_RECHARGE_RATE, ATTR_STRUCTURE_HP};
@@ -20,6 +21,16 @@ pub(in crate::services) struct FittingBefore {
 
 pub(in crate::services) async fn capture(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, fences: &OnlineFences, owner: i64, ship: i64) -> Result<FittingBefore, CallError> {
     let before = Fit::load(ex, sde.clone(), owner, ship).await?;
+    capture_from_fit(ex, sde, fences, owner, ship, before).await
+}
+
+/// Same boundary on a fit the caller already loaded and still owns; only the
+/// original membership and stored condition/location branches run, with no new
+/// fit load.
+pub(in crate::services) async fn capture_from_fit(
+    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, fences: &OnlineFences,
+    owner: i64, ship: i64, before: Fit,
+) -> Result<FittingBefore, CallError> {
     let membership = fences.membership(ship);
     let (condition, location) = if membership.is_none() {
         let hull = crate::services::items::load_items(ex, sde, crate::dao::items::loading::ItemQuery::Id(ship)).await
@@ -74,8 +85,13 @@ pub(in crate::services) async fn finish<E: From<OnlineChanged>>(ex: &(impl Execu
     if !cap_pair && boundary.before.value(Key::Ship, ATTR_RECHARGE_RATE) != final_fit.value(Key::Ship, ATTR_RECHARGE_RATE) {
         notices.push(super::attribute_change(boundary.owner, marshal::Value::Int(boundary.ship), ATTR_CHARGE, marshal::Value::Float(new_cap), marshal::Value::Float(old_cap)));
     }
-    outbox.operation(OnlineChanged::StoredFitting { owner: boundary.owner, changes: notices }.into());
+    let brain = if boundary.before.override_state(Key::Ship, infinity_core::consts::dogma::ATTR_CAPACITY)
+        != final_fit.override_state(Key::Ship, infinity_core::consts::dogma::ATTR_CAPACITY)
+        && crate::dao::characters::selection::ship_id(ex, boundary.owner).await.map_err(crate::services::db_err)? == Some(boundary.ship) {
+        Some(crate::services::dogma::brain::compile(&final_fit, boundary.owner, boundary.ship))
+    } else { None };
+    outbox.operation(OnlineChanged::StoredFitting { owner: boundary.owner, changes: notices, brain }.into());
     Ok(())
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] mod tests;

@@ -1,5 +1,7 @@
+#[cfg(feature = "tests-lua")]
 use super::*;
 
+#[cfg(feature = "tests-lua")]
 #[test]
 fn callback_user_error_preserves_message_and_dictionary() {
     let lua = Lua::new();
@@ -23,6 +25,7 @@ fn callback_user_error_preserves_message_and_dictionary() {
     }
 }
 
+#[cfg(feature = "tests-lua")]
 #[test]
 fn plain_lua_runtime_error_remains_internal() {
     let lua = Lua::new();
@@ -38,6 +41,7 @@ fn plain_lua_runtime_error_remains_internal() {
     }
 }
 
+#[cfg(feature = "tests-lua")]
 #[test]
 fn exact_amount_is_unclamped_numeric_in_lua() {
     let lua = Lua::new();
@@ -47,6 +51,7 @@ fn exact_amount_is_unclamped_numeric_in_lua() {
     assert_eq!(amount.decimal(), "9999999999999999999999999999999999.99");
 }
 
+#[cfg(feature = "tests-lua")]
 #[test]
 fn context_fields_and_session_expire_on_drop() {
     let lua = Lua::new();
@@ -66,6 +71,7 @@ fn context_fields_and_session_expire_on_drop() {
     assert!(lua.load("return ctx.session").eval::<mlua::Value>().is_err());
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 async fn retained_context_cannot_request_snapshot_after_expiry() {
     let lua = Lua::new();
@@ -78,6 +84,7 @@ async fn retained_context_cannot_request_snapshot_after_expiry() {
     assert!(rx.try_recv().is_err());
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn invocation_deadline_invalidates_context_and_vm_remains_usable() {
@@ -89,7 +96,7 @@ async fn invocation_deadline_invalidates_context_and_vm_remains_usable() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
-    let conn = crate::conn::Conn::new(stream, address);
+    let conn = infinity_wire::conn::Conn::new(stream, address);
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let mut client = Client::new(conn, cfg, db, sde, chat, world, login);
@@ -134,6 +141,7 @@ async fn invocation_deadline_invalidates_context_and_vm_remains_usable() {
     drop(peer);
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 async fn mutations_reject_expired_context_without_enqueueing() {
     let lua = Lua::new();
@@ -150,9 +158,11 @@ async fn mutations_reject_expired_context_without_enqueueing() {
     assert!(rx.try_recv().is_err());
 }
 
+#[cfg(any(feature = "tests-lua", feature = "tests-storage"))]
 #[path = "../../../dao/items/tests.rs"]
 mod mutation_fixture;
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn real_mutations_commit_and_cleanup_fixture_rows() {
@@ -180,7 +190,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "test".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
         let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), chat, world, login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), chat, world, login);
         client.notify_tx = sender_tx;
         client.change_session(vec![("charid", Value::Int(fixture.chars[0])), ("stationid", Value::Int(station_id)), ("solarsystemid", Value::Int(system_id)), ("solarsystemid2", Value::Int(system_id))]);
         let lua = Lua::new();
@@ -235,7 +245,13 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         assert_eq!(notifications.try_recv().unwrap().0, "OnAccountChange");
         assert_eq!(notifications.try_recv().unwrap().0, "OnStandingSet");
         assert!(notifications.try_recv().is_err());
-        let item_count = client.outbox.iter().filter(|packet| matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnItemChange"))).count();
+        let standing_history = crate::dao::characters::standings::history::list(&test_db, fixture.chars[0], fixture.chars[2]).await.unwrap();
+        // Refused sets journal nothing; the one committed set is the script event.
+        assert_eq!(standing_history.len(), 1);
+        let row = &standing_history[0];
+        assert_eq!((row.old_standing, row.new_standing, row.event_type_id, row.actor_id, row.mission_name_id), (0.0, 2.5, 45, Some(fixture.chars[0]), None));
+        assert!(!row.message.is_empty() && row.occurred_at > 0);
+        let item_count = client.outbox.iter().filter(|packet| matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnItemChange"))).count();
         assert_eq!(item_count, 3);
         let script = r#"
             local ctx = ...
@@ -255,7 +271,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         let invocation = crate::lua::vm::budgeted_invocation(&lua, lua.load(script).into_function().unwrap(), &crate::config::lua::LuaConfig::default(), deadline.into_std()).unwrap();
         invoke(&mut client, &lua, invocation, vec![], deadline, None, None).await.unwrap_or_else(|error| panic!("refusal invocation failed: {error:?}"));
         assert!(notifications.try_recv().is_err(), "refused mutations must not notify");
-        assert_eq!(client.outbox.iter().filter(|packet| matches!(&packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnItemChange"))).count(), item_count, "refused mutations must not notify directly");
+        assert_eq!(client.outbox.iter().filter(|packet| matches!(&packet.destination, infinity_wire::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnItemChange"))).count(), item_count, "refused mutations must not notify directly");
         let script = r#"
             local ctx = ...
             local moved = dao.items.move(ctx, stack, destination, nil, 9007199254740993)
@@ -315,9 +331,9 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         assert!(notifications.try_recv().is_err(), "rolled-back credit must not notify");
         assert!(!client.wait_pumping(-1, 0).await.unwrap());
         let mut item_notices = 0;
-        while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), crate::framing::read_frame(&mut peer)).await {
-            let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
-            if let crate::macho::Address::Broadcast { broadcast_id, .. } = packet.destination {
+        while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), infinity_wire::framing::read_frame(&mut peer)).await {
+            let packet = infinity_wire::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
+            if let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = packet.destination {
                 if broadcast_id.as_text().as_deref() == Some("OnItemChange") { item_notices += 1; }
             }
         }
@@ -356,6 +372,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
     result.expect("mutation fixture failed");
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn sovereignty_snapshot_rechecks_membership_and_returns_wire() {
@@ -377,7 +394,7 @@ async fn sovereignty_snapshot_rechecks_membership_and_returns_wire() {
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
         let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, world, login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, world, login);
         let lua = Lua::new();
         crate::lua::value::register(&lua, &lua.globals()).unwrap();
         lua.globals().set("other", fixture.chars[1]).unwrap();
@@ -416,6 +433,7 @@ async fn sovereignty_snapshot_rechecks_membership_and_returns_wire() {
     result.unwrap();
 }
 
+#[cfg(feature = "tests-lua")]
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn expired_live_context_cannot_submit_owned_adaptation() {

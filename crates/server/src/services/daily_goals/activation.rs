@@ -1,15 +1,15 @@
-//! Period-scoped daily content selection from the durable publication log.
+//! Period-scoped daily content selection from the retained publication history.
 //! The client daily periods use UTC boundaries supplied by the period DAO.
 //! Retained content is not a gateway admission; pins live only for one operation.
-use std::collections::HashMap;
-use crate::{dao::lua_content::activations::{self, ActivationRow}, lua::content::PinnedPolicy};
+use std::{collections::HashMap, sync::Arc};
+use crate::{dao::lua_content::activations::ActivationRow, lua::content::PinnedPolicy};
 use super::{Error, Resources, DAILY_GOALS_NAMESPACE};
 
-/// An operation-scoped snapshot read from the authoritative publication log.
-pub(crate) struct ActivationHistory { rows: Vec<ActivationRow>, pins: HashMap<String, PinnedPolicy> }
+/// An operation-scoped snapshot of the retained activation history.
+pub(crate) struct ActivationHistory { rows: Arc<Vec<ActivationRow>>, pins: HashMap<String, PinnedPolicy> }
 
-pub(crate) async fn load(resources: &Resources) -> Result<ActivationHistory, Error> {
-    Ok(ActivationHistory { rows: activations::list(&resources.db, DAILY_GOALS_NAMESPACE).await?, pins: HashMap::new() })
+pub(crate) fn load(resources: &Resources) -> Result<ActivationHistory, Error> {
+    Ok(ActivationHistory { rows: resources.policies.activations(DAILY_GOALS_NAMESPACE)?, pins: HashMap::new() })
 }
 
 /// Select by publication ordinal; callers provide normalized UTC period boundaries.
@@ -36,12 +36,12 @@ impl PeriodPolicy {
     pub(crate) fn policy(&self) -> &PinnedPolicy { &self.policy }
 }
 
-pub(crate) async fn resolve(resources: &Resources, history: &mut ActivationHistory, kind: &str, start: i64, end: i64) -> Result<Option<PeriodPolicy>, Error> {
+pub(crate) fn resolve(resources: &Resources, history: &mut ActivationHistory, kind: &str, start: i64, end: i64) -> Result<Option<PeriodPolicy>, Error> {
     if kind != "day" && kind != "month" { return Err(Error::Invalid); }
-    let Some(row) = select(&history.rows, start, end)? else { return Ok(None); };
+    let Some(row) = select(history.rows.as_slice(), start, end)? else { return Ok(None); };
     let (policy, newly_resolved) = match history.pins.get(&row.version) {
         Some(policy) => (policy.clone(), false),
-        None => (resources.policies.resolve(DAILY_GOALS_NAMESPACE, &row.version).await?, true),
+        None => (resources.policies.resolve(DAILY_GOALS_NAMESPACE, &row.version)?, true),
     };
     if policy.namespace() != row.namespace || policy.version() != row.version || policy.fingerprint().as_slice() != row.fingerprint.as_slice() || policy.daily_goals().is_none() {
         return Err(anyhow::anyhow!("retained daily content does not match its activation").into());
@@ -50,4 +50,4 @@ pub(crate) async fn resolve(resources: &Resources, history: &mut ActivationHisto
     Ok(Some(PeriodPolicy { kind: kind.to_owned(), start, end, policy }))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

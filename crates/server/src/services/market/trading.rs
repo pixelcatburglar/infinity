@@ -390,5 +390,5 @@ pub(super) fn validate_sell(request: SellRequest) -> Result<(), CallError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-economy"))]
 mod tests;

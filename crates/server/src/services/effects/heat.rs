@@ -2,7 +2,7 @@
 //! The rack curve mirrors `dogma/attributes/heatAttribute.py` `CalculateHeat`.
 //! The server evaluates from the last actual input change, so the result does
 //! not depend on read or tick cadence. Overload effects and heat attributes
-//! are evaluated from Fit and SDE data.
+//! are evaluated from Fit and SDE data; a local reset epoch fences old damage.
 //! Runtime heat and priming are discarded on ship departure and restart.
 //! Module damage, burnout, RPC validation and repair are handled elsewhere.
 //! Effective overload transitions also update the actor's cached fitted defenses.
@@ -28,15 +28,15 @@ use crate::space::{System, World};
 
 /// SDE heat, capacity, dissipation and attenuation attributes, low to high rack.
 const HEAT: [i32; 3] = [ATTR_HEAT_LOW, ATTR_HEAT_MED, ATTR_HEAT_HI];
-const CAPACITY: [i32; 3] = [1200, 1199, 1178];
-const DISSIPATION: [i32; 3] = [1198, 1196, 1179];
-const ATTENUATION: [i32; 3] = [1262, 1261, 1259];
+pub(super) const CAPACITY: [i32; 3] = [1200, 1199, 1178];
+pub(super) const DISSIPATION: [i32; 3] = [1198, 1196, 1179];
+pub(super) const ATTENUATION: [i32; 3] = [1262, 1261, 1259];
 /// SDE module heatAbsorbtionRateModifier.
-const ABSORPTION: i32 = 1180;
+pub(super) const ABSORPTION: i32 = 1180;
 /// SDE ship heatGenerationMultiplier.
-const GENERATION: i32 = 1224;
+pub(super) const GENERATION: i32 = 1224;
 /// SDE module heatDamage, already modified by Fit.
-const HEAT_DAMAGE: i32 = 1211;
+pub(super) const HEAT_DAMAGE: i32 = 1211;
 
 #[derive(Clone)]
 struct Entry {
@@ -53,7 +53,7 @@ struct Entry {
 struct State { modules: HashMap<i64, Entry> }
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(Default::default).lock().unwrap()
+    crate::poison::lock_or_exit(STATE.get_or_init(Default::default).lock())
 }
 
 /// Effective overload membership for a single Fit snapshot.
@@ -61,7 +61,7 @@ pub(crate) fn overloaded_modules() -> HashSet<i64> {
     state().modules.iter().filter_map(|(&id, entry)| entry.effective.then_some(id)).collect()
 }
 
-fn rack_index(flag: i32) -> Option<usize> {
+pub(super) fn rack_index(flag: i32) -> Option<usize> {
     match flag {
         FLAG_FITTING_FIRST..FLAG_MED_SLOT_FIRST => Some(0),
         FLAG_MED_SLOT_FIRST..FLAG_HI_SLOT_FIRST => Some(1),
@@ -93,9 +93,12 @@ struct Rack {
     /// Heat and time of the current curve phase. It resets only when an input actually changes.
     anchor_heat: f64,
     anchor_at: i64,
+    reset_epoch: u64,
+    reset_at: i64,
     sources: HashMap<i64, Source>,
     boundary: Option<boundary_runtime::RackBoundary>,
 }
+
 
 #[derive(Default)]
 struct Ship { owner: i64, racks: [Rack; 3] }
@@ -127,14 +130,22 @@ pub(crate) struct SourceSnapshot {
     pub attenuation: f64,
     pub heat_damage: f64,
     pub generation: Arc<AtomicBool>,
+    pub reset_epoch: u64,
+    pub sampled_at: i64,
+}
+
+fn floor_time(rack: &Rack, time: i64) -> i64 {
+    (rack.reset_epoch != 0).then_some(rack.reset_at).map_or(time, |floor| time.max(floor))
 }
 
 fn evaluated(rack: &Rack, time: i64) -> f64 {
+    let time = floor_time(rack, time);
     if time <= rack.anchor_at { return rack.anchor_heat; }
     rack::curve(rack.anchor_heat, rack.capacity, rack.incoming, rack.generation, rack.dissipation, (time - rack.anchor_at) as f64)
 }
 
 fn settle(rack: &mut Rack, time: i64) -> Option<(f64, f64)> {
+    let time = floor_time(rack, time);
     if time <= rack.last { return None; }
     let old = rack.heat;
     rack.heat = evaluated(rack, time);
@@ -144,6 +155,7 @@ fn settle(rack: &mut Rack, time: i64) -> Option<(f64, f64)> {
 
 /// Settle under the old inputs, then start the next curve phase when the change is not still in the future.
 fn reanchor(rack: &mut Rack, time: i64) {
+    let time = floor_time(rack, time);
     if time < rack.anchor_at { return; }
     settle(rack, time);
     rack.anchor_heat = evaluated(rack, time);
@@ -176,6 +188,7 @@ fn apply_source_end(rack: &mut Rack, marker: &boundary::Boundary, final_cycle: b
     let snapshot = SourceSnapshot {
         master, module: marker.module, flag: source.flag, heat: evaluated(rack, marker.at), capacity: rack.capacity,
         attenuation: rack.attenuation, heat_damage: source.damage, generation: source.generation.clone(),
+        reset_epoch: rack.reset_epoch, sampled_at: marker.at,
     };
     let stopping = source.stopping || final_cycle || pending_stop;
     let drop_incoming = stopping && !source.suspended;
@@ -335,46 +348,44 @@ pub(super) fn begin_cycle(s: &mut System, cycle: &Cycle) {
 }
 
 /// Queue evaluated source parameters; the actor applies them at nominal start.
-pub(super) async fn connect_cycle(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> Result<(), CallError> {
-    let configs: Vec<_> = (0..HEAT.len()).map(|index| (
-        fit.value(Key::Ship, CAPACITY[index]), fit.value(Key::Ship, DISSIPATION[index]),
-        fit.value(Key::Ship, ATTENUATION[index]), fit.value(Key::Ship, GENERATION),
-    )).collect();
-    let modules: Vec<_> = cycle.modules.iter().filter_map(|module| rack_index(module.flag).map(|index| (
-        module.id, module.flag, index, fit.value(Key::Module(module.id), ABSORPTION), fit.value(Key::Module(module.id), HEAT_DAMAGE),
-    ))).collect();
-    let ship = cx.ship_id;
-    let owner = cx.char_id;
+pub(super) fn connect_cycle(s: &mut System, cycle: &Cycle) -> Result<(), CallError> {
+    let Some(frame) = cycle.inputs.frame.as_ref() else {
+        return Err(CallError::Internal(anyhow::anyhow!("heat connection without captured inputs")));
+    };
+    let ship = cycle.cx.ship_id;
+    let owner = cycle.cx.char_id;
     let master = cycle.modules[0].id;
     let generation = cycle.stop.clone();
     let nominal = cycle.nominal_start;
     let duration = cycle.duration_ms;
-    cx.world.with(cx.system_id, move |s| {
-        let valid = s.contains(ship) && combat::state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &generation));
-        if !valid { return Err(CallError::Internal(anyhow::anyhow!("stale heat cycle"))); }
+    let valid = s.contains(ship) && combat::state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &generation));
+    if !valid { return Err(CallError::Internal(anyhow::anyhow!("stale heat cycle"))); }
+    let effective: Vec<_> = {
         let membership = state();
-        let effective: Vec<_> = modules.into_iter().filter(|(module, _, _, _, _)| {
-            membership.modules.get(module).is_some_and(|entry| entry.effective && entry.ship == ship && entry.owner == owner)
-        }).collect();
-        drop(membership);
-        let heat = s.heat.ships.entry(ship).or_insert_with(|| Ship { owner, racks: std::array::from_fn(|_| Rack::default()) });
-        for (module, flag, index, rate, damage) in effective {
-            let (capacity, dissipation, attenuation, generation_multiplier) = configs[index];
-            let armed = boundary_runtime::arm_start(&mut heat.racks[index], module, &generation, nominal, boundary_runtime::PendingStart {
+        cycle.inputs.members.iter().zip(&cycle.modules).filter_map(|(member, module)| {
+            let (index, rate, damage) = member.heat?;
+            membership.modules.get(&module.id)
+                .is_some_and(|entry| entry.effective && entry.ship == ship && entry.owner == owner)
+                .then_some((module.id, module.flag, index, rate, damage))
+        }).collect()
+    };
+    let heat = s.heat.ships.entry(ship).or_insert_with(|| Ship { owner, racks: std::array::from_fn(|_| Rack::default()) });
+    for (module, flag, index, rate, damage) in effective {
+        let (capacity, dissipation, attenuation, generation_multiplier) = frame.heat_racks[index];
+        let armed = boundary_runtime::arm_start(&mut heat.racks[index], module, &generation, nominal, boundary_runtime::PendingStart {
+            flag, rate, damage, capacity, dissipation, attenuation, generation_multiplier,
+        });
+        if !armed {
+            boundary_runtime::install_start(&mut heat.racks[index], module, generation.clone(), nominal);
+            boundary_runtime::arm_start(&mut heat.racks[index], module, &generation, nominal, boundary_runtime::PendingStart {
                 flag, rate, damage, capacity, dissipation, attenuation, generation_multiplier,
             });
-            if !armed {
-                boundary_runtime::install_start(&mut heat.racks[index], module, generation.clone(), nominal);
-                boundary_runtime::arm_start(&mut heat.racks[index], module, &generation, nominal, boundary_runtime::PendingStart {
-                    flag, rate, damage, capacity, dissipation, attenuation, generation_multiplier,
-                });
-            }
-            let end = crate::services::effects::lifecycle::cycle_deadline(nominal, duration);
-            if !boundary_runtime::install_end(&mut heat.racks[index], module, generation.clone(), nominal, end) { continue; }
         }
-        for index in 0..HEAT.len() { advance(s, ship, index, s.now_ms()); }
-        Ok(())
-    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system unavailable during heat connection")))?
+        let end = crate::services::effects::lifecycle::cycle_deadline(nominal, duration);
+        if !boundary_runtime::install_end(&mut heat.racks[index], module, generation.clone(), nominal, end) { continue; }
+    }
+    for index in 0..HEAT.len() { advance(s, ship, index, s.now_ms()); }
+    Ok(())
 }
 
 /// Queue this activation's end capture. The receiver resolves after older markers.
@@ -395,17 +406,54 @@ pub(super) fn finish_cycle(
     Some(receiver)
 }
 
-/// Recheck ship, owner and source activation after acquiring the damage lock.
-pub(crate) async fn generation_valid(world: &World, system: i64, ship: i64, owner: i64, source: &SourceSnapshot) -> bool {
-    let master = source.master;
-    let module = source.module;
+/// Result of checking a captured source against the actor's reset fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DamageDisposition { Apply, ResetCovered, Stale }
+
+fn reset_rack(rack: &mut Rack, at: i64) -> f64 {
+    let old = rack.heat;
+    rack.reset_epoch = rack.reset_epoch.checked_add(1).expect("heat reset epoch exhausted");
+    rack.reset_at = at;
+    rack.heat = 0.0;
+    rack.anchor_heat = 0.0;
+    rack.last = at;
+    rack.anchor_at = at;
+    old
+}
+
+/// Reset all racks of an existing ship without disturbing overload membership or boundaries.
+pub(crate) fn reset_ship_heat(s: &mut System, ship: i64, at: i64) {
+    let Some((owner, changes)) = s.heat.ships.get_mut(&ship).map(|ship_state| {
+        let owner = ship_state.owner;
+        let changes = ship_state.racks.iter_mut().enumerate().map(|(index, rack)| {
+            let old = reset_rack(rack, at);
+            notify::heat_attribute(owner, ship, HEAT[index], old, 0.0, filetime_from_unix_ms(at))
+        }).collect::<Vec<_>>();
+        (owner, changes)
+    }) else { return };
+    for (name, args) in changes { s.notify_pilot(owner, name, args); }
+}
+
+pub(crate) async fn damage_disposition(
+    world: &World, system: i64, ship: i64, owner: i64, source: &SourceSnapshot,
+) -> DamageDisposition {
+    let (module, master, epoch, sampled_at) = (source.module, source.master, source.reset_epoch, source.sampled_at);
     let generation = source.generation.clone();
     world.with(system, move |s| {
-        s.contains(ship)
-            && combat::state().active.get(&master).is_some_and(|active| active.char_id == owner && Arc::ptr_eq(&active.stop, &generation))
-            && s.heat.ships.get(&ship).is_some_and(|state| state.owner == owner && state.racks.iter().any(|rack|
-                rack.sources.get(&module).is_some_and(|source| Arc::ptr_eq(&source.generation, &generation))))
-    }).await.unwrap_or(false)
+        let active = combat::state().active.get(&master)
+            .is_some_and(|active| active.char_id == owner && Arc::ptr_eq(&active.stop, &generation));
+        let Some(state) = s.heat.ships.get(&ship) else { return DamageDisposition::Stale };
+        if !active || !s.contains(ship) || state.owner != owner { return DamageDisposition::Stale; }
+        let Some(rack) = state.racks.iter().find(|rack| rack.sources.get(&module)
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &generation))) else {
+                return DamageDisposition::Stale;
+            };
+        if rack.reset_epoch != epoch || (rack.reset_epoch != 0 && sampled_at < rack.reset_at) {
+            DamageDisposition::ResetCovered
+        } else {
+            DamageDisposition::Apply
+        }
+    }).await.unwrap_or(DamageDisposition::Stale)
 }
 
 fn suspend_stopping(rack: &mut Rack, ids: &[i64], generation: Option<&Arc<AtomicBool>>, at: i64) {
@@ -612,4 +660,4 @@ pub(crate) async fn ship_state(world: &World, system: i64, ship: i64) -> Option<
     }).await.flatten()
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, any(feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;

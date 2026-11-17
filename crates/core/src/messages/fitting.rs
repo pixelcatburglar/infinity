@@ -10,6 +10,8 @@ pub const CATEGORY: &str = "此装备不能安装在该舰船类别上。";
 pub const HULL: &str = "此装备不能安装在这艘舰船上。";
 pub const RACK: &str = "此装备不能安装在该槽位。";
 pub const OCCUPIED: &str = "该装备槽位已被占用。";
+/// A business boundary is settling the module's loaded charges; retry when it completes.
+pub const CHARGES_SETTLING: &str = "弹药装填正在结算中，请稍后重试。";
 pub const RIG_SIZE: &str = "改装件尺寸不适合这艘舰船。";
 pub const TURRET: &str = "没有足够的炮台安装位。";
 pub const LAUNCHER: &str = "没有足够的发射器安装位。";

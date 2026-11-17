@@ -76,7 +76,7 @@ async fn bubble_broadcast_delivers_only_to_live_visible_observers() {
     let (stream, address) = listener.accept().await.unwrap();
     let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: sender_connection, session_id: 1, language_id: "EN".into() };
-    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
     client.session.apply(vec![("charid", Value::Int(sender)), ("shipid", Value::Int(sender_ship)), ("solarsystemid", Value::Int(system))]);
     let args = [Value::str("Target"), Value::Int(3), Value::Int(target)];
     let call = Call { service: "fleet", method: "SendBroadcast", args: &args, kwargs: &Value::None, bound: false, bind_params: None };

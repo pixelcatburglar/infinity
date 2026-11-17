@@ -61,6 +61,27 @@ async fn unpiloted_ball_excludes_owner_skills_and_restores_fitted_condition() {
     assert_eq!(ball.char_id, None);
     assert!(!ball.interactive);
     assert_eq!(ball.pos, row.pos);
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    let identity = Identity { char_id: owner, ship_id: Some(ship), corp_id: 1, station_id: Some(station), system_id: None };
+    let hull_name = sde.types.get(hull).unwrap().name.clone().unwrap_or_default();
+    let slim_name = |ball: &Ball| ball.slim.iter().find(|(k, _)| *k == "name").map(|(_, v)| v.clone());
+    for (stored, expected) in [(None, hull_name), (Some("夜航星·观测舰"), "夜航星·观测舰".to_string()), (Some(""), String::new())] {
+        db.execute("UPDATE game.items SET name = $2 WHERE item_id = $1", &[&ship, &stored]).await.unwrap();
+        let want = Value::unicode(expected);
+        assert_eq!(slim_name(&selected(&identity, &db, &world, &sde, None, None, ship, row.pos).await.unwrap().ball).unwrap(), want);
+        assert_eq!(slim_name(&super::piloted(&db, sde.clone(), &row, owner, 0.5).await.unwrap().ball).unwrap(), want);
+        assert_eq!(slim_name(&unpiloted(&db, sde.clone(), &row).await.unwrap().ball).unwrap(), want);
+    }
+    let slim_kills = |ball: &Ball| ball.slim.iter().find(|(k, _)| *k == "kills").and_then(|(_, v)| v.as_int());
+    for kills in [None, Some(123_456_789_012i64)] {
+        if let Some(count) = kills {
+            db.execute("INSERT INTO game.ship_kill_counts (ship_item_id, player_kills) VALUES ($1,$2)", &[&ship, &count]).await.unwrap();
+        }
+        let want = Some(kills.unwrap_or(0));
+        assert_eq!(slim_kills(&selected(&identity, &db, &world, &sde, None, None, ship, row.pos).await.unwrap().ball), want);
+        assert_eq!(slim_kills(&super::piloted(&db, sde.clone(), &row, owner, 0.5).await.unwrap().ball), want);
+        assert_eq!(slim_kills(&unpiloted(&db, sde.clone(), &row).await.unwrap().ball), want);
+    }
     for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let invalid_row = FreeShip { item_id: ship, type_id: hull, owner_id: owner, corporation_id: 1, alliance_id: 0, pos: [invalid, 2.0, 3.0] };
         assert!(unpiloted(&db, sde.clone(), &invalid_row).await.is_err());
@@ -68,6 +89,18 @@ async fn unpiloted_ball_excludes_owner_skills_and_restores_fitted_condition() {
         assert!(combat::prepare_condition_with_fit(&db, ship, &fit).await.is_err());
     }
     assert_eq!(dogma::save_conditions(&db, station, &ids, &[(ship, [0.0, 0.0, 0.0], 0)]).await.unwrap(), vec![ship]);
+    let mut flagged = crate::space::System::default();
+    assert_eq!(crate::dao::characters::npc_control::set(&db, owner, account, Some(true)).await.unwrap(), Some(true));
+    super::piloted(&db, sde.clone(), &row, owner, 0.5).await.unwrap().install(&mut flagged, |s, ball| s.insert(ball));
+    assert!(flagged.npc_target_ignored(ship));
+    let snapshot = flagged.combat_condition_snapshot(ship).unwrap();
+    flagged.take(ship);
+    let transferred = super::piloted(&db, sde.clone(), &row, owner, 0.5).await.unwrap();
+    assert!(transferred.install_transfer(&mut flagged, |s, ball| s.insert(ball), snapshot));
+    assert!(flagged.npc_target_ignored(ship));
+    flagged.take(ship);
+    selected(&identity, &db, &world, &sde, None, None, ship, row.pos).await.unwrap().install(&mut flagged, |s, ball| s.insert(ball));
+    assert!(flagged.npc_target_ignored(ship));
     for invalid in [f64::NAN, f64::INFINITY] {
         assert!(dogma::set_override(&db, ship, ATTR_ARMOR_HP, invalid).await.unwrap());
         let invalid_fit = Fit::load_unpiloted(&db, sde.clone(), ship).await.ok().unwrap();

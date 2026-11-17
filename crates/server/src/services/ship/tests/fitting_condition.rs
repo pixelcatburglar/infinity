@@ -10,7 +10,6 @@ use std::time::Duration;
 
 const CONDITION_IDS: [i32; 3] = [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE];
 const MAX_IDS: [i32; 3] = [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP];
-const CLEARANCE: f64 = 100.0;
 
 macro_rules! phase {
     ($name:literal, $future:expr) => {
@@ -61,20 +60,7 @@ async fn inspect(client: &mut Client, ship: i64, system: i64, live: bool, maxima
 }
 
 async fn dock_at_station(client: &mut Client, identity: &Identity, system: i64, station: i64, ship: i64) {
-    let (sent, received) = tokio::sync::oneshot::channel();
-    phase!("queue station approach", client.world.with(system, move |s| {
-        let station = s.ball(station).expect("station ball");
-        let position = station.position_at(s.now_ms());
-        let radius = f64::from(station.radius);
-        s.command(ship, move |ball, _, _| {
-            ball.pos = [position[0] + radius + f64::from(ball.radius) + CLEARANCE, position[1], position[2]];
-            ball.vel = [0.0; 3];
-            ball.stop();
-            let _ = sent.send(());
-            Vec::new()
-        });
-    })).expect("system actor");
-    phase!("station approach", received).expect("approach action");
+    phase!("station approach", approach_station(&client.world, system, station, ship, APPROACH_CLEARANCE));
     let change = phase!("dock", dock(identity, &client.db, &client.world, Some(system), station, None::<&mut Client>)).unwrap();
     client.session.apply(change.updates);
 }

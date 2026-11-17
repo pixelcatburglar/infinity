@@ -1,16 +1,24 @@
 //! `dynamicItemService` information and creation RPCs used by
 //! `eve/client/script/dogma/dynamicItemSvc.py`. Reads game provenance, typed factor
 //! rows from `game.dynamic_item_modifiers`, and item overrides; uses SDE ranges for
-//! creation only. Renewal, erase and roguelike variants are unsupported; deployed
-//! inputs require World removal and are refused.
+//! creation only. Escrowed provenance is visible only to its recovery beneficiary.
+//! Renewal, erase and roguelike variants are unsupported; deployed inputs require
+//! World removal and are refused.
 use infinity_core::{consts::dogma::ATTR_HULL_DAMAGE, messages::dynamic_items as msg};
 use crate::{client::Client, dao::{dynamic_items, items::{dogma, loading::ItemQuery}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, rand01, Call, CallError, CallResult}};
 use marshal::Value;
 use super::mutation::{self, Context};
 
-pub(super) async fn info(ex: &(impl Executor + ?Sized), sde: &Sde, item_id: i64) -> CallResult {
+pub(super) async fn info(ex: &(impl Executor + ?Sized), sde: &Sde, item_id: i64, reader: i64) -> CallResult {
     let metadata = dynamic_items::get(ex, item_id).await.map_err(db_err)?.ok_or_else(|| notify_error(msg::NOT_FOUND))?;
     let item = load_items(ex, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(msg::NOT_FOUND))?;
+    if item.owner_id == infinity_core::consts::NPC_CORP_INTERBUS
+        && crate::dao::repairable_ship::RecoveryGroupId::new(item.location_id).is_some() {
+        let id = crate::dao::repairable_ship::ItemId::new(item_id).ok_or_else(|| notify_error(msg::NOT_FOUND))?;
+        if crate::dao::repairable_ship::escrow_beneficiary(ex, id).await.map_err(db_err)? != Some(reader) {
+            return Err(notify_error(msg::NOT_FOUND));
+        }
+    }
     if item.type_id != metadata.result_type_id { return Err(notify_error(msg::NOT_FOUND)); }
     let overrides = dogma::overrides(ex, item_id).await.map_err(db_err)?;
     let damage = overrides.iter().find(|row| row.attribute_id == ATTR_HULL_DAMAGE).map_or(0.0, |row| row.value);
@@ -22,9 +30,7 @@ pub(super) async fn info(ex: &(impl Executor + ?Sized), sde: &Sde, item_id: i64)
 fn ids<const N: usize>(args: &[Value]) -> Result<[i64; N], CallError> {
     if args.len() != N { return Err(notify_error(msg::INVALID_ARGUMENT)); }
     let mut ids = [0; N];
-    for (id, value) in ids.iter_mut().zip(args) {
-        *id = match value { Value::Int(value) if *value > 0 => *value, _ => return Err(notify_error(msg::INVALID_ARGUMENT)) };
-    }
+    for (id, value) in ids.iter_mut().zip(args) { *id = crate::services::value_positive_id(Some(value)).ok_or_else(|| notify_error(msg::INVALID_ARGUMENT))?; }
     Ok(ids)
 }
 
@@ -50,7 +56,7 @@ async fn create(c: &mut Client, mutator_id: i64, source_id: i64) -> CallResult {
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.method {
-        "GetDynamicItemInfo" => Some(match ids::<1>(call.args) { Ok(ids) => info(&c.db, &c.sde, ids[0]).await, Err(e) => Err(e) }),
+        "GetDynamicItemInfo" => Some(match ids::<1>(call.args) { Ok(ids) => info(&c.db, &c.sde, ids[0], c.session.int("charid").unwrap_or(0)).await, Err(e) => Err(e) }),
         "CreateDynamicItem" => Some(match ids::<2>(call.args) { Ok(ids) => create(c, ids[0], ids[1]).await, Err(e) => Err(e) }),
         _ => None,
     }

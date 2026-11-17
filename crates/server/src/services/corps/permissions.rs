@@ -53,5 +53,5 @@ pub(super) fn can_edit_base(actor_ceo: bool, actor_director: bool) -> bool {
     actor_ceo || actor_director
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-social"))]
 mod tests;

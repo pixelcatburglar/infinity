@@ -2,7 +2,7 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use infinity_core::{
-    consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTERNESS, dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_IMPLANT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, GROUP_BOOSTER},
+    consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTERNESS, dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_IMPLANT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_HI_POWER, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, GROUP_BOOSTER},
 };
 use crate::{
     dao::items::dogma,
@@ -22,7 +22,8 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
     let test_db = db.clone();
     let world = c.world.clone();
     let test_world = world.clone();
-    let result = tokio::spawn(async move {
+    let mut recipient = None;
+    let result = crate::tests::catch_scenario(async {
         let db = test_db;
         let sde = c.sde.clone();
         let station: i64 = 60000001;
@@ -36,7 +37,7 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
             && t.attribute(14).is_some_and(|v| v >= 1.0)).expect("published ship with a high slot").type_id;
         let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
-            && t.effects().iter().any(|e| e.effect_id == 12)
+            && t.effects().iter().any(|e| e.effect_id == EFFECT_HI_POWER)
             && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)
             && t.attribute(ATTR_CPU).is_some_and(|v| v > 0.0)
             && !t.effects().iter().any(|e| e.effect_id == infinity_core::consts::dogma::EFFECT_TURRET_FITTED || e.effect_id == infinity_core::consts::dogma::EFFECT_LAUNCHER_FITTED)).expect("high-slot module").type_id;
@@ -61,6 +62,12 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         }).collect();
         draws.sort_unstable_by_key(|v| v.0);
         draws.dedup_by_key(|v| v.0);
+        crate::dao::characters::selection::set_ship(&db, f.character, ship).await.unwrap();
+        {
+            let market = crate::services::market::lock().await;
+            recipient = Some(fixture::LiveRecipient::cold(&test_world, f.character, None, &market).await);
+        }
+        let live = recipient.as_ref().unwrap();
         let now = filetime_now();
         let fences = online::capture_online_fences(&test_world, &[f.character]).await;
         {
@@ -77,6 +84,7 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         let after = [boosted.value(Key::Ship, ATTR_CPU_OUTPUT), boosted.value(Key::Ship, ATTR_POWER_OUTPUT)];
         let index = (0..2).find(|&i| after[i] > before[i] + 1e-4).expect("booster increases ship CPU or power output");
         let (usage, load, output) = [(ATTR_CPU, ATTR_CPU_LOAD, ATTR_CPU_OUTPUT), (ATTR_POWER, ATTR_POWER_LOAD, ATTR_POWER_OUTPUT)][index];
+        assert_eq!(live.read(move |fit| fit.value(Key::Ship, output)).await, after[index]);
         assert!(dogma::set_override(&db, module, usage, (before[index] + after[index]) / 2.0).await.unwrap());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let receiver = Arc::new(std::sync::Mutex::new(receiver));
@@ -130,9 +138,13 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         assert!(brain::get(&db, f.character, item).await.unwrap().is_some());
         assert_eq!(dogma::online(&db, ship).await.unwrap().len(), 1);
         assert!(receiver.lock().unwrap().try_recv().is_err());
+        assert_eq!(live.read(move |fit|
+            (fit.source_type(Key::Booster(item)), fit.value(Key::Ship, output))).await, (Some(booster), after[index]));
         let job = Job { id: format!("{KIND}:{}", f.character), kind: KIND.into(), due_at: due, payload: f.character.to_string() };
         handle(db.clone(), test_world.clone(), job.clone()).await.unwrap();
         assert!(brain::get(&db, f.character, item).await.unwrap().is_none());
+        assert_eq!(live.read(move |fit|
+            (fit.source_type(Key::Booster(item)), fit.value(Key::Ship, output))).await, (None, before[index]));
         assert!(dogma::online(&db, ship).await.unwrap().is_empty());
         let mut stopped = false;
         let mut removed = false;
@@ -146,8 +158,13 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
         assert!(brain::get(&db, f.character, item).await.unwrap().is_none());
         assert!(dogma::online(&db, ship).await.unwrap().is_empty());
         assert!(receiver.lock().unwrap().try_recv().is_err(), "retry emitted another notification");
+        assert_eq!(live.read(move |fit|
+            (fit.source_type(Key::Booster(item)), fit.value(Key::Ship, output))).await, (None, before[index]));
     }).await;
     world.unregister_pilot_generation(f.character, None);
+    if let Some(live) = recipient {
+        live.close().await;
+    }
     scheduler::cancel(&db, &format!("{KIND}:{}", f.character)).await.unwrap();
     db.execute("DELETE FROM game.skill_history WHERE character_id=$1", &[&f.character]).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();

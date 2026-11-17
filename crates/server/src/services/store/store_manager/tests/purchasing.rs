@@ -25,8 +25,8 @@ async fn setup() -> (Db, fixture::Fixture, Client, tokio::net::TcpStream) {
     (db, actor, client, peer)
 }
 
-async fn ordinary(client: &Client) -> (i64, i32, i64, i64) {
-    let cat = catalogue(client).await.unwrap();
+fn ordinary(client: &Client) -> (i64, i32, i64, i64) {
+    let cat = catalogue(client).unwrap();
     let offer = cat.offers.iter().find(|o| !o.daily && client.sde.crates.get(o.type_id).is_none() && o.price > 0 && o.price < 1_000_000).expect("an affordable ordinary offer");
     (offer.id, offer.type_id, offer.quantity, offer.price)
 }
@@ -43,7 +43,7 @@ async fn state(db: &Db, payer: i64, recipient: i64) -> (String, i64, i64) {
 
 fn notifications(client: &mut Client) -> Vec<(String, Vec<Value>)> {
     std::mem::take(&mut client.outbox).into_iter().map(|packet| {
-        let crate::macho::Address::Broadcast { broadcast_id, .. } = packet.destination else { panic!("expected broadcast notification") };
+        let infinity_wire::macho::Address::Broadcast { broadcast_id, .. } = packet.destination else { panic!("expected broadcast notification") };
         let envelope = packet.body[0].items().unwrap();
         let decoded = marshal::loads(envelope[1].as_bytes().unwrap()).unwrap();
         let fields = decoded.items().unwrap();
@@ -64,7 +64,7 @@ async fn cleanup(db: &Db, actor: fixture::Fixture) {
 async fn ordinary_purchase_authenticates_payer_and_delivers_quantity() {
     let (db, actor, mut client, _peer) = setup().await;
     let other = fixture::create(&db).await.unwrap();
-    let (offer, ty, quantity, price) = ordinary(&client).await;
+    let (offer, ty, quantity, price) = ordinary(&client);
     set_balance(&db, actor, 10_000_000).await;
     let before_other = state(&db, other.account, other.account).await;
     let kwargs = Value::dict([("from_character_id", Value::Int(other.character))]);
@@ -87,7 +87,7 @@ async fn ordinary_purchase_authenticates_payer_and_delivers_quantity() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn invalid_purchase_arguments_have_no_effect_and_none_targets_self() {
     let (db, actor, mut client, _peer) = setup().await;
-    let (offer, _, _, price) = ordinary(&client).await;
+    let (offer, _, _, price) = ordinary(&client);
     set_balance(&db, actor, 10_000_000).await;
     let before = state(&db, actor.account, actor.account).await;
     let empty = || Value::Dict(vec![]);
@@ -130,7 +130,7 @@ async fn invalid_purchase_arguments_have_no_effect_and_none_targets_self() {
 async fn online_gift_routes_queue_to_account_transport_only() {
     let (db, actor, mut client, _peer) = setup().await;
     let recipient = fixture::create(&db).await.unwrap();
-    let (offer, ty, quantity, price) = ordinary(&client).await;
+    let (offer, ty, quantity, price) = ordinary(&client);
     set_balance(&db, actor, 10_000_000).await;
     let registration = crate::live_sessions::register(recipient.account, false).unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -155,7 +155,7 @@ async fn online_gift_routes_queue_to_account_transport_only() {
 async fn deleted_gift_recipient_is_rejected_without_effects() {
     let (db, actor, mut client, _peer) = setup().await;
     let recipient = fixture::create(&db).await.unwrap();
-    let (offer, _, _, _) = ordinary(&client).await;
+    let (offer, _, _, _) = ordinary(&client);
     set_balance(&db, actor, 10_000_000).await;
     db.execute("UPDATE game.characters SET deleted = true WHERE character_id = $1", &[&recipient.character]).await.unwrap();
     let before_payer = state(&db, actor.account, actor.account).await;
@@ -179,7 +179,7 @@ async fn deleted_gift_recipient_is_rejected_without_effects() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn oversized_balance_debits_exactly_and_notifies_clamped_projection() {
     let (db, actor, mut client, _peer) = setup().await;
-    let (offer, _, _, price) = ordinary(&client).await;
+    let (offer, _, _, price) = ordinary(&client);
     let exact = "999999999999999999999999999999999999";
     set_balance(&db, actor, exact.parse().unwrap()).await;
     assert_eq!(buy(&mut client, &[Value::Int(offer), Value::str("PLX"), Value::Int(1)], Value::Dict(vec![])).await, Value::Bool(true));

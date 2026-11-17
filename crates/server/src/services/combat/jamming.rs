@@ -57,10 +57,9 @@ pub(crate) fn apply(s: &mut System, source: i64, module: i64, target: i64, durat
             .max(records.get(&(source, module)).map_or(now, |record| record.until));
         records.insert((source, module), Jam { until, generation, recipients, started });
         let (lost, notices) = if let Some(pilot) = victim_pilot {
-            let (targets, pending, notices) = super::targeting_charges::clear_character_lock_state(&mut st, pilot);
-            let mut lost = targets;
-            lost.extend(pending);
-            (lost, notices)
+            // Pending attempts publish through their own UI failure path and
+            // never join the completed-lock loss set.
+            super::targeting_charges::clear_character_lock_state(&mut st, pilot)
         } else { (Default::default(), Vec::new()) };
         (lost, notices, until)
     };
@@ -101,4 +100,4 @@ pub(crate) fn apply(s: &mut System, source: i64, module: i64, target: i64, durat
     });
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-combat"))] mod tests;

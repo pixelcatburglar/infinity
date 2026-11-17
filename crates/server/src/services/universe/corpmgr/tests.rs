@@ -30,7 +30,7 @@ async fn delivery_assets_return_station_rows_only_to_authorized_members() {
     }
     let foreign = [Value::Int(corp + 1), Value::str("deliveries")];
     let call = Call { args: &foreign, ..call };
-    assert!(dispatch(&mut client, &call).await.unwrap().ok().unwrap().items().unwrap().is_empty());
+    assert!(dispatch(&mut client, &call).await.unwrap().is_err());
     db.execute("DELETE FROM game.items WHERE owner_id = $1", &[&corp]).await.unwrap();
     db.execute("UPDATE game.characters SET corporation_id = 1 WHERE character_id = $1", &[&actor.character]).await.unwrap();
     db.execute("DELETE FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.unwrap();

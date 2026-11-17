@@ -16,13 +16,17 @@ fn supported_numeric_effects_and_unknown() {
         (EFFECT_HACKING, Hacking), (EFFECT_PROBE_LAUNCHING, ProbeLaunch),
         (EFFECT_SURVEY_SCAN, SurveyScan),
         (EFFECT_EMP_WAVE, Smartbomb), (EFFECT_NPC_BEHAVIOR_SMARTBOMB, Smartbomb),
-        (EFFECT_CHAIN_LIGHTNING, Vorton), (EFFECT_BOMB_LAUNCHING, Bomb),
+        (EFFECT_CHAIN_LIGHTNING, Vorton), (EFFECT_ENTITY_CHAIN_LIGHTNING, Vorton), (EFFECT_BOMB_LAUNCHING, Bomb),
         (EFFECT_CLOAKING, Cloak), (EFFECT_CLOAKING_PROTOTYPE, Cloak), (EFFECT_CLOAKING_WARP_SAFE, Cloak),
         (EFFECT_MICRO_JUMP_DRIVE, MicroJumpDrive), (EFFECT_TRACTOR_BEAM, Tractor),
         (EFFECT_CARGO_SCAN, CargoScan), (EFFECT_SHIP_SCAN, ShipScan),
         (EFFECT_TARGET_HOSTILES, AutoTarget), (EFFECT_TARGET_PASSIVELY, PassiveTarget),
         (EFFECT_INDUSTRIAL_ITEM_COMPRESSION, Compression),
         (EFFECT_ONLINE as i32, Online),
+        (EFFECT_DOOMSDAY_BEAM_DOT, SuperWeapon), (EFFECT_DOOMSDAY_CONE_DOT, SuperWeapon),
+        (EFFECT_DOOMSDAY_SLASH, SuperWeapon),
+        (EFFECT_SUPER_WEAPON_AMARR, SuperWeapon), (EFFECT_SUPER_WEAPON_CALDARI, SuperWeapon),
+        (EFFECT_SUPER_WEAPON_GALLENTE, SuperWeapon), (EFFECT_SUPER_WEAPON_MINMATAR, SuperWeapon),
     ];
     for (id, expected) in cases {
         assert_eq!(classify(id, false), Some(expected), "effect {id}");
@@ -30,7 +34,10 @@ fn supported_numeric_effects_and_unknown() {
     }
     assert_eq!(classify(i32::MAX, false), None);
     assert_eq!(classify(i32::MAX, true), Some(Modifiers));
-    assert_eq!(classify(EFFECT_BASTION, true), None);
+    assert_eq!(classify(EFFECT_BASTION, true), Some(Modifiers));
+    assert_eq!(classify(EFFECT_SACRIBIS_BASTION, true), Some(Modifiers));
+    assert_eq!(classify(EFFECT_EXCLUDED_6474, false), None);
+    assert_eq!(classify(EFFECT_EXCLUDED_6474, true), None);
 }
 
 #[test]
@@ -60,7 +67,7 @@ fn activation_scope_rejects_unsupported_launchers_and_non_modules() {
 
 #[test]
 fn modifier_activation_requires_an_active_category() {
-    let mut effect = Effect { id: 1, kind: EffectKind::Modifiers, guid: None, category: None, attributes: [None; 5], flags: 0 };
+    let mut effect = Effect { id: 1, kind: EffectKind::Modifiers, guid: None, category: None, attributes: [None; 6], flags: 0 };
     for category in [None, Some(0), Some(3), Some(5)] {
         effect.category = category;
         assert!(!effect.manually_activatable(), "{category:?}");

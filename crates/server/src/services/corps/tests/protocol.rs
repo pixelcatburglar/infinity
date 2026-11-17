@@ -7,7 +7,7 @@ async fn rpc(client: &mut Client, service: &str, method: &str, args: &[Value], c
     let kwargs = Value::Dict(vec![]);
     let bind = corp.map(Value::Int);
     let call = Call { service, method, args, kwargs: &kwargs, bound: bind.is_some(), bind_params: bind.as_ref() };
-    super::super::dispatch(client, &call).await.expect("governance method routed")
+    crate::services::dispatch(client, &call).await
 }
 
 fn wire(value: Value) -> Value { marshal::loads(&marshal::dumps(&value)).unwrap() }
@@ -37,6 +37,38 @@ async fn fingerprint(db: &Db, corp: i64, holder: i64) -> String {
 
 async fn vote_fingerprint(db: &Db, corp: i64) -> String {
     db.query_one("SELECT (SELECT COALESCE(string_agg(row_to_json(c)::text, '' ORDER BY id), '') FROM game.corp_vote_cases c WHERE corporation_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(o)::text, '' ORDER BY o.case_id,o.option_id), '') FROM game.corp_vote_options o JOIN game.corp_vote_cases c ON c.id=o.case_id WHERE c.corporation_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY s.case_id,s.holder_id), '') FROM game.corp_vote_snapshot s JOIN game.corp_vote_cases c ON c.id=s.case_id WHERE c.corporation_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(b)::text, '' ORDER BY b.case_id,b.character_id), '') FROM game.corp_vote_ballots b JOIN game.corp_vote_cases c ON c.id=b.case_id WHERE c.corporation_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY h.case_id,h.holder_id), '') FROM game.corp_vote_claims h JOIN game.corp_vote_cases c ON c.id=h.case_id WHERE c.corporation_id=$1) AS value", &[&corp]).await.unwrap().get("value")
+}
+
+#[test]
+fn proposal_options_preserve_numeric_parameters_and_unicode() {
+    let kwargs = Value::Dict(vec![]);
+    for (kind, yes, no, parameter, parameter1, parameter2) in [
+        (0, "SomeoneForCEO", "DontChangeCEO", 91, None, None),
+        (2, "CreateShares", "DoNotCreateShares", 25, None, None),
+        (3, "ExpelFromCorporation", "DontExpelFromCorporation", 92, None, None),
+        (5, "LockdownItem", "DontLockdownItem", 1_000_000_000_001, Some(12), Some(34)),
+        (6, "UnlockItem", "DontUnlockItem", 1_000_000_000_001, Some(12), Some(34)),
+    ] {
+        let descriptor = |label: &str| Value::tuple([Value::str(format!("UI/Corporations/CorporationWindow/Politics/{label}"))]);
+        let optional = |value: Option<i64>| value.map(Value::Int).unwrap_or(Value::None);
+        let args = [
+            Value::unicode("\u{63d0}\u{6848}"), Value::unicode("\u{8bf4}\u{660e}"), Value::Int(kind),
+            Value::tuple([descriptor(yes), descriptor(no), Value::Int(parameter), optional(parameter1), optional(parameter2)]),
+            Value::Int(1),
+        ];
+        let call = Call { service: "voteManager", method: "InsertVoteCase", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+        let request = super::super::vote_request::parse(&call, 91).unwrap();
+        assert_eq!(request.title, "\u{63d0}\u{6848}");
+        assert_eq!(request.description, "\u{8bf4}\u{660e}");
+        assert_eq!(request.vote_type, kind);
+        assert_eq!(request.options.len(), 2);
+        for (index, expected) in [parameter, 0].into_iter().enumerate() {
+            let option = &request.options[index];
+            assert_eq!(option.option_id, index as i32);
+            assert_eq!((option.parameter, option.parameter1, option.parameter2), (Some(expected), parameter1, parameter2));
+            assert!(!option.text.is_empty());
+        }
+    }
 }
 
 #[tokio::test]
@@ -103,7 +135,7 @@ async fn real_client_governance_dispatch_and_wire_shapes() {
 
         let vote_args = |kind| vec![Value::unicode("Proposal"), Value::unicode("Description"), Value::Int(kind), Value::list([Value::unicode("Yes"), Value::unicode("No")]), Value::Int(1)];
         let before = vote_fingerprint(&test_db, corp).await;
-        for kind in [0, 1, 2, 3, 5, 6] {
+        for kind in [1, 7] {
             assert!(matches!(rpc(&mut client, "voteManager", "InsertVoteCase", &vote_args(kind), None).await, Err(CallError::User { .. })));
             assert_eq!(vote_fingerprint(&test_db, corp).await, before);
         }
@@ -147,9 +179,54 @@ async fn real_client_governance_dispatch_and_wire_shapes() {
             assert_eq!(desc.get(&rows[index], "optionText"), Some(Value::unicode(text)));
             assert_eq!(desc.get(&rows[index], "votesFor"), Some(Value::Int(weight)));
         }
+        let descriptors = |yes: &str, no: &str, quantity: i64| Value::tuple([
+            Value::tuple([Value::str(format!("UI/Corporations/CorporationWindow/Politics/{yes}"))]),
+            Value::tuple([Value::str(format!("UI/Corporations/CorporationWindow/Politics/{no}"))]),
+            Value::Int(quantity), Value::None, Value::None,
+        ]);
+        client.session.apply(vec![("charid", Value::Int(ceo.character))]);
+        let share_case = rpc(&mut client, "voteManager", "InsertVoteCase", &[
+            Value::unicode("Issue shares"), Value::unicode("Description"), Value::Int(2),
+            descriptors("CreateShares", "DoNotCreateShares", 25), Value::Int(1),
+        ], None).await.unwrap().as_int().unwrap();
+        let options = wire(rpc(&mut client, "voteManager", "GetVoteCaseOptions",
+            &[Value::Int(corp), Value::Int(share_case)], None).await.unwrap());
+        let (desc, rows) = rowset(&options);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(desc.get(&rows[0], "parameter"), Some(Value::Int(25)));
+        assert_eq!(desc.get(&rows[1], "parameter"), Some(Value::Int(0)));
+        for row in rows {
+            assert_eq!(desc.get(row, "parameter1"), Some(Value::None));
+            assert_eq!(desc.get(row, "parameter2"), Some(Value::None));
+        }
+        rpc(&mut client, "voteManager", "InsertVote", &[Value::Int(corp), Value::Int(share_case), Value::Int(0)], None).await.unwrap();
+        let case = crate::dao::corporations::votes::case(&test_db, share_case).await.unwrap().unwrap();
+        let mut connection = super::fixtures::connect().await;
+        let tx = connection.transaction().await.unwrap();
+        assert!(crate::dao::corporations::registry::lock_admission(&tx, &[], &[corp], &[]).await.unwrap());
+        let mut outbox = crate::db::outbox::Outbox::<()>::default();
+        super::super::vote_close::close_inner(&tx, &client.sde, &mut outbox, share_case, case.ends).await.unwrap();
+        tx.commit().await.unwrap();
+        let actions = wire(rpc(&mut client, "voteManager", "GetCorpSanctionedActions", &[], None).await.unwrap());
+        let (desc, entries) = indexed(&actions, "voteCaseID");
+        let row = &entries.iter().find(|(key, _)| *key == Value::Int(share_case)).unwrap().1;
+        for (name, expected) in [
+            ("voteCaseID", Value::Int(share_case)), ("voteType", Value::Int(2)),
+            ("optionID", Value::Int(0)), ("parameter", Value::Int(25)),
+            ("parameter1", Value::None), ("parameter2", Value::None),
+            ("expires", Value::Int(case.ends + crate::config::game().corporations.vote_action_window_secs * infinity_core::consts::FILETIME_SECOND)),
+            ("actedUpon", Value::Int(0)), ("inEffect", Value::Int(0)),
+            ("timeActedUpon", Value::None), ("timeRescended", Value::None),
+        ] {
+            assert_eq!(desc.get(row, name), Some(expected), "{name}");
+        }
         client.session.apply(vec![("charid", Value::Int(outsider.character))]);
         assert_eq!(wire(rpc(&mut client, "voteManager", "CanViewVotes", &[Value::Int(corp)], None).await.unwrap()), Value::Bool(false));
     }).await;
+    db.execute("DELETE FROM game.corp_item_locks WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    db.execute("UPDATE game.corporations SET active_ceo_vote_id=NULL WHERE corporation_id=$1", &[&corp]).await.unwrap();
+    db.execute("DELETE FROM game.jobs WHERE job_id IN (SELECT 'corp.sanction.expire:' || id::text FROM game.corp_vote_cases WHERE corporation_id=$1)", &[&corp]).await.unwrap();
+    db.execute("DELETE FROM game.corp_sanctioned_actions WHERE case_id IN (SELECT id FROM game.corp_vote_cases WHERE corporation_id=$1)", &[&corp]).await.unwrap();
     db.execute("DELETE FROM game.jobs WHERE job_id IN (SELECT 'corp.vote.close:' || id::text FROM game.corp_vote_cases WHERE corporation_id=$1)", &[&corp]).await.unwrap();
     for table in ["corp_vote_claims", "corp_vote_ballots", "corp_vote_snapshot", "corp_vote_options"] {
         db.execute(&format!("DELETE FROM game.{table} WHERE case_id IN (SELECT id FROM game.corp_vote_cases WHERE corporation_id=$1)"), &[&corp]).await.unwrap();

@@ -13,6 +13,31 @@ fn reservation_is_once_and_failure_only_releases_empty() {
     assert!(!reserve(&mut slot));
 }
 
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE and external flock"]
+async fn concurrent_combat_arrivals_reserve_one_roster() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = crate::tests::shared_sde(&db).await;
+    let system = *sde.dungeons.systems_of_class(7).first().expect("known-space system");
+    let world = World::new(db.clone(), sde.clone(), 1);
+    world.system(system).await.unwrap();
+    let mut site = new_site(system, [0.0; 3], Kind::Anomaly, STRENGTH_ALL, 1.0, &mut HashSet::new());
+    site.dungeon_id = Some(sde.dungeons.iter().next().expect("SDE dungeon").id);
+    let site_id = site.id;
+    state().sites.insert(site_id, site);
+    let (first, second) = tokio::join!(arrive(&db, &world, 1, system, site_id), arrive(&db, &world, 2, system, site_id));
+    first.unwrap(); second.unwrap();
+    let mut roster = state().sites[&site_id].npcs.clone().expect("spawned roster");
+    roster.sort_unstable();
+    assert!(!roster.is_empty());
+    arrive(&db, &world, 3, system, site_id).await.unwrap(); // warm landing stays a no-op
+    let mut live = world.with(system, |s| s.balls().filter(|b| s.is_npc(b.id)).map(|b| b.id).collect::<Vec<_>>()).await.unwrap();
+    live.sort_unstable();
+    assert_eq!(live, roster, "one generation, no duplicated roster");
+    state().sites.remove(&site_id);
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) { self.0.abort(); }
@@ -173,7 +198,7 @@ async fn scan_arrival_finishes_after_client_drop_and_tracks_clearance() {
         let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), test_world.clone());
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "landing-fixture".into(),
             role: 0, client_id: fixture.account, session_id: fixture.account, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, test_world.clone(), login);
+        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, test_world.clone(), login);
         client.session.apply(vec![("userid", Value::Int(fixture.account)), ("charid", Value::Int(fixture.character)),
             ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system)),
             ("constellationid", Value::Int(constellation)), ("regionid", Value::Int(region)), ("corpid", Value::Int(1))]);

@@ -3,7 +3,7 @@
 //! No expert-system effective levels are used in milestone completion. Cyclic
 //! prerequisite closures cannot be used for new steps or targets.
 use std::collections::{BTreeMap, HashSet};
-use infinity_core::{consts::{CATEGORY_SKILL, GROUP_CLOUD_COMPUTING, GROUP_SHIP_ADAPTION, GROUP_CHARACTER_ENHANCEMENT, dogma::MAX_SKILL_LEVEL}};
+use infinity_core::{consts::{CATEGORY_SKILL, GROUP_CLOUD_COMPUTING, GROUP_SHIP_ADAPTION, GROUP_CHARACTER_ENHANCEMENT, UUID_LEN, dogma::MAX_SKILL_LEVEL}};
 use crate::{sde::Sde, services::skills::requirements};
 
 /// dogma/const.py attributeSkillIsObsolete.
@@ -34,6 +34,8 @@ fn target_metadata(published: Option<bool>, cyclic: bool) -> bool {
 
 /// Client skillPlanConst.py personal plan count.
 pub(crate) const MAX_PLANS: usize = 10;
+/// Client skillPlanConst.py corporation plan count.
+pub(crate) const MAX_CORPORATION_PLANS: usize = 100;
 /// Client skillPlanConst.py maximum steps in a plan.
 pub(crate) const MAX_STEPS: usize = 150;
 /// Client skillPlanConst.py maximum milestones in a plan.
@@ -45,6 +47,15 @@ pub(crate) const MAX_DESCRIPTION: usize = 1000;
 
 /// Python 2's narrow Unicode ABI counts UTF-16 code units, not Unicode scalar values.
 pub(super) fn text_units(text: &str) -> usize { text.encode_utf16().count() }
+
+/// Corporation plan category: all-zero bytes mean "no category"; otherwise the
+/// big-endian UUID integer must name a loaded career path
+/// (skillPlanEditorOverview.py career category set).
+pub(crate) fn category(sde: &Sde, bytes: &[u8; UUID_LEN]) -> bool {
+    if bytes.iter().all(|b| *b == 0) { return true; }
+    let Ok(id) = u32::try_from(u128::from_be_bytes(*bytes)) else { return false };
+    id != 0 && sde.skill_plans.career_path(id)
+}
 
 pub(crate) fn sequence(sde: &Sde, skills: &[i32], levels: &[i32]) -> bool {
     sequence_with(skills, levels, |skill| valid_skill(sde, skill), |skill| requirements::requirements(sde, skill))
@@ -100,18 +111,18 @@ pub(crate) async fn audit(db: &crate::db::Db, sde: &Sde) -> anyhow::Result<()> {
     loop {
         let page = crate::dao::skills::plans::audit_page(db, &after).await?;
         if page.is_empty() { return Ok(()); }
-        let ids: Vec<&[u8]> = page.iter().map(|(_, plan)| plan.plan_id.as_slice()).collect();
+        let ids: Vec<&[u8]> = page.iter().map(|plan| plan.plan_id.as_slice()).collect();
         let targets = crate::dao::skills::plan_milestones::for_plans(db, &ids).await?;
         let cyclic_plans: HashSet<Vec<u8>> = targets.into_iter()
             .filter(|target| sde.skill_plans.is_cyclic(target.type_id))
             .map(|target| target.plan_id).collect();
-        for (owner, plan) in page {
+        for plan in page {
             if !sequence(sde, &plan.skill_ids, &plan.levels) || cyclic_plans.contains(&plan.plan_id) {
-                tracing::warn!(character_id = owner, plan_id = ?plan.plan_id, "legacy skill plan has invalid static skill sequence or cyclic milestone target");
+                tracing::warn!(owner = ?plan.owner, plan_id = ?plan.plan_id, "legacy skill plan has invalid static skill sequence or cyclic milestone target");
             }
             after = plan.plan_id;
         }
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-skills"))] mod tests;

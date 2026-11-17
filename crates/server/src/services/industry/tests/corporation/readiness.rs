@@ -15,12 +15,7 @@ pub(super) async fn science_readiness(db: &Db, client: &mut Client, f: Fixture, 
             }).expect("invention blueprint in SDE")
         } else { f.bp };
         let act = sde.industry.activity(kind, activity).expect("science activity in SDE");
-        for &(skill, level) in &act.skills {
-            db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0) ON CONFLICT (character_id,type_id) DO UPDATE SET level=GREATEST(game.skills.level,EXCLUDED.level)", &[&f.actor, &skill, &level]).await.unwrap();
-        }
-        for &(material, quantity) in &act.materials {
-            item(db, material, f.actor, f.station, FLAG_HANGAR, quantity.max(1) + 10, false).await;
-        }
+        prepare_activity(db, f.actor, act, personal).await;
         let copy = activity == INVENTION;
         let blueprint = item(db, kind, f.actor, f.station, FLAG_HANGAR, if copy { BLUEPRINT_COPY_QUANTITY } else { 1 }, true).await;
         if copy { industry_dao::set_blueprint(db, blueprint, 0, 0, 1).await.unwrap(); }
@@ -54,5 +49,14 @@ pub(super) async fn science_readiness(db: &Db, client: &mut Client, f: Fixture, 
             let bp = industry_dao::blueprint(db, blueprint).await.unwrap().unwrap();
             assert_eq!((bp.me, bp.te), if activity == RESEARCH_TIME { (0, 2) } else { (1, 0) });
         }
+    }
+}
+
+pub(super) async fn prepare_activity(db: &Db, actor: i64, act: &crate::sde::industry::Activity, input: &authorization::Location) {
+    for &(skill, level) in &act.skills {
+        db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,0) ON CONFLICT (character_id,type_id) DO UPDATE SET level=GREATEST(game.skills.level,EXCLUDED.level)", &[&actor, &skill, &level]).await.unwrap();
+    }
+    for &(material, quantity) in &act.materials {
+        item(db, material, input.owner_id, input.item_id, input.flag_id, quantity.max(1) + 10, false).await;
     }
 }

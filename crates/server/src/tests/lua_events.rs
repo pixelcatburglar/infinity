@@ -72,6 +72,7 @@ impl Context {
         let hub = crate::chat::Hub::new(&config.chat.domain, db.clone(), world.clone());
         let pilots = host::pilots::Pilots::new(&db, hub.clone()).await.unwrap();
         let resources = Resources { db: db.clone(), sde: sde.clone(), world: world.clone(), pilots, store_value_limit_bytes: config.lua.store_value_limit_bytes };
+        lua::initialize_content(&config.lua, &db, &sde).await.unwrap();
         lua::start(&config, &db, &sde, &world, &hub).await.unwrap();
         let lua = mlua::Lua::new();
         lua::value::register(&lua, &lua.globals()).unwrap();
@@ -80,7 +81,7 @@ impl Context {
         let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: 0, user_name: "event-observer".into(), role: 0, client_id: 0, session_id: 0, language_id: "EN".into() };
-        let client = Client::new(crate::conn::Conn::new(stream, address), Arc::new(config), db, sde, hub, world, login);
+        let client = Client::new(infinity_wire::conn::Conn::new(stream, address), Arc::new(config), db, sde, hub, world, login);
         Self { resources, lua, client: Mutex::new(client), _peer: peer, driver, dir, barriers: Mutex::new(Vec::new()) }
     }
 
@@ -145,7 +146,7 @@ impl Context {
 }
 
 #[tokio::test]
-#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE; run this exact test in its own process"]
 async fn real_pilot_event_producers() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).with_test_writer().init();
     let ctx = Context::new().await;

@@ -9,7 +9,7 @@ mod skills;
 mod effects;
 mod lifecycle;
 mod space;
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-lua"))]
 mod tests;
 
 use std::{collections::HashMap, future::Future, sync::{Arc, Mutex}};
@@ -29,7 +29,13 @@ impl Pilots {
         Ok(Arc::new(Self { account: simulated::account_id(db).await.map_err(services::db_err)?, hub, states: Mutex::new(HashMap::new()) }))
     }
     fn state(&self, id: i64) -> Arc<tokio::sync::Mutex<Option<OnlinePilot>>> {
-        self.states.lock().unwrap().entry(id).or_default().clone()
+        crate::poison::lock_or_exit(self.states.lock()).entry(id).or_default().clone()
+    }
+    /// Retire the exact old generation bound to `expected` in this registry.
+    pub(crate) async fn retire_generation(&self, world: &std::sync::Arc<crate::space::World>, character: i64,
+        expected: &crate::space::NotifyTx) -> Result<(), crate::space::containment::ContainmentFailure>
+    {
+        lifecycle::retire_generation(self, world, character, expected).await
     }
 }
 

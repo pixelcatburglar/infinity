@@ -1,24 +1,32 @@
-//! Certified plans and native prerequisite graphs loaded at startup.
-//! The client tracks certified plans by static numeric ID and reads required skills for types.
-//! Personal plan contents and mutable progress are stored separately. Cyclic native
-//! edges are retained and roots reaching cycles are indexed for validation.
+//! Certified plans, career paths and native prerequisite graphs loaded at startup.
+//! The client tracks certified plans by static numeric ID, reads required skills for
+//! types, and files corporation plans under career-path category identifiers.
+//! Personal and corporation plan contents and mutable progress are stored separately.
+//! Cyclic native edges are retained and roots reaching cycles are indexed for validation.
 use std::collections::{HashMap, HashSet};
 use crate::{dao::sde::skill_plans as dao, db::executor::Executor};
 use super::types::Types;
 
 #[derive(Default)]
-pub(crate) struct SkillPlans { ids: HashSet<u32>, requirements: HashMap<i32, Vec<(i32, i32)>>, cyclic: HashSet<i32> }
+pub(crate) struct SkillPlans { ids: HashSet<u32>, career_paths: HashSet<u32>, requirements: HashMap<i32, Vec<(i32, i32)>>, cyclic: HashSet<i32> }
 impl SkillPlans {
     pub(crate) async fn load(ex: &(impl Executor + ?Sized), types: &Types) -> anyhow::Result<Self> {
-        Self::from_rows(dao::load(ex).await?, dao::requirements(ex).await?, |id| types.get(id).is_some())
+        Self::from_rows(dao::load(ex).await?, dao::requirements(ex).await?, dao::careerpaths(ex).await?, |id| types.get(id).is_some())
     }
-    fn from_rows(plan_rows: Vec<dao::SkillPlanRow>, requirement_rows: Vec<dao::SkillPlanRow>, type_exists: impl Fn(i32) -> bool) -> anyhow::Result<Self> {
+    fn from_rows(plan_rows: Vec<dao::SkillPlanRow>, requirement_rows: Vec<dao::SkillPlanRow>, career_path_rows: Vec<dao::SkillPlanRow>, type_exists: impl Fn(i32) -> bool) -> anyhow::Result<Self> {
         let mut ids = HashSet::new();
         for row in plan_rows {
             let key: u32 = row.key.as_deref().ok_or_else(|| anyhow::anyhow!("certified skill plan missing key"))?.parse()?;
             let data: serde_json::Value = serde_json::from_str(&row.data)?;
             anyhow::ensure!(key != 0 && data.get("_key").and_then(|v| v.as_u64()) == Some(u64::from(key)), "invalid certified skill plan key {key}");
             anyhow::ensure!(ids.insert(key), "duplicate certified skill plan key {key}");
+        }
+        let mut career_paths = HashSet::new();
+        for row in career_path_rows {
+            let key: u32 = row.key.as_deref().ok_or_else(|| anyhow::anyhow!("career path missing key"))?.parse()?;
+            let data: serde_json::Value = serde_json::from_str(&row.data)?;
+            anyhow::ensure!(key != 0 && data.get("_key").and_then(|v| v.as_u64()) == Some(u64::from(key)), "invalid career path key {key}");
+            anyhow::ensure!(career_paths.insert(key), "duplicate career path key {key}");
         }
         let mut requirements = HashMap::new();
         for row in requirement_rows {
@@ -55,12 +63,14 @@ impl SkillPlans {
             }
         }
         let cyclic = remaining.into_iter().filter_map(|(id, count)| (count != 0).then_some(id)).collect();
-        Ok(Self { ids, requirements, cyclic })
+        Ok(Self { ids, career_paths, requirements, cyclic })
     }
     pub(crate) fn contains(&self, id: u32) -> bool { self.ids.contains(&id) }
+    /// Career-path category IDs accepted for corporation plans; wire category zero is not a row.
+    pub(crate) fn career_path(&self, id: u32) -> bool { self.career_paths.contains(&id) }
     pub(crate) fn requirements(&self, id: i32) -> &[(i32, i32)] { self.requirements.get(&id).map_or(&[], Vec::as_slice) }
     pub(crate) fn is_cyclic(&self, id: i32) -> bool { self.cyclic.contains(&id) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-sde"))]
 mod tests;

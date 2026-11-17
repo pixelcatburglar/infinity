@@ -1,5 +1,6 @@
 use super::*;
 use crate::services::fit::{OP_MOD_ADD, OP_POST_PERCENT};
+use crate::sde::Sde;
 
 
 #[test]
@@ -10,6 +11,32 @@ fn falloff_scales_operands_around_operation_identity() {
     assert_eq!(scaled(2.0, OP_POST_DIV, 0.0), 1.0);
     assert_eq!(scaled(2.0, OP_PRE_MUL, 1.0), 2.0);
 }
+#[test]
+fn same_id_resonance_operand_stays_raw_while_receiver_value_clamps() {
+    use infinity_core::consts::dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE as RESONANCE;
+    use crate::services::effects::EffectKind;
+    crate::tests::init_config();
+    let floor = crate::config::game().combat.resonance_floor;
+    assert_eq!(floor, 0.05);
+    // A same-ID projected operand (modifying == modified) stored below the
+    // floor: the snapshot must keep the raw source value while the public
+    // boundary value() reports the floored effective value.
+    let sde = crate::sde::types::tests::combat_fixture();
+    let source_module = -7;
+    let projection = Projection { source_ship: -1, kind: EffectKind::Modifiers, until_ms: i64::MAX,
+        source_module, source_type: 1, effect_id: 1, values: vec![(RESONANCE, 0.01)],
+        charge_values: vec![], charge_type: None, resistance_attribute: None, scramble: None };
+    let fit = Fit::for_space_type(sde, 1, vec![projection]);
+    let key = Key::Projected(source_module);
+    assert_eq!(fit.value(key, RESONANCE), floor);
+    let rows = [Modifier { func: "ItemModifier".into(), domain: "targetID".into(),
+        op: OP_POST_MUL, modified: RESONANCE, modifying: RESONANCE,
+        group: None, skill: None, target_category: None }];
+    let mut values = Vec::new();
+    snapshot_rows(&fit, key, &rows, &mut values);
+    assert_eq!(values, [(RESONANCE, 0.01, OP_POST_MUL)]);
+}
+
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
@@ -24,6 +51,7 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
 
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let db = crate::services::effects::tests::fixture::cycle_observer(db);
     let sde = Arc::new(Sde::load(&db).await.unwrap());
     let effect = registry::resolve(&sde, EFFECT_WARP_SCRAMBLE).unwrap();
     let module_type = sde.types.iter().find(|t| t.published == Some(true)
@@ -31,11 +59,12 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
         && t.effects().iter().any(|e| e.effect_id == EFFECT_WARP_SCRAMBLE))
         .expect("published scrambler").type_id;
     let source_fit = Fit::for_space_type(sde.clone(), module_type, vec![]);
-    let (values, _) = snapshot(&sde, &source_fit, Key::Ship, &effect, None);
+    let (mut module_values, mut charge_values) = (Vec::new(), Vec::new());
+    snapshot(&source_fit, Key::Ship, &effect, None, &mut module_values, &mut charge_values);
     let projection = Projection { source_ship: -1, source_module: -2, source_type: module_type,
         effect_id: EFFECT_WARP_SCRAMBLE, kind: effect.kind, until_ms: i64::MAX,
-        values: values.into_iter().map(|(id, value, _)| (id, value)).collect(),
-        charge_values: vec![], charge_type: None, scramble: None };
+        values: module_values.into_iter().map(|(id, value, _)| (id, value)).collect(),
+        charge_values: charge_values.into_iter().map(|(id, value, _)| (id, value)).collect(), charge_type: None, resistance_attribute: None, scramble: None };
     let boost_attr = sde.dogma.attributes_by_name("speedBoostFactor").next().unwrap().attribute_id;
     let mwd_effect = registry::resolve(&sde, EFFECT_MICROWARPDRIVE).unwrap();
     let duration_attr = mwd_effect.attribute(registry::EffectAttribute::Duration).unwrap();
@@ -101,7 +130,12 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
             Vec::new()
         })).await.unwrap();
         assert!(w.after(1, 1500).await);
-        while destiny_rx.try_recv().is_ok() {}
+        while let Ok(delivery) = destiny_rx.try_recv() {
+            match delivery {
+                crate::space::SceneDelivery::Destiny(_) => {}
+                crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+            }
+        }
         let called = Arc::new(AtomicBool::new(false));
         let exit = called.clone();
         let guard = w.begin_warp_arrival(1, Box::new(move |_| { exit.store(true, Ordering::SeqCst); })).await.unwrap();
@@ -122,7 +156,7 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
         let cx = Ctx { db: d.clone(), world: w.clone(), notify, char_id: f.source, ship_id: f.ship, system_id: 1 };
         on_activate(&cx, &fit, &Activation { effect: effect.clone(),
             module: Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST },
-            target: Some(f.victim) }).await.unwrap();
+            target: Some(f.victim), aim: None }).await.unwrap();
         let generation = crate::space::targeting::next_generation();
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
             effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
@@ -130,8 +164,10 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
                 combat_generations: vec![NativeCombatGeneration { module_id: f.module, generation, sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&w), system: 1 },
             started: 0, charge_type: None, cycles: 0, duration_ms: 60_000.0, nominal_start: 0,
-            other: None, repair_amount: 0.0, illegal: false };
-        assert!(matches!(on_cycle_start(&cx, &fit, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
+            other: None, repair_amount: 0.0, illegal: false,
+            source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
+        cycle = crate::services::effects::tests::fixture::capture_cycle(cycle).await;
+        assert!(matches!(on_cycle_start(&cx, &mut cycle, false).await.unwrap(), CycleOutcome::Continue));
         w.with(1, |_| ()).await.unwrap();
         let status = Fit::load_in_space(&d, &w, 1, f.target, f.victim).await.unwrap().value(Key::Ship, ATTR_WARP_SCRAMBLE_STATUS);
         assert!(status > 0.0, "scrambler did not overcome target resistance: {status}");
@@ -149,7 +185,11 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
         assert!(w.after(1, 1500).await);
         assert_eq!(w.ball(1, f.victim).await.unwrap().mode, crate::space::MODE_STOP, "scrambled aligning ship did not stop");
         let mut saw_stop = false;
-        while let Ok(batch) = destiny_rx.try_recv() {
+        while let Ok(delivery) = destiny_rx.try_recv() {
+            let batch = match delivery {
+                crate::space::SceneDelivery::Destiny(batch) => batch,
+                crate::space::SceneDelivery::Notify { event, .. } => { assert_eq!(event, "OnFleetStateChange"); continue; }
+            };
             saw_stop |= batch.iter().any(|v| {
                 let Value::Tuple(parts) = v else { return false };
                 let Value::Tuple(call) = &parts[1] else { return false };
@@ -158,6 +198,20 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
         }
         assert!(saw_stop, "scramble cancellation did not publish Stop");
         assert!(!called.load(Ordering::SeqCst));
+        cycle.repeat = 2;
+        cycle.cycles = 0;
+        crate::services::effects::tests::fixture::clear_cycles(f.module);
+        w.with(1, move |s| {
+            let now = s.now_ms();
+            crate::services::effects::lifecycle::cycle_start(s, cycle, now);
+        }).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            while crate::services::effects::tests::fixture::completed_cycles(f.module) < 2 {
+                assert!(w.after(1, 100).await);
+            }
+        }).await.expect("two scheduled projection cycles");
+        assert_eq!(crate::services::effects::tests::fixture::completed_cycles(f.module), 2);
+        crate::services::effects::tests::fixture::clear_cycles(f.module);
         fixture::set_locked_target(f.source, f.victim, false);
     }).await;
     if let Some(active) = combat::state().active.get(&mwd) {

@@ -37,5 +37,5 @@ pub(crate) async fn ensure_ship(db: &Db, sde: &Sde, char_id: i64, race_id: i32, 
     Ok(ship_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

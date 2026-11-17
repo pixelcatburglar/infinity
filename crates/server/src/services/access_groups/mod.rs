@@ -33,4 +33,4 @@ pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     if call.service == "ownerGroupManager" { owner_group_manager::dispatch(c, call).await } else { None }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-social"))] mod tests;

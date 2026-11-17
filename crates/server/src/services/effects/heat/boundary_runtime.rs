@@ -253,5 +253,5 @@ pub(super) fn blocking(rack: &Rack) -> bool {
     limit(rack, i64::MAX) != i64::MAX
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-effects"))]
 mod tests;

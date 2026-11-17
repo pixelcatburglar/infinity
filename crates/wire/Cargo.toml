@@ -1,0 +1,17 @@
+[package]
+name = "infinity-wire"
+description = "Packet framing, framed marshal transport and machoNet packets"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+marshal = { path = "../marshal" }
+infinity-core = { path = "../core" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

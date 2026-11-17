@@ -152,4 +152,4 @@ pub(super) fn map(e: &EventEnvelope, sde: &Sde) -> Result<Option<Fact>, CallErro
     Ok(Some(Fact { character, input, slices }))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-content"))] mod tests;

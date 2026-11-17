@@ -9,20 +9,25 @@ fn sphere(id: i64, pos: V3, velocity: V3) -> Snapshot {
 #[test]
 fn stationary_contact_wakes_and_disabled_targets_do_not() {
     crate::tests::init_config();
-    let mut system = system::System::new(0, std::sync::Arc::default(), 0);
     let a = super::super::tests::destiny_reference::ship(1, [0.0; 3], [0.0; 3]);
     let mut b = super::super::tests::destiny_reference::ship(2, [20.0, 0.0, 0.0], [0.0; 3]);
     b.free = false;
     b.massive = false;
-    system.insert(a);
-    system.insert(b.clone());
+    // Fresh membership keeps scene-exit actions out of the collision oracle.
+    let with_target = |target| {
+        let mut system = system::System::new(0, std::sync::Arc::default(), 0);
+        system.insert(a.clone());
+        system.insert(target);
+        system
+    };
+    let system = with_target(b.clone());
     assert!(system.is_cold(true));
     b.massive = true;
     b.cloak = 1;
-    system.insert(b.clone());
+    let system = with_target(b.clone());
     assert!(system.is_cold(true));
     b.cloak = 0;
-    system.insert(b);
+    let mut system = with_target(b);
     assert!(!system.is_cold(true));
     system.tick_with_collisions(1000, true);
     assert_ne!(system.ball(1).unwrap().pos, [0.0; 3]);
@@ -35,6 +40,8 @@ fn sweep_tangent_miss_and_fast_crossing() {
     assert_eq!(collide_two_spheres([-2.0, 1.1, 0.0], [2.0, 1.1, 0.0], zero, zero, 1.0), None);
     assert_eq!(collide_two_spheres([-10.0, 0.0, 0.0], [10.0, 0.0, 0.0], zero, zero, 1.0), Some(0.45));
     assert!(quadratic(1.0, 0.0, 1.0).is_none());
+    assert_eq!(collide_two_spheres(zero, zero, [0.5, 0.0, 0.0], [0.5, 0.0, 0.0], 1.0), Some(0.0));
+    assert_eq!(collide_two_spheres(zero, zero, zero, zero, -1.0), None);
 }
 
 #[test]
@@ -144,17 +151,31 @@ fn uncloak_resets_only_owner_after_uncloak() {
         let mut ball = super::super::tests::destiny_reference::ship(1, [0.0; 3], [0.0; 3]);
         ball.cloak = CLOAK_RESTORE;
         s.insert(ball);
+        s.insert(super::super::tests::destiny_reference::ship(2, [1.0, 0.0, 0.0], [0.0; 3]));
         let (own_tx, mut own) = tokio::sync::mpsc::unbounded_channel();
         let (other_tx, mut other) = tokio::sync::mpsc::unbounded_channel();
-        s.observe(1, 1, own_tx);
-        s.observe(2, 2, other_tx);
+        let (completed, _done) = tokio::sync::oneshot::channel();
+        s.observe(1, 1, own_tx, completed);
+        let (completed, _done) = tokio::sync::oneshot::channel();
+        s.observe(2, 2, other_tx, completed);
+        s.apply_scene_prefix(collisions);
+        crate::space::system::tests::events::initial_state(&mut own);
+        crate::space::system::tests::events::fleet_snapshot(&mut own);
+        crate::space::system::tests::events::initial_state(&mut other);
+        crate::space::system::tests::events::fleet_snapshot(&mut other);
+        let before = crate::client::filetime_now();
         s.apply_uncloak_with_collisions(1, 7, collisions);
-        let fx = special_fx(7, 1, None, None, "effects.Uncloak", 1, 0, 5, None);
+        let after = crate::client::filetime_now();
+        let fx = special_fx(7, 1, None, None, None, "effects.Uncloak", false, 1, 0,
+            Value::Int(SPECIAL_FX_UNSPECIFIED_DURATION), 0, None, 0, Value::None);
         let mut expected = vec![event(7, "UncloakBall", vec![Value::Int(1)])];
         if !collisions { expected.push(reset_event(1, 7, false).unwrap()); }
         expected.push(fx.clone());
-        assert_eq!(own.try_recv().unwrap(), expected);
-        assert_eq!(other.try_recv().unwrap(), vec![add_balls_event(7, s.ball(1).unwrap(), collisions), fx]);
+        assert_eq!(crate::space::system::tests::events::destiny(own.try_recv().unwrap()), expected);
+        let actual = crate::space::system::tests::events::destiny(other.try_recv().unwrap());
+        let mut expected_add = add_balls_event(7, s.ball(1).unwrap(), collisions);
+        crate::space::system::tests::events::reuse_checked_damage_time(&actual[0], &mut expected_add, before..=after);
+        assert_eq!(actual, vec![expected_add, fx]);
     }
 }
 
@@ -167,7 +188,9 @@ fn warp_exit_resets_after_step_with_or_without_callback() {
             let ball = super::super::tests::destiny_reference::ship(1, [0.0; 3], [100.0, 0.0, 0.0]);
             s.insert(ball);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            s.observe(1, 1, tx);
+            let (completed, _done) = tokio::sync::oneshot::channel();
+            s.observe(1, 1, tx, completed);
+            s.apply_scene_prefix(collisions);
             s.command(1, |b, _, _| { b.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000); Vec::new() });
             let (done, result) = std::sync::mpsc::channel();
             if callback {
@@ -186,7 +209,12 @@ fn warp_exit_resets_after_step_with_or_without_callback() {
             if callback { assert_eq!(result.try_recv(), Ok(())); }
             assert_eq!(s.ball(1).unwrap().flags(collisions) & FLAG_MASSIVE != 0, collisions);
             let mut updates = Vec::new();
-            while let Ok(batch) = rx.try_recv() { updates.extend(batch); }
+            while let Ok(delivery) = rx.try_recv() {
+                match delivery {
+                    crate::space::SceneDelivery::Destiny(batch) => updates.extend(batch),
+                    crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+                }
+            }
             let reset = reset_event(1, s.current_time(), false).unwrap();
             assert_eq!(updates.iter().filter(|item| **item == reset).count(), usize::from(!collisions));
             assert!(!updates.contains(&reset_event(1, s.current_time() - 1, false).unwrap()));
@@ -195,7 +223,7 @@ fn warp_exit_resets_after_step_with_or_without_callback() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run this exact test in its own process"]
 fn default_off_collision_lifecycle() {
     crate::config::init_game(Default::default()).expect("initializing default game configuration");
     assert!(!enabled());
@@ -228,8 +256,12 @@ fn default_off_collision_lifecycle() {
         ball.radius = radius;
         let mut single = system::System::new(0, std::sync::Arc::default(), 0);
         single.insert(ball);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let bytes = fullstate(single.observe(1, 1, tx));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completed, mut done) = tokio::sync::oneshot::channel();
+        assert!(single.observe(1, 1, tx, completed));
+        single.apply_scene_prefix(enabled());
+        assert_eq!(done.try_recv(), Ok(true));
+        let bytes = fullstate(crate::space::system::tests::events::initial_state(&mut rx));
         assert_eq!(bytes[0], DESTINY_FULLSTATE, "{label}");
         assert_eq!(&bytes[5 + 8 + 1..5 + 8 + 1 + 4], &radius.to_le_bytes(), "{label}");
         let expected = (if free { FLAG_FREE } else { 0 })
@@ -247,8 +279,12 @@ fn default_off_collision_lifecycle() {
     assert_eq!(stationary.ball(2).unwrap().pos, [10.0, 0.0, 0.0]);
     s.insert(ship(1, [-15.0, 0.0, 0.0], [100.0, 0.0, 0.0]));
     s.insert(ship(2, [15.0, 0.0, 0.0], [-100.0, 0.0, 0.0]));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let bytes = fullstate(s.observe(1, 1, tx));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (completed, mut done) = tokio::sync::oneshot::channel();
+    assert!(s.observe(1, 1, tx, completed));
+    s.apply_scene_prefix(enabled());
+    assert_eq!(done.try_recv(), Ok(true));
+    let bytes = fullstate(crate::space::system::tests::events::initial_state(&mut rx));
     assert_eq!(bytes[0], DESTINY_FULLSTATE);
     assert_eq!(bytes[5 + 8 + 1 + 4 + 3 * 8] & FLAG_MASSIVE, 0);
     let mut unobstructed = system::System::new(0, std::sync::Arc::default(), 0);
@@ -261,10 +297,14 @@ fn default_off_collision_lifecycle() {
     hidden.cloak = CLOAK_RESTORE;
     s.insert(hidden);
     let (tx, mut owner) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(3, 3, tx);
+    let (completed, _done) = tokio::sync::oneshot::channel();
+    s.observe(3, 3, tx, completed);
+    s.apply_scene_prefix(enabled());
+    crate::space::system::tests::events::initial_state(&mut owner);
+    crate::space::system::tests::events::fleet_snapshot(&mut owner);
     assert!(s.uncloak(3));
     s.tick(2000);
-    let batch = owner.try_recv().unwrap();
+    let batch = crate::space::system::tests::events::destiny(owner.try_recv().unwrap());
     assert_eq!(batch[0], event(1, "UncloakBall", vec![Value::Int(3)]));
     assert_eq!(batch[1], reset_event(3, 1, false).unwrap());
     let warper = ship(4, [0.0; 3], [100.0, 0.0, 0.0]);
@@ -276,7 +316,12 @@ fn default_off_collision_lifecycle() {
     }
     assert_eq!(s.ball(4).unwrap().mode, MODE_STOP);
     let mut updates = Vec::new();
-    while let Ok(batch) = owner.try_recv() { updates.extend(batch); }
+    while let Ok(delivery) = owner.try_recv() {
+        match delivery {
+            crate::space::SceneDelivery::Destiny(batch) => updates.extend(batch),
+            crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
+        }
+    }
     assert!(updates.contains(&reset_event(4, s.current_time(), false).unwrap()));
 }
 
@@ -288,18 +333,22 @@ fn nonmassive_missile_launch_and_timer_survive_off_tick() {
     s.insert(ship(1, [0.0; 3], [0.0; 3]));
     s.insert(ship(2, [100_000.0, 50_000.0, 0.0], [0.0; 3]));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    s.observe(1, 1, tx);
+    let (completed, _done) = tokio::sync::oneshot::channel();
+    s.observe(1, 1, tx, completed);
+    s.apply_scene_prefix(enabled());
+    crate::space::system::tests::events::initial_state(&mut rx);
+    crate::space::system::tests::events::fleet_snapshot(&mut rx);
     let mut missile = ship(3, [0.0; 3], [0.0; 3]);
     missile.massive = false;
     let (done, result) = std::sync::mpsc::channel();
-    s.launch_missile(missile, 2, 1, 2000, move |_| { done.send(()).unwrap(); });
+    s.launch_missile(missile, 2, 1, 2000.0, move |_, _| { done.send(()).unwrap(); });
     s.tick_with_collisions(1000, false);
     let missile = s.ball(3).unwrap();
     assert!(!missile.massive);
     assert_eq!((missile.mode, missile.follow_id, missile.launcher), (MODE_MISSILE, 2, 1));
     assert!(missile.pos[0] > 0.0 && missile.pos[1] > 0.0);
     assert!(result.try_recv().is_err());
-    let updates = rx.try_recv().unwrap();
+    let updates = crate::space::system::tests::events::destiny(rx.try_recv().unwrap());
     assert!(updates.contains(&event(0, "LaunchMissile", vec![
         Value::Int(3), Value::Int(2), Value::Int(1), Value::Bool(true), Value::Bool(false),
     ])));

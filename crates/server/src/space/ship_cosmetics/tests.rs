@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::Arc;
-use crate::space::{NpcBrain, NpcConfig, WarpState, MODE_STOP};
+use crate::{services::{ship_cosmetics_mgr::state, CallError}, space::{NpcBrain, NpcConfig, WarpState, MODE_STOP}};
 
 fn ball(id: i64, type_id: i32, character: Option<i64>) -> Ball {
     Ball { id, type_id, owner_id: 1, corp_id: 1, alliance_id: -1, char_id: character,
@@ -33,11 +33,14 @@ async fn actor_visibility_and_npc_projection() {
     assert!(fact(&system, system.ball(i64::MAX).unwrap()).is_some());
     assert!(fact(&system, system.ball(4).unwrap()).is_none());
     let npc = fact(&system, system.ball(i64::MAX).unwrap()).unwrap();
-    let states = state::project(&db, &sde, &[npc], filetime_now()).await.unwrap();
-    assert_eq!(states[0].skin_id, None);
-    assert_eq!(states[0].character_id, 0);
+    let states = state::prepare(&db, &sde, &[npc], filetime_now()).await.unwrap();
+    assert_eq!(states[0].state.skin_id, None);
+    assert_eq!(states[0].state.character_id, 0);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    system.observe(1, 1, tx);
+    let (completed, mut done) = tokio::sync::oneshot::channel();
+    assert!(system.observe(1, 1, tx, completed));
+    system.apply_scene_prefix(crate::space::collision::enabled());
+    assert_eq!(done.try_recv(), Ok(true));
     assert!(system.fleet_broadcast_visible(1, 2));
     assert!(!system.fleet_broadcast_visible(2, 1));
     let mut cloaked = ball(5, ship, Some(5)); cloaked.cloak = 1;
@@ -168,30 +171,63 @@ async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
     }).await.unwrap();
     let restored = frame(&mut observer_stream.rx, observer.character, SET, Some(ship), None).await;
     assert_state(&child(&restored, "state"), ship, owner.character, Some(skin));
-    let own_restored = frame(&mut owner_stream.rx, owner.character, SET, Some(ship), None).await;
-    assert_state(&child(&own_restored, "state"), ship, owner.character, Some(skin));
     world.observe(system, late.character, late.character, late_tx).await.unwrap();
     let snapshot = frame(&mut late_stream.rx, late.character, ALL, None, None).await;
     assert_state(&snapshot_state(&snapshot, ship).unwrap(), ship, owner.character, Some(skin));
+    // A real bubble out/back re-presents the stored SKIN to the returner
+    // through the reveal path exactly once.
+    world.with(system, move |s| {
+        let home = s.ball(observer.character).unwrap().pos;
+        assert!(s.scene_has(s.observer_token(observer.character).unwrap(), s.ball_token(ship).unwrap()));
+        s.set_ball_position(observer.character, [1e12, 0.0, 0.0], |_, _| true);
+        s.apply_scene_prefix(crate::space::collision::enabled());
+        assert!(!s.scene_has(s.observer_token(observer.character).unwrap(), s.ball_token(ship).unwrap()));
+        s.set_ball_position(observer.character, home, |_, _| true);
+        s.apply_scene_prefix(crate::space::collision::enabled());
+        assert!(s.scene_has(s.observer_token(observer.character).unwrap(), s.ball_token(ship).unwrap()));
+    }).await.unwrap();
     let npc = i64::MAX;
     let unrelated = i64::MAX - 1;
     let drone_id = i64::MAX - 2;
-    world.add_ship(system, ball(npc, entity, None)).await.unwrap();
+    world.add_npc_ship(system, ball(npc, entity, None)).await.unwrap();
     world.add_ship(system, ball(unrelated, entity, None)).await.unwrap();
     world.add_ship(system, ball(drone_id, drone, None)).await.unwrap();
     let config = NpcConfig { fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0, scan_resolution: 1.0, repairs: (0.0, 0.0, 0.0) };
     assert!(world.with(system, move |s| s.add_npc(npc, NpcBrain::new(None, config, Arc::new(|_, _| Some(Box::pin(async {})))))).await.unwrap());
-    let npc_notice = frame(&mut observer_stream.rx, observer.character, SET, Some(npc), None).await;
+    // The ordered stream itself bounds the fence at the npc registration SET:
+    // every notice before it is judged, and the reveal's ship SET is counted.
+    let mut ship_notice = None;
+    let mut ship_sets = 0;
+    let npc_notice = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        use prost_reflect::ReflectMessage;
+        loop {
+            let bytes = observer_stream.rx.recv().await.expect("notice stream closed");
+            let (notice, message) = crate::gateway::tests::decode_notice(&bytes);
+            assert_eq!(notice.target_group.unwrap().target,
+                Some(crate::gateway::protocol::target_group::Target::Character(u32::try_from(observer.character).unwrap())));
+            let actual = message.descriptor().full_name().to_owned();
+            assert_eq!(actual, SET, "unexpected notice type: {actual}");
+            let state = child(&message, "state");
+            let id = child(&state, "ship").get_field_by_name("sequential").unwrap().as_u64().unwrap();
+            if id == ship as u64 { ship_sets += 1; ship_notice = Some(message); continue; }
+            if id == npc as u64 { break message; }
+        }
+    }).await.expect("notice timeout");
+    assert_eq!(ship_sets, 1, "the reveal presents the ship's SKIN exactly once");
+    assert_state(&child(&ship_notice.unwrap(), "state"), ship, owner.character, Some(skin));
     assert_state(&child(&npc_notice, "state"), npc, 0, None);
     let owner_npc = frame(&mut owner_stream.rx, owner.character, SET, Some(npc), None).await;
     assert_state(&child(&owner_npc, "state"), npc, 0, None);
     let late_npc = frame(&mut late_stream.rx, late.character, SET, Some(npc), None).await;
     assert_state(&child(&late_npc, "state"), npc, 0, None);
-    let (again_tx, _again_destiny) = tokio::sync::mpsc::unbounded_channel();
-    let guard = crate::services::market::lock().await;
-    world.observe(system, late.character, late.character, again_tx).await.unwrap();
+    let fence = crate::space::ship_cosmetics::capture(&world, system, ship).await.unwrap();
     db.execute("DELETE FROM game.ship_skin_applications WHERE ship_item_id=$1", &[&ship]).await.unwrap();
-    drop(guard);
+    let prepared = state::prepare(&db, &sde, &[fence.fact().clone()], filetime_now()).await.unwrap().into_iter().next().unwrap();
+    let mut outbox = crate::db::outbox::Outbox::default();
+    outbox.ship_cosmetics(fence.committed(prepared));
+    crate::db::outbox::dispatch_world((), outbox, &world).unwrap();
+    let (again_tx, _again_destiny) = tokio::sync::mpsc::unbounded_channel();
+    world.observe(system, late.character, late.character, again_tx).await.unwrap();
     let current = frame(&mut late_stream.rx, late.character, ALL, None, None).await;
     assert_state(&snapshot_state(&current, ship).unwrap(), ship, owner.character, None);
     assert!(snapshot_state(&current, unrelated).is_none());
@@ -200,23 +236,81 @@ async fn deferred_actor_snapshots_uncloak_and_npc_registration() {
     assert_eq!(crate::dao::ship_skins::states_for_ships(&db, &[ship], filetime_now()).await.unwrap()[0].skin_id, None);
     let collision: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton) VALUES ($1,$2,$3,$4,1,true) RETURNING item_id", &[&hull, &owner.character, &system, &infinity_core::consts::FLAG_HANGAR]).await.unwrap().get("item_id");
     db.execute("INSERT INTO game.ship_skin_applications (ship_item_id,character_id,skin_id) VALUES ($1,$2,$3)", &[&collision, &owner.character, &skin]).await.unwrap();
-    let guard = crate::services::market::lock().await;
-    let npc_fact = world.with(system, move |s| {
-        s.add_ship(ball(collision, hull, None));
-        let config = NpcConfig { fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0, scan_resolution: 1.0, repairs: (0.0, 0.0, 0.0) };
-        assert!(s.add_npc(collision, NpcBrain::new(None, config, Arc::new(|_, _| Some(Box::pin(async {}))))));
-        fact(s, s.ball(collision).unwrap()).unwrap()
-    }).await.unwrap();
-    assert!(npc_fact.is_npc);
-    let projected = state::project(&db, &sde, &[npc_fact], filetime_now()).await.unwrap();
-    assert_eq!(projected[0], state::State { ship_id: collision, character_id: 0, skin_id: None });
     assert_eq!(crate::dao::ship_skins::states_for_ships(&db, &[collision], filetime_now()).await.unwrap()[0].skin_id, Some(skin));
+    let guard = crate::services::market::lock().await;
+    world.add_npc_ship(system, ball(collision, hull, None)).await.unwrap();
+    let before = world.with(system, move |s| (s.is_npc(collision), s.ball(collision).map(|b| fact(s, b).is_some_and(|f| f.is_npc)), s.skins.entries.get(&collision).map(|e| (e.token, e.version, e.fact.clone(), e.state.clone())))).await.unwrap();
+    let (token, version, fact0, state0) = before.2.unwrap();
+    assert_eq!((before.0, before.1, &state0), (false, Some(true), &state::State { ship_id: collision, character_id: 0, skin_id: None }));
     let collision_notice = frame(&mut observer_stream.rx, observer.character, SET, Some(collision), None).await;
     assert_state(&child(&collision_notice, "state"), collision, 0, None);
+    let bad = PreparedSkin { fact: fact0.clone(), state: state::State { ship_id: collision, character_id: 0, skin_id: Some(skin) }, expires_at: None };
+    assert!(!world.with(system, move |s| s.install_skin(token, bad)).await.unwrap());
+    assert!(world.with(system, move |s| s.add_npc(collision, NpcBrain::new(None, NpcConfig { fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0, scan_resolution: 1.0, repairs: (0.0, 0.0, 0.0) }, Arc::new(|_, _| Some(Box::pin(async {})))))).await.unwrap());
+    world.with(system, move |s| { let e = &s.skins.entries[&collision]; assert!(s.is_npc(collision) && e.token == token && e.version == version && e.fact == fact0 && e.state == state0); }).await.unwrap();
+    assert_eq!(crate::dao::ship_skins::states_for_ships(&db, &[collision], filetime_now()).await.unwrap()[0].skin_id, Some(skin));
     drop(guard);
+    // expires_at == now stays valid; the next tick reads no_skin, and only the
+    // matching version and deadline fire an expiry. Live fences apply; dead,
+    // foreign, wrong-fact and incarnation-stale identities are refused.
+    world.add_ship(system, ball(9, hull, Some(9))).await.unwrap();
+    world.with(system, move |s| {
+        let token = s.capture_ball(9).unwrap();
+        assert!(s.install_skin(token, prepared_projection(9, hull, 9, Some(7), Some(filetime_now()))));
+        let (version, deadline) = (s.skins.entries[&9].version, s.skins.entries[&9].expires_at.unwrap());
+        assert_eq!(s.skins.entries[&9].public_state(deadline).skin_id, Some(7));
+        assert_eq!(s.skins.entries[&9].public_state(deadline + 1).skin_id, None);
+        let later = deadline + 2 * infinity_core::consts::FILETIME_SECOND;
+        let token = s.capture_ball(9).unwrap();
+        assert!(s.install_skin(token, prepared_projection(9, hull, 9, Some(7), Some(later))));
+        let current = s.skins.entries[&9].version;
+        s.expire_skin(9, version, deadline); s.expire_skin(9, current, deadline);
+        assert_eq!((s.skins.entries[&9].expires_at, s.skins.entries[&9].state.skin_id), (Some(later), Some(7)));
+        s.expire_skin(9, current, later);
+        assert_eq!((s.skins.entries[&9].expires_at, s.skins.entries[&9].state.skin_id), (None, None));
+        let gate = s.snapshot_context.as_ref().unwrap().gate.clone();
+        let token = s.capture_ball(9).unwrap();
+        let fence = SkinFence { system, actor_gate: std::sync::Arc::downgrade(&gate), token, fact: fact(s, s.ball(9).unwrap()).unwrap() };
+        assert!(s.apply_skin(fence.committed(prepared_projection(9, hull, 9, Some(7), None))));
+        let other = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let dead = SkinFence { actor_gate: std::sync::Weak::new(), ..fence.clone() };
+        let foreign = SkinFence { actor_gate: std::sync::Arc::downgrade(&other), ..fence.clone() };
+        assert!(!s.apply_skin(dead.committed(prepared_projection(9, hull, 9, Some(9), None))));
+        assert!(!s.apply_skin(foreign.committed(prepared_projection(9, hull, 9, Some(9), None))));
+        let wrong = PreparedSkin { fact: Ship { ship_id: 9, type_id: hull, character_id: Some(10), is_npc: false }, ..prepared_projection(9, hull, 9, Some(9), None) };
+        assert!(!s.apply_skin(fence.committed(wrong)));
+        s.take(9); s.insert(ball(9, hull, Some(9)));
+        assert!(!s.apply_skin(fence.committed(prepared_projection(9, hull, 9, Some(9), None))));
+        // A superseded observer ticket can never receive its epoch.
+        let (first, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (completed, mut done) = tokio::sync::oneshot::channel();
+        assert!(s.observe(1, 9, first, completed));
+        s.apply_scene_prefix(crate::space::collision::enabled());
+        assert_eq!(done.try_recv(), Ok(true));
+        let old = s.observer_token(1).unwrap();
+        let (next, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (completed, mut done) = tokio::sync::oneshot::channel();
+        assert!(s.observe(1, 9, next, completed));
+        s.apply_scene_prefix(crate::space::collision::enabled());
+        assert_eq!(done.try_recv(), Ok(true));
+        assert!(s.observer_character(old).is_none() && !s.flush_observer_pending(old));
+    }).await.unwrap();
+    // A rolled-back transaction never publishes its committed projection.
+    let fence = crate::space::ship_cosmetics::capture(&world, system, 9).await.unwrap();
+    let result: Result<(), CallError> = db.transaction(|_tx, outbox: &mut crate::db::outbox::Outbox| {
+        let change = fence.committed(prepared_projection(9, hull, 9, Some(9), None));
+        Box::pin(async move { outbox.ship_cosmetics(change); Err(CallError::Internal(anyhow::anyhow!("forced rollback"))) })
+    }, |value, outbox| { let world = &world; async move { crate::db::outbox::dispatch_world(value, outbox, world) } }).await;
+    assert!(result.is_err() && world.with(system, move |s| s.skins.entries.get(&9).is_none()).await.unwrap());
     world.remove_ball(system, collision).await;
     for id in [ship, observer.character, late.character, npc, unrelated, drone_id] { world.remove_ball(system, id).await; }
     for who in [owner, observer, late] { world.unobserve(who.character); world.unregister_pilot_generation(who.character, None); }
     drop((owner_stream, observer_stream, late_stream, notify_receivers, world));
     for who in [owner, observer, late] { fixture::cleanup(&db, who).await.unwrap(); }
 }
+
+fn prepared_projection(ship: i64, hull: i32, owner: i64, skin: Option<i32>, expires_at: Option<i64>) -> PreparedSkin {
+    PreparedSkin { fact: Ship { ship_id: ship, type_id: hull, character_id: Some(owner), is_npc: false },
+        state: state::State { ship_id: ship, character_id: owner, skin_id: skin }, expires_at }
+}
+

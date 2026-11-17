@@ -4,24 +4,18 @@
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
-struct Bloodline { bloodline_id: i32 }
-impl Bloodline {
-    fn from_row(r: &Row) -> Self { Self { bloodline_id: r.get("bloodline_id") } }
-}
 pub(crate) async fn bloodline(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<i32, Error> {
-    Ok(Bloodline::from_row(&ex.query_one("SELECT bloodline_id FROM game.characters WHERE character_id = $1", &[&char_id]).await?).bloodline_id)
+    Ok(ex.query_one("SELECT bloodline_id FROM game.characters WHERE character_id = $1", &[&char_id]).await?.get::<_, i32>("bloodline_id"))
 }
-struct FreePoints { points: i64 }
-impl FreePoints { fn from_row(r: &Row) -> Self { Self { points: r.get("free_skill_points") } } }
 pub(crate) async fn free_points(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, Error> {
-    Ok(FreePoints::from_row(&ex.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&char_id]).await?).points)
+    Ok(ex.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&char_id]).await?.get::<_, i64>("free_skill_points"))
 }
 /// Grant positive free points unless the character is deleted or the balance would overflow.
 pub(crate) async fn grant_free_points(ex: &(impl Executor + ?Sized), character: i64, points: i64) -> Result<Option<i64>, Error> {
     if points <= 0 {
         return Ok(None);
     }
-    Ok(ex.query_opt("UPDATE game.characters SET free_skill_points = free_skill_points + $2 WHERE character_id = $1 AND NOT deleted AND free_skill_points <= $3::bigint - $2 RETURNING free_skill_points", &[&character, &points, &i64::MAX]).await?.as_ref().map(FreePoints::from_row).map(|row| row.points))
+    Ok(ex.query_opt("UPDATE game.characters SET free_skill_points = free_skill_points + $2 WHERE character_id = $1 AND NOT deleted AND free_skill_points <= $3::bigint - $2 RETURNING free_skill_points", &[&character, &points, &i64::MAX]).await?.as_ref().map(|row| row.get::<_, i64>("free_skill_points")))
 }
 /// Replace an observed free-point balance, refusing stale or negative updates.
 pub(crate) async fn replace_free_points(ex: &(impl Executor + ?Sized), char_id: i64, expected: i64, points: i64) -> Result<bool, Error> {
@@ -46,5 +40,10 @@ pub(crate) async fn initialize_respec(ex: &(impl Executor + ?Sized), char_id: i6
 pub(crate) async fn save_respec(ex: &(impl Executor + ?Sized), char_id: i64, bases: &[i32], state: &Respec, free: i64, date: i64, next: i64) -> Result<bool, Error> {
     Ok(ex.execute("UPDATE game.character_respec SET bases = $2, free_respecs = $3, last_respec_date = $4, next_timed_respec = $5 WHERE character_id = $1 AND free_respecs = $6 AND last_respec_date IS NOT DISTINCT FROM $7 AND next_timed_respec IS NOT DISTINCT FROM $8 AND bases IS NOT DISTINCT FROM $9", &[&char_id, &bases, &free, &date, &next, &state.free_respecs, &state.last_respec_date, &state.next_timed_respec, &state.bases]).await? == 1)
 }
+/// Replace only the chosen bases, refusing a stale observation of the whole row.
+/// Entitlements are left untouched; callers that spend a remap use save_respec.
+pub(crate) async fn save_bases(ex: &(impl Executor + ?Sized), character: i64, bases: &[i32; 5], expected: &Respec) -> Result<bool, Error> {
+    Ok(ex.execute("UPDATE game.character_respec SET bases = $2 WHERE character_id = $1 AND bases IS NOT DISTINCT FROM $3 AND free_respecs = $4 AND last_respec_date IS NOT DISTINCT FROM $5 AND next_timed_respec IS NOT DISTINCT FROM $6", &[&character, &bases.as_slice(), &expected.bases, &expected.free_respecs, &expected.last_respec_date, &expected.next_timed_respec]).await? == 1)
+}
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-storage"))] mod tests;

@@ -38,5 +38,5 @@ pub(super) fn matches_pattern(name: &str, pattern: &str) -> bool {
     p == pattern.len()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-services"))]
 mod tests;

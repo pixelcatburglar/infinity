@@ -15,6 +15,8 @@
 //! Stack quantities sent on the wire project to the client display limit;
 //! stored amounts stay exact.
 //! Hold occupancy follows client item-aware packaged and assembled volumes.
+//! A destination snapshot binds the fitted hold once; an unlimited ordinary
+//! cargo still performs honest volume arithmetic against real rows.
 //! Extraction range uses ship and rock positions sampled at the same system-actor time.
 //! Laser extraction revalidates the online fitted module under row locks. Per-cycle
 //! rounding is randomized as in `packages/mining/__init__.py`, with no fraction carry.
@@ -28,8 +30,10 @@
 //! personal ledger normally; corporate observers are unsupported.
 //!
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
-//! canonical SDE type materials per portion: the configured station yield, raised by Reprocessing,
-//! Reprocessing Efficiency and the item's own processing skill, less the configured ISK tax.
+//! canonical SDE type materials per portion: the configured station yield times the
+//! pilot's reprocessing multiplier, read from a character Fit loaded per request
+//! (skills, implants and active boosters for ore and ice; Scrapmetal Processing for
+//! everything else), capped at 100%, less the configured ISK tax.
 //! Each output type is limited to one request's maximum quantity; deposits may span stacks.
 
 mod in_space_compression_mgr;
@@ -42,25 +46,23 @@ pub(crate) mod rounding;
 use super::fit::{Fit, Key};
 use super::{db_err, keyval, notify_error, rand01, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use infinity_core::consts::{dogma::ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
+use infinity_core::consts::{FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
 use infinity_core::messages;
 use crate::space::{dist, NotifyTx, World, V3};
 use crate::space::asteroids::{self, Field};
 use crate::space::asteroids::generation::{field_groups, generation_inputs};
 use marshal::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-const ATTR_MINING_AMOUNT: i32 = 77;
+pub(crate) const ATTR_MINING_AMOUNT: i32 = 77;
 const ATTR_WASTE_MULTIPLIER: i32 = 3153;
 const ATTR_WASTE_PROBABILITY: i32 = 3154;
 const ATTR_CRIT_CHANCE: i32 = 5967;
 const ATTR_CRIT_BONUS: i32 = 5969;
 const ATTR_PROCESSING_SKILL: i32 = 790; // reprocessingSkillType
-const SKILL_REPROCESSING: i32 = 3385;
-const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
 const SKILL_SCRAPMETAL: i32 = 12196;
 /// Inclusive waste check maximum from `mining/__init__.py:54`.
 const WASTE_CHECK_MAX: u32 = 100;
@@ -70,11 +72,13 @@ const WASTE_CHECK_MAX: u32 = 100;
 
 /// Grow a field transactionally and publish it to the original system actor.
 pub(crate) async fn grow_field(db: &Db, world: &World, system: i64, field_id: i64, center: V3, field: Field, security: f64, jspace: bool) -> Result<Vec<i64>, CallError> {
-    world.system(system).await.map_err(CallError::Internal)?;
+    let admission = world.admission(system).map_err(db_err)?;
+    let market = super::market::lock().await;
+    admission.check().map_err(db_err)?;
+    world.system_locked(system, &market).await.map_err(CallError::Internal)?;
     let actor = world.asteroid_actor(system).ok_or_else(|| CallError::Internal(anyhow::anyhow!("asteroid actor unavailable")))?;
     let inputs = Arc::new(generation_inputs(world.sde(), center, field, security, jspace));
     let now = filetime_now();
-    let _market = super::market::lock().await;
     let prepared = db.transaction::<_, _, CallError, crate::db::outbox::Outbox<()>, _, _, _>(
         |tx, _| {
             let inputs = Arc::clone(&inputs);
@@ -161,14 +165,16 @@ pub(crate) enum DeliveryOutcome {
     Delivered(Delivery),
 }
 
-pub(crate) fn destination(fit: &Fit, type_id: i32) -> (i32, f64) {
+/// The mining hold of the fitted ship as a capacity snapshot; special bays
+/// capture finite limits and only ordinary cargo can be unlimited.
+pub(crate) fn destination(fit: &Fit, type_id: i32) -> Result<super::inventory::hold_storage::HoldCapacity, CallError> {
     let flag = super::inventory::holds::mining_flag(fit.sde(), fit, type_id);
-    (flag, super::inventory::holds::effective_capacity(fit, flag))
+    super::inventory::hold_storage::HoldCapacity::capture(fit, flag)
 }
 
 /// Join the caller's transaction; all notices remain in its post-commit outbox.
-pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), outbox: &mut crate::db::outbox::Outbox, sde: &crate::sde::Sde, owner: i64, ship: i64, system: i64, source: i64, pending: &crate::space::drone::PendingMining, (flag, capacity): (i32, f64)) -> Result<DeliveryOutcome, CallError> {
-    let room = super::inventory::hold_storage::room(ex, sde, owner, ship, flag, capacity).await?;
+pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), outbox: &mut crate::db::outbox::Outbox, sde: &crate::sde::Sde, owner: i64, system: i64, source: i64, pending: &crate::space::drone::PendingMining, capacity: super::inventory::hold_storage::HoldCapacity) -> Result<DeliveryOutcome, CallError> {
+    let room = super::inventory::hold_storage::room(ex, sde, owner, &capacity).await?;
     let Some(available) = crate::dao::asteroids::lock(ex, system, pending.rock, pending.type_id).await.map_err(db_err)? else { return Ok(DeliveryOutcome::Missing) };
     if available <= 0 { return Ok(DeliveryOutcome::Depleted { rock: pending.rock }); }
     let result = rounding::mining_result(pending.inputs, pending.unit_volume, available, pending.draws)
@@ -176,15 +182,15 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
     let units = result.normal_quantity.saturating_add(result.critical_hit_quantity);
     if units <= 0 { return Ok(DeliveryOutcome::NoYield); }
     let t = sde.types.get(pending.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", pending.type_id)))?;
-    let room = room.units(sde, flag, pending.type_id, false, units)?;
+    let room = room.units(sde, capacity.flag(), pending.type_id, false, units)?;
     let (taken, wasted) = extraction_amounts(units, result.wasted_quantity, available, room);
-    if taken <= 0 { return Ok(DeliveryOutcome::Full { flag }); }
+    if taken <= 0 { return Ok(DeliveryOutcome::Full { flag: capacity.flag() }); }
     let removed = taken + wasted;
     if !crate::dao::asteroids::take(ex, pending.rock, available, removed).await.map_err(db_err)? {
         return Err(CallError::Internal(anyhow::anyhow!("asteroid extraction guard failed")));
     }
     let stack = crate::dao::items::transfers::deposit_stack(
-        ex, ship, flag, pending.type_id, owner, taken,
+        ex, capacity.ship(), capacity.flag(), pending.type_id, owner, taken,
         crate::dao::items::transfers::DepositCandidate::InStatement, None,
     ).await.map_err(db_err)?;
     let receipt = super::items::enrich_deposit(sde, stack, taken)?;
@@ -194,7 +200,7 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
             || field_groups(Field::Gas, 0.0, true).0.contains(&name)
     });
     let fact = crate::dao::mining_ledger::DeliveryFact {
-        character_id: owner, ship_id: ship, solar_system_id: system, type_id: pending.type_id,
+        character_id: owner, ship_id: capacity.ship(), solar_system_id: system, type_id: pending.type_id,
         quantity: taken, quantity_wasted: wasted, event_time: filetime_now(),
         unit_volume_m3: t.volume.unwrap_or(1.0).max(0.01),
         resource_kind: if gas { crate::lua::events::resources::MiningResourceKind::Gas } else { crate::lua::events::resources::MiningResourceKind::Ore },
@@ -207,7 +213,7 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
         };
         outbox.notify_pilot(owner, "OnItemChange", vec![row.item.row(), super::inventory::notifications::item_change_dict([change]), Value::None]);
     }
-    outbox.notify_pilot(owner, "OnOreMined", vec![Value::dict([
+    outbox.notify_client("OnOreMined", vec![Value::dict([
         ("oreType", Value::Int(pending.type_id as i64)), ("quantity_added", Value::Int(taken)),
         ("quantity_removed", Value::Int(taken)), ("hasRewards", Value::Bool(false)),
         ("amountWasted", Value::Int(wasted)), ("amountCritBonus", Value::Int(result.critical_hit_quantity.max(0).min(taken))),
@@ -220,12 +226,12 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
 pub(crate) async fn delivered(db: &Db, world: &Arc<World>, system: i64, owner: i64, delivery: Delivery) -> Result<(), CallError> {
     let rock = delivery.rock;
     let left = delivery.left;
-    let pilots = world.with(system, move |s| {
+    let senders = world.with(system, move |s| {
         s.apply_mining_delivery(rock, left);
-        s.pilots().filter_map(|b| b.char_id.filter(|c| *c != owner)).collect::<Vec<_>>()
+        s.pilots().filter_map(|ball| ball.char_id.filter(|character| *character != owner).and_then(|character| s.pilot_sender(character))).collect::<Vec<_>>()
     }).await.unwrap_or_default();
-    for pilot in pilots {
-        world.notify_pilot(pilot, "OnOreMinedByOther", vec![Value::Int(delivery.rock), Value::Int(delivery.removed)]);
+    for sender in senders {
+        let _ = sender.send(("OnOreMinedByOther".into(), vec![Value::Int(delivery.rock), Value::Int(delivery.removed)]));
     }
     if delivery.left == 0 { reconcile_depleted(db, world, system, delivery.rock).await?; }
     Ok(())
@@ -252,7 +258,7 @@ enum ExtractionDelivery {
 
 /// The end of a mining cycle of `module` on rock `target`: move the yield to the hold.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, module_type: i32, module_flag: i32, target: i64) -> Result<Extraction, CallError> {
+pub(crate) async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, inputs: crate::services::effects::parameters::MiningInputs, module: i64, module_type: i32, module_flag: i32, target: i64) -> Result<Extraction, CallError> {
     use crate::lua::events::ModuleCycleOutcome;
     let facts = world.with(system, move |s| {
         let me = s.ball(ship)?;
@@ -268,13 +274,15 @@ pub(crate) async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char
     let target_lost = source_valid.then_some(ModuleCycleOutcome::TargetLost);
     let Some(gap) = gap else { return Ok(Extraction { repeat: false, outcome: target_lost, error: None }) };
     let Some(type_id) = type_id else { return Ok(Extraction { repeat: false, outcome: target_lost, error: None }) };
-    if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
+    if gap > inputs.range {
         tell(notify, messages::TARGET_OUTSIDE_MINING_RANGE);
         return Ok(Extraction { repeat: false, outcome: None, error: None });
     }
     let volume = world.sde().types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {type_id}")))?.volume.unwrap_or(1.0).max(0.01);
-    let values = yield_values(fit, Key::Module(module));
-    let destination = destination(fit, type_id);
+    let values = inputs.values;
+    let Some((_, destination)) = inputs.destination? else {
+        return Err(CallError::Internal(anyhow::anyhow!("mining cycle captured without a destination")));
+    };
     let db = db.clone();
     let world = world.clone();
     let notify = notify.clone();
@@ -295,13 +303,14 @@ pub(crate) async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char
                             || !crate::dao::items::mining::lock_module(tx, char_id, ship, module, module_type, module_flag).await.map_err(db_err)? {
                             return Ok(ExtractionDelivery::InvalidSource);
                         }
-                        deliver(tx, outbox, &sde, char_id, ship, system, module, &pending, destination).await.map(ExtractionDelivery::Delivery)
+                        deliver(tx, outbox, &sde, char_id, system, module, &pending, destination).await.map(ExtractionDelivery::Delivery)
                     })
                 },
                 |value, outbox| {
                     let world = world.clone();
+                    let notify = notify.clone();
                     async move {
-                        crate::db::outbox::dispatch_world(value, outbox, &world)
+                        crate::db::outbox::dispatch_sender(value, outbox, &world, Some(&notify))
                     }
                 },
             ).await?;
@@ -319,7 +328,7 @@ pub(crate) async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char
                 }
                 ExtractionDelivery::Delivery(DeliveryOutcome::Delivered(result)) => {
                     let repeat = result.repeat();
-                    if result.full { tell(&notify, full_notice(destination.0)); }
+                    if result.full { tell(&notify, full_notice(destination.flag())); }
                     let error = delivered(&db, &world, system, char_id, result).await.err();
                     (repeat && error.is_none(), Some(ModuleCycleOutcome::Completed), error)
                 }
@@ -344,4 +353,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

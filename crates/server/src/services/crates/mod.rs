@@ -1,7 +1,7 @@
 //! Crate service routing for eve/client/script/ui/crate/controller.py and
 //! recruitment_crate_controller.py. Previews use the startup SDE catalogue,
 //! composed from native crate data and server-authored content, and instance
-//! previews check authenticated inventory access.
+//! previews share source refusals and authenticated inventory access.
 //!
 //! Destination queries apply the same authorization and eligibility checks as
 //! opening, without reserving anything; opening checks the current state again.
@@ -18,7 +18,9 @@ mod crate_service;
 mod opening;
 
 use crate::client::Client;
-use crate::services::{Call, CallResult};
+use crate::services::{Call, CallError, CallResult};
+
+fn invalid_source() -> CallError { crate::services::notify_error(infinity_core::messages::crates::INVALID_SOURCE) }
 
 pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
@@ -27,4 +29,4 @@ pub(crate) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-economy"))] mod tests;

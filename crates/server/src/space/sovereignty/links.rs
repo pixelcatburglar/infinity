@@ -20,6 +20,8 @@ pub(crate) struct LinkCycle {
     pub range_m: f64,
     pub scoring: bool,
     pub expires_sim: i64,
+    /// True only between paid registration and the real fitted-active publication.
+    pub publication_pending: bool,
 }
 
 #[derive(Clone)]
@@ -40,6 +42,17 @@ pub(super) struct State {
     next_token: u64,
     deadline_ms: i64,
     pressure: bool,
+}
+
+/// Inspect capture runtime without retiring links or changing checkpoints.
+pub(in crate::space) fn unload_blocked(system: &System) -> Option<&'static str> {
+    let state = &system.sovereignty.links;
+    if state.current.is_some() { Some("sovereignty_capture") }
+    else if !state.active.is_empty() { Some("sovereignty_links") }
+    else if !state.segments.is_empty() { Some("sovereignty_segments") }
+    else if state.dirty || state.frozen.is_some() || state.inflight.is_some() || state.pressure {
+        Some("sovereignty_checkpoint")
+    } else { None }
 }
 
 fn ready(system: &System) -> bool {
@@ -86,7 +99,14 @@ fn valid(system: &System, cycle: &LinkCycle) -> bool {
         || !crate::services::combat::targeting_charges::has_target(source.character_id, cycle.target_item_id) { return false; }
     let Some(record) = system.actor_combat.get(&source.ship_id) else { return false };
     if !matches!(record.phase, CombatPhase::Live) || record.membership_generation != cycle.membership_generation
-        || !valid_condition(&record.condition) || record.fit.module_state(source.module_id) != Some((true, true)) { return false; }
+        || !valid_condition(&record.condition) { return false; }
+    if !crate::services::effects::lifecycle::activation_current(
+        source.module_id, source.character_id, &cycle.activation,
+    ) || (cycle.publication_pending && cycle.activation.load(Ordering::Relaxed)) {
+        return false;
+    }
+    let Some((online, active)) = record.fit.module_state(source.module_id) else { return false };
+    if !online || (!active && !cycle.publication_pending) { return false; }
     let (Some(ship), Some(target)) = (system.ball(source.ship_id), system.ball(cycle.target_item_id)) else { return false };
     if ship.mode == crate::space::MODE_WARP || target.mode == crate::space::MODE_WARP { return false; }
     let distance = dist(ship.position_at(system.now_ms()), target.position_at(system.now_ms()));
@@ -141,6 +161,18 @@ pub(crate) fn paid_cycle(system: &mut System, cycle: LinkCycle) -> bool {
     let inserted = state.active.insert(module, cycle).is_none();
     if inserted { system.refresh_projection_target(ship); }
     replay::boundary(system, now);
+    true
+}
+
+/// Clear a first-cycle link's pending admission once the real active bit publishes.
+pub(crate) fn publish_start(system: &mut System, module: i64, activation: &Arc<AtomicBool>) -> bool {
+    let Some(link) = cycle(system, module, activation) else { return false };
+    if !link.publication_pending || link.expires_sim <= filetime_from_unix_ms(system.now_ms()) || !valid_paid(system, &link) { return false; }
+    let Some(record) = system.actor_combat.get(&link.contributor.ship_id) else { return false };
+    if record.fit.module_state(module) != Some((true, true)) { return false; }
+    let Some(link) = system.sovereignty.links.active.get_mut(&module)
+        .filter(|link| Arc::ptr_eq(&link.activation, activation)) else { return false };
+    link.publication_pending = false;
     true
 }
 
@@ -232,4 +264,4 @@ pub(in crate::space) fn tick(system: &mut System) {
     worker::tick(system);
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

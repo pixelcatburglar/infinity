@@ -229,7 +229,15 @@ pub(in crate::services) async fn notify_item_change<X: Send>(db: &(impl Executor
     Ok(())
 }
 
+/// `OnItemChange(item, change, location)` for an already loaded row, addressed
+/// to the explicitly selected pilot rather than the calling client.
+pub(in crate::services) fn notify_owner_item_change<X: Send>(outbox: &mut Outbox<X>, item: &Item, owner: i64, change: impl IntoIterator<Item = (i64, Value)>) {
+    outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), item_change_dict(change), Value::None]);
+}
+
 /// Current station-scoped viewers of the item's corporate custody.
+/// An inactive office lease still identifies custody but grants no ordinary
+/// viewers; management asset audiences are computed separately.
 pub(in crate::services) async fn corp_item_viewers(ex: &(impl Executor + ?Sized), item: &Item) -> Result<Vec<i64>, CallError> {
     let custody = if let Some(corp) = crate::services::offices::office_owner(ex, item.location_id).await? {
         Some((corp, item.location_id, item.flag_id))
@@ -242,13 +250,17 @@ pub(in crate::services) async fn corp_item_viewers(ex: &(impl Executor + ?Sized)
     let Some((corp, location, flag)) = custody else { return Ok(Vec::new()) };
     let Some(station) = custody_station(ex, location, flag).await? else { return Ok(Vec::new()) };
     let Some(role) = corp_hangar_role(flag, false) else { return Ok(Vec::new()) };
+    if flag != infinity_core::consts::FLAG_CORP_DELIVERIES {
+        let active = crate::dao::offices::get(ex, location).await.map_err(db_err)?
+            .is_some_and(|lease| lease.is_active(crate::client::filetime_now()));
+        if !active { return Ok(Vec::new()); }
+    }
     let ids = crate::dao::characters::members::active_ids(ex, corp).await.map_err(db_err)?;
     let authorities = crate::dao::characters::roles::authorities(ex, &ids).await.map_err(db_err)?;
     Ok(authorities.into_iter().filter(|authority|
         crate::services::corps::permissions::allows_at(authority, corp, station, role)
     ).map(|authority| authority.character).collect())
 }
-
 /// Queue a provided corporate row to members authorized to view its division.
 pub(in crate::services) async fn notify_corp_item_change<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: &Item, change: Vec<(i64, Value)>) -> Result<(), CallError> {
     let mut source = item.clone();
@@ -263,12 +275,23 @@ pub(in crate::services) async fn notify_corp_item_change<X: Send>(ex: &(impl Exe
     Ok(())
 }
 
-/// Queue the standard junkyard notification for a removed item.
-pub(in crate::services) fn notify_item_removed<X: Send>(outbox: &mut Outbox<X>, item: Item) {
+/// The standard junkyard removal payload shared by every removed-item target.
+fn removed_payload(item: Item) -> (Value, Value) {
     let old_location = item.location_id;
     let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
-    let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]);
-    outbox.notify_client("OnItemChange", vec![gone.row(), change, Value::None]);
+    (gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]))
+}
+
+/// Queue the standard junkyard notification for a removed item.
+pub(in crate::services) fn notify_item_removed<X: Send>(outbox: &mut Outbox<X>, item: Item) {
+    let (row, change) = removed_payload(item);
+    outbox.notify_client("OnItemChange", vec![row, change, Value::None]);
+}
+
+/// Queue the same removal notification addressed to the item owner.
+pub(in crate::services) fn notify_owner_item_removed<X: Send>(outbox: &mut Outbox<X>, item: Item, owner: i64) {
+    let (row, change) = removed_payload(item);
+    outbox.notify_pilot(owner, "OnItemChange", vec![row, change, Value::None]);
 }
 
 /// Queue deletion to corporate viewers using the item's captured pre-delete location.
@@ -280,5 +303,5 @@ pub(in crate::services) async fn notify_corp_item_removed<X: Send>(
     notify_corp_item_change(ex, outbox, &gone, vec![(IX_LOCATION_ID, Value::Int(old))]).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-inventory"))]
 mod tests;

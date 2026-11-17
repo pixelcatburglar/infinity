@@ -108,4 +108,4 @@ pub(super) fn invalidate(system: &mut System, changes: &[SourceChange]) {
     }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-space"))] mod tests;

@@ -61,5 +61,5 @@ pub(super) async fn command(db: &Db, args: &[String]) -> Result<String, CallErro
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-slash"))]
 mod tests;

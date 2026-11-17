@@ -146,7 +146,7 @@ async fn real_script_reads_and_unquoted_injection() {
     crate::services::tests::fixture::cleanup(&db, character).await.unwrap();
 }
 #[tokio::test]
-#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run this exact test in its own process"]
 async fn repository_script_inject_exchange_and_retained_read() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -154,6 +154,7 @@ async fn repository_script_inject_exchange_and_retained_read() {
     let (mut client, _peer) = crate::services::tests::client(db.clone(), character.character).await;
     client.login.user_id = character.account;
     let fixture = fixture::create(&db, client.sde.clone(), client.world.clone()).await;
+    assert!(crate::lua::CATALOGUE.set(fixture.catalogue.clone()).is_ok());
     client.session.apply(vec![("stationid", Value::Int(fixture.station))]);
     db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&character.character, &fixture.station]).await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -322,6 +323,18 @@ async fn repository_script_inject_exchange_and_retained_read() {
     }
     assert_eq!(rx.recv().await.unwrap().0, "OnItemChange");
     assert_eq!(rx.recv().await.unwrap().0, "OnUserResponsed");
+    {
+        // The shared catalogue serves retained adaptation reads without a
+        // host: a disabled start returns early and leaves no HOST, EVENTS or
+        // ENABLED marker behind, while the read path keeps working.
+        let mut disabled = crate::config::Config::default();
+        disabled.lua.enabled = false;
+        let hub = crate::chat::Hub::new("test", db.clone(), client.world.clone());
+        crate::lua::start(&disabled, &db, &client.sde, &client.world, &hub).await.unwrap();
+        assert!(crate::lua::HOST.get().is_none() && crate::lua::EVENTS.get().is_none() && !crate::lua::enabled());
+        let subject = crate::dao::ship_adaption::snapshot(&db, character.character).await.unwrap().subject.unwrap();
+        crate::lua::retained_adaption(&subject.content_namespace, &subject.content_version).unwrap();
+    }
     let kwargs = Value::None;
     let call = Call { service: "shipAdaptionMgr", method: "fetch_user_data", args: &[], kwargs: &kwargs, bound: false, bind_params: None };
     assert_eq!(crate::services::dispatch(&mut client, &call).await.unwrap(), Value::None);

@@ -79,7 +79,7 @@ fn requested_stop_and_old_activation_do_not_remove_replacement() {
         contributor: CaptureContributor { character_id: 1, ship_id: 2, module_id: 1,
             corporation_id: 1, alliance_id: 1, source_revision: 1 },
         membership_generation: 1, activation: current.clone(), range_m: 1.0,
-        scoring: false, expires_sim: 1,
+        scoring: false, expires_sim: 1, publication_pending: false,
     });
     current.store(true, Ordering::Relaxed);
     assert!(blocks(&system, 2));
@@ -103,7 +103,7 @@ fn frozen_endpoint_rejects_paid_cycle_without_changing_history_or_active_link() 
     let cycle = LinkCycle { target_item_id: 1, target_epoch: 1,
         contributor: contributor.clone(), membership_generation: 1,
         activation: Arc::new(AtomicBool::new(false)), range_m: 1.0,
-        scoring: true, expires_sim: i64::MAX };
+        scoring: true, expires_sim: i64::MAX, publication_pending: false };
     system.sovereignty.links.active.insert(1, cycle.clone());
     system.sovereignty.links.segments.push(Segment { contributor: contributor.clone(), start: 1, end: 2 });
     system.sovereignty.links.frozen = Some(CaptureObservation {

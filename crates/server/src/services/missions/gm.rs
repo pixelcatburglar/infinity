@@ -6,6 +6,9 @@
 //! Actor effects run after database commit: a stopped actor can leave deposited
 //! goods committed while the command reports failure.
 //! Mission cargo deposits hold the market lock through transaction dispatch.
+//! Existing goods in the delivery hangar, and in the active ship cargo while
+//! docked there, count toward the requirement; each singleton item counts as
+//! one regardless of its encoded quantity.
 use super::*;
 use std::collections::BTreeMap;
 use crate::dao::items::loading::ItemQuery;
@@ -63,7 +66,7 @@ pub(crate) async fn force_complete(c: &mut Client, agent: Option<i64>) -> Result
                 for ((station, type_id), qty) in goods {
                     let cargo_ship = if docked == Some(station) { ship } else { 0 };
                     let rows = items::load_items(tx, &sde, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, cargo_ship, FLAG_CARGO)).await.map_err(db_err)?;
-                    let available = rows.iter().try_fold(0_i128, |total, item| total.checked_add(i128::from(item.quantity)))
+                    let available = rows.iter().try_fold(0_i128, |total, item| total.checked_add(i128::from(crate::services::item_volume::stack_size(item.singleton, item.quantity))))
                         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("mission inventory quantity overflow")))?;
                     let missing = missing_amount(qty, available);
                     if missing > 0 {
@@ -104,5 +107,5 @@ pub(crate) async fn force_complete(c: &mut Client, agent: Option<i64>) -> Result
     Ok(missions.len())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tests-content"))]
 mod tests;

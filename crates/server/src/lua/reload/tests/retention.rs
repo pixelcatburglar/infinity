@@ -1,6 +1,6 @@
 //! Database-backed authored package retention and generation admission.
 use super::super::*;
-use crate::{lua::{content::{PinnedPolicy, PolicyInput, PolicyPlan, Rule}, host::Resources}, sde::Sde, space::World};
+use crate::{lua::{content::{PinnedPolicy, PolicyInput, PolicyPlan, Rule}, host::Resources}, sde::Sde, services::CallError, space::World};
 
 #[derive(Debug, PartialEq, Eq)]
 struct HistoryRow {
@@ -45,7 +45,7 @@ async fn retained_packages_and_admission_follow_publication() {
     };
     write_version(&v1, "1200");
     let config = LuaConfig { scripts_dir: root.to_string_lossy().into_owned(), ..LuaConfig::default() };
-    let host = Host::new(config.clone(), resources.clone()).await.unwrap();
+    let host = Host::new(config.clone(), resources.clone(), Catalogue::load(&resources.db, &config, &resources.sde).await.unwrap()).await.unwrap();
     let old = PinnedPolicy::pin(host.snapshot(), "sovereignty").unwrap();
     let old_row = crate::dao::lua_content::load(&db, "sovereignty", &v1).await.unwrap().unwrap();
     let initial = history(&db, "sovereignty").await;
@@ -87,7 +87,7 @@ async fn retained_packages_and_admission_follow_publication() {
     let before_failure = host.snapshot();
     let before_failure_policy = PinnedPolicy::pin(before_failure.clone(), "sovereignty").unwrap();
     write_version(&v3, "1202");
-    let candidate_v3 = PinnedPolicy::pin(Arc::new(vm::build(&config, &resources).unwrap()), "sovereignty").unwrap();
+    let candidate_v3 = PinnedPolicy::pin(Arc::new(vm::build(&config, &resources, host.catalogue()).unwrap()), "sovereignty").unwrap();
     db.execute(&format!("CREATE FUNCTION game.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.namespace = 'sovereignty' AND NEW.version = '{v3}' THEN RAISE EXCEPTION 'test activation append failure'; END IF; RETURN NEW; END $$"), &[]).await.unwrap();
     db.execute(&format!("CREATE TRIGGER {trigger} BEFORE INSERT ON game.lua_content_activations FOR EACH ROW EXECUTE FUNCTION game.{trigger}()"), &[]).await.unwrap();
     let error = host.reload().await.unwrap_err();
@@ -103,8 +103,8 @@ async fn retained_packages_and_admission_follow_publication() {
     assert!(host.admit(&candidate_v3).is_err());
     db.execute(&format!("DROP TRIGGER {trigger} ON game.lua_content_activations"), &[]).await.unwrap();
     write_version(&v1, "1200");
-    let candidate = vm::build(&config, &resources).unwrap();
-    persist(&resources, &candidate).await.unwrap();
+    let candidate = vm::build(&config, &resources, host.catalogue()).unwrap();
+    publish(&resources, &candidate, crate::client::filetime_now()).await.unwrap();
     let after_a = history(&db, "sovereignty").await;
     assert_eq!(after_a.len(), after_b.len() + 1);
     assert_eq!(after_a.last().unwrap().version, v1);
@@ -112,10 +112,11 @@ async fn retained_packages_and_admission_follow_publication() {
     assert_eq!(after_a.last().unwrap().fingerprint, old_row.fingerprint);
     assert_ne!(current.evaluate(Rule::SelfDestruct, &input).unwrap(), old_result);
     drop(host);
-    let restarted = Host::new(config, resources).await.unwrap();
+    let restarted = Host::new(config.clone(), resources.clone(), Catalogue::load(&resources.db, &config, &resources.sde).await.unwrap()).await.unwrap();
     assert_eq!(history(&db, "sovereignty").await, after_a);
-    let retained = restarted.retained("sovereignty", &v1).await.unwrap();
+    let retained = restarted.catalogue().resolve("sovereignty", &v1).unwrap();
     assert_eq!(retained.evaluate(Rule::SelfDestruct, &input).unwrap(), old_result);
+    assert_eq!(retained.evaluate(Rule::InitializeCapital, &input).unwrap(), PolicyPlan::Capital { current_system: 42, not_before: input.now + crate::client::filetime_ticks_from_seconds(2592000) });
     assert_eq!(retained.namespace(), "sovereignty");
     assert_eq!(retained.version(), v1);
     let retained_row = crate::dao::lua_content::load(&db, "sovereignty", &v1).await.unwrap().unwrap();
@@ -123,13 +124,49 @@ async fn retained_packages_and_admission_follow_publication() {
     assert_eq!(retained_row.source, old_row.source);
     assert_eq!(retained_row.data, old_row.data);
     assert!(restarted.admit(&retained).is_err());
-    assert!(restarted.retained("sovereignty", "missing").await.is_err());
-    for (column, value) in [("fingerprint", "decode(repeat('00',32),'hex')"), ("schema_version", "2"), ("compiler_identity", "'other'")] {
-        let row = crate::dao::lua_content::load(&db, "sovereignty", &v1).await.unwrap().unwrap();
-        db.execute(&format!("UPDATE game.lua_content_versions SET {column} = {value} WHERE namespace = $1 AND version = $2"), &[&"sovereignty", &v1]).await.unwrap();
-        assert!(restarted.retained("sovereignty", &v1).await.is_err());
-        db.execute("UPDATE game.lua_content_versions SET fingerprint = $3, schema_version = $4, compiler_identity = $5 WHERE namespace = $1 AND version = $2", &[&"sovereignty", &v1, &row.fingerprint, &row.schema_version, &row.compiler_identity]).await.unwrap();
+    assert!(retained.same_package(&restarted.catalogue().resolve("sovereignty", &v1).unwrap()));
+    let CallError::Internal(error) = restarted.catalogue().resolve("sovereignty", "missing").err().expect("missing retained must fail") else { panic!("missing retained must be an internal error") };
+    assert!(error.downcast_ref::<MissingRetainedPackage>().is_some());
+    let policies = restarted.policies();
+    let head = policies.activations("sovereignty").unwrap().last().unwrap().ordinal;
+    assert!(policies.is_current("sovereignty", Some(head)).unwrap());
+    assert!(!policies.is_current("sovereignty", Some(head - 1)).unwrap());
+    assert!(!policies.is_current("sovereignty", Some(head + 1)).unwrap());
+    assert!(!policies.is_current("sovereignty", None).unwrap());
+    {
+        // A real COMMIT->install window: the reload guard is held across the
+        // production publish transaction and the same publication block the
+        // host itself runs, so the committed activation is invisible to the
+        // catalogue until install runs.
+        let _guard = policies.reload.lock().await;
+        write_version(&v3, "1202");
+        let candidate = Arc::new(vm::build(&config, &resources, restarted.catalogue()).unwrap());
+        let appended = publish(&resources, &candidate, crate::client::filetime_now()).await.unwrap();
+        assert_eq!(appended.len(), 1);
+        assert_eq!((appended[0].namespace.as_str(), appended[0].version.as_str()), ("sovereignty", v3.as_str()));
+        assert_eq!(restarted.catalogue().head("sovereignty").unwrap(), Some(head));
+        assert!(!policies.is_current("sovereignty", Some(head)).unwrap());
+        {
+            let _gate = restarted.publication.lock().unwrap();
+            restarted.catalogue().install(&candidate, candidate.content.packages.values().cloned().collect(), appended, Vec::new()).unwrap();
+            restarted.current.send_replace(candidate);
+        }
     }
+    let new_head = policies.activations("sovereignty").unwrap().last().unwrap().ordinal;
+    assert!(new_head > head);
+    assert!(policies.is_current("sovereignty", Some(new_head)).unwrap());
+    assert!(!policies.is_current("sovereignty", Some(head)).unwrap());
+    for (column, value) in [("fingerprint", "decode(repeat('00',32),'hex')"), ("schema_version", "2"), ("compiler_identity", "'other'")] {
+        let row = crate::dao::lua_content::load(&db, "sovereignty", &v2).await.unwrap().unwrap();
+        db.execute(&format!("UPDATE game.lua_content_versions SET {column} = {value} WHERE namespace = $1 AND version = $2"), &[&"sovereignty", &v2]).await.unwrap();
+        // External writes never reach the loaded catalogue; a fresh startup
+        // load must reject the corrupted identity instead.
+        assert!(restarted.catalogue().resolve("sovereignty", &v2).is_ok());
+        assert!(Catalogue::load(&resources.db, &config, &resources.sde).await.is_err());
+        db.execute("UPDATE game.lua_content_versions SET fingerprint = $3, schema_version = $4, compiler_identity = $5 WHERE namespace = $1 AND version = $2", &[&"sovereignty", &v2, &row.fingerprint, &row.schema_version, &row.compiler_identity]).await.unwrap();
+    }
+    let repaired = restarted.catalogue().resolve("sovereignty", &v2).unwrap();
+    assert_eq!(repaired.evaluate(Rule::SelfDestruct, &input).unwrap(), PolicyPlan::SelfDestruct { due: input.now + crate::client::filetime_ticks_from_seconds(1201) });
     }).await;
     let mut cleanup_errors = Vec::new();
     for statement in [

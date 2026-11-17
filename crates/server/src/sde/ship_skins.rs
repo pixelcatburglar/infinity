@@ -1,5 +1,6 @@
 //! Immutable first-party SKIN definitions from native static data.
 //! `shipskins/static.py` defines regional visibility, hulls and license fields.
+//! `ordinary_skins` yields the complete region-visible non-structure grant set.
 //! Runtime ownership, structures and single-use activation are not handled here.
 use crate::{dao::sde::ship_skins as dao, db::{self, executor::Executor}};
 
@@ -62,6 +63,17 @@ impl ShipSkins {
     pub(crate) fn licenses(&self) -> impl Iterator<Item = &License> {
         self.licenses.iter()
     }
+
+    /// Ordinary non-structure SKINs visible in `region`: the complete ascending,
+    /// duplicate-free grant set for bulk administration, not the license-item subset.
+    pub(crate) fn ordinary_skins<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Skin> {
+        let mut seen = None;
+        self.skins.iter().filter(move |skin| {
+            let duplicate = seen == Some(skin.skin_id);
+            seen = Some(skin.skin_id);
+            !duplicate && !skin.is_structure_skin && skin.visible(region)
+        })
+    }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(all(test, feature = "tests-sde"))] mod tests;
