@@ -137,7 +137,7 @@ impl Rig {
     }
     async fn cycle(&self, members: usize) -> Cycle {
         let guns = &self.guns[..members];
-        fx::capture_cycle(Cycle { cx: self.cx.clone(), effect: self.effect.clone(), target: Some(self.victim),
+        fx::capture_cycle(Cycle { cx: self.cx.clone(), presented_effect: self.effect.id, effect: self.effect.clone(), target: Some(self.victim),
             modules: guns.iter().enumerate().map(|(i, &id)| Module { id, type_id: self.gun, flag: FLAG_HI_SLOT_FIRST + i as i32 }).collect(),
             repeat: 1, stop: self.stop.clone(),
             owner: ActivationOwner { master: guns[0], generation: self.stop.clone(), pending_combat: None,
@@ -498,7 +498,7 @@ async fn missile_launch_spends_one_charge_and_impact_spends_none() {
         state.activation_generation.insert(module_id, stop.clone()); }
     let cx = Ctx { db: f.db.clone(), world: f.world.clone(), notify: f.client.notify_tx.clone(), char_id: f.owner, ship_id: f.ship, system_id: f.system };
     let effect = registry::resolve(&sde, infinity_core::consts::dogma::EFFECT_USE_MISSILES).expect("missile effect");
-    let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], effect,
+    let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
         target: Some(victim), repeat: 1, stop: stop.clone(), owner: ActivationOwner { master: module_id, generation: stop, armed: true,
             combat_generations: vec![NativeCombatGeneration { module_id, generation: next_generation(), sequence: 0 }],
             pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },

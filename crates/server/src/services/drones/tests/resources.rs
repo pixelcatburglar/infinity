@@ -1,6 +1,6 @@
 #[cfg(feature = "tests-combat")] mod physical;
 #[cfg(feature = "tests-combat")] mod logistics;
-#[cfg(feature = "tests-combat")] mod delegation;
+#[cfg(feature = "tests-combat")] pub(in crate::services) mod delegation;
 #[cfg(any(feature = "tests-combat", feature = "tests-economy", feature = "tests-ships", feature = "tests-effects"))] pub(in crate::services) mod fleet;
 
 #[cfg(feature = "tests-combat")] use anyhow::{anyhow, ensure, Result};

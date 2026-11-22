@@ -4,7 +4,11 @@ use super::System;
 use crate::lua::events::combat::CombatEntity;
 use crate::lua::events::resources::{FactContext, FactOrigin};
 use crate::space::combat_facts::{CombatFacts, CombatSource, Refusal};
+use crate::npc_security::FrozenMultiplier;
+use crate::services::fit::Key;
 
+/// SDE dgmAttributeTypes attributeID 359, `securityStatusKillBonus`.
+const ATTR_SECURITY_STATUS_KILL_BONUS: i32 = 359;
 fn incarnation(epoch: u64, generation: u64) -> [u8; 16] {
     let mut value = [0; 16];
     value[..8].copy_from_slice(&epoch.to_be_bytes());
@@ -24,9 +28,9 @@ impl System {
         effect_id: Option<i64>, weapon_type_id: Option<i32>, origin: FactOrigin,
         guard: impl FnOnce(&System) -> bool) -> Result<CombatSource, Refusal> {
         if !self.is_npc(source_id) && self.drone(source_id).is_none() { return Err(Refusal::Invalid); }
-        let record = self.actor_combat.get(&source_id).ok_or(Refusal::Invalid)?;
-        let generation = record.membership_generation;
+        let record = self.actor_combat.get_mut(&source_id).ok_or(Refusal::Invalid)?;
         let sequence = record.source_sequence.checked_add(1).ok_or(Refusal::Overflow)?;
+        let generation = *record.body_source_generation.get_or_insert_with(crate::space::targeting::next_generation);
         let source = self.prepare_combat_source(source_id, module_id, effect_id, weapon_type_id,
             origin, generation, sequence, 1, guard)?;
         self.actor_combat.get_mut(&source_id).expect("native source retained in actor turn").source_sequence = sequence;
@@ -70,17 +74,23 @@ impl System {
         if (self.drone(source_id).is_some() || entity.character_id.is_some()) && controller.is_none() {
             return Err(Refusal::Invalid);
         }
-        let actor = controller.and_then(|ball| ball.char_id).filter(|id| *id > 0);
-        let context = FactContext { corporation_id: controller.and_then(|b| (b.corp_id > 0).then_some(b.corp_id)),
-            alliance_id: controller.and_then(|b| (b.alliance_id > 0).then_some(b.alliance_id)), faction_id: None,
-            ship_id: controller.map(|b| b.id), ship_type_id: controller.map(|b| b.type_id),
+        let (ship_id, ship_type, character, corporation, alliance) = controller.map(|ball| (
+            ball.id, ball.type_id, ball.char_id.filter(|id| *id > 0),
+            (ball.corp_id > 0).then_some(ball.corp_id), (ball.alliance_id > 0).then_some(ball.alliance_id),
+        )).unwrap_or((0, 0, None, None, None));
+        let npc_security_multiplier = if character.is_some() {
+            let raw = self.with_combat_fit(ship_id, |fit, _, _| fit.value(Key::Char, ATTR_SECURITY_STATUS_KILL_BONUS));
+            let Some(multiplier) = raw.and_then(FrozenMultiplier::new) else { return Err(Refusal::Invalid); };
+            Some(multiplier)
+        } else { None };
+        let context = FactContext { corporation_id: corporation, alliance_id: alliance, faction_id: None,
+            ship_id: character.map(|_| ship_id), ship_type_id: character.map(|_| ship_type),
             system_id: (self.id > 0).then_some(self.id), station_id: None, origin };
-        let controller_incarnation = match controller {
-            Some(ball) => Some(self.combat_entity(ball.id).ok_or(Refusal::Invalid)?.incarnation),
-            None => None,
-        };
+        let controller_incarnation = if character.is_some() {
+            Some(self.combat_entity(ship_id).ok_or(Refusal::Invalid)?.incarnation)
+        } else { None };
         let source_is_npc = self.is_npc(source_id) && self.drone(source_id).is_none();
-        let source = CombatSource { actual_actor_character: actor, entity, context, source_is_npc, controller_incarnation, module_id, effect_id,
+        let source = CombatSource { actual_actor_character: character, entity, context, source_is_npc, npc_security_multiplier, controller_incarnation, module_id, effect_id,
             weapon_type_id, activation: incarnation(self.combat_facts.as_ref().expect("ledger initialized").runtime_epoch(), generation), sequence };
         let facts = self.combat_facts.as_mut().expect("ledger initialized");
         facts.register_source(source.activation, generation, first_sequence)?;
@@ -96,6 +106,15 @@ impl System {
         let facts = self.combat_facts.as_mut().ok_or(Refusal::Invalid)?;
         let activation = incarnation(facts.runtime_epoch(), generation);
         facts.retire_source(activation, generation)
+    }
+
+    /// End body ownership even if admission refused before registration.
+    pub(in crate::space) fn retire_body_combat_source(&mut self, source_id: i64) {
+        let Some(record) = self.actor_combat.get_mut(&source_id) else { return };
+        let generation = record.body_source_generation.take();
+        record.source_sequence = 0;
+        // Registration can be absent after a refused admission; cleanup is best-effort.
+        if let Some(generation) = generation { let _ = self.retire_combat_source(generation); }
     }
 
     pub(crate) fn npc_death_context(&self, item: i64, token: u64, generation: u64)

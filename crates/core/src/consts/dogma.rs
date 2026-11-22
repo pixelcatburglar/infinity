@@ -208,6 +208,16 @@ pub const ATTR_SPEED_FACTOR: i32 = 20;
 pub const ATTR_SPEED_FACTOR_INTERIM: i32 = 2148;
 /// Client dogma/const.py: attributeWarpScrambleStatus.
 pub const ATTR_WARP_SCRAMBLE_STATUS: i32 = 104;
+/// SDE dgmAttributeTypes: gateScrambleStatus.
+pub const ATTR_GATE_SCRAMBLE_STATUS: i32 = 1973;
+/// SDE dgmAttributeTypes: warpScrambleRange (interdiction probe field radius).
+pub const ATTR_WARP_SCRAMBLE_RANGE: i32 = 103;
+
+/// SDE dgmAttributeTypes: stasisWebifierResistance (default 1.0).
+pub const ATTR_STASIS_WEBIFIER_RESISTANCE: i32 = 2115;
+
+/// SDE dgmAttributeTypes: warpBubbleImmune.
+pub const ATTR_WARP_BUBBLE_IMMUNE: i32 = 1538;
 /// Client dogma/const.py: attributeActivationBlocked.
 pub const ATTR_ACTIVATION_BLOCKED: i32 = 1349;
 /// Client dogma/const.py: attributeActivationBlockedStrenght (client spelling).
@@ -220,6 +230,20 @@ pub const ATTR_SIGNATURE_RADIUS: i32 = 552;
 pub const ATTR_MAX_RANGE: i32 = 54;
 /// dogma/const.py: compressibleItemsTypeList.
 pub const ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST: i32 = 3255;
+/// SDE dgmAttributeTypes: activationRequiresActiveIndustrialCore.
+pub const ATTR_ACTIVATION_REQUIRES_ACTIVE_INDUSTRIAL_CORE: i32 = 3265;
+/// Client dogma/const.py: attributeValidTargetWhitelist (a type-list ID).
+pub const ATTR_VALID_TARGET_WHITELIST: i32 = 5745;
+/// Client dogma/const.py: attributeDotDuration (ms).
+pub const ATTR_DOT_DURATION: i32 = 5735;
+/// Client dogma/const.py: attributeDotMaxDamagePerTick.
+pub const ATTR_DOT_MAX_DAMAGE_PER_TICK: i32 = 5736;
+/// Client dogma/const.py: attributeDotMaxHPPercentagePerTick (percent).
+pub const ATTR_DOT_MAX_HP_PERCENTAGE_PER_TICK: i32 = 5737;
+/// Client dogma/const.py: attributeBreacherPodDamageResistance (default 1.0).
+pub const ATTR_BREACHER_POD_DAMAGE_RESISTANCE: i32 = 6255;
+/// Client dogma/const.py: attributeBreacherPodActivatedDamageReceivedPercentage.
+pub const ATTR_BREACHER_POD_ACTIVATED_DAMAGE_RECEIVED_PERCENTAGE: i32 = 6257;
 /// SDE dgmAttributeTypes: maxTractorVelocity.
 pub const ATTR_MAX_TRACTOR_VELOCITY: i32 = 1045;
 /// SDE dgmAttributeTypes: accessDifficultyBonus.
@@ -230,6 +254,15 @@ pub const ATTR_REACTIVATION_DELAY: i32 = 669;
 pub const ATTR_TARGETING_DELAY: i32 = 560;
 /// SDE dgmAttributeTypes: disallowRepeatingActivation.
 pub const ATTR_DISALLOW_REPEATING_ACTIVATION: i32 = 1014;
+/// SDE dgmAttributeTypes: disallowAssistance.
+pub const ATTR_DISALLOW_ASSISTANCE: i32 = 854;
+/// Client dogma/const.py `attributeDisallowEarlyDeactivation`.
+pub const ATTR_DISALLOW_EARLY_DEACTIVATION: i32 = 906;
+/// Client dogma/const.py attributeDuration.
+pub const ATTR_DURATION: i32 = 73;
+/// Client dogma/const.py `attributeStanceSwitchTime`: hull stance switch
+/// cooldown in milliseconds.
+pub const ATTR_STANCE_SWITCH_TIME: i32 = 1985;
 /// SDE dgmAttributeTypes: quantity.
 pub const ATTR_QUANTITY: i32 = 805;
 /// SDE dgmAttributeTypes: isOnline.
@@ -283,6 +316,14 @@ pub const EFFECT_GUNNERY_MAX_RANGE_FALLOFF_TRACKING_SPEED_BONUS: i32 = 4559;
 pub const EFFECT_USE_MISSILES: i32 = 101;
 /// SDE dgmEffects: defenderMissileLaunching; charge-content admission only.
 pub const EFFECT_DEFENDER_MISSILE_LAUNCHING: i32 = 103;
+/// SDE dgmEffects: dotMissileLaunching, the SCARAB breacher pod charge effect.
+pub const EFFECT_DOT_MISSILE_LAUNCHING: i32 = 12174;
+/// Client dogma/const.py: effectModuleBonusBreacherPodDamageControl.
+pub const EFFECT_MODULE_BONUS_BREACHER_POD_DAMAGE_CONTROL: i32 = 12916;
+/// SDE dbuffCollections: BPDC Damage Received Percentage, the timed source
+/// folding `breacherPodActivatedDamageReceivedPercentage` into
+/// `breacherPodDamageResistance` with Minimum/PostPercent.
+pub const DBUFF_BPDC_DAMAGE_RECEIVED_PERCENTAGE: i32 = 2600;
 /// SDE dgmEffects: shieldBoosting.
 pub const EFFECT_SHIELD_BOOSTING: i32 = 4;
 /// SDE dgmEffects: armorRepair.
@@ -423,6 +464,8 @@ pub const EFFECT_SIEGE: i32 = 6582;
 pub const EFFECT_TRIAGE: i32 = 6581;
 /// SDE dgmEffects: moduleBonusStellianTriageModule.
 pub const EFFECT_STELLIAN_TRIAGE: i32 = 12248;
+/// SDE dgmEffects: adaptiveArmorHardener.
+pub const EFFECT_ADAPTIVE_ARMOR_HARDENER: i32 = 4928;
 /// SDE dgmEffects: shipModuleFocusedWarpDisruptionScript.
 pub const EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT: i32 = 6849;
 /// SDE dgmEffects: shipModuleFocusedWarpScramblingScript.
@@ -455,6 +498,8 @@ pub const ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE: i32 = 110;
 pub const ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE: i32 = 109;
 /// SDE dgmAttributeTypes: structure_explosive_damage_resonance.
 pub const ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE: i32 = 111;
+/// SDE dgmAttributeTypes: resistanceShiftAmount.
+pub const ATTR_RESISTANCE_SHIFT_AMOUNT: i32 = 1849;
 /// SDE dgmAttributeTypes: scan_resolution.
 pub const ATTR_SCAN_RESOLUTION: i32 = 564;
 /// SDE dgmAttributeTypes: max_target_range.
@@ -607,6 +652,20 @@ pub const EFFECT_COMMAND_BURST_SKIRMISH: i32 = 6734;
 pub const EFFECT_COMMAND_BURST_INFO: i32 = 6735;
 /// SDE dgmEffects: moduleBonusWarfareLinkMining.
 pub const EFFECT_COMMAND_BURST_MINING: i32 = 6736;
+/// SDE dgmAttributeTypes: warfareBuff1ID..warfareBuff4ID, the dbuff collection
+/// selectors carried by command-burst modules.
+pub const ATTR_WARFARE_BUFF_IDS: [i32; 4] = [2468, 2470, 2472, 2536];
+/// SDE dgmAttributeTypes: warfareBuff1Value..warfareBuff4Value, the collection
+/// values paired with ATTR_WARFARE_BUFF_IDS.
+pub const ATTR_WARFARE_BUFF_VALUES: [i32; 4] = [2469, 2471, 2473, 2537];
+/// SDE dgmAttributeTypes: buffDuration, applied modifier duration.
+pub const ATTR_BUFF_DURATION: i32 = 2535;
+/// SDE dgmAttributeTypes: maxDirectionalScanRange.
+pub const ATTR_MAX_DIRECTIONAL_SCAN_RANGE: i32 = 5796;
+/// SDE dgmAttributeTypes: expeditionCommandBurstProbeStrengthBonusCharID.
+pub const ATTR_EXPEDITION_COMMAND_BURST_PROBE_STRENGTH_BONUS: i32 = 6118;
+/// SDE dgmAttributeTypes: expeditionCommandBurstProbeDeviationBonusCharID.
+pub const ATTR_EXPEDITION_COMMAND_BURST_PROBE_DEVIATION_BONUS: i32 = 6119;
 /// SDE dgmEffects: moduleTitanEffectGenerator.
 pub const EFFECT_TITAN_EFFECT_GENERATOR: i32 = 6753;
 /// SDE dgmEffects: siegeModeEffect.
@@ -685,6 +744,8 @@ pub const EFFECT_ASSAULT_DAMAGE_CONTROL: i32 = 7012;
 pub const EFFECT_EMERGENCY_HULL_ENERGIZER: i32 = 6484;
 /// SDE dgmEffects: targetSpectrumBreakerBonus (signature radius suppressor).
 pub const EFFECT_TARGET_SPECTRUM_BREAKER_BONUS: i32 = 8109;
+/// SDE dgmEffects: interdictionNullifierBonus.
+pub const EFFECT_INTERDICTION_NULLIFIER_BONUS: i32 = 8117;
 
 // Superweapon dogma attributes (client `dogma/const.py` attribute* rows).
 /// SDE dgmAttributeTypes: disallowInEmpireSpace.

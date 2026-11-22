@@ -169,6 +169,15 @@ fn actual_bastion_name_supplements_only_empty_sde_modifiers() {
     assert_eq!(mjd.modifiers.len(), 1);
     assert_eq!((mjd.modifiers[0].op, mjd.modifiers[0].modified, mjd.modifiers[0].modifying),
         (POST_PERCENT, ATTR_SIGNATURE_RADIUS, ATTR_SIGNATURE_RADIUS_BONUS_PERCENT));
+
+    for (name, effect_id) in [("microJumpPortalDrive", 6208), ("microJumpPortalDriveCapital", 12126)] {
+        let mut portal = effect(name);
+        portal.effect_id = effect_id;
+        supplement(&mut portal);
+        assert_eq!(portal.modifiers.len(), 1);
+        assert_eq!((portal.modifiers[0].op, portal.modifiers[0].modified, portal.modifiers[0].modifying),
+            (POST_PERCENT, ATTR_SIGNATURE_RADIUS, ATTR_SIGNATURE_RADIUS_BONUS_PERCENT));
+    }
 }
 
 #[test]
@@ -204,4 +213,18 @@ fn propulsion_rows_cover_mass_and_microwarp_signature_once() {
     assert_eq!((microwarpdrive.modifiers[0].op, microwarpdrive.modifiers[0].modified), (MOD_ADD, ATTR_MASS));
     assert_eq!((microwarpdrive.modifiers[1].op, microwarpdrive.modifiers[1].modified, microwarpdrive.modifiers[1].modifying),
         (POST_PERCENT, ATTR_SIGNATURE_RADIUS, ATTR_SIGNATURE_RADIUS_BONUS));
+}
+
+#[test]
+fn sphere_rows_cover_mass_velocity_and_signature_penalties() {
+    let mut sphere = effect("warpDisruptSphere");
+    supplement(&mut sphere);
+    let rows: Vec<(&str, i32, i32, i32)> = sphere.modifiers.iter()
+        .map(|row| (row.domain.as_str(), row.op, row.modified, row.modifying)).collect();
+    assert_eq!(rows, vec![
+        ("shipID", POST_PERCENT, ATTR_MASS, ATTR_MASS_BONUS),
+        ("shipID", POST_PERCENT, ATTR_MAX_VELOCITY, ATTR_MAX_VELOCITY_MODIFIER),
+        ("shipID", POST_PERCENT, ATTR_SIGNATURE_RADIUS, ATTR_SIGNATURE_RADIUS_BONUS),
+    ]);
+    assert!(sphere.modifiers.iter().all(|row| row.func == "ItemModifier" && row.group.is_none() && row.skill.is_none() && row.target_category.is_none()));
 }

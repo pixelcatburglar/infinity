@@ -54,7 +54,7 @@ pub(crate) fn init_config() -> &'static crate::config::game::GameConfig {
 #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-inventory", feature = "tests-skills", feature = "tests-economy", feature = "tests-social", feature = "tests-content", feature = "tests-slash", feature = "tests-services", feature = "tests-space", feature = "tests-lua", feature = "tests-storage", feature = "tests-gateway", feature = "tests-runtime"))]
 pub(crate) async fn shared_sde(db: &crate::db::Db) -> std::sync::Arc<crate::sde::Sde> {
     static SDE: tokio::sync::OnceCell<std::sync::Arc<crate::sde::Sde>> = tokio::sync::OnceCell::const_new();
-    SDE.get_or_try_init(|| async { crate::sde::Sde::load(db).await.map(std::sync::Arc::new) }).await.unwrap().clone()
+    SDE.get_or_try_init(|| Box::pin(async { crate::sde::Sde::load(db).await.map(std::sync::Arc::new) })).await.unwrap().clone()
 }
 
 #[cfg(feature = "tests-runtime")]

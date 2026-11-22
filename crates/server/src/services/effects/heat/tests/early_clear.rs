@@ -53,6 +53,7 @@ fn cycle(cx: &Ctx, effect: &registry::Effect, module_type: i32, generation: Arc<
         cx: cx.clone(),
         modules: vec![Module { id: CLEARED, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }],
         effect: effect.clone(),
+        presented_effect: effect.id,
         target: None, repeat: 1, stop: generation.clone(),
         owner: ActivationOwner { master: CLEARED, generation, armed: false, combat_generations: Vec::new(),
             pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },

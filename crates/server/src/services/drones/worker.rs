@@ -1,4 +1,5 @@
-//! Sequential actor callbacks for drone work.
+//! Sequential actor callbacks for drone work: combat, repair and capacitor
+//! phases, mining and salvage cycle ends, and contact-time cargo delivery.
 use std::sync::{Arc, Weak};
 use tracing::warn;
 use infinity_core::consts::{dogma::ATTR_DRONE_BANDWIDTH_USED, dogma::ATTR_DRONE_CONTROL_DISTANCE, dogma::ATTR_ENTITY_FLY_RANGE, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_SCAN_RESOLUTION};
@@ -7,7 +8,7 @@ use crate::services::{CallError, fit::{Fit, Key}, effects::{self, EffectKind, Ja
 use crate::space::{World, drone::{DroneAction, DroneEffects, DroneOrder, DroneRecord, DronePhase, DroneSpec}};
 
 fn supported(kind: EffectKind) -> bool {
-    matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Mining | EffectKind::RemoteRepair { .. }
+    matches!(kind, EffectKind::Turret | EffectKind::Missile | EffectKind::Mining | EffectKind::Salvage | EffectKind::RemoteRepair { .. }
         | EffectKind::Neutralizer | EffectKind::Ecm
         | EffectKind::Projected { jamming: JammingType::Webify | JammingType::Paint | JammingType::Damp | JammingType::TrackingDisrupt })
 }
@@ -114,7 +115,17 @@ pub(crate) fn effects(db: Db, world: Weak<World>, system: i64) -> DroneEffects {
             };
             let result = match action {
                 DroneAction::Cycle { drone, target, phase } => cycle(&db, &world, system, drone, target, phase, membership, attempt).await,
-                DroneAction::Contact { drone, return_to_bay } => crate::services::drones::inventory::returning::contact(&db, &world, system, drone, return_to_bay).await,
+                DroneAction::Contact { drone, return_to_bay, carried } => {
+                    // A return to the bay always runs the ordinary return
+                    // transaction, which delivers any carried cargo before it
+                    // moves the root; only in-space transports take the
+                    // delivery-only contact.
+                    if carried && !return_to_bay {
+                        crate::services::drones::salvage::contact(&db, &world, system, drone).await
+                    } else {
+                        crate::services::drones::inventory::returning::contact(&db, &world, system, drone, return_to_bay).await
+                    }
+                }
             };
             if let Err(error) = result {
                 if crate::services::combat::capacity::is_refusal(&error) {
@@ -125,7 +136,13 @@ pub(crate) fn effects(db: Db, world: Weak<World>, system: i64) -> DroneEffects {
                     CallError::Internal(error) => warn!("drone {id}: {error:#}"),
                     CallError::User { msg, .. } => {
                         warn!("drone {id}: {msg}");
-                        world.with(system, move |s| s.drone_idle(id, generation)).await;
+                        // A refused cargo delivery is stop-and-hold, never a
+                        // generic idle that would restart a timed retry; the
+                        // contact outcome may already hold an unmarked load.
+                        world.with(system, move |s| {
+                            if s.drone_carries_cargo(id) { s.drone_salvage_blocked(id, generation); }
+                            else if !s.drone_delivery_blocked(id) { s.drone_idle(id, generation); }
+                        }).await;
                     }
                 }
             }

@@ -1,0 +1,9 @@
+{
+    "version": "1",
+    "source": "authored interdictor probe payload policy",
+    "payloads": {
+        "548": "warp_field",
+        "4088": "stasis_pulse"
+    },
+    "stasis_collection_id": 27
+}

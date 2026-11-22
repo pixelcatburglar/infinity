@@ -553,3 +553,40 @@ fn duplicate_alignment_replaces_callback_without_repricing_or_reset() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     crate::services::combat::forget_ship(ship);
 }
+
+#[test]
+fn interdiction_correction_keeps_zero_and_partial_capacitor_semantics() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::space::system::tests::ball;
+    // (source x, coefficient, capacity, expected endpoint x; None = in-field abort)
+    for (index, (source_x, coefficient, capacity, expected)) in [
+        (AU - 150_000.0, 0.0, 1.0, Some(AU - 200_000.0)),
+        (AU - 150_000.0, 0.000001, 1.0, Some(AU - 200_000.0)),
+        (AU - 150_000.0, 0.000001, 0.25, Some(0.25 * AU)),
+        (0.0, 0.000001, 1.0, None),
+    ].iter().enumerate() {
+        let id = -930_200 - index as i64;
+        let mut system = fixture(id, *coefficient, *capacity);
+        system.insert(ball(-1, Some(9), *source_x));
+        assert!(system.begin_interdiction(-1, -2, Arc::new(AtomicBool::new(false)), 50_000.0), "{index}");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let arrival = system.register_warp_arrival(Box::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }));
+        assert!(system.queue_warp(id, 3000, WarpDestination::Exact([AU, 0.0, 0.0]), Some(arrival)));
+        system.release_warp_arrival(arrival);
+        system.tick(1000);
+        if let Some(x) = expected {
+            let ball = system.ball(id).unwrap();
+            assert!(ball.is_warping(), "{index}");
+            assert!(!system.warp_exits[&id].full && !system.warp_exits[&id].pending, "{index}");
+            assert!((ball.goto[0] - x).abs() <= 1.0, "{index}: {}", ball.goto[0]);
+            assert!(system.warp_corrections.contains(&id), "{index}");
+        } else {
+            assert_eq!(system.ball(id).unwrap().mode, MODE_STOP, "{index}");
+            assert!(!system.warp_exits.contains_key(&id), "{index}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{index}");
+        assert!(system.warp_arrivals.is_empty(), "{index}");
+        crate::services::combat::forget_ship(id);
+    }
+}

@@ -126,7 +126,7 @@ async fn targeters_maps_live_pilots_and_merges_npc_ball_ids() {
 async fn npc_projected_weapon_attributes_change_application() {
     use infinity_core::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
         dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, CATEGORY_ENTITY};
-    use crate::services::effects::{projection::Projection, weapons::{missile_applied, turret_chance, Missile}, EffectKind, JammingType};
+    use crate::services::effects::{projection::Projection, weapons::{missile_applied, missile::Missile, turret_chance}, EffectKind, JammingType};
 
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -166,7 +166,7 @@ async fn npc_projected_weapon_attributes_change_application() {
     let missile = Missile { charge: 1, raw: [1.0; 4],
         aoe_cloud: 40.0 * projected.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
         aoe_velocity: 170.0 * projected.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
-        drf: 0.604, velocity: 1.0, flight_time_ms: 1.0, weapon: npc, illegal: false };
+        drf: 0.604, velocity: 1.0, flight_time_ms: 1.0, weapon: npc, illegal: false, dot: None };
     assert!((missile.aoe_cloud / (40.0 * cloud) - 2.0).abs() < 1e-9);
     assert!((missile.aoe_velocity / (170.0 * velocity) - 0.5).abs() < 1e-9);
     let applied = missile_applied(35.0, 400.0, missile.aoe_cloud, missile.aoe_velocity, missile.drf);

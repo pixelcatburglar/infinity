@@ -83,6 +83,12 @@ pub(crate) fn has_target(character: i64, target: i64) -> bool {
     state().targets.get(&character).is_some_and(|targets| targets.contains(&target))
 }
 
+/// Whether a pilot other than `character` holds a completed lock on `target`.
+/// Pending attempts and the character's own lock do not count.
+pub(crate) fn board_target_locked_by_other(character: i64, target: i64) -> bool {
+    state().targets.iter().any(|(&pilot, targets)| pilot != character && targets.contains(&target))
+}
+
 /// Ok(None): the character has no completed lock; Ok(Some(id)): exactly one;
 /// Err(()): more than one. Pending lock attempts never count.
 pub(crate) fn sole_target(character: i64) -> Result<Option<i64>, ()> {
@@ -422,14 +428,17 @@ fn charge_matches(mut groups: impl Iterator<Item = f64>, group: Option<i32>, mod
         }
 }
 
-fn compatible_charge(sde: &Sde, module_type: i32, charge: &Item) -> bool {
+/// Whether `charge_type` is a charge the module type can load: a charge-category
+/// type whose group is one of the module's charge groups and whose charge size
+/// matches when the module declares one. Unknown types are incompatible.
+pub(in crate::services) fn compatible_charge(sde: &Sde, module_type: i32, charge_type: i32) -> bool {
     let Some(module) = sde.types.get(module_type) else { return false };
-    let Some(charge_type) = sde.types.get(charge.type_id) else { return false };
+    let Some(charge) = sde.types.get(charge_type) else { return false };
     let groups = CHARGE_GROUP_ATTRIBUTES.iter().flat_map(|name| sde.dogma.attributes_by_name(name))
         .filter_map(|attr| module.attribute(attr.attribute_id));
     let size = sde.dogma.attributes_by_name("chargeSize").next().map(|attr| attr.attribute_id);
-    charge.category_id == CATEGORY_CHARGE as i64 && charge_matches(groups, charge_type.group_id,
-        size.and_then(|id| module.attribute(id)), size.and_then(|id| charge_type.attribute(id)))
+    charge.category_id == Some(CATEGORY_CHARGE) && charge_matches(groups, charge.group_id,
+        size.and_then(|id| module.attribute(id)), size.and_then(|id| charge.attribute(id)))
 }
 
 /// Whether the module type declares charge compatibility: any positive charge
@@ -626,4 +635,4 @@ pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, mod
 }
 
 
-#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships", feature = "tests-inventory")))] pub(in crate::services) mod tests;

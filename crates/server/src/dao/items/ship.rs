@@ -1,5 +1,5 @@
 //! Ship item persistence in game.items, game.module_charges, game.weapon_banks,
-//! game.pending_reloads, game.insurance and game.blueprints.
+//! game.pending_reloads, game.ship_stances, game.insurance and game.blueprints.
 //! Shared item type lookup and positioned creation live in `items::inventory` and `items::creation`.
 //! Reload start, completion, return and recovery lock the ship item row as their
 //! first transaction statement, before acquiring child rows in their usual order.
@@ -58,6 +58,9 @@ pub(crate) async fn delete_lost(ex:&(impl Executor+?Sized), ship:i64, retained:&
     for row in &reservations { super::pending_reloads::take(ex, row.reload_id).await?; }
     ex.execute("DELETE FROM game.module_charges WHERE ship_id = ANY($1)", &[&closure]).await?;
     ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = ANY($1) OR master_id = ANY($1) OR slave_id = ANY($1)", &[&closure]).await?;
+    // A retained repairable hull loses its mode item with the closure; drop
+    // its stance timing too; the items FK only cascades for deleted hulls.
+    super::ship_stance::clear(ex, &closure).await?;
     for ship_id in &closure { crate::dao::insurance::take_payout(ex, *ship_id).await?; }
     let destroyed: Vec<_> = closure.iter().copied().filter(|id| retained.binary_search(id).is_err()).collect();
     crate::dao::industry::delete_blueprint_state(ex, &destroyed).await?;

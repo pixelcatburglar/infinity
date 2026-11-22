@@ -7,31 +7,24 @@
 //! Abandoning also detaches the owner domain from the drone's resident fit:
 //! its own node, overrides, condition and incoming projections are kept, and
 //! the old owner still receives the final own-fit attribute delta before the
-//! state change that unloads the drone client-side.
+//! state change that unloads the drone client-side. Launch re-syncs the
+//! owner domain's live runtime modifier sources onto the prepared fit.
+//! Salvage orders run one real cycle per wreck, hold the work's single effect
+//! activation here, and carry committed cargo home for contact delivery.
+//! An unproven settlement latches the work closed until cold restore
+//! re-reads the real cargo.
 
 use super::*;
 use infinity_core::consts::{*, dogma::*};
 use crate::space::combat::inputs::FitDeltaSources;
 use crate::space::targeting::next_generation as generation;
+use std::sync::atomic::{AtomicBool, Ordering};
+use crate::services::effects::{registry::{self, EffectFlag}, EffectKind};
+use crate::space::system::presentation::{FxRetention, ModuleFx};
 
 /// Server movement policy: converge inside the action/contact boundary, not at it.
 const DRONE_APPROACH_RANGE_FACTOR: f64 = 0.5;
 
-pub(in crate::space) struct Reservation { owner: i64, controller: i64, bandwidths: Vec<f64> }
-pub(in crate::space) struct DroneBrain {
-    record: DroneRecord,
-    effects: DroneEffects,
-    lock_at: i64,
-    locked: bool,
-    cycle_at: i64,
-    end_at: Option<i64>,
-    combat_attempt: Option<crate::services::effects::space_source::PreparedCombatAttempt>,
-    contact_queued: bool,
-    contact_claimed: Option<u64>,
-    kinematics: Option<crate::services::effects::propulsion::Kinematics>,
-    announced: bool,
-    npc_ignored: bool,
-}
 
 impl System {
     /// The real owner's NPC-ignore flag projected onto this brain; cleared on abandon.
@@ -58,8 +51,227 @@ impl System {
         ball.char_id.or_else(|| self.drones.get(&id).and_then(|b| (b.record.owner != OWNER_UNOWNED).then_some(b.record.owner)))
     }
     pub(crate) fn drones(&self) -> impl Iterator<Item = &DroneRecord> { self.drones.values().map(|b| &b.record) }
-    fn drone_ship_live(&self, owner: i64, ship: i64) -> bool {
+    pub(crate) fn drone_ship_live(&self, owner: i64, ship: i64) -> bool {
         self.ball(ship).is_some_and(|b| b.char_id == Some(owner) && b.cloak == 0 && b.mode != MODE_WARP)
+    }
+    /// Whether the brain's transport marker is set; the marker is a hint only,
+    /// the durable children are re-read inside every custody transaction.
+    pub(crate) fn drone_carries_cargo(&self, id: i64) -> bool {
+        self.drones.get(&id).is_some_and(|b| b.salvage.carried)
+    }
+    /// Whether a refused delivery holds the drone for the next player command.
+    pub(crate) fn drone_delivery_blocked(&self, id: i64) -> bool { self.drones.get(&id).is_some_and(|b| b.salvage.blocked) }
+    /// Mark durable cargo aboard for a still-owned drone after the one
+    /// command-time cold discovery. A drone already on salvage work turns
+    /// home with the cargo before its order starts new wreck work.
+    pub(crate) fn drone_mark_carried(&mut self, id: i64, owner: i64) -> bool {
+        let Some(b) = self.drones.get_mut(&id).filter(|b| b.record.owner == owner) else { return false };
+        b.salvage.carried = true;
+        if !matches!(b.record.order, DroneOrder::Salvage(_)) { return true; }
+        let Some(controller) = b.record.controller else { return true };
+        self.salvage_stop(id);
+        let Some(b) = self.drones.get_mut(&id) else { return true };
+        b.record.state = DRONE_STATE_DEPARTING;
+        b.locked = false; b.lock_at = 0; b.end_at = None; b.combat_attempt = None;
+        let record = b.record.clone();
+        self.notify_drone(&record);
+        self.drone_follow(id, controller, DRONE_SCOOP_RANGE);
+        true
+    }
+    /// Admit one in-flight salvage end for the current order and target: one
+    /// settlement per brain at a time, refused for stale or busy brains.
+    /// Returns the combat membership, the work's cancel flag and the owner's
+    /// notification sender.
+    pub(crate) fn drone_salvage_admit(&mut self, id: i64, generation: u64, target: i64)
+        -> Option<(u64, std::sync::Arc<AtomicBool>, Option<NotifyTx>)> {
+        if !self.drone_current(id, generation) { return None; }
+        let membership = self.combat_membership_generation(id)?;
+        let b = self.drones.get(&id)?;
+        let sender = self.pilot_sender(b.record.owner);
+        if b.contact_claimed.is_some() || b.salvage.in_flight || b.salvage.carried || b.salvage.blocked || b.salvage.unknown { return None; }
+        if !matches!(b.record.order, DroneOrder::Salvage(_)) || b.record.target != Some(target) { return None; }
+        let cancelled = b.salvage.fx.clone()?;
+        if cancelled.load(Ordering::Relaxed) { return None; }
+        if !self.drone_valid(id, target, generation) { return None; }
+        self.drones.get_mut(&id)?.salvage.in_flight = true;
+        Some((membership, cancelled, sender))
+    }
+    /// The settlement's final admission view of one in-flight end: the same
+    /// generation and membership plus `drone_valid`'s shared admission, and
+    /// the drone still inside action range.
+    pub(crate) fn drone_salvage_in_flight(&self, id: i64, generation: u64, target: i64, membership: u64) -> bool {
+        let Some(b) = self.drones.get(&id) else { return false };
+        if self.combat_membership_generation(id) != Some(membership) || !b.salvage.in_flight
+            || !matches!(b.record.order, DroneOrder::Salvage(_)) || !self.drone_valid(id, target, generation) { return false; }
+        self.sampled_ball(id).zip(self.sampled_ball(target)).is_some_and(|(me, victim)|
+            (dist(me.pos, victim.pos) - f64::from(me.radius) - f64::from(victim.radius)).max(0.0) <= b.record.spec.optimal_range.max(0.0))
+    }
+    /// Clear the in-flight guard after a miss or an unavailable settle; the
+    /// ordinary cycle re-arms.
+    pub(crate) fn drone_salvage_resume(&mut self, id: i64, generation: u64) {
+        if let Some(b) = self.drones.get_mut(&id).filter(|b| b.record.generation == generation) {
+            b.salvage.in_flight = false;
+        }
+    }
+    /// A committed recovery: cargo is aboard, the work's effect retires and
+    /// the drone flies the load back to its controller.
+    pub(crate) fn drone_salvage_carried(&mut self, id: i64, generation: u64) {
+        if !self.drone_current(id, generation) { return; }
+        let controller = self.drones.get(&id).and_then(|b| {
+            (matches!(b.record.order, DroneOrder::Salvage(_)) && b.salvage.in_flight)
+                .then_some(b.record.controller).flatten()
+        });
+        let Some(controller) = controller else { return; };
+        self.salvage_stop(id);
+        let Some(b) = self.drones.get_mut(&id) else { return };
+        b.salvage.carried = true;
+        b.record.target = Some(controller);
+        b.record.state = DRONE_STATE_DEPARTING;
+        b.locked = false; b.lock_at = 0; b.end_at = None; b.combat_attempt = None;
+        let record = b.record.clone();
+        self.notify_drone(&record);
+        self.drone_follow(id, controller, DRONE_SCOOP_RANGE);
+    }
+    /// Stop-and-hold: the contact is released and the drone waits in place
+    /// for the next player command; the cargo stays aboard either way.
+    pub(crate) fn drone_salvage_blocked(&mut self, id: i64, generation: u64) {
+        let Some(b) = self.drones.get_mut(&id).filter(|b| b.record.generation == generation) else { return; };
+        b.salvage.blocked = true;
+        b.salvage.in_flight = false;
+        b.contact_claimed = None; b.contact_queued = false;
+        self.drone_stop(id);
+    }
+    /// An unproven settlement latches the hold; no player order reopens it.
+    pub(crate) fn drone_salvage_unknown(&mut self, id: i64, generation: u64) {
+        self.drone_salvage_blocked(id, generation);
+        if let Some(b) = self.drones.get_mut(&id).filter(|b| b.record.generation == generation) { b.salvage.unknown = true; }
+    }
+    /// A finished delivery: the transport ends and a standing automatic
+    /// intent retargets this boundary; a one-off order goes idle.
+    pub(crate) fn drone_salvage_delivered(&mut self, id: i64, generation: u64) {
+        let owned = self.drones.get(&id).is_some_and(|b| b.contact_claimed == Some(generation));
+        if !self.drone_current(id, generation) && !owned { return; }
+        let auto = {
+            let Some(b) = self.drones.get_mut(&id) else { return };
+            b.salvage.carried = false;
+            b.salvage.in_flight = false;
+            b.contact_claimed = None; b.contact_queued = false;
+            b.salvage.auto
+        };
+        if !self.drone_current(id, generation) { return; }
+        match self.drones.get(&id).map(|b| b.record.order) {
+            Some(DroneOrder::Salvage(_)) if auto => self.salvage_retarget(id),
+            // An explicit wreck keeps its one shot after the delivery.
+            Some(DroneOrder::Salvage(Some(t))) => self.salvage_resume_manual(id, generation, t),
+            // The ordinary return-home think branch finishes with its orbit.
+            Some(DroneOrder::ReturnHome) => {}
+            _ => self.drone_idle(id, generation),
+        }
+    }
+    /// One private salvage-work exit: retire this work's effect activation
+    /// and clear the in-flight guard. Every order change, idle, jam, loss,
+    /// abandon and removal funnels through it.
+    fn salvage_stop(&mut self, id: i64) {
+        let fx = self.drones.get_mut(&id).and_then(|b| {
+            b.salvage.in_flight = false;
+            b.salvage.fx.take()
+        });
+        if let Some(fx) = fx {
+            fx.store(true, Ordering::Relaxed);
+            self.retire_fx_activation(id, &fx);
+        }
+    }
+    /// Mother-ship control distance for an order: salvage work measures the
+    /// wreck's surface like the automatic picker; other work keeps the
+    /// centre-to-centre distance.
+    fn control_gap(order: DroneOrder, gap: f64, ship: &Ball, victim: &Ball) -> f64 {
+        if matches!(order, DroneOrder::Salvage(_)) { (gap - f64::from(ship.radius) - f64::from(victim.radius)).max(0.0) } else { gap }
+    }
+    /// The owner's nearest visible wreck to the mother ship's sampled surface
+    /// distance; ID breaks ties. One event-boundary pick over live balls.
+    fn salvage_nearest(&self, owner: i64, ship: i64, control_range: f64) -> Option<i64> {
+        let ship = self.ball(ship)?;
+        let ship_pos = ship.position_at(self.ms);
+        let sde = self.sde()?;
+        self.balls()
+            .filter(|b| b.owner_id == owner
+                && sde.types.get(b.type_id).and_then(|t| t.group_id) == Some(GROUP_WRECK)
+                && targeting::target_visible(*b))
+            .map(|b| (b.id, (dist(ship_pos, b.position_at(self.ms)) - f64::from(ship.radius) - f64::from(b.radius)).max(0.0)))
+            .filter(|&(_, surface)| control_range.is_finite() && surface <= control_range)
+            .min_by(|(a, da), (b, db)| da.total_cmp(db).then_with(|| a.cmp(b)))
+            .map(|(id, _)| id)
+    }
+    /// Event-boundary retarget for standing automatic salvage: adopt the
+    /// nearest owned wreck, or stand idle with the intent kept.
+    fn salvage_retarget(&mut self, id: i64) {
+        let Some(d) = self.drone(id) else { return };
+        if !matches!(d.order, DroneOrder::Salvage(_)) { return; }
+        let Some(controller) = d.controller else { return; };
+        let picked = self.salvage_nearest(d.owner, controller, d.spec.control_range);
+        // The transport's home target never collides with a wreck pick; only an
+        // unchanged work target skips re-selection.
+        if picked.is_some() && picked == d.target { return; }
+        self.salvage_stop(id);
+        let Some(b) = self.drones.get_mut(&id) else { return };
+        b.record.target = picked;
+        b.locked = false; b.lock_at = 0; b.end_at = None; b.combat_attempt = None;
+        b.record.state = if picked.is_some() { DRONE_STATE_APPROACHING } else { DRONE_STATE_IDLE };
+        let record = b.record.clone();
+        self.notify_drone(&record);
+        match picked {
+            Some(target) => self.drone_follow(id, target, record.spec.optimal_range.max(0.0)),
+            None => self.drone_stop(id),
+        }
+    }
+    /// Resume an explicit order's deferred wreck after a delivery: it keeps
+    /// its one shot only while it is still a live visible wreck inside the
+    /// mother ship's control range.
+    fn salvage_resume_manual(&mut self, id: i64, generation: u64, target: i64) {
+        if !self.drone_current(id, generation) { return; }
+        let Some(d) = self.drone(id) else { return };
+        let Some(controller) = d.controller else { self.drone_idle(id, generation); return; };
+        let valid = self.ball(controller).zip(self.ball(target)).is_some_and(|(ship, victim)|
+            targeting::target_visible(victim)
+                && self.sde().and_then(|sde| sde.types.get(victim.type_id)).and_then(|t| t.group_id) == Some(GROUP_WRECK)
+                && d.spec.control_range.is_finite()
+                && Self::control_gap(d.order, dist(ship.position_at(self.ms), victim.position_at(self.ms)), &ship, &victim) <= d.spec.control_range);
+        if !valid { self.drone_idle(id, generation); return; }
+        self.salvage_stop(id);
+        let Some(b) = self.drones.get_mut(&id) else { return };
+        b.record.target = Some(target);
+        b.locked = false; b.lock_at = 0; b.end_at = None; b.combat_attempt = None;
+        b.record.state = DRONE_STATE_APPROACHING;
+        let record = b.record.clone();
+        self.notify_drone(&record);
+        self.drone_follow(id, target, record.spec.optimal_range.max(0.0));
+    }
+    /// The current wreck vanished or became invalid: a standing intent
+    /// retargets at this boundary, an explicit order ends.
+    fn salvage_boundary(&mut self, id: i64, generation: u64) {
+        if !self.drone_current(id, generation) { return; }
+        if self.drones.get(&id).is_some_and(|b| b.salvage.auto) {
+            self.salvage_retarget(id);
+        } else {
+            self.drone_idle(id, generation);
+        }
+    }
+    /// Enter salvage work on `target`: one fresh work identity per work or
+    /// target change, then the shared sustained effect publication.
+    fn salvage_begin(&mut self, id: i64, target: i64) {
+        if !self.drones.get(&id).is_some_and(|b| b.salvage.fx.is_none() || b.record.target != Some(target)) { return; }
+        self.salvage_stop(id);
+        let generation = std::sync::Arc::new(AtomicBool::new(false));
+        if let Some(b) = self.drones.get_mut(&id) { b.salvage.fx = Some(generation.clone()); }
+        let Some((type_id, duration_ms, effect_id)) = self.drones.get(&id).map(|b| (b.record.spec.type_id, b.record.spec.duration_ms, b.record.spec.effect_id)) else { return };
+        let Some(effect) = effect_id.and_then(|id| self.sde().and_then(|sde| registry::resolve(sde, id))) else { return };
+        let Some(guid) = effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) else { return };
+        if !self.begin_fx_activation(id, id, Some(target), generation.clone()) { return; }
+        self.publish_module_fx(id, &generation, ModuleFx {
+            module: FxModule { item: Some(id), type_id },
+            guid, charge: None, offensive: effect.has(EffectFlag::Offensive),
+            duration_ms, repeat: -1, graphic_info: Value::None,
+        }, true, FxRetention::Current);
     }
     pub(crate) fn reserve_drone_launch(&mut self, owner: i64, controller: i64, bandwidths: &[f64], max_active: f64, total_bandwidth: f64) -> Option<u64> {
         if !self.drone_ship_live(owner, controller) || !max_active.is_finite() || max_active < 0.0 || !total_bandwidth.is_finite() || total_bandwidth < 0.0
@@ -87,6 +299,11 @@ impl System {
             let id = prepared.ball.id;
             prepared.fit.replace_projections_for(crate::services::fit::Key::Ship, self.projections_on(controller), Some(self.projection_revision(controller)));
             prepared.fit.replace_projections_for(prepared.key, self.projections_on(id), Some(self.projection_revision(id)));
+            for source in self.runtime_sources_anchored(controller, Some(owner)).into_iter()
+                .chain(self.runtime_sources_anchored(id, None))
+            {
+                prepared.fit.replace_runtime_modifier_source(source);
+            }
             let (health, changed) = prepared.condition.rebase_with_fit(&prepared.fit, prepared.key)?;
             prepared.ball.health = health;
             dirty.push(changed);
@@ -126,7 +343,7 @@ impl System {
         self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
         self.snapshot_positions.insert(id, (self.snapshot_generation, pos));
         if self.snapshot_due == 0 { self.snapshot_due = self.ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND)); }
-        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, combat_attempt: None, contact_queued: false, contact_claimed: None, kinematics: None, announced, npc_ignored: owner != OWNER_UNOWNED && self.pilot_npc_ignored(owner) });
+        self.drones.insert(id, DroneBrain { record, effects, lock_at: 0, locked: false, cycle_at: 0, end_at: None, combat_attempt: None, contact_queued: false, contact_claimed: None, kinematics: None, announced, npc_ignored: owner != OWNER_UNOWNED && self.pilot_npc_ignored(owner), salvage: DroneSalvage::default() });
     }
     fn notify_drone(&self, d: &DroneRecord) {
         if self.drones.get(&d.id).is_none_or(|b| !b.announced) { return; }
@@ -159,26 +376,57 @@ impl System {
             || crate::services::combat::jamming::is_jammed(id, self.ms) || crate::services::combat::jamming::is_jammed(controller, self.ms) { return false; }
         self.ball(id).zip(self.ball(controller)).zip(self.ball(target)).is_some_and(|((drone, ship), victim)|
             targeting::target_visible(victim)
-            && dist(ship.position_at(self.ms), victim.position_at(self.ms)) <= d.spec.control_range
+            && Self::control_gap(d.order, dist(ship.position_at(self.ms), victim.position_at(self.ms)), &ship, &victim) <= d.spec.control_range
             && (d.spec.max_target_range == 0.0 || dist(drone.position_at(self.ms), victim.position_at(self.ms)) <= d.spec.max_target_range))
     }
     pub(crate) fn drone_order(&mut self, id: i64, owner: i64, controller: i64, order: DroneOrder) -> bool {
         let Some(d) = self.drone(id) else { return false };
         if self.drones[&id].contact_claimed.is_some() || d.owner != owner || !self.drone_ship_live(owner, controller) || (d.controller != Some(controller) && !(order == DroneOrder::ReturnBay && d.controller.is_none())) { return false; }
-        if let DroneOrder::Engage(target) | DroneOrder::Mine(target) = order {
-            if crate::services::combat::jamming::is_jammed(id, self.ms) || crate::services::combat::jamming::is_jammed(controller, self.ms) { return false; }
-            let Some((ship, victim)) = self.ball(controller).zip(self.ball(target)) else { return false };
-            if !targeting::target_visible(victim) || !d.spec.control_range.is_finite()
-                || dist(ship.position_at(self.ms), victim.position_at(self.ms)) > d.spec.control_range { return false; }
+        // Committed cargo turns a salvage order into a delivery first; the
+        // target lock, range and group gates apply to real work only.
+        let carried = self.drones[&id].salvage.carried;
+        if let DroneOrder::Engage(target) | DroneOrder::Mine(target) | DroneOrder::Salvage(Some(target)) = order {
+            if !(carried && matches!(order, DroneOrder::Salvage(_))) {
+                if crate::services::combat::jamming::is_jammed(id, self.ms) || crate::services::combat::jamming::is_jammed(controller, self.ms) { return false; }
+                let Some((ship, victim)) = self.ball(controller).zip(self.ball(target)) else { return false; };
+                if !targeting::target_visible(victim) || !d.spec.control_range.is_finite()
+                    || Self::control_gap(order, dist(ship.position_at(self.ms), victim.position_at(self.ms)), &ship, &victim) > d.spec.control_range { return false; }
+                if matches!(order, DroneOrder::Salvage(_)) && self.sde().and_then(|sde| sde.types.get(victim.type_id)).and_then(|t| t.group_id) != Some(GROUP_WRECK) { return false; }
+            }
         }
+        // The SDE effect decides admissible work: a salvager refuses every
+        // other work order, every other drone refuses salvage. This single
+        // admission also covers the automatic-engagement caller.
+        let salvager = matches!(d.spec.effect_id.and_then(|id| self.sde().and_then(|sde| registry::resolve(sde, id))).map(|effect| effect.kind), Some(EffectKind::Salvage));
+        if salvager && matches!(order, DroneOrder::Engage(_) | DroneOrder::Mine(_) | DroneOrder::Assist(_) | DroneOrder::Guard(_)) { return false; }
+        if !salvager && matches!(order, DroneOrder::Salvage(_)) { return false; }
+        // A salvage order never reopens an unproven settlement.
+        if self.drones[&id].salvage.unknown && matches!(order, DroneOrder::Salvage(_)) { return false; }
+        let salvage_target = match order {
+            DroneOrder::Salvage(Some(target)) => Some(target),
+            DroneOrder::Salvage(None) if !carried => self.salvage_nearest(owner, controller, d.spec.control_range),
+            _ => None,
+        };
         self.remove_projections_from(id);
+        self.salvage_stop(id);
         let b = self.drones.get_mut(&id).unwrap();
         let old_order = b.record.order;
+        b.salvage.auto = match order {
+            DroneOrder::Salvage(None) => true,
+            DroneOrder::Salvage(Some(_)) => b.salvage.auto,
+            _ => false,
+        };
+        b.salvage.blocked = false;
         b.record.generation = generation();
         b.record.order = order;
-        b.record.target = match order { DroneOrder::Engage(t) | DroneOrder::Mine(t) => Some(t), DroneOrder::ReturnBay => Some(controller), _ => None };
+        b.record.target = match order { DroneOrder::Engage(t) | DroneOrder::Mine(t) => Some(t), DroneOrder::Salvage(_) => salvage_target, DroneOrder::ReturnBay => Some(controller), _ => None };
         if order != DroneOrder::ReturnBay { b.record.pending = None; }
-        b.record.state = match order { DroneOrder::ReturnBay | DroneOrder::ReturnHome => DRONE_STATE_DEPARTING, DroneOrder::Engage(_) | DroneOrder::Mine(_) => DRONE_STATE_APPROACHING, _ => DRONE_STATE_IDLE };
+        b.record.state = match order {
+            DroneOrder::ReturnBay | DroneOrder::ReturnHome => DRONE_STATE_DEPARTING,
+            DroneOrder::Engage(_) | DroneOrder::Mine(_) => DRONE_STATE_APPROACHING,
+            DroneOrder::Salvage(_) => if carried { DRONE_STATE_DEPARTING } else if salvage_target.is_some() { DRONE_STATE_APPROACHING } else { DRONE_STATE_IDLE },
+            _ => DRONE_STATE_IDLE,
+        };
         b.locked = false; b.lock_at = 0; b.cycle_at = 0; b.end_at = None; b.contact_queued = false;
         b.combat_attempt = None;
         let record = b.record.clone();
@@ -192,6 +440,11 @@ impl System {
         match order {
             DroneOrder::ReturnBay | DroneOrder::ReturnHome => self.drone_follow(id, controller, DRONE_SCOOP_RANGE),
             DroneOrder::Engage(target) | DroneOrder::Mine(target) => self.drone_follow(id, target, record.spec.optimal_range.max(0.0)),
+            DroneOrder::Salvage(_) if carried => self.drone_follow(id, controller, DRONE_SCOOP_RANGE),
+            DroneOrder::Salvage(_) => match salvage_target {
+                Some(target) => self.drone_follow(id, target, record.spec.optimal_range.max(0.0)),
+                None => self.drone_stop(id),
+            },
             _ => self.drone_stop(id),
         }
         true
@@ -233,7 +486,9 @@ impl System {
     pub(crate) fn drone_idle(&mut self, id: i64, generation: u64) {
         if !self.drone_current(id, generation) { return; }
         self.remove_projections_from(id);
+        self.salvage_stop(id);
         let b = self.drones.get_mut(&id).unwrap();
+        b.salvage.auto = false; b.salvage.blocked = false;
         b.record.generation = self::generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.state = DRONE_STATE_IDLE; b.record.pending = None;
         b.locked = false; b.end_at = None; b.contact_queued = false;
         b.combat_attempt = None;
@@ -250,7 +505,7 @@ impl System {
         let d = self.drone(id)?;
         let b = self.drones.get(&id)?;
         if !self.drone_current(id, generation) || b.contact_claimed.is_some() || !b.contact_queued
-            || (d.pending.is_none() && d.order != DroneOrder::ReturnBay) { return None; }
+            || (d.pending.is_none() && !b.salvage.carried && d.order != DroneOrder::ReturnBay) { return None; }
         let destination = if d.order == DroneOrder::ReturnBay { d.target? } else { d.controller? };
         if !self.drone_ship_live(d.owner, destination) { return None; }
         let (source, ship) = self.sampled_ball(id).zip(self.sampled_ball(destination))?;
@@ -289,8 +544,10 @@ impl System {
         let Some(d) = self.drone(id) else { return };
         self.remove_projections_from(id);
         crate::services::combat::jamming::clear(self, id);
+        self.salvage_stop(id);
         let b = self.drones.get_mut(&id).unwrap();
         b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.pending = None; b.record.state = DRONE_STATE_IDLE; b.locked = false;
+        b.salvage.auto = false;
         b.combat_attempt = None;
         b.npc_ignored = false;
         // The final own-fit delta must reach the old owner before the state
@@ -318,8 +575,10 @@ impl System {
         let ids: Vec<_> = self.drones().filter(|d| d.controller == Some(controller) || (d.order == DroneOrder::ReturnBay && d.target == Some(controller))).map(|d| d.id).collect();
         for id in ids {
             self.remove_projections_from(id);
+            self.salvage_stop(id);
             let was_controlled = self.drones[&id].record.controller == Some(controller) && self.drones[&id].announced;
             let b = self.drones.get_mut(&id).unwrap();
+            b.salvage.auto = false;
             b.record.controller = None; b.record.controller_owner = None; b.record.generation = generation(); b.record.order = DroneOrder::Idle; b.record.target = None; b.record.state = DRONE_STATE_IDLE; b.locked = false; b.end_at = None; b.contact_queued = false;
             b.combat_attempt = None;
             if b.contact_claimed.is_none() {
@@ -335,6 +594,8 @@ impl System {
         let ids: Vec<_> = self.drones().filter(|d| d.id == source || d.controller == Some(source)).map(|d| d.id).collect();
         for id in ids {
             self.remove_projections_from(id);
+            let salvaging = self.drones.get(&id).is_some_and(|b| matches!(b.record.order, DroneOrder::Salvage(_)));
+            if salvaging { self.salvage_stop(id); }
             let b = self.drones.get_mut(&id).unwrap();
             if b.record.pending.is_none() && b.record.target.is_some() && (b.locked || b.lock_at != 0) {
                 b.record.generation = generation();
@@ -348,6 +609,10 @@ impl System {
     pub(in crate::space) fn drone_removed(&mut self, id: i64) {
         self.remove_drone_aggressor(id);
         if let Some(b) = self.drones.remove(&id) {
+            if let Some(fx) = b.salvage.fx {
+                fx.store(true, Ordering::Relaxed);
+                self.retire_fx_activation(id, &fx);
+            }
             let d = b.record;
             if d.owner != OWNER_UNOWNED {
                 self.notify_pilot(d.owner, "OnDroneStateChange", crate::services::effects::notify::drone_state(id, None, None, DRONE_STATE_IDLE, d.spec.type_id, None, None));
@@ -387,10 +652,17 @@ impl System {
             self.drone_controller_lost(controller); return;
         }
         if !self.drone_ship_live(d.owner, controller) { self.drone_jammed(controller); return; }
-        if d.pending.is_some() || matches!(d.order, DroneOrder::ReturnBay | DroneOrder::ReturnHome) {
+        let salvager = matches!(d.order, DroneOrder::Salvage(_));
+        let (carried, blocked) = self.drones.get(&id).map(|b| (
+            b.salvage.carried && matches!(d.order, DroneOrder::Salvage(_) | DroneOrder::ReturnHome | DroneOrder::ReturnBay),
+            b.salvage.blocked,
+        )).unwrap_or_default();
+        // A refused delivery holds position until the next player command.
+        if blocked { return; }
+        if d.pending.is_some() || carried || matches!(d.order, DroneOrder::ReturnBay | DroneOrder::ReturnHome) {
             let Some((me, ship)) = self.sampled_ball(id).zip(self.sampled_ball(controller)) else { return };
             if dist(me.pos, ship.pos) - f64::from(me.radius) - f64::from(ship.radius) > DRONE_SCOOP_RANGE { return; }
-            if d.order == DroneOrder::ReturnHome && d.pending.is_none() {
+            if d.order == DroneOrder::ReturnHome && d.pending.is_none() && !carried {
                 self.drone_idle(id, d.generation);
                 let orbit = d.spec.orbit_range.max(0.0);
                 let Some(generation) = self.drones.get(&id).map(|b| b.record.generation) else { return };
@@ -407,10 +679,11 @@ impl System {
             let brain = self.drones.get_mut(&id).unwrap();
             if !brain.contact_queued {
                 brain.contact_queued = true;
-                if self.effect_jobs.is_some() { self.effect_staging.push(npc::EffectJob::Drone { effects: brain.effects.clone(), action: DroneAction::Contact { drone: d, return_to_bay: brain.record.order == DroneOrder::ReturnBay } }); }
+                if self.effect_jobs.is_some() { self.effect_staging.push(npc::EffectJob::Drone { effects: brain.effects.clone(), action: DroneAction::Contact { drone: d, return_to_bay: brain.record.order == DroneOrder::ReturnBay, carried } }); }
             }
             return;
         }
+        if salvager { self.think_salvage(id); return; }
         let Some(target) = d.target else { return };
         let jammed = crate::services::combat::jamming::is_jammed(id, self.ms) || crate::services::combat::jamming::is_jammed(controller, self.ms);
         let Some((me, victim, ship)) = self.sampled_ball(id).zip(self.sampled_ball(target)).zip(self.sampled_ball(controller)).map(|((a,b),c)| (a,b,c)) else { self.drone_idle(id, d.generation); return };
@@ -425,6 +698,51 @@ impl System {
             self.drones.get_mut(&id).unwrap().combat_attempt = None;
             return;
         }
+        let state = if matches!(d.order, DroneOrder::Mine(_)) { DRONE_STATE_MINING } else { DRONE_STATE_COMBAT };
+        self.drone_run_cycle(id, &d, target, &victim, state);
+    }
+    /// Salvage work cycle: approach the wreck inside effect range, lock, then
+    /// run Begin/End phases. An in-flight settlement pauses phase queueing;
+    /// a lost or invalid wreck is an event boundary that retargets or idles.
+    fn think_salvage(&mut self, id: i64) {
+        let Some(d) = self.drone(id) else { return };
+        let Some(controller) = d.controller else { return };
+        if self.drones.get(&id).is_none_or(|b| b.salvage.in_flight || b.salvage.unknown) { return; }
+        // Target selection happens at command and completion boundaries only;
+        // a targetless drone waits for the next boundary, it never rescans.
+        let Some(target) = d.target else { return; };
+        let Some((me, victim, ship)) = self.sampled_ball(id).zip(self.sampled_ball(target)).zip(self.sampled_ball(controller)).map(|((a, b), c)| (a, b, c)) else {
+            self.salvage_boundary(id, d.generation);
+            return;
+        };
+        let wreck = self.sde().and_then(|sde| sde.types.get(victim.type_id)).and_then(|t| t.group_id) == Some(GROUP_WRECK);
+        if !wreck || !targeting::target_visible(&victim) {
+            self.salvage_boundary(id, d.generation);
+            return;
+        }
+        let jammed = crate::services::combat::jamming::is_jammed(id, self.ms) || crate::services::combat::jamming::is_jammed(controller, self.ms);
+        if jammed || Self::control_gap(d.order, dist(ship.pos, victim.pos), &ship, &victim) > d.spec.control_range || (d.spec.max_target_range != 0.0 && dist(me.pos, victim.pos) > d.spec.max_target_range) {
+            self.remove_projections_from(id);
+            self.salvage_stop(id);
+            let b = self.drones.get_mut(&id).unwrap();
+            if b.locked || b.lock_at != 0 { b.record.generation = generation(); }
+            b.combat_attempt = None;
+            b.locked = false; b.lock_at = 0; b.end_at = None;
+            return;
+        }
+        if dist(me.pos, victim.pos) - f64::from(me.radius) - f64::from(victim.radius) > d.spec.optimal_range.max(0.0) {
+            self.salvage_stop(id);
+            self.drones.get_mut(&id).unwrap().combat_attempt = None;
+            return;
+        }
+        self.drone_run_cycle(id, &d, target, &victim, DRONE_STATE_SALVAGING);
+        // The work's effect starts only once the drone really works the wreck;
+        // repeat calls are a no-op until the work or its target changes.
+        if self.drones.get(&id).is_some_and(|b| b.locked) { self.salvage_begin(id, target); }
+    }
+    /// The shared lock-and-cycle tail for a drone holding one action target:
+    /// scan-resolution lock first, then Begin/End effect phases on the worker.
+    fn drone_run_cycle(&mut self, id: i64, d: &DroneRecord, target: i64, victim: &Ball, state: i32) {
         let signature = victim.signature_radius.or_else(|| self.projection_sde.as_ref()
             .and_then(|sde| sde.types.get(victim.type_id))
             .and_then(|data| data.attribute(ATTR_SIGNATURE_RADIUS))).unwrap_or(f64::from(victim.radius));
@@ -443,7 +761,6 @@ impl System {
         }
         let mut notice = None;
         if self.ms >= b.cycle_at {
-            let state = if matches!(d.order, DroneOrder::Mine(_)) { DRONE_STATE_MINING } else { DRONE_STATE_COMBAT };
             if b.record.state != state { b.record.state = state; notice = Some(b.record.clone()); }
             let deadline = self.ms.saturating_add(d.spec.duration_ms.min(i64::MAX as f64) as i64);
             b.cycle_at = deadline; b.end_at = Some(deadline);

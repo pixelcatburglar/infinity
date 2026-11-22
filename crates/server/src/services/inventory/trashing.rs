@@ -31,6 +31,28 @@ pub(super) fn broker_refusal_key(error: &CallError) -> Option<&'static str> {
 }
 
 pub(crate) async fn resolve_location(c: &Client, item: i64) -> Result<i64, CallError> {
+    // A transient child's true outer is its actor's system, not a database
+    // ancestry that does not exist; everything else keeps the old walk.
+    let actor_identity = super::npc_loot::client_identity(c);
+    if let Some(system) = c.session.int("solarsystemid") {
+        match super::npc_loot::source(&c.world, &actor_identity, system, item, None).await {
+            crate::space::system::npc_wrecks::NpcWreckLookup::Ready(source) =>
+                return Ok(source.wreck.root.location_id),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                return Err(super::npc_loot::busy());
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Absent => match super::npc_loot::view(&c.world, &actor_identity, system, item).await {
+                crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => return Ok(view.root.location_id),
+                crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                    super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                    return Err(super::npc_loot::busy());
+                }
+                _ => {}
+            },
+            crate::space::system::npc_wrecks::NpcWreckLookup::Denied => {}
+        }
+    }
     let chain = crate::dao::items::deliveries::ancestry(&c.db, item).await.map_err(db_err)?;
     let ids: std::collections::HashSet<_> = chain.iter().map(|row| row.item_id).collect();
     chain.iter().find(|row| !ids.contains(&row.location_id)).map(|row| row.location_id)
@@ -113,12 +135,91 @@ async fn capture(c: &Client, roots: &[i64], location: i64) -> Result<(super::lif
     }, audience, fences))
 }
 
+/// How one requested root resolved inside the actor turn: a transient child
+/// with its true outer, a transient root, or an ordinary persistent row.
+enum TrashClass {
+    Child { root: i64, outer: i64, item: crate::dao::items::loading::Item },
+    Root { outer: i64, owner: i64, type_id: i32, group_id: i64, category_id: i64 },
+    Persistent,
+    Denied,
+    Busy(Option<std::sync::Arc<crate::space::system::npc_wrecks::NpcWreckClaim>>),
+}
+
 /// Destroy the permitted roots through the shared lifecycle after the client
 /// inventory's own session capture; post-commit routing is the same as before.
 pub(crate) async fn trash_items(c: &mut Client, roots: &[i64], location: i64) -> Result<Value, CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     if roots.is_empty() { return Ok(Value::list([])); }
-    let (prepared, audience, fences) = capture(c, roots, location).await?;
+    // Every requested root is classified in one actor turn: transient members
+    // carry their real outer and owner, everything else stays persistent.
+    let actor_identity = super::npc_loot::client_identity(c);
+    let system = c.session.int("solarsystemid").unwrap_or_default();
+    let classified = match c.session.int("solarsystemid") {
+        Some(system) => {
+            let roots = roots.to_vec();
+            c.world.with(system, move |s| roots.iter().map(|&id| {
+                match s.npc_loot_source(&actor_identity, id, None) {
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Ready(source) =>
+                        TrashClass::Child { root: source.wreck.root.item_id, outer: source.wreck.root.location_id, item: source.item },
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => TrashClass::Busy(claim),
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Denied => TrashClass::Denied,
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Absent => match s.npc_wreck_view(&actor_identity, id) {
+                        crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => TrashClass::Root {
+                            outer: view.root.location_id, owner: view.root.owner_id,
+                            type_id: view.root.type_id, group_id: view.root.group_id, category_id: view.root.category_id,
+                        },
+                        crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => TrashClass::Busy(claim),
+                        crate::space::system::npc_wrecks::NpcWreckLookup::Denied => TrashClass::Denied,
+                        crate::space::system::npc_wrecks::NpcWreckLookup::Absent => TrashClass::Persistent,
+                    },
+                }
+            }).collect::<Vec<_>>()).await
+        }
+        None => None,
+    };
+    let classified = classified.unwrap_or_else(|| roots.iter().map(|_| TrashClass::Persistent).collect());
+    let cannot_trash = || user_error(messages::MSG_CANNOT_TRASH_ITEM, vec![]);
+    let mut root_deletes = std::collections::BTreeSet::new();
+    let mut child_deletes: std::collections::BTreeMap<i64, Vec<i64>> = std::collections::BTreeMap::new();
+    let mut persistent_ids = Vec::new();
+    for (index, entry) in classified.iter().enumerate() {
+        match entry {
+            TrashClass::Child { root, outer, item } => {
+                if *outer != location || item.owner_id != me
+                    || c.sde.typelists.is_untrashable(item.type_id, item.group_id as i32, item.category_id as i32) {
+                    return Err(cannot_trash());
+                }
+                child_deletes.entry(*root).or_default().push(item.item_id);
+            }
+            TrashClass::Root { outer, owner, type_id, group_id, category_id } => {
+                if *outer != location || *owner != me
+                    || c.sde.typelists.is_untrashable(*type_id, *group_id as i32, *category_id as i32) {
+                    return Err(cannot_trash());
+                }
+                root_deletes.insert(roots[index]);
+            }
+            TrashClass::Busy(claim) => {
+                super::npc_loot::reconcile_busy(&c.world, &c.sde, claim.clone()).await;
+                return Err(super::npc_loot::busy());
+            }
+            TrashClass::Denied => return Err(cannot_trash()),
+            TrashClass::Persistent => persistent_ids.push(roots[index]),
+        }
+    }
+    let access = crate::space::system::npc_wrecks::NpcWreckAccess::Inventory(actor_identity);
+    let specs: Vec<(i64, Vec<i64>)> = root_deletes.iter().map(|&root| (root, vec![root]))
+        .chain(child_deletes.iter().filter(|(root, _)| !root_deletes.contains(*root))
+            .map(|(root, items)| (*root, items.clone())))
+        .collect();
+    if persistent_ids.is_empty() {
+        // Pure transient batch: the claims validate every root together, then
+        // each apply removes its own rows. No database, no economy lock.
+        let guards = super::npc_loot::claim_deletes(&c.world, &c.sde, system, access, specs,
+            Vec::new(), Vec::new()).await.map_err(|_| cannot_trash())?;
+        super::npc_loot::commit_deletes(guards).await;
+        return Ok(Value::list([]));
+    }
+    let (prepared, audience, fences) = capture(c, &persistent_ids, location).await?;
     let mut hulls = std::collections::BTreeSet::new();
     for item in &prepared.snapshots {
         if item.category_id == i64::from(CATEGORY_SHIP) { hulls.insert(item.item_id); }
@@ -130,6 +231,18 @@ pub(crate) async fn trash_items(c: &mut Client, roots: &[i64], location: i64) ->
     let mut holds = super::super::combat::loaded::LoadedHolds::lock(&c.world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
     let settle = holds.settle_rows();
     let held_ships = holds.ships();
+    // Mixed batch: claims freeze the complete persistent preimage, then one
+    // transaction does the shared lifecycle; the memory apply only runs on a
+    // proven commit.
+    let mut deletes = if specs.is_empty() { Vec::new() } else {
+        super::npc_loot::claim_deletes(&c.world, &c.sde, system, access, specs,
+            prepared.roots.clone(), prepared.snapshots.clone()).await?
+    };
+    let claims: Vec<std::sync::Arc<crate::space::system::npc_wrecks::NpcWreckClaim>> =
+        deletes.iter().map(|claimed| claimed.guard.claim().clone()).collect();
+    let fence_keys: Vec<String> = claims.iter()
+        .map(|claim| super::npc_loot::delete_fence_key(claim.root(), claim.serial())).collect();
+    super::npc_loot::may_execute_deletes(&mut deletes);
     let db = c.db.clone(); let sde = c.sde.clone();
     let world = c.world.clone(); let notify_tx = c.notify_tx.clone();
     let char_id = c.session.int("charid");
@@ -140,7 +253,11 @@ pub(crate) async fn trash_items(c: &mut Client, roots: &[i64], location: i64) ->
         let audience = audience.clone(); let fences = fences.clone();
         let settle = settle.clone();
         let held_ships = held_ships.clone();
+        let fence_keys = fence_keys.clone();
         Box::pin(async move {
+            for key in &fence_keys {
+                crate::dao::items::npc_loot::fence(tx, key).await.map_err(db_err)?;
+            }
             let mut verified = super::lifecycle::verify_closure(tx, &sde, &prepared, &custody, super::lifecycle::Operation::Destroy).await?;
             verified.loaded_writes = settle;
             let audience = Some(audience.resolve(tx, &sde).await?);
@@ -155,9 +272,13 @@ pub(crate) async fn trash_items(c: &mut Client, roots: &[i64], location: i64) ->
             }
             Ok((Value::list([]), seed_sets))
         })
-    }, |value, outbox| async move {
+    }, move |value, outbox| async move {
+        super::npc_loot::commit_deletes(deletes).await;
         dispatch_move(value, outbox, &world, |notification| super::super::effects::online::dispatch_notification(notification, &world, &notify_tx, char_id))
     }).await;
+    if result.is_err() {
+        super::npc_loot::reconcile_deletes(&c.world, &c.sde, &claims).await;
+    }
     let seeds = match &result { Ok((_, seed_sets)) => seed_sets.clone(), _ => Vec::new() };
     holds.finish(&db, &c.world, result, &seeds).await.map(|(value, _)| value)
 }

@@ -9,3 +9,5 @@ pub const MAX_ACTIVE_EXCEEDED: &str = "已达到无人机控制数量上限。";
 pub const DELEGATE_NOT_IN_FLEET: &str = "目标驾驶员不在你的舰队中。";
 pub const NOT_IN_SPACE: &str = "必须在太空中才能执行无人机指令。";
 pub const TRANSITION_BUSY: &str = "无人机正在执行另一项操作。";
+/// Cargo carried by a drone belongs to another character and cannot be taken.
+pub const CARGO_FOREIGN: &str = "该无人机携带着不属于你的货物。";

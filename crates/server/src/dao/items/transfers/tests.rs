@@ -38,6 +38,27 @@ async fn contract_handover_preserves_nested_locations() {
 
 #[tokio::test]
 #[ignore]
+async fn handover_keeps_hidden_mode_child_and_switch_timing() {
+    let (mut client, connection) = crate::config::tests::test_database().to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move { connection.await.unwrap(); });
+    let tx = client.transaction().await.unwrap();
+    let hull = insert(&tx, crate::sde::ship_stances::HULL_STANCES[0].hull_type, 101, 102, 4, 1).await.unwrap();
+    insert(&tx, crate::sde::ship_stances::HULL_STANCES[0].modes[0].1, 101, hull, infinity_core::consts::FLAG_HIDDEN_MODIFIERS, 1).await.unwrap();
+    crate::dao::items::ship_stance::insert_timing(&tx, hull).await.unwrap();
+    let closure = crate::dao::items::inventory::descendants(&tx, &[hull]).await.unwrap();
+    let requests = closure.iter().map(|&item_id| crate::dao::items::parent_locks::LockRequest { item_id,
+        strength: crate::dao::items::parent_locks::LockStrength::Update }).collect::<Vec<_>>();
+    let locks = crate::dao::items::parent_locks::lock(&tx, &[hull], &requests).await.unwrap();
+    hand_over(&tx, &[Transfer { item_id: hull, owner: 103, location: 104, flag: 4 }], &closure, &locks, &[]).await.unwrap();
+    let row = tx.query_one("SELECT owner_id, location_id, flag_id, (SELECT ready_at FROM game.ship_stances WHERE ship_id = $1) AS ready_at FROM game.items WHERE location_id = $1 AND flag_id = $2",
+        &[&hull, &infinity_core::consts::FLAG_HIDDEN_MODIFIERS]).await.unwrap();
+    assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id"), row.get::<_, Option<i64>>("ready_at")),
+        (103, hull, infinity_core::consts::FLAG_HIDDEN_MODIFIERS, Some(0)));
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
 async fn deposit_splits_overflow_and_validates_created_rows() {
     let cfg = crate::config::tests::test_database();
     let (mut client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();

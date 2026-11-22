@@ -184,6 +184,11 @@ progress_pending_batches = 4        # env: COMBAT_PROGRESS_PENDING_BATCHES
 # Server policy: minimum final shield, armor and structure damage resonance after
 # all dogma modifiers; finite, above 0 and at most 1. Restart required.
 resonance_floor = 0.05
+# Transient NPC wreck/loot item-ID reservation: one block per running system,
+# always large enough for a complete natural generation; refills below a quarter
+# of the block are serialized by this per-actor failure cooldown, not a timer.
+npc_wreck_id_block_size = 4096    # env: COMBAT_NPC_WRECK_ID_BLOCK_SIZE
+npc_wreck_id_retry_ms = 1000      # env: COMBAT_NPC_WRECK_ID_RETRY_MS
 
 [npc]
 belt_rats = true                    # existing behavior: region pirates spawn when a pilot warps to a belt

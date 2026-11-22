@@ -94,7 +94,7 @@ async fn launch_limits_and_return_are_inventory_backed() {
     assert_eq!(f.call("entity", "CmdReturnHome", &commands).await.ok().unwrap(), Value::Dict(vec![]));
     assert!(f.world.with(system, { let ids=ids.clone(); move |s| ids.iter().all(|id| s.drone(*id).is_some_and(|d| d.order == DroneOrder::ReturnHome)) }).await.unwrap());
     assert_eq!(f.db.query_one("SELECT count(*) FROM game.items WHERE item_id=ANY($1) AND location_id=$2", &[&ids, &system]).await.unwrap().get::<_, i64>("count"), 5);
-    for method in ["CmdSalvage", "CmdReconnectToDrones"] { assert!(f.call("entity", method, &commands).await.is_err()); }
+    for method in ["CmdReconnectToDrones"] { assert!(f.call("entity", method, &commands).await.is_err()); }
     f.world.with(system, move |s| s.drone_controller_lost(ship)).await.unwrap();
     for id in &ids { assert!(f.world.with(system, { let id=*id; move |s| s.drone(id).is_some_and(|d| d.owner == owner && d.controller.is_none()) }).await.unwrap()); }
     let mut lost = HashSet::new();
@@ -169,13 +169,18 @@ async fn combat_drone_and_npc_death_share_real_effect_path() {
     assert_eq!(f.call("entity", "CmdEngage", &args).await.ok().unwrap(), Value::Dict(vec![]));
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while f.world.ball(f.system, npc).await.is_some() { assert!(f.world.after(f.system, 100).await); }
-        while crate::dao::wallets::characters::balance(&f.db, f.owner).await.unwrap() <= balance { assert!(f.world.after(f.system, 100).await); }
-    }).await.expect("drone NPC kill and bounty");
+    }).await.expect("drone NPC kill");
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while f.db.query_opt("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3", &[&f.owner, &f.system, &wreck_type]).await.unwrap().is_none() {
             assert!(f.world.after(f.system, 100).await);
         }
     }).await.expect("NPC wreck");
+    f.world.flush_positions().await.unwrap();
+    let pools = crate::dao::npc_bounties::for_character(&f.db, f.owner).await.unwrap();
+    let batch = pools.first().expect("drone kill bounty batch").batch;
+    assert_eq!(crate::dao::wallets::characters::balance(&f.db, f.owner).await.unwrap(), balance);
+    crate::services::bounty::npc::settle_due(&f.db, &f.world, (f.owner, batch.started_at), batch.due_at).await.unwrap();
+    assert!(crate::dao::wallets::characters::balance(&f.db, f.owner).await.unwrap() > balance);
     let post_kill = crate::dao::wallets::characters::balance(&f.db, f.owner).await.unwrap();
     let neutral = f.drone(ty, 1, true).await;
     unowned_drone = Some(neutral);

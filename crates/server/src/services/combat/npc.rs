@@ -6,7 +6,8 @@
 //! The client has no NPC server combat implementation to mirror.
 //! Weapon animations are published through the system's ordered scene channel.
 use super::*;
-use crate::services::effects::weapons::{launch_missile, turret_shot, Missile, TurretSpool};
+use crate::services::effects::weapons::{turret_shot, TurretSpool};
+use crate::services::effects::weapons::missile::{launch_missile, Missile};
 use crate::services::effects::spool::{SpoolBinding, SpoolParameters};
 use infinity_core::consts::dogma::ATTR_AGILITY;
 use infinity_core::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_PER_CYCLE, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_MAX, dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK, dogma::EFFECT_NPC_BEHAVIOR_SHIELD_BOOST, dogma::EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR, dogma::ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT, dogma::ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION, dogma::ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT, dogma::ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION};
@@ -68,8 +69,9 @@ pub(crate) async fn spawn(db: &Db, world: &Arc<World>, system: i64, data: &TypeD
 #[derive(Clone)]
 pub(super) struct NpcStats {
     /// (shield boost, armor repair) amount per repair cycle, and the cycle (ms).
-    /// A carried behavior repair effect (SDE 6990/6884) supplies a layer's
-    /// amount rescaled to the shared cycle when no valid legacy amount exists.
+    /// A finite positive legacy amount is rescaled onto the shared cycle by its
+    /// own duration; a carried behavior repair effect (SDE 6990/6884) supplies
+    /// that layer only when no valid legacy amount exists.
     pub(super) repairs: (f64, f64, f64),
     pub(super) scan_resolution: f64,
     pub(super) fly_range: f64,
@@ -110,11 +112,18 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
         .or_else(|| sde.dogma.attribute(id).and_then(|a| a.default_value))
         .unwrap_or(fallback);
     // Both repair layers tick on one existing shared cycle (floor unchanged).
-    // A carried npcBehaviorShieldBooster/npcBehaviorArmorRepairer effect (SDE
-    // 6990/6884) supplies that layer's amount rescaled onto the shared cycle —
-    // only when no finite positive legacy amount exists; never added on top.
+    // Each finite positive legacy amount is rescaled by its own finite positive
+    // duration; missing or invalid duration keeps the original amount. A carried
+    // npcBehaviorShieldBooster/npcBehaviorArmorRepairer effect (SDE 6990/6884)
+    // supplies that layer only when no finite positive legacy amount exists.
     let repair_cycle_ms = attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_DURATION, 0.0)
         .max(attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_DURATION, 0.0)).max(NPC_REPAIR_CYCLE_FLOOR_MS);
+    let legacy_amount = |amount_id, duration_id| {
+        let amount = attr(sde, type_id, amount_id, 0.0);
+        if !(amount.is_finite() && amount > 0.0) { return amount; }
+        behavior_cycle_amount(Some(amount), sde.types.attribute(type_id, duration_id), repair_cycle_ms)
+            .unwrap_or(amount)
+    };
     let behavior = |legacy: f64, effect: i32, amount_id: i32, duration_id: i32| {
         if legacy.is_finite() && legacy > 0.0
             || !sde.types.effects(type_id).iter().any(|entry| entry.effect_id == effect) { return legacy; }
@@ -122,8 +131,8 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
             sde.types.attribute(type_id, duration_id), repair_cycle_ms).unwrap_or(legacy)
     };
     let repairs = (
-        behavior(attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0), EFFECT_NPC_BEHAVIOR_SHIELD_BOOST, ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT, ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION),
-        behavior(attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0), EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR, ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT, ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION),
+        behavior(legacy_amount(ATTR_ENTITY_SHIELD_BOOST_AMOUNT, ATTR_ENTITY_SHIELD_BOOST_DURATION), EFFECT_NPC_BEHAVIOR_SHIELD_BOOST, ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT, ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION),
+        behavior(legacy_amount(ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, ATTR_ENTITY_ARMOR_REPAIR_DURATION), EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR, ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT, ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION),
         repair_cycle_ms,
     );
     Ok(NpcStats {
@@ -143,9 +152,9 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
     })
 }
 
-/// Per-cycle amount of one carried NPC behavior repair effect rescaled onto
-/// the shared cycle: SDE `amount * cycle_ms / duration`. Missing, non-finite
-/// or non-positive inputs admit no behavior amount.
+/// Per-cycle amount of one NPC local repair rescaled onto the shared cycle:
+/// SDE `amount * cycle_ms / duration`. Missing, non-finite or non-positive
+/// inputs admit no amount.
 fn behavior_cycle_amount(amount: Option<f64>, duration: Option<f64>, cycle_ms: f64) -> Option<f64> {
     let (amount, duration) = (amount?, duration?);
     (amount.is_finite() && amount > 0.0 && duration.is_finite() && duration > 0.0)
@@ -262,6 +271,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
                 flight_time_ms,
                 weapon: type_id,
                 illegal: false,
+                dot: None,
             };
             launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), owner_id, None, missile,
                 Some(guard), attempt).await?;

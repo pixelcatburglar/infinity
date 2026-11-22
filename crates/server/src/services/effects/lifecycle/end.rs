@@ -8,6 +8,22 @@ pub(in crate::services::effects) fn cycle_end(s: &mut System, cycle: Cycle, end:
     }
     let final_cycle = cycle_is_final(cycle.stop.load(Ordering::Relaxed), cycle.effect.has(EffectFlag::DisallowAutoRepeat), cycle.repeat, cycle.cycles);
     let Some(receiver) = super::super::heat::finish_cycle(s, &cycle, end, final_cycle) else { cycle_stop(s, cycle); return };
+    // The adaptive hardener's paid window closes synchronously here: the
+    // tally is taken and the profile adapts before the deferred family/heat
+    // work, so gap hits can never enter this cycle's window. An ordinary
+    // requested stop keeps this paid cycle; a forced-inactive, wrong-owner
+    // or replaced source does not.
+    if let Some(membership) = cycle.source_membership {
+        if let Some(parameters::CycleFrame { packet: parameters::MasterPacket::ReactiveArmor(inputs), .. }) =
+            cycle.inputs.frame.as_ref()
+        {
+            if source_subject_current(s, cycle.cx.ship_id, cycle.cx.char_id, membership,
+                &cycle.modules[0], cycle.presented_effect, &cycle.stop)
+            {
+                s.finish_reactive_armor_cycle(cycle.cx.ship_id, membership, cycle.modules[0].id, &cycle.stop, inputs.shift);
+            }
+        }
+    }
     let membership = s.combat_membership_generation(cycle.cx.ship_id);
     s.defer(async move { cycle_end_work(cycle, end, final_cycle, membership, receiver).await; });
 }
@@ -68,37 +84,48 @@ pub(in crate::services::effects) fn cycle_stop(s: &mut System, mut cycle: Cycle)
         member.turret_round = None;
     }
     retire_combat_generations(s, std::mem::take(&mut cycle.owner.combat_generations));
-    let mut st = state();
-    // A duration-bounded consumer still pending admission never published a
-    // start; its silent cancellation emits no stop either.
-    let pending_cancel = super::super::active_cycle::consumer(cycle.effect.id)
-        && matches!(st.active_cycles.get(&master),
-            Some(crate::services::combat::ActiveCycle::Pending { .. }));
-    let retired = retire_activation(&mut st.active, master, &cycle.stop, || {
-        if (cycle.effect.kind != EffectKind::Entosis || cycle.cycles > 0) && !pending_cancel {
-            ship_effect(&cx, master, cycle.effect.id, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
+    let tracked = super::super::active_cycle::tracked(cycle.effect.id);
+    let (retired, terminal) = if tracked {
+        let mut st = state();
+        let terminal = super::super::active_cycle::terminate(&mut st, master, &cycle.stop);
+        drop(st);
+        cycle.owner.armed = false;
+        (false, terminal)
+    } else {
+        let mut st = state();
+        let retired = retire_activation(&mut st.active, master, &cycle.stop, || {
+            if cycle.effect.kind != EffectKind::Entosis || cycle.cycles > 0 {
+                ship_effect(&cx, master, cycle.presented_effect, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
+            }
+        });
+        if retired && cycle.effect.kind != EffectKind::Propulsion && st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &cycle.stop)) {
+            st.activation_generation.remove(&master);
         }
-    });
-    if retired && cycle.effect.kind != EffectKind::Propulsion && st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &cycle.stop)) {
-        st.activation_generation.remove(&master);
-    }
-    if retired { cycle.owner.armed = false; }
-    if super::super::active_cycle::consumer(cycle.effect.id) {
-        super::super::active_cycle::stopped(s.now_ms(), &mut st, master, &cycle.stop);
-    }
-    drop(st);
+        drop(st);
+        if retired { cycle.owner.armed = false; }
+        (retired, None)
+    };
+    if let Some(terminal) = terminal { super::super::active_cycle::apply_terminal(s, terminal); }
     if cycle.effect.kind == EffectKind::Entosis { super::super::entosis::stop(s, &cycle); }
     if retired {
         for module in &cycle.modules { s.fitted_module_active(cx.ship_id, module.id, false); }
     }
-    if retired && matches!(cycle.effect.kind, EffectKind::Cloak | EffectKind::MicroJumpDrive) {
+    // A retired sphere's assistance block lifts with the published inactive
+    // bit: the source's incoming projections are re-evaluated once, but only
+    // while the ship that admitted this activation still owns its combat
+    // membership; a replacement never receives a stale generation's refresh.
+    if retired && cycle.presented_effect == i64::from(infinity_core::consts::dogma::EFFECT_WARP_DISRUPT_SPHERE)
+        && s.combat_membership_generation(cx.ship_id) == cycle.source_membership {
+        s.refresh_projection_target(cx.ship_id);
+    }
+    if retired && matches!(cycle.effect.kind, EffectKind::Cloak | EffectKind::MicroJumpDrive | EffectKind::MicroJumpField) {
         s.refresh_projection_target(cx.ship_id);
     }
     if retired { on_stop(s, &cx, &cycle); }
     // A retired activation reports its ramp attributes back to zero and drops
     // its readouts; a superseded generation is untouched by its fencing.
     if retired { s.spool_readout_clear(cx.ship_id, &cycle.stop); }
-    s.retire_fx_activation(master, &cycle.stop);
+    if !tracked { s.retire_fx_activation(master, &cycle.stop); }
     if retired && matches!(charge_kind(cycle.effect.id, cycle.effect.kind), EffectKind::FueledLocalRepair { .. }) {
         s.defer(async move {
             if let Err(error) = crate::services::combat::targeting_charges::auto_reload(&cx, master).await {

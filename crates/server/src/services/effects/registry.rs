@@ -4,12 +4,11 @@
 //! classifying a later-wave kind does not implement its lifecycle behavior.
 use infinity_core::{consts::{*, dogma::*}};
 use crate::sde::Sde;
-use super::{EffectKind, JammingType};
+use super::{command_burst::CommandBurstFamily, EffectKind, JammingType};
 
-/// Client inventorycommon/const.py: groupMissileLauncherFestival.
-const GROUP_MISSILE_LAUNCHER_FESTIVAL: i64 = 501;
+use super::festival::GROUP_MISSILE_LAUNCHER_FESTIVAL;
 /// Client inventorycommon/const.py: groupBubbleProbeLauncher.
-const GROUP_BUBBLE_PROBE_LAUNCHER: i64 = 589;
+pub(super) const GROUP_BUBBLE_PROBE_LAUNCHER: i64 = 589;
 /// Client inventorycommon/const.py: groupMissileLauncherBomb.
 const GROUP_BOMB_LAUNCHER: i64 = 862;
 /// Client inventorycommon/const.py: groupMissileLauncherXLTorpedo.
@@ -20,12 +19,21 @@ const GROUP_XL_CRUISE_LAUNCHER: i64 = 1674;
 const GROUP_RAPID_TORPEDO_LAUNCHER: i64 = 1673;
 
 /// Player activations are module effects, excluding later-wave launcher families.
-pub(super) fn activation_in_scope(category: i64, group: i64, kind: EffectKind) -> bool {
+/// Group 501 is admitted only when the resident type is a published ordinary
+/// festival launcher. Heat and deactivation use the same predicate and do not
+/// require a loaded charge. Every other excluded missile group stays refused.
+pub(super) fn activation_in_scope(sde: &Sde, type_id: i32, kind: EffectKind) -> bool {
+    let Some(row) = sde.types.get(type_id) else { return false };
+    let (category, group) = (i64::from(row.category_id.unwrap_or(0)), i64::from(row.group_id.unwrap_or(0)));
     category == i64::from(CATEGORY_MODULE)
-        && !(kind == EffectKind::Missile && matches!(group,
-            GROUP_MISSILE_LAUNCHER_FESTIVAL | GROUP_BUBBLE_PROBE_LAUNCHER |
-            GROUP_BOMB_LAUNCHER | GROUP_XL_TORPEDO_LAUNCHER |
-            GROUP_XL_CRUISE_LAUNCHER | GROUP_RAPID_TORPEDO_LAUNCHER))
+        && if kind == EffectKind::Missile && group == GROUP_MISSILE_LAUNCHER_FESTIVAL {
+            super::festival::launcher_in_scope(sde, type_id)
+        } else {
+            !(kind == EffectKind::Missile && matches!(group,
+                GROUP_MISSILE_LAUNCHER_FESTIVAL | GROUP_BUBBLE_PROBE_LAUNCHER |
+                GROUP_BOMB_LAUNCHER | GROUP_XL_TORPEDO_LAUNCHER |
+                GROUP_XL_CRUISE_LAUNCHER | GROUP_RAPID_TORPEDO_LAUNCHER))
+        }
 }
 
 /// SDE dogma effect attribute-ID columns, in descriptor array order.
@@ -48,6 +56,9 @@ pub(crate) struct Effect {
     category: Option<i32>,
     attributes: [Option<i32>; 6],
     flags: u8,
+    /// Accepted ordinary festival admission. Absent for every other effect,
+    /// including a festival module that has not been admitted this activation.
+    pub(super) festival: Option<super::festival::Admission>,
 }
 
 impl Effect {
@@ -72,12 +83,15 @@ impl Effect {
         Self {
             id: i64::from(row.effect_id), kind,
             guid: row.guid.clone().filter(|g| !g.is_empty()),
-            category: row.effect_category, attributes, flags,
+            category: row.effect_category, attributes, flags, festival: None,
         }
     }
 
     pub(crate) fn attribute(&self, key: EffectAttribute) -> Option<i32> { self.attributes[key as usize] }
     pub(crate) fn has(&self, key: EffectFlag) -> bool { self.flags & (1 << key as u8) != 0 }
+    pub(super) fn set_flag(&mut self, key: EffectFlag, value: bool) {
+        if value { self.flags |= 1 << key as u8; } else { self.flags &= !(1 << key as u8); }
+    }
     pub(super) fn manually_activatable(&self) -> bool {
         self.kind != EffectKind::Modifiers || self.category.is_some_and(|category| ACTIVE_CATEGORIES.contains(&category))
     }
@@ -94,7 +108,7 @@ pub(crate) fn kind(sde: &Sde, effect_id: i32) -> Option<EffectKind> {
     classify(effect_id, sde.dogma.effect(effect_id).is_some_and(|effect| !effect.modifiers().is_empty()))
 }
 
-fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
+pub(super) fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
     use EffectKind::*;
     Some(match effect_id {
         EFFECT_TARGET_ATTACK => Turret,
@@ -108,7 +122,7 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_MINING_CLOUDS => Mining,
         EFFECT_MINING => Mining,
         EFFECT_HACKING => Hacking,
-        EFFECT_PROBE_LAUNCHING => ProbeLaunch,
+        EFFECT_PROBE_LAUNCHING if has_modifiers => Modifiers,
         EFFECT_EMP_WAVE => Smartbomb,
         EFFECT_CHAIN_LIGHTNING | EFFECT_ENTITY_CHAIN_LIGHTNING => Vorton,
         EFFECT_FUELED_ARMOR_REPAIR => FueledLocalRepair { layer: 1, amount_attr: ATTR_ARMOR_DAMAGE_AMOUNT, charge_bonus_attr: Some(ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER) },
@@ -209,37 +223,38 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_NPC_BEHAVIOR_DAMP => Projected { jamming: JammingType::Damp },
         EFFECT_NPC_WARP_SCRAMBLE => Projected { jamming: JammingType::Scramble },
         EFFECT_NPC_WARP_SCRAMBLE_MWD => Projected { jamming: JammingType::Scramble },
-        EFFECT_WARP_DISRUPT_SPHERE => return None,
+        EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT => Projected { jamming: JammingType::Scramble },
+        EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT => Projected { jamming: JammingType::Disrupt },
+        EFFECT_WARP_DISRUPT_SPHERE => Interdiction,
         EFFECT_ENTOSIS_LINK => Entosis,
         EFFECT_SNOWBALL_LAUNCHING => return None,
         EFFECT_INDUSTRIAL_ITEM_COMPRESSION => Compression,
         EFFECT_CLONE_RESPAWN_BAY => return None,
-        EFFECT_MICRO_JUMP_PORTAL => return None,
+        EFFECT_MICRO_JUMP_PORTAL => MicroJumpField,
         EFFECT_MICRO_JUMP_PORTAL_CAPITAL => return None,
-        EFFECT_COMMAND_BURST_ARMOR => return None,
-        EFFECT_COMMAND_BURST_SHIELD => return None,
-        EFFECT_COMMAND_BURST_SKIRMISH => return None,
-        EFFECT_COMMAND_BURST_INFO => return None,
-        EFFECT_COMMAND_BURST_MINING => return None,
+        EFFECT_MODULE_BONUS_BREACHER_POD_DAMAGE_CONTROL => BreachControl,
+        EFFECT_COMMAND_BURST_ARMOR => CommandBurst { family: CommandBurstFamily::Armor },
+        EFFECT_COMMAND_BURST_SHIELD => CommandBurst { family: CommandBurstFamily::Shield },
+        EFFECT_COMMAND_BURST_SKIRMISH => CommandBurst { family: CommandBurstFamily::Skirmish },
+        EFFECT_COMMAND_BURST_INFO => CommandBurst { family: CommandBurstFamily::Information },
+        EFFECT_COMMAND_BURST_MINING => CommandBurst { family: CommandBurstFamily::Mining },
         EFFECT_TITAN_EFFECT_GENERATOR => return None,
         EFFECT_SIEGE_MODE => return None,
         EFFECT_TRIAGE_MODE => return None,
         EFFECT_TRIAGE_MODE_7 => return None,
         EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE => Propulsion,
         EFFECT_BASTION |
-        EFFECT_SACRIBIS_BASTION => Modifiers,
+        EFFECT_SACRIBIS_BASTION |
+        EFFECT_INDUSTRIAL_COMPACT_CORE |
+        EFFECT_INDUSTRIAL_CORE |
+        EFFECT_SIEGE |
+        EFFECT_TRIAGE |
+        EFFECT_STELLIAN_TRIAGE => Modifiers,
         id if id == EFFECT_ONLINE as i32 => Online,
         EFFECT_CYNO_GENERATION |
         EFFECT_CLONE_JUMP_ACCEPTING |
-        EFFECT_INDUSTRIAL_COMPACT_CORE |
-        EFFECT_INDUSTRIAL_CORE |
         EFFECT_JUMP_PORTAL |
-        EFFECT_JUMP_PORTAL_BO |
-        EFFECT_SIEGE |
-        EFFECT_TRIAGE |
-        EFFECT_STELLIAN_TRIAGE |
-        EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT |
-        EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT => return None,
+        EFFECT_JUMP_PORTAL_BO => return None,
         _ if has_modifiers => Modifiers,
         _ => return None,
     })

@@ -4,7 +4,7 @@
 //! invalid dispatch returns internal errors, and unexpected cleanup logs a warning.
 //! Effect animations are published through the system's ordered scene channel.
 use super::parameters::{direct_damage_weapon, MasterPacket, MemberInputs, MemberPacket};
-use super::{EffectKind, repair, mining, capacitor, projected, range, ecm, aoe, bombs, vorton, cloak, mjd, compression, tractor, scan, targeting, salvage, defenders};
+use super::{EffectKind, breach_control, command_burst, repair, mining, capacitor, projected, range, ecm, aoe, bombs, vorton, cloak, mjd, mjfg, compression, tractor, scan, targeting, salvage, defenders, interdiction, probes};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::lifecycle::{Module, Cycle, CycleOutcome, charge_kind, UE_TYPEID};
 use super::fx::weapon_fx;
@@ -13,8 +13,8 @@ use super::weapons::{bank, consume_charge, empty_charge, fire_missile, fire_turr
 use crate::services::combat::{state, Ctx};
 use crate::services::combat::targeting_charges::targets_of;
 use crate::services::fit::{Fit, Key};
-use crate::services::{user_error, CallError};
-use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE};
+use crate::services::{user_error, notify_error, CallError};
+use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_VALID_TARGET_WHITELIST, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE};
 use infinity_core::messages;
 use crate::space::{special_fx, FxModule, System, MODE_WARP, system::presentation::FxRetention};
 use marshal::Value;
@@ -48,7 +48,7 @@ async fn remote_repair(cx: &Ctx, cycle: &mut Cycle, layer: usize) -> Result<Cycl
             || !targets_of(character).contains(&target) { return false; }
         let Some((ship, victim)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return false; };
         if ship.char_id != Some(character) || ship.mode == MODE_WARP || victim.mode == MODE_WARP || victim.char_id != pilot
-            || crate::space::sovereignty::links::assistance_blocked(s, target) { return false; }
+            || crate::space::combat::assistance_blocked(s, target) { return false; }
         let category = sde.types.get(victim.type_id).and_then(|t| t.category_id);
         if category != Some(CATEGORY_SHIP) && !(category == Some(infinity_core::consts::CATEGORY_ENTITY) && s.is_npc(target))
             && !(category == Some(infinity_core::consts::CATEGORY_DRONE) && s.drone(target).is_some()) { return false; }
@@ -88,6 +88,7 @@ async fn defender_cycle(cx: &Ctx, cycle: &mut Cycle) -> Result<Option<CycleOutco
                 charge: inputs.charge, raw: inputs.raw, aoe_cloud: inputs.aoe_cloud,
                 aoe_velocity: inputs.aoe_velocity, drf: inputs.drf, velocity: inputs.velocity,
                 flight_time_ms: inputs.flight_time_ms,
+                dot: inputs.dot,
             }
         };
         let Some(attempt) = super::lifecycle::combat_source::prepare_combat_source(cycle, module.id, Some(module.type_id)).await? else {
@@ -111,6 +112,13 @@ async fn defender_cycle(cx: &Ctx, cycle: &mut Cycle) -> Result<Option<CycleOutco
 }
 
 pub(super) async fn on_cycle_start(cx: &Ctx, cycle: &mut Cycle, charged: bool) -> Result<CycleOutcome, CallError> {
+    if cycle.effect.festival.is_some() {
+        let outcome = super::festival::start(cx, cycle).await?;
+        if matches!(outcome, CycleOutcome::Continue) && cycle.cycles == 0 {
+            weapon_fx(cx, &cycle.modules, &cycle.effect, cycle.target, cycle.charge_type, true, cycle.duration_ms, cycle.repeat, cycle.modules[0].id, &cycle.stop, FxRetention::Transient, Value::None);
+        }
+        return Ok(outcome);
+    }
     if let Some(outcome) = defender_cycle(cx, cycle).await? { return Ok(outcome); }
     use EffectKind::*;
     let outcome = match cycle.effect.kind {
@@ -283,17 +291,40 @@ pub(super) async fn on_cycle_start(cx: &Ctx, cycle: &mut Cycle, charged: bool) -
         Smartbomb => aoe::start(cx, cycle).await,
         Bomb => bombs::start(cx, cycle).await,
         Vorton => vorton::start(cx, cycle).await,
-        MicroJumpDrive => mjd::start(cx, cycle).await,
+        MicroJumpDrive | MicroJumpField => mjd::start(cx, cycle).await,
         Cloak => cloak::start(cx, cycle).await,
         Compression => compression::start(cx, cycle).await,
         Tractor => tractor::start(cx, cycle).await,
         CargoScan | ShipScan | SurveyScan => scan::start(cx, cycle).await,
         AutoTarget | PassiveTarget => targeting::start(cx, cycle).await,
         Salvage => salvage::start(cx, cycle).await,
-        kind @ (Entosis | ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle start kind: {kind:?}"))),
+        CommandBurst { .. } => command_burst::start(cx, cycle).await,
+        BreachControl => breach_control::start(cx, cycle).await,
+        Interdiction => interdiction::start(cx, cycle).await,
+        ProbeLaunch => probes::start(cx, cycle).await,
+        kind @ (Entosis | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle start kind: {kind:?}"))),
     }?;
     Ok(outcome)
 }
+/// Ship-mode admission beyond the generic activation checks: refuse a start
+/// while the ship warps, while the pilot or ship record is missing or stale,
+/// while the combat record is not live, or under a real module cloak. The
+/// caller-supplied target is normalized away upstream, so a mode never
+/// anchors a target.
+pub(super) async fn ship_mode_admission(cx: &Ctx) -> Result<(), CallError> {
+    let (ship, character) = (cx.ship_id, cx.char_id);
+    let (warping, absent, unlive, cloaked) = cx.world.with(cx.system_id, move |s| {
+        (s.ball(ship).is_none_or(|b| b.mode == MODE_WARP),
+            s.pilot_ball(character).is_none_or(|b| b.id != ship),
+            !matches!(s.combat_phase(ship), Some(crate::space::combat::CombatPhase::Live)),
+            s.has_module_cloak(ship))
+    }).await.unwrap_or((true, true, true, true));
+    if warping { return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![])); }
+    if absent || unlive { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
+    if cloaked { return Err(notify_error(messages::effects::MODE_ACTION_BLOCKED)); }
+    Ok(())
+}
+
 
 pub(super) async fn on_cycle_end(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
     use EffectKind::*;
@@ -307,11 +338,12 @@ pub(super) async fn on_cycle_end(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOut
         }
         Mining => Ok(mining::end(cx, cycle).await),
         MicroJumpDrive => mjd::end(cx, cycle).await,
+        MicroJumpField => mjfg::end(cx, cycle).await,
         Salvage => salvage::end(cx, cycle).await,
         CargoScan | ShipScan | SurveyScan => scan::end(cx, cycle).await,
         SuperWeapon => super::super_weapon::end(cx, cycle).await,
-        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer | Smartbomb | Vorton | Cloak | Tractor | AutoTarget | PassiveTarget | Bomb | Compression | Entosis => Ok(CycleOutcome::Continue),
-        kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle end kind: {kind:?}"))),
+        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer | Smartbomb | Vorton | Cloak | Tractor | AutoTarget | PassiveTarget | Bomb | Compression | Entosis | CommandBurst { .. } | BreachControl | Interdiction | ProbeLaunch => Ok(CycleOutcome::Continue),
+        kind @ (Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle end kind: {kind:?}"))),
     }
 }
 
@@ -342,16 +374,18 @@ pub(super) fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
         }
         Cloak => cloak::stop(s, cx, cycle),
         Compression => compression::stop(s, cx, cycle),
+        BreachControl => s.retire_fx_activation(cycle.modules[0].id, &cycle.stop),
         Tractor => tractor::stop(s, cx, cycle),
         CargoScan | ShipScan | SurveyScan => scan::stop(s, cx, cycle),
+        Interdiction => interdiction::stop(s, cx, cycle),
         Entosis => {
             if cycle.cycles > 0 {
                 s.retire_fx_activation(cycle.modules[0].id, &cycle.stop);
             }
         }
         Salvage => salvage::stop(s, cx, cycle),
-        Modifiers | LocalRepair { .. } | MicroJumpDrive | AutoTarget | PassiveTarget => {}
-        kind @ (ProbeLaunch | Hacking | Online) => warn!(?kind, "unexpected unsupported effect cleanup"),
+        Modifiers | LocalRepair { .. } | MicroJumpDrive | MicroJumpField | AutoTarget | PassiveTarget | CommandBurst { .. } | ProbeLaunch => {}
+        kind @ (Hacking | Online) => warn!(?kind, "unexpected unsupported effect cleanup"),
     }
 }
 
@@ -360,6 +394,16 @@ pub(super) struct Activation {
     pub(super) module: Module,
     pub(super) target: Option<i64>,
     pub(super) aim: Option<super::parameters::SuperWeaponAim>,
+}
+
+/// Refuse an activation whose module's loaded slot has no committed charge.
+async fn require_loaded_charge(cx: &Ctx, module: &Module) -> Result<(), CallError> {
+    let (ship, module_id) = (cx.ship_id, module.id);
+    let effective = cx.world.with(cx.system_id, move |s| s.loaded_effective(ship, module_id)).await.flatten();
+    if effective.is_none_or(|(_, _, quantity, pending)| quantity <= 0 || pending) {
+        return Err(user_error(messages::MSG_NO_CHARGES, vec![("launcher".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
+    }
+    Ok(())
 }
 
 pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(), CallError> {
@@ -375,12 +419,21 @@ pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) ->
             }).await.unwrap_or((false, false));
             if in_warp { return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![])); }
             if !present { return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![])); }
-            let direct = direct_damage_weapon(fit, &activation.module, &activation.effect);
-            let (ship, module) = (cx.ship_id, activation.module.id);
-            let effective = cx.world.with(cx.system_id, move |s| s.loaded_effective(ship, module)).await.flatten();
-            if !direct && effective.is_none_or(|(_, _, quantity, pending)| quantity <= 0 || pending) {
-                return Err(user_error(messages::MSG_NO_CHARGES, vec![("launcher".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(activation.module.type_id as i64)]))]));
+            // validTargetWhitelist (a type-list ID) restricts what the module may
+            // engage; the breacher pod launcher uses it to admit ships and
+            // structures only. The client checks nothing locally, so the server
+            // refuses here (dogma/const.py attributeValidTargetWhitelist).
+            let whitelist = fit.value(Key::Module(activation.module.id), ATTR_VALID_TARGET_WHITELIST);
+            if whitelist > 0.0 && whitelist.fract() == 0.0 && whitelist < i64::MAX as f64 {
+                let sde = cx.world.sde().clone();
+                let allowed = cx.world.with(cx.system_id, move |s| s.ball(target).map(|ball| ball.type_id)).await.flatten()
+                    .and_then(|type_id| sde.types.get(type_id)
+                        .map(|data| sde.typelists.contains(whitelist as i64, type_id, data.group_id, data.category_id)))
+                    .unwrap_or(false);
+                if !allowed { return Err(notify_error(messages::effects::BREACHER_INVALID_TARGET)); }
             }
+            let direct = direct_damage_weapon(fit, &activation.module, &activation.effect);
+            if !direct { require_loaded_charge(cx, &activation.module).await?; }
             Ok(())
         }
         Projected { .. } => {
@@ -408,7 +461,7 @@ pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) ->
             let optimal = activation.effect.attribute(EffectAttribute::Range).map(|a| fit.value(key, a)).unwrap_or(0.0);
             let falloff = activation.effect.attribute(EffectAttribute::Falloff).map(|a| fit.value(key, a)).unwrap_or(0.0);
             let (target, _, _) = repair::target(cx, activation.target, optimal, falloff).await?;
-            if cx.world.with(cx.system_id, move |s| crate::space::sovereignty::links::assistance_blocked(s, target)).await.unwrap_or(true) {
+            if cx.world.with(cx.system_id, move |s| crate::space::combat::assistance_blocked(s, target)).await.unwrap_or(true) {
                 return Err(crate::services::notify_error(messages::effects::ENTOSIS_ASSISTANCE_BLOCKED));
             }
             Ok(())
@@ -422,18 +475,24 @@ pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) ->
             }
             Ok(())
         }
-        Modifiers | LocalRepair { .. } | FueledLocalRepair { .. } | Propulsion => Ok(()),
         Smartbomb => aoe::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Modifiers | LocalRepair { .. } | FueledLocalRepair { .. } | Propulsion | BreachControl => {
+            if super::active_cycle::ship_mode(activation.effect.id) { ship_mode_admission(cx).await?; }
+            Ok(())
+        }
         Bomb => bombs::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Vorton => vorton::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Cloak => cloak::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
-        MicroJumpDrive => mjd::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        MicroJumpDrive | MicroJumpField => mjd::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Compression => compression::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Tractor => tractor::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         CargoScan | ShipScan | SurveyScan => scan::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         AutoTarget | PassiveTarget => targeting::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Salvage => salvage::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Interdiction => interdiction::validate(cx, fit, activation),
         Entosis => super::entosis::validate(cx, fit, activation).await,
-        kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported activation kind: {kind:?}"))),
+        CommandBurst { .. } => require_loaded_charge(cx, &activation.module).await,
+        ProbeLaunch => { probes::validate(cx, fit, activation)?; require_loaded_charge(cx, &activation.module).await }
+        kind @ (Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported activation kind: {kind:?}"))),
     }
 }

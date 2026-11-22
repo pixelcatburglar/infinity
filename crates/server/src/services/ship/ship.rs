@@ -1,4 +1,4 @@
-//! Ship RPC routing for undocking, boarding, stored ships, fitting, configuration,
+//! Ship RPC routing for undocking, boarding, ejecting, stored ships, fitting, configuration,
 //! deployment, drones and persistent `GetDirtTimestamp`/`ResetDirtTimestamp`.
 //! `ballparkCommon/docking.py` defines NPC undock channels and initial velocity;
 //! `eve/client/script/ui/shared/fitting/cleanShipButton.py` uses ship cleaning.
@@ -102,6 +102,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "StoreVessel" => Some(super::stored::store(c, call).await),
         "BoardStoredShip" => Some(super::stored::board(c, call).await),
         "LaunchFromContainer" => Some(super::stored::launch(c, call).await),
+        "Eject" => Some(super::eject::eject(c, call).await),
         "AssembleShip" => Some(crate::services::fitting::ship::assemble(c, call).await),
         "CheckEnoughSubSystemToUndock" => Some(Ok(Value::Bool(true))),
         "GetDirtTimestamp" => Some(super::cleaning::get(c, call).await),

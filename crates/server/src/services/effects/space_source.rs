@@ -133,6 +133,13 @@ pub(crate) async fn apply(cx: &SourceContext<'_>, attempt: Option<PreparedCombat
             };
             crate::services::drones::mining::finish_cycle(cx.db, cx.world, cx.system, cx.drone.unwrap().clone(), cx.target.id, mining.values).await
         }
+        EffectKind::Salvage if matches!(cx.phase, DronePhase::End) && cx.drone.is_some() => {
+            let SourceInputs::DroneSalvage { range, bonus } = cx.inputs else {
+                return Err(CallError::Internal(anyhow::anyhow!("salvage phase captured without drone salvage inputs")));
+            };
+            crate::services::drones::salvage::finish_cycle(cx.db, cx.world, cx.system, cx.drone.unwrap().clone(), cx.target.clone(), *range, *bonus).await
+        }
+        EffectKind::Salvage if cx.drone.is_some() => Ok(()),
         EffectKind::Mining if matches!(cx.phase, DronePhase::Begin) && cx.drone.is_some() => Ok(()),
         EffectKind::Vorton => super::vorton::apply_source(cx, attempt).await,
         _ => {

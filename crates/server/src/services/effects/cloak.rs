@@ -5,6 +5,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use super::{EffectKind, lifecycle::{self, Cycle, CycleOutcome, Module}, parameters::MasterPacket, registry::Effect};
 use infinity_core::messages;
+
 use crate::services::{combat::{self, Ctx, targeting_charges::clear_locks_on}, fit::{Fit, Key}, notify_error, CallError};
 use crate::space::System;
 
@@ -12,16 +13,13 @@ use crate::space::System;
 const ATTR_CAN_CLOAK: i32 = 1163;
 /// dogma/const.py: attributeDisallowCloaking.
 const ATTR_DISALLOW_CLOAKING: i32 = 2454;
-/// dogma/const.py: attributeDisallowEarlyDeactivation.
-const ATTR_DISALLOW_EARLY_DEACTIVATION: i32 = 906;
 
 
 pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, _effect: &Effect, _target: Option<i64>) -> Result<(), CallError> {
     if fit.value(Key::Ship, ATTR_CAN_CLOAK) <= 0.0 || fit.value(Key::Ship, ATTR_DISALLOW_CLOAKING) > 0.0 {
         return Err(notify_error(messages::effects::CLOAK_UNSUITABLE));
     }
-    if combat::state().active.iter().any(|(&id, active)| active.char_id == cx.char_id && id != module.id
-        && fit.value(Key::Module(id), ATTR_DISALLOW_EARLY_DEACTIVATION) > 0.0) {
+    if super::active_cycle::early_deactivation_locked(fit, cx.char_id, module.id) {
         return Err(notify_error(messages::effects::CLOAK_UNSUITABLE));
     }
     let ship = cx.ship_id;
@@ -68,11 +66,17 @@ pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, C
     };
     let (reactivation, targeting) = (inputs.reactivation_ms, inputs.targeting_ms);
     let generation = cycle.stop.clone();
-    let ship = cx.ship_id;
+    let (ship, character) = (cx.ship_id, cx.char_id);
     let cleanup_cx = cx.clone();
     let result = cx.world.with(cx.system_id, move |s| {
         if crate::space::sovereignty::links::blocks(s, ship) {
             return Err(notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
+        }
+        // The effective early-deactivation lock is rechecked on the resident
+        // fit: a mode admitted after validation still blocks the cloak.
+        if s.resident_fit(ship, |fit, _|
+            super::active_cycle::early_deactivation_locked(fit, character, module)).unwrap_or(false) {
+            return Ok(false);
         }
         if s.cloak_obstructed(ship) { return Ok(false); }
         let current = combat::state().active.get(&module).is_some_and(|a| Arc::ptr_eq(&a.stop, &generation));
@@ -82,6 +86,8 @@ pub(super) async fn start(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, C
             !guard_generation.load(Ordering::Relaxed) && !s.cloak_obstructed(ship)
                 && !crate::space::sovereignty::links::blocks(s, ship)
                 && combat::state().active.get(&module).is_some_and(|a| Arc::ptr_eq(&a.stop, &guard_generation))
+                && !s.resident_fit(ship, |fit, _|
+                    super::active_cycle::early_deactivation_locked(fit, character, module)).unwrap_or(false)
         }, Some(Box::new(move |s| s.defer(async move {
             lifecycle::stop_offensive(&cleanup_cx, module).await;
             clear_locks_on(&cleanup_cx.world, cleanup_cx.system_id, cleanup_cx.ship_id, cleanup_cx.char_id);

@@ -3,12 +3,14 @@
 //! sampled physical reachability from game.items and the system actor. Shared-bay
 //! deposits preserve item ownership; whole takes acquire the subtree after pending
 //! reload settlement. Enacted corporation blueprint locks and pending vote-case
-//! reservations freeze originals inside a moving subtree. Loot rights, suspect
-//! flags and POS tower control are not modelled.
+//! reservations freeze originals inside a moving subtree. A hidden
+//! internal-modifier item is never a selected move root or destination flag and
+//! travels only inside its hull. Loot rights, suspect flags and POS tower
+//! control are not modelled.
 
 use super::access::{corporate_custody, custody_allowed, Container};
 use super::destination::{Custody, Destination};
-use super::is_fitting_flag;
+use super::{is_fitting_flag, is_internal_modifier_flag};
 use super::notifications::{notify_corp_item_change, notify_item_change};
 use super::reachability::{Endpoint, Reachability};
 use super::stacks::split_stack;
@@ -25,7 +27,32 @@ use crate::db::{Db, outbox::Notification};
 use crate::space::{NotifyTx, World};
 use std::sync::Arc;
 
-const FLAG_AUTOFIT: i32 = 0;
+pub(super) const FLAG_AUTOFIT: i32 = 0;
+
+/// The ordinary `Container::Item` default flag and the corporation-deliveries
+/// refusal shared by persistent movement and transient loot moves. Not used by
+/// the office/SAG-specific branches: they keep their own flag rules.
+pub(crate) fn item_destination_flag(destination_category: i64, requested: Option<i32>) -> Option<i32> {
+    match requested {
+        Some(flag) if flag == FLAG_CORP_DELIVERIES => None,
+        Some(flag) => Some(flag),
+        None => Some(if destination_category == i64::from(CATEGORY_SHIP) { FLAG_CARGO } else { FLAG_HANGAR }),
+    }
+}
+
+/// Classify a defaulted move flag for one source type: returns the flag a
+/// plain move stores plus whether a real fitting slot is required. A `true`
+/// result with flag `FLAG_AUTOFIT` is only the autofit request still owed a
+/// `free_slot` pick, never an already chosen slot.
+pub(crate) fn classify_move_flag(source_category: i64, defaulted_flag: i32) -> (i32, bool) {
+    if defaulted_flag == FLAG_AUTOFIT
+        && (source_category == i64::from(infinity_core::consts::CATEGORY_MODULE)
+            || source_category == i64::from(infinity_core::consts::CATEGORY_SUBSYSTEM)) {
+        return (FLAG_AUTOFIT, true);
+    }
+    if is_fitting_flag(defaulted_flag) { return (defaulted_flag, true); }
+    (if defaulted_flag == FLAG_AUTOFIT { FLAG_CARGO } else { defaulted_flag }, false)
+}
 
 pub(in crate::services) enum MoveEffect {
     Bank(super::super::combat::banks::BankStop),
@@ -86,7 +113,7 @@ async fn authorized_source(ex: &(impl Executor + ?Sized), sde: &Sde, item: &Item
     Ok((parent.group_id == i64::from(infinity_core::consts::GROUP_WRECK) || i32::try_from(parent.group_id).ok().is_some_and(|id| infinity_core::consts::CARGO_CONTAINER_GROUPS.contains(&id))).then_some(SourceProof::ForeignLoot))
 }
 
-async fn authorized_destination(ex: &(impl Executor + ?Sized), sde: &Sde, container: &Container, flag: Option<i32>, char_id: i64, station: Option<i64>, corporation: Option<i64>) -> Result<Option<(i64, i64, i32, bool)>, CallError> {
+pub(super) async fn authorized_destination(ex: &(impl Executor + ?Sized), sde: &Sde, container: &Container, flag: Option<i32>, char_id: i64, station: Option<i64>, corporation: Option<i64>) -> Result<Option<(i64, i64, i32, bool)>, CallError> {
     if flag == Some(FLAG_CORP_DELIVERIES) { return Ok(None); }
     match container {
         Container::Deliveries { .. } => Ok(None),
@@ -108,8 +135,7 @@ async fn authorized_destination(ex: &(impl Executor + ?Sized), sde: &Sde, contai
             }
             if corporate_custody(ex, Some(sde), *id).await?.is_some() { return Ok(None); }
             let Some(item) = load_items(ex, sde, ItemQuery::Id(*id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
-            let default = if item.category_id == CATEGORY_SHIP as i64 { FLAG_CARGO } else { FLAG_HANGAR };
-            let flag = flag.unwrap_or(default);
+            let Some(flag) = item_destination_flag(item.category_id, flag) else { return Ok(None) };
             // Foreign parents are provisional here; the combined reachability
             // and shared-lineage proof below decides whether they are usable.
             Ok(Some((*id, char_id, flag, false)))
@@ -226,6 +252,49 @@ pub(crate) async fn move_item(
     notify: impl FnMut(Notification) -> Result<(), CallError> + Send,
 ) -> Result<Option<i64>, CallError> {
     let char_id = identity.char_id;
+    // Transient endpoints are decided before any `game.items` read: an
+    // admitted NPC loot source takes the existing transaction, an admitted
+    // transient destination admits only another plain-loot source of the same
+    // actor, and everything else keeps the persistent path.
+    if let Some(system) = space_system {
+        let actor_identity = super::npc_loot::actor_identity(identity, Some(system));
+        let (destination_lookup, source_lookup) = {
+            let destination_id = match container { Container::Item(id) => Some(*id), _ => None };
+            world.with(system, move |s| (
+                destination_id.map(|id| s.npc_wreck_view(&actor_identity, id)),
+                s.npc_loot_source(&actor_identity, item_id, source),
+            )).await.unwrap_or((None, crate::space::system::npc_wrecks::NpcWreckLookup::Absent))
+        };
+        match source_lookup {
+            crate::space::system::npc_wrecks::NpcWreckLookup::Ready(npc) => {
+                return match destination_lookup {
+                    Some(crate::space::system::npc_wrecks::NpcWreckLookup::Ready(destination)) =>
+                        super::npc_loot::transient_move(world, &actor_identity, system, npc, destination, flag, qty).await,
+                    Some(crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim)) => {
+                        super::npc_loot::reconcile_busy(world, sde, claim).await;
+                        Err(super::npc_loot::busy())
+                    }
+                    _ => super::npc_loot::take(identity, db, world, sde, space_system, container, npc, source, flag, qty, notify).await,
+                };
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Denied => return Err(super::npc_loot::denied()),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                super::npc_loot::reconcile_busy(world, sde, claim).await;
+                return Err(super::npc_loot::busy());
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Absent => match destination_lookup {
+                // Persistent player property is never deposited into a
+                // transient root, no matter which caller asked.
+                Some(crate::space::system::npc_wrecks::NpcWreckLookup::Ready(_)) => return Err(super::npc_loot::denied()),
+                Some(crate::space::system::npc_wrecks::NpcWreckLookup::Denied) => return Err(super::npc_loot::denied()),
+                Some(crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim)) => {
+                    super::npc_loot::reconcile_busy(world, sde, claim).await;
+                    return Err(super::npc_loot::busy());
+                }
+                _ => {}
+            },
+        }
+    }
     let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
     let station = identity.station_id;
     let system = space_system;
@@ -286,8 +355,7 @@ pub(crate) async fn move_item(
         if let Some((sys, _)) = fences.membership(item.location_id) { engage_ships.push((sys, item.location_id)); }
     }
     let destination_fitting = matches!(container, Container::Item(_))
-        && (is_fitting_flag(destination_flag) || (destination_flag == FLAG_AUTOFIT
-            && (item.category_id == i64::from(infinity_core::consts::CATEGORY_MODULE) || item.category_id == i64::from(infinity_core::consts::CATEGORY_SUBSYSTEM))));
+        && classify_move_flag(item.category_id, destination_flag).1;
     if destination_fitting {
         if let Some((sys, _)) = fences.membership(location) { engage_ships.push((sys, location)); }
     }
@@ -314,8 +382,7 @@ pub(crate) async fn move_item(
             let destination_parent = destination_parent.clone();
             Box::pin(async move {
                 let flag = destination_flag;
-                let destination_fitting = is_fitting_flag(flag) || (flag == FLAG_AUTOFIT
-                    && (item.category_id == i64::from(infinity_core::consts::CATEGORY_MODULE) || item.category_id == i64::from(infinity_core::consts::CATEGORY_SUBSYSTEM)));
+                let destination_fitting = classify_move_flag(item.category_id, flag).1;
                 let source_fitting = is_fitting_flag(item.flag_id);
                 use crate::dao::items::parent_locks::{LockRequest, LockStrength};
                 let mut requests = vec![LockRequest { item_id: item.item_id, strength: LockStrength::Update }];
@@ -386,7 +453,7 @@ pub(crate) async fn move_item(
                 let flag = if flag == FLAG_AUTOFIT && destination_fitting {
                     super::super::effects::fitting::free_slot(tx, sde.clone(), owner, location, item.item_id, item.type_id).await?
                         .ok_or_else(|| notify_error(messages::fitting::SLOTS))?
-                } else if flag == FLAG_AUTOFIT { FLAG_CARGO } else { flag };
+                } else { classify_move_flag(item.category_id, flag).0 };
                 if custody == Custody::TakeSubtree && item.location_id == location && item.flag_id == flag {
                     destination.item_owner = item.owner_id;
                     custody = Custody::Preserve;
@@ -422,6 +489,9 @@ pub(crate) async fn move_item(
                     Some((before, changed))
                 } else { None };
                 if online {
+                    // A live mode record refuses the implicit offline step of
+                    // unfitting before the online transition consumes it.
+                    super::super::effects::active_cycle::removal_refusal(item.item_id)?;
                     super::super::effects::online::set_online_core(tx, &sde, &policy, outbox, &fences, item.location_id, item.item_id, false).await?;
                 }
                 destination.flag = flag;
@@ -488,14 +558,23 @@ pub(in crate::services) async fn move_core<X: Send>(
     audience: Option<&super::notifications::ResolvedAudience>, actor: i64,
 ) -> Result<Option<i64>, CallError> {
     let Destination { item_owner: owner, capacity_owner, location, flag } = *destination;
+    // A hidden internal-modifier item is never a selected move root or a
+    // destination flag; descendants still travel with their whole hull.
+    if is_internal_modifier_flag(item.flag_id) || is_internal_modifier_flag(flag) {
+        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+    }
     let mut guarded = if take.is_none() && (item.singleton || custody == Custody::TakeSubtree) {
         inventory_dao::descendants(tx, &[item.item_id]).await.map_err(db_err)?
     } else { vec![item.item_id] };
-    // A module with a live duration-bounded activation record cannot leave its
-    // fitted location: running or pending records refuse as activated, an
-    // unexpired cooling record refuses with its remaining delay. Same-location
-    // fitting-flag moves are not refused.
-    if is_fitting_flag(item.flag_id) && (item.location_id != location || !is_fitting_flag(flag)) {
+    // A module with a live tracked activation record cannot leave its fitted
+    // location: running or pending records refuse as activated, an unexpired
+    // cooling record refuses with its remaining delay. Same-location
+    // fitting-flag moves are not refused for ordinary cycles, but a live ship
+    // mode additionally refuses a same-ship slot or owner change because the
+    // admitted record binds the module's fitted identity.
+    if is_fitting_flag(item.flag_id) && (item.location_id != location || !is_fitting_flag(flag)
+        || (super::super::effects::active_cycle::mode_subject(item.item_id)
+            && (item.flag_id != flag || item.owner_id != owner))) {
         super::super::effects::active_cycle::removal_refusal(item.item_id)?;
     }
     if !guarded.contains(&item.item_id) { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
@@ -525,6 +604,7 @@ pub(in crate::services) async fn move_core<X: Send>(
         }
         let receipts = super::super::combat::reload_recovery::settle_subtree(tx, sde, outbox, item.item_id, location, actor, audience, locks, preparation).await?;
         created.extend(receipts.iter().filter_map(|receipt| receipt.created.as_ref().map(|row| row.item.item_id)));
+        preparation.record_receipts(receipts);
         transfer_closure = inventory_dao::descendants(tx, &[item.item_id]).await.map_err(db_err)?;
         if preparation.closure().iter().any(|id| !transfer_closure.contains(id))
             || transfer_closure.iter().any(|id| !preparation.closure().contains(id) && !created.contains(id)) {

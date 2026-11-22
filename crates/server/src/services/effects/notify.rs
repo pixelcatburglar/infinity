@@ -2,6 +2,8 @@
 //! Payloads use runtime effect and item data; EWAR slots follow client
 //! dogma/effects/GetEwarTypeByEffectID and buffBarConst. Jam start times are
 //! FILETIME and durations are milliseconds. Scheduling and delivery are elsewhere.
+//! The dbuff tracker replaces its whole state per `OnDbuffUpdated`, and the
+//! source pilot hears one `OnFleetBoosted` count per pulse.
 //! Scan result stack quantities are projected to the client display limit;
 //! scanned inventory stays exact.
 
@@ -129,6 +131,22 @@ fn attribute_change_at(owner: i64, item: Value, attribute: i32, new: Value, old:
         old,
         Value::None,
     ])
+}
+
+/// dbuffClient tracker `OnDbuffUpdated(shipID, [(collectionID, (value, expiryTime)), ...])`:
+/// the ship's complete current state, sorted by collection by the actor read;
+/// expiry is FILETIME or None for an untimed source; an empty list clears the
+/// client state.
+pub(crate) fn command_burst_dbuff_updated(ship_id: i64, entries: &[(i32, f64, Option<i64>)]) -> Vec<Value> {
+    vec![Value::Int(ship_id), Value::list(entries.iter().map(|&(collection, value, expiry_ms)| Value::tuple([
+        Value::Int(i64::from(collection)),
+        Value::tuple([Value::Float(value), expiry_ms.map_or(Value::None, |ms| Value::Int(crate::client::filetime_from_unix_ms(ms)))]),
+    ])))]
+}
+
+/// dbuffClient `OnFleetBoosted(moduleTypeID, numBoosted)` for the source pilot only.
+pub(crate) fn command_burst_fleet_boosted(module_type_id: i32, num_boosted: i64) -> Vec<Value> {
+    vec![Value::Int(i64::from(module_type_id)), Value::Int(num_boosted)]
 }
 
 /// Client dogma heat-source modifier connection event.

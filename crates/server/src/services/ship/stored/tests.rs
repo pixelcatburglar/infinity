@@ -2,6 +2,8 @@
 mod recovery;
 mod settlement;
 
+#[cfg(feature = "tests-effects")]
+mod mode_exit;
 use infinity_core::consts::{CATEGORY_SHIP, FLAG_SHIP_HANGAR, GROUP_CAPSULE, GROUP_SOLAR_SYSTEM, TYPE_CAPSULE};
 use infinity_core::consts::dogma::{ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SHIP_MAINTENANCE_BAY_CAPACITY};
 use crate::dao::items::{creation, loading::{load_items, ItemQuery}, ship_configuration::{self, Patch}, space_ships::FreeShip};
@@ -20,22 +22,32 @@ struct BayFixture {
 }
 
 impl BayFixture {
-    async fn new() -> Self {
-        let mut f = Fixture::new().await;
+    async fn new() -> Self { Self::with_pair(None).await }
+
+    async fn with_pair(pair: Option<(i32, i32)>) -> Self {
+        let mut f = Box::pin(Fixture::new()).await;
         let system_data = f.sde.map.systems().find(|s| s.constellation_id.is_some() && s.region_id.is_some()).expect("SDE system hierarchy");
         let (constellation, region) = (system_data.constellation_id.unwrap(), system_data.region_id.unwrap());
         crate::dao::characters::ship::location(&f.db, f.owner, f.system, constellation, region).await.unwrap();
-        let host_type = f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
-            && t.attribute(ATTR_SHIP_MAINTENANCE_BAY_CAPACITY).is_some_and(|v| v.is_finite() && v > 0.0)
-            && super::super::balls::radius(&f.sde, t.type_id).is_ok()).expect("SDE maintenance bay host");
-        let capacity = host_type.attribute(ATTR_SHIP_MAINTENANCE_BAY_CAPACITY).unwrap();
-        let host_kind = host_type.type_id;
-        let kind = f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
-            && t.type_id != host_kind && t.group_id != Some(GROUP_CAPSULE) && t.volume.is_some_and(|v| v > 0.0 && v <= capacity)
-            && crate::services::inventory::holds::accepts(&f.sde, FLAG_SHIP_HANGAR, t.type_id)
-            && super::super::balls::radius(&f.sde, t.type_id).is_ok() && f.sde.is_tradable(t.type_id)
-            && ATTR_REQUIRED_SKILLS.iter().zip(ATTR_REQUIRED_SKILL_LEVELS).any(|(&skill, level)| t.attribute(skill).unwrap_or(0.0) > 0.0 && t.attribute(level).unwrap_or(0.0) > 0.0))
-            .expect("tradable SDE ship fitting maintenance bay").type_id;
+        let (host_kind, kind) = if let Some((hull, host)) = pair {
+            let hull_volume = f.sde.types.get(hull).and_then(|ty| ty.volume).expect("selected hull volume");
+            let host_capacity = f.sde.types.get(host).and_then(|ty| ty.attribute(ATTR_SHIP_MAINTENANCE_BAY_CAPACITY)).expect("selected host capacity");
+            assert!(host_capacity.is_finite() && host_capacity >= hull_volume, "selected host contains the hull without an override");
+            (host, hull)
+        } else {
+            let host_type = f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
+                && t.attribute(ATTR_SHIP_MAINTENANCE_BAY_CAPACITY).is_some_and(|v| v.is_finite() && v > 0.0)
+                && super::super::balls::radius(&f.sde, t.type_id).is_ok()).expect("SDE maintenance bay host");
+            let capacity = host_type.attribute(ATTR_SHIP_MAINTENANCE_BAY_CAPACITY).unwrap();
+            let host_kind = host_type.type_id;
+            let kind = f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
+                && t.type_id != host_kind && t.group_id != Some(GROUP_CAPSULE) && t.volume.is_some_and(|v| v > 0.0 && v <= capacity)
+                && crate::services::inventory::holds::accepts(&f.sde, FLAG_SHIP_HANGAR, t.type_id)
+                && super::super::balls::radius(&f.sde, t.type_id).is_ok() && f.sde.is_tradable(t.type_id)
+                && ATTR_REQUIRED_SKILLS.iter().zip(ATTR_REQUIRED_SKILL_LEVELS).any(|(&skill, level)| t.attribute(skill).unwrap_or(0.0) > 0.0 && t.attribute(level).unwrap_or(0.0) > 0.0))
+                .expect("tradable SDE ship fitting maintenance bay").type_id;
+            (host_kind, kind)
+        };
         let (host_owner, host_pilot) = f.add_pilot().await;
         crate::dao::characters::ship::location(&f.db, host_owner, f.system, constellation, region).await.unwrap();
         let pos = [0.0; 3];
@@ -45,6 +57,8 @@ impl BayFixture {
         f.world.remove_ball(f.system, f.ship).await;
         f.ship = old;
         f.client.session.apply(vec![("shipid", Value::Int(old)), ("userid", Value::Int(f.account)), ("solarsystemid2", Value::Int(f.system))]);
+        f.world.unregister_pilot_generation(f.owner, None);
+        crate::space::session_change::test_support::register_elapsed(&f.world, f.owner, f.client.notify_tx.clone());
         let online = infinity_core::session::OnlineSession::from_session(&f.client.session).expect("fixture online session");
         f.world.set_online_session(f.owner, Some(online));
         let row = FreeShip { item_id: old, type_id: kind, owner_id: f.owner, corporation_id: 1, alliance_id: -1, pos };
@@ -97,8 +111,10 @@ impl BayFixture {
         let (viewer, _) = self.f.add_pilot().await;
         for owner in [self.f.owner, self.host_owner, viewer] {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            if owner == self.f.owner { self.f.client.notify_tx = tx.clone(); }
-            self.f.world.register_pilot(owner, tx);
+            if owner == self.f.owner {
+                self.f.client.notify_tx = tx.clone();
+                crate::space::session_change::test_support::register_elapsed(&self.f.world, owner, tx);
+            } else { self.f.world.register_pilot(owner, tx); }
             if owner == self.f.owner {
                 let online = infinity_core::session::OnlineSession::from_session(&self.f.client.session).expect("fixture online session");
                 self.f.world.set_online_session(owner, Some(online));
@@ -240,7 +256,7 @@ async fn assert_cargo(f: &BayFixture, id: i64, ship: i64, owner: i64) {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn store_switches_to_capsule_and_removes_stored_world_hull() {
     let mut b = BayFixture::new().await;
-    let result = catch_scenario(async {
+    let result = catch_scenario(Box::pin(async {
     let (old, host, owner, db) = (b.f.ship, b.host, b.f.owner, b.f.db.clone());
     let content = cargo(&b, old, owner).await;
     state(character_before_items(&db, owner, &[old, host], async { b.call("StoreVessel", &[Value::Int(host)]).await.unwrap() }).await);
@@ -253,7 +269,7 @@ async fn store_switches_to_capsule_and_removes_stored_world_hull() {
     assert_cargo(&b, content, old, owner).await;
     assert!(crate::dao::items::dogma::overrides(&b.f.db, old).await.unwrap().iter().any(|a| a.attribute_id == infinity_core::consts::dogma::ATTR_ARMOR_DAMAGE && a.value == 1.0));
     selected(&b, capsule).await;
-    }).await;
+    })).await;
     b.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
@@ -262,7 +278,7 @@ async fn store_switches_to_capsule_and_removes_stored_world_hull() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn board_stored_takes_hull_and_retains_previous_unpiloted() {
     let mut b = BayFixture::new().await;
-    let result = catch_scenario(async {
+    let result = catch_scenario(Box::pin(async {
     let (old, host, owner, db) = (b.f.ship, b.host, b.f.owner, b.f.db.clone());
     let target = b.stored(b.host_owner).await;
     let content = cargo(&b, target, b.host_owner).await;
@@ -276,7 +292,7 @@ async fn board_stored_takes_hull_and_retains_previous_unpiloted() {
     assert_eq!(old_ball.char_id, None);
     assert!(!old_ball.interactive);
     selected(&b, target).await;
-    }).await;
+    })).await;
     b.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }
@@ -285,7 +301,7 @@ async fn board_stored_takes_hull_and_retains_previous_unpiloted() {
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run serially"]
 async fn launch_stored_takes_hull_without_switching_ego() {
     let mut b = BayFixture::new().await;
-    let result = catch_scenario(async {
+    let result = catch_scenario(Box::pin(async {
     let (old, host, owner, db) = (b.f.ship, b.host, b.f.owner, b.f.db.clone());
     let target = b.stored(b.host_owner).await;
     let content = cargo(&b, target, b.host_owner).await;
@@ -299,7 +315,7 @@ async fn launch_stored_takes_hull_without_switching_ego() {
     assert_eq!((ball.owner_id, ball.char_id, ball.interactive), (owner, None, false));
     assert!(ball.pos.iter().all(|v| v.is_finite()));
     selected(&b, old).await;
-    }).await;
+    })).await;
     b.cleanup().await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
 }

@@ -224,6 +224,8 @@ impl Config {
         override_env!("MINING_PROGRESS_BATCH_ROWS", config.mining.progress_batch_rows);
         override_env!("COMBAT_PROGRESS_KEY_CAPACITY", config.combat.progress_key_capacity);
         override_env!("COMBAT_PROGRESS_PENDING_BATCHES", config.combat.progress_pending_batches);
+        override_env!("COMBAT_NPC_WRECK_ID_BLOCK_SIZE", config.combat.npc_wreck_id_block_size);
+        override_env!("COMBAT_NPC_WRECK_ID_RETRY_MS", config.combat.npc_wreck_id_retry_ms);
         override_env!("DAILY_GOALS_HISTORY_PAGE_MAXIMUM", config.game.daily_goals.history_page_maximum);
         override_env!("DAILY_GOALS_ROLLOVER_BATCH_SIZE", config.game.daily_goals.rollover_batch_size);
         if let Some(value) = env("DAILY_GOALS_QA_ACCOUNT_IDS") {

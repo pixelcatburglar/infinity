@@ -265,6 +265,15 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
     } else {
         Vec::new()
     };
+    // The actor's running adaptive-armor profile primes the module operand
+    // and ship resonance rows a cold fit cannot know; an absent state leaves
+    // the cold baseline.
+    let reactive_armor = if let Some(system) = system {
+        c.world.with(system, move |s| s.reactive_armor_readout(ship_id)).await.flatten()
+    } else {
+        None
+    };
+    let candidates = fit.fitting_candidates(&fit);
     for item in items {
         let mut attrs = type_attributes(&c.sde, item.type_id);
         // Supply fitted values for ship and module attributes, including HUD maxima.
@@ -277,8 +286,30 @@ pub(super) async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallErr
         };
         if let Some(key) = key {
             overlay_overrides(&mut attrs, fit.overrides(key).iter().copied());
+            // A runtime collection can modify an attribute the type row and
+            // overrides do not carry. The candidate list is the existing
+            // generic enumeration; its entry is only a slot for wire_value.
+            let start = candidates.partition_point(|(candidate, _)| candidate < &key);
+            let end = candidates[start..].partition_point(|(candidate, _)| candidate == &key);
+            for (_, attribute) in &candidates[start..start + end] {
+                attrs.entry(i64::from(*attribute)).or_insert(0.0);
+            }
             for (attr, value) in attrs.iter_mut() {
                 *value = fit.wire_value(key, *attr as i32);
+            }
+            if let Some((module, module_values, ship_values)) = reactive_armor {
+                let overlay = if item.item_id == module {
+                    Some(module_values)
+                } else if item.item_id == ship_id {
+                    Some(ship_values)
+                } else {
+                    None
+                };
+                if let Some(values) = overlay {
+                    for (index, attr) in fit::reactive_armor::ARMOR_RESONANCE.iter().enumerate() {
+                        attrs.insert(*attr as i64, values[index]);
+                    }
+                }
             }
         }
         let mut active = if online.contains(&item.item_id) {

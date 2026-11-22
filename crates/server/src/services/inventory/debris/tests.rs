@@ -4,7 +4,7 @@
 use super::*;
 use crate::client::Client;
 use crate::db::Db;
-use crate::services::combat::groups_health::spawn_wreck;
+use crate::services::combat::groups_health::wreck::{debris_ball, DEBRIS_DEFAULT_RADIUS};
 use crate::services::slash::tests::support::{register_online, rpc, wire};
 use crate::services::tests::{client, fixture::{self, Fixture}};
 use crate::space::{Ball, WarpState, MODE_STOP, V3};
@@ -19,6 +19,17 @@ fn ball(id: i64, type_id: i32, owner: i64, character: Option<i64>, pos: V3, vel:
         follow_id: 0, follow_range: 0.0, free, global: false, massive: true, interactive: false,
         warp: WarpState::default(), last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new() }
+}
+
+/// A persistent debris root: a real `game.items` row plus the shared debris
+/// ball, exactly the GM `/container` path. These fixtures insert persistent
+/// children under the root, so a transient actor-owned wreck would corrupt
+/// the fixture; nothing transient is allowed here.
+async fn persistent_debris(db: &Db, world: &World, sde: &Sde, system: i64, type_id: i32, owner: i64, pos: V3, empty: bool) -> i64 {
+    let id = crate::dao::items::creation::positioned(db, type_id, owner, system, pos).await.unwrap();
+    let radius = sde.types.get(type_id).and_then(|t| t.radius).unwrap_or(f64::from(DEBRIS_DEFAULT_RADIUS)) as f32;
+    world.add_ship(system, debris_ball(id, type_id, owner, 1, pos, radius, None, empty, crate::space::now_ms())).await.unwrap();
+    id
 }
 
 async fn space_fixture() -> (Db, Arc<Sde>, Client, tokio::net::TcpStream, Fixture, i64, i64, i32) {
@@ -51,17 +62,17 @@ async fn slash_cleanup_selects_sampled_debris_and_persists_whole_trees() {
         && !sde.typelists.is_untrashable(t.type_id, t.group_id.unwrap_or_default(), t.category_id.unwrap_or_default())).unwrap().type_id;
     let loot_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_MODULE)).unwrap().type_id;
     let foreign = fixture::create(&db).await.unwrap();
-    let near = spawn_wreck(&db, &c.world, system, wreck_type, f.character, 1, [1_000.0, 0.0, 0.0], None, None).await.unwrap();
+    let near = persistent_debris(&db, &c.world, &sde, system, wreck_type, f.character, [1_000.0, 0.0, 0.0], false).await;
     let nested = crate::dao::items::creation::rookie_ship(&db, container_type, f.character, near, 0).await.unwrap();
     let loot_a = crate::dao::items::transfers::insert(&db, loot_type, f.character, near, 0, 1).await.unwrap();
     let loot_b = crate::dao::items::transfers::insert(&db, loot_type, foreign.character, nested, 0, 1).await.unwrap();
-    let edge = spawn_wreck(&db, &c.world, system, container_type, foreign.character, 1, [20_000.0, 0.0, 0.0], None, None).await.unwrap();
-    let outside = spawn_wreck(&db, &c.world, system, wreck_type, f.character, 1, [20_001.0, 0.0, 0.0], None, None).await.unwrap();
-    let far = spawn_wreck(&db, &c.world, system, wreck_type, f.character, 1, [1e6, 0.0, 0.0], None, None).await.unwrap();
+    let edge = persistent_debris(&db, &c.world, &sde, system, container_type, foreign.character, [20_000.0, 0.0, 0.0], true).await;
+    let outside = persistent_debris(&db, &c.world, &sde, system, wreck_type, f.character, [20_001.0, 0.0, 0.0], true).await;
+    let far = persistent_debris(&db, &c.world, &sde, system, wreck_type, f.character, [1e6, 0.0, 0.0], true).await;
     let sentinel = crate::dao::items::creation::positioned(&db, ship_type, f.character, system, [2_000.0, 0.0, 0.0]).await.unwrap();
     c.world.add_ship(system, ball(sentinel, ship_type, f.character, None, [2_000.0, 0.0, 0.0], [0.0; 3], false)).await.unwrap();
     let other_system = sde.map.systems().nth(1).unwrap().solar_system_id;
-    let other = spawn_wreck(&db, &c.world, other_system, wreck_type, f.character, 1, [0.0; 3], None, None).await.unwrap();
+    let other = persistent_debris(&db, &c.world, &sde, other_system, wreck_type, f.character, [0.0; 3], true).await;
     let mut foreign_rx = register_online(&c.world, OnlineSession { character_id: foreign.character, user_id: Some(foreign.account),
         session_id: 2, ship_id: None, station_id: None, system_id: Some(system), corporation_id: None, alliance_id: None,
         faction_id: None, fleet_id: None, role: 0, corporation_role: 0 });
@@ -86,7 +97,7 @@ async fn slash_cleanup_selects_sampled_debris_and_persists_whole_trees() {
     s.insert(ball(celestial, wreck_type, 1, None, sampled, [0.0; 3], false));
     s.insert(ball(3, ship_type, f.character, Some(f.character), sampled, [0.0; 3], false));
     let identity = Identity { char_id: f.character, ship_id: Some(3), corp_id: 1, station_id: None, system_id: Some(system) };
-    assert_eq!(select_roots(&s, &sde, &identity, CleanupScope::Nearby).unwrap().iter().map(|root| root.item_id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(select_roots(&mut s, &sde, &identity, CleanupScope::Nearby).unwrap().iter().map(|root| root.item_id).collect::<Vec<_>>(), vec![1]);
     assert_eq!(wire(rpc(&mut c, "/testclear").await), wire(Ok(Value::unicode(messages::gm::gm_debris_cleared(0, 0)))));
     c.world.remove_ball(system, ship).await;
     c.session.apply(vec![("stationid", Value::Int(sde.map.stations().next().unwrap().station_id)), ("solarsystemid", Value::None)]);
@@ -112,21 +123,57 @@ async fn cleanup_rejects_the_entire_batch_for_a_reserved_subtree() {
         && !sde.typelists.is_untrashable(t.type_id, GROUP_WRECK, t.category_id.unwrap_or_default())).unwrap().type_id;
     let pick = |category: i32| sde.types.iter().find(|t| t.category_id == Some(category)
         && !sde.typelists.is_untrashable(t.type_id, t.group_id.unwrap_or_default(), category)).unwrap().type_id;
-    let a = spawn_wreck(&db, &c.world, system, wreck_type, f.character, 1, [1_000.0, 0.0, 0.0], None, None).await.unwrap();
-    let b = spawn_wreck(&db, &c.world, system, wreck_type, f.character, 1, [1_000.0, 0.0, 0.0], None, None).await.unwrap();
+    let a = persistent_debris(&db, &c.world, &sde, system, wreck_type, f.character, [1_000.0, 0.0, 0.0], false).await;
+    let b = persistent_debris(&db, &c.world, &sde, system, wreck_type, f.character, [1_000.0, 0.0, 0.0], false).await;
     let hull = crate::dao::items::creation::rookie_ship(&db, pick(CATEGORY_SHIP), f.character, b, 0).await.unwrap();
     let module = crate::dao::items::creation::rookie_ship(&db, pick(CATEGORY_MODULE), f.character, hull, FLAG_FITTING_FIRST).await.unwrap();
     let reload = crate::dao::items::pending_reloads::insert(&db, f.character, hull, module, FLAG_FITTING_FIRST, pick(CATEGORY_CHARGE), 1, FLAG_CARGO, hull).await.unwrap();
+    let radius = sde.types.get(wreck_type).and_then(|t| t.radius).unwrap_or(f64::from(DEBRIS_DEFAULT_RADIUS)) as f32;
+    let transient = c.world.with(system, move |s|
+        s.npc_wreck_spawn(wreck_type, f.character, 1, [1_000.0, 0.0, 0.0], radius, None, vec![])).await.unwrap().expect("reserved ids");
     let mut rx = register_online(&c.world, OnlineSession::from_session(&c.session).unwrap());
     let Err(CallError::User { msg, dict }) = rpc(&mut c, "/testclear").await else { panic!("a reserved subtree must refuse the batch") };
     assert_eq!(msg, messages::MSG_CUSTOM_NOTIFY);
     assert!(dict.iter().any(|(key, value)| key == "notify" && matches!(value, Value::Unicode(t) if t.as_str() == messages::gm::GM_DEBRIS_REFUSED)));
     assert_eq!(alive(&db, vec![a, b, hull, module]).await.len(), 4, "a refused batch must leave every row");
-    assert!(c.world.ball(system, a).await.is_some() && c.world.ball(system, b).await.is_some());
+    assert!(c.world.ball(system, a).await.is_some() && c.world.ball(system, b).await.is_some() && c.world.ball(system, transient).await.is_some(),
+        "the refused batch left every root, transient included");
+    assert!(db.query_opt("SELECT 1 FROM game.items WHERE item_id=$1", &[&transient]).await.unwrap().is_none());
     assert!(rx.try_recv().is_err(), "no removal notification may be sent for a refused batch");
     crate::dao::items::pending_reloads::take(&db, reload).await.unwrap();
     c.world.remove_ball(system, a).await;
+    c.world.remove_ball(system, transient).await;
     c.world.remove_ball(system, b).await;
     db.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&vec![a, b, hull, module]]).await.unwrap();
+    fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn slash_wreck_spawns_transient_while_container_persists() {
+    let (db, sde, mut c, _peer, f, system, _ship, _ship_type) = space_fixture().await;
+    let wreck_type = sde.types.iter().find(|t| t.group_id == Some(GROUP_WRECK)
+        && !sde.typelists.is_untrashable(t.type_id, GROUP_WRECK, t.category_id.unwrap_or_default())).unwrap().type_id;
+    let container_type = sde.types.iter().find(|t| crate::services::inventory::hold_storage::is_ordinary_container(&sde, t.type_id)
+        && !sde.typelists.is_untrashable(t.type_id, t.group_id.unwrap_or_default(), t.category_id.unwrap_or_default())).unwrap().type_id;
+    let before: std::collections::HashSet<i64> = c.world.with(system, |s| s.balls().map(|b| b.id).collect()).await.unwrap();
+    assert!(rpc(&mut c, &format!("/wreck {wreck_type}")).await.is_ok());
+    let after: std::collections::HashSet<i64> = c.world.with(system, |s| s.balls().map(|b| b.id).collect()).await.unwrap();
+    let transient = *after.difference(&before).next().expect("the wreck ball appeared");
+    assert!(db.query_opt("SELECT 1 FROM game.items WHERE item_id=$1", &[&transient]).await.unwrap().is_none(),
+        "/wreck spawns a transient root with no row");
+    let state = c.world.with(system, move |s| match s.npc_wreck_recovery_view(
+        &crate::space::system::npc_wrecks::NpcWreckAccess::GmCleanup { character: 1 }, transient) {
+        crate::space::system::npc_wrecks::NpcWreckLookup::Ready(v) => (v.root.type_id, v.items.len()), _ => panic!("view")
+    }).await.unwrap();
+    assert_eq!(state, (wreck_type, 0), "an empty transient wreck root");
+    assert!(rpc(&mut c, &format!("/container {container_type}")).await.is_ok());
+    let after2: std::collections::HashSet<i64> = c.world.with(system, |s| s.balls().map(|b| b.id).collect()).await.unwrap();
+    let persistent = *after2.difference(&after).next().expect("the container ball appeared");
+    assert!(db.query_opt("SELECT singleton FROM game.items WHERE item_id=$1", &[&persistent]).await.unwrap().is_some(),
+        "/container keeps its persistent row");
+    assert!(rpc(&mut c, "/testclear").await.is_ok());
+    assert!(c.world.ball(system, transient).await.is_none() && c.world.ball(system, persistent).await.is_none());
+    assert!(db.query_opt("SELECT 1 FROM game.items WHERE item_id=$1", &[&persistent]).await.unwrap().is_none());
     fixture::cleanup(&db, f).await.unwrap();
 }

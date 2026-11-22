@@ -27,6 +27,37 @@ fn valid_name(name: &str, limit: usize) -> bool { name.chars().count() <= limit 
 pub(crate) async fn set_label(c: &mut Client, item_id: i64, name: String) -> Result<Value, CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     if !valid_name(&name, CONTAINER_NAME_LIMIT) { return Err(notify_error(messages::inventory::NAME_INVALID)); }
+    // A transient root is renamed inside its actor: the loose-loot container
+    // keeps the ordinary owner rule, a wreck is never renameable, and the same
+    // location row refreshes the caller's cache. No market, no SQL.
+    if let Some(system) = c.session.int("solarsystemid") {
+        let actor_identity = super::npc_loot::client_identity(c);
+        match super::npc_loot::view(&c.world, &actor_identity, system, item_id).await {
+            crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => {
+                if !super::npc_loot::renameable(&view) {
+                    return Err(notify_error(messages::inventory::NAME_NOT_RENAMEABLE));
+                }
+                if view.root.owner_id != me {
+                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                }
+                let row = config::location_row(item_id, &name);
+                let actor_row = row.clone();
+                let expected = view.identity.clone();
+                c.world.with(system, move |s| s.mutate_npc_loot(&actor_identity, &expected,
+                    crate::space::system::npc_wrecks::NpcLootMutation::Rename { name, row: actor_row, caller: me })).await
+                    .unwrap_or_else(|| Err(super::npc_loot::busy()))?;
+                c.notify("OnCfgDataChanged", vec![Value::str("evelocations"), row]);
+                return Ok(Value::None);
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Denied =>
+                return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                return Err(super::npc_loot::busy());
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {}
+        }
+    }
     let _lock = market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();

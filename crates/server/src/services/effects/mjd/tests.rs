@@ -60,7 +60,7 @@ async fn stale_generation_does_not_complete_jump_or_move_ship() {
             st.activation_generation.insert(module, generation.clone());
         }
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }],
-            effect, target: None, repeat: 1, stop: generation.clone(),
+            presented_effect: effect.id, effect, target: None, repeat: 1, stop: generation.clone(),
             owner: ActivationOwner { master: module, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
             started: 0, charge_type: None, cycles: 0, duration_ms: 1.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
             source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };

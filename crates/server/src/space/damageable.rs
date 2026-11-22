@@ -68,9 +68,9 @@ impl DamageableProjectile {
     /// the scene: `destroyed` only tells the owner to run the terminal.
     pub(crate) fn apply(&mut self, raw: [f64; 4]) -> Option<ProjectileDamageOutcome> {
         if !super::combat::valid_raw(raw) { return None; }
-        let dealt = super::combat::absorb_preserving_overdamage(&mut self.condition, raw);
+        let absorbed = super::combat::absorb_preserving_overdamage(&mut self.condition, raw);
         Some(ProjectileDamageOutcome {
-            dealt: dealt.iter().sum(),
+            dealt: absorbed.layers.iter().sum(),
             remaining_structure: self.condition.now[2],
             destroyed: self.condition.now[2] <= 0.0,
         })

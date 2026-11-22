@@ -94,6 +94,28 @@ fn resolve<'a>(c: &Client, root: &Item, rows: &'a [LineageRow]) -> Option<(i64, 
 pub(super) async fn contents(c: &Client, call: &Call<'_>) -> CallResult {
     let (id, dockable, system) = request(c, call)?;
     let me = c.session.int("charid").filter(|id| *id > 0).ok_or_else(refusal)?;
+    // The only in-memory inventory is the caller's own system actor: a remote
+    // transient root keeps the ordinary refusal, and a busy or denied local
+    // one reports its own outcome instead of falling back to the database.
+    let actor_identity = super::npc_loot::client_identity(c);
+    if let Some(space_system) = c.session.int("solarsystemid") {
+        match super::npc_loot::view(&c.world, &actor_identity, space_system, id).await {
+            crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => {
+                let actual = view.root.location_id;
+                let local = c.session.int("stationid").is_none() && c.session.int("solarsystemid") == Some(dockable);
+                if !local || actual != dockable || system.is_some_and(|system| system != actual) {
+                    return Err(refusal());
+                }
+                return Ok(Value::List(super::npc_loot::list_rows(&view, None)));
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                return Err(super::npc_loot::busy());
+            }
+            crate::space::system::npc_wrecks::NpcWreckLookup::Denied => return Err(refusal()),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {}
+        }
+    }
     if crate::services::trade::is_trade_container(id) || crate::services::exploration::container_locked(id) { return Err(refusal()); }
     let root = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.pop().ok_or_else(refusal)?;
     let ship = root.category_id == i64::from(CATEGORY_SHIP);
@@ -168,17 +190,25 @@ pub(super) async fn validate(c: &Client, call: &Call<'_>) -> CallResult {
         }
     }
     if order.is_empty() { return Ok(Value::List(Vec::new())); }
-    let items = load_items(&c.db, &c.sde, ItemQuery::Ids(&order)).await.map_err(db_err)?;
+    let actor_identity = super::npc_loot::client_identity(c);
+    let views = match c.session.int("solarsystemid") {
+        Some(system) => super::npc_loot::views(&c.world, &actor_identity, system, &order).await,
+        None => order.iter().map(|_| crate::space::system::npc_wrecks::NpcWreckLookup::Absent).collect(),
+    };
+    let persistent: Vec<i64> = order.iter().zip(views.iter())
+        .filter(|(_, view)| matches!(view, crate::space::system::npc_wrecks::NpcWreckLookup::Absent))
+        .map(|(&id, _)| id).collect();
+    let items = load_items(&c.db, &c.sde, ItemQuery::Ids(&persistent)).await.map_err(db_err)?;
     let items: HashMap<_, _> = items.into_iter().map(|item| (item.item_id, item)).collect();
-    let endpoints: Vec<_> = order.iter().map(|&location| Endpoint { location, flag: FLAG_CARGO }).collect();
+    let endpoints: Vec<_> = persistent.iter().map(|&location| Endpoint { location, flag: FLAG_CARGO }).collect();
     let identity = crate::services::identity::Identity::of_client(c);
     let reach = Reachability::capture(&identity, &c.db, &c.world, c.session.int("solarsystemid"), &endpoints).await?;
     let checked = reach.inspect_many(&c.db, &c.sde, &endpoints).await?;
-    let reserved: HashSet<_> = crate::dao::trades::reserved(&c.db, &order).await.map_err(db_err)?.into_iter().collect();
+    let reserved: HashSet<_> = crate::dao::trades::reserved(&c.db, &persistent).await.map_err(db_err)?.into_iter().collect();
     let me = c.session.int("charid").ok_or_else(refusal)?;
     let mut resolved = HashMap::new();
     let mut needs_authority = false;
-    for &id in &order {
+    for &id in &persistent {
         if let Some((_, _, custody, chain)) = items.get(&id).and_then(|item|
             checked.full_lineage(id).and_then(|rows| resolve(c, item, rows))) {
             needs_authority |= custody.is_some();
@@ -188,25 +218,46 @@ pub(super) async fn validate(c: &Client, call: &Call<'_>) -> CallResult {
     let authority = if needs_authority {
         crate::services::corps::permissions::load(&c.db, me).await?
     } else { None };
+    let persistent_pos: HashMap<i64, usize> = persistent.iter().enumerate().map(|(index, &id)| (id, index)).collect();
+    // A claimed transient root is unprovable for this request: a sealed one
+    // gets its single gated proof here, a live one stays invalid until the
+    // next call.
+    for view in &views {
+        if let crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) = view {
+            super::npc_loot::reconcile_busy(&c.world, &c.sde, claim.clone()).await;
+        }
+    }
     let mut invalid = Vec::new();
     for (index, &id) in order.iter().enumerate() {
-        let valid = items.get(&id).is_some_and(|item| {
-            if inconsistent.contains(&id) || reserved.contains(&id) || !checked.admitted[index]
-                || !item.singleton || !CARGO_CONTAINER_GROUPS.iter().any(|g| i64::from(*g) == item.group_id)
-                || snapshots[&id] != (i64::from(item.type_id), item.owner_id, item.location_id, i64::from(item.flag_id)) {
-                return false;
-            }
-            let Some((custody, chain)) = resolved.get(&id) else { return false };
-            if chain.iter().any(|r| crate::services::trade::is_trade_container(r.ancestor.item_id)
-                || crate::services::exploration::container_locked(r.ancestor.item_id)) { return false; }
-            if c.session.int("stationid").is_some() && custody.is_none()
-                && chain.iter().any(|r| r.ancestor.owner_id != me) { return false; }
-            if let Some((corp, station, flag)) = custody {
-                let Some(role) = super::access::corp_hangar_role(*flag, false) else { return false };
-                if !authority.as_ref().is_some_and(|a| crate::services::corps::permissions::allows_at(a, *corp, *station, role)) { return false; }
-            }
-            true
-        });
+        let valid = match &views[index] {
+            // A compliant transient replacement container answers the same
+            // type/singleton/snapshot predicate; a wreck stays invalid and a
+            // busy or denied root can never prove its rows.
+            crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) =>
+                !inconsistent.contains(&id)
+                    && view.kind == crate::space::system::npc_wrecks::NpcWreckKind::LooseLootContainer
+                    && view.root.singleton
+                    && CARGO_CONTAINER_GROUPS.iter().any(|g| i64::from(*g) == view.root.group_id)
+                    && snapshots[&id] == (i64::from(view.root.type_id), view.root.owner_id, view.root.location_id, i64::from(view.root.flag_id)),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Absent => items.get(&id).is_some_and(|item| {
+                if inconsistent.contains(&id) || reserved.contains(&id) || !checked.admitted[persistent_pos[&id]]
+                    || !item.singleton || !CARGO_CONTAINER_GROUPS.iter().any(|g| i64::from(*g) == item.group_id)
+                    || snapshots[&id] != (i64::from(item.type_id), item.owner_id, item.location_id, i64::from(item.flag_id)) {
+                    return false;
+                }
+                let Some((custody, chain)) = resolved.get(&id) else { return false };
+                if chain.iter().any(|r| crate::services::trade::is_trade_container(r.ancestor.item_id)
+                    || crate::services::exploration::container_locked(r.ancestor.item_id)) { return false; }
+                if c.session.int("stationid").is_some() && custody.is_none()
+                    && chain.iter().any(|r| r.ancestor.owner_id != me) { return false; }
+                if let Some((corp, station, flag)) = custody {
+                    let Some(role) = super::access::corp_hangar_role(*flag, false) else { return false };
+                    if !authority.as_ref().is_some_and(|a| crate::services::corps::permissions::allows_at(a, *corp, *station, role)) { return false; }
+                }
+                true
+            }),
+            _ => false,
+        };
         if !valid { invalid.push(Value::Int(id)); }
     }
     Ok(Value::List(invalid))

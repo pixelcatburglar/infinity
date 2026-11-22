@@ -2,51 +2,10 @@
 mod governance;
 #[path = "tests/loaded.rs"]
 mod loaded;
+#[path = "tests/helpers.rs"]
+mod helpers;
+use helpers::{ball, delivered, expected_add};
 use super::*;
-use crate::space::WarpState;
-
-fn ball(id: i64, kind: i32, pilot: Option<i64>, x: f64) -> Ball {
-    Ball {
-        id, type_id: kind, owner_id: 1, corp_id: 1, alliance_id: -1,
-        char_id: pilot, signature_radius: Some(1.0), mode: MODE_STOP, radius: 1.0,
-        mass: 1e6, max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
-        pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0],
-        old_vel: [0.0; 3], segment_acceleration: None, goto: [0.0; 3],
-        follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, interactive: pilot.is_some(), warp: WarpState::default(),
-        last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
-        cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
-    }
-}
-
-fn delivered(s: &mut System, rx: &mut mpsc::UnboundedReceiver<crate::space::SceneDelivery>) -> Vec<Value> {
-    s.apply_scene_prefix(crate::space::collision::enabled());
-    let mut events = Vec::new();
-    while let Ok(delivery) = rx.try_recv() {
-        match delivery {
-            crate::space::SceneDelivery::Destiny(batch) => events.extend(batch),
-            crate::space::SceneDelivery::Notify { event, .. } => assert_eq!(event, "OnFleetStateChange"),
-        }
-    }
-    events
-}
-
-fn expected_add(s: &System, stamp: i64, ids: &[i64]) -> Value {
-    let collisions = crate::space::collision::enabled();
-    let mut ordered: Vec<i64> = ids.to_vec();
-    ordered.sort_unstable();
-    let mut stream = vec![1u8]; // DESTINY_BALLS kind byte
-    stream.extend_from_slice(&(stamp as i32).to_le_bytes());
-    let mut slims = Vec::new();
-    let mut damage = Vec::new();
-    for id in ordered {
-        let ball = s.ball(id).unwrap();
-        ball.write(&mut stream, collisions);
-        slims.push(ball.slim_item());
-        if ball.free { damage.push((Value::Int(id), ball.damage_state())); }
-    }
-    crate::space::event(stamp, "AddBalls", vec![Value::tuple([Value::str(stream), Value::list(slims), Value::Dict(damage)])])
-}
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
@@ -69,7 +28,7 @@ async fn authorization_checks_identity_category_occupancy_safety_and_surface_ran
     assert!(matches!(s.authorize_board(1, 20, 10, 10.0), Err(BoardRefusal::StalePilot)));
     assert!(matches!(s.authorize_board(1, 10, 10, 10.0), Err(BoardRefusal::InvalidTarget)));
     s.balls.get_mut(&20).unwrap().owner_id = 2;
-    assert!(matches!(s.authorize_board(1, 10, 20, 10.0), Err(BoardRefusal::InvalidTarget)));
+    assert!(s.authorize_board(1, 10, 20, 10.0).is_ok());
     s.balls.get_mut(&20).unwrap().owner_id = 1;
     s.balls.get_mut(&20).unwrap().type_id = other;
     assert!(matches!(s.authorize_board(1, 10, 20, 10.0), Err(BoardRefusal::InvalidTarget)));
@@ -266,17 +225,29 @@ async fn committed_publication_replaces_membership_and_preserves_observer() {
     assert_eq!(actual, expected, "the restored free hull is one current Add");
 
     s.take(target_id);
+    s.command(old_id, |ball, _, _| { ball.vel = [0.0, 20.0, 0.0]; Vec::new() });
+    let advance = |s: &mut System| s.tick(s.now_ms().saturating_add(MILLISECONDS_PER_SECOND - s.now_ms().rem_euclid(MILLISECONDS_PER_SECOND)));
+    advance(&mut s);
+    advance(&mut s);
     let snapshot_ball = s.sampled_ball(old_id).unwrap();
+    let sampled_velocity = snapshot_ball.vel;
+    assert!(sampled_velocity[1] > 0.0);
     let guard = s.begin_condition_transitions(&[old_id]).unwrap();
     let (token, state) = &guard.entries[0];
     let old = balls::unpiloted(&db, sde.clone(), &row(old_id, snapshot_ball.pos)).await.ok().unwrap();
+    assert_eq!(old.ball.vel, [0.0; 3]);
     let target = balls::piloted(&db, sde.clone(), &row(target_id, [8.0, 0.0, 0.0]), owner, 0.0).await.ok().unwrap();
     assert!(s.apply_committed_transition(transitions::CommittedTransition {
         old: Some(transitions::CommittedOld::Retained { snapshot_ball, prepared: old, state: state.clone(), token: *token }),
         target: transitions::CommittedTarget { id: target_id, sampled_position: [8.0, 0.0, 0.0], prepared: target, pilot: Some((7, owner)), existing: None },
         character: owner, expected: None, fresh: false, actor_gate: None,
     }));
-    assert_eq!(s.ball(old_id).unwrap().char_id, None);
+    let retained = s.ball(old_id).unwrap();
+    assert_eq!((retained.mode, retained.vel, retained.char_id), (MODE_STOP, sampled_velocity, None));
+    advance(&mut s);
+    let decayed = s.ball(old_id).unwrap().vel[1];
+    assert!(0.0 < decayed && decayed < sampled_velocity[1], "retained hull must decelerate through native stop evolution, got {decayed}");
+    assert_eq!(s.ball(target_id).unwrap().vel, [0.0; 3]);
     assert_eq!(s.pilot_ball(owner).unwrap().id, target_id);
     assert_eq!(s.observer_ego(7), Some(target_id));
     assert_eq!(s.pilots().filter(|b| b.char_id == Some(owner)).count(), 1);
@@ -361,9 +332,12 @@ async fn stopped_actor_recovers_committed_boarding_from_loader_and_seeds() {
             ship_id: Some(target_id), station_id: None, system_id: Some(system), corporation_id: Some(1),
             alliance_id: None, faction_id: None, fleet_id: None, role: 0, corporation_role: 0 };
         let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
-        world.register_pilot(owner, notify_tx);
+        crate::space::session_change::test_support::register_elapsed(&world, owner, notify_tx);
         world.set_online_session(owner, Some(newer.clone()));
         assert_eq!(world.online_session(owner), Some(newer.clone()));
+        let elapsed = crate::space::session_change::ship_change_deadline(0);
+        assert!(!world.ship_change_ready(owner, newer.session_id, elapsed - 1));
+        assert!(world.ship_change_ready(owner, newer.session_id, crate::client::filetime_now()));
         assert!(world.apply_committed_transition(system, transitions::CommittedTransition {
             old: Some(transitions::CommittedOld::Retained { snapshot_ball: snapshot.old.clone(), prepared: old, state: states[0].clone(), token: tokens[0] }),
             target: transitions::CommittedTarget { id: target_id, sampled_position: snapshot.target.pos, prepared: target, pilot: Some((7, owner)), existing: Some((states[1].clone(), tokens[1])) },
@@ -740,7 +714,7 @@ async fn bounty_boundary_receipts_cover_commit_rollback_and_unknown() {
         let prepared = balls::piloted(&db, sde, &row, owner, 0.0).await.ok().unwrap();
         world.with(system, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
         // commit: a dirty bucket rides the dock's own transaction and proves Durable.
-        world.with(system, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(777).unwrap(), crate::client::filetime_now())).await.unwrap().unwrap();
+        world.with(system, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(777).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), crate::client::filetime_now())).await.unwrap().unwrap();
         let admission = world.admission(system).unwrap();
         let market = crate::services::market::lock().await;
         let gate = world.lock_condition_snapshot(system).await.unwrap();
@@ -748,11 +722,11 @@ async fn bounty_boundary_receipts_cover_commit_rollback_and_unknown() {
         world.checkpoint_dock(db.clone(), owner, ship, system, destination.clone(), transition, market, gate, admission).await.unwrap();
         let rows = crate::dao::npc_bounties::for_character(&db, owner).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].amount, rows[0].kill_count), (crate::isk::IskAmount::from_cents(777).unwrap(), 1));
+        assert_eq!((rows[0].amount, rows[0].kill_count, rows[0].legacy_kill_count, rows[0].security_gain), (crate::isk::IskAmount::from_cents(777).unwrap(), 1, 0, crate::npc_security::SecurityGain::for_kill(crate::config::game().crimewatch.security_gain_npc_kill, crate::npc_security::FrozenMultiplier::new(1.0).unwrap())));
         assert!(world.with(system, move |s| s.bounty_pending_receipts(Some(owner)).is_empty() && !s.bounty_checkpoint_pending()).await.unwrap());
         // rollback: a write transaction that fails leaves the receipt Unchanged
         // and the dirty bucket intact.
-        world.with(system, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(50).unwrap(), crate::client::filetime_now() + 1)).await.unwrap().unwrap();
+        world.with(system, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(50).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), crate::client::filetime_now() + 1)).await.unwrap().unwrap();
         let receipt = world.with(system, move |s| s.capture_npc_bounties(Some(owner))).await.unwrap().unwrap().unwrap();
         let failed = db.transaction(|tx, _: &mut ()| {
             let receipt = receipt.clone();
@@ -770,7 +744,7 @@ async fn bounty_boundary_receipts_cover_commit_rollback_and_unknown() {
         assert_eq!(crate::dao::npc_bounties::for_character(&db, owner).await.unwrap()[0].kill_count, 2);
         // unknown: an outside change between failed write and resolve is
         // neither Durable nor Unchanged, and the receipt stays owned.
-        world.with(system, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(1).unwrap(), crate::client::filetime_now() + 2)).await.unwrap().unwrap();
+        world.with(system, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(1).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), crate::client::filetime_now() + 2)).await.unwrap().unwrap();
         let receipt = world.with(system, move |s| s.capture_npc_bounties(Some(owner))).await.unwrap().unwrap().unwrap();
         let failed = db.transaction(|tx, _: &mut ()| {
             let receipt = receipt.clone();

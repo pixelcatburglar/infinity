@@ -28,9 +28,13 @@
 //! follows actor membership generations. Legacy sphere collisions do not emit bumps.
 //! Ordinary warp charges the shared in-memory capacitor at activation; partial routes
 //! publish their completed state and do not complete the original arrival callback.
+//! Ship-sourced warp-disruption fields are transient actor state: raising one
+//! cancels enclosed alignment once, warping out of it is refused, and a route
+//! ending near a field edge is dragged onto it.
 //! Live compressor ranges use actor-owned module generations and static type lists.
 //! Taking a ball also ends its in-memory ECM lockout before its pilot leaves.
 //! Rack heat and overload membership are transient and are cleared when a ship leaves.
+//! Breacher damage-over-time applications are transient actor state cleared with the ball.
 //! Committed item renames project the new name onto the live ball's slim and
 //! the `evelocations` cache of pilots whose live observer can see the ball
 //! now; that audience is the observer's own scene bubble plus globals.
@@ -42,7 +46,9 @@ use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 #[path = "effects.rs"] mod effects;
+#[path = "interdiction.rs"] mod interdiction;
 #[path = "boarding.rs"] pub(crate) mod boarding;
+#[path = "probes.rs"] mod probes;
 pub(crate) mod appearance;
 mod affiliation;
 mod npc_control;
@@ -59,6 +65,7 @@ mod warp_capacitor;
 pub(crate) mod observers;
 pub(crate) mod presentation;
 mod interest;
+pub(crate) mod npc_wrecks;
 mod membership;
 use presentation::SceneExit;
 use observers::{DestinyAudience, Observer};
@@ -145,7 +152,11 @@ pub struct System {
     cloak_reactivation: HashMap<i64, i64>,
     cloak_targeting: HashMap<i64, i64>,
     tractors: HashMap<i64, Tractor>,
+    /// Live ship-sourced warp-disruption fields keyed by owning module.
+    interdiction: interdiction::Fields,
     tractor_epochs: HashMap<i64, Arc<()>>,
+    /// Live interdiction probes keyed by their own ball id.
+    probes: HashMap<i64, probes::Probe>,
     pub(super) brains: HashMap<i64, NpcBrain>,
     pub(super) drones: HashMap<i64, drone::DroneBrain>,
     pub(super) drone_reservations: HashMap<u64, drone::Reservation>,
@@ -167,9 +178,13 @@ pub struct System {
     pub(super) snapshot_context: Option<snapshot::Context>,
     pub(super) projection_sde: Option<Arc<Sde>>,
     pub(crate) heat: crate::services::effects::heat::HeatState,
+    /// Breacher pod damage-over-time applications per target; cleared with the ball.
+    pub(crate) breacher: crate::services::effects::breacher::DotState,
     pub(super) projections: HashMap<i64, Vec<crate::services::effects::projection::Projection>>,
     pub(super) projection_targets: HashMap<i64, i64>,
     pub(super) projection_revisions: HashMap<i64, u64>,
+    /// Timed runtime modifier inputs and their per-receiver expiry timer arms.
+    pub(super) runtime_inputs: dbuff::RuntimeTimedState,
     pub(super) snapshot_positions: HashMap<i64, (u64, V3)>,
     pub(super) snapshot_generation: u64,
     pub(super) snapshot_due: i64,
@@ -180,6 +195,9 @@ pub struct System {
     gm_previews: HashMap<i64, gm_effects::SentPreviews>,
     /// NPC bounty pools owned by this actor; the shared coordinator is World-side.
     pub(super) bounties: bounties::State,
+    /// Transient NPC wreck and loose-loot roots, their single-claim state and
+    /// the reserved item-ID blocks; dropped wholesale with this actor.
+    npc_wrecks: npc_wrecks::NpcWrecks,
 }
 impl System {
     pub(crate) fn sde(&self) -> Option<&crate::sde::Sde> { self.projection_sde.as_deref() }
@@ -306,6 +324,12 @@ impl System {
         ball.old_pos = ball.pos;
         ball.old_vel = ball.vel;
         ball.segment_acceleration = None;
+        // A claimed transient NPC wreck root refuses same-ID replacement here
+        // at the entry point; the exit hook alone cannot protect the claim.
+        if self.npc_wreck_blocks_insert(ball.id) {
+            tracing::warn!(system = self.id, ball = ball.id, "refused insert over busy npc wreck root");
+            return;
+        }
         self.take(ball.id);
         if let Some(char_id) = ball.char_id {
             let binding = self.world.upgrade().and_then(|world| world.bindings.binding(char_id));
@@ -350,6 +374,7 @@ impl System {
         self.invalidate_missile_target(id);
         self.invalidate_missile_launcher(id);
         self.remove_bomb_flight(id);
+        self.probe_departed(id);
     }
     /// Remove a ball and capture its presentation exit: old observer tickets and
     /// clear IDs for the fleet boundary, the sustained effects to stop, and the
@@ -357,15 +382,11 @@ impl System {
     /// client clear happens only in the queued exit action.
     pub(in crate::space) fn take_for_scene_exit(&mut self, id: i64) -> Option<(Ball, SceneExit)> {
         self.missile_departure(id);
-        if (self.is_npc(id) || self.drone(id).is_some()) && self.contains(id) {
-            if let Some(generation) = self.combat_membership_generation(id) {
-                let _ = self.retire_combat_source(generation);
-            }
-        }
         self.drone_controller_lost(id);
         self.drone_removed(id);
         self.cleanup_tractors(id);
         self.cancel_warp_intent(id);
+        self.interdiction_departed(id);
         if self.balls.contains_key(&id) {
             crate::services::combat::jamming::clear(self, id);
         }
@@ -373,19 +394,25 @@ impl System {
             let fleet = crate::services::fleets::space_state::remove_ball_tags(self, self.id, id, self.balls[&id].char_id);
             Some(self.capture_scene_exit(id, fleet))
         } else { None };
+        // Retire the departing ship's tracked cycles while its combat
+        // membership generation is still installed: the shared terminal's
+        // Running-stop is fenced on that membership.
+        crate::services::effects::active_cycle::ship_departure(self, id);
         self.remove_combat_state(id);
         if !self.balls.contains_key(&id) { return None; }
+        self.remove_runtime_ball(id, self.balls[&id].char_id);
         self.ball_tokens.remove(&id);
+        self.npc_wreck_root_departed(id);
         self.pending_uncloak.remove(&id);
         sovereignty::links::removed(self, id);
         crate::services::effects::heat::remove_ship(self, id);
+        crate::services::effects::breacher::remove_ball(self, id);
         self.compressors.remove(&id);
         self.module_cloaks.remove(&id);
         self.cloak_targeting.remove(&id);
         self.super_weapon_ship_left(id);
         self.remove_projections_from(id);
         self.remove_projections_on_departure(id);
-        crate::services::effects::active_cycle::ship_departure(self, id);
         self.gm_effect_ball_leaving(id);
         self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
@@ -552,11 +579,15 @@ impl System {
                 ranges.entry(entry.list).and_modify(|range| *range = range.max(entry.range)).or_insert(entry.range);
             }
         }
+        let value = (!ranges.is_empty()).then(|| Value::Dict(
+            ranges.into_iter().map(|(list, range)| (Value::Int(list), Value::Float(range))).collect()));
+        self.publish_slim_field(ship, "compression_facility_typelists", value);
+    }
+    /// Set or remove one custom slim field and republish the slim item to the ball's audience.
+    pub(crate) fn publish_slim_field(&mut self, ship: i64, key: &'static str, value: Option<Value>) {
         let Some(ball) = self.balls.get_mut(&ship) else { return };
-        ball.slim.retain(|(key, _)| *key != "compression_facility_typelists");
-        if !ranges.is_empty() {
-            ball.slim.push(("compression_facility_typelists", Value::Dict(ranges.into_iter().map(|(list, range)| (Value::Int(list), Value::Float(range))).collect())));
-        }
+        ball.slim.retain(|(field, _)| *field != key);
+        if let Some(value) = value { ball.slim.push((key, value)); }
         let slim = ball.slim_item();
         self.publish_destiny(ship, |stamp| vec![event(stamp, "OnSlimItemChange", vec![Value::Int(ship), slim])]);
     }

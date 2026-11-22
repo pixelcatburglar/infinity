@@ -115,7 +115,18 @@ async fn debris(c: &mut Client, command: &str, args: &[String]) -> Result<String
     let pos = [center[0] + distance, center[1], center[2]];
     let owner = c.session.int("charid").ok_or_else(usage)?;
     let corp = c.session.int("corpid").unwrap_or(0);
-    let id = super::super::combat::groups_health::spawn_wreck(&c.db, &c.world, system, type_id, owner, corp, pos, None, None).await?;
+    let id = if command == "wreck" {
+        // Transient actor-owned empty wreck: actor-reserved ID, no persistence.
+        super::super::combat::groups_health::wreck::spawn_wreck(&c.db, &c.world, system, type_id, owner, corp, pos, None, None).await?
+    } else {
+        // An ordinary persistent cargo container with the shared debris ball.
+        let id = crate::dao::items::creation::positioned(&c.db, type_id, owner, system, pos).await.map_err(crate::services::db_err)?;
+        let radius = c.sde.types.get(type_id).and_then(|t| t.radius)
+            .unwrap_or(f64::from(super::super::combat::groups_health::wreck::DEBRIS_DEFAULT_RADIUS)) as f32;
+        let ball = super::super::combat::groups_health::wreck::debris_ball(id, type_id, owner, corp, pos, radius, None, true, now_ms());
+        c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+        id
+    };
     Ok(messages::gm::gm_debris_spawned(id))
 }
 

@@ -2,18 +2,23 @@
 //! lifecycle tokens. Damage and repair are synchronous actor operations; database,
 //! client and market work stay in their existing asynchronous callers. Cycles
 //! borrow the resident fit through the single mutable input gate in `inputs`.
+//! The adaptive armor hardener's transient cycle profile and accepted-hit
+//! tally live in `reactive_armor`, bound to one fitted module, its activation
+//! generation and the record's membership; it is never persisted.
 mod facts;
 mod fitting;
 pub(crate) mod inputs;
 pub(crate) mod loaded;
+mod reactive_armor;
 pub(crate) mod spool;
+mod transition;
 use spool::SpoolReadout;
 use super::System;
 use crate::services::combat::damage::DamageSource;
 use crate::services::combat::groups_health::{recharge, Condition, ShipStats};
 use crate::services::fit::{Fit, Key};
 use crate::client::filetime_now;
-use infinity_core::consts::FILETIME_SECOND;
+use infinity_core::consts::{dogma::ATTR_DISALLOW_ASSISTANCE, FILETIME_SECOND};
 use std::future::Future;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,6 +124,9 @@ pub(crate) struct ActorDamageOutcome {
 pub(crate) struct DamagePlan {
     target: i64, victim: crate::lua::events::combat::CombatEntity,
     source: DamageSource, condition: Condition, old: [f64; 3], layers: [f64; 3],
+    /// Accepted post-resistance typed armor damage for the reactive profile's
+    /// open window; zero for flat and force-loss plans.
+    armor: [f64; 4],
     dealt: f64, lethal: bool, force_loss: bool, at: i64, generation: u64, revision: u64,
     position: [f64; 3], identity: Option<i64>, kind: Option<i32>, owner_id: i64,
     corp_id: i64, is_drone: bool, is_npc: bool,
@@ -161,6 +169,8 @@ pub(crate) struct ActorCombatRecord {
     pub(crate) fit_key: Key,
     pub(crate) fit_revision: u64,
     pub(crate) membership_generation: u64,
+    /// Runtime-only replay activation, independent of membership generation.
+    pub(crate) body_source_generation: Option<u64>,
     pub(crate) source_sequence: u64,
     pub(crate) revision: u64,
     pub(crate) saved_revision: u64,
@@ -175,6 +185,10 @@ pub(crate) struct ActorCombatRecord {
     /// `ship_info` prime values only — damage never reads them, they are never
     /// persisted, and each entry dies with its activation generation.
     pub(crate) spool_readouts: Vec<SpoolReadout>,
+    /// The running adaptive armor hardener's transient cycle state; never
+    /// persisted, never snapshotted, dies with this record. See
+    /// `reactive_armor.rs`.
+    pub(crate) reactive_armor: Option<reactive_armor::ReactiveArmorState>,
 }
 
 pub(crate) fn valid_raw(raw: [f64; 4]) -> bool {
@@ -213,6 +227,19 @@ fn rebase_condition_at(condition: &mut Condition, stats: ShipStats, at: i64) -> 
     true
 }
 
+/// Whether incoming remote assistance is refused for `ship`: an active
+/// Entosis link on a capital-fitted hull, or any active fitted module with a
+/// positive effective `disallowAssistance` value (SDE dgmAttributeTypes 854,
+/// carried by warp disruption field generators). The second condition reads
+/// the resident combat record only; a ship without one answers by the
+/// Entosis condition alone.
+pub(crate) fn assistance_blocked(system: &System, ship: i64) -> bool {
+    super::sovereignty::links::assistance_blocked(system, ship)
+        || system.actor_combat.get(&ship).is_some_and(|record| record.fit.fitted_modules().any(|(module, _)|
+            record.fit.module_state(module).is_some_and(|(_, active)| active)
+                && record.fit.value(Key::Module(module), ATTR_DISALLOW_ASSISTANCE) > 0.0))
+}
+
 impl ActorCombatRecord {
     fn prune_contributions(&mut self, since: i64) {
         self.contributions.retain(|_, entry| entry.last_damage_at >= since);
@@ -226,13 +253,34 @@ impl ActorCombatRecord {
     }
 }
 
-pub(crate) fn absorb_preserving_overdamage(condition: &mut Condition, raw: [f64; 4]) -> [f64; 3] {
+/// Which resonance table a damage application uses: the target's fitted
+/// resonances, or none (Breacher pod boarding damage, client
+/// dotWeapons/common/dotRegistry.py ApplyFlatDamage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Absorption { Fitted, Flat }
+
+/// Layer totals plus the armor layer's actual post-resistance damage, in raw
+/// order (em, thermal, kinetic, explosive). Only the armor layer is typed;
+/// shield and hull stay in `layers`.
+pub(crate) struct AbsorbedDamage {
+    pub(crate) layers: [f64; 3],
+    pub(crate) armor: [f64; 4],
+}
+
+fn absorb_layers(condition: &mut Condition, raw: [f64; 4], resonance: [[f64; 4]; 3]) -> AbsorbedDamage {
     let mut left = raw;
     let mut dealt = [0.0; 3];
+    let mut armor = [0.0; 4];
     for layer in 0..3 {
-        let effective: f64 = (0..4).map(|i| left[i] * condition.stats.resonance[layer][i]).sum();
+        let product: [f64; 4] = std::array::from_fn(|i| left[i] * resonance[layer][i]);
+        let effective: f64 = product.iter().sum();
         if effective <= 0.0 { break; }
         let available = condition.now[layer].max(0.0);
+        let taken = effective.min(available);
+        if layer == 1 && effective > 0.0 {
+            let scale = taken / effective;
+            armor = std::array::from_fn(|i| product[i] * scale);
+        }
         if effective <= available {
             condition.now[layer] = available - effective;
             dealt[layer] = effective;
@@ -243,7 +291,17 @@ pub(crate) fn absorb_preserving_overdamage(condition: &mut Condition, raw: [f64;
         if condition.now[layer] > 0.0 { condition.now[layer] = 0.0; }
         left = left.map(|value| value * (overflow / effective));
     }
-    dealt
+    AbsorbedDamage { layers: dealt, armor }
+}
+
+pub(crate) fn absorb_preserving_overdamage(condition: &mut Condition, raw: [f64; 4]) -> AbsorbedDamage {
+    absorb_layers(condition, raw, condition.stats.resonance)
+}
+
+/// Resistance-free spill through shield, armor and hull, preserving
+/// overdamage into the next layer (Breacher pod boarding damage).
+pub(crate) fn absorb_flat_preserving_overdamage(condition: &mut Condition, amount: f64) -> [f64; 3] {
+    absorb_layers(condition, [amount, 0.0, 0.0, 0.0], [[1.0; 4]; 3]).layers
 }
 
 impl System {
@@ -290,20 +348,28 @@ impl System {
         self.install_condition_with_key(ship, condition, fit, Key::Ship);
     }
 
-    pub(crate) fn install_condition_with_key(&mut self, ship: i64, condition: Condition, fit: Fit, fit_key: Key) {
+    pub(crate) fn install_condition_with_key(&mut self, ship: i64, condition: Condition, mut fit: Fit, fit_key: Key) {
         let generation = self.persistent_generation(ship)
             .or_else(|| self.actor_combat.get(&ship).map(|record| record.membership_generation))
             .unwrap_or_else(crate::space::targeting::next_generation);
         if !valid_condition(&condition) { return; }
         if self.actor_combat.get(&ship).is_some_and(|record| record.has_loaded_obligations()) { return; }
         self.nativefact_clock = self.nativefact_clock.max(condition.shield_at);
-        let source_sequence = self.actor_combat.get(&ship)
-            .filter(|record| record.membership_generation == generation).map_or(0, |record| record.source_sequence);
+        if self.actor_combat.get(&ship).is_some_and(|record| record.membership_generation != generation) {
+            self.retire_body_combat_source(ship);
+        }
+        let (body_source_generation, source_sequence) = self.actor_combat.get(&ship)
+            .filter(|record| record.membership_generation == generation)
+            .map_or((None, 0), |record| (record.body_source_generation, record.source_sequence));
         let loaded = loaded::seed_map(fit.loaded_seeds());
+        for source in self.runtime_sources_anchored(ship, self.ball(ship).and_then(|ball| ball.char_id)) {
+            fit.replace_runtime_modifier_source(source);
+        }
         let record = ActorCombatRecord {
-            condition, fit, fit_key, fit_revision: 0, membership_generation: generation, source_sequence,
+            condition, fit, fit_key, fit_revision: 0, membership_generation: generation, body_source_generation, source_sequence,
             revision: 1, saved_revision: 1, character_timer: None, contributions: HashMap::new(),
             phase: CombatPhase::Live, pending: None, loaded, spool_readouts: Vec::new(),
+            reactive_armor: None,
         };
         self.actor_combat.insert(ship, record);
         self.arm_character_expiry(ship);
@@ -319,6 +385,7 @@ impl System {
     }
 
     pub(crate) fn remove_combat_state(&mut self, ship: i64) {
+        self.retire_body_combat_source(ship);
         if !matches!(self.actor_combat.get(&ship).map(|r| r.phase),
             Some(CombatPhase::Dying { .. } | CombatPhase::Transition { .. }))
             && !self.actor_combat.get(&ship).is_some_and(|r| r.has_loaded_obligations()) {
@@ -368,15 +435,26 @@ impl System {
     {
         if force_loss && !self.is_damage_immune(target) { self.ensure_combat_facts(); }
         let facts = source.facts;
-        let result = self.apply_damage_inner(target, raw, source, force_loss);
+        let result = self.apply_damage_inner(target, raw, source, force_loss, Absorption::Fitted);
         if let Some(facts) = facts { self.finish_combat_attempt(&facts); }
         result
     }
 
-    fn apply_damage_inner(&mut self, target: i64, raw: [f64; 4], source: DamageSource, force_loss: bool)
+    /// `apply_damage` sibling for resistance-free flat damage (Breacher pod
+    /// boarding ticks); attempt admission and outcome handling are identical.
+    pub(crate) fn apply_flat_damage(&mut self, target: i64, amount: f64, source: DamageSource)
+        -> Result<Option<ActorDamageOutcome>, crate::space::combat_facts::Refusal>
+    {
+        let facts = source.facts;
+        let result = self.apply_damage_inner(target, [amount, 0.0, 0.0, 0.0], source, false, Absorption::Flat);
+        if let Some(facts) = facts { self.finish_combat_attempt(&facts); }
+        result
+    }
+
+    fn apply_damage_inner(&mut self, target: i64, raw: [f64; 4], source: DamageSource, force_loss: bool, absorption: Absorption)
         -> Result<Option<ActorDamageOutcome>, crate::space::combat_facts::Refusal> {
         let at = { self.observe_combat_utc()?; self.combat_observed_time() };
-        let Some(plan) = self.plan_damage(target, raw, source, force_loss, at) else { return Ok(None) };
+        let Some(plan) = self.plan_damage(target, raw, source, force_loss, at, absorption) else { return Ok(None) };
         let pending_damage = if !force_loss && plan.dealt > 0.0 {
             let facts = self.combat_facts.as_mut().ok_or(crate::space::combat_facts::Refusal::Invalid)?;
             let mut reservation = facts.reserve_damage(plan.source.facts.ok_or(crate::space::combat_facts::Refusal::Invalid)?, &plan.victim, at)?;
@@ -389,7 +467,7 @@ impl System {
 
     pub(crate) fn plan_area_damage(&self, target: i64, raw: [f64; 4], source: DamageSource, at: i64)
         -> Option<crate::space::combat_facts::reservation::ReservedTarget<DamageBatchEntry>> {
-        let plan = self.plan_damage(target, raw, source, false, at)?;
+        let plan = self.plan_damage(target, raw, source, false, at, Absorption::Fitted)?;
         Some(crate::space::combat_facts::reservation::ReservedTarget::new(
             plan.victim, plan.layers, DamageBatchEntry { plan: Some(plan), outcome: None }))
     }
@@ -448,7 +526,7 @@ impl System {
     }
 
     pub(crate) fn plan_damage(&self, target: i64, raw: [f64; 4], source: DamageSource,
-        force_loss: bool, at: i64) -> Option<DamagePlan> {
+        force_loss: bool, at: i64, absorption: Absorption) -> Option<DamagePlan> {
         if at != self.nativefact_clock || !valid_raw(raw) { return None; }
         if self.is_damage_immune(target) { return None; }
         let position = self.sample_position(target)?;
@@ -474,11 +552,17 @@ impl System {
             condition.stats.shield_tau_ms, dt);
         condition.shield_at = at;
         let old = condition.now;
-        let layers = if force_loss {
+        let (layers, armor) = if force_loss {
             condition.now[2] = 0.0;
-            [0.0; 3]
+            ([0.0; 3], [0.0; 4])
         } else {
-            absorb_preserving_overdamage(&mut condition, raw)
+            match absorption {
+                Absorption::Fitted => {
+                    let absorbed = absorb_preserving_overdamage(&mut condition, raw);
+                    (absorbed.layers, absorbed.armor)
+                }
+                Absorption::Flat => (absorb_flat_preserving_overdamage(&mut condition, raw[0]), [0.0; 4]),
+            }
         };
         let dealt = layers.iter().sum::<f64>();
         if !dealt.is_finite() || !valid_condition(&condition) { return None; }
@@ -491,13 +575,13 @@ impl System {
         if let Some(sum) = exact_damage.as_mut() {
             for amount in layers { if amount > 0.0 && !sum.try_add(amount) { return None; } }
         }
-        Some(DamagePlan { target, victim, source, condition, old, layers, dealt, lethal, force_loss, at,
+        Some(DamagePlan { target, victim, source, condition, old, layers, armor, dealt, lethal, force_loss, at,
             generation, revision, position, identity, kind, owner_id, corp_id, is_drone, is_npc, exact_damage })
     }
 
     fn commit_damage_plan(&mut self, plan: DamagePlan,
         pending_damage: Option<crate::space::combat_facts::PendingDamage>) -> Option<ActorDamageOutcome> {
-        let DamagePlan { target, victim, source, condition, old, layers: _, dealt, lethal, force_loss, at,
+        let DamagePlan { target, victim, source, condition, old, layers: _, armor, dealt, lethal, force_loss, at,
             generation, revision, position, identity, kind, owner_id, corp_id, is_drone, is_npc, exact_damage } = plan;
         if self.actor_combat.get(&target).is_none_or(|record| record.revision != revision
             || record.membership_generation != generation || !matches!(record.phase, CombatPhase::Live)) { return None; }
@@ -563,6 +647,12 @@ impl System {
             record.pending = Some(PendingCombat::Dying { token, generation, snapshot: Arc::clone(&snapshot), in_flight: true, npc_context: None, player_context: None });
             Some(snapshot)
         } else { None };
+        // Accepted nonlethal typed armor damage tallies into the running
+        // hardener's open cycle window; lethal, force-loss and refused plans
+        // leave the tally untouched.
+        if !lethal && !force_loss {
+            if let Some(state) = record.reactive_armor.as_mut() { state.observe(armor); }
+        }
         Some(ActorDamageOutcome { dealt, old, new: record.condition.now,
             source, lethal, first_lethal })
     }
@@ -653,127 +743,6 @@ impl System {
         true
     }
 
-    pub(crate) fn begin_combat_transition(&mut self, ship: i64) -> Option<(u64, ActorConditionSnapshot)> {
-        let snapshot = self.combat_condition_snapshot(ship)?;
-        let record = self.actor_combat.get_mut(&ship)?;
-        if !matches!(record.phase, CombatPhase::Live) { return None; }
-        let token = crate::space::targeting::next_generation();
-        record.phase = CombatPhase::Transition { token };
-        Some((token, snapshot))
-    }
-
-    fn republish_thawed_condition(&mut self, ship: i64) {
-        self.refresh_fitted_stats(ship);
-        let Some((max, now)) = self.combat_health_scalars(ship) else { return };
-        let health = [0, 1, 2].map(|i| if max[i] > 0.0 {
-            if i == 0 { (now[i] / max[i]).clamp(0.0, 1.0) }
-            else { (1.0 - now[i] / max[i]).clamp(0.0, 1.0) }
-        } else { 0.0 });
-        if self.ball(ship).is_some_and(|ball| ball.health != health) {
-            self.set_health(ship, health);
-        }
-    }
-
-    pub(crate) fn cancel_combat_transition(&mut self, ship: i64, token: u64, generation: u64) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if record.membership_generation != generation || record.phase != (CombatPhase::Transition { token }) { return false; }
-        if matches!(record.pending, Some(PendingCombat::Transition { token: pending_token, .. }) if pending_token == token) {
-            record.pending = None;
-        }
-        record.phase = CombatPhase::Live;
-        self.republish_thawed_condition(ship);
-        true
-    }
-
-    pub(crate) fn commit_combat_transition(&mut self, ship: i64, token: u64) -> bool {
-        let Some(record) = self.actor_combat.get(&ship) else { return false };
-        if record.phase != (CombatPhase::Transition { token }) { return false; }
-        self.actor_combat.remove(&ship);
-        true
-    }
-
-    pub(crate) fn transfer_combat_state(&mut self, ship: i64, destination_generation: u64,
-        snapshot: ActorConditionSnapshot, fit: Fit, fit_key: Key) -> bool {
-        if self.persistent_generation(ship) != Some(destination_generation)
-            || snapshot.item_id != ship || !valid_condition(&snapshot.condition)
-            || self.actor_combat.get(&ship).is_some_and(|record| record.has_loaded_obligations()) { return false; }
-        let condition = snapshot.condition;
-        self.nativefact_clock = self.nativefact_clock.max(condition.shield_at);
-        let loaded = loaded::seed_map(fit.loaded_seeds());
-        self.actor_combat.insert(ship, ActorCombatRecord {
-            condition, fit, fit_key, fit_revision: 0, membership_generation: destination_generation,
-            source_sequence: 0,
-            revision: snapshot.revision, saved_revision: snapshot.saved_revision,
-            character_timer: None,
-            contributions: snapshot.contributions.into_iter().map(|e| (e.attacker_id, e)).collect(),
-            phase: CombatPhase::Live, pending: None, loaded, spool_readouts: Vec::new(),
-        });
-        self.arm_character_expiry(ship);
-        self.refresh_fitted_stats(ship);
-        true
-    }
-
-
-    pub(crate) fn mark_pending_transition(
-        &mut self,
-        ship: i64,
-        token: u64,
-        generation: u64,
-        callback: Arc<dyn Fn() -> crate::space::npc::NpcFuture + Send + Sync>,
-    ) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if record.membership_generation != generation || record.phase != (CombatPhase::Transition { token }) { return false; }
-        record.pending = Some(PendingCombat::Transition { token, generation, callback, in_flight: true });
-        true
-    }
-
-    pub(crate) fn release_pending_combat(&mut self, ship: i64, token: u64, generation: u64) -> bool {
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        let Some(pending) = record.pending.as_mut() else { return false };
-        let (stored_token, stored_generation, in_flight) = match pending {
-            PendingCombat::Dying { token, generation, in_flight, .. }
-            | PendingCombat::Transition { token, generation, in_flight, .. } => (token, generation, in_flight),
-        };
-        if *stored_token != token || *stored_generation != generation { return false; }
-        *in_flight = false;
-        true
-    }
-
-    pub(crate) fn claim_pending_combat(&mut self) -> Vec<(i64, PendingCombat)> {
-        self.actor_combat.iter_mut().filter_map(|(&ship, record)| {
-            let pending = record.pending.as_mut()?;
-            let in_flight = match pending {
-                PendingCombat::Dying { in_flight, .. } | PendingCombat::Transition { in_flight, .. } => in_flight,
-            };
-            if *in_flight { return None; }
-            *in_flight = true;
-            Some((ship, pending.clone()))
-        }).collect()
-    }
-
-    pub(crate) fn restore_known_rollback(&mut self, ship: i64, token: u64, generation: u64) -> bool {
-        if self.ball(ship).is_none() || self.persistent_generation(ship).is_some_and(|current| current != generation) { return false; }
-        let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
-        if record.membership_generation != generation || record.phase != (CombatPhase::Dying { token }) { return false; }
-        let Some(next_revision) = record.revision.checked_add(1) else { return false };
-        let Some(PendingCombat::Dying { snapshot, .. }) = record.pending.take() else { return false };
-        record.condition = snapshot.condition.clone();
-        record.contributions = snapshot.undo_contributions.clone().into_iter().map(|e| (e.attacker_id, e)).collect();
-        record.revision = next_revision;
-        record.saved_revision = record.saved_revision.min(record.revision.saturating_sub(1));
-        record.phase = CombatPhase::Live;
-        self.republish_thawed_condition(ship);
-        true
-    }
-
-    pub(crate) fn finalize_dying(&mut self, ship: i64, token: u64, generation: u64) -> bool {
-        let Some(record) = self.actor_combat.get(&ship) else { return false };
-        if record.membership_generation != generation || record.phase != (CombatPhase::Dying { token }) { return false; }
-        self.actor_combat.remove(&ship);
-        true
-    }
-
-
     pub(crate) fn combat_phase(&self, ship: i64) -> Option<CombatPhase> {
         self.actor_combat.get(&ship).map(|record| record.phase)
     }
@@ -789,4 +758,4 @@ impl System {
 
 }
 
-#[cfg(all(test, any(feature = "tests-combat", feature = "tests-services", feature = "tests-ships", feature = "tests-slash", feature = "tests-space")))] pub(crate) mod tests;
+#[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-services", feature = "tests-ships", feature = "tests-slash", feature = "tests-space")))] pub(crate) mod tests;

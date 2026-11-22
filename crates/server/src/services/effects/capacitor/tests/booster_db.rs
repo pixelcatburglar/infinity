@@ -122,7 +122,7 @@ async fn cap_booster_db_smoke() {
         let stop = Arc::new(AtomicBool::new(false));
         combat::state().active.insert(fixture.module, combat::ActiveModule { char_id: fixture.character, stop: stop.clone(), forced_inactive: false });
         combat::state().activation_generation.insert(fixture.module, stop.clone());
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![module], effect, target: None, repeat: 1,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![module], presented_effect: effect.id, effect, target: None, repeat: 1,
             stop: stop.clone(), owner: ActivationOwner { master: fixture.module, generation: stop, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
             started: 0, charge_type: None, cycles: 0, duration_ms: 0.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
             source_membership: None, target_type: None,

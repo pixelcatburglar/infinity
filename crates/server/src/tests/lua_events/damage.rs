@@ -5,7 +5,7 @@ use infinity_core::{
     consts::{CATEGORY_SHIP, CATEGORY_CHARGE, dogma::{ATTR_SHIELD_CAPACITY, ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_HP, ATTR_EMP_FIELD_RANGE, ATTR_AOE_CLOUD_SIZE, EFFECT_NPC_BEHAVIOR_SMARTBOMB, ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE}},
 };
 use crate::{
-    services::{combat::{self, damage::apply_damage_guarded, groups_health}, effects::{aoe, registry, weapons::{self, Missile}}},
+    services::{combat::{self, damage::apply_damage_guarded, groups_health}, effects::{aoe, registry, weapons::{self, missile::Missile}}},
     space::{Ball, WarpState, MODE_STOP, NpcAction, NpcBrain, NpcConfig, HOSTILE_TO_ALL},
 };
 
@@ -153,9 +153,9 @@ pub(super) async fn run(ctx: &super::Context) {
         world.remove_ball(SYSTEM, unpiloted).await;
         combat::forget_ship(unpiloted);
         let missile = Missile { charge, raw: [1.0, 0.0, 0.0, 0.0], aoe_cloud: 1.0, aoe_velocity: 100.0,
-            drf: 1.0, velocity: 1000.0, flight_time_ms: 1_000.0, weapon: npc_type, illegal: false };
+            drf: 1.0, velocity: 1000.0, flight_time_ms: 1_000.0, weapon: npc_type, illegal: false, dot: None };
         let attempt = npc_attempt(world, source, None, None, Some(npc_type)).await;
-        weapons::launch_missile(db.clone(), world.clone(), SYSTEM, attacker.clone(), target.clone(), 1, None, missile, None, attempt).await.ok().unwrap();
+        weapons::missile::launch_missile(db.clone(), world.clone(), SYSTEM, attacker.clone(), target.clone(), 1, None, missile, None, attempt).await.ok().unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if ctx.events().await.len() > cursor { break; }

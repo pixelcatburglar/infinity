@@ -8,8 +8,11 @@
 //! through generic attribute overrides.
 //! Committed override-only deltas admit set and remove writes on named keys
 //! without touching topology, runtime flags or incarnations.
+//! A terminal stance switch attaches its `StanceTransition` receipt to the
+//! same patch; ordinary fittings always carry `None`.
 
 use super::{Fit, Key, Node};
+use crate::services::ship_stance::StanceTransition;
 use infinity_core::consts::dogma::{ATTR_ARMOR_DAMAGE, ATTR_CAPACITY, ATTR_CHARGE, ATTR_HEAT_HI,
     ATTR_HEAT_LOW, ATTR_HEAT_MED, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS,
     ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_RADIUS, ATTR_SHIELD_CHARGE, ATTR_VOLUME};
@@ -19,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct CommittedFitting {
     changes: Vec<(Key, Change)>,
     candidates: Vec<(Key, i32)>,
+    stance: Option<StanceTransition>,
 }
 
 enum Change {
@@ -40,6 +44,11 @@ impl Fit {
         if self.cargo_unlimited() || after.cargo_unlimited() { targets.insert(ATTR_CAPACITY); }
         for fit in [Some(self), (!std::ptr::eq(self, after)).then_some(after)].into_iter().flatten() {
             targets.extend(fit.passive_by_attribute.keys().copied());
+            for source in &fit.runtime_sources {
+                if let Some(collection) = fit.sde.dbuffs.get(source.collection_id) {
+                    targets.extend(collection.modifiers.iter().map(|m| m.modifier.modified));
+                }
+            }
             for node in fit.nodes.values() {
                 for type_id in [Some(node.type_id), node.charge_type].into_iter().flatten() {
                     for entry in fit.sde.types.effects(type_id) {
@@ -125,7 +134,7 @@ impl Fit {
                 (None, None) => unreachable!(),
             }
         }
-        CommittedFitting { changes, candidates }
+        CommittedFitting { changes, candidates, stance: None }
     }
 
     /// Apply only fields changed by the committed operation to the current
@@ -149,11 +158,13 @@ impl Fit {
                 Change::Remove => {
                     if self.nodes.remove(key).is_some() { applied = true; }
                     if let Key::Charge(module) = key { self.charge_incarnations.remove(module); }
+                    if let Key::Module(module) = key { self.clear_reactive_armor(*module); }
                 }
                 Change::Insert(node) => {
                     if let Key::Charge(module) = key {
                         self.charge_incarnations.insert(*module, crate::space::targeting::next_generation());
                     }
+                    if let Key::Module(module) = key { self.clear_reactive_armor(*module); }
                     self.nodes.insert(*key, node.clone());
                     applied = true;
                 }
@@ -182,6 +193,11 @@ impl Fit {
                             applied |= node.cargo_unlimited != *mode;
                             node.cargo_unlimited = *mode;
                         }
+                    }
+                    // A committed offline drops the module's adapted operand
+                    // profile like a removal; ordinary field deltas keep it.
+                    if let (Key::Module(module), Some(false)) = (*key, *online) {
+                        self.clear_reactive_armor(module);
                     }
                 }
             }
@@ -258,7 +274,7 @@ impl CommittedFitting {
                 overrides: vec![(ATTR_HULL_DAMAGE, Some(0.0))],
             },
         )).collect();
-        Self { changes, candidates: Vec::new() }
+        Self { changes, candidates: Vec::new(), stance: None }
     }
 
     /// A committed override-only field delta: `Some` sets the final persisted
@@ -275,7 +291,7 @@ impl CommittedFitting {
             candidates.extend(overrides.iter().filter_map(|&(attr, _)| generic(attr).then_some((key, attr))));
             (key, Change::Update { online: None, overrides, cargo_unlimited: None })
         }).collect();
-        Self { changes, candidates }
+        Self { changes, candidates, stance: None }
     }
 
     /// True when the patch carries override-only updates confined to `key`:
@@ -289,6 +305,13 @@ impl CommittedFitting {
     }
 
     pub(crate) fn candidates(&self) -> &[(Key, i32)] { &self.candidates }
+
+    /// The committed stance transition this patch publishes, set only by the
+    /// terminal fitting of an accepted switch; ordinary fittings return `None`.
+    pub(crate) fn ship_stance(&self) -> Option<StanceTransition> { self.stance }
+
+    /// Attach the committed switch receipt to this patch.
+    pub(crate) fn set_ship_stance(&mut self, stance: StanceTransition) { self.stance = Some(stance); }
 }
 
 #[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships", feature = "tests-space")))] pub(crate) mod tests;

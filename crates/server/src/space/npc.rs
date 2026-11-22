@@ -118,6 +118,7 @@ impl System {
     pub fn add_npc(&mut self, id: i64, mut brain: NpcBrain) -> bool {
         if !self.contains(id) { return false; }
         if self.actor_combat.get(&id).is_some_and(|record| matches!(record.phase, super::combat::CombatPhase::Dying { .. })) {
+            self.retire_body_combat_source(id);
             self.actor_combat.remove(&id);
         }
         if !self.actor_combat.contains_key(&id) {

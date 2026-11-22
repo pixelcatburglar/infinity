@@ -75,7 +75,7 @@ pub(crate) fn placement_fixture(groups: &[(i32, Option<i32>)]) -> Arc<Sde> {
     Arc::new(sde)
 }
 
-#[cfg(any(feature = "tests-inventory", feature = "tests-lua"))]
+#[cfg(any(feature = "tests-inventory", feature = "tests-lua", feature = "tests-space"))]
 /// Add attributes to synthetic placement types, without loading client data.
 pub(crate) fn attribute_fixture(groups: &[(i32, Option<i32>)], attributes: &[(i32, Vec<(i32, f64)>)]) -> Arc<Sde> {
     let mut sde = Arc::try_unwrap(placement_fixture(groups)).ok().unwrap();
@@ -85,6 +85,12 @@ pub(crate) fn attribute_fixture(groups: &[(i32, Option<i32>)], attributes: &[(i3
         sde.types.types[index].attributes.sort_unstable_by_key(|value| value.0);
     }
     Arc::new(sde)
+}
+
+#[cfg(feature = "tests-lua")]
+/// Register one synthetic group so a content reference check can see it.
+pub(crate) fn add_group(sde: &mut crate::sde::Sde, group: i32) {
+    sde.types.groups.insert(group, super::Group { category_id: None, name: None, lower_name: None });
 }
 #[cfg(feature = "tests-inventory")]
 /// Add synthetic capacity and volume fields to placement types.

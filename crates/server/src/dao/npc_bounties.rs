@@ -6,6 +6,7 @@
 //! the live/DB merge; resurrection prevention is the epoch protocol, not SQL.
 use crate::db::{self, executor::Executor};
 use crate::isk::IskAmount;
+use crate::npc_security::SecurityGain;
 use tokio_postgres::Row;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,10 +22,19 @@ pub(crate) struct Pool {
     pub system_id: i64,
     pub amount: IskAmount,
     pub kill_count: i64,
+    pub legacy_kill_count: i64,
+    pub security_gain: SecurityGain,
 }
 
 impl Pool {
     fn from_row(row: &Row) -> Result<Self, db::Error> {
+        let gain = SecurityGain::from_storage(row.get("security_gain_log"))
+            .ok_or_else(|| db::Error::Progress(anyhow::anyhow!("npc bounty security gain is not canonical")))?;
+        let legacy_kill_count = row.get("legacy_kill_count");
+        let kill_count = row.get("kill_count");
+        if !(0..=kill_count).contains(&legacy_kill_count) {
+            return Err(db::Error::Progress(anyhow::anyhow!("npc bounty legacy count exceeds its total")));
+        }
         Ok(Self {
             batch: Batch {
                 character_id: row.get("character_id"),
@@ -33,12 +43,12 @@ impl Pool {
             },
             system_id: row.get("system_id"),
             amount: super::numeric::parse_isk(row.get("amount"))?,
-            kill_count: row.get("kill_count"),
+            kill_count, legacy_kill_count, security_gain: gain,
         })
     }
 }
 
-const COLUMNS: &str = "character_id, system_id, batch_started_at, due_at, amount::text AS amount, kill_count";
+const COLUMNS: &str = "character_id, system_id, batch_started_at, due_at, amount::text AS amount, kill_count, legacy_kill_count, security_gain_log";
 
 /// Every distinct open batch identity, ordered by character. Callers reject a
 /// character carrying two different identities instead of picking one row.
@@ -86,23 +96,34 @@ pub(crate) async fn save_absolute(ex: &(impl Executor + ?Sized), rows: &[Pool]) 
     let dues: Vec<i64> = rows.iter().map(|row| row.batch.due_at).collect();
     let amounts: Vec<String> = rows.iter().map(|row| row.amount.decimal()).collect();
     let counts: Vec<i64> = rows.iter().map(|row| row.kill_count).collect();
+    let legacy: Vec<i64> = rows.iter().map(|row| row.legacy_kill_count).collect();
+    let gains: Vec<Option<f64>> = rows.iter().map(|row| row.security_gain.storage()).collect();
     let written = ex.query(
-        "INSERT INTO game.npc_bounty_pools (character_id, system_id, batch_started_at, due_at, amount, kill_count)
+        "INSERT INTO game.npc_bounty_pools
+            (character_id, system_id, batch_started_at, due_at, amount, kill_count, legacy_kill_count, security_gain_log)
          SELECT source.character_id, source.system_id, source.batch_started_at, source.due_at,
-                source.amount::numeric, source.kill_count
-         FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::text[], $6::bigint[])
-             AS source(character_id, system_id, batch_started_at, due_at, amount, kill_count)
+                source.amount::numeric, source.kill_count, source.legacy_kill_count, source.security_gain_log
+         FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::text[], $6::bigint[], $7::bigint[], $8::double precision[])
+             AS source(character_id, system_id, batch_started_at, due_at, amount, kill_count, legacy_kill_count, security_gain_log)
          ON CONFLICT (character_id, system_id) DO UPDATE SET
              batch_started_at = EXCLUDED.batch_started_at, due_at = EXCLUDED.due_at,
-             amount = EXCLUDED.amount, kill_count = EXCLUDED.kill_count
+             amount = EXCLUDED.amount, kill_count = EXCLUDED.kill_count,
+             legacy_kill_count = EXCLUDED.legacy_kill_count, security_gain_log = EXCLUDED.security_gain_log
          WHERE game.npc_bounty_pools.batch_started_at = EXCLUDED.batch_started_at
            AND game.npc_bounty_pools.due_at = EXCLUDED.due_at
+           AND game.npc_bounty_pools.legacy_kill_count = EXCLUDED.legacy_kill_count
            AND game.npc_bounty_pools.amount <= EXCLUDED.amount
            AND game.npc_bounty_pools.kill_count <= EXCLUDED.kill_count
+           AND (game.npc_bounty_pools.security_gain_log IS NULL
+                AND EXCLUDED.security_gain_log IS NULL
+                OR game.npc_bounty_pools.security_gain_log IS NOT NULL
+                   AND (EXCLUDED.security_gain_log IS NULL
+                        OR EXCLUDED.security_gain_log >= game.npc_bounty_pools.security_gain_log))
            AND (game.npc_bounty_pools.kill_count < EXCLUDED.kill_count
-                OR game.npc_bounty_pools.amount = EXCLUDED.amount)
+                OR game.npc_bounty_pools.amount = EXCLUDED.amount
+                   AND game.npc_bounty_pools.security_gain_log IS NOT DISTINCT FROM EXCLUDED.security_gain_log)
          RETURNING character_id",
-        &[&characters, &systems, &starts, &dues, &amounts, &counts],
+        &[&characters, &systems, &starts, &dues, &amounts, &counts, &legacy, &gains],
     ).await?;
     if written.len() != rows.len() {
         return Err(db::Error::Progress(anyhow::anyhow!("npc bounty pool identity changed during absolute checkpoint")));

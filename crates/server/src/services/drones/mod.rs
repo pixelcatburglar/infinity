@@ -1,10 +1,13 @@
 //! Drone commands follow the client entity moniker and ship service contracts.
 //! Michelle receives drone state through bootstrap and state notifications; it
-//! does not issue a remote GetDroneState call. Salvage and reconnect are refused.
+//! does not issue a remote GetDroneState call. Salvage work runs through the
+//! shared wreck recovery settlement and delivers real cargo on ship contact;
+//! reconnect remains refused.
 
 pub(crate) mod inventory;
 pub(crate) mod mining;
 pub(crate) mod worker;
+pub(crate) mod salvage;
 pub(crate) mod settings;
 mod entity;
 

@@ -208,7 +208,7 @@ pub(in crate::services) fn route_target(notification: crate::db::outbox::Notific
 /// `OnItemChange` change dict: quantity columns project to the client display
 /// limit (invCache and inventorysvc rebuild the old row from the changed keys);
 /// every other key, value type and the order are preserved.
-pub(in crate::services) fn item_change_dict(change: impl IntoIterator<Item = (i64, Value)>) -> Value {
+pub(crate) fn item_change_dict(change: impl IntoIterator<Item = (i64, Value)>) -> Value {
     Value::Dict(change.into_iter().map(|(key, value)| {
         let value = match value {
             Value::Int(quantity) if key == IX_QUANTITY || key == IX_STACK_SIZE => {
@@ -276,7 +276,7 @@ pub(in crate::services) async fn notify_corp_item_change<X: Send>(ex: &(impl Exe
 }
 
 /// The standard junkyard removal payload shared by every removed-item target.
-fn removed_payload(item: Item) -> (Value, Value) {
+pub(crate) fn removed_payload(item: Item) -> (Value, Value) {
     let old_location = item.location_id;
     let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
     (gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]))

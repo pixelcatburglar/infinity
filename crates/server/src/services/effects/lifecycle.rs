@@ -16,17 +16,22 @@
 //! Duration-bounded pure-modifier activations additionally carry module-item
 //! keyed Pending/Running/Cooling records in shared combat state (active_cycle.rs).
 //! Weapon animations are published through the system's ordered scene channel.
+//! A module presenting warpDisruptSphere resolves through `scripted_effect` to
+//! the loaded script's projected effect; notifications and effect membership
+//! keep the requested ID. Security-class admission is shared: modules carrying
+//! the high-security or empire-space disallow attributes refuse before family
+//! validation.
 use super::{EffectKind, parameters, registry, spool, repair};
 use super::registry::{Effect, EffectFlag};
 use super::notify::ship_effect;
 use super::behaviors::{on_cycle_end, on_stop};
 use crate::services::combat::{state, ActiveModule, Ctx};
 use crate::services::combat::groups_health::inject;
-use crate::services::fit::Key;
+use crate::services::fit::{Fit, Key};
 use crate::services::items::load_items;
-use crate::services::{db_err, notify_error, CallError};
 use crate::dao::items::loading::{Item, ItemQuery};
-use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE, FLAG_HANGAR};
+use crate::services::{db_err, notify_error, user_error, CallError};
+use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_DISALLOW_IN_EMPIRE_SPACE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ADAPTIVE_ARMOR_HARDENER, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_WARP_DISRUPT_SPHERE, FLAG_HANGAR};
 use infinity_core::consts::{dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
 use crate::client::filetime_from_unix_ms;
 use infinity_core::messages;
@@ -71,7 +76,13 @@ pub(in crate::services) async fn stop_offensive(cx: &Ctx, except_module: i64) {
         if item.item_id == except_module { continue; }
         let Some(generation) = state().active.get(&item.item_id).filter(|active| active.char_id == cx.char_id).map(|active| active.stop.clone()) else { continue };
         for row in cx.world.sde().types.effects(item.type_id) {
-            let Some(effect) = registry::resolve(cx.world.sde(), row.effect_id) else { continue };
+            // A warpDisruptSphere row resolves through the loaded script like
+            // activation does; the slot is read only for that effect.
+            let charge = if row.effect_id == EFFECT_WARP_DISRUPT_SPHERE {
+                let (ship, system, module) = (cx.ship_id, cx.system_id, item.item_id);
+                cx.world.with(system, move |s| s.loaded_effective(ship, module)).await.flatten()
+            } else { None };
+            let Some(effect) = scripted_effect(cx.world.sde(), row.effect_id, charge.map(|(_, type_id, _, _)| type_id)) else { continue };
             if !effect.has(EffectFlag::Offensive) || effect.kind == EffectKind::Cloak || !effect.manually_activatable() { continue; }
             if subject_core(&cx.db, cx.world.sde(), &policy, cx.ship_id, item.item_id, row.effect_id, true).await.is_err() { continue; }
             let module = item.item_id;
@@ -93,6 +104,27 @@ pub(in crate::services) async fn stop_offensive(cx: &Ctx, except_module: i64) {
 pub(super) const MIN_MODULE_DURATION_MS: f64 = 250.0;
 /// Client UserError type-ID substitution tag.
 pub(super) const UE_TYPEID: i64 = 4;
+
+/// Client dogma/const.py: attributeDisallowInHighSec;
+/// packages/dogma/moduleRestrictions.py refuses activation in high-security
+/// space for any module carrying it. System corruption is not modelled.
+const ATTR_DISALLOW_IN_HIGH_SEC: i32 = 1970;
+
+/// The one dogmaLM security-class check: a module that disallows high-security
+/// use cannot activate while its ship sits in a high-security system, and a
+/// module carrying `disallowInEmpireSpace` cannot activate in any
+/// positive-security (empire) system, low-security included.
+pub(super) fn security_class_check(sde: &Sde, fit: &Fit, module: i64, system: i64) -> Result<(), CallError> {
+    if fit.value(Key::Module(module), ATTR_DISALLOW_IN_HIGH_SEC) > 0.0
+        && crate::services::crimewatch::highsec_system(sde, system) {
+        return Err(user_error(messages::MSG_CANT_IN_HIGH_SEC_SPACE, vec![]));
+    }
+    if fit.value(Key::Module(module), ATTR_DISALLOW_IN_EMPIRE_SPACE) > 0.0
+        && crate::services::crimewatch::empire_system(sde, system) {
+        return Err(user_error(messages::MSG_CANT_IN_EMPIRE_SPACE, vec![]));
+    }
+    Ok(())
+}
 
 
 
@@ -130,31 +162,25 @@ pub(super) struct ActivationOwner {
 
 impl Drop for ActivationOwner {
     fn drop(&mut self) {
-        if self.armed {
-            let mut st = state();
-            if st.active.get(&self.master).is_some_and(|current| Arc::ptr_eq(&current.stop, &self.generation)) {
-                st.active.remove(&self.master);
-            }
-            if st.activation_generation.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
-                st.activation_generation.remove(&self.master);
-            }
-            // When no world remains to run the posted terminal, the dropping
-            // generation's record still ends: Pending cancels and Running
-            // starts its cooling against the wall clock. A live system's
-            // posted finish_record owns the published terminal instead.
-            if self.world.upgrade().is_none() {
-                super::active_cycle::stopped(crate::space::now_ms(), &mut st, self.master, &self.generation);
-            }
-        }
+        let terminal = if self.armed {
+            // The dropping generation's record and activation markers are
+            // consumed synchronously in one critical section, so cleanup
+            // holds even when no actor remains to run a posted terminal; the
+            // small result carries only what a live actor still publishes.
+            super::active_cycle::terminate(&mut state(), self.master, &self.generation)
+        } else { None };
         drop(self.pending_combat.take());
         let generations = std::mem::take(&mut self.combat_generations);
-        if !generations.is_empty() {
+        if !generations.is_empty() || terminal.is_some() {
             if let Some(world) = self.world.upgrade() {
                 let (master, generation) = (self.master, self.generation.clone());
                 world.post(self.system, move |s| {
                     retire_combat_generations(s, generations);
-                    s.retire_fx_activation(master, &generation);
-                    super::active_cycle::finish_record(s, master, &generation);
+                    if let Some(terminal) = terminal {
+                        super::active_cycle::apply_terminal(s, terminal);
+                    } else {
+                        s.retire_fx_activation(master, &generation);
+                    }
                 });
             }
         }
@@ -166,6 +192,10 @@ pub(super) struct Cycle {
     pub(super) cx: Ctx,
     pub(super) modules: Vec<Module>,
     pub(super) effect: Effect,
+    /// The effect ID the client requested and the module presents in
+    /// notifications and effect membership; a loaded script runs its own
+    /// resolved effect while this stays the module's requested effect.
+    pub(super) presented_effect: i64,
     pub(super) target: Option<i64>,
     pub(super) repeat: i64,
     pub(super) stop: Arc<AtomicBool>,
@@ -187,17 +217,25 @@ pub(super) struct Cycle {
 }
 
 impl Drop for Cycle {
-    /// A dropped cycle still returns every unconsumed loaded admission, and a
-    /// cycle carrying a bound spool clears only its own generation's readout.
+    /// A dropped cycle still returns every unconsumed loaded admission, a
+    /// cycle carrying a bound spool clears only its own generation's readout,
+    /// and an adaptive armor cycle retires its own generation's profile
+    /// through the same posted teardown even with no permits or spool.
     fn drop(&mut self) {
         let permits: Vec<_> = self.inputs.members.iter_mut().filter_map(|member| member.permit.take()).collect();
         let spooled = self.inputs.members.iter().any(|member| member.spool.is_some());
-        if !permits.is_empty() || spooled {
+        let reactive = (self.effect.id == i64::from(EFFECT_ADAPTIVE_ARMOR_HARDENER))
+            .then_some(self.source_membership).flatten();
+        if !permits.is_empty() || spooled || reactive.is_some() {
             let ship = self.cx.ship_id;
             let generation = self.stop.clone();
+            let module = self.modules[0].id;
             self.cx.world.post(self.cx.system_id, move |s| {
                 for permit in permits { s.release_loaded_use(permit); }
                 if spooled { s.spool_readout_clear(ship, &generation); }
+                if let Some(membership) = reactive {
+                    s.retire_reactive_armor(ship, membership, module, &generation);
+                }
             });
         }
     }
@@ -318,17 +356,32 @@ pub(super) fn capture_cycle_inputs(s: &mut System, cycle: &mut Cycle) -> Result<
     for member in &mut cycle.inputs.members {
         if let Some(permit) = member.permit.take() { s.release_loaded_use(permit); }
     }
-    let reuse = std::mem::take(&mut cycle.inputs);
-    let captured = s.with_combat_fit_active(cycle.cx.ship_id,
-        cycle.modules.iter().map(|module| module.id), |fit, _key, stamp| {
-        // A member replaced since admission never reaches parameter evaluation.
-        (!cycle.source_membership.is_some_and(|membership| membership != stamp.membership))
-            .then(|| parameters::capture_cycle(fit, cycle, stamp, reuse))
-            .map(|inputs| (inputs, stamp))
+    // A first adaptive-armor capture retires the previous generation's
+    // profile through the shared fenced teardown before the clean seed reads.
+    // Current owner, type, effect and membership authority is checked first;
+    // capture itself opens no observation window.
+    if cycle.cycles == 0 && cycle.effect.id == i64::from(EFFECT_ADAPTIVE_ARMOR_HARDENER) {
+        let Some(membership) = s.combat_membership_generation(cycle.cx.ship_id) else { return Ok(false) };
+        if !source_subject_current(s, cycle.cx.ship_id, cycle.cx.char_id, membership,
+            &cycle.modules[0], cycle.presented_effect, &cycle.stop) {
+            return Ok(false);
+        }
+        let (module_id, module_type) = (cycle.modules[0].id, cycle.modules[0].type_id);
+        if !s.prepare_reactive_armor_activation(cycle.cx.ship_id, membership, module_id, module_type, &cycle.stop) {
+            return Ok(false);
+        }
+    }
+    let (reuse, bound_membership, modules) = (std::mem::take(&mut cycle.inputs), cycle.source_membership,
+        cycle.modules.iter().map(|module| module.id).collect::<Vec<_>>());
+    let captured = s.with_combat_fit_active(cycle.cx.ship_id, modules.into_iter(), |fit, _key, stamp| {
+        // A member replaced since admission never reaches parameter evaluation;
+        // membership binds before capture so the cycle sees it as its live incarnation.
+        if bound_membership.is_some_and(|membership| membership != stamp.membership) { return None; }
+        cycle.source_membership = Some(stamp.membership);
+        Some((parameters::capture_cycle(fit, cycle, stamp, reuse), stamp))
     });
     let Some(Some((captured, stamp))) = captured else { return Ok(false) };
     let inputs = captured?;
-    cycle.source_membership.get_or_insert(stamp.membership);
     cycle.inputs = inputs;
     // A spool-capable member binds once to this activation's target
     // incarnation on its first successful capture; a bound member whose
@@ -388,7 +441,7 @@ pub(super) fn capture_cycle_inputs(s: &mut System, cycle: &mut Cycle) -> Result<
         member.permit = (member.charge_token.is_some() && match kind {
             EffectKind::Turret => !matches!(&member.packet, parameters::MemberPacket::Turret(inputs) if inputs.direct_damage),
             EffectKind::Missile | EffectKind::Bomb | EffectKind::Vorton => true,
-            EffectKind::FueledLocalRepair { .. } | EffectKind::CapBooster => index == 0,
+            EffectKind::FueledLocalRepair { .. } | EffectKind::CapBooster | EffectKind::CommandBurst { .. } | EffectKind::ProbeLaunch => index == 0,
             _ => false,
         }).then(|| s.hold_loaded_use(ship, module.id)).flatten();
     }
@@ -416,7 +469,7 @@ pub(in crate::services::effects) fn cycle_start(s: &mut System, mut cycle: Cycle
             EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer
             | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm
             | EffectKind::Mining | EffectKind::Salvage | EffectKind::CargoScan | EffectKind::ShipScan
-            | EffectKind::SurveyScan | EffectKind::Tractor | EffectKind::Entosis)
+            | EffectKind::SurveyScan | EffectKind::Tractor | EffectKind::Entosis | EffectKind::Interdiction)
         {
             s.begin_fx_activation(cycle.modules[0].id, cycle.cx.ship_id, cycle.target, cycle.stop.clone());
         }
@@ -444,10 +497,10 @@ pub(in crate::services::effects) fn cycle_discharge(kind: EffectKind, charged: b
     if matches!(kind, EffectKind::FueledLocalRepair { layer: 0, .. }) && charged { 0.0 } else { need }
 }
 
-pub(in crate::services::effects) fn needs_charge(kind: EffectKind) -> bool { matches!(kind, EffectKind::CapBooster | EffectKind::Bomb | EffectKind::Vorton) }
+pub(in crate::services::effects) fn needs_charge(kind: EffectKind) -> bool { matches!(kind, EffectKind::CapBooster | EffectKind::Bomb | EffectKind::Vorton | EffectKind::CommandBurst { .. } | EffectKind::ProbeLaunch) }
 
 pub(in crate::services::effects) fn charge_sensitive(kind: EffectKind) -> bool {
-    matches!(kind, EffectKind::CapBooster | EffectKind::FueledLocalRepair { .. } | EffectKind::Bomb | EffectKind::Vorton)
+    matches!(kind, EffectKind::CapBooster | EffectKind::FueledLocalRepair { .. } | EffectKind::Bomb | EffectKind::Vorton | EffectKind::CommandBurst { .. } | EffectKind::ProbeLaunch)
 }
 
 pub(super) fn charge_kind(id: i64, kind: EffectKind) -> EffectKind {
@@ -481,6 +534,20 @@ pub(in crate::services) fn has_effect(effects: &[crate::sde::types::TypeEffect],
     effects.iter().any(|entry| entry.effect_id == effect)
 }
 
+/// Client dogma/effects/environment.py:65-69: a warpDisruptSphere activation
+/// with a loaded script runs the script's own projected effect. The module
+/// stays the activation's subject and presented effect; the script's charge
+/// type only selects which of its declared effects actually runs, resolved
+/// here as the single effect that classifies as projected.
+pub(super) fn scripted_effect(sde: &Sde, requested: i32, charge: Option<i32>) -> Option<Effect> {
+    if requested != EFFECT_WARP_DISRUPT_SPHERE { return registry::resolve(sde, requested); }
+    charge.and_then(|ty| sde.types.effects(ty).iter()
+        .map(|row| row.effect_id)
+        .find(|id| matches!(registry::kind(sde, *id), Some(EffectKind::Projected { .. })))
+        .and_then(|id| registry::resolve(sde, id)))
+    .or_else(|| registry::resolve(sde, requested))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn valid_subject(hull: &Item, module: &Item, owner: i64, ship: i64, active_ship: Option<i64>, station: Option<i64>, effects: &[crate::sde::types::TypeEffect], effect: i32, require_online: bool, online: bool) -> bool {
     hull.item_id == ship && hull.owner_id == owner && hull.category_id == i64::from(CATEGORY_SHIP)
@@ -512,9 +579,10 @@ pub(super) async fn subject(db: &Db, sde: &Sde, policy: &OnlinePolicy, ship: i64
 
 /// Current source authority inside the actor: the same activation generation
 /// and owner, a live resident record of the admitted membership, and the
-/// actual module still fitted, online and carrying the SDE effect. An
-/// ordinary stop still lets the in-flight end run; a stale activation, a
-/// forced-inactive source or a replaced membership does not.
+/// actual module still fitted, online and carrying the presented SDE effect
+/// the client requested. An ordinary stop still lets the in-flight end run; a
+/// stale activation, a forced-inactive source or a replaced membership does
+/// not.
 pub(super) fn source_subject_current(s: &mut System, ship: i64, owner: i64, membership: u64, module: &Module, effect: i64, activation: &Arc<AtomicBool>) -> bool {
     if !state().active.get(&module.id).is_some_and(|active| active.char_id == owner && !active.forced_inactive && Arc::ptr_eq(&active.stop, activation)) { return false; }
     if !s.ball(ship).is_some_and(|ball| ball.owner_id == owner && ball.char_id == Some(owner)) { return false; }
@@ -530,9 +598,10 @@ pub(super) fn source_subject_current(s: &mut System, ship: i64, owner: i64, memb
 pub(super) async fn cycle_subject_valid(cycle: &Cycle) -> bool {
     let Some(membership) = cycle.source_membership else { return false };
     let (world, system, cx, module, effect, activation) =
-        (cycle.cx.world.clone(), cycle.cx.system_id, cycle.cx.clone(), cycle.modules[0].clone(), cycle.effect.id, cycle.stop.clone());
+        (cycle.cx.world.clone(), cycle.cx.system_id, cycle.cx.clone(), cycle.modules[0].clone(), cycle.presented_effect, cycle.stop.clone());
     world.with(system, move |s| source_subject_current(s, cx.ship_id, cx.char_id, membership, &module, effect, &activation)).await.unwrap_or(false)
 }
+
 
 
 #[cfg(all(test, feature = "tests-effects"))] mod tests;

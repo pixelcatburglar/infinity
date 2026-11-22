@@ -26,5 +26,16 @@ pub const ENTOSIS_ACTION_BLOCKED: &str = "主权链接仍在运行，无法执�
 /// CCP Entosis Link: capital ships cannot receive remote assistance while linked.
 pub const ENTOSIS_ASSISTANCE_BLOCKED: &str = "目标正在使用主权链接，无法接受远程支援。";
 
+/// Breacher pod launcher: the locked target is outside the launcher's
+/// valid-target type list.
+pub const BREACHER_INVALID_TARGET: &str = "破坏者座舱发射器无法对该目标使用。";
+
+/// An admitted ship mode (Bastion, Sacribis) locks steering, warp, dock,
+/// jump, cloaking, micro jumps and manual fitting until it retires.
+pub const MODE_ACTION_BLOCKED: &str = "舰船处于强化模式，无法执行此操作。";
+/// A compressor whose fitted requirement is positive has no live industrial
+/// or compact core on the same ship.
+pub const INDUSTRIAL_CORE_REQUIRED: &str = "需要启动工业核心后才能压缩物品。";
+
 /// Server policy: the bounded combat fact buffer cannot accept another cycle.
 pub const COMBAT_CAPACITY_FULL: &str = "战斗记录暂时已满，模块效果无法生效，请稍后重试。";

@@ -3,7 +3,7 @@
 //! effective attributes come from Fit and condition is stored in game.item_attributes.
 //! Burnout publishes one final fitting after all damage writes and offlines.
 //! Rack heat itself is transient; reset epochs discard already-covered captures.
-//! Paste repair and structure repair are unsupported.
+//! Paste repair lives in `paste.rs`; structure repair is unsupported.
 
 use std::sync::Arc;
 use infinity_core::consts::{dogma::ATTR_HULL_DAMAGE, dogma::ATTR_STRUCTURE_HP, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MED_SLOTS, dogma::ATTR_HI_SLOTS, dogma::ATTR_RIG_SLOTS, dogma::EFFECT_EMERGENCY_HULL_ENERGIZER, CATEGORY_MODULE, CATEGORY_SHIP};
@@ -51,6 +51,7 @@ pub(crate) fn burnt(fit: &Fit, module: i64) -> bool {
 }
 
 pub(crate) fn validate(fit: &Fit, module: i64) -> Result<(), CallError> {
+    if super::paste::repairing(module) { return Err(notify_error(messages::heat::BEING_REPAIRED)); }
     if burnt(fit, module) { Err(notify_error(messages::heat::BURNT_OUT)) } else { Ok(()) }
 }
 
@@ -136,7 +137,7 @@ pub(in crate::services::effects) async fn apply(cx: &Ctx, membership: Option<u64
                 let mut final_fit = None;
                 for &(id, _, old, new, hp) in &damage {
                     if old.map(|state| state.value).unwrap_or(0.0) != new && exhausted(hp, new) {
-                        let (_, fit) = online::set_online_core(tx, &sde, &policy, outbox, &fences, ship, id, false).await?;
+                        let (_, fit) = online::set_online_forced(tx, &sde, &policy, outbox, &fences, ship, id, false).await?;
                         final_fit = Some(fit);
                     }
                 }

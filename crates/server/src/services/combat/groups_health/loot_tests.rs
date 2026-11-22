@@ -1,3 +1,4 @@
+use super::super::bounty_payout;
 use super::*;
 
 #[test]

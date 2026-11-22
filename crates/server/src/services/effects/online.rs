@@ -124,10 +124,36 @@ pub(in crate::services) async fn set_online_core<E: From<OnlineChanged> + Send>(
     ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, policy: &OnlinePolicy, outbox: &mut Outbox<E>, fences: &OnlineFences,
     ship: i64, item: i64, online: bool,
 ) -> Result<(bool, crate::services::fit::Fit), CallError> {
+    set_online_impl(ex, sde, policy, outbox, fences, ship, item, online, false).await
+}
+
+/// The forced variant for callers that already proved the transition (heat
+/// burnout, breach self-burn): the same locked mutation and reconcile,
+/// without the ordinary early-deactivation refusal.
+pub(in crate::services) async fn set_online_forced<E: From<OnlineChanged> + Send>(
+    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, policy: &OnlinePolicy, outbox: &mut Outbox<E>, fences: &OnlineFences,
+    ship: i64, item: i64, online: bool,
+) -> Result<(bool, crate::services::fit::Fit), CallError> {
+    set_online_impl(ex, sde, policy, outbox, fences, ship, item, online, true).await
+}
+
+async fn set_online_impl<E: From<OnlineChanged> + Send>(
+    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, policy: &OnlinePolicy, outbox: &mut Outbox<E>, fences: &OnlineFences,
+    ship: i64, item: i64, online: bool, forced: bool,
+) -> Result<(bool, crate::services::fit::Fit), CallError> {
     let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
     if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(refuse()); }
     let (hull, module) = subject_core(ex, sde, policy, ship, item, EFFECT_ONLINE as i32, false).await?;
     let was_online = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item);
+    if !forced && !online && was_online {
+        // The subject's own effective 906 value reserves that module only.
+        // A mode on another slot does not refuse an unrelated offline, and
+        // the fitted fit supplies the value inside this transaction.
+        let fit = crate::services::fit::Fit::load(ex, sde.clone(), policy.owner, ship).await?;
+        if super::active_cycle::subject_early_locked(&fit, item) {
+            return Err(notify_error(messages::effects::MODE_ACTION_BLOCKED));
+        }
+    }
     if online {
         let fit = crate::services::fit::Fit::load(ex, sde.clone(), policy.owner, ship).await?;
         super::heat::damage::validate(&fit, item)?;
@@ -387,6 +413,9 @@ pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
     if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(refuse()); }
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
     if hull.owner_id != owner || hull.category_id != i64::from(infinity_core::consts::CATEGORY_SHIP) || !hull.singleton { return Err(refuse()); }
+    // A supported hull missing its mode item and timing gains the default
+    // stance in this same transaction; it is no switch receipt or event.
+    crate::services::ship_stance::state::ensure_initialized_tx(ex, sde, outbox, &hull).await?;
     let fit = crate::services::fit::Fit::load(ex, sde.clone(), owner, ship).await?;
     let mut burnt = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?;
     burnt.sort_unstable_by_key(|module| module.item_id);

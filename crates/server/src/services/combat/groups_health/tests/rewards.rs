@@ -89,6 +89,9 @@ fn expected_notices(owner: i64, corp: i64, net: crate::isk::IskAmount, tax: crat
     if !tax.is_zero() { notices.push(vec![Value::str("cash"), Value::Int(corp), Value::Float(tax.client_isk(crate::isk::corporation_client_cap()))]); }
     notices
 }
+fn killer(character: i64) -> Option<super::super::NpcKiller> {
+    Some(super::super::NpcKiller { character_id: character, multiplier: crate::npc_security::FrozenMultiplier::new(1.0).unwrap() })
+}
 
 async fn batch_started(f: &Fixture) -> Result<i64> {
     Ok(f.db.query_one("SELECT batch_started_at FROM game.npc_bounty_pools WHERE character_id=$1 LIMIT 1", &[&f.owner]).await?.get("batch_started_at"))
@@ -107,7 +110,7 @@ async fn split(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> {
         f.db.execute("UPDATE game.corporations SET tax_rate=$2 WHERE corporation_id=$1", &[&corp, &rate]).await?;
         f.db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&f.owner]).await?;
         f.db.execute("UPDATE game.corp_wallets SET balance=0 WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?;
-        reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
+        reward_kill(&f.db, &f.world, f.system, &ball, killer(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
         // The kill records the pool notice only; wallet and tax wait for the
         // batch deadline, and the durable checkpoint rides the same writer.
         let (name, _) = receiver.try_recv().map_err(|_| anyhow!("pool notice missing"))?;
@@ -132,8 +135,7 @@ async fn overflow(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()> 
     f.db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await?;
     f.db.execute("UPDATE game.corp_wallets SET balance='9999999999999999999999999999999999.99'::numeric WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?;
     let before = balances(f, corp).await?;
-    // Fixture NPC types have no SDE wreck mapping, so reward_kill returns before spawn_wreck.
-    reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
+    reward_kill(&f.db, &f.world, f.system, &ball, killer(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
     let (name, _) = receiver.try_recv().map_err(|_| anyhow!("pool notice missing"))?;
     ensure!(name == "OnBountyAddedToPayout", "expected pool notice, got {name}");
     settle(f).await.err().ok_or_else(|| anyhow!("corporate overflow unexpectedly succeeded"))?;
@@ -150,7 +152,7 @@ async fn postcommit(f: &Fixture, corp: i64, receiver: &mut Notices) -> Result<()
     let net = payout.checked_sub(tax).ok_or_else(|| anyhow!("tax exceeds payout"))?;
     f.db.execute("UPDATE game.corporations SET tax_rate=0.1 WHERE corporation_id=$1", &[&corp]).await?;
     f.db.execute("UPDATE game.characters SET balance=0 WHERE character_id=$1", &[&f.owner]).await?;
-    reward_kill(&f.db, &f.world, f.system, &ball, Some(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
+    reward_kill(&f.db, &f.world, f.system, &ball, killer(f.owner)).await.map_err(|e| anyhow!("reward: {e:?}"))?;
     let (name, _) = receiver.try_recv().map_err(|_| anyhow!("pool notice missing"))?;
     ensure!(name == "OnBountyAddedToPayout", "expected pool notice, got {name}");
     f.world.flush_positions().await?;

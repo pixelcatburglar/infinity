@@ -109,6 +109,22 @@ pub(super) async fn write_damage(
         .then(|| attribute_change(owner, Value::Int(item), attribute, Value::Float(new), Value::Float(old))))
 }
 
+/// Client inventoryUtil.GetComputedBasePrice(typeID, 1), including its material portion rule.
+pub(in crate::services) fn computed_base_price(sde: &Sde, id: i32) -> f64 {
+    let Some(ty) = sde.types.get(id) else { return 0.0 };
+    let materials = ty.materials();
+    if materials.is_empty() {
+        let portion = ty.portion_size.unwrap_or(1).max(1) as f64;
+        return (ty.base_price.unwrap_or(0.0) / portion).trunc();
+    }
+    materials.iter().filter_map(|m| {
+        let material = sde.types.get(m.material_type_id)?;
+        let portion = material.portion_size.unwrap_or(0);
+        if portion <= 0 { return None; }
+        Some(m.quantity.unwrap_or(0) as f64 * (material.base_price.unwrap_or(0.0) / portion as f64).trunc() / portion as f64)
+    }).sum::<f64>().trunc()
+}
+
 fn refuse() -> CallError { notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION) }
 fn no_ship() -> CallError { notify_error(messages::gm::GM_DOGMA_NO_SHIP) }
 fn not_docked() -> CallError { notify_error(messages::gm::GM_SHIP_DOCKED_REQUIRED) }

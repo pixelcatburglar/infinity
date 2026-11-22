@@ -173,7 +173,7 @@ impl LoadedHolds {
                 let gate = world.lock_condition_snapshot(system).await.map_err(db_err)?;
                 holds.gates.push((system, gate));
             }
-            let claimed = hold.claimed_membership();
+            let claimed = hold.claimed_membership(ship);
             let captured = world.with(system, move |s| (
                 s.combat_membership_generation(ship),
                 s.capture_held_loaded(&[ship]),

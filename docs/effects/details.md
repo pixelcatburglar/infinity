@@ -36,8 +36,9 @@ uncertain, reconciliation checks the stored state: a confirmed rollback
 restores the prior condition, while a committed loss is published or retired.
 An inconclusive result remains pending for reconciliation.
 
-This covers ordinary typed damage. Breacher damage over time and its defensive
-module are not implemented.
+This covers ordinary typed damage. Breacher pod boarding damage is flat
+damage over time on the same authority (see [Breacher pods](../effects.md#breacher-pods));
+its defensive module is not implemented.
 
 ## SDE and Python modifiers
 

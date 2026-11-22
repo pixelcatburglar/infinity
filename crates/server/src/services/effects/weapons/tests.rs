@@ -1,4 +1,5 @@
 use super::*;
+use super::missile::{launch_missile, Missile};
 use crate::space::System;
 use crate::dao::items::creation;
 use infinity_core::consts::dogma::{ATTR_AOE_CLOUD_SIZE, ATTR_AOE_VELOCITY};
@@ -135,7 +136,7 @@ async fn missile_impact_capacity_notifies_and_fences_activation_generation() {
     }
     let projectile = || Missile { charge, raw: [raw, 0.0, 0.0, 0.0], aoe_cloud: 1.0,
         aoe_velocity: 10_000.0, drf: 1.0, velocity: 4_000.0, flight_time_ms: 5_000.0,
-        weapon: charge, illegal: false };
+        weapon: charge, illegal: false, dot: None };
     launch_missile(db.clone(), world.clone(), system, source.clone(), target.clone(), character, Some(master),
         projectile(), None, first.with_activation(master, old.clone())).await.unwrap();
     assert!(world.after(system, 2_000).await);
@@ -338,7 +339,7 @@ async fn missile_uses_signature_and_speed_at_impact() {
     }).await.unwrap();
     let stale = Missile {
         charge, raw: [shield, 0.0, 0.0, 0.0], aoe_cloud: 40.0, aoe_velocity: 170.0,
-        drf: 0.604, velocity: 1_000.0, flight_time_ms: 5_000.0, weapon: charge, illegal: false,
+        drf: 0.604, velocity: 1_000.0, flight_time_ms: 5_000.0, weapon: charge, illegal: false, dot: None,
     };
     let before = test_world.with(system, |s| s.balls().count()).await.unwrap();
     let guard = crate::services::effects::space_source::SourceGuard::Npc {
@@ -361,7 +362,7 @@ async fn missile_uses_signature_and_speed_at_impact() {
     let missile = Missile {
         charge, raw: [shield * 0.25 / resonance, 0.0, 0.0, 0.0],
         aoe_cloud: 40.0, aoe_velocity: 170.0, drf: 0.604,
-        velocity: 1_000.0, flight_time_ms: 5_000.0, weapon: charge, illegal: false,
+        velocity: 1_000.0, flight_time_ms: 5_000.0, weapon: charge, illegal: false, dot: None,
     };
     let impact_attempt = attempt(&test_world, system, source.id, None, charge).await;
     launch_missile(test_db.clone(), test_world.clone(), system, source.clone(), target.clone(), 1, None, missile, None, impact_attempt).await.ok().unwrap();
@@ -414,7 +415,7 @@ async fn missile_uses_signature_and_speed_at_impact() {
     let projectile = |velocity| Missile {
         charge, raw: [shield * 0.05 / resonance, 0.0, 0.0, 0.0],
         aoe_cloud: 1.0, aoe_velocity: 10_000.0, drf: 1.0,
-        velocity, flight_time_ms: 20_000.0, weapon: charge, illegal: false,
+        velocity, flight_time_ms: 20_000.0, weapon: charge, illegal: false, dot: None,
     };
     // Restore the rigid target's consistent stationary state: the 400 m/s
     // sideways velocity only served the application check above, and native
@@ -580,7 +581,7 @@ async fn lethal_missile_contact_recovers_the_persistent_target_once() {
         let target_ball = f.world.ball(system, target).await.unwrap();
         let charge = missile_charge(&f.sde);
         let projectile = || Missile { charge, raw: [1e30; 4], aoe_cloud: 1.0, aoe_velocity: 10_000.0,
-            drf: 1.0, velocity: 100.0, flight_time_ms: 20_000.0, weapon: charge, illegal: false };
+            drf: 1.0, velocity: 100.0, flight_time_ms: 20_000.0, weapon: charge, illegal: false, dot: None };
         let shot = attempt(&f.world, system, source.id, None, charge).await;
         let facts = shot.facts();
         launch_missile(f.db.clone(), f.world.clone(), system, source.clone(), target_ball.clone(), f.owner, None, projectile(), None, shot).await.unwrap();

@@ -1,7 +1,7 @@
 //! Frozen player-loss facts built from the loss transaction's actual inputs.
 //! Retail averages are binary64 observations.
 use std::{collections::HashMap, sync::{Arc, Mutex}};
-use crate::{db::outbox::{Outbox, SourceKey}, lua::events::{GameEvent, combat::{BinaryAmount, CombatEntity, ConflictKind, KillParticipant, LossValuation, ValuationCategory, ValuationComponent, ValuationSource}, resources::FactContext}, services::{combat::damage::DamageSource, CallError}, space::{combat::ContributionEntry, snapshot::FactCheckpoint}};
+use crate::{db::outbox::{Outbox, SourceKey}, lua::events::{GameEvent, combat::{BinaryAmount, CombatEntity, ConflictKind, KillParticipant, LossValuation, ValuationCategory, ValuationComponent, ValuationSource}, resources::FactContext}, services::{combat::damage::DamageSource, identity::Identity, CallError}, space::{combat::ContributionEntry, snapshot::FactCheckpoint}};
 use super::LossOutcome;
 
 pub(crate) struct PlayerLossContext {
@@ -27,6 +27,14 @@ impl PlayerLossContext {
         }
     }
 }
+
+pub(in crate::services) fn loss_identity(system: i64, snapshot: &crate::space::combat::FirstLethalSnapshot) -> Option<Identity> {
+    snapshot.identity.map(|char_id| Identity {
+        char_id, ship_id: Some(snapshot.item_id), corp_id: snapshot.corp_id,
+        station_id: None, system_id: Some(system),
+    })
+}
+
 /// Freeze the original physical root after its identity guards have passed.
 pub(in crate::services) async fn freeze_source(
     ex: &(impl crate::db::executor::Executor + ?Sized), pending: &PlayerLossContext,

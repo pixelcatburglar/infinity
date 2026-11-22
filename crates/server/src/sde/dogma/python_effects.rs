@@ -1,9 +1,11 @@
 //! Python effect modifier data from `eve/common/script/dogma/pythonEffects/`.
 //! Only empty SDE modifier lists are supplemented; effect lifecycle is not represented.
 //! Weapon disruption includes ship, entity and drone target categories; fighter
-//! ability targets are not represented by the current fit nodes.
+//! ability targets are not represented by the current fit nodes. The micro jump
+//! drive, both portal drives and the warp disruption field generator supply the
+//! client's own-ship penalty rows.
 use super::{Effect, Modifier};
-use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_ACTIVATION_BLOCKED_STRENGTH, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_ARMOR_DAMAGE_AMOUNT, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_EM_DAMAGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_EXPLOSIVE_DAMAGE, dogma::ATTR_FALLOFF, dogma::ATTR_KINETIC_DAMAGE, dogma::ATTR_MASS, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_SCAN_RESOLUTION, dogma::ATTR_SHIELD_BONUS, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_SPEED_FACTOR, dogma::ATTR_SPEED_FACTOR_INTERIM, dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_THERMAL_DAMAGE, dogma::ATTR_WARP_SCRAMBLE_STATUS};
+use infinity_core::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_ACTIVATION_BLOCKED_STRENGTH, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_ARMOR_DAMAGE_AMOUNT, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_DURATION, dogma::ATTR_EM_DAMAGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_EXPLOSIVE_DAMAGE, dogma::ATTR_FALLOFF, dogma::ATTR_KINETIC_DAMAGE, dogma::ATTR_MASS, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_SCAN_RESOLUTION, dogma::ATTR_SHIELD_BONUS, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_SPEED_FACTOR, dogma::ATTR_SPEED_FACTOR_INTERIM, dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, dogma::ATTR_THERMAL_DAMAGE, dogma::ATTR_WARP_SCRAMBLE_STATUS};
 use infinity_core::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_TRACKING_SPEED};
 use infinity_core::consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_SLOTS, dogma::ATTR_TURRET_SLOTS_LEFT, dogma::ATTR_LAUNCHER_SLOTS_LEFT, dogma::ATTR_UPGRADE_COST, dogma::ATTR_UPGRADE_LOAD, dogma::ATTR_UPGRADE_SLOTS_LEFT};
 use infinity_core::consts::{dogma::ATTR_SCAN_GRAVIMETRIC_STRENGTH, dogma::ATTR_SCAN_LADAR_STRENGTH, dogma::ATTR_SCAN_MAGNETOMETRIC_STRENGTH, dogma::ATTR_SCAN_RADAR_STRENGTH};
@@ -30,8 +32,6 @@ const ATTR_CLOAKING_TARGETING_DELAY_BONUS: i32 = 619;
 const ATTR_DAMAGE_MULTIPLIER_BONUS: i32 = 292;
 /// Client dogma/const.py: attributeDisallowOffensiveModifiers.
 const ATTR_DISALLOW_OFFENSIVE_MODIFIERS: i32 = 872;
-/// Client dogma/const.py: attributeDuration.
-const ATTR_DURATION: i32 = 73;
 /// Client dogma/const.py: attributeExplosionDelayBonus.
 const ATTR_EXPLOSION_DELAY_BONUS: i32 = 596;
 /// Client dogma/const.py: attributeFalloffBonus.
@@ -46,10 +46,14 @@ const ATTR_HULL_KINETIC_DAMAGE_RESONANCE: i32 = 976;
 const ATTR_HULL_THERMAL_DAMAGE_RESONANCE: i32 = 977;
 /// Client dogma/const.py: attributeMassAddition.
 const ATTR_MASS_ADDITION: i32 = 796;
+/// Client dogma/const.py: attributeMassBonus.
+const ATTR_MASS_BONUS: i32 = 1131;
 /// Client dogma/const.py: attributeMaxRangeBonus.
 const ATTR_MAX_RANGE_BONUS: i32 = 351;
 /// Client dogma/const.py: attributeMaxTargetRangeBonusInterim.
 const ATTR_MAX_TARGET_RANGE_BONUS_INTERIM: i32 = 2136;
+/// Client dogma/const.py: attributeMaxVelocityModifier.
+const ATTR_MAX_VELOCITY_MODIFIER: i32 = 1076;
 /// Client dogma/const.py: attributeMissileVelocityBonus.
 const ATTR_MISSILE_VELOCITY_BONUS: i32 = 547;
 /// Client dogma/const.py: attributeRofBonus.
@@ -271,6 +275,12 @@ pub(super) fn supplement(effect: &mut Effect) {
         Some("microJumpDrive") => &[
             Row { func: "ItemModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_SIGNATURE_RADIUS, modifying: ATTR_SIGNATURE_RADIUS_BONUS_PERCENT, skill: None },
         ],
+        // eve/common/script/dogma/pythonEffects/microJumpPortalDrive.py:
+        // BaseMicroJumpPortalDrive (both effect IDs); its disallowTethering
+        // ModAdd has no server consumer and is not represented.
+        Some("microJumpPortalDrive") | Some("microJumpPortalDriveCapital") => &[
+            Row { func: "ItemModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_SIGNATURE_RADIUS, modifying: ATTR_SIGNATURE_RADIUS_BONUS_PERCENT, skill: None },
+        ],
         // eve/common/script/dogma/pythonEffects/propulsionModules.py: Afterburner.
         Some("moduleBonusAfterburner") => &[
             Row { func: "ItemModifier", domain: "shipID", op: MOD_ADD, modified: ATTR_MASS, modifying: ATTR_MASS_ADDITION, skill: None },
@@ -336,6 +346,14 @@ pub(super) fn supplement(effect: &mut Effect) {
         // eve/common/script/dogma/pythonEffects/migratedeffects.py: SelfRof.
         Some("selfRof") => &[
             Row { func: "LocationRequiredSkillModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_RATE_OF_FIRE, modifying: ATTR_ROF_BONUS, skill: Some(SOURCE_ITEM_TYPE) },
+        ],
+        // eve/common/script/dogma/pythonEffects/warpDisruptSphere.py:
+        // WarpDisruptSphere. The generator's self-penalty rows only; its two
+        // group-domain rows have no consumer and are not represented.
+        Some("warpDisruptSphere") => &[
+            Row { func: "ItemModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_MASS, modifying: ATTR_MASS_BONUS, skill: None },
+            Row { func: "ItemModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_MAX_VELOCITY, modifying: ATTR_MAX_VELOCITY_MODIFIER, skill: None },
+            Row { func: "ItemModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_SIGNATURE_RADIUS, modifying: ATTR_SIGNATURE_RADIUS_BONUS, skill: None },
         ],
         _ => &[],
     };

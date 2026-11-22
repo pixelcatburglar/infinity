@@ -99,7 +99,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
     let old_damage = (old_state.condition.stats.max[1] - old_state.condition.now[1],
         old_state.condition.stats.max[2] - old_state.condition.now[2]);
     let plan = match operation {
-        Operation::Board => RecoveryPlan::Board { character: owner, user, system, old, old_type, target, target_type },
+        Operation::Board => RecoveryPlan::Board { character: owner, user, system, old, old_type, target, target_type, ownership: None },
         Operation::Store => RecoveryPlan::Store { character: owner, user, system, old, old_type, host },
         Operation::BoardStored => RecoveryPlan::BoardStored { character: owner, user, system, old, old_type, host, target, target_type, prior_owner },
     };
@@ -110,7 +110,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
         }).await.unwrap();
         let sde = f.sde.clone();
         let selected = settle_space(f.world.clone(), f.db.clone(), f.sde.clone(), system, owner, client,
-            expected.clone(), transition, market, gate, f.world.admission(system).unwrap(), plan,
+            expected.clone(), 0, transition, market, gate, f.world.admission(system).unwrap(), plan.clone(),
             move |tx, outbox, states, facts| {
                 let sde = sde.clone();
                 Box::pin(async move {
@@ -160,7 +160,7 @@ async fn recover_after_stop(operation: Operation, disconnected: bool, replaced: 
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let settlement = BoardSettlement {
         world: Arc::downgrade(&f.world), db: f.db.clone(), sde: f.sde.clone(), system,
-        character: owner, client, expected, plan, entries, facts: Some(frame.clone()), actor_gate: handle.gate.clone(),
+        character: owner, client, expected, ready_at: 0, retained: Mutex::new(None), plan: plan.clone(), entries, facts: Some(frame.clone()), actor_gate: handle.gate.clone(),
         receipt: Mutex::new(Some((sender, None))), admission: f.world.admission(system).unwrap(),
     };
     let rolled_back: Result<(), CallError> = f.db.transaction(
@@ -640,8 +640,8 @@ async fn session_fence_refusal_thaws_all_reservations_before_any_write() {
     let ran = Arc::new(AtomicBool::new(false));
     let worker_ran = ran.clone();
     let result = settle_space(f.world.clone(), f.db.clone(), f.sde.clone(), system, owner, f.client.login.client_id,
-        expected, transition, market, gate, f.world.admission(system).unwrap(),
-        RecoveryPlan::Board { character: owner, user, system, old, old_type: kind, target, target_type: kind },
+        expected, 0, transition, market, gate, f.world.admission(system).unwrap(),
+        RecoveryPlan::Board { character: owner, user, system, old, old_type: kind, target, target_type: kind, ownership: None },
         move |_, _, _, _| {
             let worker_ran = worker_ran.clone();
             Box::pin(async move {
@@ -704,14 +704,13 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     let kind = crate::dao::items::inventory::type_id(&f.db, old).await.unwrap().unwrap();
     let target = creation::positioned(&f.db, kind, owner, system, [2.0, 0.0, 0.0]).await.unwrap();
     let other = creation::positioned(&f.db, kind, owner, system, [4.0, 0.0, 0.0]).await.unwrap();
-    let row = crate::dao::items::space_ships::unpiloted(&f.db, system).await.unwrap().into_iter()
-        .find(|row| row.item_id == target).unwrap();
+    let row = crate::dao::items::space_ships::unpiloted(&f.db, system).await.unwrap().into_iter().find(|row| row.item_id == target).unwrap();
     let prepared = balls::unpiloted(&f.db, f.sde.clone(), &row).await.unwrap();
     f.world.with(system, move |s| prepared.install(s, |s, ball| s.add_persistent_ship(ball))).await.unwrap();
     f.client.session.apply(vec![("userid", Value::Int(user)), ("solarsystemid2", Value::Int(system))]);
     let expected = infinity_core::session::OnlineSession::from_session(&f.client.session).unwrap();
     f.world.set_online_session(owner, Some(expected.clone()));
-    let plan = RecoveryPlan::Board { character: owner, user, system, old, old_type: kind, target, target_type: kind };
+    let plan = RecoveryPlan::Board { character: owner, user, system, old, old_type: kind, target, target_type: kind, ownership: None };
     let mut transition = f.world.with(system, move |s| {
         let generation = s.combat_membership_generation(old).unwrap();
         let source = s.prepare_combat_source(old, None, None, None,
@@ -728,7 +727,7 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let settlement = Arc::new(BoardSettlement {
         world: Arc::downgrade(&f.world), db: f.db.clone(), sde: f.sde.clone(), system, character: owner,
-        client: f.client.login.client_id, expected: expected.clone(), plan, entries: entries.clone(), facts: Some(frame.clone()), actor_gate: handle.gate.clone(),
+        client: f.client.login.client_id, expected: expected.clone(), ready_at: 0, retained: Mutex::new(None), plan: plan.clone(), entries: entries.clone(), facts: Some(frame.clone()), actor_gate: handle.gate.clone(),
         receipt: Mutex::new(Some((sender, Some(CallError::Internal(anyhow::anyhow!("original board error")))))), admission: f.world.admission(system).unwrap(),
     });
     let rows: Vec<_> = frame.condition_rows().collect();
@@ -751,6 +750,7 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     let error = receiver.await.unwrap().unwrap_err();
     assert!(format!("{error:?}").contains("original board error"));
     f.world.with(system, move |s| {
+        assert!(s.claim_pending_combat().is_empty(), "the claimed tokens are not claimed again");
         assert_eq!(s.combat_phase(old), Some(CombatPhase::Live));
         assert_eq!(s.combat_phase(target), Some(CombatPhase::Live));
     }).await.unwrap();
@@ -767,7 +767,7 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     let (sender, _receiver) = tokio::sync::oneshot::channel();
     let settlement = Arc::new(BoardSettlement {
         world: Arc::downgrade(&f.world), db: f.db.clone(), sde: f.sde.clone(), system, character: owner,
-        client: f.client.login.client_id, expected, plan, entries: entries.clone(), facts: None, actor_gate: handle.gate.clone(),
+        client: f.client.login.client_id, expected, ready_at: 0, retained: Mutex::new(None), plan, entries: entries.clone(), facts: None, actor_gate: handle.gate.clone(),
         receipt: Mutex::new(Some((sender, None))), admission: f.world.admission(system).unwrap(),
     });
     crate::dao::characters::selection::set_ship(&f.db, owner, other).await.unwrap();
@@ -784,3 +784,6 @@ async fn board_pending_releases_group_for_retry_and_rejects_partial_ownership() 
     crate::dao::characters::selection::set_ship(&f.db, owner, old).await.unwrap();
     f.cleanup().await;
 }
+
+#[path = "tests/foreign.rs"]
+mod foreign;

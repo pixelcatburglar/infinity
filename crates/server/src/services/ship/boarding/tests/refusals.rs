@@ -1,5 +1,5 @@
 //! Direct Board refusals against real game rows, SDE data and system actors.
-//! Foreign custody is intentionally unsupported.
+//! Foreign custody admits only the in-space subtree; its cases live in `foreign`.
 use super::*;
 use crate::dao::items::{creation, space_ships::FreeShip};
 use crate::services::ship::balls;
@@ -100,7 +100,7 @@ async fn rejected_board_requests_leave_database_actor_session_and_notifications_
         }
         let mut c = client(test_db.clone(), sde, world.clone(), account).await;
         c.session.apply(vec![("userid", Value::Int(account)), ("charid", Value::Int(owner)), ("shipid", Value::Int(old)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
-        world.register_pilot(owner, c.notify_tx.clone());
+        crate::space::session_change::test_support::register_elapsed(&world, owner, c.notify_tx.clone());
         world.set_online_session(owner, infinity_core::session::OnlineSession::from_session(&c.session));
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
         world.observe(system, c.login.client_id, old, events).await.unwrap();

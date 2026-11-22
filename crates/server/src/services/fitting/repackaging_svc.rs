@@ -1,9 +1,11 @@
 //! Item repackaging for `repackagingSvc`, mirroring
 //! `eve/client/script/ui/services/menuSvcExtras/invItemFunctions.py`.
 //! Uses game items, charges, reload reservations, banks, insurance and dogma overrides,
-//! plus SDE stations and types. Confirmed ordinary ship rigs are destroyed; other
-//! direct contents return to the owning station hangar atomically. Repackaged
-//! hulls become non-singleton items and do not receive a fitting terminal.
+//! plus SDE stations and types. Confirmed ordinary ship rigs are destroyed; a
+//! recognized tactical-mode item is destroyed the same way and the hull's
+//! stance timing is cleared. Other direct contents return to the owning
+//! station hangar atomically. Repackaged hulls become non-singleton items and
+//! do not receive a fitting terminal.
 //! Locked items with service-life damage cannot be repackaged.
 //! Structure access, sealed plastic wrap repackaging, and repackaging the contents
 //! of non-ship containers are unsupported.
@@ -13,7 +15,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use crate::client::Client;
 use infinity_core::consts::dogma::EFFECT_ONLINE;
-use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR, FLAG_RIG_FIRST, FLAG_RIG_LAST, GROUP_STRATEGIC_CRUISER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, TYPE_PLASTIC_WRAP};
+use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR, FLAG_HIDDEN_MODIFIERS, FLAG_RIG_FIRST, FLAG_RIG_LAST, GROUP_STRATEGIC_CRUISER, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, TYPE_PLASTIC_WRAP};
 use crate::dao::items::{charges, combat as combat_dao, dogma, fitting as fitting_dao, inventory as inventory_dao, loading::{Item, ItemQuery}, parent_locks::{self, LockRequest, LockStrength}, pending_reloads};
 use crate::db::outbox::Outbox;
 use infinity_core::messages;
@@ -232,7 +234,8 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                                 && sde.types.effects(item.type_id).iter().any(|effect| i64::from(effect.effect_id) == EFFECT_ONLINE) {
                                 online::set_online_core(tx, &sde, &policy, outbox, &fences, id, item.item_id, false).await?;
                             }
-                            if root.group_id != GROUP_STRATEGIC_CRUISER && (FLAG_RIG_FIRST..=FLAG_RIG_LAST).contains(&item.flag_id) {
+                            if root.group_id != GROUP_STRATEGIC_CRUISER && (FLAG_RIG_FIRST..=FLAG_RIG_LAST).contains(&item.flag_id)
+                                || item.flag_id == FLAG_HIDDEN_MODIFIERS && crate::sde::ship_stances::stance_for_mode(root.type_id, item.type_id).is_some() {
                                 if !fitting_dao::destroy_upgrade(tx, &item).await.map_err(db_err)? { return Err(refuse()); }
                                 inventory::notifications::notify_item_removed(outbox, item);
                             } else {
@@ -241,6 +244,9 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                                 outbox.event(crate::lua::events::GameEvent::ItemsMoved { char_id, item_id: item.item_id, from_location_id: id, to_location_id: root.location_id, quantity: item.quantity });
                             }
                         }
+                        // Repackaging also drops the hull's stance timing: its
+                        // mode item was deleted above or was never created.
+                        crate::dao::items::ship_stance::clear(tx, &[id]).await.map_err(db_err)?;
                         for charge in charges::all(tx, id).await.map_err(db_err)? {
                             if charge.quantity != 0 { return Err(refuse()); }
                             combat_dao::delete_empty_charge(tx, id, charge.flag_id).await.map_err(db_err)?;

@@ -17,7 +17,7 @@ fn cycle(cx: &Ctx, module_id: i64, character: i64, module_type: i32, effect: reg
         state.active.insert(module_id, ActiveModule { char_id: character, stop: generation.clone(), forced_inactive: false });
         state.activation_generation.insert(module_id, generation.clone());
     }
-    Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], effect, target, repeat: 1,
+    Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect, target, repeat: 1,
         stop: generation.clone(), owner: ActivationOwner { master: module_id, generation, armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 }, started: 0, charge_type: None,
         cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
         source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() }

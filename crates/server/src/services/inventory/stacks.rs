@@ -2,13 +2,14 @@
 //! `eve/client/script/environment/invCache.py`. Uses `game.items`, trade
 //! reservations, corporate custody and SDE data; staged trade items and
 //! corporation vote-locked blueprint originals are not mutable.
+//! Pure merge planning lives in `plan`.
 
 use super::access::{custody_allowed, may_take_corp_hangar, Container};
 use super::notifications::{notify_corp_item_change, notify_item_change, notify_item_removed};
 use super::reachability::{Endpoint, Reachability};
 use crate::client::Client;
 use infinity_core::consts::{FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
-use crate::dao::items::{inventory as inventory_dao, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}};
+use crate::dao::items::{inventory as inventory_dao, loading::{Item, ItemQuery}, quantities};
 use crate::db::{executor::Executor, outbox::{dispatch_client, Outbox}};
 use infinity_core::messages;
 use crate::sde::Sde;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 use super::destination::ParentSnapshot;
 
+pub(in crate::services::inventory) mod plan;
 pub(super) async fn capture_parents(ex: &(impl Executor + ?Sized), sde: &Sde, endpoints: &[Endpoint]) -> Result<Vec<ParentSnapshot>, CallError> {
     let mut ids: Vec<_> = endpoints.iter().map(|endpoint| endpoint.location).collect();
     ids.sort_unstable();
@@ -69,23 +71,6 @@ fn same_snapshot(before: &[Item], current: &[Item]) -> bool {
             && old.type_id == item.type_id && old.singleton == item.singleton && old.quantity == item.quantity))
 }
 
-/// Simulate transfers in request order, retaining the original snapshots for guarded writes.
-pub(super) fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, QuantityChange>, CallError> {
-    let mut states: BTreeMap<i64, (&Item, Option<i64>)> = items.iter().map(|item| (item.item_id, (item, Some(item.quantity)))).collect();
-    for &(source, dest, requested) in ops {
-        if source == dest { continue; }
-        let (Some(&(src, Some(src_qty))), Some(&(dst, Some(dst_qty)))) = (states.get(&source), states.get(&dest)) else { continue };
-        if src.type_id != dst.type_id || src.singleton || dst.singleton || src_qty <= 0 { continue; }
-        if (src.owner_id, src.location_id, src.flag_id) != (dst.owner_id, dst.location_id, dst.flag_id) { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
-        let take = i128::from(requested.clamp(1, src_qty)).min(i128::from(infinity_core::consts::MAX_STACK_QUANTITY) - i128::from(dst_qty)) as i64;
-        let total = dst_qty + take;
-        states.get_mut(&source).unwrap().1 = if take == src_qty { None } else { Some(src_qty - take) };
-        states.get_mut(&dest).unwrap().1 = Some(total);
-    }
-    Ok(states.into_iter().filter_map(|(id, (item, quantity))| {
-        (quantity != Some(item.quantity)).then(|| (id, QuantityChange::new(item, quantity)))
-    }).collect())
-}
 
 pub(super) async fn mutation_corporate(ex: &(impl Executor + ?Sized), sde: &Sde, item: &Item, me: i64, station: Option<i64>, shared: bool) -> Result<bool, CallError> {
     if shared && station.is_none() { return Ok(false); }
@@ -106,7 +91,7 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, ch
         let shared = checked.lineage(endpoint.location).is_some_and(|rows| super::movement::shared_lineage(sde, endpoint, rows.len(), |id| rows.get(&id)));
         if mutation_corporate(db, sde, item, me, station, shared).await? { corporate.push(item.item_id); }
     }
-    let changes = plan_merges(&items, ops)?;
+    let changes = plan::plan_merges(&items, ops)?;
     let mut holds = BTreeMap::<(i64, i32), (Vec<super::hold_storage::Addition>, Vec<i64>)>::new();
     for item in items.iter().filter(|item| changes.contains_key(&item.item_id)) {
         let entry = holds.entry((item.location_id, item.flag_id)).or_default();
@@ -144,6 +129,38 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Arc<Sde>, ch
 }
 
 pub(super) async fn merge_operations(c: &mut Client, container: &Container, source_container: Option<i64>, ops: Vec<(i64, i64, i64)>) -> Result<(), CallError> {
+    if let Container::Item(id) = container {
+        let actor_identity = super::npc_loot::client_identity(c);
+        if let Some(system) = c.session.int("solarsystemid") {
+            match super::npc_loot::view(&c.world, &actor_identity, system, *id).await {
+                crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => {
+                    // Same turn view plus the shared pure plan; ops naming items
+                    // outside the root are ignored exactly like missing rows.
+                    if let Some(source_container) = source_container {
+                        if source_container != *id
+                            && ops.iter().any(|&(source, _, _)| view.items.iter().any(|item| item.item_id == source)) {
+                            return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                        }
+                    }
+                    let changes = plan::plan_merges(&view.items, &ops)?;
+                    if !changes.is_empty() {
+                        let expected = view.identity.clone();
+                        c.world.with(system, move |s| s.mutate_npc_loot(&actor_identity, &expected,
+                            crate::space::system::npc_wrecks::NpcLootMutation::Quantities(changes))).await
+                            .unwrap_or_else(|| Err(super::npc_loot::busy()))?;
+                    }
+                    return Ok(());
+                }
+                crate::space::system::npc_wrecks::NpcWreckLookup::Denied =>
+                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)),
+                crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                    super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                    return Err(super::npc_loot::busy());
+                }
+                crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {}
+            }
+        }
+    }
     let _lock = super::super::market::lock().await;
     let me = c.session.int("charid").unwrap_or(0);
     let station = c.session.int("stationid");
@@ -166,7 +183,7 @@ pub(super) async fn merge_operations(c: &mut Client, container: &Container, sour
             let snapshots = snapshots.clone();
             let parents = parents.clone();
             Box::pin(async move {
-                let write_ids: Vec<_> = plan_merges(&snapshots, &ops)?.into_keys().collect();
+                let write_ids: Vec<_> = plan::plan_merges(&snapshots, &ops)?.into_keys().collect();
                 let _locks = lock_parents(tx, &sde, &parents, &snapshots, &write_ids).await?;
                 let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
                 if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
@@ -220,6 +237,38 @@ async fn stack_items(ex: &(impl Executor + ?Sized), sde: &Sde, container: &Conta
 
 /// `StackAll([flag])`: merge every unassembled stack of the same type in the container.
 pub(super) async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> Result<(), CallError> {
+    if let Container::Item(id) = container {
+        let actor_identity = super::npc_loot::client_identity(c);
+        if let Some(system) = c.session.int("solarsystemid") {
+            match super::npc_loot::view(&c.world, &actor_identity, system, *id).await {
+                crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => {
+                    // The flag filter and the shared grouping plan are unchanged;
+                    // the resulting quantity plan applies in one actor turn.
+                    let items: Vec<Item> = view.items.iter()
+                        .filter(|item| flag.is_none_or(|flag| item.flag_id == flag as i32))
+                        .cloned().collect();
+                    let ops = plan::stack_all_ops(&items);
+                    if !ops.is_empty() {
+                        let changes = plan::plan_merges(&items, &ops)?;
+                        if !changes.is_empty() {
+                            let expected = view.identity.clone();
+                            c.world.with(system, move |s| s.mutate_npc_loot(&actor_identity, &expected,
+                                crate::space::system::npc_wrecks::NpcLootMutation::Quantities(changes))).await
+                                .unwrap_or_else(|| Err(super::npc_loot::busy()))?;
+                        }
+                    }
+                    return Ok(());
+                }
+                crate::space::system::npc_wrecks::NpcWreckLookup::Denied =>
+                    return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)),
+                crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                    super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                    return Err(super::npc_loot::busy());
+                }
+                crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {}
+            }
+        }
+    }
     let _lock = super::super::market::lock().await;
     let me = c.session.int("charid").unwrap_or(0);
     let station = c.session.int("stationid");
@@ -255,12 +304,7 @@ pub(super) async fn stack_all(c: &mut Client, container: &Container, flag: Optio
             let snapshots = snapshots.clone();
             let parents = parents.clone();
             Box::pin(async move {
-                let mut groups = BTreeMap::<(i64, i32, i32), usize>::new();
-                for item in snapshots.iter().filter(|item| !item.singleton) {
-                    *groups.entry((item.owner_id, item.type_id, item.flag_id)).or_default() += 1;
-                }
-                let write_ids: Vec<_> = snapshots.iter().filter(|item| !item.singleton
-                    && groups[&(item.owner_id, item.type_id, item.flag_id)] > 1).map(|item| item.item_id).collect();
+                let write_ids = plan::stack_write_ids(&snapshots);
                 let _locks = lock_parents(tx, &sde, &parents, &snapshots, &write_ids).await?;
                 if let Container::Deliveries { station_id, owner_id } = &container {
                     if station != Some(*station_id) || !may_take_corp_hangar(tx, me, *owner_id, *station_id, FLAG_CORP_DELIVERIES).await? {
@@ -285,20 +329,7 @@ pub(super) async fn stack_all(c: &mut Client, container: &Container, flag: Optio
                 if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
                     return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
                 }
-                let mut first: std::collections::HashMap<(i64, i32, i32), (i64, i64)> = Default::default();
-                let mut ops = Vec::new();
-                for item in items.iter().filter(|i| !i.singleton) {
-                    let key = (item.owner_id, item.type_id, item.flag_id);
-                    if let Some((dest, quantity)) = first.get_mut(&key) {
-                        if item.quantity <= 0 { continue; }
-                        let take = i128::from(item.quantity).min(i128::from(infinity_core::consts::MAX_STACK_QUANTITY) - i128::from(*quantity)) as i64;
-                        if take > 0 { ops.push((item.item_id, *dest, take)); }
-                        *quantity += take;
-                        if take < item.quantity { *dest = item.item_id; *quantity = item.quantity - take; }
-                    } else {
-                        first.insert(key, (item.item_id, item.quantity));
-                    }
-                }
+                let ops = plan::stack_all_ops(&items);
                 let audience = audience.resolve(tx, &sde).await?;
                 apply_merges(tx, &sde, &checked, &audience, outbox, items, &ops, me, station).await
             })

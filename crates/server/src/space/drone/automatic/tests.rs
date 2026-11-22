@@ -37,9 +37,13 @@ fn setup(base: i64) -> System {
     s
 }
 
+fn fixture_fit() -> crate::services::fit::Fit {
+    crate::services::fit::Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, Vec::new())
+}
+
 fn npc(s: &mut System, id: i64, x: f64) {
     s.insert(ball(id, None, x));
-    let fit = crate::services::fit::Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, Vec::new());
+    let fit = fixture_fit();
     let stats = crate::services::combat::groups_health::ShipStats::from_fit(&fit, crate::services::fit::Key::Ship);
     s.install_condition_with_key(id, crate::services::combat::groups_health::Condition {
         now: stats.max, stats, shield_at: crate::client::filetime_now(),
@@ -125,13 +129,99 @@ fn dead_and_cloaked_aggressors_are_excluded() {
 }
 
 fn install_combat(s: &mut System, id: i64) {
-    let fit = crate::services::fit::Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, Vec::new());
+    let fit = fixture_fit();
     let stats = crate::services::combat::groups_health::ShipStats {
         max: [100.0; 3], resonance: [[1.0; 4]; 3], shield_tau_ms: 1e30,
     };
     s.install_condition(id, crate::services::combat::groups_health::Condition {
         now: [99.0; 3], stats, shield_at: crate::client::filetime_now() + infinity_core::consts::FILETIME_SECOND,
     }, fit);
+}
+
+#[test]
+fn body_reinstall_and_retirement_preserve_receipt_ownership() {
+    use crate::lua::events::resources::FactOrigin;
+    use crate::space::combat_facts::Refusal;
+    let mut s = setup(730_900);
+    let id = 730_940;
+    npc(&mut s, id, 20.0);
+    let lower = crate::space::targeting::next_generation();
+    let first = s.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    let upper = crate::space::targeting::next_generation();
+    let body_generation = u64::from_be_bytes(first.activation[8..].try_into().unwrap());
+    assert!(lower < body_generation && body_generation < upper);
+    assert_eq!(first.sequence, 1);
+    let record = &s.actor_combat[&id];
+    let (condition, key) = (record.condition.clone(), record.fit_key);
+    s.install_condition_with_key(id, condition, fixture_fit(), key);
+    let second = s.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    assert_eq!((second.activation, second.sequence), (first.activation, first.sequence + 1));
+    let (token, snapshot) = s.begin_combat_transition(id).unwrap();
+    assert!(s.cancel_combat_transition(id, token, snapshot.generation));
+    let (token, _) = s.begin_combat_transition(id).unwrap();
+    assert!(s.remove_ball(id).is_some());
+    let record = &s.actor_combat[&id];
+    assert_eq!((record.body_source_generation, record.source_sequence), (None, 0));
+    let at = s.combat_observed_time();
+    let facts = s.combat_facts.as_mut().unwrap();
+    let receipt = facts.reserve_damage(first, &first.entity, at).unwrap();
+    facts.release(receipt);
+    assert!(matches!(facts.reserve_damage(first, &first.entity, at), Err(Refusal::Replay)));
+    facts.finish_attempt(&second);
+    assert!(s.commit_combat_transition(id, token));
+    let other = id + 1;
+    npc(&mut s, other, 40.0);
+    let pending = s.prepare_body_combat_source(other, None, None, None, FactOrigin::Natural, |s| s.is_npc(other)).unwrap();
+    let (token, _) = s.begin_combat_transition(other).unwrap();
+    assert!(s.commit_combat_transition(other, token));
+    assert!(s.ball(other).is_some());
+    let at = s.combat_observed_time();
+    let facts = s.combat_facts.as_mut().unwrap();
+    let receipt = facts.reserve_damage(pending, &pending.entity, at).unwrap();
+    facts.release(receipt);
+}
+
+#[test]
+fn body_transfer_and_fallback_install_start_new_activations() {
+    use crate::lua::events::resources::FactOrigin;
+    let id = 731_040;
+    let mut source = setup(731_000);
+    npc(&mut source, id, 20.0);
+    let old = source.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    let record = &source.actor_combat[&id];
+    let (condition, key) = (record.condition.clone(), record.fit_key);
+    source.install_condition_with_key(id, condition, fixture_fit(), key);
+    let next = source.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    assert_eq!((next.activation, next.sequence), (old.activation, old.sequence + 1));
+    assert!(source.set_condition_fraction_mask(id, 0b010, 0.5));
+    assert!(source.repair_condition(id, 1, 1.0, crate::space::combat::RepairSource::Remote(old)).unwrap());
+    let frame = crate::space::snapshot::capture_fact_checkpoint(&mut source).unwrap().unwrap();
+    let later = source.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    assert!(source.repair_condition(id, 1, 1.0, crate::space::combat::RepairSource::Remote(later)).unwrap());
+    frame.acknowledge(&mut source, &std::collections::HashSet::new());
+    assert!(source.combat_facts.as_ref().unwrap().is_dirty());
+    let snapshot = source.combat_condition_snapshot(id).unwrap();
+    let mut destination = setup(732_000);
+    destination.add_persistent_ship(ball(id, None, 20.0));
+    install_combat(&mut destination, id);
+    assert!(destination.add_npc(id, NpcBrain::new(None, NpcConfig { fly_range: 20.0, aggro_range: 100.0,
+        rate_of_fire_ms: 2500.0, scan_resolution: 100.0, repairs: (0.0, 0.0, 5000.0) },
+        Arc::new(|_, _| Some(Box::pin(async {}))))));
+    let existing = destination.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    let generation = destination.persistent_generation(id).unwrap();
+    let key = destination.actor_combat[&id].fit_key;
+    assert!(!destination.transfer_combat_state(id, generation + 1, snapshot.clone(), fixture_fit(), key));
+    assert_eq!((destination.actor_combat[&id].body_source_generation, destination.actor_combat[&id].source_sequence),
+        (Some(u64::from_be_bytes(existing.activation[8..].try_into().unwrap())), existing.sequence));
+    assert!(destination.transfer_combat_state(id, generation, snapshot, fixture_fit(), key));
+    let new = destination.prepare_body_combat_source(id, None, None, None, FactOrigin::Natural, |s| s.is_npc(id)).unwrap();
+    assert_ne!(new.activation, old.activation);
+    assert_eq!(new.sequence, 1);
+    assert_ne!(new.activation, existing.activation);
+    destination.finish_combat_attempt(&existing);
+    source.finish_combat_attempt(&old);
+    source.finish_combat_attempt(&next);
+    destination.finish_combat_attempt(&new);
 }
 
 #[test]

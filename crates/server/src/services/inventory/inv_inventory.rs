@@ -1,7 +1,11 @@
 //! Bound `invInventory` requests from `eve/client/script/environment/invCache.py`
 //! and `invCacheContainer`. Reads `game.items`, corporate roles and SDE types and
 //! delegates movement, reachability and stack mutations. Shared ship-bay reads
-//! revalidate current physical reachability and access. Service-life damage is
+//! revalidate current physical reachability and access. An admitted owner's
+//! read of a supported hull's hidden modifier flag or full contents initializes
+//! its tactical stance state in one hull-locked transaction under the economy
+//! lock; foreign or unauthorized reads never create state.
+//! Service-life damage is
 //! read for the authorized inventory listing; soul binding is not modelled.
 
 use super::access::{container_of, custody_allowed, may_view_corp_hangar, Container};
@@ -9,7 +13,7 @@ use super::movement;
 use super::stacks::{merge_operations, stack_all};
 use super::reachability::{Endpoint, Reachability};
 use crate::client::{short, Client};
-use infinity_core::consts::{CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_FLEET_HANGAR, FLAG_HANGAR, FLAG_PILOT, FLAG_SHIP_HANGAR, GROUP_WRECK, TYPE_CHARACTER, TYPE_OFFICE, TYPE_PLASTIC_WRAP};
+use infinity_core::consts::{CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_FLEET_HANGAR, FLAG_HANGAR, FLAG_HIDDEN_MODIFIERS, FLAG_PILOT, FLAG_SHIP_HANGAR, GROUP_WRECK, TYPE_CHARACTER, TYPE_OFFICE, TYPE_PLASTIC_WRAP};
 use crate::dao::items::loading::{self, GameItem, Item, ItemQuery};
 use crate::db::executor::Executor;
 use infinity_core::messages;
@@ -109,14 +113,74 @@ async fn list(c: &Client, container: &Container, flags: Option<Vec<i64>>) -> Res
                 return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
             }
             if parent.as_ref().is_some_and(physical_container) {
-                let mut requested: Vec<i32> = flags.unwrap_or_else(|| items.iter().map(|item| item.flag_id).collect());
+                let mut requested: Vec<i32> = flags.clone().unwrap_or_else(|| items.iter().map(|item| item.flag_id).collect());
                 if requested.is_empty() {
                     requested.extend([FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_SHIP_HANGAR]);
                 }
                 requested.sort_unstable();
                 requested.dedup();
-                let endpoints: Vec<_> = requested.iter().map(|&flag| Endpoint { location: *item_id, flag }).collect();
-                let permissions = admitted(c, &endpoints).await?;
+                let mut endpoints: Vec<_> = requested.iter().map(|&flag| Endpoint { location: *item_id, flag }).collect();
+                // Access is settled before any state is created; the capture is
+                // reused to recheck the flags of the post-commit reload.
+                let identity = super::super::identity::Identity::of_client(c);
+                let reach = Reachability::capture(&identity, &c.db, &c.world, c.session.int("solarsystemid"), &endpoints).await?;
+                let mut permissions = reach.check_many(&c.db, &c.sde, &endpoints).await?;
+                // The owner's own assembled stance-capable hull initializes its
+                // mode item and timing once when the hidden modifier flag or the
+                // full list is requested; foreign readers never create state.
+                if let Some(hull) = &parent {
+                    if hull.owner_id == me && hull.singleton
+                        && crate::sde::ship_stances::for_hull(hull.type_id).is_some()
+                        && flags.as_ref().is_none_or(|flags| flags.contains(&FLAG_HIDDEN_MODIFIERS))
+                        && permissions.iter().any(|allowed| *allowed)
+                    {
+                        let authorized = hull.clone();
+                        let sde = c.sde.clone();
+                        let world = c.world.clone();
+                        {
+                            // The economy lock covers the locked initialization
+                            // transaction only, never actor reachability checks.
+                            let _market = crate::services::market::lock().await;
+                            c.db.transaction(
+                                move |tx, outbox: &mut crate::db::outbox::Outbox| {
+                                    let sde = sde.clone();
+                                    let authorized = authorized.clone();
+                                    Box::pin(async move {
+                                        let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
+                                        if !crate::dao::items::ship::lock_reload_ship(tx, authorized.item_id).await.map_err(db_err)? {
+                                            return Err(refuse());
+                                        }
+                                        let hull = load_items(tx, &sde, ItemQuery::Id(authorized.item_id)).await.map_err(db_err)?
+                                            .into_iter().next().ok_or_else(refuse)?;
+                                        if hull.owner_id != authorized.owner_id || hull.type_id != authorized.type_id
+                                            || hull.location_id != authorized.location_id || hull.flag_id != authorized.flag_id
+                                            || hull.quantity != authorized.quantity || !hull.singleton
+                                            || crate::sde::ship_stances::for_hull(hull.type_id).is_none()
+                                        {
+                                            return Err(refuse());
+                                        }
+                                        crate::services::ship_stance::state::ensure_initialized_tx(tx, &sde, outbox, &hull).await
+                                    })
+                                },
+                                |_, outbox| async move { crate::db::outbox::dispatch_world((), outbox, &world) },
+                            ).await?;
+                        }
+                        items = match &flags {
+                            Some(flags) => load_items(&c.db, &c.sde, ItemQuery::LocationFlags(*item_id, flags)).await.map_err(db_err)?,
+                            None => load_items(&c.db, &c.sde, ItemQuery::Location(*item_id)).await.map_err(db_err)?,
+                        };
+                        if items.iter().any(|item| requested.binary_search(&item.flag_id).is_err()) {
+                            requested = flags.clone().unwrap_or_else(|| items.iter().map(|item| item.flag_id).collect());
+                            if requested.is_empty() {
+                                requested.extend([FLAG_CARGO, FLAG_FLEET_HANGAR, FLAG_SHIP_HANGAR]);
+                            }
+                            requested.sort_unstable();
+                            requested.dedup();
+                            endpoints = requested.iter().map(|&flag| Endpoint { location: *item_id, flag }).collect();
+                            permissions = reach.check_many(&c.db, &c.sde, &endpoints).await?;
+                        }
+                    }
+                }
                 items.retain(|item| requested.binary_search(&item.flag_id).ok().is_some_and(|index| permissions[index]));
                 return Ok(items);
             }
@@ -286,47 +350,79 @@ pub(super) async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
             return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
         }
     }
+    let mut transient = None;
     if let Container::Item(id) = &container {
-        if super::super::trade::is_trade_container(*id) {
-            return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
-        }
-        if !crate::dao::trades::reserved(&c.db, &[*id]).await.map_err(db_err)?.is_empty() {
-            return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
-        }
-        let read = matches!(call.method, "List" | "ListByFlags" | "GetSelfInvItem" | "GetItem" | "GetCapacity" | "GetAvailableTurretSlots" | "ListSoulBound" | "ListServiceLifeDamage");
-        if let Some(allowed) = office_access(c, *id, read).await? {
-            if !allowed {
-                return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+        // A root this actor knows is answered from the actor in one turn; the
+        // trade reservation, office and corporate custody checks exist only for
+        // database items and are skipped for it.
+        let actor_identity = super::npc_loot::client_identity(c);
+        let lookup = match c.session.int("solarsystemid") {
+            Some(system) => super::npc_loot::view(&c.world, &actor_identity, system, *id).await,
+            None => crate::space::system::npc_wrecks::NpcWreckLookup::Absent,
+        };
+        match lookup {
+            crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) => transient = Some(view),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Denied =>
+                return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)),
+            crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) => {
+                super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await;
+                return Err(super::npc_loot::busy());
             }
-        } else {
-            let me = c.session.int("charid").unwrap_or(0);
-            if custody_allowed(&c.db, &c.sde, *id, me, c.session.int("stationid"), false).await? == Some(false) {
-                return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+            crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {
+                if super::super::trade::is_trade_container(*id) {
+                    return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
+                }
+                if !crate::dao::trades::reserved(&c.db, &[*id]).await.map_err(db_err)?.is_empty() {
+                    return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
+                }
+                let read = matches!(call.method, "List" | "ListByFlags" | "GetSelfInvItem" | "GetItem" | "GetCapacity" | "GetAvailableTurretSlots" | "ListSoulBound" | "ListServiceLifeDamage");
+                if let Some(allowed) = office_access(c, *id, read).await? {
+                    if !allowed {
+                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
+                } else {
+                    let me = c.session.int("charid").unwrap_or(0);
+                    if custody_allowed(&c.db, &c.sde, *id, me, c.session.int("stationid"), false).await? == Some(false) {
+                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
+                }
             }
         }
     }
     match call.method {
         "List" => {
             let flag = kw_or_arg(call, "flag", 0).and_then(|v| v.as_int());
+            if let Some(view) = &transient {
+                return Ok(Value::List(super::npc_loot::list_rows(view, flag.map(|f| vec![f]))));
+            }
             let items = list(c, &container, flag.map(|f| vec![f])).await?;
             Ok(Value::List(items.iter().map(Item::row).collect()))
         }
         "ListByFlags" => {
             let flags = kw_or_arg(call, "flags", 0).and_then(|v| v.items()).map(|f| f.iter().filter_map(|x| x.as_int()).collect());
+            if let Some(view) = &transient {
+                return Ok(Value::List(super::npc_loot::list_rows(view, flags)));
+            }
             let items = list(c, &container, flags).await?;
             Ok(Value::List(items.iter().map(Item::row).collect()))
         }
-        "GetSelfInvItem" | "GetItem" => self_item(c, &container).await,
+        "GetSelfInvItem" | "GetItem" => match &transient {
+            Some(view) => Ok(view.root.row()),
+            None => self_item(c, &container).await,
+        },
         "GetCapacity" => {
             let flag = match kw_or_arg(call, "flag", 0) {
                 None => FLAG_CARGO,
                 Some(value) => value.as_int().and_then(|v| i32::try_from(v).ok())
                     .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?,
             };
+            if let Some(view) = &transient {
+                return super::npc_loot::capacity_reply(&c.sde, view);
+            }
             capacity(c, &container, flag).await
         }
         "GetAvailableTurretSlots" => {
-            self_item(c, &container).await?;
+            if transient.is_none() { self_item(c, &container).await?; }
             Ok(Value::list([]))
         }
         // Add(itemID, sourceID, flag=, qty=) -> itemID now in this container
@@ -365,13 +461,16 @@ pub(super) async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
             stack_all(c, &container, flag).await.map(|_| Value::None)
         }
         "ListServiceLifeDamage" => {
+            // Fresh plain loot carries no service-life attachments, so the
+            // proven empty set is returned without touching the repair DAO.
+            if transient.is_some() { return Ok(Value::Dict(vec![])); }
             self_item(c, &container).await?;
             let flag = kw_or_arg(call, "flag", 0).and_then(|v| v.as_int());
             let items = list(c, &container, flag.map(|f| vec![f])).await?;
             crate::services::repairable_ship::service_life::for_items(&c.db, &items).await
         }
         "ListSoulBound" => {
-            self_item(c, &container).await?;
+            if transient.is_none() { self_item(c, &container).await?; }
             Ok(Value::Dict(vec![]))
         }
         _ => {

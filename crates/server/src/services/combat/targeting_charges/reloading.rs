@@ -78,7 +78,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                 let planned_stacks = if automatic {
                     if let Some(module) = planned_fitted.first() {
                         load_items(tx, &sde, ItemQuery::OwnerLocationFlag(owner, ship, FLAG_CARGO)).await.map_err(db_err)?
-                            .into_iter().filter(|item| item.quantity > 0 && compatible_charge(&sde, module.type_id, item)).collect::<Vec<_>>()
+                            .into_iter().filter(|item| item.quantity > 0 && compatible_charge(&sde, module.type_id, item.type_id)).collect::<Vec<_>>()
                     } else { Vec::new() }
                 } else { load_items(tx, &sde, ItemQuery::Ids(&charge_ids)).await.map_err(db_err)? };
                 let planned_flags: Vec<_> = planned_fitted.iter().map(|item| item.flag_id).collect();
@@ -201,7 +201,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                 let stacks = if automatic {
                     let module = &fitted[0];
                     load_items(tx, &sde, ItemQuery::OwnerLocationFlag(owner, ship, FLAG_CARGO)).await.map_err(db_err)?
-                        .into_iter().filter(|item| item.quantity > 0 && compatible_charge(&sde, module.type_id, item)).collect()
+                        .into_iter().filter(|item| item.quantity > 0 && compatible_charge(&sde, module.type_id, item.type_id)).collect()
                 } else {
                     load_items(tx, &sde, ItemQuery::Ids(&charge_ids)).await.map_err(db_err)?
                 };
@@ -235,7 +235,7 @@ pub(super) async fn reload(db: &Db, world: &Arc<World>, notify: &NotifyTx, sde: 
                     let module = fitted.iter().find(|item| item.item_id == module_id).ok_or_else(refuse)?;
                     if !flags.insert(module.flag_id) { continue; }
                     let Some(charge) = selected.iter().find_map(|id| items.get(id).filter(|(_, q)| *q > 0).map(|(item, _)| item)) else { break };
-                    if !compatible_charge(&sde, module.type_id, charge) { return Err(refuse()); }
+                    if !compatible_charge(&sde, module.type_id, charge.type_id) { return Err(refuse()); }
                     let type_id = charge.type_id;
                     let module_type = sde.types.get(module.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", module.type_id)))?;
                     let capacity = module_type.capacity.unwrap_or(0.0).max(module_type.attribute(ATTR_CAPACITY).unwrap_or(0.0));

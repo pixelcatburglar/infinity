@@ -48,7 +48,7 @@ async fn fact_context_normalizes_unknown_session_dimensions() {
 #[test]
 fn pinpoint_formation_resolves_a_site() {
     let s = site([0.0; 3], 0.6);
-    let around = |r: f64| (0..4).map(|i| ([r * 0.4 * (i as f64 - 1.5), 0.0, 0.0], r, 40.0 * 1.1025)).collect::<Vec<_>>();
+    let around = |r: f64| (0..4).map(|i| ScanningProbe { pos: [r * 0.4 * (i as f64 - 1.5), 0.0, 0.0], range: r, strength: 40.0 * 1.1025, deviation_per_range: 0.5 }).collect::<Vec<_>>();
     assert_eq!(certainty(&s, &around(0.25 * AU)).0, 1.0);
     let wide = certainty(&s, &around(8.0 * AU)).0;
     assert!(wide > 0.0 && wide < 0.25, "{wide}");

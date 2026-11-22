@@ -326,3 +326,68 @@ fn raw_mining_pending_lifecycle() {
     s.drone_controller_lost(10);
     assert!(s.drone(30).unwrap().pending.is_none());
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE"]
+async fn salvage_order_gates_fx_lifecycle_and_unknown_latch() {
+    use crate::space::drone::PendingMining;
+    use crate::services::mining::rounding::{MiningDraws, MiningInputs};
+    use std::sync::atomic::Ordering;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let wreck_type = sde.types.iter().find(|t| t.group_id == Some(infinity_core::consts::GROUP_WRECK)).unwrap().type_id;
+    let mut s = setup();
+    s.projection_sde = Some(sde);
+    for (id, x) in [(41, 15.0), (40, 20.0)] {
+        let mut wreck = ball(id, None, x);
+        wreck.type_id = wreck_type; wreck.owner_id = 20;
+        s.insert(wreck);
+    }
+    let mut salvage_spec = spec();
+    salvage_spec.scan_resolution = 0.0;
+    salvage_spec.effect_id = Some(infinity_core::consts::dogma::EFFECT_SALVAGE_DRONE);
+    s.insert(drone_ball(30));
+    s.register_drone(30, salvage_spec.clone(), effects(), Some(10), Some(20), false);
+    let stats = crate::services::combat::groups_health::ShipStats { max: [100.0; 3], resonance: [[1.0; 4]; 3], shield_tau_ms: 1e30 };
+    s.install_condition(30, crate::services::combat::groups_health::Condition { now: stats.max, stats, shield_at: 0 },
+        crate::services::fit::Fit::for_space_type(crate::sde::types::tests::combat_fixture(), 1, Vec::new()));
+    assert!(s.drone_salvage_admit(30, 0, 41).is_none());
+    assert!(s.drone_order(30, 20, 10, DroneOrder::Salvage(None)));
+    assert_eq!(s.drone(30).unwrap().target, Some(41));
+    s.tick(1100);
+    let generation = s.drone(30).unwrap().generation;
+    let Some((membership, cancelled, _)) = s.drone_salvage_admit(30, generation, 41) else { panic!("admission after lock") };
+    assert!(s.drone_salvage_in_flight(30, generation, 41, membership));
+    assert!(s.drone_salvage_admit(30, generation, 41).is_none());
+    assert!(s.drone_salvage_admit(30, generation.wrapping_add(1), 41).is_none());
+    assert!(!s.drone_salvage_in_flight(30, generation, 41, membership.wrapping_add(1)));
+    s.drone_jammed(10);
+    assert!(cancelled.load(Ordering::Relaxed));
+    s.tick(2100);
+    let generation = s.drone(30).unwrap().generation;
+    let Some((membership, next_cancelled, _)) = s.drone_salvage_admit(30, generation, 41) else { panic!("re-admission after relock") };
+    assert!(!next_cancelled.load(Ordering::Relaxed));
+    assert!(s.drone_order(30, 20, 10, DroneOrder::ReturnHome));
+    assert!(next_cancelled.load(Ordering::Relaxed));
+    assert!(!s.drone_salvage_in_flight(30, generation, 41, membership));
+    s.drone_salvage_delivered(30, generation);
+    assert_eq!(s.drone(30).unwrap().order, DroneOrder::ReturnHome);
+    let generation = s.drone(30).unwrap().generation;
+    s.drone_salvage_unknown(30, generation);
+    assert!(s.drone_delivery_blocked(30));
+    assert!(!s.drone_order(30, 20, 10, DroneOrder::Salvage(None)));
+    assert!(s.drone_order(30, 20, 10, DroneOrder::ReturnHome));
+    assert!(!s.drone_order(30, 20, 10, DroneOrder::Salvage(Some(41))));
+    s.drone_removed(30);
+    s.register_drone(30, salvage_spec, effects(), Some(10), Some(20), false);
+    assert!(s.drone_order(30, 20, 10, DroneOrder::Salvage(None)));
+    s.remove_ball(41);
+    s.think_drones();
+    assert_eq!(s.drone(30).unwrap().target, Some(40));
+    let pending = PendingMining { rock: 40, type_id: 1, unit_volume: 2.0,
+        inputs: MiningInputs { clamp_factor: 0.5, volume: 3.0, waste_volume_multiplier: 0.2, waste_probability: 4.0, crit_quantity_multiplier: 0.3, crit_probability: 0.4, efficiency: 0.9 },
+        draws: MiningDraws { waste_check: 7, normal_round: 0.1, waste_round: 0.2, crit_check: 0.3, crit_round: 0.4 } };
+    let generation = s.drone(30).unwrap().generation;
+    assert!(!s.drone_pending(30, generation, pending));
+}

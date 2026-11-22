@@ -4,7 +4,7 @@ use crate::{db::Db, space::{Ball, WarpState, MODE_STOP}};
 
 #[cfg(feature = "tests-effects")]
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn item(db: &Db, type_id: i32, owner: i64, location: i64, flag: i32, quantity: i64, singleton: bool, online: bool) -> Result<i64, Error> {
+pub(in crate::services) async fn item(db: &Db, type_id: i32, owner: i64, location: i64, flag: i32, quantity: i64, singleton: bool, online: bool) -> Result<i64, Error> {
     Ok(db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING item_id",
         &[&type_id, &owner, &location, &flag, &quantity, &singleton, &online]).await?.get("item_id"))
 }
@@ -15,7 +15,7 @@ pub(super) async fn position(db: &Db, item: i64, system: i64, pos: [f64; 3]) -> 
     Ok(())
 }
 
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-content", feature = "tests-ships", feature = "tests-slash"))]
 pub(in crate::services) async fn admit(db: &Db, world: &std::sync::Arc<crate::space::World>, system: i64, ball: Ball) {
     let row = crate::dao::items::space_ships::FreeShip { item_id: ball.id, type_id: ball.type_id,
         owner_id: ball.owner_id, corporation_id: ball.corp_id, alliance_id: ball.alliance_id, pos: ball.pos };
@@ -30,7 +30,7 @@ pub(in crate::services) async fn admit(db: &Db, world: &std::sync::Arc<crate::sp
     })).await.expect("install prepared ship");
 }
 #[cfg(feature = "tests-effects")]
-pub(in crate::services::effects) async fn publish_fit(db: &Db, world: &std::sync::Arc<crate::space::World>, system: i64, owner: i64, ship: i64) {
+pub(in crate::services) async fn publish_fit(db: &Db, world: &std::sync::Arc<crate::space::World>, system: i64, owner: i64, ship: i64) {
     let fit = crate::services::fit::Fit::load_in_space(db, world, system, owner, ship).await.expect("load changed fit");
     assert!(crate::services::tests::fixture::publish_fitting(world, system, owner, ship, fit).await);
 }
@@ -153,7 +153,7 @@ pub(super) async fn admit_npc(world: &std::sync::Arc<crate::space::World>, syste
 }
 
 
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-content", feature = "tests-ships", feature = "tests-slash"))]
 pub(in crate::services) fn ball(id: i64, type_id: i32, owner: i64, pilot: Option<i64>, x: f64) -> Ball {
     Ball { id, type_id, owner_id: owner, corp_id: 1, alliance_id: -1, char_id: pilot,
         signature_radius: None, mode: MODE_STOP, radius: 1.0, mass: 1e6, max_vel: 0.0,
@@ -166,7 +166,7 @@ pub(in crate::services) fn ball(id: i64, type_id: i32, owner: i64, pilot: Option
 
 #[cfg(feature = "tests-effects")]
 /// One dogmaIM dispatch on the test client (Activate, Deactivate, ShipGetInfo).
-pub(in crate::services::effects) async fn dogma_call(client: &mut crate::client::Client, method: &str, args: &[marshal::Value]) -> crate::services::CallResult {
+pub(in crate::services) async fn dogma_call(client: &mut crate::client::Client, method: &str, args: &[marshal::Value]) -> crate::services::CallResult {
     let kwargs = marshal::Value::Dict(vec![]);
     crate::services::dogma::dispatch(client, &crate::services::Call { service: "dogmaIM", method, args, kwargs: &kwargs, bound: false, bind_params: None }).await
 }

@@ -82,7 +82,7 @@ pub(super) async fn apply_damage_guarded(
             Some(DamageGuard::Npc(source, hostile, generation)) => s.npc_projection_valid(source, hostile, generation)
                 && s.ball(source).is_some_and(|ball| ball.mode != MODE_WARP),
         };
-        let completion = damage::apply_area_damage_in_actor(s, &db, system, weapon, &mut victims, application, facts, &sde, valid_source);
+        let completion = damage::area::apply_area_damage_in_actor(s, &db, system, weapon, &mut victims, application, facts, &sde, valid_source);
         if completion.attempt_finished { attempt.disarm(); }
         let result = match completion.fatal {
             Some(error) => Err(error),

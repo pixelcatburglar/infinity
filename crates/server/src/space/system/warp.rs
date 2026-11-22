@@ -81,6 +81,22 @@ impl System {
         if let Some(id) = id { self.release_warp_arrival(id); }
     }
 
+    /// Queue a Stop for a ship whose accepted warp is still aligning: the
+    /// command rechecks the captured combat membership and fires only while
+    /// the ball is in warp mode without a committed effect stamp.
+    pub(in crate::space) fn stop_aligning_warp(&mut self, target: i64, generation: u64) {
+        self.command(target, move |ball, stamp, system| {
+            if system.combat_membership_generation(target) == Some(generation)
+                && ball.mode == MODE_WARP && ball.effect_stamp < 0
+            {
+                ball.stop();
+                vec![event(stamp, "Stop", vec![Value::Int(target)])]
+            } else {
+                Vec::new()
+            }
+        });
+    }
+
     /// Queue one warp request into the scene action prefix. Position and
     /// bubble changes ride the same ordered stream; real warp exits still
     /// invalidate only their own original rules.
@@ -91,6 +107,10 @@ impl System {
         let generation = (self.persistent_generation(ship), self.combat_membership_generation(ship));
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
             if !s.ball_token_current(token) || (s.persistent_generation(ship), s.combat_membership_generation(ship)) != generation {
+                if let Some(id) = arrival { s.release_warp_arrival(id); }
+                return;
+            }
+            if crate::services::effects::active_cycle::mode_locked(s, ship) {
                 if let Some(id) = arrival { s.release_warp_arrival(id); }
                 return;
             }

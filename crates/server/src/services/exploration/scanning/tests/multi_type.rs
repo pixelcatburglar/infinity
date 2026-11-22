@@ -34,11 +34,11 @@ async fn multi_type_probe_recovery_deposits_each_type_once() {
         let ship = recovery_ship(&scenario_db, &mut client.session, character, system, hull).await;
         let expiry = filetime_now() + FILETIME_SECOND * 60;
         for (id, (type_id, _)) in ids.into_iter().zip(probes.iter().copied()) {
-            state().probes.insert(id, Probe { char_id: character, system, type_id, pos: [0.0; 3], expiry, strength: 1.0 });
+            state().probes.insert(id, Probe { char_id: character, system, type_id, pos: [0.0; 3], expiry, bonuses: ProbeBonuses::default() });
         }
         let foreign_system = client.sde.map.systems().find(|s| s.solar_system_id != system).unwrap().solar_system_id;
         let foreign = character * 100 + 55;
-        state().probes.insert(foreign, Probe { char_id: character, system: foreign_system, type_id: probes[0].0, pos: [0.0; 3], expiry, strength: 1.0 });
+        state().probes.insert(foreign, Probe { char_id: character, system: foreign_system, type_id: probes[0].0, pos: [0.0; 3], expiry, bonuses: ProbeBonuses::default() });
         let args = [Value::list(ids.into_iter().chain([foreign, ids[0]]).map(Value::Int))];
         let kwargs = Value::None;
         let call = Call { service: "scanMgr", method: "RecoverProbes", args: &args, kwargs: &kwargs, bound: true, bind_params: None };

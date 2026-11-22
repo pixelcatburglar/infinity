@@ -121,7 +121,10 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
             .await.context("system stopped")?.context("ship or rock missing after positioning")?;
         ensure!(gap >= 8_000.0, "ship started too close to rock: surface gap {gap}");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _pilot_binding = f.world.bind_pilot(f.owner, tx.clone(), None, None).map_err(|e| anyhow!("bind pilot: {e:?}"))?;
         f.world.register_pilot(f.owner, tx);
+        let ship_ball = f.world.with(f.system, move |s| s.sampled_ball(ship)).await.flatten().context("fixture ship missing")?;
+        crate::services::effects::tests::fixture::admit(&f.db, &f.world, f.system, ship_ball).await;
         launch(&mut f, id).await?;
         let motion = f.world.ball(f.system, id).await.context("launched drone has no ball")?;
         ensure!(motion.free && motion.mass == DRONE_FALLBACK_MASS && f64::from(motion.agility) == DRONE_FALLBACK_AGILITY,
@@ -195,7 +198,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         command(&mut f, id, "CmdReturnHome", None).await?;
         let mut notices = 0;
         for _ in 0..100 { while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { notices += 1; } } if notices > 0 { break; } tick(&f).await?; }
-        ensure!(notices == 1 && quantities(&f, rock, ore).await? == after, "post-commit notice or single delivery missing");
+        ensure!(notices == 1 && quantities(&f, rock, ore).await? == after, "post-commit notice or single delivery missing: notices={notices}");
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let _rollback_intent = pending(&f, id, rock, "rejected-bay intent").await?;
         f.set(f.ship, ATTR_DRONE_CAPACITY, 0.0).await;

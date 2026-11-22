@@ -62,6 +62,21 @@ impl World {
             crate::services::CallError::Internal(error) => error,
             crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
         })?;
+        // Transient NPC wreck ID reservation: one committed block must be in
+        // hand before the actor exists; an error or unknown commit burns the
+        // whole block and fails this load rather than publish a partial pool.
+        let npc_wreck_ids = self.db.transaction::<_, _, crate::services::CallError, crate::db::outbox::Outbox<()>, _, _, _>(
+            |tx, _| {
+                let block = crate::config::game().combat.npc_wreck_id_block_size;
+                Box::pin(async move {
+                    crate::dao::items::npc_loot::reserve_ids(tx, block).await.map_err(crate::services::CallError::from)
+                })
+            },
+            |ids, _| async move { Ok::<Vec<i64>, crate::services::CallError>(ids) },
+        ).await.map_err(|error| match error {
+            crate::services::CallError::Internal(error) => error,
+            crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+        })?;
         let mut systems = crate::poison::lock_or_exit(self.systems.lock());
         match systems.get(&system_id) {
             Some(handle) if !handle.is_closed() => return Ok(()),
@@ -79,6 +94,7 @@ impl World {
         system.world = self.weak.clone();
         system.projection_sde = Some(self.sde.clone());
         system.notice_hub = Some(self.notice_hub.clone());
+        system.npc_wreck_install_ids(npc_wreck_ids);
         system.restore_bounties(&bounty_rows);
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };

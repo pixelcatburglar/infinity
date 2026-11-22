@@ -11,7 +11,7 @@ pub(crate) fn cached_overloaded(s: &System, ship: i64, module: i64) -> Option<bo
     s.actor_combat.get(&ship)?.fit.module_overloaded(module)
 }
 
-#[cfg(feature = "tests-ships")]
+#[cfg(any(feature = "tests-ships", feature = "tests-effects"))]
 pub(crate) fn cached_module_attribute(
     s: &System, ship: i64, module: i64, attr: i32,
 ) -> Option<(f64, Option<u64>)> {
@@ -62,12 +62,40 @@ fn combat_clock_never_regresses_before_actor_tick() {
 #[cfg(feature = "tests-space")] #[test]
 fn typed_damage_spills_once_and_preserves_existing_overdamage() {
     let mut c = condition([10.0, 20.0, 30.0]);
-    let layers = absorb_preserving_overdamage(&mut c, [35.0, 0.0, 0.0, 0.0]);
-    assert_eq!(layers, [10.0, 20.0, 5.0]);
+    let absorbed = absorb_preserving_overdamage(&mut c, [35.0, 0.0, 0.0, 0.0]);
+    assert_eq!(absorbed.layers, [10.0, 20.0, 5.0]);
     assert_eq!(c.now, [0.0, 0.0, 25.0]);
+    // Armor takes the whole 20 after resistance 1; shield and hull add nothing.
+    assert_eq!(absorbed.armor, [20.0, 0.0, 0.0, 0.0]);
+    let mut typed = condition([0.0, 10.0, 0.0]);
+    typed.stats.resonance[1] = [0.5, 0.25, 0.0, 1.0];
+    // Products 4, 2, 0, 8 sum to 14; 10 of 14 HP clips them to 20/7, 10/7, 0, 40/7.
+    let clipped = absorb_preserving_overdamage(&mut typed, [8.0, 8.0, 8.0, 8.0]);
+    assert_eq!(clipped.layers, [0.0, 10.0, 0.0]);
+    assert!(clipped.armor.iter().zip([20.0 / 7.0, 10.0 / 7.0, 0.0, 40.0 / 7.0])
+        .all(|(got, want)| (got - want).abs() < 1e-9));
+    let mut shield = condition([50.0, 0.0, 100.0]);
+    shield.stats.resonance[0][0] = 0.5;
+    assert_eq!(absorb_preserving_overdamage(&mut shield, [20.0, 0.0, 0.0, 0.0]).armor, [0.0; 4]);
+    let mut hull = condition([0.0, 0.0, 100.0]);
+    hull.stats.resonance[2][3] = 0.5;
+    assert_eq!(absorb_preserving_overdamage(&mut hull, [0.0, 0.0, 0.0, 20.0]).armor, [0.0; 4]);
     let mut c = condition([0.0, -30.0, 30.0]);
-    assert_eq!(absorb_preserving_overdamage(&mut c, [5.0, 0.0, 0.0, 0.0]), [0.0, 0.0, 5.0]);
+    assert_eq!(absorb_preserving_overdamage(&mut c, [5.0, 0.0, 0.0, 0.0]).layers, [0.0, 0.0, 5.0]);
     assert_eq!(c.now, [0.0, -30.0, 25.0]);
+}
+
+#[cfg(feature = "tests-space")] #[test]
+fn flat_damage_ignores_resonance_and_spills_layers() {
+    let mut c = condition([10.0, 20.0, 30.0]);
+    c.stats.resonance = [[0.5; 4]; 3];
+    // 40 flat is not halved by resonance: 10 shield, 20 armor, 10 hull spill.
+    assert_eq!(absorb_flat_preserving_overdamage(&mut c, 40.0), [10.0, 20.0, 10.0]);
+    assert_eq!(c.now, [0.0, 0.0, 20.0]);
+    let mut c = condition([10.0, 0.0, 30.0]);
+    c.stats.resonance = [[0.1; 4]; 3];
+    assert_eq!(absorb_flat_preserving_overdamage(&mut c, 50.0), [10.0, 0.0, 30.0]);
+    assert_eq!(c.now, [0.0, 0.0, 0.0]);
 }
 
 #[cfg(feature = "tests-space")] #[test]
@@ -113,16 +141,39 @@ fn fitted_maxima_and_resistance_preserve_condition() {
     changed.resonance[0][0] = 0.5;
     assert!(rebase_condition(&mut c, changed));
     assert_eq!(c.now, [60.0, 250.0, 310.0]);
-    assert_eq!(absorb_preserving_overdamage(&mut c, [20.0, 0.0, 0.0, 0.0]), [10.0, 0.0, 0.0]);
+    assert_eq!(absorb_preserving_overdamage(&mut c, [20.0, 0.0, 0.0, 0.0]).layers, [10.0, 0.0, 0.0]);
     assert_eq!(c.now[0], 50.0);
     assert!(rebase_condition(&mut c, original.clone()));
     assert!((c.now[0] - 50.0).abs() < 1e-9);
     assert_eq!(&c.now[1..], &[150.0, 210.0]);
-    assert_eq!(absorb_preserving_overdamage(&mut c, [20.0, 0.0, 0.0, 0.0]), [20.0, 0.0, 0.0]);
+    assert_eq!(absorb_preserving_overdamage(&mut c, [20.0, 0.0, 0.0, 0.0]).layers, [20.0, 0.0, 0.0]);
     let mut boundary = original;
     boundary.max = [20.0, 50.0, 90.0];
     assert!(rebase_condition(&mut c, boundary));
     assert_eq!(c.now, [20.0, 0.0, 0.0]);
+}
+
+#[cfg(feature = "tests-space")] #[test]
+fn active_module_assistance_uses_resident_flags() {
+    crate::tests::init_config();
+    let install = |disallow: f64, active: bool| {
+        let mut fit = crate::services::fit::attributes::tests::module_fit(
+            crate::sde::types::tests::combat_fixture(), 1, 1, true);
+        assert!(fit.apply_committed_fitting(&crate::services::fit::attributes::CommittedFitting::overridden_attributes(
+            vec![(Key::Module(2), ATTR_DISALLOW_ASSISTANCE, Some(disallow))])));
+        fit.set_module_active(2, active);
+        let mut system = System::default();
+        system.install_condition(1, condition([100.0, 200.0, 300.0]), fit);
+        system
+    };
+    let links = crate::space::sovereignty::links::assistance_blocked;
+    let (inactive, zeroed, active) = (install(1.0, false), install(0.0, true), install(1.0, true));
+    // An inactive or zeroed `disallowAssistance` answers by the Entosis rule
+    // alone; the active module's positive value is what blocks on its own.
+    assert_eq!(assistance_blocked(&inactive, 1), links(&inactive, 1));
+    assert_eq!(assistance_blocked(&zeroed, 1), links(&zeroed, 1));
+    assert!(assistance_blocked(&active, 1) && !links(&active, 1));
+    assert!(!assistance_blocked(&System::default(), 9));
 }
 #[cfg(feature = "tests-space")] #[test]
 fn floored_resonance_reaches_absorbed_damage_and_repair_stays_unscaled() {
@@ -155,21 +206,21 @@ fn floored_resonance_reaches_absorbed_damage_and_repair_stays_unscaled() {
         let mut c = Condition { stats: stats.clone(), now: stats.max, shield_at: filetime_now() };
         let mut raw = [0.0; 4];
         raw[channel] = 20.0;
-        let dealt = absorb_preserving_overdamage(&mut c, raw);
+        let dealt = absorb_preserving_overdamage(&mut c, raw).layers;
         assert!((dealt[0] - 20.0 * floor).abs() < 1e-9, "channel {channel}: {dealt:?}");
         assert_eq!(&dealt[1..], &[0.0, 0.0]);
     }
     // Armor and hull absorb through their own floored resonance rows once the
     // layers above are gone.
     let mut c = Condition { stats: stats.clone(), now: [0.0, stats.max[1], stats.max[2]], shield_at: filetime_now() };
-    let dealt = absorb_preserving_overdamage(&mut c, [0.0, 0.0, 20.0, 0.0]);
+    let dealt = absorb_preserving_overdamage(&mut c, [0.0, 0.0, 20.0, 0.0]).layers;
     assert!((dealt[1] - 20.0 * floor).abs() < 1e-9);
     let mut c = Condition { stats: stats.clone(), now: [0.0, 0.0, stats.max[2]], shield_at: filetime_now() };
-    let dealt = absorb_preserving_overdamage(&mut c, [0.0, 0.0, 0.0, 20.0]);
+    let dealt = absorb_preserving_overdamage(&mut c, [0.0, 0.0, 0.0, 20.0]).layers;
     assert!((dealt[2] - 20.0 * floor).abs() < 1e-9);
     // Overflow re-applies the floored resonance at each layer on the way down.
     let mut c = Condition { stats: stats.clone(), now: stats.max, shield_at: filetime_now() };
-    let dealt = absorb_preserving_overdamage(&mut c, [4000.0, 0.0, 0.0, 0.0]);
+    let dealt = absorb_preserving_overdamage(&mut c, [4000.0, 0.0, 0.0, 0.0]).layers;
     assert!((dealt[0] - 100.0).abs() < 1e-9);
     assert!((dealt[1] - 100.0).abs() < 1e-9);
     assert!(dealt[2] < 1e-9, "hull keeps nearly all its hitpoints: {dealt:?}");
@@ -232,7 +283,7 @@ async fn hub_damage_immunity_covers_single_and_area_native_paths() {
     system.observe_combat_utc().unwrap();
     let at = system.combat_observed_time();
     let raw = [1.0, 0.0, 0.0, 0.0];
-    assert!(system.plan_damage(1, raw, source.clone(), false, at).is_some());
+    assert!(system.plan_damage(1, raw, source.clone(), false, at, Absorption::Fitted).is_some());
     assert!(system.plan_area_damage(1, raw, source.clone(), at).is_some());
     let before = system.actor_combat[&1].condition.now;
     let revision = system.actor_combat[&1].revision;

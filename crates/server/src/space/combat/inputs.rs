@@ -22,14 +22,16 @@
 //! cold owner-handoff counterpart: the real owner's complete ship and
 //! character domain lands on a still-live resident drone at one captured
 //! FILETIME, without granting control and without a second clock read or
-//! database load.
+//! database load. Resolved runtime modifier source changes land through
+//! `publish_runtime_changes`, which applies each anchor's folded scalars on
+//! the resident fit and shares the same receipt.
 
 use super::{rebase_condition_at, CombatPhase, ShipStats, System};
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil};
 use crate::services::combat::groups_health::rebase_capacitor;
 use crate::services::effects::{projection::Projection, propulsion};
 use crate::services::fit::{attributes::CommittedFitting, character::{CharacterInputs, OwnerInputs},
-    Fit, Key};
+    runtime::{RuntimeModifierSource, RuntimeReceiverKey}, Fit, Key};
 use infinity_core::consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_MAX_TARGET_RANGE,
     dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SCAN_RESOLUTION, OWNER_UNOWNED};
 
@@ -64,7 +66,13 @@ pub(in crate::space) enum FitDeltaSources<'a> {
     Character(&'a CharacterInputs),
     Projections(&'a [Projection]),
     Fitting(&'a CommittedFitting),
+    /// Runtime source changes about to land; their collection IDs seed the receipt.
+    Runtime(&'a [crate::space::dbuff::RuntimeStateChange]),
     Owner(&'a OwnerInputs),
+    /// An adaptive armor profile publication: the receipt pairs exactly the
+    /// module's four operand rows with the ship's four resonance rows; a due
+    /// character deadline upgrades it to the full `Current` enumeration.
+    ReactiveArmor(i64),
 }
 
 /// One publication's pre-expiry snapshot: the receiving item and its
@@ -258,6 +266,13 @@ impl System {
         Some(read(&record.fit, record.fit_key, stamp))
     }
 
+    /// Read-only resident-fit borrow for authority gates that must work on a
+    /// shared `&System`, including while an action temporarily holds the
+    /// ship's ball. `None` when the ship has no combat record.
+    pub(crate) fn resident_fit<R: 'static>(&self, item: i64, read: impl FnOnce(&Fit, u64) -> R) -> Option<R> {
+        self.actor_combat.get(&item).map(|record| read(&record.fit, record.membership_generation))
+    }
+
     /// Borrow the live fit while the listed modules hold a scoped active bit.
     ///
     /// Same single prepare as `with_combat_fit`, including the ordinary expiry
@@ -428,6 +443,55 @@ impl System {
         removed
     }
 
+    /// Land resolved runtime source changes on the resident fits they anchor
+    /// to and publish each receiving record's delta through the shared
+    /// receipt. Ship-anchored changes also reach every controlled drone's
+    /// copied owner domain. Returns the ship items whose runtime state moved.
+    pub(in crate::space) fn publish_runtime_changes(&mut self, changes: &[crate::space::dbuff::RuntimeStateChange]) -> Vec<i64> {
+        let mut groups: Vec<(i64, bool, Vec<crate::space::dbuff::RuntimeStateChange>)> = Vec::new();
+        for change in changes {
+            let (item, ship_anchored) = match change.receiver {
+                RuntimeReceiverKey::Ship(ship) | RuntimeReceiverKey::Module { ship, .. } => (ship, true),
+                RuntimeReceiverKey::Character(character) => match self.pilot_ball(character).map(|ball| ball.id) {
+                    Some(id) => (id, true),
+                    None => continue,
+                },
+                RuntimeReceiverKey::Drone { drone, .. } => (drone, false),
+            };
+            match groups.iter_mut().find(|(id, _, _)| *id == item) {
+                Some((_, _, group)) => group.push(*change),
+                None => groups.push((item, ship_anchored, vec![*change])),
+            }
+        }
+        let mut moved = Vec::new();
+        for (item, ship_anchored, group) in groups {
+            let resolved: Vec<(crate::space::dbuff::RuntimeStateChange, Option<RuntimeModifierSource>)> = group.iter()
+                .map(|change| (*change, self.runtime_source_snapshot(change.receiver, change.collection_id, change.source)))
+                .collect();
+            let Some((expired, _, receipt)) = self.prepare_fit_publication(item, Some(FitDeltaSources::Runtime(&group))) else { continue };
+            let apply = |fit: &mut Fit| resolved.iter().fold(false, |changed, (change, snapshot)| {
+                (match snapshot {
+                    Some(source) => fit.replace_runtime_modifier_source(*source),
+                    None => fit.remove_runtime_modifier_source(change.receiver, change.collection_id, change.source),
+                }) || changed
+            });
+            let changed = self.actor_combat.get_mut(&item).is_some_and(|record| {
+                if !apply(&mut record.fit) { return false; }
+                record.fit_revision = record.fit_revision.saturating_add(1);
+                true
+            });
+            if ship_anchored {
+                self.propagate_ship_input(item, FitDeltaSources::Runtime(&group), &apply);
+            }
+            if expired || changed { self.rebase_fitted_outputs(item); }
+            if let Some(before) = receipt { self.finish_fit_delta(before, None); }
+            if ship_anchored && (changed || resolved.iter().any(|(_, snapshot)| snapshot.is_none())) {
+                moved.push(item);
+            }
+        }
+        moved
+    }
+
     /// Pay one charge under a live permit; a last round also removes the fit
     /// charge node its token names in this same actor turn. Refusal leaves
     /// the permit's finite use to the caller's owner.
@@ -474,7 +538,13 @@ impl System {
     }
 
     pub(crate) fn fitted_module_online(&mut self, ship: i64, module: i64, online: bool) -> bool {
-        let Some((expired, _, receipt)) = self.prepare_fit_publication(ship, None) else { return false };
+        // A direct offline that takes an adaptive armor profile down plans
+        // the Current receipt so the reset publishes; ordinary writes keep
+        // the deadline-only planning.
+        let planned = (!online && self.actor_combat.get(&ship)
+            .is_some_and(|record| record.fit.has_reactive_armor(module)))
+            .then_some(FitDeltaSources::Current);
+        let Some((expired, _, receipt)) = self.prepare_fit_publication(ship, planned) else { return false };
         let Some(record) = self.actor_combat.get_mut(&ship) else { return false };
         if record.revision == u64::MAX || !record.fit.set_module_online(module, online) {
             if expired { self.rebase_fitted_outputs(ship); }
@@ -482,9 +552,15 @@ impl System {
             return false;
         }
         record.fit_revision = record.fit_revision.saturating_add(1);
+        record.reconcile_reactive_armor();
         self.propagate_ship_input(ship, FitDeltaSources::Current, move |fit| fit.set_module_online(module, online));
         self.rebase_fitted_outputs(ship);
         if let Some(before) = receipt { self.finish_fit_delta(before, None); }
+        // A committed offline is the forced terminal for any tracked
+        // activation on this module: the generation fence keeps it once.
+        if !online {
+            crate::services::effects::active_cycle::finish_module(self, ship, module);
+        }
         true
     }
 
@@ -512,6 +588,7 @@ impl System {
             let record = self.actor_combat.get_mut(&ship).unwrap();
             record.fit.set_module_active(module, active);
             record.fit_revision = record.fit_revision.saturating_add(1);
+            record.reconcile_reactive_armor();
         }
         self.propagate_ship_input(ship, FitDeltaSources::Current, move |fit| fit.set_module_active(module, active));
         self.rebase_fitted_outputs(ship);

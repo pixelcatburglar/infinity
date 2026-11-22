@@ -54,7 +54,7 @@ pub(super) fn add_in_system(s: &mut System, sde: &Sde, request: LockRequest) -> 
         Ok(()) => {}
     }
     if jamming::is_jammed(ship, s.now_ms()) { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])); }
-    let max_targets = if pilot_limit > 0.0 { ship_limit.min(pilot_limit) } else { ship_limit } as usize; // ship limit capped by the pilot's Targeting skills
+    let max_targets = fitted_lock_limit(pilot_limit, ship_limit);
     let (target_type, target_radius) = s.ball(target).map(|b| (b.type_id, f64::from(b.radius))).unwrap_or((0, 0.0));
     let delay = lock_time_ms(scan_resolution, attr(sde, target_type, ATTR_SIGNATURE_RADIUS, target_radius));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
@@ -85,19 +85,23 @@ pub(super) fn add_in_system(s: &mut System, sde: &Sde, request: LockRequest) -> 
     s.drop_jump_cloak(ship);
     debug!("locking {target} in {delay}ms");
     let completion = LockRequest { character, ship, system, target, silent, owner, ui_owner: None, notify };
-    s.schedule(delay, move |s| complete(s, completion, attempt, max_targets, source, target_token));
+    s.schedule(delay, move |s| complete(s, completion, attempt, source, target_token));
     Ok(Value::tuple([Value::Bool(true), Value::list(current.into_iter().map(Value::Int))]))
 }
 
 /// The timer's one-shot completion: incarnation tokens, cloak, jam and the
-/// shared predicate against the range fitted now must all still hold.
-fn complete(s: &mut System, request: LockRequest, attempt: u64, limit: usize, source: crate::space::system::observers::BallToken, target: crate::space::system::observers::BallToken) {
+/// shared predicate against the range and lock limit fitted now must all still hold.
+fn complete(s: &mut System, request: LockRequest, attempt: u64, source: crate::space::system::observers::BallToken, target: crate::space::system::observers::BallToken) {
     let valid = s.ball_token_current(source) && s.ball_token_current(target)
         && !jamming::is_jammed(request.ship, s.now_ms())
         && s.ball(request.ship).is_some_and(|b| b.cloak == 0)
         && s.ball(request.target).is_some_and(|b| b.cloak == 0)
+        && s.combat_phase(request.target).is_none_or(|phase| !matches!(phase, crate::space::combat::CombatPhase::Transition { .. }))
         && s.with_combat_fit(request.ship, |fit, _, _| fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE))
             .is_some_and(|range| check(s, request.character, request.ship, request.target, range).is_ok());
+    let limit = s.with_combat_fit(request.ship, |fit, _, _|
+        fitted_lock_limit(fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS), fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS)))
+        .unwrap_or(1);
     let pilot = s.ball(request.target).and_then(|ball| ball.char_id);
     let (_, added) = {
         let mut st = state();
@@ -115,6 +119,14 @@ fn complete(s: &mut System, request: LockRequest, attempt: u64, limit: usize, so
             |args| { let _ = request.notify.send(("OnTarget".to_string(), args)); },
             |args| { if let Some(pilot) = pilot { s.notify_pilot(pilot, "OnTarget", args); } });
     }
+}
+
+/// The lock count admission and completion both read from the current fit.
+/// A positive pilot limit caps the ship; a non-positive one leaves the ship
+/// limit, and the count is never below one.
+fn fitted_lock_limit(pilot_limit: f64, ship_limit: f64) -> usize {
+    let limit = if pilot_limit > 0.0 { ship_limit.min(pilot_limit) } else { ship_limit };
+    (limit as usize).max(1)
 }
 
 /// Remove one sweep-invalidated completed lock: conditional State removal

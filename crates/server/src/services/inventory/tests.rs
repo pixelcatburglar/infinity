@@ -6,7 +6,7 @@ use super::access::Container;
 use super::inv_inventory::{inventory, item_capacity_reply};
 use super::movement::{move_core, move_item};
 use super::destination::{Custody, Destination};
-use super::stacks::plan_merges;
+use super::stacks::plan::plan_merges;
 use crate::client::Client;
 use infinity_core::consts::{CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_HANGAR, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1, TYPE_PLASTIC_WRAP};
 use infinity_core::consts::dogma::ATTR_CAPACITY;
@@ -29,6 +29,7 @@ mod read_access;
 mod read_custody;
 mod quantity_display;
 mod unlimited_cargo;
+mod ship_stance;
 
 pub(super) fn item(id: i64, quantity: i64) -> Item {
     Item { item_id: id, type_id: 1, owner_id: 1, location_id: 1, flag_id: 1, quantity, singleton: false, group_id: 1, category_id: 1, custom_info: None }

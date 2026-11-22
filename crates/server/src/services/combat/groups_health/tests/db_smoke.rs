@@ -1,3 +1,4 @@
+use super::super::wreck::spawn_wreck;
 use super::*;
 use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipLocation};
 use std::sync::Arc;
@@ -239,6 +240,8 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
     let (world, second) = (f.world.clone(), world2.clone());
     let self_kill_events = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
     let captured = self_kill_events.clone();
+    let bounty_batch = Arc::new(std::sync::Mutex::new(None));
+    let captured_batch = bounty_batch.clone();
     let result = tokio::spawn(async move {
         let add_npc = |world: Arc<World>, id| async move {
             let mut b = ball(id, npc_type, None);
@@ -304,9 +307,19 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         assert_eq!(wrecks[0].1.iter().find(|(key, _)| *key == "launcherID").map(|(_, value)| value), Some(&Value::Int(npc)));
         let debris = spawn_wreck(&db, &second, system, wreck_type, owner, 1, [0.0; 3], None, None).await.unwrap();
         assert!(!second.ball(system, debris).await.unwrap().slim.iter().any(|(key, _)| *key == "launcherID"));
+        assert_eq!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap(), balance);
+        second.flush_positions().await.unwrap();
+        assert_eq!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap(), balance);
+        let pools = crate::dao::npc_bounties::for_character(&db, owner).await.unwrap();
+        assert_eq!(pools.len(), 1);
+        let batch = pools[0].batch;
+        *captured_batch.lock().unwrap() = Some(batch);
+        crate::services::bounty::npc::settle_due(&db, &second, (owner, batch.started_at), batch.due_at).await.unwrap();
         assert!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap() > balance);
-        assert!(db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2 AND item_id<>$3",
-            &[&owner, &system, &drone]).await.unwrap().get::<_, i64>("count") >= 2);
+        // Transient roots and their loot publish no game.items rows at all.
+        let transient = vec![wrecks[0].0, debris];
+        assert_eq!(db.query_one("SELECT count(*) FROM game.items WHERE item_id=ANY($1) OR location_id=ANY($1)",
+            &[&transient]).await.unwrap().get::<_, i64>("count"), 0);
         let rows = events().await;
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0].get::<_, i64>("source_id"), rows[1].get::<_, i64>("source_id"));
@@ -360,6 +373,13 @@ async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
         for id in ids { world2.remove_ball(system, id).await; forget_ship(id); }
     }
     world2.flush_positions().await.unwrap();
+    let pools = crate::dao::npc_bounties::for_character(&f.db, owner).await.unwrap();
+    let batch = (*bounty_batch.lock().unwrap()).or_else(|| pools.first().map(|pool| pool.batch));
+    if let Some(batch) = batch {
+        assert!(pools.iter().all(|pool| pool.batch == batch), "fixture bounty identity drifted");
+        crate::dao::jobs::cancel(&f.db, &crate::services::bounty::npc::job(batch).id).await.unwrap();
+        crate::dao::npc_bounties::delete_batch(&f.db, batch).await.unwrap();
+    }
     f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id>$2 AND solar_system_id=$3",
         &[&(EventSource::NpcOccurrence as i16), &marker, &system]).await.unwrap();
     f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id=$2",

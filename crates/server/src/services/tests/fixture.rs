@@ -408,17 +408,17 @@ pub(crate) async fn publish_fitting(
 
 /// Hull placement for `create_ship`: docked inserts the supplied station as
 /// the item location; space uses the actor-ready DAO helpers.
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash", feature = "tests-runtime"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-slash", feature = "tests-runtime"))]
 #[derive(Clone, Copy)]
 pub(crate) enum ShipLocation {
     #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-slash"))]
     Docked { station: i64 },
-    #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-runtime"))]
+    #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-runtime"))]
     Space { system: i64 },
 }
 
 /// One carried or fitted item on a shared fixture ship, created in spec order.
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash", feature = "tests-runtime"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-slash", feature = "tests-runtime"))]
 #[derive(Clone, Copy)]
 pub(crate) struct ShipItemSpec<'a> {
     pub type_id: i32,
@@ -430,7 +430,7 @@ pub(crate) struct ShipItemSpec<'a> {
 }
 
 /// Account, character, hull and the created item ids in spec order.
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash", feature = "tests-runtime"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-slash", feature = "tests-runtime"))]
 pub(crate) struct ShipFixture { pub account: i64, pub character: i64, pub ship: i64, pub items: Vec<i64> }
 
 #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash", feature = "tests-runtime"))]
@@ -442,7 +442,7 @@ impl ShipFixture {
 
 /// One transaction: role-0 account and character, then the hull and each spec
 /// item under it with its optional `game.item_attributes` overrides.
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash", feature = "tests-runtime"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-slash", feature = "tests-runtime"))]
 pub(crate) async fn create_ship(db: &Db, ship_type: i32, location: ShipLocation, items: &[ShipItemSpec<'_>]) -> Result<ShipFixture, Error> {
     db.transaction(|tx, _: &mut ()| {
         let items: Vec<(i32, i32, i64, bool, bool, Vec<(i32, f64)>)> = items.iter()
@@ -454,7 +454,7 @@ pub(crate) async fn create_ship(db: &Db, ship_type: i32, location: ShipLocation,
         let ship = match location {
             #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-slash"))]
             ShipLocation::Docked { station } => tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z) VALUES ($1, $2, $3, 0, 1, true, 0, 0, 0) RETURNING item_id", &[&ship_type, &character, &station]).await?.get("item_id"),
-            #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-runtime"))]
+            #[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-runtime"))]
             ShipLocation::Space { system } => {
                 let ship = crate::dao::items::creation::positioned(tx, ship_type, character, system, [0.0; 3]).await?;
                 crate::dao::characters::selection::set_ship(tx, character, ship).await?;
@@ -479,7 +479,7 @@ pub(crate) async fn create_ship(db: &Db, ship_type: i32, location: ShipLocation,
 /// removed at its persisted location, the pilot generation unregistered and
 /// the combat cache forgotten, then one position flush; `None` never loads an
 /// actor. One transaction removes the fixture-owned rows in dependency order.
-#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-slash", feature = "tests-runtime"))]
+#[cfg(any(feature = "tests-effects", feature = "tests-combat", feature = "tests-ships", feature = "tests-content", feature = "tests-slash", feature = "tests-runtime"))]
 pub(crate) async fn cleanup_ship(db: &Db, world: Option<&crate::space::World>, fixture: ShipFixture) -> Result<(), Error> {
     if let Some(world) = world {
         if let Some(system) = db.query_opt("SELECT location_id FROM game.items WHERE item_id = $1", &[&fixture.ship]).await?.map(|row| row.get::<_, i64>("location_id")) {
@@ -513,4 +513,9 @@ pub(crate) async fn cleanup_ship(db: &Db, world: Option<&crate::space::World>, f
         Ok(())
         })
     }, |(), ()| async move { Ok(()) }).await
+}
+
+#[cfg(any(feature = "tests-effects", feature = "tests-space"))]
+pub(crate) fn install_running_mode(module: i64, ship: i64, owner: i64, effect: i64, membership: u64, generation: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    crate::services::combat::state().active_cycles.insert(module, crate::services::combat::ActiveCycle::Running { generation: generation.clone(), owner, ship, effect, membership, start: 0, duration_ms: 1.0, delay_ms: 0, repeat: 1 });
 }

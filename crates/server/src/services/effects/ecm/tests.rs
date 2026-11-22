@@ -2,7 +2,7 @@ use super::*;
 
 mod db_smoke;
 mod fit_db;
-mod module_admission;
+pub(in crate::services::effects) mod module_admission;
 
 #[test]
 fn primary_sensor_keeps_first_tie_and_ignores_invalid_values() {

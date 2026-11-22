@@ -10,6 +10,7 @@ mod replay;
 pub(crate) mod reservation;
 pub(crate) mod scramble;
 
+use crate::npc_security::FrozenMultiplier;
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::lua::events::combat::{CombatEntity, HpLayer, SettlementId};
@@ -23,6 +24,9 @@ use scramble::{CapturedScramble, ScrambleStore};
 pub(crate) struct CombatSource {
     pub actual_actor_character: Option<i64>, pub entity: CombatEntity, pub context: FactContext,
     pub source_is_npc: bool,
+    /// Frozen at attack admission. `None` is an ordinary source with no player
+    /// controller; a player controller always carries `Some`. Not part of source identity.
+    pub npc_security_multiplier: Option<FrozenMultiplier>,
     pub controller_incarnation: Option<[u8; 16]>,
     pub module_id: Option<i64>, pub effect_id: Option<i64>, pub weapon_type_id: Option<i32>,
     pub activation: [u8; 16], pub sequence: u64,

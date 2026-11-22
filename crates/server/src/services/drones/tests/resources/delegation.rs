@@ -21,7 +21,7 @@ async fn catch_scenario<F: Future<Output = Result<()>>>(future: F) -> std::threa
     }).await
 }
 
-async fn lock(f: &mut Fixture, owner: i64, target: i64) -> Result<()> {
+pub(in crate::services) async fn lock(f: &mut Fixture, owner: i64, target: i64) -> Result<()> {
     let args = [Value::Int(target)];
     let kwargs = Value::None;
     let call = Call { service: "dogmaIM", method: "AddTarget", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
@@ -42,7 +42,7 @@ async fn launch(f: &mut Fixture, drone: i64) -> Result<()> {
     Ok(())
 }
 
-async fn command(f: &mut Fixture, name: &str, args: &[Value]) -> Result<()> {
+pub(in crate::services) async fn command(f: &mut Fixture, name: &str, args: &[Value]) -> Result<()> {
     let result = f.call("entity", name, args).await.map_err(call_error)?;
     ensure!(result == Value::Dict(vec![]), "{name} refused: {result:?}");
     Ok(())

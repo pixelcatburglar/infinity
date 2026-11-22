@@ -48,3 +48,15 @@ pub(crate) async fn take_payout(ex: &(impl Executor + ?Sized), ship: i64) -> Res
 pub(crate) async fn uninsure(ex: &(impl Executor + ?Sized), ship: i64, owner: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.insurance WHERE ship_id = $1 AND owner_id = $2", &[&ship, &owner]).await
 }
+
+/// Delete the policies of hulls whose owner just changed and return each
+/// previous holder once. Callers notify; this pays nothing and writes no event.
+pub(crate) async fn void_many(ex: &(impl Executor + ?Sized), ships: &[i64]) -> Result<Vec<i64>, Error> {
+    let rows = ex.query(
+        "DELETE FROM game.insurance WHERE ship_id = ANY($1) RETURNING owner_id", &[&ships],
+    ).await?;
+    let mut owners: Vec<i64> = rows.iter().map(|row| row.get("owner_id")).collect();
+    owners.sort_unstable();
+    owners.dedup();
+    Ok(owners)
+}

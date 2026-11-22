@@ -11,9 +11,11 @@
 //! owner domain (ship, module, charge and ship-bound projection nodes plus
 //! the raw character rows at their watermark) for the cold drone handoff; a
 //! deadline already past inside a package expires at the receiving gate's
-//! captured FILETIME instead of resurrecting until a timer fires.
+//! captured FILETIME instead of resurrecting until a timer fires. The
+//! package also carries the owner's runtime modifier source scalars so a
+//! drone's copied owner domain keeps the ship's live buffs.
 
-use super::{chance_enabled, Fit, Key, Location, Node, EFFECT_CATEGORY_PASSIVE};
+use super::{chance_enabled, runtime::{RuntimeModifierSource, RuntimeReceiverKey}, Fit, Key, Location, Node, EFFECT_CATEGORY_PASSIVE};
 use crate::dao::items::brain::BrainItem;
 use crate::dao::skills::{expert_systems::ExpertSystem as Installation, training::Skill};
 use infinity_core::consts::{dogma::ATTR_SKILL_POINTS, dogma::ATTR_SKILL_TIME_CONSTANT, dogma::EFFECT_SKILL,
@@ -163,6 +165,7 @@ impl Fit {
         let own = Key::Drone(drone);
         self.nodes.retain(|key, node| *key == own
             || matches!(key, Key::Projected(_) if node.receiver == Some(own)));
+        self.retain_runtime_sources(|r| matches!(r, RuntimeReceiverKey::Drone { drone: d, .. } if d == drone));
         self.character = None;
         self.character_at = 0;
         self.charge_incarnations.clear();
@@ -192,6 +195,9 @@ impl Fit {
             character_at: self.character_at,
             nodes,
             projection_revision: self.projection_revision,
+            runtime_sources: self.runtime_modifier_sources().iter().copied()
+                .filter(|s| !matches!(s.receiver, RuntimeReceiverKey::Drone { .. }))
+                .collect(),
         })
     }
 
@@ -210,6 +216,10 @@ impl Fit {
             self.nodes.insert(*key, node.clone());
         }
         self.charge_incarnations.retain(|module, _| self.nodes.contains_key(&Key::Charge(*module)));
+        self.retain_runtime_sources(|r| matches!(r, RuntimeReceiverKey::Drone { .. }));
+        for source in &inputs.runtime_sources {
+            self.replace_runtime_modifier_source(*source);
+        }
         self.ship_id = Some(inputs.ship);
         self.projection_revision = inputs.projection_revision;
         self.character = Some(inputs.character.clone());
@@ -234,20 +244,24 @@ pub(crate) struct OwnerInputs {
     character_at: i64,
     nodes: Vec<(Key, Node)>,
     projection_revision: Option<u64>,
+    /// The owner's Ship/Module/Character receiver scalars at package time.
+    runtime_sources: Vec<RuntimeModifierSource>,
 }
 
 impl OwnerInputs {
     /// The borrowed modifier-source view a receiving fit snapshots before the
-    /// package lands: the raw character domain plus each node's
-    /// `(type_id, charge_type, projected_effect)` descriptor. Nodes and
-    /// topology stay private; which modifiers actually run remains the
-    /// receiving evaluator's call.
+    /// package lands: the raw character domain, each node's
+    /// `(type_id, charge_type, projected_effect)` descriptor, and the owner's
+    /// runtime source scalars. Nodes and topology stay private; which
+    /// modifiers actually run remains the receiving evaluator's call.
     pub(crate) fn notification_sources(&self) -> (
         &CharacterInputs,
         impl Iterator<Item = (i32, Option<i32>, Option<i32>)> + '_,
+        &[RuntimeModifierSource],
     ) {
         (&self.character,
-            self.nodes.iter().map(|(_, node)| (node.type_id, node.charge_type, node.projected_effect)))
+            self.nodes.iter().map(|(_, node)| (node.type_id, node.charge_type, node.projected_effect)),
+            &self.runtime_sources)
     }
 }
 

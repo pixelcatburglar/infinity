@@ -378,15 +378,15 @@ async fn bounty_only_snapshot_is_durable_and_stale_capture_cannot_resurrect() {
     let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     world.system(system_id).await.unwrap();
     // A bounty-only dirty actor still reaches the snapshot writer.
-    world.with(system_id, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(1234).unwrap(), crate::client::filetime_now())).await.unwrap().unwrap();
+    world.with(system_id, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(1234).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), crate::client::filetime_now())).await.unwrap().unwrap();
     world.flush_positions().await.unwrap();
     let rows = crate::dao::npc_bounties::for_character(&db, owner).await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0].system_id, rows[0].kill_count, rows[0].amount), (system_id, 1, crate::isk::IskAmount::from_cents(1234).unwrap()));
+    assert_eq!((rows[0].system_id, rows[0].kill_count, rows[0].legacy_kill_count, rows[0].security_gain, rows[0].amount), (system_id, 1, 0, crate::npc_security::SecurityGain::for_kill(crate::config::game().crimewatch.security_gain_npc_kill, crate::npc_security::FrozenMultiplier::new(1.0).unwrap()), crate::isk::IskAmount::from_cents(1234).unwrap()));
     let job_id = format!("npc-bounty:{}:{}", owner, rows[0].batch.started_at);
     assert_eq!(db.query_one("SELECT kind FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap().get::<_, String>("kind"), "npc.bounty.payout");
     // The same writer covers the next kill; nothing accumulates.
-    world.with(system_id, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(5).unwrap(), crate::client::filetime_now())).await.unwrap().unwrap();
+    world.with(system_id, move |s| s.add_npc_bounty(owner, 42, crate::isk::IskAmount::from_cents(5).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), crate::client::filetime_now())).await.unwrap().unwrap();
     world.flush_positions().await.unwrap();
     assert_eq!(crate::dao::npc_bounties::for_character(&db, owner).await.unwrap()[0].kill_count, 2);
     // A stale writer kept from before the payout must be refused afterward and

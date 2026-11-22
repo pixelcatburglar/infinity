@@ -7,7 +7,7 @@ use crate::services::fit::attributes::tests::ship_fit;
 use crate::sde::types::tests::placement_fixture;
 use crate::space::system::tests::events::{install_projection_sde, publish_scene_prefix};
 use crate::space::{Pilots, System};
-use infinity_core::consts::{GROUP_SUN, GROUP_WRECK};
+use infinity_core::consts::{GROUP_SUN, GROUP_WRECK, dogma::{ATTR_MAX_LOCKED_TARGETS, ATTR_MAX_TARGET_RANGE}};
 
 /// Synthetic placement type carrying a group the fixture marks global.
 const GLOBAL_TARGET_TYPE: i32 = 7;
@@ -38,10 +38,12 @@ fn placed_ball(id: i64, owner: Option<i64>, radius: f32, x: f64) -> Ball {
     ball
 }
 
-/// Install a resident fit whose only distinguishing output is the fitted
-/// max-target range.
-fn install_range(system: &mut System, ship: i64, range: f64) {
-    let fit = ship_fit(&[(ATTR_MAX_TARGET_RANGE, range)]);
+/// Install a resident fit with the fitted max-target range, a positive ship
+/// lock limit and a positive pilot lock limit. Existing cases keep one spare
+/// slot above the one pending attempt; a later patch can lower either limit.
+fn install_limits(system: &mut System, ship: i64, range: f64, ship_limit: f64, pilot_limit: f64) {
+    let mut fit = ship_fit(&[(ATTR_MAX_TARGET_RANGE, range), (ATTR_MAX_LOCKED_TARGETS, ship_limit)]);
+    fit.apply_character_inputs(&pilot_limit_inputs(pilot_limit));
     let stats = ShipStats::from_fit(&fit, Key::Ship);
     system.install_condition(ship, Condition { now: stats.max, stats, shield_at: filetime_now() }, fit);
 }
@@ -82,7 +84,7 @@ fn lock_scene(source_radius: f32, target_radius: f32, center: f64, range: f64, g
     let mut target_ball = placed_ball(target, Some(target_pilot), target_radius, center);
     if let Some((type_id, _)) = global { target_ball.type_id = type_id; target_ball.global = true; }
     system.insert(target_ball);
-    install_range(&mut system, ship, range);
+    install_limits(&mut system, ship, range, 2.0, 2.0);
     let (ui, ui_rx) = channel();
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
     let begun = state().begin_lock(ship, character, target, attempt, system.now_ms(), Some(ui));
@@ -91,18 +93,54 @@ fn lock_scene(source_radius: f32, target_radius: f32, center: f64, range: f64, g
         attempt, _guard: LockGuard { character, ship } }
 }
 
-/// Commit one real fitting patch between the two given resident ranges and
-/// drain the queued actor actions plus the owner's fit notification.
+/// Commit one real fitting patch that keeps the scene's positive ship lock
+/// limit and replaces the resident range, then drain the queued actor actions
+/// plus the owner's fit notification. The pilot limit stays on the character
+/// domain, which a ship fitting patch does not replace.
 fn republish_range(f: &mut LockScene, from: f64, to: f64) {
-    let before = ship_fit(&[(ATTR_MAX_TARGET_RANGE, from)]);
-    let patch = ship_fit(&[(ATTR_MAX_TARGET_RANGE, to)]).into_committed_fitting(&before);
+    publish_ship_limits(f, from, to, 2.0);
+    assert_eq!(f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE)), Some(to));
+}
+
+fn ship_limit_fit(range: f64, ship_limit: f64) -> crate::services::fit::Fit {
+    ship_fit(&[(ATTR_MAX_TARGET_RANGE, range), (ATTR_MAX_LOCKED_TARGETS, ship_limit)])
+}
+
+fn pilot_limit_inputs(pilot_limit: f64) -> crate::services::fit::character::CharacterInputs {
+    crate::services::fit::character::CharacterInputs {
+        at: 1,
+        attributes: Some(vec![(ATTR_MAX_LOCKED_TARGETS, pilot_limit)]),
+        ..Default::default()
+    }
+}
+
+fn publish_ship_limits(f: &mut LockScene, from_range: f64, to_range: f64, ship_limit: f64) {
+    let previous = f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS)).expect("resident ship limit");
+    let candidates = [(from_range != to_range, ATTR_MAX_TARGET_RANGE, from_range, to_range), (previous != ship_limit, ATTR_MAX_LOCKED_TARGETS, previous, ship_limit)];
+    let expected = candidates.into_iter().filter(|row| row.0);
+    let before = ship_limit_fit(from_range, previous);
+    let patch = ship_limit_fit(to_range, ship_limit).into_committed_fitting(&before);
     let generation = f.system.persistent_generation(f.ship).unwrap();
     assert!(f.system.publish_fitting(f.ship, f.character, generation, patch, vec![]));
-    assert_eq!(f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE)), Some(to));
     publish_scene_prefix(&mut f.system, false);
-    while let Ok((event, _)) = f.owner_rx.try_recv() {
-        assert_eq!(event, "OnModuleAttributeChanges");
+    let count = expected.clone().count();
+    if count == 0 {
+        assert!(f.owner_rx.try_recv().is_err(), "unchanged fitting publishes nothing");
+        return;
     }
+    let (event, args) = f.owner_rx.try_recv().expect("one fitting publication");
+    assert_eq!(event, "OnModuleAttributeChanges");
+    let [Value::List(changes)] = args.as_slice() else { panic!("one change list") };
+    assert_eq!(changes.len(), count, "one row per changed attribute");
+    for (_, attribute, old, new) in expected {
+        assert!(changes.iter().any(|change| {
+            let Value::Tuple(row) = change else { return false };
+            row.len() == 8 && row[0] == Value::str("OnModuleAttributeChange") && row[1] == Value::Int(f.character)
+                && row[2] == Value::Int(f.ship) && row[3] == Value::Int(i64::from(attribute)) && row[4].as_int().is_some()
+                && row[5].as_float() == Some(new) && row[6].as_float() == Some(old) && row[7] == Value::None
+        }), "exact changed row");
+    }
+    assert!(f.owner_rx.try_recv().is_err(), "no extra fitting publication");
 }
 
 /// The real admission request: the owner's notify handle and this case's UI channel.
@@ -117,7 +155,7 @@ fn complete(f: &mut LockScene) {
     let request = request(f, None);
     let source = f.system.capture_ball(f.ship).unwrap();
     let target = f.system.capture_ball(f.target).unwrap();
-    super::complete(&mut f.system, request, f.attempt, 5, source, target);
+    super::complete(&mut f.system, request, f.attempt, source, target);
 }
 
 /// Turn the fixture's pending attempt into a completed lock, the precondition
@@ -277,6 +315,40 @@ fn completion_refuses_beyond_surface_range() {
     expect_lock_refusal(&mut f);
 }
 
+/// One lock completes while the limit is 2. The next real admission is still
+/// pending when the ship limit, then the pilot limit, drops to 1. Completion
+/// reads that current limit and refuses. The completed lock stays.
+#[test]
+fn completion_uses_current_ship_and_pilot_limit() {
+    let mut f = lock_scene(10.0, 20.0, 100.0, 200.0, None);
+    let held = f.target;
+    let due = admit(&mut f);
+    f.system.tick(due);
+    expect_add(&mut f);
+    let second = f.ship + 20;
+    f.system.insert(placed_ball(second, Some(f.target_pilot), 20.0, 100.0));
+    f.target = second;
+    let due = admit(&mut f);
+    publish_ship_limits(&mut f, 200.0, 200.0, 1.0);
+    f.system.tick(due);
+    expect_lock_refusal(&mut f);
+    assert!(has_target(f.character, held), "a tightened ship limit does not evict the completed lock");
+    publish_ship_limits(&mut f, 200.0, 200.0, 5.0);
+    assert_eq!(f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS)), Some(5.0));
+    assert_eq!(f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS)), Some(2.0));
+    let due = admit(&mut f);
+    let generation = f.system.persistent_generation(f.ship).unwrap();
+    assert!(f.system.publish_character_inputs(f.ship, f.character, generation, &pilot_limit_inputs(1.0)));
+    publish_scene_prefix(&mut f.system, false);
+    assert_eq!(f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS)), Some(5.0));
+    assert_eq!(f.system.with_combat_fit(f.ship, |fit, _, _| fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS)), Some(1.0));
+    assert!(f.owner_rx.try_recv().is_err(), "character limit publishes no ship row");
+    f.system.tick(due);
+    expect_lock_refusal(&mut f);
+    assert!(has_target(f.character, held), "a tightened pilot limit does not evict the completed lock");
+    f.target = held;
+}
+
 #[test]
 fn admission_refuses_target_outside_scene() {
     let mut f = lock_scene(10.0, 20.0, 100_000_000.0, 200_000_000.0, None);
@@ -336,7 +408,7 @@ fn admitted_lock_completes_on_schedule_then_drops_after_shrink() {
 fn pending_attempt_dies_when_its_admission_world_changes() {
     fenced(130.0, 200.0, |f| {
         f.system.insert(placed_ball(f.ship, Some(f.character), 10.0, 0.0));
-        install_range(&mut f.system, f.ship, 200.0);
+        install_limits(&mut f.system, f.ship, 200.0, 5.0, 5.0);
     });
     fenced(130.0, 200.0, |f| {
         f.system.insert(placed_ball(f.target, Some(f.target_pilot), 20.0, 130.0));
@@ -507,3 +579,20 @@ fn internal_successor_adopted_by_ui_keeps_its_attempt() {
     assert!(f.ui_rx.try_recv().is_err());
     assert_eq!(state().locking[&(f.character, f.target)].attempt, attempt);
 }
+
+#[test]
+fn reserved_transition_refuses_completion_and_a_missing_record_does_not() {
+    let mut reserved = lock_scene(10.0, 20.0, 50.0, 200.0, None);
+    install_limits(&mut reserved.system, reserved.target, 200.0, 5.0, 5.0);
+    let due = admit(&mut reserved);
+    let transition = reserved.system.begin_condition_transitions(&[reserved.target]).expect("target transition");
+    reserved.system.tick(due);
+    expect_lock_refusal(&mut reserved);
+    drop(transition);
+    let mut open = lock_scene(10.0, 20.0, 50.0, 200.0, None);
+    let due = admit(&mut open);
+    assert!(open.system.combat_phase(open.target).is_none());
+    open.system.tick(due);
+    expect_add(&mut open);
+}
+

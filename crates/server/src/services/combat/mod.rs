@@ -71,7 +71,7 @@ use crate::db::executor::Executor;
 use crate::db::outbox::Outbox;
 use infinity_core::messages;
 use crate::sde::Sde;
-use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
+use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
 use crate::space::combat::ActorConditionSnapshot;
 use marshal::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -109,9 +109,10 @@ pub(super) struct ActiveModule {
     pub(super) forced_inactive: bool,
 }
 
-/// Runtime record of one duration-bounded module activation, keyed by module
-/// item ID. `services::effects::active_cycle` owns the transitions; the records
-/// are memory-only and are cleared on server restart.
+/// Runtime record of one tracked module activation, keyed by module item
+/// ID: the duration-bounded consumers and the ship modes.
+/// `services::effects::active_cycle` owns the transitions; the records are
+/// memory-only and are cleared on server restart.
 pub(super) enum ActiveCycle {
     /// Registered activation not yet accepted by its actor; carries no bonus,
     /// effect animation or cooldown.
@@ -120,6 +121,8 @@ pub(super) enum ActiveCycle {
         generation: Arc<AtomicBool>,
         /// The hull the module is fitted on.
         ship: i64,
+        /// The SDE effect ID the activation registered.
+        effect: i64,
     },
     /// Accepted activation applying its module modifier until the nominal end.
     Running {
@@ -131,6 +134,9 @@ pub(super) enum ActiveCycle {
         ship: i64,
         /// The SDE effect ID the activation runs.
         effect: i64,
+        /// The hull's combat membership generation bound at acceptance; the
+        /// shared terminal applies only to this original incarnation.
+        membership: u64,
         /// Actor time in milliseconds when the activation was accepted; the
         /// effect's interval is [start, start + duration).
         start: i64,
@@ -256,6 +262,7 @@ pub fn reset(c: &Client) {
 }
 
 pub(crate) fn reset_pilot(world: &crate::space::World, char_id: i64, space_ship: Option<(i64, i64)>) {
+    super::effects::heat::paste::settle_character(world, char_id);
     super::effects::heat::clear_character(char_id);
     clear_character_locks(world, char_id);
     state().reset_character(char_id);

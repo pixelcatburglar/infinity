@@ -547,7 +547,9 @@ Fleet location queries include online, visible fleet members in the caller's cur
 | ship | StoreVessel | handled | `crates/server/src/services/ship/stored.rs` |
 | ship | BoardStoredShip | handled | `crates/server/src/services/ship/stored.rs` |
 | ship | LaunchFromContainer | handled | `crates/server/src/services/ship/stored.rs` |
+| ship | Eject | handled | `crates/server/src/services/ship/eject.rs` |
 | ship | AssembleShip | handled | `crates/server/src/services/fitting/ship.rs` |
+| shipStanceMgr | SetShipStance | handled | `crates/server/src/services/ship_stance_mgr.rs` |
 | dogmaIM | CreateNewbieShip, CreateNewbieBonusItems | handled | `crates/server/src/services/fitting/newbie.rs` |
 | ship | CheckEnoughSubSystemToUndock | fixed | `crates/server/src/services/ship/ship.rs` |
 | ship | GetDirtTimestamp, ResetDirtTimestamp | handled | `crates/server/src/services/ship/cleaning.rs` |
@@ -562,13 +564,21 @@ Fleet location queries include online, visible fleet members in the caller's cur
 
 The rookie ship request boards a newly created racial rookie ship when the current ship is not already a rookie ship, preserving the previous hull and its contents. Independently, the bonus request grants the six entries of the server-selected racial rookie fit once per character as loose items in the current NPC station hangar. Both use the same embedded catalogue as character provisioning, refuse structure and in-space requests, and return `None` after commit. Actual-client button and hangar-refresh behavior is NOT VERIFIED.
 
+`SetShipStance` takes exactly a positive ship ID and a positive stance key and
+answers `None`, which the client ignores. The caller must be the owner of an
+assembled stance-capable hull docked in its station hangar or piloting it in
+the current system; the hidden mode item and its switch state are covered in
+[Effects](effects.md#ship-stances). A different stance is refused while the
+persisted cooldown deadline has not been reached, and selecting the current
+stance is a successful no-op.
+
 The dirt RPCs take exactly one positive ship ID and require the current location binding. Reads initialize a persistent timestamp for a local physical hull, including visible foreign hulls in space without a fleet or corporation affiliation. Reset applies to an owned singleton ship in the current NPC station hangar, active or inactive, or the current piloted ship in space, and returns the committed FILETIME as a Python long. When the reset hull is live in a loaded system, the commit is followed by the existing `OnSlimItemChange` slim update rather than a dedicated cleaning event; a hull whose incarnation changed after commit keeps the stored timestamp and recovers on its next real load. This describes the service protocol; the real client clean-button UI has not been verified.
 
 The kill-counter call is unbound: the client issues it without a location moniker. It takes exactly one positive ship ID and answers with the hull's real persisted player-kill count as an integer. A caller reads the real count only for a hull its selected character owns, wherever that hull currently rests, or for a foreign hull the shared configuration visibility check authorizes. Every other well-formed query (a foreign hull outside that visibility, a non-ship, a packaged or a missing item) answers `0` rather than a refusal, and only a malformed argument shape is an error. The read never creates a row and grants no GM reach; the GM `/killmark` command is the global view. The stored and returned value is exact; the client's hangar model clamps its own display at 999.
 
 `ConfigureShip` accepts a dictionary patch of the four boolean keys `FleetHangar_AllowFleetAccess`, `FleetHangar_AllowCorpAccess`, `SMB_AllowFleetAccess` and `SMB_AllowCorpAccess` for the account's currently selected owned ship. It requires the current location-bound ship moniker, in station or space; an unknown key or non-boolean value refuses the entire patch. Settings are owner-bound, default to false and do not carry a previous owner's grants to a new owner. `GetShipConfiguration(shipID)` returns all four keys for an owned ship in the current station hangar or a visible owned ship in space, and for a currently fleet- or corporation-affiliated observer of a visible ship in space. This metadata is available before any switch grants bay contents and without an operational-range check. Foreign docked, unaffiliated or invisible ships are refused. The client's 15-second metadata cache is not an authorization grant.
 
-In space the ship service binds to `(system, GROUP_SOLAR_SYSTEM)`; station configuration uses the current station binding. `StoreVessel(hostID)`, `BoardStoredShip(hostID, shipID)` and `LaunchFromContainer(hostID, itemID)` use current maintenance-bay access and the ship transitions described in [Features](features.md). Store and board return the server's existing ship-state shape; launch returns an empty mutator result. These are server choices, not captured retail response shapes: client wrappers ignore the results. Fleet hangar and maintenance bay opening uses local client wrappers and bound inventory calls, not separate `Open*` remote methods. These checks concern ship and shared-inventory operations, not blanket authorization for other services.
+In space the ship service binds to `(system, GROUP_SOLAR_SYSTEM)`; station configuration uses the current station binding. `StoreVessel(hostID)`, `BoardStoredShip(hostID, shipID)` and `LaunchFromContainer(hostID, itemID)` use current maintenance-bay access and the ship transitions described in [Features](features.md). Store and board return the server's existing ship-state shape; launch returns an empty mutator result. `Eject()` returns the same ship-state shape; the client ignores it. These are server choices, not captured retail response shapes: client wrappers ignore the results. Fleet hangar and maintenance bay opening uses local client wrappers and bound inventory calls, not separate `Open*` remote methods. These checks concern ship and shared-inventory operations, not blanket authorization for other services.
 
 After actor restoration, recovery preserves normal motion of the old unpiloted hull while fencing persistent membership, type, owner and the absence of a pilot.
 

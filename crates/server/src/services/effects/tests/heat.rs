@@ -4,6 +4,7 @@ use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipItemSpec, S
 mod cleanup;
 mod banks;
 mod skills;
+mod paste;
 use infinity_core::{
     consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CPU, dogma::ATTR_CPU_OUTPUT,
         dogma::ATTR_HI_SLOTS, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_LOW_SLOTS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MED_SLOTS,

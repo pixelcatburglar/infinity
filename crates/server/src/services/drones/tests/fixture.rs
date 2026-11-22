@@ -122,11 +122,23 @@ impl Fixture {
     pub(crate) async fn real_system() -> Self {
         Self::create(true, &[]).await
     }
+    #[cfg(feature = "tests-effects")]
+    pub(in crate::services) async fn with_database_config(config: crate::config::deployment::DatabaseConfig) -> Self {
+        crate::tests::init_config();
+        Self::create_with_database(false, &[], config).await
+    }
+
 
     #[cfg(any(feature = "tests-combat", feature = "tests-social", feature = "tests-economy", feature = "tests-effects", feature = "tests-ships", feature = "tests-space", feature = "tests-slash", feature = "tests-services"))]
     async fn create(real_system: bool, required_hold_attributes: &[i32]) -> Self {
         crate::tests::init_config();
-        let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+        let config = crate::config::tests::test_database();
+        Self::create_with_database(real_system, required_hold_attributes, config).await
+    }
+
+    #[cfg(any(feature = "tests-combat", feature = "tests-social", feature = "tests-economy", feature = "tests-effects", feature = "tests-ships", feature = "tests-space", feature = "tests-slash", feature = "tests-services"))]
+    async fn create_with_database(real_system: bool, required_hold_attributes: &[i32], config: crate::config::deployment::DatabaseConfig) -> Self {
+        let db = Db::connect(&config).await.unwrap();
         let sde = Arc::new(Sde::load(&db).await.unwrap());
         let home = sde.map.stations().find(|s| s.solar_system_id.is_some() && s.constellation_id.is_some() && s.region_id.is_some()).unwrap().station_id;
         // Startup can rewind identity sequences past deleted characters whose journal rows remain.

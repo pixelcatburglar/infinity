@@ -6,6 +6,7 @@
 use infinity_core::consts::FLAG_HANGAR;
 use crate::db::{self, executor::Executor};
 
+pub(crate) mod ownership;
 /// Lock and validate the account's selected, assembled in-space hull.
 pub(crate) async fn guard_current(ex: &(impl Executor + ?Sized), character: i64, user: i64, old: i64, system: i64, old_type: i32) -> Result<bool, db::Error> {
     if ex.query_opt("SELECT character_id FROM game.characters WHERE character_id=$1 AND user_id=$2 AND ship_id=$3 AND NOT deleted AND station_id IS NULL AND solar_system_id=$4 FOR UPDATE", &[&character, &user, &old, &system]).await?.is_none() { return Ok(false); }
@@ -31,12 +32,18 @@ pub(crate) async fn unselected(ex: &(impl Executor + ?Sized), ship: i64) -> Resu
 
 
 /// Captured facts required to distinguish a committed stored-hull transition.
-#[derive(Clone, Copy)]
+/// `Board.ownership` is `None` for an already-owned hull; a foreign take carries
+/// the immutable source and the attempt's exact postimage.
+#[derive(Clone)]
 pub(crate) enum RecoveryPlan {
-    Board { character: i64, user: i64, system: i64, old: i64, old_type: i32, target: i64, target_type: i32 },
+    Board { character: i64, user: i64, system: i64, old: i64, old_type: i32, target: i64, target_type: i32,
+        ownership: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<ownership::BoardOwnershipProof>>>>> },
     Store { character: i64, user: i64, system: i64, old: i64, old_type: i32, host: i64 },
     BoardStored { character: i64, user: i64, system: i64, old: i64, old_type: i32,
         host: i64, target: i64, target_type: i32, prior_owner: i64 },
+    /// Voluntary eject: the old hull stays in space and the target is a new
+    /// capsule whose id only exists once the transaction has committed.
+    Eject { character: i64, user: i64, system: i64, old: i64, old_type: i32 },
 }
 
 pub(crate) enum Recovery {
@@ -47,13 +54,22 @@ pub(crate) enum Recovery {
 
 /// Resolve commit or rollback from one database snapshot; ambiguous facts remain unknown.
 pub(crate) async fn recovery(ex: &(impl Executor + ?Sized), plan: &RecoveryPlan) -> Result<Recovery, db::Error> {
-    let (character, user, system, old, old_type, host, target, target_type, prior_owner, store, ordinary) = match *plan {
-        RecoveryPlan::Board { character, user, system, old, old_type, target, target_type } =>
-            (character, user, system, old, old_type, system, Some(target), target_type, character, false, true),
+    let sealed = match plan {
+        RecoveryPlan::Board { ownership: Some(slot), .. } => match slot.lock().unwrap_or_else(|poison| poison.into_inner()).clone() {
+            Some(proof) => Some(proof),
+            None => return Ok(Recovery::Unknown),
+        },
+        _ => None,
+    };
+    let (character, user, system, old, old_type, host, target, target_type, prior_owner, store, ordinary, fresh_target) = match plan {
+        RecoveryPlan::Board { character, user, system, old, old_type, target, target_type, .. } =>
+            (*character, *user, *system, *old, *old_type, *system, Some(*target), *target_type, *character, false, true, false),
         RecoveryPlan::Store { character, user, system, old, old_type, host } =>
-            (character, user, system, old, old_type, host, None, infinity_core::consts::TYPE_CAPSULE, character, true, false),
+            (*character, *user, *system, *old, *old_type, *host, None, infinity_core::consts::TYPE_CAPSULE, *character, true, false, true),
         RecoveryPlan::BoardStored { character, user, system, old, old_type, host, target, target_type, prior_owner } =>
-            (character, user, system, old, old_type, host, Some(target), target_type, prior_owner, false, false),
+            (*character, *user, *system, *old, *old_type, *host, Some(*target), *target_type, *prior_owner, false, false, false),
+        RecoveryPlan::Eject { character, user, system, old, old_type } =>
+            (*character, *user, *system, *old, *old_type, *system, None, infinity_core::consts::TYPE_CAPSULE, *character, false, false, true),
     };
     let flag = infinity_core::consts::FLAG_SHIP_HANGAR;
     let row = ex.query_opt("SELECT ch.ship_id AS selected, ch.corporation_id,
@@ -82,7 +98,10 @@ pub(crate) async fn recovery(ex: &(impl Executor + ?Sized), plan: &RecoveryPlan)
     let target_free: bool = row.get("target_free");
     let old_free: bool = row.get("old_free");
     let target_exclusive: bool = row.get("target_exclusive");
-    if old_free && target_exclusive && target_space && selected.is_some() && (store || selected == target) && (if store { old_stored } else { old_space }) {
+    if old_free && target_exclusive && target_space && selected.is_some() && (fresh_target || selected == target) && (if store { old_stored } else { old_space }) {
+        if let (Some(proof), Some(target_id)) = (sealed.as_ref(), target) {
+            if !proof.committed(ex, character, target_id).await? { return Ok(Recovery::Unknown); }
+        }
         let corporation_id = row.get("corporation_id");
         let alliance_id = row.get("alliance_id");
         let target = super::space_ships::FreeShip {
@@ -95,8 +114,16 @@ pub(crate) async fn recovery(ex: &(impl Executor + ?Sized), plan: &RecoveryPlan)
         }) };
         return Ok(Recovery::Committed { target, old });
     }
-    // Another character selecting the still-stored target can itself cause the refusal.
-    if selected == Some(old) && old_space && (store || if ordinary { target_space && target_free } else { target_stored }) { return Ok(Recovery::Aborted); }
+    if selected == Some(old) && old_space && (fresh_target || if ordinary { target_space && target_free } else { target_stored }) {
+        if let Some(proof) = sealed.as_ref() {
+            if !proof.aborted(ex).await? { return Ok(Recovery::Unknown); }
+        }
+        return Ok(Recovery::Aborted);
+    }
+    // The old hull must still be the selected in-space ship; an unrelated selection is unknown.
+    if let Some(proof) = sealed.as_ref() {
+        if selected == Some(old) && old_space && target_free && proof.aborted(ex).await? { return Ok(Recovery::Aborted); }
+    }
     Ok(Recovery::Unknown)
 }
 

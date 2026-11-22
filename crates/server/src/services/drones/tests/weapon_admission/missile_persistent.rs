@@ -102,14 +102,14 @@ async fn scenario(fault: bool) -> Result<()> {
         let missile = Missile { charge: weapon, raw: [1.0, 0.0, 0.0, 0.0],
             aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(), aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(),
             drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: 25.0, flight_time_ms: 20_000.0,
-            weapon, illegal: false };
+            weapon, illegal: false, dot: None };
         let cold_world = crate::space::World::new(f.db.clone(), f.sde.clone(), 1);
         let cold_missile = Missile { charge: weapon, raw: [1.0, 0.0, 0.0, 0.0],
             aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(), aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(),
             drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: 25.0, flight_time_ms: 20_000.0,
-            weapon, illegal: false };
+            weapon, illegal: false, dot: None };
         let cold_attempt = admitted(&f, guard, source, from.type_id).await?;
-        tokio::time::timeout(Duration::from_secs(15), weapons::launch_missile(f.db.clone(), cold_world, f.system, from.clone(), target.clone(), f.owner, None, cold_missile, Some(guard), cold_attempt))
+        tokio::time::timeout(Duration::from_secs(15), weapons::missile::launch_missile(f.db.clone(), cold_world, f.system, from.clone(), target.clone(), f.owner, None, cold_missile, Some(guard), cold_attempt))
             .await.map_err(|_| anyhow!("non-market cold missile admission timed out"))?.map_err(|error| anyhow!("cold missile admission: {error:?}"))?;
         let source_type = from.type_id;
         let prehit = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship)).await.flatten()
@@ -117,7 +117,7 @@ async fn scenario(fault: bool) -> Result<()> {
         let original_ship = f.world.ball(f.system, f.ship).await.ok_or_else(|| anyhow!("missing original ship"))?;
         let before = f.world.with(f.system, |s| s.balls().count()).await.ok_or_else(|| anyhow!("actor stopped"))?;
         let attempt = admitted(&f, guard, source, from.type_id).await?;
-        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, missile, Some(guard), attempt).await.ok().ok_or_else(|| anyhow!("launch failed"))?;
+        weapons::missile::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, missile, Some(guard), attempt).await.ok().ok_or_else(|| anyhow!("launch failed"))?;
         ensure!(f.world.with(f.system, |s| s.balls().count()).await == Some(before + 1), "missile was not scheduled");
         if fault {
             ensure!(crate::services::crimewatch::security_status(&f.db, f.owner).await.ok() == Some(security_before), "security update did not fail");
@@ -165,7 +165,7 @@ async fn scenario(fault: bool) -> Result<()> {
         f.world.register_pilot(victim, tx);
         let zero = Missile { charge: weapon, raw: [0.0; 4], aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(),
             aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(), drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(),
-            velocity: 1_000_000.0, flight_time_ms: 5_000.0, weapon: from.type_id, illegal: false };
+            velocity: 1_000_000.0, flight_time_ms: 5_000.0, weapon: from.type_id, illegal: false, dot: None };
         let weak = std::sync::Arc::downgrade(&f.world);
         let system = f.system;
         let facts = f.world.with(system, move |s| {
@@ -174,7 +174,7 @@ async fn scenario(fault: bool) -> Result<()> {
                 generation, 1, 1, |_| true)
         }).await.ok_or_else(|| anyhow!("actor stopped"))?.map_err(|error| anyhow!("replacement source: {error:?}"))?;
         let attempt = crate::services::effects::space_source::PreparedCombatAttempt::new(facts, weak, system);
-        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from.clone(), target.clone(), f.owner, None, zero, None, attempt).await.ok().ok_or_else(|| anyhow!("zero missile launch failed"))?;
+        weapons::missile::launch_missile(f.db.clone(), f.world.clone(), f.system, from.clone(), target.clone(), f.owner, None, zero, None, attempt).await.ok().ok_or_else(|| anyhow!("zero missile launch failed"))?;
         tokio::time::timeout(Duration::from_secs(35), async {
             loop {
                 while let Ok((event, args)) = rx.try_recv() {
@@ -189,14 +189,14 @@ async fn scenario(fault: bool) -> Result<()> {
         // A launcher removed before contact cancels the flight entirely.
         let hot = Missile { charge: weapon, raw: [1.0, 0.0, 0.0, 0.0], aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(),
             aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(), drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(),
-            velocity: 1_000_000.0, flight_time_ms: 5_000.0, weapon: from.type_id, illegal: false };
+            velocity: 1_000_000.0, flight_time_ms: 5_000.0, weapon: from.type_id, illegal: false, dot: None };
         let facts = f.world.with(system, move |s| {
             let generation = s.combat_membership_generation(replacement).unwrap();
             s.prepare_combat_source(replacement, None, None, None, crate::lua::events::resources::FactOrigin::Natural,
                 generation, 2, 1, |_| true)
         }).await.ok_or_else(|| anyhow!("actor stopped"))?.map_err(|error| anyhow!("removal source: {error:?}"))?;
         let attempt = crate::services::effects::space_source::PreparedCombatAttempt::new(facts, std::sync::Arc::downgrade(&f.world), system);
-        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, hot, None, attempt).await.ok().ok_or_else(|| anyhow!("removal missile launch failed"))?;
+        weapons::missile::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, hot, None, attempt).await.ok().ok_or_else(|| anyhow!("removal missile launch failed"))?;
         f.world.remove_ball(f.system, replacement).await;
         ensure!(f.world.after(f.system, 6_000).await, "actor stopped awaiting expiry");
         let after_removal = f.world.with(f.system, move |s| s.combat_condition_snapshot(victim_ship).map(|v| v.contributions)).await.flatten().ok_or_else(|| anyhow!("missing victim condition"))?;

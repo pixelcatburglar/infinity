@@ -1,10 +1,13 @@
 //! Fenced publication and settlement of committed ship transitions.
-//! Client ship boarding and stored-vessel operations use actor-owned condition
+//! Client ship boarding, stored-vessel and voluntary eject operations use actor-owned condition
 //! snapshots and game item rows; no independent condition state is maintained.
 //! Restored old hull identity uses persistent membership, type and owner, not mutable motion.
 //! Membership removals retain their original observer boundary during boarding;
 //! the ego handoff then rides the scene delta as a directed transfer, so the
 //! rebound observer loses the old incarnation and gains the new one in order.
+//! A hull retained in space keeps the position and velocity sampled together
+//! at admission and decelerates through ordinary evolution; the committed
+//! boundary records the shared ship-change deadline frozen at admission.
 
 use super::*;
 use crate::space::combat::{ActorConditionSnapshot, CombatPhase};
@@ -170,9 +173,12 @@ impl System {
                 CommittedOld::Stored { id, token, .. } => { self.commit_combat_transition(id, token); }
                 CommittedOld::Restored { .. } | CommittedOld::StoredFresh { .. } => {}
                 CommittedOld::Retained { snapshot_ball, mut prepared, state, .. } => {
+                    // The outgoing hull keeps the position and velocity sampled
+                    // together at admission: STOP removes propulsion intent and
+                    // ordinary evolution decelerates it.
                     prepared.ball.pos = snapshot_ball.pos;
+                    prepared.ball.vel = snapshot_ball.vel;
                     prepared.ball.stop();
-                    prepared.ball.vel = [0.0; 3];
                     clear_committed_loaded(self, snapshot_ball.id);
                     if !prepared.install_transfer(self, |s, ball| s.add_persistent_ship(ball), state) { return false; }
                 }
@@ -210,6 +216,13 @@ struct BoardSettlement {
     character: i64,
     client: i64,
     expected: OnlineSession,
+    /// The ship-change deadline frozen at this change's admission; committed
+    /// retries and recovery record exactly this value, never a recomputed one.
+    ready_at: i64,
+    /// Sampled outgoing hull from the admitting transaction. Same-process
+    /// recovery rebuilds the prepared ball and copies this position and
+    /// velocity onto it; a restarted process has no sample.
+    retained: Mutex<Option<Ball>>,
     plan: RecoveryPlan,
     entries: Vec<(u64, ActorConditionSnapshot)>,
     facts: Option<Arc<crate::space::snapshot::FactCheckpoint>>,
@@ -219,6 +232,14 @@ struct BoardSettlement {
 }
 
 impl BoardSettlement {
+    /// Record the deadline frozen at admission. The admitting dispatch calls
+    /// this as its first act, and that dispatch runs only after COMMIT.
+    fn record_deadline(&self) {
+        if let Some(world) = self.world.upgrade() {
+            world.commit_ship_change(self.character, self.expected.session_id, self.ready_at);
+        }
+    }
+
     fn finish(&self, result: Result<Option<i64>, &'static str>) -> bool {
         if let Some((sender, original)) = crate::poison::lock_or_exit(self.receipt.lock()).take() {
             let result = result.map_err(|message| original.unwrap_or_else(|| CallError::Internal(anyhow::anyhow!(message))));
@@ -323,36 +344,46 @@ impl BoardSettlement {
             return false;
         }
         let old = match self.plan {
-            RecoveryPlan::Board { old, .. } | RecoveryPlan::Store { old, .. } | RecoveryPlan::BoardStored { old, .. } => old,
+            RecoveryPlan::Board { old, .. } | RecoveryPlan::Store { old, .. } | RecoveryPlan::BoardStored { old, .. } | RecoveryPlan::Eject { old, .. } => old,
         };
         let roots = match self.plan {
             RecoveryPlan::Board { old, target, .. } => vec![old, target],
             RecoveryPlan::Store { old, host, .. } => vec![old, host],
             RecoveryPlan::BoardStored { old, host, target, .. } => vec![old, host, target],
+            RecoveryPlan::Eject { old, .. } => vec![old],
         };
         let character = self.character;
-        let plan = self.plan;
+        let plan = self.plan.clone();
         let facts = self.facts.clone();
         let sde = self.sde.clone();
         let read = self.db.transaction(|tx, _: &mut ()| {
             let roots = roots.clone();
+            let plan = plan.clone();
             let facts = facts.clone();
             let sde = sde.clone();
             Box::pin(async move {
                 use crate::dao::items::{deliveries, inventory, parent_locks::{LockRequest, LockStrength}};
                 use crate::services::{db_err, inventory::destination::{lock_items, parent_requests}};
                 crate::dao::characters::selection::lock_character(tx, character).await.map_err(db_err)?;
-                let selected = if matches!(plan, RecoveryPlan::Store { .. }) {
+                let selected = if matches!(plan, RecoveryPlan::Store { .. } | RecoveryPlan::Eject { .. }) {
                     crate::dao::characters::selection::ship_id(tx, character).await.map_err(db_err)?
                 } else { None };
                 let lineages = deliveries::ancestry_many(tx, &roots).await.map_err(db_err)?;
                 let closure = inventory::descendants(tx, &roots).await.map_err(db_err)?;
                 let mut requests: Vec<_> = closure.iter().copied().chain(selected)
                     .map(|item_id| LockRequest { item_id, strength: LockStrength::Update }).collect();
+                let mut optional = Vec::new();
+                if let RecoveryPlan::Board { ownership: Some(slot), .. } = &plan {
+                    if let Some(proof) = slot.lock().unwrap_or_else(|poison| poison.into_inner()).clone() {
+                        optional = proof.created_ids().to_vec();
+                        requests.extend(proof.evidence_ids().into_iter()
+                            .map(|item_id| LockRequest { item_id, strength: LockStrength::Update }));
+                    }
+                }
                 requests.extend(parent_requests(&sde,
                     lineages.iter().map(|row| (row.ancestor.item_id, row.ancestor.type_id)),
                     LockStrength::Update, LockStrength::Share)?);
-                let locks = lock_items(tx, &sde, &requests, &[]).await?;
+                let locks = lock_items(tx, &sde, &requests, &optional).await?;
                 if inventory::descendants(tx, &roots).await.map_err(db_err)? != closure
                     || deliveries::ancestry_many(tx, &roots).await.map_err(db_err)? != lineages {
                     return Err(CallError::Internal(anyhow::anyhow!("stale ship transition recovery")));
@@ -360,7 +391,7 @@ impl BoardSettlement {
                 let outcome = boarding::recovery(tx, &plan).await.map_err(db_err)?;
                 if let Recovery::Committed { target, old } = &outcome {
                     if locks.row(target.item_id).is_none() || old.as_ref().is_some_and(|row| locks.row(row.item_id).is_none())
-                        || (matches!(plan, RecoveryPlan::Store { .. }) && selected != Some(target.item_id)) {
+                        || (matches!(plan, RecoveryPlan::Store { .. } | RecoveryPlan::Eject { .. }) && selected != Some(target.item_id)) {
                         return Err(CallError::Internal(anyhow::anyhow!("unlocked ship transition recovery")));
                     }
                 }
@@ -387,6 +418,10 @@ impl BoardSettlement {
             }
         }
         if let Recovery::Committed { target: ref target_row, old: ref old_row } = outcome {
+            // A proven commit records its frozen deadline before publication.
+            // A later publish or receipt failure cannot reopen or recompute it,
+            // and a stale session writes nothing.
+            world.commit_ship_change(self.character, self.expected.session_id, self.ready_at);
             let target_id = target_row.item_id;
             if world.online_session(self.character).as_ref() != Some(&self.expected) {
                 if self.retire_stale(world, old, old_row.as_ref()).await {
@@ -403,8 +438,15 @@ impl BoardSettlement {
                     && s.combat_phase(id) == Some(CombatPhase::Transition { token }))).await.unwrap_or(false);
             let Ok(target) = balls::piloted(&self.db, self.sde.clone(), target_row, self.character, security).await else { return false };
             let transition = if reserved {
+                let retained = crate::poison::lock_or_exit(self.retained.lock()).clone();
                 let old_prepared = if matches!(self.plan, RecoveryPlan::Store { .. }) {
                     Some(PreparedOld::Stored { id: old })
+                } else if let Some(retained) = retained {
+                    let Some(row) = old_row.as_ref() else { return false };
+                    let Ok(mut prepared) = balls::unpiloted(&self.db, self.sde.clone(), row).await else { return false };
+                    prepared.ball.pos = retained.pos;
+                    prepared.ball.vel = retained.vel;
+                    Some(PreparedOld::Retained { snapshot_ball: retained, prepared })
                 } else {
                     let Some(row) = old_row.as_ref() else { return false };
                     let Ok(prepared) = balls::unpiloted(&self.db, self.sde.clone(), row).await else { return false };
@@ -460,7 +502,7 @@ impl BoardSettlement {
 
 pub(crate) async fn settle_space<F>(
     world: Arc<World>, db: Db, sde: Arc<crate::sde::Sde>, system: i64, character: i64, client: i64,
-    expected: OnlineSession, transition: CombatTransition,
+    expected: OnlineSession, ready_at: i64, transition: CombatTransition,
     market: crate::services::market::economy_lock::Guard, gate: tokio::sync::OwnedMutexGuard<()>,
     admission: crate::space::containment::ActorAdmission,
     plan: RecoveryPlan, operation: F,
@@ -482,7 +524,7 @@ where
     }).collect();
     let settlement = Arc::new(BoardSettlement {
         world: Arc::downgrade(&world), db: db.clone(), sde, system, character, client,
-        expected, plan, entries, facts: transition.facts.clone(), actor_gate, admission, receipt: Mutex::new(Some((sender, None))),
+        expected, ready_at, retained: Mutex::new(None), plan, entries, facts: transition.facts.clone(), actor_gate, admission, receipt: Mutex::new(Some((sender, None))),
     });
     let submit_world = world.clone();
     let submitted = world.with(system, move |s| s.defer_condition_transition(transition, move |mut transition| async move {
@@ -509,8 +551,12 @@ where
                 let states = states.clone();
                 let operation = operation.clone();
                 let facts = settlement.facts.clone();
+                let retained = Arc::clone(&settlement);
                 Box::pin(async move {
                     let (prepared, written) = operation(tx, outbox, &states, facts.as_deref()).await?;
+                    if let Some(PreparedOld::Retained { snapshot_ball, .. }) = &prepared.old {
+                        *crate::poison::lock_or_exit(retained.retained.lock()) = Some(snapshot_ball.clone());
+                    }
                     if states.iter().any(|state| state.revision != state.saved_revision && !written.contains(&state.item_id)) {
                         return Err(CallError::Internal(anyhow::anyhow!("ship condition was not checkpointed")));
                     }
@@ -521,6 +567,7 @@ where
                 let world = &submit_world;
                 let settlement = &settlement;
                 async move {
+                    settlement.record_deadline();
                     let target = prepared.target.id;
                     let transition = prepared.committed(&settlement.entries, character, Some(settlement.expected.clone()), &written, settlement.actor_gate.clone())
                         .map_err(CallError::Internal)?;

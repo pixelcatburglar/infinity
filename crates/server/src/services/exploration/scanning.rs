@@ -10,6 +10,8 @@
 //! Probe recovery admits only a pilot in space aboard the current non-capsule
 //! ship and returns only that pilot's unexpired probes in the current system;
 //! distance to the probes is not checked.
+//! ConeScan caps the requested range by the ship's effective directional scan
+//! range (client directionalScanUtil.py).
 
 use super::*;
 
@@ -145,16 +147,6 @@ pub(super) async fn broadcast_sites(world: &World, system: i64, added: &[Site], 
 
 // ---------------------------------------------------------------- probes
 
-/// A pilot's probe strength (baseSensorStrength with the Astrometrics skills) and scan
-/// time (ms, Astrometric Acquisition).
-pub(super) async fn probe_skills(ex: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<(f64, f64), CallError> {
-    let skills = crate::services::skills::effective::snapshot_at(ex, sde, char_id, at).await?;
-    let level = |skill: i32| skills.level(skill) as f64;
-    let strength = (1.0 + 0.05 * level(SKILL_ASTROMETRICS)) * (1.0 + 0.05 * level(SKILL_RANGEFINDING));
-    let scan_ms = 10_000.0 * (1.0 - 0.1 * level(SKILL_ACQUISITION));
-    Ok((strength, scan_ms))
-}
-
 pub(super) fn probe_value(id: i64, p: &Probe) -> Value {
     keyval([
         ("probeID", Value::Int(id)),
@@ -162,6 +154,7 @@ pub(super) fn probe_value(id: i64, p: &Probe) -> Value {
         ("pos", pos_value(p.pos)),
         ("destination", pos_value(p.pos)),
         ("expiry", Value::Int(p.expiry)),
+        ("scanBonuses", scan_bonuses_value(&p.bonuses)),
     ])
 }
 /// Field of a KeyVal (or dict) sent back by the client.
@@ -185,22 +178,25 @@ pub(super) fn as_pos(v: Option<&Value>) -> Option<V3> {
     }
 }
 
-/// How well a set of (position, range, strength) probes resolves a site.
-pub(super) fn certainty(site: &Site, probes: &[(V3, f64, f64)]) -> (f64, f64) {
+/// How well a set of covering probes resolves a site: each contributes its
+/// effective strength over its scan range; the result sphere comes from the
+/// tightest covering probe's range scaled by its effective deviation per
+/// metre of range. Returns (certainty, spread_m).
+pub(super) fn certainty(site: &Site, probes: &[ScanningProbe]) -> (f64, f64) {
     let mut signal = 0.0;
     let mut covering = 0;
     let mut tightest = f64::MAX;
-    for &(pos, range, strength) in probes {
-        let d = dist(pos, site.pos);
-        if d > range {
+    for p in probes {
+        let d = dist(p.pos, site.pos);
+        if d > p.range {
             continue;
         }
         covering += 1;
-        tightest = tightest.min(range);
+        tightest = tightest.min(p.range * p.deviation_per_range);
         // Strength halves with each doubling of range beyond 0.25 AU, and fades toward
         // the edge of the probe's sphere.
-        let falloff = 1.0 - (d / range).powi(2) * 0.5;
-        signal += strength * (0.25 * AU / range).min(1.0) * falloff;
+        let falloff = 1.0 - (d / p.range).powi(2) * 0.5;
+        signal += p.strength * (0.25 * AU / p.range).min(1.0) * falloff;
     }
     if covering == 0 {
         return (0.0, 0.0);
@@ -246,10 +242,15 @@ pub(super) fn result_value(s: &Site, certainty: f64, spread: f64) -> Value {
 }
 
 /// bound scanMgr.RequestScans(probes): move the probes to their destinations, scan, report.
+/// Strength, deviation and scan time come from the pilot's resident fit; a
+/// session without a ship fit or an online probe launcher is refused before
+/// any probe moves (SPACE_REQUIRED / ScnNoLauncher).
 pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Ok(Value::None) };
+    let Some(ship) = c.session.int("shipid") else {
+        return Err(notify_error(messages::exploration::SPACE_REQUIRED));
+    };
     ensure_loaded(&c.db, &c.world, system).await?;
-    let (_, scan_ms) = probe_skills(&c.db, &c.sde, char_id, filetime_now()).await?;
     // (probeID, destination, range)
     let mut moved = vec![];
     if let Some(Value::Dict(probes)) = call.args.first() {
@@ -261,6 +262,21 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
         }
     }
     let now = filetime_now();
+    // The probe types this scan moves (deduplicated), for the fit evaluation.
+    let mut types = Vec::new();
+    {
+        let st = state();
+        for &(id, _, _) in &moved {
+            let Some(p) = st.probes.get(&id).filter(|p| p.char_id == char_id && p.system == system && p.expiry > now) else { continue };
+            if !types.contains(&p.type_id) {
+                types.push(p.type_id);
+            }
+        }
+    }
+    let inputs = c.world.with(system, move |s| s.with_combat_fit(ship, |fit, _, _| scan_inputs(fit, &types)))
+        .await
+        .flatten()
+        .ok_or_else(|| notify_error(messages::exploration::SPACE_REQUIRED))??;
     let mut scanning = vec![];
     let mut probe_ids = vec![];
     {
@@ -268,18 +284,19 @@ pub(super) async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult
         st.probes.retain(|_, p| p.expiry > now);
         for &(id, dest, range) in &moved {
             let Some(p) = st.probes.get_mut(&id).filter(|p| p.char_id == char_id && p.system == system) else { continue };
+            let Some(t) = inputs.types.iter().find(|t| t.type_id == p.type_id) else { continue };
             p.pos = dest;
-            scanning.push((dest, range, p.strength));
+            scanning.push(ScanningProbe { pos: dest, range, strength: t.strength, deviation_per_range: t.deviation_per_range });
             probe_ids.push((id, probe_value(id, p)));
         }
     }
     let sent = Value::Dict(probe_ids.iter().map(|(id, v)| (Value::Int(*id), v.clone())).collect());
-    c.notify("OnSystemScanStarted", vec![Value::Int(now), Value::Int(scan_ms as i64), sent]);
+    c.notify("OnSystemScanStarted", vec![Value::Int(now), Value::Int(inputs.scan_ms as i64), sent]);
     let ids: Vec<i64> = probe_ids.iter().map(|(id, _)| *id).collect();
     let (world, db) = (c.world.clone(), c.db.clone());
     let context = fact_context(c, FactOrigin::Natural);
     tokio::spawn(async move {
-        if !world.after(system, scan_ms as u64).await {
+        if !world.after(system, inputs.scan_ms as u64).await {
             return;
         }
         let job_world = world.clone();
@@ -428,11 +445,14 @@ pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: boo
 }
 
 /// bound scanMgr.ConeScan(angle, range, x, y, z): everything in the cone, by type.
+/// The requested range is capped by the ship's effective directional scan range.
 pub(super) async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     let n = |i: usize| call.args.get(i).and_then(|v| v.as_float()).unwrap_or(0.0);
     let (angle, range, dir) = (n(0), n(1), [n(2), n(3), n(4)]);
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::list([])) };
     let Some(hits) = c.world.with(system, move |s| {
+        let max = s.with_combat_fit(ship, |fit, _, _| fit.value(crate::services::fit::Key::Ship, infinity_core::consts::dogma::ATTR_MAX_DIRECTIONAL_SCAN_RANGE))?;
+        let range = range.min(max);
         let me = s.sample_position(ship)?;
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(CONE_DIRECTION_MIN_LENGTH);
         let half = (angle / CONE_HALF_ANGLE_DIVISOR).min(std::f64::consts::PI);

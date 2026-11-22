@@ -9,7 +9,7 @@ fn entity(item_id: i64) -> CombatEntity {
 }
 fn pending() -> PendingDamage {
     let source = CombatSource { actual_actor_character: None, entity: entity(1), source_is_npc: true,
-        controller_incarnation: None, context: FactContext { corporation_id: None, alliance_id: None,
+        npc_security_multiplier: None, controller_incarnation: None, context: FactContext { corporation_id: None, alliance_id: None,
             faction_id: None, ship_id: None, ship_type_id: None, system_id: Some(7), station_id: None,
             origin: FactOrigin::Natural }, module_id: None, effect_id: None, weapon_type_id: None,
         activation: [4; 16], sequence: 9 };

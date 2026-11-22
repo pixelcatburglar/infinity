@@ -40,7 +40,7 @@ fn drone_final_blow_and_prior_drone_credit_retain_physical_sources() {
     let drone = |item| CombatEntity { character_id: None, ..entity(item, 1) };
     let entry = |character, physical, amount, exact_damage| ContributionEntry { attacker_id: character, source_ship_id: Some(character), source_ship_type: Some(1), weapon_type_id: None, damage: amount, last_damage_at: 1, illegal: false, entity: physical, context: context(character), exact_damage };
     let contributions = vec![entry(2, drone(99), 2.0, two), entry(1, drone(98), 100.0, one)];
-    let source = DamageSource { facts: Some(crate::space::combat_facts::CombatSource { actual_actor_character: Some(2), entity: drone(99), context: context(2), source_is_npc: false, controller_incarnation: Some([1; 16]), module_id: None, effect_id: None, weapon_type_id: None, activation: [1; 16], sequence: 1 }), ..Default::default() };
+    let source = DamageSource { facts: Some(crate::space::combat_facts::CombatSource { actual_actor_character: Some(2), entity: drone(99), context: context(2), source_is_npc: false, npc_security_multiplier: Some(crate::npc_security::FrozenMultiplier::new(1.0).unwrap()), controller_incarnation: Some([1; 16]), module_id: None, effect_id: None, weapon_type_id: None, activation: [1; 16], sequence: 1 }), ..Default::default() };
     let value = valuation(1, &vec![], &HashMap::new(), 1, crate::isk::IskAmount::ZERO).unwrap();
     let mut outbox = Outbox::<()>::default();
     let event = events(&mut outbox, 10, 11, entity(10, 10), context(10), 1, ConflictKind::Unknown, &source, &contributions, value);
@@ -95,7 +95,7 @@ fn npc_final_blow_retains_physical_entity_without_credit() {
     npc.character_id = None;
     let source = DamageSource { facts: Some(crate::space::combat_facts::CombatSource {
         actual_actor_character: None, entity: npc, context: context(20), source_is_npc: true,
-        controller_incarnation: None, module_id: None, effect_id: None, weapon_type_id: None,
+        npc_security_multiplier: None, controller_incarnation: None, module_id: None, effect_id: None, weapon_type_id: None,
         activation: [1; 16], sequence: 1,
     }), ..Default::default() };
     let value = valuation(1, &vec![], &HashMap::new(), 1, crate::isk::IskAmount::ZERO).unwrap();

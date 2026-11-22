@@ -3,7 +3,7 @@ use crate::db::Db;
 use crate::isk::IskAmount;
 
 fn pool(batch: Batch, system: i64, amount: &str, kills: i64) -> Pool {
-    Pool { batch, system_id: system, amount: IskAmount::parse_decimal(amount).unwrap(), kill_count: kills }
+    Pool { batch, system_id: system, amount: IskAmount::parse_decimal(amount).unwrap(), kill_count: kills, legacy_kill_count: 0, security_gain: crate::npc_security::SecurityGain::ZERO }
 }
 
 #[tokio::test]
@@ -40,12 +40,44 @@ async fn npc_bounty_absolute_checkpoint_schema_and_rollback() {
         assert!(save_absolute(&db, &[rejected]).await.is_err());
     }
     assert_eq!(for_character(&db, owner).await.unwrap()[1], pool(batch, 2, "12.34", 3));
-    // A partial multi-row write fails the whole statement: the conflicting
-    // first row leaves the fresh second row unwritten.
+    // A partial multi-row write fails inside the caller's transaction: the
+    // conflicting row leaves the fresh row unwritten after rollback.
     let conflicting = pool(Batch { character_id: owner, started_at: 101, due_at: 1300 }, 2, "20.00", 4);
-    assert!(save_absolute(&db, &[conflicting, pool(batch, 4, "5.00", 1)]).await.is_err());
+    let mixed = db.transaction(|tx, _: &mut ()| { let conflicting = conflicting.clone(); Box::pin(async move {
+        save_absolute(tx, &[conflicting, pool(batch, 4, "5.00", 1)]).await?;
+        Ok::<_, crate::db::Error>(())
+    }) }, |value, ()| async move { Ok(value) }).await;
+    assert!(mixed.is_err());
     assert!(for_character(&db, owner).await.unwrap().iter().all(|row| row.system_id != 4));
     assert_eq!(for_character(&db, owner).await.unwrap()[1], pool(batch, 2, "12.34", 3));
+    let mut changed_gain = pool(batch, 2, "12.34", 3);
+    changed_gain.security_gain = crate::npc_security::SecurityGain::for_kill(0.2, crate::npc_security::FrozenMultiplier::new(1.0).unwrap());
+    let gain_only = db.transaction(|tx, _: &mut ()| { let changed_gain = changed_gain.clone(); Box::pin(async move {
+        save_absolute(tx, &[changed_gain]).await?;
+        Ok::<_, crate::db::Error>(())
+    }) }, |value, ()| async move { Ok(value) }).await;
+    assert!(gain_only.is_err());
+    assert_eq!(for_character(&db, owner).await.unwrap()[1].security_gain, crate::npc_security::SecurityGain::ZERO);
+    let mut changed_legacy = pool(batch, 2, "13.00", 4);
+    changed_legacy.legacy_kill_count = 1;
+    let legacy_only = db.transaction(|tx, _: &mut ()| { let changed_legacy = changed_legacy.clone(); Box::pin(async move {
+        save_absolute(tx, &[changed_legacy]).await?;
+        Ok::<_, crate::db::Error>(())
+    }) }, |value, ()| async move { Ok(value) }).await;
+    assert!(legacy_only.is_err());
+    let mut full = pool(batch, 2, "12.34", 4);
+    full.security_gain = crate::npc_security::SecurityGain::for_kill(1.0, crate::npc_security::FrozenMultiplier::new(1.0).unwrap());
+    save_absolute(&db, std::slice::from_ref(&full)).await.unwrap();
+    assert_eq!(for_character(&db, owner).await.unwrap()[1], full);
+    let mut regressed = full.clone();
+    regressed.kill_count = 5;
+    regressed.security_gain = crate::npc_security::SecurityGain::for_kill(0.2, crate::npc_security::FrozenMultiplier::new(1.0).unwrap());
+    let regression = db.transaction(|tx, _: &mut ()| { let regressed = regressed.clone(); Box::pin(async move {
+        save_absolute(tx, &[regressed]).await?;
+        Ok::<_, crate::db::Error>(())
+    }) }, |value, ()| async move { Ok(value) }).await;
+    assert!(regression.is_err());
+    assert_eq!(for_character(&db, owner).await.unwrap()[1], full);
     // Pool rows and their payout job roll back together.
     let other = Batch { character_id: owner, started_at: 200, due_at: 1400 };
     let outcome = db.transaction(|tx, _: &mut ()| Box::pin(async move {

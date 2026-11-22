@@ -1,5 +1,5 @@
 //! Item loading, inventory, creation, transfers, quantities, positions, charges,
-//! ship, clone, combat, dogma, fitting, hacking, mining, service-life and social persistence.
+//! ship, stance, clone, combat, dogma, fitting, hacking, mining, service-life and social persistence.
 //! Sources include `game.items`, `game.characters`, `game.module_charges`,
 //! `game.pending_reloads`, `game.weapon_banks`, `game.fittings`, `game.blueprints`,
 //! `game.industry_jobs`, `game.market_orders`, `game.corp_item_locks`, vote-case
@@ -27,6 +27,7 @@ pub(crate) mod inventory;
 pub(crate) mod loading;
 pub(crate) mod loyalty;
 pub(crate) mod mining;
+pub(crate) mod npc_loot;
 pub(crate) mod parent_locks;
 pub(crate) mod pending_reloads;
 pub(crate) mod positions;
@@ -40,6 +41,7 @@ pub(crate) mod ship_appearance;
 pub(crate) mod ship_configuration;
 pub(crate) mod ship_dirt;
 pub(crate) mod ship_kill_counts;
+pub(crate) mod ship_stance;
 pub(crate) mod space_ships;
 pub(crate) mod skills;
 pub(crate) mod social;

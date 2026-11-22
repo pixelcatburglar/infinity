@@ -1,6 +1,8 @@
 use super::*;
+use crate::services::effects::tests::fixture as actors;
 use crate::services::tests::fixture;
 mod multi_type;
+mod probe_bonuses;
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn refused_probe_recovery_keeps_probe_and_sends_no_notification() {
@@ -14,7 +16,7 @@ async fn refused_probe_recovery_keeps_probe_and_sends_no_notification() {
     let kind = client.sde.types.iter().find(|ty| ty.volume.is_some_and(|v| v > hull.capacity.unwrap() * 1000.0)).unwrap().type_id;
     let ship = recovery_ship(&db, &mut client.session, character, system, hull.type_id).await;
     let id = character * 100 + 50;
-    state().probes.insert(id, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: filetime_now() + FILETIME_SECOND * 60, strength: 1.0 });
+    state().probes.insert(id, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: filetime_now() + FILETIME_SECOND * 60, bonuses: ProbeBonuses::default() });
     let args = [Value::list([Value::Int(id)])];
     let kwargs = Value::None;
     let call = Call { service: "scanMgr", method: "RecoverProbes", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
@@ -43,8 +45,8 @@ async fn recovery_excludes_expired_probes_and_deposits_live_probe_once() {
     let expired = character * 100 + 51;
     let live = character * 100 + 52;
     let now = filetime_now();
-    state().probes.insert(expired, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: now - 1, strength: 1.0 });
-    state().probes.insert(live, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: now + FILETIME_SECOND * 60, strength: 1.0 });
+    state().probes.insert(expired, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: now - 1, bonuses: ProbeBonuses::default() });
+    state().probes.insert(live, Probe { char_id: character, system, type_id: kind, pos: [0.0; 3], expiry: now + FILETIME_SECOND * 60, bonuses: ProbeBonuses::default() });
     let kwargs = Value::None;
     let expired_args = [Value::list([Value::Int(expired)])];
     let expired_call = Call { service: "scanMgr", method: "RecoverProbes", args: &expired_args, kwargs: &kwargs, bound: true, bind_params: None };
@@ -93,16 +95,16 @@ async fn recovery_excludes_expired_probes_and_deposits_live_probe_once() {
 async fn ordinary_scan_removes_disappeared_qa_result() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let owner = fixture::create(&db).await.unwrap();
-    let character = owner.character;
-    let system = character * 100 + 10;
+    let system = 910_011_i64;
+    let fixture = scan_ship(&db, system, true).await;
+    let (character, ship) = (fixture.character, fixture.ship);
     let site_id = system + 1;
     let scenario_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut client, _peer) = crate::services::tests::client(scenario_db.clone(), character).await;
         client.login.role = infinity_core::consts::ROLE_QA;
-        client.session.apply(vec![("solarsystemid", Value::Int(system))]);
-        client.world.system(system).await.unwrap();
+        client.session.apply(vec![("solarsystemid", Value::Int(system)), ("shipid", Value::Int(ship))]);
+        actors::admit(&scenario_db, &client.world, system, actors::ball(ship, 621, character, Some(character), 0.0)).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.world.register_pilot(character, tx);
         let mut site = new_site(system, [0.0; 3], Kind::Anomaly, STRENGTH_ALL, 1.0, &mut HashSet::new());
@@ -131,6 +133,7 @@ async fn ordinary_scan_removes_disappeared_qa_result() {
         assert!(absent.contains(&Value::str("OLD-RESULT")));
         assert!(state().reported.get(&(character, system)).unwrap().is_empty());
         client.world.unregister_pilot_generation(character, None);
+        client.world.clone()
     }).await;
     {
         let mut st = state();
@@ -138,8 +141,10 @@ async fn ordinary_scan_removes_disappeared_qa_result() {
         st.loaded.remove(&system);
         st.reported.remove(&(character, system));
     }
-    fixture::cleanup(&db, owner).await.unwrap();
-    result.unwrap();
+    match result {
+        Ok(world) => fixture::cleanup_ship(&db, Some(&*world), fixture).await.unwrap(),
+        Err(error) => { fixture::cleanup_ship(&db, None, fixture).await.unwrap(); std::panic::resume_unwind(error.into_panic()); }
+    }
 }
 
 #[tokio::test]
@@ -147,9 +152,9 @@ async fn ordinary_scan_removes_disappeared_qa_result() {
 async fn ordinary_scan_does_not_publish_failed_perfect_results() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let owner = fixture::create(&db).await.unwrap();
-    let character = owner.character;
-    let system = character * 100 + 20;
+    let system = 910_111_i64;
+    let fixture = scan_ship(&db, system, true).await;
+    let (character, ship) = (fixture.character, fixture.ship);
     let first = system + 1;
     let second = system + 2;
     let trigger = format!("scan_ordinary_failure_{character}");
@@ -163,13 +168,13 @@ async fn ordinary_scan_does_not_publish_failed_perfect_results() {
         let sql = format!("CREATE TRIGGER {scenario_trigger} BEFORE INSERT ON game.exploration_scanned FOR EACH ROW EXECUTE FUNCTION {scenario_function}()");
         scenario_db.execute(&sql, &[]).await.unwrap();
         let (mut client, _peer) = crate::services::tests::client(scenario_db.clone(), character).await;
-        client.session.apply(vec![("solarsystemid", Value::Int(system))]);
-        client.world.system(system).await.unwrap();
+        client.session.apply(vec![("solarsystemid", Value::Int(system)), ("shipid", Value::Int(ship))]);
+        actors::admit(&scenario_db, &client.world, system, actors::ball(ship, 621, character, Some(character), 0.0)).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.world.register_pilot(character, tx);
         let mut taken = HashSet::new();
-        let mut a = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_ALL, 1.0, &mut taken);
-        let mut b = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_ALL, 1.0, &mut taken);
+        let mut a = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_ALL, 2.0, &mut taken);
+        let mut b = new_site(system, [0.0; 3], Kind::Signature, STRENGTH_ALL, 2.0, &mut taken);
         a.id = first;
         b.id = second;
         save_site(&scenario_db, &a).await.unwrap();
@@ -182,7 +187,7 @@ async fn ordinary_scan_does_not_publish_failed_perfect_results() {
             st.sites.insert(first, a);
             st.sites.insert(second, b);
             for id in system + 3..system + 7 {
-                st.probes.insert(id, Probe { char_id: character, system, type_id: 1, pos: [0.0; 3], expiry: filetime_now() + FILETIME_SECOND * 60, strength: 100.0 });
+                st.probes.insert(id, Probe { char_id: character, system, type_id: 30013, pos: [0.0; 3], expiry: filetime_now() + FILETIME_SECOND * 60, bonuses: ProbeBonuses::default() });
                 probes.push((Value::Int(id), keyval([("destination", pos_value([0.0; 3])), ("scanRange", Value::Float(AU))])));
             }
         }
@@ -199,6 +204,7 @@ async fn ordinary_scan_does_not_publish_failed_perfect_results() {
         assert!(!st.scanned.contains(&(character, first)));
         assert!(!st.scanned.contains(&(character, second)));
         assert!(!targets.iter().any(|target| st.reported.get(&(character, system)).is_some_and(|set| set.contains(target))));
+        client.world.clone()
     }).await;
     db.execute(&format!("DROP TRIGGER IF EXISTS {trigger} ON game.exploration_scanned"), &[]).await.unwrap();
     db.execute(&format!("DROP FUNCTION IF EXISTS {function}()"), &[]).await.unwrap();
@@ -217,8 +223,10 @@ async fn ordinary_scan_does_not_publish_failed_perfect_results() {
             st.probes.remove(&id);
         }
     }
-    fixture::cleanup(&db, owner).await.unwrap();
-    result.unwrap();
+    match result {
+        Ok(world) => fixture::cleanup_ship(&db, Some(&*world), fixture).await.unwrap(),
+        Err(error) => { fixture::cleanup_ship(&db, None, fixture).await.unwrap(); std::panic::resume_unwind(error.into_panic()); }
+    }
 }
 
 #[tokio::test]
@@ -337,15 +345,15 @@ async fn gm_scan_all_journals_only_first_resolution() {
 async fn ordinary_partial_known_and_anomaly_do_not_journal() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let owner = fixture::create(&db).await.unwrap();
-    let character = owner.character;
-    let system = character * 100 + 92;
+    let system = 910_211_i64;
+    let fixture = scan_ship(&db, system, true).await;
+    let (character, ship) = (fixture.character, fixture.ship);
     let ids = [system + 1, system + 2, system + 3];
     let scenario_db = db.clone();
     let result = tokio::spawn(async move {
         let (mut client, _peer) = crate::services::tests::client(scenario_db.clone(), character).await;
-        client.session.apply(vec![("solarsystemid", Value::Int(system))]);
-        client.world.system(system).await.unwrap();
+        client.session.apply(vec![("solarsystemid", Value::Int(system)), ("shipid", Value::Int(ship))]);
+        actors::admit(&scenario_db, &client.world, system, actors::ball(ship, 621, character, Some(character), 0.0)).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.world.register_pilot(character, tx);
         let mut taken = HashSet::new();
@@ -367,11 +375,14 @@ async fn ordinary_partial_known_and_anomaly_do_not_journal() {
         let rows = scenario_db.query("SELECT event_id FROM game.progress_events WHERE kind='SignatureResolved' AND subject_character_id=$1", &[&character]).await.unwrap();
         assert!(rows.is_empty());
         client.world.unregister_pilot_generation(character, None);
+        client.world.clone()
     }).await;
     { let mut st = state(); for id in ids { st.sites.remove(&id); st.scanned.remove(&(character, id)); } st.loaded.remove(&system); st.reported.remove(&(character, system)); }
     for id in ids { delete_site(&db, id).await.unwrap(); }
-    fixture::cleanup(&db, owner).await.unwrap();
-    result.unwrap();
+    match result {
+        Ok(world) => fixture::cleanup_ship(&db, Some(&*world), fixture).await.unwrap(),
+        Err(error) => { fixture::cleanup_ship(&db, None, fixture).await.unwrap(); std::panic::resume_unwind(error.into_panic()); }
+    }
 }
 
 async fn recovery_ship(db: &Db, session: &mut infinity_core::session::Session, character: i64, system: i64, hull_type: i32) -> i64 {
@@ -381,4 +392,60 @@ async fn recovery_ship(db: &Db, session: &mut infinity_core::session::Session, c
     crate::dao::characters::ship::undock(db, character, system).await.unwrap();
     session.apply(vec![("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system)), ("stationid", Value::None)]);
     ship
+}
+
+/// A legal resident scan ship: published Caracal hull, an (optionally online)
+/// Prototype Iris Probe Launcher in a high slot and the three T1 scan arrays in mid
+/// slots, plus the real SDE skill chain with real SP (scan bonuses and the
+/// hull's requirements), so `Fit::load`/`admit` see a production-legal fit.
+async fn scan_ship(db: &Db, system: i64, launcher_online: bool) -> fixture::ShipFixture {
+    let spec = |type_id, flag_id, online| fixture::ShipItemSpec { type_id, flag_id, quantity: 1, singleton: true, online, attributes: &[] };
+    let fixture = fixture::create_ship(db, 621, fixture::ShipLocation::Space { system },
+        &[spec(2083, 27, launcher_online), spec(33180, 19, true), spec(33178, 20, true), spec(33176, 21, true)]).await.unwrap();
+    let sde = crate::tests::shared_sde(db).await;
+    for (skill, level) in [(3402, 3), (3412, 4), (25739, 2), (25810, 2), (25811, 2), (3334, 1), (33092, 3), (3330, 3), (3327, 2)] {
+        let rank = crate::services::skills::training::skill_type(&sde, skill).rank;
+        crate::dao::skills::training::set_level(db, fixture.character, skill, level, crate::services::skills::formulas::sp_for_level(rank, i64::from(level))).await.unwrap();
+    }
+    fixture
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn cone_scan_range_is_capped_by_effective_directional_range() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let owner = fixture::create(&db).await.unwrap();
+    let character = owner.character;
+    let (mut client, _peer) = crate::services::tests::client(db.clone(), character).await;
+    let system = crate::dao::characters::ship::current(&db, character).await.unwrap().and_then(|location| location.system).unwrap();
+    let hull = client.sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP) && ty.group_id != Some(infinity_core::consts::GROUP_CAPSULE) && ty.capacity.is_some_and(|v| v > 0.0)).unwrap().type_id;
+    let ship = recovery_ship(&db, &mut client.session, character, system, hull).await;
+    assert!(crate::dao::items::dogma::set_override(&db, ship, infinity_core::consts::dogma::ATTR_MAX_DIRECTIONAL_SCAN_RANGE, 6_000.0).await.unwrap());
+    let world = client.world.clone();
+    actors::admit(&db, &world, system, actors::ball(ship, hull, character, Some(character), 0.0)).await;
+    let (inner, outer) = (character * 100 + 61, character * 100 + 62);
+    world.add_ship(system, actors::ball(inner, hull, character, None, 4_000.0)).await.unwrap();
+    world.add_ship(system, actors::ball(outer, hull, character, None, 8_000.0)).await.unwrap();
+    let ids = |value: Value| {
+        let mut found = value.items().unwrap().iter().filter_map(|row| crate::services::value_field(row, "id").and_then(Value::as_int)).collect::<Vec<_>>();
+        found.sort_unstable();
+        found
+    };
+    let kwargs = Value::None;
+    let args = [Value::Float(360.0), Value::Float(20_000.0), Value::Float(1.0), Value::Float(0.0), Value::Float(0.0)];
+    let call = Call { service: "scanMgr", method: "ConeScan", args: &args, kwargs: &kwargs, bound: true, bind_params: None };
+    let capped = cone_scan(&mut client, &call).await.unwrap();
+    assert_eq!(ids(capped), vec![inner]);
+    let landed = world.with(system, move |s| s.land_runtime_inputs(&[crate::space::dbuff::TimedRuntimeInput {
+        receiver: crate::services::fit::runtime::RuntimeReceiverKey::Ship(ship), collection_id: 2465,
+        source: crate::services::fit::runtime::RuntimeSourceKey { producer: crate::services::fit::runtime::RuntimeProducerNamespace::new(9), source_id: 1, incarnation: 1 },
+        value: 300.0, expires_at_ms: s.now_ms() + 60_000 }])).await.unwrap();
+    assert_eq!(landed, 1);
+    let widened = cone_scan(&mut client, &call).await.unwrap();
+    assert_eq!(ids(widened), vec![inner, outer]);
+    world.remove_ball(system, inner).await;
+    world.remove_ball(system, outer).await;
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap();
+    fixture::cleanup(&db, owner).await.unwrap();
 }

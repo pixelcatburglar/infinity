@@ -123,7 +123,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: character, ship_id: ship, system_id: 1 };
         let effect = registry::resolve(&sde, EFFECT_MICROWARPDRIVE).unwrap();
         let make_cycle = || Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: infinity_core::consts::FLAG_FITTING_FIRST }],
-            effect: effect.clone(), target: None, repeat: 3, stop: stop.clone(),
+            effect: effect.clone(), presented_effect: effect.id, target: None, repeat: 3, stop: stop.clone(),
             owner: ActivationOwner { master: module, generation: stop.clone(), armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
             started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
             source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
@@ -158,7 +158,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
             .value(Key::Ship, ATTR_MAX_VELOCITY);
         assert!((deactivating - boosted).abs() <= tolerance, "ordinary stop maxVelocity {deactivating} differs from boosted {boosted}");
         let cycle = Cycle { cx, modules: vec![Module { id: module, type_id: module_type, flag: infinity_core::consts::FLAG_FITTING_FIRST }],
-            effect, target: None, repeat: 3, stop: ordinary.clone(),
+            presented_effect: effect.id, effect, target: None, repeat: 3, stop: ordinary.clone(),
             owner: ActivationOwner { master: module, generation: ordinary, armed: false, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
             started: 123, charge_type: None, cycles: 1, duration_ms: 456.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
             source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };

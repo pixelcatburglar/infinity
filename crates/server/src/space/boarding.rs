@@ -60,7 +60,7 @@ impl LoadedQuiesceRefusal {
 /// have run, an invalidation after. Both are no-ops on a committed or
 /// replaced record, and an explicit disposition drains the receipt first.
 pub(crate) struct HeldLoaded {
-    world: std::sync::Weak<World>, system: i64, slots: Vec<HeldSlot>, in_flight: bool,
+    world: std::sync::Weak<World>, system: i64, resident: Vec<(i64, u64)>, slots: Vec<HeldSlot>, in_flight: bool,
 }
 
 fn each_held(s: &mut System, slots: &[HeldSlot], mut f: impl FnMut(&HeldSlot, &mut crate::space::combat::loaded::LoadedSlot)) {
@@ -101,7 +101,7 @@ impl HeldLoaded {
 
     /// The membership generation this receipt claimed scope on when the ship
     /// was resident at claim time; `None` means no resident scope was claimed.
-    pub(crate) fn claimed_membership(&self) -> Option<u64> { self.slots.first().map(|slot| slot.membership) }
+    pub(crate) fn claimed_membership(&self, ship: i64) -> Option<u64> { self.resident.iter().find(|scope| scope.0 == ship).map(|scope| scope.1) }
 
 
     /// Known commit: publication already ran; unhold only the slots this
@@ -144,10 +144,12 @@ pub(crate) async fn quiesce_ship_loaded(world: &World, system: i64, ships: &[i64
                 let Some(record) = s.actor_combat.get(&ship) else { continue };
                 if record.loaded.values().any(|slot| slot.held || slot.unknown) { return Some(Err(())); }
             }
+            let resident = if ships.is_empty() { Vec::new() } else {
+                ships.iter().filter_map(|&ship| s.actor_combat.get(&ship).map(|record| (ship, record.membership_generation))).collect()
+            };
             let mut slots = Vec::new();
-            for &ship in &ships {
+            for &(ship, membership) in &resident {
                 if let Some(record) = s.actor_combat.get_mut(&ship) {
-                    let membership = record.membership_generation;
                     for slot in record.loaded.values_mut() {
                         slot.held = true;
                         slots.push(HeldSlot { ship, membership, module: slot.module,
@@ -156,10 +158,10 @@ pub(crate) async fn quiesce_ship_loaded(world: &World, system: i64, ships: &[i64
                 }
             }
             s.drain_loaded(tx);
-            Some(Ok((s.world.clone(), slots)))
+            Some(Ok((s.world.clone(), resident, slots)))
         }
     }).await;
-    let (weak, slots) = match claimed {
+    let (weak, resident, slots) = match claimed {
         Some(Some(Ok(claimed))) => claimed,
         Some(Some(Err(()))) | Some(None) => return Err(LoadedQuiesceRefusal::Busy),
         None => return Err(LoadedQuiesceRefusal::Stopped),
@@ -167,7 +169,7 @@ pub(crate) async fn quiesce_ship_loaded(world: &World, system: i64, ships: &[i64
     // The receipt owner exists before the drain wait starts: a caller
     // cancelled here drops it and releases the claim instead of stranding
     // held slots.
-    let guard = HeldLoaded { world: weak, system, slots, in_flight: false };
+    let guard = HeldLoaded { world: weak, system, resident, slots, in_flight: false };
     if rx.recv().await.is_none() {
         return Err(LoadedQuiesceRefusal::Busy);
     }
@@ -711,27 +713,48 @@ impl TransferSettlement {
 
 
 impl System {
-    /// Sample and authorize without changing actor state.
-    pub(crate) fn authorize_board(&self, character: i64, old: i64, target: i64, max_gap: f64) -> Result<BoardSnapshot, BoardRefusal> {
-        let old_ball = self.pilot_ball(character).filter(|b| b.id == old && b.char_id == Some(character) && b.owner_id == character)
+    /// The pilot's own live persistent hull, sampled at the actor clock: the
+    /// pilot ball with this id, owner and character, a ship category, not in
+    /// warp or cloaked, with finite position, velocity and radius.
+    pub(crate) fn authorize_own_hull(&self, character: i64, ship: i64) -> Result<(Ball, u64), BoardRefusal> {
+        let pilot = self.pilot_ball(character).filter(|b| b.id == ship && b.char_id == Some(character) && b.owner_id == character)
             .ok_or(BoardRefusal::StalePilot)?;
-        let old_generation = self.persistent_generation(old).ok_or(BoardRefusal::StalePilot)?;
-        let is_ship = |b: &Ball| self.sde().and_then(|sde| sde.types.get(b.type_id))
+        let generation = self.persistent_generation(ship).ok_or(BoardRefusal::StalePilot)?;
+        let is_ship = self.sde().and_then(|sde| sde.types.get(pilot.type_id))
             .is_some_and(|ty| ty.category_id == Some(CATEGORY_SHIP));
-        if !is_ship(old_ball) { return Err(BoardRefusal::StalePilot); }
-        if old == target { return Err(BoardRefusal::InvalidTarget); }
-        let target_ball = self.ball(target).filter(|b| b.owner_id == character && is_ship(b))
-            .ok_or(BoardRefusal::InvalidTarget)?;
-        let target_generation = self.persistent_generation(target).ok_or(BoardRefusal::InvalidTarget)?;
-        if target_ball.char_id.is_some() || target_ball.interactive { return Err(BoardRefusal::Occupied); }
-        if old_ball.mode == MODE_WARP || target_ball.mode == MODE_WARP || old_ball.cloak != 0 || target_ball.cloak != 0 {
+        if !is_ship { return Err(BoardRefusal::StalePilot); }
+        if pilot.mode == MODE_WARP || pilot.cloak != 0 { return Err(BoardRefusal::Unsafe); }
+        let ball = self.sampled_ball(ship).ok_or(BoardRefusal::StalePilot)?;
+        if !ball.radius.is_finite() || ball.radius < 0.0
+            || !ball.pos.iter().chain(ball.vel.iter()).all(|v| v.is_finite()) {
             return Err(BoardRefusal::Unsafe);
         }
-        let old = self.sampled_ball(old).ok_or(BoardRefusal::StalePilot)?;
+        Ok((ball, generation))
+    }
+
+    /// A voluntary exit also refuses a fitted module whose effective
+    /// `disallowEarlyDeactivation` is positive. Launch keeps the physical gate.
+    pub(crate) fn authorize_own_hull_exit(&self, character: i64, ship: i64) -> Result<(Ball, u64), BoardRefusal> {
+        let authorized = self.authorize_own_hull(character, ship)?;
+        let locked = self.resident_fit(ship, |fit, _|
+            crate::services::effects::active_cycle::early_deactivation_locked(fit, character, 0)).unwrap_or(false);
+        if locked { return Err(BoardRefusal::Unsafe); }
+        Ok(authorized)
+    }
+
+    /// Sample and authorize without changing actor state.
+    pub(crate) fn authorize_board(&self, character: i64, old: i64, target: i64, max_gap: f64) -> Result<BoardSnapshot, BoardRefusal> {
+        let (old, old_generation) = self.authorize_own_hull_exit(character, old)?;
+        if old.id == target { return Err(BoardRefusal::InvalidTarget); }
+        let is_ship = |b: &Ball| self.sde().and_then(|sde| sde.types.get(b.type_id))
+            .is_some_and(|ty| ty.category_id == Some(CATEGORY_SHIP));
+        let target_ball = self.ball(target).filter(|ball| is_ship(ball)).ok_or(BoardRefusal::InvalidTarget)?;
+        let target_generation = self.persistent_generation(target).ok_or(BoardRefusal::InvalidTarget)?;
+        if target_ball.char_id.is_some() || target_ball.interactive { return Err(BoardRefusal::Occupied); }
+        if target_ball.mode == MODE_WARP || target_ball.cloak != 0 { return Err(BoardRefusal::Unsafe); }
         let target = self.sampled_ball(target).ok_or(BoardRefusal::InvalidTarget)?;
-        if !max_gap.is_finite() || max_gap < 0.0 || !old.radius.is_finite() || old.radius < 0.0
-            || !target.radius.is_finite() || target.radius < 0.0
-            || !old.pos.iter().chain(target.pos.iter()).chain(old.vel.iter()).chain(target.vel.iter()).all(|v| v.is_finite()) {
+        if !max_gap.is_finite() || max_gap < 0.0 || !target.radius.is_finite() || target.radius < 0.0
+            || !target.pos.iter().chain(target.vel.iter()).all(|v| v.is_finite()) {
             return Err(BoardRefusal::Unsafe);
         }
         let distance = dist(old.pos, target.pos);

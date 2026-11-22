@@ -55,6 +55,16 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             return Err("target lost");
         }
         if matches!(cycle.effect.kind, EffectKind::Ecm | EffectKind::BurstJammer) && ecm::validate_cycle(&cx, &cycle).await.is_err() { check_target = true; return Err("target lost"); }
+        // A mode revalidates the shared source authority before any debit,
+        // including later cycles: a stale generation, owner, membership,
+        // online bit or effect never spends capacitor or fuel.
+        if super::super::active_cycle::ship_mode(cycle.effect.id) {
+            let admitted = cycle.source_membership;
+            let (ship, character, module, effect, generation) = (cx.ship_id, cx.char_id, cycle.modules[0].clone(), cycle.presented_effect, cycle.stop.clone());
+            let current = cx.world.with(cx.system_id, move |s| admitted.is_some_and(|membership|
+                super::super::active_cycle::mode_source_current(s, ship, character, membership, &module, effect, &generation))).await.unwrap_or(false);
+            if !current { return Err("source lost"); }
+        }
         let need = cycle_discharge(resource_kind, charged, discharge);
         if !drain_capacitor(&cx, capacitor.0, capacitor.1, need) {
             cx.notify("OnEffectMessage", vec![Value::str("NotEnoughCharge"), Value::Dict(vec![])]);
@@ -122,8 +132,9 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
                     CycleOutcome::Ended { reason, outcome } => { public = Some(outcome); reason }
                     CycleOutcome::Continue => unreachable!(),
                 };
-                if (charge_sensitive(resource_kind) && matches!(reason, "out of charges" | "source lost or in warp")
-                    || matches!(cycle.effect.kind, EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu) && reason == "target lost") && need > 0.0 {
+                if ((charge_sensitive(resource_kind) && matches!(reason, "out of charges" | "source lost or in warp")
+                    || matches!(cycle.effect.kind, EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu) && reason == "target lost")
+                    || super::super::active_cycle::ship_mode(cycle.effect.id) && reason == "source lost") && need > 0.0 {
                     if let Err(error) = refund_refused_charge(&cx, need).await {
                         warn!("module {master} capacitor refund failed: {}", match error { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
                     }
@@ -137,31 +148,90 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     let (result, cycle, deadline) = if result.is_ok() {
         // The heat connection runs inside one actor turn on the captured
         // packet, then the cycle returns and the original order continues. A
-        // duration-bounded consumer accepts its Pending record in the same
-        // turn; a stale admission returns for the ordinary stop. Members whose
-        // shot actually fired publish their ramp readout in the same turn.
-        // Only `spool_applied` carriers reach it.
+        // tracked activation connects and validates heat before any visible
+        // acceptance, so a failure consumes its record silently in this same
+        // turn; a stale admission returns for the ordinary stop. Members
+        // whose shot actually fired publish their ramp readout in the same
+        // turn. Only `spool_applied` carriers reach it.
         match cx.world.with(cx.system_id, move |s| {
-            let deadline = if super::super::active_cycle::consumer(cycle.effect.id) {
-                match super::super::active_cycle::accept(s, &mut cycle) {
-                    Some(deadline) => Some(deadline),
-                    None => return (None, cycle),
+            let (mode, bounded) = (super::super::active_cycle::ship_mode(cycle.effect.id),
+                super::super::active_cycle::duration_bounded(cycle.effect.id));
+            let deadline = if bounded || mode {
+                if let Err(error) = heat::connect_cycle(s, &cycle) {
+                    let mut st = state();
+                    let terminal = super::super::active_cycle::terminate(&mut st, master, &cycle.stop);
+                    drop(st);
+                    if let Some(terminal) = terminal { super::super::active_cycle::apply_terminal(s, terminal); }
+                    return (Some((Err(error), None)), cycle);
                 }
+                if mode {
+                    let current = cycle.source_membership.is_some_and(|membership|
+                        super::super::active_cycle::mode_source_current(s, cycle.cx.ship_id, cycle.cx.char_id, membership,
+                            &cycle.modules[0], cycle.presented_effect, &cycle.stop));
+                    if !current { return (None, cycle); }
+                }
+                if bounded || cycle.cycles == 0 {
+                    match super::super::active_cycle::accept(s, &mut cycle) {
+                        Some(deadline) if bounded => Some(deadline),
+                        Some(_) => None,
+                        None => return (None, cycle),
+                    }
+                } else if !super::super::active_cycle::running_generation(master, &cycle.stop) {
+                    return (None, cycle);
+                } else { None }
             } else { None };
             for module in &cycle.modules {
                 s.fitted_module_active(cycle.cx.ship_id, module.id, true);
+            }
+            // An active sphere carries a positive `disallowAssistance` value:
+            // its first published active bit turns the restriction on, so the
+            // source's incoming projections are re-evaluated once inside this
+            // actor turn. The refresh needs the still-current activation, the
+            // admitted membership and the actually published bit; scripted
+            // presentations share the presented id, and later cycles never
+            // republish, so they never re-arm it.
+            if cycle.cycles == 0
+                && cycle.presented_effect == i64::from(infinity_core::consts::dogma::EFFECT_WARP_DISRUPT_SPHERE)
+                && activation_current(master, cycle.cx.char_id, &cycle.stop)
+                && s.combat_membership_generation(cycle.cx.ship_id) == cycle.source_membership
+                && s.with_combat_fit(cycle.cx.ship_id, |fit, _, _|
+                    fit.module_state(master).is_some_and(|(_, active)| active)).unwrap_or(false)
+            {
+                s.refresh_projection_target(cycle.cx.ship_id);
             }
             let nominal = crate::client::filetime_from_unix_ms(cycle.nominal_start);
             for member in &cycle.inputs.members {
                 let Some(applied) = member.spool_applied else { continue };
                 let Some(state) = member.spool else { continue };
-                if state.binding().is_none() { continue; }
+                if state.binding().is_none() { continue };
                 let parameters::MemberPacket::Turret(inputs) = &member.packet else { continue };
                 let Some(parameters) = inputs.spool else { continue };
                 let max_at = parameters.maximum_at(nominal, state.current(parameters), cycle.duration_ms);
                 s.spool_readout_publish(cycle.cx.ship_id, member.module, &cycle.stop, applied, max_at, cycle.cx.char_id);
             }
-            (Some((heat::connect_cycle(s, &cycle), deadline)), cycle)
+            // The adaptive hardener installs or reopens its profile in the
+            // same actor turn once the authority check and the heat connection
+            // have both succeeded; a refused admission stops the activation
+            // rather than cycling silently without the mechanic.
+            let connection = match if bounded || mode { Ok(()) } else { heat::connect_cycle(s, &cycle) } {
+                Err(error) => Err(error),
+                Ok(()) if cycle.effect.id == i64::from(EFFECT_ADAPTIVE_ARMOR_HARDENER) => {
+                    let seed = match cycle.inputs.frame.as_ref().map(|frame| &frame.packet) {
+                        Some(parameters::MasterPacket::ReactiveArmor(inputs)) => inputs.seed,
+                        _ => None,
+                    };
+                    let admitted = cycle.source_membership.is_some_and(|membership|
+                        source_subject_current(s, cycle.cx.ship_id, cycle.cx.char_id, membership,
+                            &cycle.modules[0], cycle.presented_effect, &cycle.stop)
+                        && s.begin_reactive_armor(cycle.cx.ship_id, membership, cycle.modules[0].id,
+                            cycle.modules[0].type_id, &cycle.stop, seed));
+                    if admitted { Ok(()) } else {
+                        Err(CallError::Internal(anyhow::anyhow!("adaptive armor activation refused")))
+                    }
+                }
+                Ok(()) => Ok(()),
+            };
+            (Some((connection, deadline)), cycle)
         }).await {
             Some((Some((Ok(()), deadline)), returned)) => {
                 let mut result = Ok(());
@@ -169,7 +239,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
                     && !entosis::publish_start(&cx, &returned).await {
                     result = Err("Entosis link invalidated");
                 }
-                if result.is_ok() && (returned.effect.kind == EffectKind::Smartbomb || returned.cycles == 0 && matches!(returned.effect.kind, EffectKind::Bomb | EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer)) {
+                if result.is_ok() && (returned.effect.kind == EffectKind::Smartbomb || returned.cycles == 0 && matches!(returned.effect.kind, EffectKind::Bomb | EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer | EffectKind::MicroJumpField)) {
                     let retention = if matches!(returned.effect.kind, EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm) { FxRetention::Current } else { FxRetention::Transient };
                     weapon_fx(&cx, &returned.modules, &returned.effect, returned.target, returned.charge_type, true, returned.duration_ms, returned.repeat, master, &returned.stop, retention, Value::None);
                 }
@@ -177,9 +247,23 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             }
             Some((Some((Err(error), _)), returned)) => {
                 warn!("module {master} heat connection failed: {}", match error { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
+                let amount = returned.inputs.frame.as_ref().map(|frame| cycle_discharge(charge_kind(returned.effect.id, returned.effect.kind), returned.charge_type.is_some(), frame.discharge)).unwrap_or(0.0);
+                if amount > 0.0 {
+                    if let Err(refund) = refund_refused_charge(&cx, amount).await {
+                        warn!("module {master} capacitor refund failed: {}", match refund { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
+                    }
+                }
                 (Err("heat connection failed"), Some(returned), None)
             }
-            Some((None, returned)) => (Err("activation stale"), Some(returned), None),
+            Some((None, returned)) => {
+                let amount = returned.inputs.frame.as_ref().map(|frame| cycle_discharge(charge_kind(returned.effect.id, returned.effect.kind), returned.charge_type.is_some(), frame.discharge)).unwrap_or(0.0);
+                if super::super::active_cycle::ship_mode(returned.effect.id) && amount > 0.0 {
+                    if let Err(refund) = refund_refused_charge(&cx, amount).await {
+                        warn!("module {master} capacitor refund failed: {}", match refund { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
+                    }
+                }
+                (Err("activation stale"), Some(returned), None)
+            }
             None => (Err("system unavailable"), None, None),
         }
     } else { (result, Some(cycle), None) };

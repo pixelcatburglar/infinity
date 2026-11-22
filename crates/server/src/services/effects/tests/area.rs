@@ -77,7 +77,7 @@ async fn smartbomb_damages_near_owned_unpiloted_ball_but_not_source_or_outside()
             state.active.insert(module_id, ActiveModule { char_id: f.character, stop: generation.clone(), forced_inactive: false });
             state.activation_generation.insert(module_id, generation.clone());
         }
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], effect,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
             target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module_id, generation, armed: true,
                 combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id, generation: crate::space::targeting::next_generation(), sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
@@ -186,7 +186,7 @@ async fn bomb_flies_before_dealing_raw_damage_to_launcher_and_consumes_one_charg
             state.active.insert(module_id, ActiveModule { char_id: f.character, stop: generation.clone(), forced_inactive: false });
             state.activation_generation.insert(module_id, generation.clone());
         }
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], effect,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
             target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module_id, generation, armed: true,
                 combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id, generation: crate::space::targeting::next_generation(), sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
@@ -345,7 +345,7 @@ async fn vorton_spends_one_charge_and_limits_arcs_around_primary() {
             state.active.insert(module_id, ActiveModule { char_id: f.character, stop: generation.clone(), forced_inactive: false });
             state.activation_generation.insert(module_id, generation.clone());
         }
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], effect,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
             target: Some(ids[0]), repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module_id, generation, armed: true,
                 combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id, generation: crate::space::targeting::next_generation(), sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
@@ -464,7 +464,7 @@ async fn removed_bomb_releases_its_native_attempt_at_expiry() {
             state.active.insert(module_id, ActiveModule { char_id: f.character, stop: generation.clone(), forced_inactive: false });
             state.activation_generation.insert(module_id, generation.clone());
         }
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], effect,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: weapon, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
             target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module_id, generation, armed: true,
                 combat_generations: vec![lifecycle::NativeCombatGeneration { module_id, generation: crate::space::targeting::next_generation(), sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
@@ -578,7 +578,7 @@ async fn defender_no_target_preserves_loaded_charge_and_permit() {
     combat::state().active.insert(module, ActiveModule { char_id: f.character, stop: generation.clone(), forced_inactive: false });
     combat::state().activation_generation.insert(module, generation.clone());
     let cx = Ctx { db: db.clone(), world: world.clone(), notify: tx, char_id: f.character, ship_id: f.ship, system_id: 1 };
-    let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: launcher, flag: FLAG_HI_SLOT_FIRST }], effect,
+    let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: launcher, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
         target: None, repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation, armed: true, combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id: module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
             pending_combat: None, world: Arc::downgrade(&world), system: 1 }, started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0,
         nominal_start: 0, other: None, repair_amount: 0.0, illegal: false, source_membership: None, target_type: None, inputs: Default::default() };

@@ -5,7 +5,10 @@
 //! payout's final capture all write through `write_in` inside the caller's
 //! transaction and prove the outcome later through `resolve_in`. The Arc
 //! outlives its caller's Future; a cached `Unknown` is re-probed under a fresh
-//! character fence, while other outcomes remain authoritative.
+//! character fence, while other outcomes remain authoritative. Complete `Pool`
+//! equality carries the immutable legacy count and the canonical new gain,
+//! including a NULL full gain: a difference in either field alone is enough
+//! for `Unknown`, and no second proof vector or epsilon comparison is used.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use anyhow::anyhow;
