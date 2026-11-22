@@ -2,7 +2,7 @@ use super::*;
 
 /// Dedicated test-database configuration shared by every domain: the test URL
 /// with the downgrade guard off, so connects never refuse on recorded history.
-pub(super) fn database_config() -> deployment::DatabaseConfig {
+pub(crate) fn database_config() -> deployment::DatabaseConfig {
     deployment::DatabaseConfig {
         url: std::env::var("INFINITY_TEST_DATABASE_URL").expect("INFINITY_TEST_DATABASE_URL must name a dedicated test database"),
         schema_downgrade_guard: false,

@@ -64,33 +64,39 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let amount = call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
     let void_old = call.kwargs.get("voidOld").or(call.args.get(3)).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
-    let Some(item) = crate::services::items::load_items(db, &c.sde, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.pop() else {
-        return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
-    };
-    if item.owner_id != me || !item.singleton || item.category_id != CATEGORY_SHIP as i64 {
-        return Err(notify_error(messages::INSURANCE_REQUIRES_OWN_ASSEMBLED_SHIP));
-    }
-    let full = value(&c.sde, item.type_id);
-    let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
-        return Err(notify_error(messages::INSURANCE_QUOTE_EXPIRED));
-    };
-    let existing = insurance::contract(db, ship).await.map_err(db_err)?;
-    if existing.is_some() && !void_old {
-        return Err(CallError::User { msg: messages::MSG_INSURE_SHIP_FAILED_SINGLE_CONTRACT.into(), dict: vec![("ownerID".into(), Value::Int(me))] });
-    }
     let now = filetime_now();
-    let type_id = item.type_id;
+    let sde = c.sde.clone();
     db.transaction(
-        |tx, outbox: &mut Outbox| Box::pin(async move {
+        move |tx, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+            if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? {
+                return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
+            }
+            let Some(current) = crate::services::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.pop() else {
+                return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
+            };
+            if current.owner_id != me || !current.singleton || current.category_id != CATEGORY_SHIP as i64 {
+                return Err(notify_error(messages::INSURANCE_REQUIRES_OWN_ASSEMBLED_SHIP));
+            }
+            let full = value(&sde, current.type_id);
+            let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
+                return Err(notify_error(messages::INSURANCE_QUOTE_EXPIRED));
+            };
+            if insurance::contract(tx, ship).await.map_err(db_err)?.is_some() && !void_old {
+                return Err(CallError::User { msg: messages::MSG_INSURE_SHIP_FAILED_SINGLE_CONTRACT.into(), dict: vec![("ownerID".into(), Value::Int(me))] });
+            }
+            let type_id = current.type_id;
             super::wallets::debit(tx, outbox, me, crate::isk::IskAmount::from_isk(amount)?).await?;
             insurance::insure(tx, ship, me, type_id, fraction, now, now + CONTRACT_DAYS * FILETIME_DAY).await.map_err(db_err)?;
             super::mail::notify(tx, outbox, me, NOTIFICATION_ISSUED, NOTIFICATION_GROUP_INSURANCE, INSURER, &format!("{{itemID: {ship}, typeID: {type_id}}}")).await?;
             outbox.notify_pilot(me, "OnShipInsured", vec![]);
             Ok(())
-        }),
+            })
+        },
         |(), outbox| async move { dispatch_world((), outbox, world) },
     ).await?;
-    info!("insurance: {me} insured ship {ship} at {fraction} for {amount:.0} ISK");
+    info!("insurance: {me} insured ship {ship} for {amount:.0} ISK");
     Ok(Value::None)
 }
 
@@ -145,13 +151,16 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "InsureShip" => insure(c, call).await,
         "UnInsureShip" => {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            match insurance::uninsure(db, ship, me).await {
-                Ok(_) => {
-                    c.world.notify_pilot(me, "OnShipInsured", vec![]);
-                    Ok(Value::None)
-                }
-                Err(e) => Err(db_err(e)),
-            }
+            let world = &*c.world;
+            c.db.transaction(
+                |tx, outbox: &mut Outbox| Box::pin(async move {
+                    if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Ok(()); }
+                    insurance::uninsure(tx, ship, me).await.map_err(db_err)?;
+                    outbox.notify_pilot(me, "OnShipInsured", vec![]);
+                    Ok(())
+                }),
+                |(), outbox| async move { dispatch_world((), outbox, world) },
+            ).await.map(|()| Value::None)
         }
         _ => return None,
     })

@@ -2,7 +2,9 @@
 //! Restoration prepares positioned drones before the system actor starts; orders
 //! and controller state are transient, and unsupported drone work is refused.
 //! Restoration also carries each real owner's persistent GM NPC-ignore flag
-//! from the positioned join into the prepared drone.
+//! from the positioned join into the prepared drone. Salvage cargo committed
+//! to a drone stays durable: contact, return and scoop paths discover the
+//! actual children inside their own transactions.
 
 use std::sync::Arc;
 
@@ -14,9 +16,9 @@ use crate::services::{db_err, notify_error, CallError, fit::{Fit, Key}, items::l
 use crate::space::{Ball, MODE_STOP, WarpState, drone::PreparedDrone};
 pub(crate) mod launch;
 pub(crate) mod returning;
-
+pub(in crate::services::drones) mod cargo;
 /// Lock and validate the currently selected hull before drone inventory changes.
-async fn prepare_ship(ex: &(impl Executor + ?Sized), sde: &Sde, owner: i64, ship: i64, system: i64) -> Result<(), CallError> {
+pub(super) async fn prepare_ship(ex: &(impl Executor + ?Sized), sde: &Sde, owner: i64, ship: i64, system: i64) -> Result<(), CallError> {
     let unavailable = || notify_error(infinity_core::messages::drones::NOT_AVAILABLE);
     if !ship_dao::lock_reload_ship(ex, ship).await.map_err(db_err)? || crate::dao::characters::selection::ship_id(ex, owner).await.map_err(db_err)? != Some(ship) { return Err(unavailable()); }
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(unavailable)?;

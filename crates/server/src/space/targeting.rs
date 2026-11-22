@@ -1,4 +1,4 @@
-//! Provides target visibility checks and generations for space actors.
+//! Provides target visibility checks and process-unique generations for space actors and combat activations.
 //! No direct client mirror; the combat service owns the targeting wire contract.
 //! No tables; uses ball state and an in-memory counter.
 //! Visibility alone does not check range, locks or targeting eligibility.

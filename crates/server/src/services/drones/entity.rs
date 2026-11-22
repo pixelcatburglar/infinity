@@ -1,7 +1,8 @@
 //! Entity moniker commands used by the client drone menu. State is delivered by
 //! Michelle bootstrap and notifications, not a remote state-query method. Mining
-//! orders require a visible asteroid owned by the current system.
-
+//! orders require a visible asteroid owned by the current system. Salvage orders
+//! take an optional locked wreck or pick the owner's nearest visible wreck; a
+//! drone found carrying committed cargo delivers it to the ship before new work.
 use std::collections::HashSet;
 use marshal::Value;
 use crate::client::Client;
@@ -22,6 +23,13 @@ fn parse(method: &str, args: &[Value]) -> Result<(Vec<i64>, Command), CallError>
         ("CmdEngage", [ids, target]) => (ids, Command::Order(DroneOrder::Engage(positive_id(target).ok_or_else(invalid)?))),
         ("CmdMineRepeatedly", [ids, target]) => (ids, Command::Order(DroneOrder::Mine(positive_id(target).ok_or_else(invalid)?))),
         ("CmdAssist", [character, ids]) => (ids, Command::Order(DroneOrder::Assist(positive_id(character).ok_or_else(invalid)?))),
+        ("CmdSalvage", [ids, target]) => {
+            let target = match target {
+                Value::None => None,
+                value => Some(positive_id(value).ok_or_else(invalid)?),
+            };
+            (ids, Command::Order(DroneOrder::Salvage(target)))
+        }
         ("CmdGuard", [character, ids]) => (ids, Command::Order(DroneOrder::Guard(positive_id(character).ok_or_else(invalid)?))),
         ("CmdReturnHome", [ids]) => (ids, Command::Order(DroneOrder::ReturnHome)),
         ("CmdReturnBay", [ids]) => (ids, Command::Order(DroneOrder::ReturnBay)),
@@ -49,7 +57,7 @@ fn record_error(errors: &mut Vec<(Value, Value)>, id: i64, error: CallError) -> 
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
-    if !matches!(call.method, "CmdEngage" | "CmdMineRepeatedly" | "CmdAssist" | "CmdGuard" | "CmdReturnHome" | "CmdReturnBay" | "CmdAbandonDrone") {
+    if !matches!(call.method, "CmdEngage" | "CmdMineRepeatedly" | "CmdAssist" | "CmdGuard" | "CmdSalvage" | "CmdReturnHome" | "CmdReturnBay" | "CmdAbandonDrone") {
         return Err(crate::services::effects::unsupported::refusal(None, call.method, 0));
     }
     let (ids, command) = parse(call.method, call.args)?;
@@ -73,19 +81,23 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 async fn execute(c: &mut Client, system: i64, owner: i64, ship: i64, id: i64, command: Command) -> Result<(), CallError> {
     let (drone, mineable) = c.world.with(system, move |s| {
         let mineable = match command { Command::Order(DroneOrder::Mine(target)) => s.rock_type(target).is_some(), _ => true };
-        (s.drone(id).filter(|_| s.ball(id).is_some()), mineable)
+        (s.drone(id).filter(|_| s.ball(id).is_some()).map(|drone| (drone, s.combat_membership_generation(id))), mineable)
     }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
-    let drone = drone.ok_or_else(|| notify_error(text::NOT_AVAILABLE))?;
+    let Some((drone, membership)) = drone else { return Err(notify_error(text::NOT_AVAILABLE)); };
     if drone.owner != owner { return Err(notify_error(text::NOT_AVAILABLE)); }
     if command == Command::Abandon { return super::inventory::abandon(c, id).await; }
     let Command::Order(order) = command else { unreachable!() };
     if drone.controller != Some(ship) && !(order == DroneOrder::ReturnBay && drone.controller.is_none()) {
         return Err(notify_error(text::NOT_CONTROLLED));
     }
-    if matches!(order, DroneOrder::Engage(_) | DroneOrder::Mine(_) | DroneOrder::Assist(_) | DroneOrder::Guard(_)) && drone.spec.effect_id.is_none() {
+    if matches!(order, DroneOrder::Engage(_) | DroneOrder::Mine(_) | DroneOrder::Assist(_) | DroneOrder::Guard(_) | DroneOrder::Salvage(_)) && drone.spec.effect_id.is_none() {
         return Err(crate::services::effects::unsupported::refusal(None, "drone effect", drone.spec.type_id));
     }
-    if let DroneOrder::Engage(target) | DroneOrder::Mine(target) = order {
+    let effect_kind = drone.spec.effect_id.and_then(|id| crate::services::effects::registry::resolve(&c.sde, id)).map(|effect| effect.kind);
+    if matches!(order, DroneOrder::Salvage(_)) && effect_kind != Some(crate::services::effects::EffectKind::Salvage) {
+        return Err(crate::services::effects::unsupported::refusal(None, "drone effect", drone.spec.type_id));
+    }
+    if let DroneOrder::Engage(target) | DroneOrder::Mine(target) | DroneOrder::Salvage(Some(target)) = order {
         if !crate::services::combat::targeting_charges::targets_of(owner).contains(&target) {
             return Err(crate::services::user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
         }
@@ -105,8 +117,21 @@ async fn execute(c: &mut Client, system: i64, owner: i64, ship: i64, id: i64, co
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
         if !valid { return Err(notify_error(text::NOT_AVAILABLE)); }
     }
-    let accepted = c.world.with(system, move |s| s.drone_order(id, owner, ship, order)).await
-        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+    // Cold cargo discovery reads the facts before the order, so the one actor
+    // admission below verifies and marks atomically; only SDE salvage drones
+    // ever pay for the read, and a refused order never moves the marker.
+    let discover = matches!(order, DroneOrder::Salvage(_) | DroneOrder::ReturnHome)
+        && effect_kind == Some(crate::services::effects::EffectKind::Salvage)
+        && !c.world.with(system, move |s| s.drone_carries_cargo(id)).await.unwrap_or(false)
+        && !crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::Location(id)).await.map_err(crate::services::db_err)?.is_empty();
+    // The discovery read ran outside the actor: order and marker apply only
+    // while the same generation, membership and controller still hold.
+    let (generation, controller) = (drone.generation, drone.controller);
+    let accepted = c.world.with(system, move |s| {
+        if !s.drone_current(id, generation) || s.combat_membership_generation(id) != membership
+            || s.drone(id).is_none_or(|d| d.controller != controller) { return false; }
+        s.drone_order(id, owner, ship, order) && (!discover || s.drone_mark_carried(id, owner))
+    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
     if !accepted { return Err(notify_error(text::NOT_AVAILABLE)); }
     Ok(())
 }

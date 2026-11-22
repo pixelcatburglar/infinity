@@ -2,6 +2,9 @@
 //! consumed by `eve/client/script/remote/michelle.py`; hulls and their fittings
 //! come from game items and the SDE. Condition is installed only for a published
 //! hull, so duplicate restoration cannot replace live state. Boarding is separate.
+//! A restored stance-capable hull missing its state is initialized in one
+//! hull-locked transaction before its ball is prepared; drift or a malformed
+//! state aborts the load with the ship id instead of a silent skip.
 use super::{Ball, System, World, MILLISECONDS_PER_SECOND};
 use infinity_core::consts::CATEGORY_SHIP;
 
@@ -26,6 +29,44 @@ impl World {
         let mut balls = Vec::new();
         for row in rows {
             if self.sde.types.get(row.type_id).and_then(|t| t.category_id) != Some(CATEGORY_SHIP) { continue; }
+            // Only stance-capable hulls pay the initialization transaction;
+            // every other ship type skips it through the in-memory table.
+            if crate::sde::ship_stances::for_hull(row.type_id).is_some() {
+                let sde = self.sde.clone();
+                let world = self;
+                self.db.transaction(
+                    move |tx, outbox: &mut crate::db::outbox::Outbox| {
+                        let sde = sde.clone();
+                        Box::pin(async move {
+                            // The caller already holds the market lifecycle
+                            // guard; only the hull row lock is taken here.
+                            if !crate::dao::items::ship::lock_reload_ship(tx, row.item_id)
+                                .await.map_err(crate::services::db_err)?
+                            {
+                                return Err(crate::services::CallError::Internal(
+                                    anyhow::anyhow!("persistent ship {} hull row missing", row.item_id)));
+                            }
+                            let hull = crate::services::items::load_items(tx, &sde,
+                                    crate::dao::items::loading::ItemQuery::Id(row.item_id)).await
+                                .map_err(crate::services::db_err)?.into_iter().next()
+                                .ok_or_else(|| crate::services::CallError::Internal(
+                                    anyhow::anyhow!("persistent ship {} hull row missing", row.item_id)))?;
+                            if hull.owner_id != row.owner_id || hull.type_id != row.type_id
+                                || hull.location_id != system || hull.flag_id != 0
+                                || !hull.singleton || hull.quantity != 1
+                            {
+                                return Err(crate::services::CallError::Internal(
+                                    anyhow::anyhow!("persistent ship {} hull drifted from the unpiloted row", row.item_id)));
+                            }
+                            crate::services::ship_stance::state::ensure_initialized_tx(tx, &sde, outbox, &hull).await
+                        })
+                    },
+                    |_, outbox| async move { crate::db::outbox::dispatch_world((), outbox, world) },
+                ).await.map_err(|error| match error {
+                    crate::services::CallError::Internal(error) => anyhow::anyhow!("persistent ship {}: {error}", row.item_id),
+                    crate::services::CallError::User { msg, .. } => anyhow::anyhow!("persistent ship {}: {msg}", row.item_id),
+                })?;
+            }
             let ball = crate::services::ship::balls::unpiloted(&self.db, self.sde.clone(), &row).await
                 .map_err(|error| match error {
                     crate::services::CallError::Internal(error) => error,

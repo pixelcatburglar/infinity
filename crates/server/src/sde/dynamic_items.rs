@@ -65,7 +65,8 @@ fn parse_row(key: Option<&str>, data: &str) -> Result<(i32, Mutation), Exclusion
         }
         let min = range.get("min").and_then(Value::as_f64).filter(|n| n.is_finite() && *n > 0.0).ok_or_else(bad)?;
         let max = range.get("max").and_then(Value::as_f64).filter(|n| n.is_finite() && *n > 0.0).ok_or_else(bad)?;
-        if min > max { return Err(bad()); }
+        // The source endpoints may run in either direction. The existing
+        // affine sample uses them as stored.
         if let Some(value) = range.get("highIsGood") { flag(value).ok_or_else(bad)?; }
         if let Some(value) = range.get("canEnsureGood") { flag(value).ok_or_else(bad)?; }
         if attributes.insert(id, AttributeRange { min, max }).is_some() { return Err(bad()); }

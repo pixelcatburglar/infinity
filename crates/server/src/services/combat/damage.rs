@@ -1,14 +1,17 @@
 //! Applies typed damage and repairs to actor-owned fitted health. Nonlethal
 //! observations follow the actor mutation; player loss facts and notifications
 //! commit atomically through the ship loss service. Live health is checkpointed
-//! by the system snapshot worker. Flat, Breacher and DOT damage are unsupported.
+//! by the system snapshot worker. Flat Breacher boarding damage enters
+//! through `apply_flat_damage_in_actor`.
 //! `apply_damage_in_actor` is the shared in-actor entry; `apply_damage_guarded`
 //! wraps it with an admission guard for callers outside the actor.
-//! `apply_area_damage_in_actor` is the shared in-actor batch for one sampled
+//! `area::apply_area_damage_in_actor` is the shared in-actor batch for one sampled
 //! victim set; wrappers outside the actor run their admission guard first.
 use super::*;
 use crate::services::effects::online::OnlineChanged;
-use crate::services::ship::loss::{destroy_ship_in_transaction, medical, publish_loss, LossInput, LossOutcome};
+use crate::services::ship::loss::{destroy_ship_in_transaction, facts, medical, publish_loss, LossInput, LossOutcome};
+
+pub(crate) mod area;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DamageSource {
@@ -36,138 +39,6 @@ fn fact_refusal(system: i64, refusal: crate::space::combat_facts::Refusal) -> Op
             Some(CallError::Internal(anyhow::anyhow!("combat fact refusal: {refusal:?}"))),
     }
 }
-/// The result of one in-actor area batch: `attempt_finished` marks that
-/// `apply_area_damage` ran and finished the source attempt on every path it
-/// takes; `fatal` is a refusal that aborts the batch; `first_error` keeps the
-/// first per-target completion failure while the rest still apply. Loss
-/// receipts belong to the caller's worker and must be awaited outside the
-/// actor.
-pub(crate) struct AreaCompletion {
-    pub(crate) attempt_finished: bool,
-    pub(crate) fatal: Option<CallError>,
-    pub(crate) receipts: Vec<tokio::sync::oneshot::Receiver<Result<(), CallError>>>,
-    pub(crate) first_error: Option<CallError>,
-}
-
-/// Shared in-actor area apply/finish for one sampled victim batch
-/// `(target, pilot, membership, illegal, report)`. `valid_source` admits the
-/// batch; a declined batch clears `victims` so no hit report is emitted.
-/// `application` selects each accepted victim's raw vector: a fixed typed
-/// vector for every victim, the Vorton missile formula sampled per target,
-/// or a fitted weapon signature scale.
-/// Damageable projectiles in range take the projectile path after source
-/// admission and never enter ship plans. The caller keeps ownership of any
-/// attempt token: this helper finishes the `facts` attempt only through
-/// `admit_area_source`/`apply_area_damage`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_area_damage_in_actor(
-    s: &mut crate::space::System, db: &Db, system: i64, weapon: i32,
-    victims: &mut Vec<(i64, Option<i64>, Option<u64>, bool, Option<(i64, f64)>)>,
-    application: crate::services::effects::aoe::DamageApplication,
-    facts: crate::space::combat_facts::CombatSource,
-    sde: &crate::sde::Sde, valid_source: bool,
-) -> AreaCompletion {
-    use crate::services::effects::aoe::DamageApplication;
-    let ship = facts.entity.item_id;
-    let attacker = facts.actual_actor_character;
-    let mut completion = AreaCompletion { attempt_finished: false, fatal: None, receipts: Vec::new(), first_error: None };
-    if !valid_source {
-        victims.clear();
-        return completion;
-    }
-    if let Err(error) = s.observe_combat_utc() {
-        completion.fatal = Some(match error {
-            crate::space::combat_facts::Refusal::Full => super::capacity::refusal(system),
-            other => CallError::Internal(anyhow::anyhow!("area boundary refusal: {other:?}")),
-        });
-        return completion;
-    }
-    let at = s.combat_observed_time();
-    victims.sort_unstable_by_key(|entry| entry.0);
-    let mut targets = Vec::with_capacity(victims.len());
-    let mut projectiles = Vec::new();
-    for (target, pilot, membership, illegal, report) in victims.iter_mut() {
-        let (target, pilot, membership, illegal) = (*target, *pilot, *membership, *illegal);
-        if s.projectile_damageable(target) {
-            let base = match application {
-                DamageApplication::Fixed(raw) => raw,
-                DamageApplication::Vorton(inputs) => inputs.raw,
-                DamageApplication::Signature { raw, .. } => raw,
-            };
-            projectiles.push((target, base));
-            continue;
-        }
-        if !s.ball(target).is_some_and(|ball| ball.char_id == pilot)
-            || s.combat_membership_generation(target) != membership { continue; }
-        if s.is_damage_immune(target) { continue; }
-        let raw = match application {
-            DamageApplication::Fixed(raw) => {
-                *report = Some((crate::services::effects::weapons::hit_quality(1.0), 0.0));
-                raw
-            }
-            DamageApplication::Vorton(inputs) => {
-                let Some(victim) = s.sampled_ball(target) else { continue };
-                *report = Some((crate::services::effects::weapons::hit_quality(1.0), 0.0));
-                crate::services::effects::vorton::vorton_application(inputs.raw,
-                    crate::services::effects::weapons::target_signature(sde, &victim),
-                    crate::space::dist(victim.vel, [0.0; 3]), inputs.aoe_cloud, inputs.aoe_velocity, inputs.drf)
-            }
-            DamageApplication::Signature { raw, signature_radius } => {
-                let factor = if signature_radius > 0.0 {
-                    let Some(victim) = s.sampled_ball(target) else { continue };
-                    (crate::services::effects::weapons::target_signature(sde, &victim) / signature_radius).clamp(0.0, 1.0)
-                } else { 1.0 };
-                if factor <= 0.0 { continue; }
-                *report = Some((crate::services::effects::weapons::hit_quality(1.0), 0.0));
-                raw.map(|value| value * factor)
-            }
-        };
-        let source = DamageSource { attacker_id: attacker, attacker_ball_id: Some(ship),
-            source_ship_id: Some(ship), source_ship_type: Some(facts.entity.type_id),
-            weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal };
-        match s.plan_area_damage(target, raw, source, at) {
-            Some(plan) => targets.push(plan),
-            None if matches!(s.combat_phase(target), Some(crate::space::combat::CombatPhase::Live)) => {
-                completion.fatal = Some(CallError::Internal(anyhow::anyhow!("area damage plan failed for live target")));
-                return completion;
-            }
-            None => { *report = None; }
-        }
-    }
-    targets.sort_unstable_by_key(|target| (target.target.item_id, target.target.incarnation));
-    let applied = if targets.is_empty() { s.admit_area_source(facts, &mut [], at, |_| valid_source) }
-        else { s.apply_area_damage(facts, &mut targets, at, |_| valid_source) };
-    completion.attempt_finished = true;
-    match applied {
-        Ok(false) => return completion,
-        Err(crate::space::combat_facts::Refusal::Full) => {
-            completion.fatal = Some(super::capacity::refusal(system));
-            return completion;
-        }
-        Err(crate::space::combat_facts::Refusal::Replay | crate::space::combat_facts::Refusal::Busy) => {
-            victims.clear();
-            return completion;
-        }
-        Err(error) => {
-            completion.fatal = Some(CallError::Internal(anyhow::anyhow!("area combat refusal: {error:?}")));
-            return completion;
-        }
-        Ok(true) => {}
-    }
-    for (target, projectile_raw) in projectiles { s.apply_projectile_damage(target, projectile_raw); }
-    for target in &mut targets {
-        let Some(outcome) = target.payload.outcome.take() else { continue };
-        if let Ok(index) = victims.binary_search_by_key(&target.target.item_id, |entry| entry.0) {
-            if let Some((_, dealt)) = victims[index].4.as_mut() { *dealt = outcome.dealt; }
-        }
-        match complete_damage_outcome(s, db, system, target.target.item_id, outcome) {
-            Ok((_, Some(receipt))) => completion.receipts.push(receipt),
-            Ok((_, None)) => {},
-            Err(error) => if completion.first_error.is_none() { completion.first_error = Some(error); },
-        }
-    }
-    completion
-}
 
 
 
@@ -190,7 +61,38 @@ pub(crate) fn apply_damage_in_actor(
         if let Some(facts) = source.facts { s.finish_combat_attempt(&facts); }
         return Err(CallError::Internal(anyhow::anyhow!("non-finite combat target position")));
     }
-    let outcome = match s.apply_damage(target, raw, source, force_loss) {
+    let result = s.apply_damage(target, raw, source, force_loss);
+    complete_in_actor(s, db, system, target, result)
+}
+
+/// Flat (resistance-free) sibling of `apply_damage_in_actor` for Breacher pod
+/// ticks; same validation, admission and completion.
+pub(crate) fn apply_flat_damage_in_actor(
+    s: &mut crate::space::System, db: &Db, system: i64, target: i64,
+    amount: f64, source: DamageSource,
+) -> Result<Option<(DamageOutcome, Option<tokio::sync::oneshot::Receiver<Result<(), CallError>>>)>, CallError> {
+    if !amount.is_finite() || amount < 0.0 {
+        if let Some(facts) = source.facts { s.finish_combat_attempt(&facts); }
+        return Err(CallError::Internal(anyhow::anyhow!("invalid flat damage")));
+    }
+    if s.sample_position(target).is_some_and(|pos| !pos.iter().all(|v| v.is_finite())) {
+        if let Some(facts) = source.facts { s.finish_combat_attempt(&facts); }
+        return Err(CallError::Internal(anyhow::anyhow!("non-finite combat target position")));
+    }
+    let result = s.apply_flat_damage(target, amount, source);
+    complete_in_actor(s, db, system, target, result)
+}
+
+/// Shared completion of the two in-actor damage entries: `apply_damage` and
+/// `apply_flat_damage` finish the source attempt on every return, so the
+/// refusal mapping and outcome completion here never finish twice. A returned
+/// loss receipt belongs to the caller's worker and must be awaited outside
+/// the actor.
+fn complete_in_actor(
+    s: &mut crate::space::System, db: &Db, system: i64, target: i64,
+    result: Result<Option<crate::space::combat::ActorDamageOutcome>, crate::space::combat_facts::Refusal>,
+) -> Result<Option<(DamageOutcome, Option<tokio::sync::oneshot::Receiver<Result<(), CallError>>>)>, CallError> {
+    let outcome = match result {
         Ok(outcome) => outcome,
         Err(refusal) => return match fact_refusal(system, refusal) {
             Some(error) => Err(error),
@@ -314,19 +216,11 @@ fn npc_combat_contact(s: &crate::space::System, source: &DamageSource, target_is
     }
 }
 
-
-fn loss_identity(system: i64, snapshot: &crate::space::combat::FirstLethalSnapshot) -> Option<Identity> {
-    snapshot.identity.map(|char_id| Identity {
-        char_id, ship_id: Some(snapshot.item_id), corp_id: snapshot.corp_id,
-        station_id: None, system_id: Some(system),
-    })
-}
-
 async fn settle_loss(
     db: Db, world: Arc<World>, system: i64, snapshot: Arc<crate::space::combat::FirstLethalSnapshot>, new: [f64; 3],
 ) -> Result<(), CallError> {
     let _market = super::super::market::lock().await;
-    let identity = loss_identity(system, &snapshot);
+    let identity = facts::loss_identity(system, &snapshot);
     let sde = world.sde().clone();
     // Only a real piloted capsule-group hull captures the owner's online fences,
     // and only before any gate; ordinary and unpiloted losses keep the source
@@ -401,8 +295,11 @@ async fn settle_loss(
             let loaded = loaded.clone();
             Box::pin(async move {
                 if let Some(identity) = identity.as_ref() {
-                    // Serialize the piloted owner before the checkpoint and item locks.
+                    // Serialize the piloted owner, then freeze the original hull source before checkpoint and remaining item locks.
                     crate::dao::characters::selection::lock_character(tx, identity.char_id).await.map_err(db_err)?;
+                    crate::dao::items::ship::lock_reload_ship(tx, snapshot.item_id).await.map_err(db_err)?;
+                    facts::freeze_source(tx, &input.pending, crate::dao::repairable_ship::SourceKind::PilotedShip,
+                        snapshot.item_id, identity.char_id, input.victim.type_id, system, input.lethal_at, input.position).await?;
                     let committed = if let Some(frame) = input.pending.checkpoint.as_ref() {
                         frame.is_committed(tx).await.map_err(db_err)?
                     } else { false };
@@ -594,7 +491,7 @@ async fn reconcile_locked(
     let frozen = pending.as_ref().and_then(|context| crate::poison::lock_or_exit(context.recovery_source.lock()).clone())
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("loss source unavailable")))?;
     let (physical_committed, original_live) = recovery_proof(db, &frozen).await?;
-    if let Some(identity) = loss_identity(system, snapshot) {
+    if let Some(identity) = facts::loss_identity(system, snapshot) {
         let char_id = identity.char_id;
         let source = db.transaction(
             |tx, _outbox: &mut Outbox| Box::pin(async move {

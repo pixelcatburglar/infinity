@@ -3,7 +3,7 @@
 //! always stops at `npc_sleep_origin`; earlier refusals and the structural
 //! move/install are still exercised exactly.
 use super::*;
-use crate::space::combat_facts::{CombatFacts, CombatSource, Refusal};
+use crate::space::combat_facts::{CombatFacts, Refusal};
 use crate::space::system::npc_sleep::NpcSpawnOrigin;
 
 fn brain(owner: Option<i64>) -> NpcBrain {
@@ -96,25 +96,15 @@ fn sleep_admission_refuses_live_activity_and_unknown_groups() {
 #[test]
 fn combat_facts_pending_attempts_block_sleep_and_ledger_continues() {
     let mut s = cohort();
-    let mut facts = CombatFacts::new(9, s.id, 8, 8);
-    let activation = { let mut a = [0u8; 16]; a[8..].copy_from_slice(&7u64.to_be_bytes()); a };
-    facts.register_source(activation, 7, 1).unwrap();
-    let entity = crate::lua::events::combat::CombatEntity {
-        item_id: 1000, type_id: 1, incarnation: [0u8; 16],
-        character_id: None, corporation_id: None, alliance_id: None, faction_id: None };
-    let context = crate::lua::events::resources::FactContext {
-        corporation_id: None, alliance_id: None, faction_id: None, ship_id: Some(1000),
-        ship_type_id: Some(1), system_id: Some(7), station_id: None,
-        origin: crate::lua::events::resources::FactOrigin::Natural };
-    let source = CombatSource { actual_actor_character: None, entity, source_is_npc: true,
-        context, controller_incarnation: None, module_id: None, effect_id: None,
-        weapon_type_id: None, activation, sequence: 1 };
-    facts.reserve_attempt(&source).unwrap();
-    s.combat_facts = Some(facts);
+    s.combat_facts = Some(CombatFacts::new(9, s.id, 8, 8));
+    let source = s.prepare_body_combat_source(1000, None, None, None,
+        crate::lua::events::resources::FactOrigin::Natural, |s| s.is_npc(1000)).unwrap();
+    let entity = source.entity;
     // A clean journal with an outstanding attempt is not quiescent.
     assert_eq!(s.npc_sleep_blocked(), Some("combat_attempts"));
+    let at = s.combat_observed_time();
     let facts = s.combat_facts.as_mut().unwrap();
-    let reserved = facts.reserve_damage(source, &entity, 1).unwrap();
+    let reserved = facts.reserve_damage(source, &entity, at).unwrap();
     facts.release(reserved);
     assert!(!facts.has_pending_attempts());
     let payload = s.take_sleeping_npcs().unwrap().expect("proven cohort");
@@ -125,8 +115,10 @@ fn combat_facts_pending_attempts_block_sleep_and_ledger_continues() {
     let mut s2 = System::new(7, Arc::new(Pilots::default()), 0);
     s2.projection_sde = Some(crate::sde::types::tests::combat_fixture());
     s2.install_sleeping_npcs(payload);
-    let restored = s2.combat_facts.as_mut().unwrap();
-    assert_eq!(restored.runtime_epoch(), 9);
-    assert!(restored.reserve_attempt(&CombatSource { sequence: 2, ..source }).is_ok());
-    assert!(matches!(restored.reserve_attempt(&CombatSource { sequence: 1, ..source }), Err(Refusal::Replay)));
+    assert_eq!(s2.combat_facts.as_ref().unwrap().runtime_epoch(), 9);
+    let next = s2.prepare_body_combat_source(1000, None, None, None,
+        crate::lua::events::resources::FactOrigin::Natural, |s| s.is_npc(1000)).unwrap();
+    assert_eq!(next.activation, source.activation);
+    assert_eq!(next.sequence, source.sequence + 1);
+    assert!(matches!(s2.combat_facts.as_mut().unwrap().reserve_attempt(&source), Err(Refusal::Replay)));
 }

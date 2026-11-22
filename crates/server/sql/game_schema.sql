@@ -227,6 +227,15 @@ CREATE TABLE IF NOT EXISTS game.ship_kill_counts (
     player_kills bigint NOT NULL CHECK (player_kills >= 0)
 );
 
+-- dao/items/ship_stance: per-hull stance switch timing in FILETIME; the
+-- current stance is the real hidden mode item, so no current column exists.
+CREATE TABLE IF NOT EXISTS game.ship_stances (
+    ship_id            bigint PRIMARY KEY REFERENCES game.items(item_id) ON DELETE CASCADE,
+    previous_stance_id bigint,
+    switched_at        bigint NOT NULL,
+    ready_at           bigint NOT NULL
+);
+
 
 -- Ship SKIN licenses and applications; expiry timestamps use FILETIME.
 CREATE TABLE IF NOT EXISTS game.ship_skin_licenses (
@@ -2089,6 +2098,29 @@ CREATE TABLE IF NOT EXISTS game.npc_bounty_pools (
     CHECK (batch_started_at > 0 AND due_at > batch_started_at)
 );
 CREATE INDEX IF NOT EXISTS npc_bounty_pools_system_idx ON game.npc_bounty_pools (system_id, character_id);
+-- dao/npc_bounties: one-time generation cutover. Old unpaid kills keep their count
+-- as legacy rights; new kills store a frozen finite log, with NULL meaning a full gain.
+ALTER TABLE game.npc_bounty_pools ADD COLUMN IF NOT EXISTS legacy_kill_count bigint;
+ALTER TABLE game.npc_bounty_pools ADD COLUMN IF NOT EXISTS security_gain_log double precision DEFAULT 0;
+UPDATE game.npc_bounty_pools SET legacy_kill_count = kill_count WHERE legacy_kill_count IS NULL;
+ALTER TABLE game.npc_bounty_pools ALTER COLUMN legacy_kill_count SET DEFAULT 0;
+ALTER TABLE game.npc_bounty_pools ALTER COLUMN legacy_kill_count SET NOT NULL;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.npc_bounty_pools'::regclass AND conname = 'npc_bounty_pools_legacy_count_check') THEN
+        ALTER TABLE game.npc_bounty_pools ADD CONSTRAINT npc_bounty_pools_legacy_count_check
+            CHECK (legacy_kill_count >= 0 AND legacy_kill_count <= kill_count);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.npc_bounty_pools'::regclass AND conname = 'npc_bounty_pools_security_gain_check') THEN
+        ALTER TABLE game.npc_bounty_pools ADD CONSTRAINT npc_bounty_pools_security_gain_check
+            CHECK (security_gain_log IS NULL OR (security_gain_log >= 0 AND security_gain_log < 'Infinity'::double precision));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'game.npc_bounty_pools'::regclass AND conname = 'npc_bounty_pools_legacy_gain_check') THEN
+        ALTER TABLE game.npc_bounty_pools ADD CONSTRAINT npc_bounty_pools_legacy_gain_check
+            CHECK (kill_count > legacy_kill_count OR security_gain_log IS NOT NULL AND security_gain_log = 0);
+    END IF;
+END $$;
+
 
 -- Corporate contract ownership and captured custody (dao/contracts).
 -- Defaults: 1000 is the client's master wallet key (appConst accountingKeyCash, ACCOUNT_CASH in consts.rs); 4 is the station hangar flag (inventorycommon const flagHangar, FLAG_HANGAR).

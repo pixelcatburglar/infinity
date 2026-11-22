@@ -36,8 +36,10 @@ fn concord_tickets_gate_reserve_cancel_and_stale_drop() {
     assert!(reserve_concord(&mut *state(), false, 1.0, 0.5, criminal).is_none());
     assert!(reserve_concord(&mut *state(), true, 0.4, 0.5, criminal).is_none());
     let old = reserve_concord(&mut *state(), true, 0.5, 0.5, criminal).unwrap();
+    assert!(concord_pursuit(criminal));
     assert!(is_criminal(criminal, 0) && reserve_concord(&mut *state(), true, 1.0, 0.5, criminal).is_none());
     cancel_concord(criminal);
+    assert!(!concord_pursuit(criminal));
     let new = reserve_concord(&mut *state(), true, 0.5, 0.5, criminal).unwrap();
     assert!((new.generation != old.generation, concord_ticket_current(old), concord_ticket_current(new)) == (true, false, true));
     let mut system = System::default();
@@ -66,6 +68,20 @@ fn queued_concord_ticket_releases_on_drop_or_execution() {
     assert!(reserve_concord(&mut *state(), true, 1.0, 0.5, criminal).is_some());
     drop(system);
     cancel_concord(criminal);
+}
+
+#[test]
+fn pursuit_follows_the_response_ticket_not_the_suspect_flag() {
+    crate::tests::init_config();
+    let suspect = -103;
+    state().pilots.entry(suspect).or_default().suspect_until = i64::MAX;
+    assert!(is_criminal(suspect, 0));
+    assert!(!concord_pursuit(suspect));
+    let ticket = reserve_concord(&mut *state(), true, 1.0, 0.5, suspect).unwrap();
+    assert!(concord_pursuit(suspect));
+    drop(PendingConcord(ticket));
+    assert!(!concord_pursuit(suspect));
+    state().pilots.remove(&suspect);
 }
 
 #[test]

@@ -29,6 +29,9 @@
 //! respawns and warp-exit callbacks are transient; pending work does not survive restart.
 //! Probe charges are consumed atomically before transient probes are created.
 //! Probe origins, directional scans and wormhole range use actor-time sampled positions.
+//! Probe strength, deviation and scan time come from the pilot's resident fit
+//! at scan time; the launch-time module and hull breakdown on OnNewProbe is
+//! display data.
 //!
 //! Client scan consumers: `eve/client/script/parklife/scanSvc.py:193-198,253-260`,
 //! `eve/client/script/parklife/directionalScanSvc.py:46-49`, and
@@ -53,11 +56,13 @@ mod scan_mgr;
 pub(crate) mod wormhole_mgr;
 mod generation;
 mod scanning;
+mod probe_attributes;
 pub(crate) mod sites;
 mod landing;
 
 use generation::*;
 use scanning::*;
+use probe_attributes::*;
 use sites::*;
 
 use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, value_ids, Call, CallError, CallResult};
@@ -109,15 +114,10 @@ const ARCHETYPE_ICE: i64 = 28;
 const ARCHETYPE_GAS: i64 = 30;
 const GROUP_SCATTER_CONTAINER: i32 = 1207;
 const TYPE_K162: i32 = 30831;
-const ATTR_BASE_SENSOR_STRENGTH: i32 = 1371;
 const ATTR_WH_TARGET_CLASS: i32 = 1381;
 const ATTR_WH_LIFE_MINUTES: i32 = 1382;
 const ATTR_WH_MASS: i32 = 1383;
 const ATTR_WH_JUMP_MASS: i32 = 1385;
-// Skills
-const SKILL_ASTROMETRICS: i32 = 3412;
-const SKILL_RANGEFINDING: i32 = 25739;
-const SKILL_ACQUISITION: i32 = 25811;
 /// Probes per pilot (probescanning.const.MAX_PROBES).
 const MAX_PROBES: usize = 8;
 /// A scan's certainty from covering probes: sum of (strength x falloff x ease) / this.
@@ -141,7 +141,6 @@ const SITE_OFFSET: (f64, f64) = (8_000_000.0, 30_000_000.0);
 
 /// Site IDs (and wormhole ball IDs) continue from game.exploration_site_seq.
 static NEXT_SITE_ID: AtomicI64 = AtomicI64::new(0);
-static NEXT_PROBE_ID: AtomicI64 = AtomicI64::new(9_600_000_000_000);
 
 fn pick<T: Clone>(items: &[T]) -> Option<T> {
     (!items.is_empty()).then(|| items[(rand01() * items.len() as f64) as usize % items.len()].clone())
@@ -243,7 +242,9 @@ struct Probe {
     type_id: i32,
     pos: V3,
     expiry: i64,
-    strength: f64,
+    /// Launch-time module/hull percentages for the client's empty-launcher
+    /// breakdown (display only; scans re-read the fit).
+    bonuses: ProbeBonuses,
 }
 
 #[derive(Default)]
@@ -405,25 +406,40 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     else {
         return Ok(Value::None);
     };
+    // Only a real scan-probe launcher and a real scanner charge may mint
+    // scanner state: a forged call naming another charged module (for example
+    // an interdiction sphere launcher) must not consume or create probes here.
+    let launcher_ok = crate::services::items::load_items(&c.db, c.world.sde(), crate::dao::items::loading::ItemQuery::Id(module)).await.map_err(db_err)?
+        .first().and_then(|item| c.world.sde().types.get(item.type_id))
+        .is_some_and(|data| data.group_id == Some(GROUP_SCAN_PROBE_LAUNCHER));
+    if !launcher_ok { return Ok(Value::None); }
+
     let rows = super::combat::loaded::rows(&c.db, &c.world, Some(system), ship).await?;
-    let Some((_, have)) = rows.iter().find(|r| r.flag_id == flag).map(|r| (r.type_id, r.quantity))
+    let Some((probe_type, have)) = rows.iter().find(|r| r.flag_id == flag).map(|r| (r.type_id, r.quantity))
     else {
         return Err(CallError::User { msg: messages::MSG_NO_CHARGES.into(), dict: vec![] });
     };
     let out = state().probes.values().filter(|p| p.char_id == char_id && p.system == system).count();
+    if !c.world.sde().types.get(probe_type).is_some_and(|data| data.group_id == Some(infinity_core::consts::GROUP_SCANNER_PROBE)) {
+        return Ok(Value::None);
+    }
+
     let cap = (MAX_PROBES - out.min(MAX_PROBES)) as i64;
     if wanted.min(have).min(cap) <= 0 {
         return Ok(Value::None);
     }
     let now = filetime_now();
-    let (skill, _) = probe_skills(&c.db, &c.sde, char_id, now).await?;
     let armed = super::combat::loaded::LoadedHolds::arm(&c.world, &[(system, ship)], notify_error(messages::fitting::CHARGES_SETTLING)).await?;
     let _market = crate::services::market::lock().await;
     let mut holds = super::combat::loaded::LoadedHolds::lock(&c.world, armed, notify_error(messages::fitting::CHARGES_SETTLING)).await?;
     let settle = holds.settle_rows();
-    let (pos, token) = c.world.with(system, move |s| {
-        (s.sample_position(ship).unwrap_or([0.0; 3]), s.fitted_charge_token(ship, module))
-    }).await.unwrap_or(([0.0; 3], None));
+    let (pos, token, bonuses) = c.world.with(system, move |s| {
+        (
+            s.sample_position(ship).unwrap_or([0.0; 3]),
+            s.fitted_charge_token(ship, module),
+            s.with_combat_fit(ship, |fit, _, _| probe_bonuses(fit, module, probe_type)).unwrap_or_default(),
+        )
+    }).await.unwrap_or(([0.0; 3], None, ProbeBonuses::default()));
     enum Launch { Probes }
     crate::progress::leaf_effect!(Launch);
     let user_id = c.login.user_id;
@@ -461,13 +477,11 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
                     Effect::Operation(Launch::Probes) => {
-                        let attrs = &world.sde().types;
-                        let base = attrs.attribute(type_id, ATTR_BASE_SENSOR_STRENGTH).unwrap_or(40.0);
-                        let lifetime_ms = attrs.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
+                        let lifetime_ms = world.sde().types.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
                         let expiry = now + (lifetime_ms * 10_000.0) as i64;
                         for _ in 0..take {
-                            let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
-                            let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
+                            let id = crate::space::probe_ids::next_probe_id();
+                            let probe = Probe { char_id, system, type_id, pos, expiry, bonuses };
                             c.notify("OnNewProbe", vec![probe_value(id, &probe)]);
                             state().probes.insert(id, probe);
                         }

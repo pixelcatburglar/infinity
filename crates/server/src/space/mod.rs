@@ -10,6 +10,9 @@
 //! game items. Changed persistent positions are saved periodically and at shutdown.
 //! Pilot presence is process-local and uses live notification channels; it does not
 //! coordinate presence across server processes.
+//! The same registry carries each live pilot's shared ship-change deadline
+//! (`session_change.rs`): process-local like presence, armed at registration
+//! and recorded only by a change that actually commits.
 //! Only player-piloted ships set the explicit interactive ball field.
 //!
 //! The actor runs wall-aligned 100 ms housekeeping, timers and NPC decisions;
@@ -61,6 +64,7 @@ pub(crate) mod asteroids;
 pub(crate) mod ship_cosmetics;
 pub(crate) mod system;
 mod projections;
+pub(crate) mod dbuff;
 pub(crate) mod preload;
 mod npc;
 pub(crate) mod drone;
@@ -69,6 +73,8 @@ pub(crate) mod damageable;
 pub(crate) mod sovereignty;
 pub(crate) mod combat_facts;
 pub(crate) mod targeting;
+pub(crate) mod probe_ids;
+
 mod warpin;
 pub(crate) mod snapshot;
 pub(crate) mod bounties;
@@ -83,6 +89,8 @@ pub(crate) mod collision;
 mod warp;
 mod wire;
 mod loading;
+pub(crate) mod npc_wrecks;
+pub(crate) mod session_change;
 pub use warp::{WarpOutcome, WarpState};
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
@@ -432,41 +440,36 @@ pub(crate) fn special_fx(
         graphic_info,
     ])
 }
-
 /// Shared notification registry and admission queues, safe to use inside an actor.
 #[derive(Default)]
 pub struct Pilots {
     capacity: usize,
-    notify: Mutex<HashMap<i64, (NotifyTx, Option<infinity_core::session::OnlineSession>)>>,
+    notify: Mutex<HashMap<i64, session_change::Registration>>,
     queues: Mutex<HashMap<i64, JumpQueue>>,
 }
 impl Pilots {
-    pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) {
-        crate::poison::lock_or_exit(self.notify.lock()).insert(char_id, (tx, None));
-    }
-
     pub(crate) fn set_online_session(&self, char_id: i64, session: Option<infinity_core::session::OnlineSession>) {
         let mut notify = crate::poison::lock_or_exit(self.notify.lock());
         let Some(entry) = notify.get_mut(&char_id) else { return };
-        if let (Some(live), Some(next)) = (entry.1.as_ref(), session.as_ref()) {
+        if let (Some(live), Some(next)) = (entry.session.as_ref(), session.as_ref()) {
             if live.session_id != next.session_id { return; }
-        } else if session.is_none() && entry.1.is_some() {
+        } else if session.is_none() && entry.session.is_some() {
             return;
         }
-        entry.1 = session;
+        entry.session = session;
     }
 
     pub(crate) fn online_session(&self, char_id: i64) -> Option<infinity_core::session::OnlineSession> {
-        crate::poison::lock_or_exit(self.notify.lock()).get(&char_id).filter(|(tx, _)| !tx.is_closed()).and_then(|(_, session)| session.clone()).filter(|s| s.character_id == char_id)
+        crate::poison::lock_or_exit(self.notify.lock()).get(&char_id).filter(|entry| !entry.tx.is_closed()).and_then(|entry| entry.session.clone()).filter(|s| s.character_id == char_id)
     }
 
     pub(crate) fn replace_online_session(&self, character: i64, expected: Option<&infinity_core::session::OnlineSession>, next: Option<infinity_core::session::OnlineSession>) -> bool {
         let mut notify = crate::poison::lock_or_exit(self.notify.lock());
         match notify.get_mut(&character) {
-            Some((tx, session)) if !tx.is_closed() => {
-                if expected.is_none() || session.as_ref() != expected { return false; }
+            Some(entry) if !entry.tx.is_closed() => {
+                if expected.is_none() || entry.session.as_ref() != expected { return false; }
                 if next.as_ref().is_some_and(|s| s.character_id != character || Some(s.session_id) != expected.map(|e| e.session_id)) { return false; }
-                *session = next;
+                entry.session = next;
                 true
             }
             _ => expected.is_none() && next.is_none(),
@@ -474,8 +477,8 @@ impl Pilots {
     }
 
     pub(crate) fn station_guests(&self, station_id: i64) -> Vec<infinity_core::session::OnlineSession> {
-        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, (tx, session))| {
-            session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id && s.station_id == Some(station_id)).cloned()
+        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, entry)| {
+            entry.session.as_ref().filter(|s| !entry.tx.is_closed() && s.character_id == id && s.station_id == Some(station_id)).cloned()
         }).collect()
     }
 
@@ -483,16 +486,16 @@ impl Pilots {
     /// result is instantaneous: a session may change or disconnect before the caller uses it.
     /// No ordering is imposed; callers sort outside the lock.
     pub(crate) fn online_sessions(&self) -> Vec<infinity_core::session::OnlineSession> {
-        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, (tx, session))| {
-            session.as_ref().filter(|s| !tx.is_closed() && s.character_id == id).cloned()
+        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, entry)| {
+            entry.session.as_ref().filter(|s| !entry.tx.is_closed() && s.character_id == id).cloned()
         }).collect()
     }
 
     pub(crate) fn unregister_pilot_generation(&self, char_id: i64, session_id: Option<i64>) -> bool {
         let mut notify = crate::poison::lock_or_exit(self.notify.lock());
-        let Some((_, session)) = notify.get(&char_id) else { return false };
+        let Some(entry) = notify.get(&char_id) else { return false };
         if let Some(sid) = session_id {
-            if session.as_ref().is_none_or(|live| live.session_id != sid) { return false; }
+            if entry.session.as_ref().is_none_or(|live| live.session_id != sid) { return false; }
         }
         notify.remove(&char_id);
         drop(notify);
@@ -503,16 +506,16 @@ impl Pilots {
     }
 
     pub fn is_online(&self, char_id: i64) -> bool {
-        crate::poison::lock_or_exit(self.notify.lock()).get(&char_id).is_some_and(|(tx, _)| !tx.is_closed())
+        crate::poison::lock_or_exit(self.notify.lock()).get(&char_id).is_some_and(|entry| !entry.tx.is_closed())
     }
 
     pub fn online_pilots(&self) -> Vec<i64> {
-        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, (tx, _))| (!tx.is_closed()).then_some(id)).collect()
+        crate::poison::lock_or_exit(self.notify.lock()).iter().filter_map(|(&id, entry)| (!entry.tx.is_closed()).then_some(id)).collect()
     }
 
     pub fn notify_pilot(&self, char_id: i64, event: &str, args: Vec<Value>) {
-        if let Some((tx, _)) = crate::poison::lock_or_exit(self.notify.lock()).get(&char_id) {
-            let _ = tx.send((event.to_string(), args));
+        if let Some(entry) = crate::poison::lock_or_exit(self.notify.lock()).get(&char_id) {
+            let _ = entry.tx.send((event.to_string(), args));
         }
     }
 

@@ -81,7 +81,7 @@ pub(super) async fn end(cx: &Ctx, cycle: &mut Cycle) -> Result<CycleOutcome, Cal
     };
     let Some(membership) = cycle.source_membership else { return Ok(CycleOutcome::Stop("subject lost")); };
     let (source, character, module, effect_id, generation, range, sde, notify) =
-        (cx.ship_id, cx.char_id, cycle.modules[0].clone(), cycle.effect.id, cycle.stop.clone(), inputs.range, cx.world.sde().clone(), cx.clone());
+        (cx.ship_id, cx.char_id, cycle.modules[0].clone(), cycle.presented_effect, cycle.stop.clone(), inputs.range, cx.world.sde().clone(), cx.clone());
     let applied = cx.world.with(cx.system_id, move |s| {
         if !source_subject_current(s, source, character, membership, &module, effect_id, &generation)
             || !targets_of(character).contains(&target) || !in_range(s, source, target, range, &sde) { return false; }

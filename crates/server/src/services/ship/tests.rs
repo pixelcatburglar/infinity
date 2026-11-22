@@ -225,14 +225,22 @@ async fn docking_checks_surface_range_before_accepting() {
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
-async fn completed_jumps_record_only_destination_arrivals() {
+async fn completed_jumps_record_only_destination_arrivals_and_gate_scramble_status_blocks_only_positive_gate_requests() {
     use std::sync::Arc;
     use crate::dao::map_telemetry::{self, EventKind, EventSource, HistoryStat};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let systems: Vec<i64> = sde.map.systems().filter(|s| s.constellation_id.is_some() && s.region_id.is_some()).take(2).map(|s| s.solar_system_id).collect();
-    let (origin, destination) = (systems[0], systems[1]);
+    let has_geometry = |sde: &crate::sde::Sde, id: i64| sde.map.celestial(id)
+        .is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some());
+    let (from_gate, to_gate, origin, destination) = sde.map.all_celestials().find_map(|celestial| {
+        let gate = sde.map.stargate(celestial.item_id)?;
+        let (to, origin, destination) = (gate.dest_stargate_id?, gate.solar_system_id?, gate.dest_solar_system_id?);
+        let ancestry = |system| sde.map.system(system)
+            .is_some_and(|s| s.constellation_id.is_some() && s.region_id.is_some());
+        (has_geometry(&sde, celestial.item_id) && has_geometry(&sde, to) && ancestry(origin) && ancestry(destination))
+            .then_some((celestial.item_id, to, origin, destination))
+    }).expect("SDE stargate pair with coordinates and ancestry");
     let marker = map_telemetry::next_occurrence(&db).await.unwrap();
     let start = crate::client::filetime_now();
     let (account, character, hull) = db.transaction(|tx, _: &mut ()| Box::pin(async move {
@@ -247,13 +255,9 @@ async fn completed_jumps_record_only_destination_arrivals() {
     let d = db.clone();
     let result = tokio::spawn(async move {
         admit_fixture_ship(&d, &w, origin, character, hull, true).await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-        let (stream, address) = listener.accept().await.unwrap();
         let cfg = Arc::new(crate::config::Config::default());
-        let chat = crate::chat::Hub::new(&cfg.chat.domain, d.clone(), w.clone());
         let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
-        let mut client = Client::new(infinity_wire::conn::Conn::new(stream, address), cfg, d.clone(), sde, chat, w.clone(), login);
+        let (_listener, _peer, mut client) = crate::services::tests::connected_client(d.clone(), sde, w.clone(), cfg, login).await;
         client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(origin))]);
         let market = crate::services::market::lock().await;
         let cold_started = std::time::Instant::now();
@@ -294,7 +298,10 @@ async fn completed_jumps_record_only_destination_arrivals() {
         assert_eq!(in_rx.try_recv().unwrap(), false);
         assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(15), out_rx.recv()).await.unwrap(), Some(true));
         w.remove_ball(destination, -77).await;
-        jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await.unwrap();
+        approach_station(&w, origin, from_gate, hull, APPROACH_CLEARANCE).await;
+        assert!(w.with(origin, move |s| s.with_combat_fit(hull, |fit, _, _|
+            fit.value(crate::services::fit::Key::Ship, ATTR_GATE_SCRAMBLE_STATUS))).await.flatten().unwrap() <= 0.0);
+        stargate_jump(&mut client, from_gate, to_gate).await.unwrap();
         let arrived = w.with(destination, move |s| s.combat_health_scalars(hull).unwrap()).await.unwrap();
         assert!((arrived.1[1] - old.1[1]).abs() < 1e-8);
         assert!((arrived.1[2] - old.1[2]).abs() < 1e-8);
@@ -317,7 +324,21 @@ async fn completed_jumps_record_only_destination_arrivals() {
         teleport(&mut client, origin, [0.0; 3]).await.unwrap();
         assert_eq!(map_telemetry::visits(&d, character).await.unwrap()[0].visits, 1);
         assert_eq!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap().len(), 1);
-        jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await.unwrap();
+        approach_station(&w, origin, from_gate, hull, APPROACH_CLEARANCE).await;
+        let generation = w.with(origin, move |s| s.persistent_generation(hull)).await.flatten().unwrap();
+        assert!(w.with(origin, move |s| s.publish_fitting(hull, character, generation,
+            crate::services::fit::attributes::CommittedFitting::overridden_attributes(
+                vec![(crate::services::fit::Key::Ship, ATTR_GATE_SCRAMBLE_STATUS, Some(1.0))]), vec![])).await.unwrap());
+        assert!(matches!(stargate_jump(&mut client, from_gate, to_gate).await,
+            Err(CallError::User { msg, dict }) if msg == messages::MSG_GATE_SCRAMBLED && dict.is_empty()));
+        assert_eq!(client.session.int("solarsystemid"), Some(origin));
+        assert_eq!(map_telemetry::visits(&d, character).await.unwrap()[0].visits, 1);
+        let generation = w.with(origin, move |s| s.persistent_generation(hull)).await.flatten().unwrap();
+        assert!(w.with(origin, move |s| s.publish_fitting(hull, character, generation,
+            crate::services::fit::attributes::CommittedFitting::overridden_attributes(
+                vec![(crate::services::fit::Key::Ship, ATTR_GATE_SCRAMBLE_STATUS, Some(0.0))]), vec![])).await.unwrap());
+        stargate_jump(&mut client, from_gate, to_gate).await.unwrap();
+        assert_eq!(client.session.int("solarsystemid"), Some(destination));
         let visits = map_telemetry::visits(&d, character).await.unwrap();
         assert_eq!(visits.len(), 1);
         assert_eq!((visits[0].solar_system_id, visits[0].visits), (destination, 2));

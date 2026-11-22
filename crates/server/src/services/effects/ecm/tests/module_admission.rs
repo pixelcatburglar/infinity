@@ -96,7 +96,7 @@ async fn module_ecm_final_admission_precedes_crimewatch() -> Result<()> {
             state.active.insert(module, ActiveModule { char_id: attacker, stop: generation.clone(), forced_inactive: false });
             state.activation_generation.insert(module, generation.clone());
         }
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], effect,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }], presented_effect: effect.id, effect,
             target: Some(victim_ship), repeat: 1, stop: generation.clone(), owner: ActivationOwner { master: module, generation: generation.clone(), armed: false,
                 combat_generations: vec![crate::services::effects::lifecycle::NativeCombatGeneration { module_id: module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&cx.world), system: cx.system_id },
@@ -257,4 +257,25 @@ async fn ecm_final_consumer_expires_defense_and_rejects_replaced_body() {
     assert!(!combat::jamming::is_jammed(target, system.now_ms()));
     combat::forget_ship(source);
     combat::forget_ship(target);
+}
+
+/// Two controlled rolls of one resident receiver: below the reduced chance jams,
+/// and a roll between that chance and the unresisted chance does not.
+pub(in crate::services::effects) fn assert_triage_receiver_ecm(s: &mut crate::space::System, sde: &Arc<Sde>, source_ship: i64, source_module: i64, receiver: i64, effect: &Effect, expected_resistance: f64, sensors: [f64; 4]) {
+    let src = s.with_combat_fit(source_ship, |fit, _, _| source(fit, Key::Module(source_module), source_ship, source_module, effect, 1_000.0)).expect("sender fit");
+    let victim = s.ball(receiver).expect("receiver").clone();
+    let (index, defense) = primary(sensors).expect("primary sensor");
+    let multiplier = range_multiplier(gap(s.ball(source_ship).expect("sender"), &victim), src.optimal, src.falloff);
+    let unresisted = chance(src.strengths[index], defense, multiplier);
+    let reduced = chance(src.strengths[index] * expected_resistance, defense, multiplier);
+    assert!(expected_resistance.is_finite() && expected_resistance > 0.0 && expected_resistance < 1.0, "resistance {expected_resistance}");
+    assert!(reduced.is_finite() && reduced > 0.0 && reduced < unresisted && unresisted < 1.0, "reduced {reduced} unresisted {unresisted}");
+    let membership = s.combat_membership_generation(receiver);
+    let jam = TargetGate { victim: victim.clone(), membership, owner: None, player: None, guard: None, roll: reduced / 2.0 };
+    assert!(apply_one_in_actor(s, sde, &src, jam).is_some());
+    assert!(combat::jamming::is_jammed(receiver, s.now_ms()));
+    combat::jamming::clear(s, receiver);
+    let miss = TargetGate { victim, membership, owner: None, player: None, guard: None, roll: (reduced + unresisted) / 2.0 };
+    assert!(apply_one_in_actor(s, sde, &src, miss).is_some());
+    assert!(!combat::jamming::is_jammed(receiver, s.now_ms()));
 }

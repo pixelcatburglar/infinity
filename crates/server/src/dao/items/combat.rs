@@ -14,9 +14,6 @@ pub(crate) async fn delete_empty_charge(ex: &(impl Executor + ?Sized), ship: i64
 pub(crate) async fn set_online(ex: &(impl Executor + ?Sized), item: i64, ship: i64, owner: i64, flag: i32, item_type: i32, hull_type: i32, hull_location: i64, hull_flag: i32, hull_singleton: bool, online: bool) -> Result<u64, Error> {
     ex.execute("UPDATE game.items SET online = $10 WHERE item_id = $1 AND location_id = $2 AND owner_id = $3 AND flag_id = $4 AND type_id = $5 AND singleton AND online <> $10 AND EXISTS (SELECT 1 FROM game.items hull WHERE hull.item_id = $2 AND hull.owner_id = $3 AND hull.type_id = $6 AND hull.location_id = $7 AND hull.flag_id = $8 AND hull.singleton = $9)", &[&item, &ship, &owner, &flag, &item_type, &hull_type, &hull_location, &hull_flag, &hull_singleton, &online]).await
 }
-pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), kind: i32, owner: i64, wreck: i64, quantity: i64) -> Result<u64, Error> {
-    ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, 0, $4)", &[&kind, &owner, &wreck, &quantity]).await
-}
 
 pub(crate) async fn clear_banks(ex: &(impl Executor + ?Sized), ship: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await

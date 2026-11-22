@@ -358,3 +358,17 @@ async fn disruption_does_not_emit_stop_for_non_preparing_modes() {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn field_blocks_commit_until_retired() {
+    let (mut system, _) = fixture().await;
+    let generation = Arc::new(AtomicBool::new(false));
+    assert!(system.begin_interdiction(124, 125, generation.clone(), 100_000.0));
+    let revision = system.projection_revision(123);
+    assert_eq!(commit_warp(&mut system, 123, revision, false, 4000,
+        WarpDestination::Exact([1_000_000.0, 0.0, 0.0]), None), WarpCommit::Scrambled);
+    system.end_interdiction(125, &generation);
+    assert_eq!(commit_warp(&mut system, 123, revision, false, 4000,
+        WarpDestination::Exact([1_000_000.0, 0.0, 0.0]), None), WarpCommit::Queued);
+}

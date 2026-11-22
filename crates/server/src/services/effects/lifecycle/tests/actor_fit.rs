@@ -31,7 +31,7 @@ async fn cycle_source_gate_consumes_deadline_and_binds_membership() {
     state().activation_generation.insert(2, stop.clone());
     let result = crate::tests::catch_scenario(async {
         let mut cycle = Cycle { cx, modules: vec![Module { id: 2, type_id: module_type, flag: FLAG_HI_SLOT_FIRST }],
-            effect, target: None, repeat: 1, stop: stop.clone(),
+            presented_effect: effect.id, effect, target: None, repeat: 1, stop: stop.clone(),
             owner: ActivationOwner { master: 2, generation: stop.clone(), armed: false, combat_generations: vec![],
                 pending_combat: None, world: std::sync::Weak::new(), system: 1 },
             started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0,
@@ -48,7 +48,7 @@ async fn cycle_source_gate_consumes_deadline_and_binds_membership() {
         let fraction = crate::services::combat::groups_health::npc_capacitor_fraction(&sde, system.ball(1).unwrap()).unwrap();
         assert!((fraction - 0.5).abs() < 0.01);
         let current = |s: &mut System, owner, module: &Module, generation: &Arc<AtomicBool>|
-            source_subject_current(s, 1, owner, membership, module, cycle.effect.id, generation);
+            source_subject_current(s, 1, owner, membership, module, cycle.presented_effect, generation);
         assert!(current(&mut system, 1, &cycle.modules[0], &stop));
         assert!(!current(&mut system, 2, &cycle.modules[0], &stop));
         let missing = Module { id: 3, type_id: module_type, flag: FLAG_HI_SLOT_FIRST };
@@ -107,6 +107,7 @@ async fn activated_self_buff_retracks_member_cycle_values() {
     let buff_stop = Arc::new(AtomicBool::new(false));
     state().active.insert(module_id, ActiveModule { char_id: f.character, stop: buff_stop.clone(), forced_inactive: false });
     let mut cycle = Cycle { cx, modules: guns.iter().enumerate().map(|(i, &id)| Module { id, type_id: turret, flag: FLAG_HI_SLOT_FIRST + i as i32 }).collect(),
+        presented_effect: i64::from(infinity_core::consts::dogma::EFFECT_TARGET_ATTACK),
         effect: registry::resolve(&sde, infinity_core::consts::dogma::EFFECT_TARGET_ATTACK).unwrap(), target: None, repeat: 1, stop: Arc::new(AtomicBool::new(false)),
         owner: ActivationOwner { master: guns[0], generation: Arc::new(AtomicBool::new(false)), armed: false, combat_generations: vec![], pending_combat: None, world: std::sync::Weak::new(), system: 1 },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
@@ -115,6 +116,7 @@ async fn activated_self_buff_retracks_member_cycle_values() {
         parameters::MemberPacket::Turret(turret) => turret.parameters, _ => panic!("member packet is not turret") }).collect::<Vec<_>>();
     let base = { assert!(capture_cycle_inputs(&mut system, &mut cycle).unwrap()); params(&cycle) };
     let mut buff = Cycle { cx: cycle.cx.clone(), modules: vec![Module { id: module_id, type_id: buff_type, flag: FLAG_MED_SLOT_FIRST }],
+        presented_effect: i64::from(EFFECT_GUNNERY_MAX_RANGE_FALLOFF_TRACKING_SPEED_BONUS),
         effect: registry::resolve(&sde, EFFECT_GUNNERY_MAX_RANGE_FALLOFF_TRACKING_SPEED_BONUS).unwrap(), target: None, repeat: 1, stop: buff_stop.clone(),
         owner: ActivationOwner { master: module_id, generation: buff_stop.clone(), armed: true, combat_generations: vec![], pending_combat: None, world: std::sync::Weak::new(), system: 1 },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,

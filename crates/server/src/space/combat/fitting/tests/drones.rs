@@ -38,7 +38,7 @@ async fn drone_fixture() -> (System, Fit, Vec<(Key, i32, f64)>, OwnerInputs, u64
     let before = resident.fitting_values(&resident.fitting_candidates(&oracle));
     let (registry, owner_rx, delegate_rx) = pilot_channels();
     let mut system = System::new(1, registry, 0);
-    install_drone(&mut system, drone.type_id, resident);
+    install_drone(&mut system, drone.type_id, 2, resident);
     crate::services::combat::groups_health::fill_capacitor(5, 100.0, f64::MAX, now);
     let generation = system.drone(5).unwrap().generation;
     let membership = system.combat_membership_generation(5).unwrap();

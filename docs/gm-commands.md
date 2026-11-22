@@ -54,7 +54,7 @@ Commands invoked from menus also echo their results in the conversation.
 | `/iteminfo <itemID>` / `/typeinfo <type>` | Show an item, or a type with its attributes |
 | `/entity deploy <count> <typeID>` / `/npc <type\|group> [count] [distance]` | Spawn NPCs, at most `gm.max_spawn_count` per command |
 | `/npcclear [radius\|system]` | Remove GM-spawned NPCs only |
-| `/wreck [type] [distance]` / `/container [type] [distance]` | Create an empty wreck or container |
+| `/wreck [type] [distance]` / `/container [type] [distance]` | `/wreck` creates an empty temporary wreck; `/container` still creates an ordinary persistent container |
 | `/sysjunkclear` | Permanently destroy every live wreck and ordinary container in the session's solar system, including everything stored inside them |
 | `/testclear` | Same, limited to debris whose ball center is within 20 km of your ship in space |
 | `/suicide` | Destroy your own current ship or capsule in space; no arguments. |
@@ -120,21 +120,31 @@ private slash feedback is still delivered only while chat is online. Parsed
 arguments are joined with one space and trimmed at the outside; whitespace
 inside quoted arguments is retained.
 
-`/sysjunkclear` and `/testclear` permanently delete whole item trees: the wreck
-or container and every item stored inside it is destroyed, never moved or
-refunded, and there is no way to recover any of it. `/sysjunkclear` uses the
+`/sysjunkclear` and `/testclear` permanently delete whole item trees. A purely
+in-memory wreck destroys the actor root and its children without materializing
+them first. A mixed cleanup claims once and deletes memory only after the
+persistent subtree's existing transaction succeeds. A live or parked claim
+refuses the whole batch; it is not used as proof. A sealed unknown GM delete
+is proved once before any new capture: a committed proof only finishes that
+old scene and transient delta, while a proved rollback releases it and the
+current explicit command captures and authorizes a fresh cleanup. Unrelated
+selected work is left untouched and the command is refused rather than
+reported as cleared. The reported item count is the number of items removed,
+not only the number of database rows. Nothing is moved or refunded, and there
+is no way to recover any of it. There is no expiry, restart restoration or
+replay of a lost notification. `/sysjunkclear` uses the
 session's current solar system and works while docked, but only sees a running
 system: one with no live actor is reported as zero roots and is never loaded, so
 debris in a dormant system stays out of reach. `/testclear` requires the caller
 in space on their ship and counts sampled ball centers within 20 km, boundary
-included. Each run is one all-or-nothing batch: if any selected tree holds an
+included. Each fresh run is one all-or-nothing batch: if any selected tree holds an
 item the client does not allow to be trashed, or the contents changed since the
 command read them, the whole command is refused, nothing is deleted, and the
 reply does not identify the offending object; `/testclear` from another spot can
 still clear around it. Notifications go to each row's real owner. If removal
 from the live scene cannot be confirmed after the database commit, the reply
 says so; the rows are already deleted in that case. Repeating either command is
-safe.
+safe: it proves an old attempt instead of repeating its database deletion.
 
 `/heal` works on your own active ship only. While docked at a station it persists
 the ship's shield, armor and hull condition and clears the damage of every fitted
@@ -398,8 +408,12 @@ discarded merely because no pilot is present. A marked belt or combat-site
 cohort can leave with the actor only when every survivor is strictly stopped,
 with no motion
 segment, collision contact, target, lock, pending death, timer, worker,
-wreck, or positive local auto-repair, including a full-hit-point ship that
+a persistent wreck, or a transient wreck with a claim, an unknown outcome or
+a pending item ID, or positive local auto-repair, including a full-hit-point ship that
 still has that repair. Manual and automatic unloading share that boundary.
+A quiescent unclaimed temporary wreck can itself be discarded. An NPC survivor
+keeps the existing four-category exemption exactly; this does not widen sleep
+or replay.
 The survivors stay in the same process and are restored on the next cold
 load before the cold scene is published; they are not respawned, rewarded,
 or cleared, and a restart still drops them. Every other NPC category

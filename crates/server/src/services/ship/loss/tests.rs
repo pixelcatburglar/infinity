@@ -6,6 +6,7 @@ use crate::dao::items::parent_locks::tests::{character_before_items, wait_blocke
 
 mod body;
 mod nested_contents;
+mod ship_stance;
 
 /// Open a raw connection to the dedicated test database for cross-connection
 /// lock barriers; each test spawns the connection driver itself.

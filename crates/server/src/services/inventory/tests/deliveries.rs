@@ -3,7 +3,7 @@ use super::super::{movement, CONTAINER_CORP_MARKET, INVENTORY};
 use super::super::access::{container_of, corp_hangar_role, may_take_corp_hangar, may_view_corp_hangar, Container};
 use super::super::inv_broker::broker;
 use super::super::notifications::notify_corp_item_change;
-use super::super::stacks::plan_merges;
+use super::super::stacks::plan::plan_merges;
 use super::super::tests::item;
 use infinity_core::consts::{CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
 use crate::dao::items::loading::{Item, ItemQuery};

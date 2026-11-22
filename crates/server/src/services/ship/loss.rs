@@ -6,7 +6,9 @@
 //! active contents closure at any depth, its reservations, charges, banks and
 //! mutable attachments are consumed, while killmails, insurance and characters
 //! are guarded or updated through their services, then ShipLost is handed to
-//! the post-commit runtime dispatcher. Preparation fences the closure,
+//! the post-commit runtime dispatcher. The hidden tactical-mode item and its
+//! timing row are deleted with the closure but never listed in the killmail,
+//! valuation or recovery manifests. Preparation fences the closure,
 //! intersecting reservations and external reservation-source ancestry before
 //! acquiring item rows; snapshot drift aborts the attempt for the bounded
 //! whole-transaction retry. Client-visible work is limited to replacing the
@@ -15,7 +17,7 @@
 //! are not promised. A piloted capsule-group hull additionally dies with its
 //! unprotected active augmentation rows and respawns through the medical home
 //! station in the same transaction.
-use infinity_core::consts::{FLAG_FRIGATE_ESCAPE_BAY, IX_FLAG, IX_LOCATION_ID, TYPE_CAPSULE};
+use infinity_core::consts::{FLAG_FRIGATE_ESCAPE_BAY, FLAG_HIDDEN_MODIFIERS, IX_FLAG, IX_LOCATION_ID, TYPE_CAPSULE};
 use crate::dao::{characters::selection, items::{boarding, creation, loading::ItemQuery, ship as item_dao}};
 use crate::db::{executor::Executor, outbox::{Outbox, SourceKey}};
 use crate::lua::events::GameEvent;
@@ -258,8 +260,13 @@ pub(crate) async fn destroy_ship_in_transaction<X: From<OnlineChanged> + Send>(
             }
         }
     }
+    // Internal modifier items (the hidden tactical mode) are never drops or
+    // loss value: they leave the killmail, valuation and recovery manifests.
     let mut lost: super::super::crimewatch::Lost = item_dao::lost_items(ex, ship).await.map_err(db_err)?
-        .iter().map(|r| (r.type_id, r.flag_id, r.singleton, if r.singleton { 1 } else { r.quantity })).collect();
+        .iter().map(|r| (r.type_id, r.flag_id, r.singleton, if r.singleton { 1 } else { r.quantity }))
+        .filter(|&(type_id, flag_id, ..)| !(flag_id == FLAG_HIDDEN_MODIFIERS
+            && crate::sde::ship_stances::stance_for_mode(ship_type, type_id).is_some()))
+        .collect();
     for r in item_dao::lost_charges(ex, ship).await.map_err(db_err)? {
         lost.push((r.type_id, r.flag_id, false, r.quantity));
     }

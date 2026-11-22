@@ -51,13 +51,36 @@ pub(crate) fn location_row(id: i64, name: &str) -> Value {
 }
 
 async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
-    let rows = crate::dao::characters::social::locations(&c.db, ids).await.map_err(db_err)?;
+    // Ids the caller's own system actor owns are answered from its transient
+    // inventory in one turn; only the remaining ids query the social DAO.
+    let mut transient: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    if let Some(system) = c.session.int("solarsystemid") {
+        let actor_identity = crate::services::inventory::npc_loot::client_identity(c);
+        let views = crate::services::inventory::npc_loot::views(&c.world, &actor_identity, system, ids).await;
+        // A claimed transient root keeps its sealed-Unknown proof once here;
+        // a live claim only means the id is answered like an unknown one.
+        for view in &views {
+            if let crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) = view {
+                crate::services::inventory::npc_loot::reconcile_busy(&c.world, &c.sde, claim.clone()).await;
+            }
+        }
+        for (&id, view) in ids.iter().zip(views.iter()) {
+            if let crate::space::system::npc_wrecks::NpcWreckLookup::Ready(view) = view {
+                transient.insert(id, crate::services::inventory::npc_loot::location_name(&c.sde, view));
+            }
+        }
+    }
+    let persistent: Vec<i64> = ids.iter().copied().filter(|id| !transient.contains_key(id)).collect();
+    let rows = crate::dao::characters::social::locations(&c.db, &persistent).await.map_err(db_err)?;
     let mut data: Vec<_> = rows.iter().map(|r| {
         let name = r.name.as_deref()
             .or_else(|| c.sde.types.get(r.type_id).and_then(|t| t.name.as_deref()))
             .unwrap_or_default();
         location_row(r.id, name)
     }).collect();
+    for (&id, name) in &transient {
+        data.push(location_row(id, name));
+    }
     let keys: std::collections::HashSet<_> = ids.iter().copied().collect();
     data.extend(c.sde.map.systems().filter(|r| keys.contains(&r.solar_system_id)).map(|r| {
         Value::list([

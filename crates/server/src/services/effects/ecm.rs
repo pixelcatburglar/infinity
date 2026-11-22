@@ -239,4 +239,4 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
     Ok(())
 }
 
-#[cfg(all(test, feature = "tests-effects"))] mod tests;
+#[cfg(all(test, feature = "tests-effects"))] pub(in crate::services::effects) mod tests;

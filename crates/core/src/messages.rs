@@ -49,6 +49,7 @@ pub mod crates;
 pub mod crimewatch;
 pub mod drones;
 pub mod effects;
+pub mod deployables;
 pub mod dynamic_items;
 pub mod exploration;
 pub mod faction_warfare;
@@ -86,6 +87,7 @@ pub mod subscriptions;
 pub mod wars;
 pub mod ship_skins;
 pub mod ship;
+pub mod ship_stance;
 
 /// Invalid structure deployment or lifecycle command.
 pub const STRUCTURE_OPERATION_INVALID: &str = "无效的结构操作请求。";
@@ -614,6 +616,10 @@ pub const MSG_CANT_ASSEMBLE_MODULAR_SHIP_IN_SPACE: &str = "CantAssembleModularSh
 pub const MSG_CANT_BOARD_SHIP_NOT_IN_HANGAR: &str = "CantBoardShipNotInHangar";
 /// Client message `CantBoardUnassembledShip`.
 pub const MSG_CANT_BOARD_UNASSEMBLED_SHIP: &str = "CantBoardUnassembledShip";
+/// Client message `CantInEmpireSpace` (packages/dogma/moduleRestrictions.py).
+pub const MSG_CANT_IN_EMPIRE_SPACE: &str = "CantInEmpireSpace";
+/// Client message `CantInHighSecSpace` (packages/dogma/moduleRestrictions.py).
+pub const MSG_CANT_IN_HIGH_SEC_SPACE: &str = "CantInHighSecSpace";
 /// Client message `CantRepackageActiveShip`.
 pub const MSG_CANT_REPACKAGE_ACTIVE_SHIP: &str = "CantRepackageActiveShip";
 /// Client message `CantUndockNotInStation`.
@@ -674,6 +680,8 @@ pub const MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT: &str = "DeniedActivateTargetNo
 pub const MSG_DOCKING_REQUEST_DENIED: &str = "DockingRequestDenied";
 /// Client message `FleetError`.
 pub const MSG_FLEET_ERROR: &str = "FleetError";
+/// Client message `GateScrambled`.
+pub const MSG_GATE_SCRAMBLED: &str = "GateScrambled";
 /// Client message `IndustryBlueprintAccessDenied`.
 pub const MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED: &str = "IndustryBlueprintAccessDenied";
 /// Client message `IndustryJobAccessDenied`.
@@ -700,6 +708,8 @@ pub const MSG_NOT_AT_STATION: &str = "NotAtStation";
 pub const MSG_NOT_CLOSE_ENOUGH_TO_JUMP: &str = "NotCloseEnoughToJump";
 /// Client message `NotEnoughMoney`.
 pub const MSG_NOT_ENOUGH_MONEY: &str = "NotEnoughMoney";
+/// Client message `NotEnoughRepairMaterialToFinishAllRepairs` (shipmodulebutton.py RepairModule).
+pub const MSG_NOT_ENOUGH_REPAIR_MATERIAL_TO_FINISH_ALL_REPAIRS: &str = "NotEnoughRepairMaterialToFinishAllRepairs";
 /// Client message `OnlyCEOCanResign`.
 pub const MSG_ONLY_CEO_CAN_RESIGN: &str = "OnlyCEOCanResign";
 /// Client `eve/client/script/ui/shared/neocom/attributes.py:241` validation.
@@ -734,3 +744,7 @@ pub const MSG_SHIP_NOT_FOUND: &str = "ShipNotFound";
 pub const MSG_SLASH_ERROR: &str = "SlashError";
 /// Client message `TargetingAttemptCancelled`.
 pub const MSG_TARGETING_ATTEMPT_CANCELLED: &str = "TargetingAttemptCancelled";
+
+/// Client `dialogs.jsonl` key `ScnNoLauncher`: probe scanning needs an online
+/// scan probe launcher.
+pub const MSG_SCN_NO_LAUNCHER: &str = "ScnNoLauncher";

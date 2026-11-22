@@ -353,9 +353,14 @@ impl Payout {
                     if rows != expected { return Err(db_err(anyhow!("npc bounty preimage changed before payment"))); }
                     if batch.due_at > now { return Err(db_err(anyhow!("npc bounty batch is not yet due"))); }
                     let mut kills: u64 = 0;
+                    let mut legacy: u64 = 0;
+                    let mut gain = crate::npc_security::SecurityGain::ZERO;
                     for row in &rows {
                         kills = kills.checked_add(u64::try_from(row.kill_count).map_err(|_| db_err(anyhow!("npc bounty kill count overflow")))?)
                             .ok_or_else(|| db_err(anyhow!("npc bounty kill count overflow")))?;
+                        legacy = legacy.checked_add(u64::try_from(row.legacy_kill_count).map_err(|_| db_err(anyhow!("npc bounty legacy count overflow")))?)
+                            .ok_or_else(|| db_err(anyhow!("npc bounty legacy count overflow")))?;
+                        gain = gain.merge(row.security_gain);
                     }
                     for row in &rows {
                         let settled = tax::settle_reward(tx, outbox, batch.character_id, row.amount, None).await?;
@@ -378,7 +383,7 @@ impl Payout {
                             }).await.map_err(db_err)?;
                         }
                     }
-                    crimewatch::settle_npc_kills(tx, outbox, batch.character_id, kills).await?;
+                    crimewatch::settle_npc_gain(tx, outbox, batch.character_id, kills, legacy, gain).await?;
                     if npc_bounties::delete_batch(tx, batch).await.map_err(db_err)? != expected.len() as u64 {
                         return Err(db_err(anyhow!("npc bounty batch delete count mismatch")));
                     }

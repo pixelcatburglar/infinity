@@ -1,5 +1,5 @@
 use super::*;
-
+use crate::services::effects::tests::fixture as actors;
 #[test]
 fn boards_connect_entry_to_core() {
     for tier in 1..=4 {
@@ -155,4 +155,47 @@ async fn winning_hacking_turn_journals_natural_origin() {
     crate::dao::exploration::delete_container(&db, container).await.unwrap();
     crate::services::tests::fixture::cleanup(&db, owner).await.unwrap();
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn hacking_start_uses_resident_fit_virus_values() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_SHIP)).expect("published SDE ship").type_id;
+    let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(infinity_core::consts::CATEGORY_MODULE)
+        && t.name.as_deref().is_some_and(|name| name.starts_with("Data Analyzer "))
+        && matches!(required_analyzer_skill(t), Ok(Some(SKILL_HACKING)))).expect("published data analyzer").type_id;
+    let base = sde.types.attribute(module_type, ATTR_VIRUS_COHERENCE).expect("analyzer coherence");
+    let owner = crate::services::tests::fixture::create(&db).await.unwrap();
+    let rank = crate::services::skills::training::skill_type(&sde, SKILL_HACKING).rank;
+    let points = crate::services::skills::formulas::sp_for_level(rank, 3);
+    crate::dao::skills::training::set_level(&db, owner.character, SKILL_HACKING, 3, points).await.unwrap();
+    let system = owner.character * 100 + 96;
+    let ship = crate::dao::items::creation::positioned(&db, ship_type, owner.character, system, [0.0; 3]).await.unwrap();
+    let module = crate::dao::items::creation::rookie_ship(&db, module_type, owner.character, ship, infinity_core::consts::FLAG_MED_SLOT_FIRST).await.unwrap();
+    db.execute("UPDATE game.items SET online = true WHERE item_id = $1", &[&module]).await.unwrap();
+    let container_type = sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_ENTITY)).expect("published entity").type_id;
+    let container = crate::dao::exploration::insert_container(&db, container_type, system, [0.0; 3]).await.unwrap();
+    let site = crate::services::exploration::tests::hacking_site(&db, system, container).await;
+    let world = World::new(db.clone(), sde.clone(), 0);
+    actors::admit(&db, &world, system, actors::ball(ship, ship_type, owner.character, Some(owner.character), 0.0)).await;
+    world.add_ship(system, actors::ball(container, container_type, owner.character, None, 0.0)).await.unwrap();
+    let identity = Identity { char_id: owner.character, ship_id: Some(ship), corp_id: 0, station_id: None, system_id: Some(system) };
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    start(&identity, &db, &world, &sde, Some(system), sender.clone(), owner.account, module, Some(container), |_| Ok(())).await.unwrap();
+    assert_eq!(games().get(&owner.character).unwrap().coherence, (base + 30.0).round() as i64);
+    games().remove(&owner.character);
+    let landed = world.with(system, move |s| s.land_runtime_inputs(&[crate::space::dbuff::TimedRuntimeInput {
+        receiver: crate::services::fit::runtime::RuntimeReceiverKey::Ship(ship), collection_id: 2468,
+        source: crate::services::fit::runtime::RuntimeSourceKey { producer: crate::services::fit::runtime::RuntimeProducerNamespace::new(9), source_id: 1, incarnation: 1 },
+        value: 12.0, expires_at_ms: s.now_ms() + 60_000 }])).await.unwrap();
+    assert_eq!(landed, 1);
+    start(&identity, &db, &world, &sde, Some(system), sender, owner.account, module, Some(container), |_| Ok(())).await.unwrap();
+    assert_eq!(games().get(&owner.character).unwrap().coherence, (base + 42.0).round() as i64);
+    games().remove(&owner.character);
+    crate::services::exploration::tests::remove_hacking_site(&db, site).await;
+    crate::dao::exploration::delete_container(&db, container).await.unwrap();
+    crate::services::tests::fixture::cleanup(&db, owner).await.unwrap();
 }

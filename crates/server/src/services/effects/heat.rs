@@ -10,6 +10,7 @@
 pub(crate) mod rack;
 pub(crate) mod damage;
 pub(crate) mod rpc;
+pub(crate) mod paste;
 mod boundary;
 mod boundary_runtime;
 

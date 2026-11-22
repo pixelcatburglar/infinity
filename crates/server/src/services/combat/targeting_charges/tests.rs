@@ -431,7 +431,7 @@ fn compatible_groups_and_sizes_are_required() {
 
 #[cfg(feature = "tests-combat")] mod shared_bays;
 
-#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships"))]
+#[cfg(any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships", feature = "tests-inventory"))]
 pub(in crate::services) fn compatible_ammunition(sde: &Sde) -> (i32, i32) {
     let size_id = sde.dogma.attributes_by_name("chargeSize").next().map(|a| a.attribute_id);
     sde.types.iter().filter(|m| m.published == Some(true) && m.category_id == Some(infinity_core::consts::CATEGORY_MODULE) && sde.is_tradable(m.type_id))

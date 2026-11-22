@@ -19,6 +19,7 @@ use marshal::Value;
 use infinity_core::consts::FILETIME_SECOND;
 use crate::dao::npc_bounties::{self, Batch, Pool};
 use crate::isk::IskAmount;
+use crate::npc_security::{FrozenMultiplier, SecurityGain};
 use crate::poison::lock_or_exit as lock;
 use crate::services::{bounty::npc::checkpoint::{Capture, Checkpoint, CheckpointOutcome}, CallError};
 use super::*;
@@ -29,6 +30,7 @@ use super::*;
 pub(in crate::space) struct PendingKill {
     pub amount: IskAmount,
     pub enemy_type: i32,
+    pub security_gain: SecurityGain,
 }
 
 /// Live pool authority for one character in this system.
@@ -36,6 +38,10 @@ pub(in crate::space) struct Bucket {
     pub batch: Batch,
     pub amount: IskAmount,
     pub kill_count: i64,
+    /// Unpaid kills already present at the generation cutover; new kills never increment it.
+    pub legacy_kill_count: i64,
+    /// Frozen new-generation gain. Legacy contribution is priced only at payout.
+    pub security_gain: SecurityGain,
     pub revision: u64,
     pub saved_revision: u64,
     /// A captured writer not yet resolved; while set no second writer is issued.
@@ -45,10 +51,10 @@ pub(in crate::space) struct Bucket {
 
 impl Bucket {
     fn new(batch: Batch) -> Self {
-        Self { batch, amount: IskAmount::ZERO, kill_count: 0, revision: 1, saved_revision: 1, checkpoint: None, pending: Vec::new() }
+        Self { batch, amount: IskAmount::ZERO, kill_count: 0, legacy_kill_count: 0, security_gain: SecurityGain::ZERO, revision: 1, saved_revision: 1, checkpoint: None, pending: Vec::new() }
     }
     fn restored(row: &Pool) -> Self {
-        Self { batch: row.batch, amount: row.amount, kill_count: row.kill_count, revision: 1, saved_revision: 1, checkpoint: None, pending: Vec::new() }
+        Self { batch: row.batch, amount: row.amount, kill_count: row.kill_count, legacy_kill_count: row.legacy_kill_count, security_gain: row.security_gain, revision: 1, saved_revision: 1, checkpoint: None, pending: Vec::new() }
     }
 }
 
@@ -182,11 +188,14 @@ fn drain_pending_locked(bucket: &mut Bucket, batch: Batch) -> Vec<PendingKill> {
         bucket.batch = batch;
         bucket.amount = IskAmount::ZERO;
         bucket.kill_count = 0;
+        bucket.legacy_kill_count = 0;
+        bucket.security_gain = SecurityGain::ZERO;
     }
     let mut accepted = 0;
     for kill in &bucket.pending {
         match (bucket.amount.checked_add(kill.amount), bucket.kill_count.checked_add(1), bucket.revision.checked_add(1)) {
             (Some(amount), Some(count), Some(revision)) => {
+                bucket.security_gain = bucket.security_gain.merge(kill.security_gain);
                 (bucket.amount, bucket.kill_count, bucket.revision) = (amount, count, revision);
             }
             _ => break,
@@ -208,7 +217,8 @@ impl System {
     /// shared batch is frozen for payout, the pending list. The pool notice is
     /// deferred while frozen; kills never touch the database, the market lock
     /// or a per-kill job write.
-    pub(crate) fn add_npc_bounty(&mut self, character: i64, enemy_type: i32, amount: IskAmount, occurred_at: i64) -> Result<(), CallError> {
+    pub(crate) fn add_npc_bounty(&mut self, character: i64, enemy_type: i32, amount: IskAmount, multiplier: FrozenMultiplier, occurred_at: i64) -> Result<(), CallError> {
+        let gain = SecurityGain::for_kill(crate::config::game().crimewatch.security_gain_npc_kill, multiplier);
         let shared = self.bounty_shared(character)
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("world stopped during npc bounty")))?;
         let drained;
@@ -221,7 +231,7 @@ impl System {
                     meta.pending.earliest = Some(occurred_at);
                 }
                 self.bounties.buckets.entry(character).or_insert_with(|| Bucket::new(Batch { character_id: character, started_at: occurred_at, due_at: occurred_at.saturating_add(1) }))
-                    .pending.push(PendingKill { amount, enemy_type });
+                    .pending.push(PendingKill { amount, enemy_type, security_gain: gain });
                 return Ok(());
             }
             drained = self.align_npc_bounty_locked(character, Some(occurred_at), &mut meta)?;
@@ -232,6 +242,7 @@ impl System {
                 bucket.kill_count.checked_add(1).ok_or_else(overflow)?,
                 bucket.revision.checked_add(1).ok_or_else(overflow)?,
             );
+            bucket.security_gain = bucket.security_gain.merge(gain);
             (bucket.amount, bucket.kill_count, bucket.revision) = (amount2, count, revision);
             batch.due_at
         };
@@ -351,7 +362,7 @@ impl System {
             let include = all || (!frozen && bucket.revision != bucket.saved_revision);
             if !include { continue; }
             captures.push(Capture {
-                pool: Pool { batch: bucket.batch, system_id: self.id, amount: bucket.amount, kill_count: bucket.kill_count },
+                pool: Pool { batch: bucket.batch, system_id: self.id, amount: bucket.amount, kill_count: bucket.kill_count, legacy_kill_count: bucket.legacy_kill_count, security_gain: bucket.security_gain },
                 revision: bucket.revision,
                 incarnation: self.bounties.incarnation.clone(),
             });
@@ -413,8 +424,8 @@ impl World {
 
     /// Deliver one kill's rounded gross to the live actor; the batch deadline
     /// and pending split resolve inside the actor turn.
-    pub(crate) async fn record_npc_bounty(&self, system: i64, character: i64, enemy_type: i32, amount: IskAmount, occurred_at: i64) -> Result<(), CallError> {
-        self.with(system, move |s| s.add_npc_bounty(character, enemy_type, amount, occurred_at))
+    pub(crate) async fn record_npc_bounty(&self, system: i64, character: i64, enemy_type: i32, amount: IskAmount, multiplier: FrozenMultiplier, occurred_at: i64) -> Result<(), CallError> {
+        self.with(system, move |s| s.add_npc_bounty(character, enemy_type, amount, multiplier, occurred_at))
             .await
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor unavailable for npc bounty")))?
     }

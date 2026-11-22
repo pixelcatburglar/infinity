@@ -7,18 +7,16 @@
 //! injections also respect active Entosis assistance restrictions on capital hulls.
 //! NPC death is journaled before native removal; bounty and wreck processing follow separately.
 //! NPC bounty joins the pilot's per-character batch pool; wallet, tax, journal
-//! and security settle at the batch deadline. Wreck and loot are unchanged.
+//! and security settle at the batch deadline. Transient wreck and loot live in
+//! `wreck` and the actor's `npc_wrecks` state; they are never persisted.
 //! NPC repairs use actor-owned condition and are not persisted. Persistent ships and
 //! drones publish live condition from their actor and checkpoint it in batches.
 //! Positive pilot damage with a supplied source ball emits after actor health update or actual removal.
 use super::*;
-use infinity_core::consts::CATEGORY_MODULE;
+use crate::npc_security::FrozenMultiplier;
 pub(crate) mod death;
 pub(crate) use death::settle_npc_loss;
-
-/// Server loot policy: wreck loot candidates are priced from the loot minimum up to
-/// the bounty, but never below this ceiling, so a tiny bounty still samples a modest range.
-const NPC_LOOT_MINIMUM_CEILING: f64 = 50_000.0;
+pub(crate) mod wreck;
 
 // ---------------------------------------------------------------- capacitor and hit points
 
@@ -237,7 +235,7 @@ fn capacitor_operation_in_actor(s: &mut crate::space::System, sde: &crate::sde::
     if (ball.type_id, ball.char_id) != (type_id, pilot)
         || guard.as_ref().is_some_and(|guard| !guard.valid(s))
         || matches!(op, Operation::Inject(_)) && guard.as_ref().is_some_and(|guard|
-            guard.source() != ship && crate::space::sovereignty::links::assistance_blocked(s, ship))
+            guard.source() != ship && crate::space::combat::assistance_blocked(s, ship))
     {
         return None;
     }
@@ -355,15 +353,22 @@ pub(crate) fn set_damage_layers(now: [f64; 3], old_max: [f64; 3], max: [f64; 3],
     })
 }
 
+/// The admitted controller and the multiplier frozen with that same source.
+#[derive(Clone, Copy)]
+pub(super) struct NpcKiller {
+    pub(super) character_id: i64,
+    pub(super) multiplier: FrozenMultiplier,
+}
 
 
 
 
 
-async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball: Ball, attacker: Option<i64>) -> Result<(), CallError> {
+
+async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball: Ball, killer: Option<NpcKiller>) -> Result<(), CallError> {
     info!("ball {target} (type {}) destroyed", ball.type_id);
     super::super::map::events::npc_lost(db, system, filetime_now()).await;
-    if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
+    if let Err(e) = reward_kill(db, world, system, &ball, killer).await {
         warn!("wreck of {target}: {}", match e {
             CallError::Internal(e) => format!("{e:#}"),
             CallError::User { msg, .. } => msg,
@@ -412,11 +417,13 @@ fn bounty_payout(bounty: f64, multiplier: f64) -> Option<f64> {
     payout.is_finite().then_some(payout)
 }
 
-/// A destroyed NPC pays its bounty to the pilot who killed it and leaves a wreck (its
-/// group's wreck type, sde_native.wrecks) holding loot worth about its raw SDE bounty.
-pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Option<i64>) -> Result<(), CallError> {
+/// A destroyed NPC pays its bounty to the pilot who killed it. Its wreck and
+/// ordinary loot are transient actor state: the draw was frozen in the death
+/// context and the system actor publishes it at finalize (see `wreck` and
+/// `space::system::npc_wrecks`), so no persistent items are created here.
+pub(super) async fn reward_kill(_db: &Db, world: &World, system: i64, npc: &Ball, killer: Option<NpcKiller>) -> Result<(), CallError> {
     let bounty = attr(world.sde(), npc.type_id, ATTR_ENTITY_KILL_BOUNTY, 0.0);
-    if let Some(pilot) = killer.filter(|_| bounty > 0.0) {
+    if let Some(killer) = killer.filter(|_| bounty > 0.0) {
         let payout = bounty_payout(bounty, crate::config::game().combat.bounty_multiplier)
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("nonfinite bounty payout for NPC type {}", npc.type_id)))?;
         let rounded_payout = super::super::market::round2(payout);
@@ -428,97 +435,19 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         let gross = crate::isk::IskAmount::from_isk(rounded_payout)?;
         // The kill records into the character's durable batch; wallet, tax,
         // journal and security settle at the batch deadline. A pool record
-        // failure must not prevent the wreck below.
-        match world.record_npc_bounty(system, pilot, npc.type_id, gross, filetime_now()).await {
-            Ok(()) => info!("{pilot} earned {payout:.0} ISK bounty for {}", npc.type_id),
-            Err(error) => warn!("bounty pool record for {pilot}: {}", match error {
+        // failure must not prevent transient wreck publication.
+        match world.record_npc_bounty(system, killer.character_id, npc.type_id, gross, killer.multiplier, filetime_now()).await {
+            Ok(()) => info!("{} earned {payout:.0} ISK bounty for {}", killer.character_id, npc.type_id),
+            Err(error) => warn!("bounty pool record for {}: {}", killer.character_id, match error {
                 CallError::Internal(e) => format!("{e:#}"),
                 CallError::User { msg, .. } => msg,
             }),
         }
     }
-    let sde = world.sde();
-    let Some(npc_type) = sde.types.get(npc.type_id) else { return Ok(()) };
-    let Some(wreck_type) = npc_type.group_id.and_then(|group| sde.wrecks.get(group, npc_type.race_id.unwrap_or(0))) else { return Ok(()) };
-    let owner = killer.unwrap_or(npc.owner_id);
-    spawn_wreck(db, world, system, wreck_type, owner, npc.corp_id, npc.pos, Some(npc.id), Some(bounty)).await?;
+
     Ok(())
 }
 
-/// Create an inventory-backed wreck, linking a destroyed source ship when supplied,
-/// with the normal NPC loot selection.
-pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type: i32, owner: i64, corp: i64, pos: crate::space::V3, source_ship: Option<i64>, bounty: Option<f64>) -> Result<i64, CallError> {
-    let sde = world.sde();
-    let radius = sde.types.get(wreck_type).and_then(|t| t.radius).unwrap_or(100.0);
-    let wreck_id = crate::dao::items::creation::positioned(db, wreck_type, owner, system, pos).await.map_err(db_err)?;
-    // Loot: one or two modules or ammo stacks that traded on Serenity, worth up to the bounty.
-    let picks = 1 + (rand01() * 2.0) as i64;
-    let mut loot: Vec<_> = bounty.into_iter()
-        .flat_map(|bounty| sde.prices.average_between(crate::sde::prices::LOOT_MINIMUM_AVERAGE, loot_ceiling(bounty)))
-        .filter_map(|row| sde.types.get(row.type_id).and_then(|t| loot_category(t.published, t.category_id).map(|category| (row.type_id, category))))
-        .collect();
-    for i in 0..(picks as usize).min(loot.len()) {
-        let j = i + (rand01() * (loot.len() - i) as f64) as usize;
-        loot.swap(i, j);
-    }
-    loot.truncate(picks as usize);
-    for &(type_id, category) in &loot {
-        let quantity: i64 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i64 } else { 1 };
-        crate::dao::items::combat::insert_loot(db, type_id, owner, wreck_id, quantity).await.map_err(db_err)?;
-    }
-    let mut slim = Vec::with_capacity(1 + usize::from(source_ship.is_some()));
-    slim.push(("isEmpty", Value::Bool(loot.is_empty())));
-    if let Some(source_ship) = source_ship { slim.push(("launcherID", Value::Int(source_ship))); }
-    let ball = Ball {
-        id: wreck_id,
-        type_id: wreck_type,
-        owner_id: owner,
-        corp_id: corp,
-        alliance_id: -1,
-        char_id: None,
-        signature_radius: None,
-        mode: crate::space::MODE_RIGID,
-        radius: radius as f32,
-        mass: 10_000.0,
-        max_vel: 0.0,
-        agility: 1.0,
-        speed_fraction: 0.0,
-        pos,
-        vel: [0.0; 3],
-        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None,
-        goto: [0.0; 3],
-        follow_id: 0,
-        follow_range: 0.0,
-        free: false,
-        global: false,
-        massive: true,
-        interactive: false,
-        warp: crate::space::WarpState::default(),
-        last_ms: now_ms(),
-        interpolation_anchor_ms: 0,
-        effect_stamp: 0,
-        cloak: 0,
-        cloak_until: 0,
-        health: [1.0; 3],
-        launcher: 0,
-        slim,
-    };
-    world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-    debug!("wreck {wreck_id} ({wreck_type}) with {} loot stacks", loot.len());
-    Ok(wreck_id)
-}
-
-/// Upper price bound of one NPC's loot candidates. A NaN static bounty stays NaN: prices
-/// keep PostgreSQL float ordering, where NaN sorts above every number, so the range is open-ended.
-fn loot_ceiling(bounty: f64) -> f64 {
-    if bounty.is_nan() { bounty } else { bounty.max(NPC_LOOT_MINIMUM_CEILING) }
-}
-
-fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> {
-    category.filter(|&id| published == Some(true) && (id == CATEGORY_MODULE || id == CATEGORY_CHARGE))
-}
-
-#[cfg(all(test, feature = "tests-combat"))] mod loot_tests;
 #[cfg(all(test, any(feature = "tests-combat", feature = "tests-effects", feature = "tests-ships")))] pub(in crate::services) mod tests;
 
 

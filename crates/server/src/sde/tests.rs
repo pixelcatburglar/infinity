@@ -16,6 +16,7 @@ impl Default for Sde {
             sovereignty: Default::default(),
             compression: Default::default(),
             dogma: Default::default(),
+            dbuffs: Default::default(),
             dynamic_items: Default::default(),
             expert_systems: Default::default(),
             skill_plans: Default::default(),

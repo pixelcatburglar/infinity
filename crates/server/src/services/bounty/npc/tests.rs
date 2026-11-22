@@ -4,6 +4,7 @@
 use super::*;
 use anyhow::{anyhow, ensure, Result};
 use infinity_core::consts::{ACCOUNT_CASH, OWNER_DED, REF_BOUNTY_PRIZES, REF_CORPORATION_TAX_NPC_BOUNTIES, ROLE_ACCOUNTANT};
+use crate::db::executor::Executor;
 use crate::dao::npc_bounties::Pool;
 use crate::isk::IskAmount;
 use crate::services::drones::tests::fixture::Fixture;
@@ -13,7 +14,7 @@ const FUTURE: i64 = i64::MAX / 4;
 const WAIT: Duration = Duration::from_secs(30);
 
 async fn kill(f: &Fixture, system: i64, character: i64, cents: i128, at: i64) -> Result<()> {
-    f.world.with(system, move |s| s.add_npc_bounty(character, 42, IskAmount::from_cents(cents).unwrap(), at)).await
+    f.world.with(system, move |s| s.add_npc_bounty(character, 42, IskAmount::from_cents(cents).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), at)).await
         .ok_or_else(|| anyhow!("system actor missing"))?
         .map_err(|e| anyhow!("bounty record: {e:?}"))
 }
@@ -116,19 +117,60 @@ async fn npc_payout_final_capture_and_source_journals() -> Result<()> {
             let expected = if *system == f.system { "15.00" } else { "2.50" };
             ensure!(entries[index].3 == *system && entries[index].4 == expected, "wrong source posting {entries:?}");
         }
-        // The aggregate security settlement is exactly one UPDATE for the
-        // whole batch, not one shift per kill.
         let security: f64 = f.db.query_one("SELECT security_status FROM game.characters WHERE character_id=$1", &[&f.owner]).await?.get("security_status");
         ensure!(security > 0.0, "batch security settlement missing: {security}");
-        // A replayed job never re-pays: the batch identity is gone.
         settle_due(&f.db, &f.world, (f.owner, started), FUTURE).await.map_err(|e| anyhow!("settle: {e:?}"))?;
         let balance: String = f.db.query_one("SELECT balance::text AS balance FROM game.characters WHERE character_id=$1", &[&f.owner]).await?.get("balance");
         ensure!(balance == "17.50", "job replay double-credited: {balance}");
         Ok::<(), anyhow::Error>(())
     }.await;
+    let owner = f.owner;
+    let name = format!("npc_gain_fault_{owner}");
+    let function = format!("game.{name}_fn");
+    let table = format!("game.{name}_updates");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    f.world.register_pilot(owner, tx);
+    let fault = crate::tests::catch_scenario(async {
+        f.db.uncached().execute(&format!("CREATE TABLE IF NOT EXISTS {table} (character_id bigint PRIMARY KEY, updates bigint NOT NULL)"), &[]).await.unwrap();
+        f.db.uncached().execute(&format!("CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_OP = 'DELETE' AND OLD.character_id = {owner} THEN RAISE EXCEPTION 'fixture delete fault'; END IF; IF TG_OP = 'UPDATE' AND NEW.character_id = {owner} THEN INSERT INTO {table} VALUES (NEW.character_id, 1) ON CONFLICT (character_id) DO UPDATE SET updates = {table}.updates + 1; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END $$"), &[]).await.unwrap();
+        f.db.uncached().execute(&format!("DROP TRIGGER IF EXISTS {name}_count ON game.characters"), &[]).await.unwrap();
+        f.db.uncached().execute(&format!("CREATE TRIGGER {name}_count AFTER UPDATE OF security_status ON game.characters FOR EACH ROW EXECUTE FUNCTION {function}()"), &[]).await.unwrap();
+        f.db.uncached().execute(&format!("DROP TRIGGER IF EXISTS {name}_delete ON game.npc_bounty_pools"), &[]).await.unwrap();
+        f.db.uncached().execute(&format!("CREATE TRIGGER {name}_delete BEFORE DELETE ON game.npc_bounty_pools FOR EACH ROW EXECUTE FUNCTION {function}()"), &[]).await.unwrap();
+        kill(&f, f.system, owner, 100, crate::client::filetime_now()).await.unwrap();
+        f.world.flush_positions().await.unwrap();
+        while rx.try_recv().is_ok() {}
+        let started = started(&f, owner).await.unwrap();
+        let before_rows = rows(&f, owner).await.unwrap();
+        let before_balance: String = f.db.query_one("SELECT balance::text AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("balance");
+        let before_security: f64 = f.db.query_one("SELECT security_status FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("security_status");
+        let before_journal = journal(&f, owner).await.unwrap();
+        let mut security_notices = 0_i64;
+        let take_security = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Vec<marshal::Value>)>, security_notices: &mut i64| while let Ok((name, _)) = rx.try_recv() { if name == "OnSecurityStatusUpdate" { *security_notices += 1; } };
+        assert!(settle_due(&f.db, &f.world, (owner, started), FUTURE).await.is_err());
+        take_security(&mut rx, &mut security_notices);
+        assert_eq!(security_notices, 0);
+        assert_eq!((rows(&f, owner).await.unwrap(), journal(&f, owner).await.unwrap()), (before_rows, before_journal));
+        let balance: String = f.db.query_one("SELECT balance::text AS balance FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("balance");
+        let security: f64 = f.db.query_one("SELECT security_status FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("security_status");
+        assert_eq!((balance, security), (before_balance, before_security));
+        f.db.uncached().execute(&format!("DROP TRIGGER IF EXISTS {name}_delete ON game.npc_bounty_pools"), &[]).await.unwrap();
+        settle_due(&f.db, &f.world, (owner, started), FUTURE).await.unwrap();
+        take_security(&mut rx, &mut security_notices);
+        assert_eq!(security_notices, 1);
+        settle_due(&f.db, &f.world, (owner, started), FUTURE).await.unwrap();
+        take_security(&mut rx, &mut security_notices);
+        assert_eq!(security_notices, 1);
+        let updates: i64 = f.db.query_one(&format!("SELECT updates FROM {table} WHERE character_id=$1"), &[&owner]).await.unwrap().get("updates");
+        assert_eq!(updates, 1);
+    }).await;
+    f.db.uncached().execute(&format!("DROP TRIGGER IF EXISTS {name}_count ON game.characters"), &[]).await.unwrap();
+    f.db.uncached().execute(&format!("DROP TRIGGER IF EXISTS {name}_delete ON game.npc_bounty_pools"), &[]).await.unwrap();
+    f.db.uncached().execute(&format!("DROP FUNCTION IF EXISTS {function}()"), &[]).await.unwrap();
+    f.db.uncached().execute(&format!("DROP TABLE IF EXISTS {table}"), &[]).await.unwrap();
     cleanup_pools(&f, f.owner).await;
     f.cleanup().await;
-    result
+    result.and_then(|value| fault.map(|()| value).map_err(|panic| anyhow!("security fault: {panic:?}")))
 }
 
 #[tokio::test]
@@ -147,7 +189,7 @@ async fn npc_bounty_restart_offline_and_reverse_system_load() -> Result<()> {
         // kill in a reverse-loaded system joins the same deadline.
         let world2 = crate::space::World::new(db.clone(), f.sde.clone(), 1);
         world2.system(other).await?;
-        world2.with(other, move |s| s.add_npc_bounty(f.owner, 42, cents(250), t0 + 1)).await
+        world2.with(other, move |s| s.add_npc_bounty(f.owner, 42, cents(250), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), t0 + 1)).await
             .ok_or_else(|| anyhow!("system actor missing"))?.map_err(|e| anyhow!("bounty record: {e:?}"))?;
         world2.flush_positions().await?;
         let pools = rows(&f, f.owner).await?;
@@ -175,8 +217,10 @@ async fn npc_bounty_restart_offline_and_reverse_system_load() -> Result<()> {
 async fn npc_payout_cancel_preserves_owner_and_new_kills() -> Result<()> {
     let f = Fixture::real_system().await;
     let original: i64 = f.db.query_one("SELECT corporation_id FROM game.characters WHERE character_id=$1", &[&f.owner]).await?.get("corporation_id");
+    let mut owned_corp = None;
     let result = async {
         let corp = corp_fixture(&f, 0.1).await?;
+        owned_corp = Some(corp);
         let t0 = crate::client::filetime_now();
         kill(&f, f.system, f.owner, 12_000_000, t0).await?;
         f.world.flush_positions().await?;
@@ -207,15 +251,24 @@ async fn npc_payout_cancel_preserves_owner_and_new_kills() -> Result<()> {
         release?;
         // A kill during the frozen window keeps its own time and lands pending.
         kill(&f, f.system, f.owner, 6_000_000, t0 + 1).await?;
+        let before = rows(&f, f.owner).await?;
         // The armed owner reconciles: the intact preimage proves Unpaid and the
         // pending kill merges back under the unchanged deadline.
         let first = settle_due(&f.db, &f.world, (f.owner, started), FUTURE).await;
         ensure!(first.is_err(), "unpaid reconciliation should return to the scheduler");
+        f.world.flush_positions().await?;
+        let merged = rows(&f, f.owner).await?;
+        let rate = crate::config::game().crimewatch.security_gain_npc_kill;
+        let expected_gain = before[0].security_gain.merge(crate::npc_security::SecurityGain::for_kill(rate, crate::npc_security::FrozenMultiplier::new(1.0).unwrap()));
+        ensure!(merged.len() == 1 && merged[0].kill_count == before[0].kill_count + 1 && merged[0].security_gain == expected_gain, "pending gain was not merged once: {merged:?}");
         let second = settle_due(&f.db, &f.world, (f.owner, started), FUTURE).await;
         second.map_err(|e| anyhow!("settle after cancel: {e:?}"))?;
         ensure!(rows(&f, f.owner).await?.is_empty(), "paid rows remain");
         let balance: String = f.db.query_one("SELECT balance::text AS balance FROM game.characters WHERE character_id=$1", &[&f.owner]).await?.get("balance");
         ensure!(balance == "162000.00", "cancel path paid wrong amount: {balance}");
+        let security: f64 = f.db.query_one("SELECT security_status FROM game.characters WHERE character_id=$1", &[&f.owner]).await?.get("security_status");
+        let expected_security = 10.0 * expected_gain.fraction();
+        ensure!((security - expected_security).abs() <= 1e-9, "merged gain was not paid once: {security}");
         let corporate: String = f.db.query_one("SELECT balance::text AS balance FROM game.corp_wallets WHERE corporation_id=$1 AND account_key=$2", &[&corp, &ACCOUNT_CASH]).await?.get("balance");
         ensure!(corporate == "18000.00", "corporation tax wrong: {corporate}");
         ensure!(journal(&f, f.owner).await?.len() == 1, "cancel path duplicated journals");
@@ -223,9 +276,9 @@ async fn npc_payout_cancel_preserves_owner_and_new_kills() -> Result<()> {
         drop(blocker);
         let _ = observer_driver.await;
         let _ = blocker_driver.await;
-        cleanup_corp(&f, corp, original).await;
         Ok::<(), anyhow::Error>(())
     }.await;
+    if let Some(corp) = owned_corp { cleanup_corp(&f, corp, original).await; }
     cleanup_pools(&f, f.owner).await;
     f.cleanup().await;
     result
@@ -334,6 +387,10 @@ async fn npc_payout_unknown_uses_complete_preimage() -> Result<()> {
         let frozen = lock(shared.meta.lock()).frozen.clone().ok_or_else(|| anyhow!("frozen owner retired while unknown"))?;
         let missing = preimage.iter().find(|row| row.system_id == f.system.min(other)).ok_or_else(|| anyhow!("saved preimage incomplete"))?;
         crate::dao::npc_bounties::save_absolute(&f.db, std::slice::from_ref(missing)).await?;
+        f.db.execute("UPDATE game.npc_bounty_pools SET security_gain_log=0.25 WHERE character_id=$1 AND system_id=$2", &[&f.owner, &missing.system_id]).await?;
+        let gain_only = settle_due(&f.db, &f.world, (f.owner, started), FUTURE).await;
+        ensure!(gain_only.is_err() && frozen.phase() == Phase::Unknown, "gain-only preimage difference was accepted");
+        f.db.execute("UPDATE game.npc_bounty_pools SET security_gain_log=$3 WHERE character_id=$1 AND system_id=$2", &[&f.owner, &missing.system_id, &missing.security_gain.storage()]).await?;
         let third = settle_due(&f.db, &f.world, (f.owner, started), FUTURE).await;
         ensure!(third.is_err(), "unpaid classification must return to the scheduler");
         ensure!(frozen.phase() == Phase::Unpaid, "restored preimage did not classify Unpaid");
@@ -392,28 +449,120 @@ async fn npc_tax_is_current_per_source_aggregate() -> Result<()> {
     result
 }
 
-#[test]
-fn npc_security_gain_is_stable_aggregate_and_not_pvp_commutative() {
-    assert_eq!(crimewatch::npc_gain_fraction(0.0, 5), 0.0);
-    assert_eq!(crimewatch::npc_gain_fraction(1.0, 5), 1.0);
-    assert_eq!(crimewatch::npc_gain_fraction(0.5, 0), 0.0);
-    let (r, n) = (1e-9_f64, 1_000_000_u64);
-    let stable = crimewatch::npc_gain_fraction(r, n);
-    // Independent stable reference: alternating binomial series
-    // 1-(1-r)^n = sum_{k>=1} (-1)^(k+1) C(n,k) r^k, stopped once terms are negligible.
-    let (mut reference, mut term, mut k) = (0.0_f64, n as f64 * r, 1.0_f64);
-    while term.abs() > 1e-20 * n as f64 * r {
-        reference += term;
-        k += 1.0;
-        term *= -(n as f64 - k + 1.0) / k * r;
+
+fn rate_config(rate: f64) -> crate::config::game::GameConfig {
+    let mut config = crate::config::game::GameConfig::default();
+    config.crimewatch.security_gain_npc_kill = rate;
+    config
+}
+
+fn rate_identity_head(text: &str) -> Result<(i64, i64, i64)> {
+    let mut lines = text.lines();
+    let owner = lines.next().ok_or_else(|| anyhow!("rate identity missing owner"))?.parse()?;
+    let account = lines.next().ok_or_else(|| anyhow!("rate identity missing account"))?.parse()?;
+    let started = lines.next().ok_or_else(|| anyhow!("rate identity missing batch start"))?.parse()?;
+    Ok((owner, account, started))
+}
+
+/// Remove this persisted batch and its payout job, then the shared owner rows.
+/// A batch that drifted to another identity is reported and left in place.
+async fn isolate_rate_owner(root: &std::path::Path) -> Result<()> {
+    let path = root.join("identity");
+    if !path.exists() { return Ok(()); }
+    let (owner, account, started) = rate_identity_head(&std::fs::read_to_string(&path)?)?;
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await?;
+    let pools = crate::dao::npc_bounties::for_character(&db, owner).await?;
+    if let Some(pool) = pools.first() {
+        ensure!(pools.len() == 1 && pool.batch.started_at == started, "rate isolation found a different batch for {owner}");
+        crate::dao::npc_bounties::delete_batch(&db, pool.batch).await?;
     }
-    assert!(reference.is_finite() && reference != 0.0 && (stable - reference).abs() / reference < 1e-12,
-        "expm1 path diverged: {stable} vs {reference}");
-    let shift = |v: f64, fraction: f64, toward: f64| v + (toward - v) * fraction;
-    let (g, penalty) = (0.05_f64, 0.10_f64);
-    // Interleaved PvP penalty and kills are honestly not equivalent to the
-    // deferred aggregate: the orders genuinely produce different results.
-    let interleaved = shift(shift(shift(0.0, g, 10.0), penalty, -10.0), g, 10.0);
-    let aggregated = shift(shift(0.0, crimewatch::npc_gain_fraction(g, 2), 10.0), penalty, -10.0);
-    assert!((interleaved - aggregated).abs() > 1e-9, "deferred aggregate must not pretend PvP equivalence: {interleaved} vs {aggregated}");
+    crate::dao::jobs::cancel(&db, &super::job_id(owner, started)).await?;
+    let fixture = crate::services::tests::fixture::Fixture { account, character: owner };
+    let captured = crate::services::tests::fixture::capture_fixture_rows(&db, &[fixture], &[]).await?;
+    crate::services::tests::fixture::cleanup(&db, fixture).await?;
+    crate::services::tests::fixture::assert_fixture_removed(&db, &captured).await?;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with real SDE; run this exact test in its own process"]
+
+async fn npc_gain_keeps_acceptance_rate_across_process_restart() -> Result<()> {
+    const PHASE: &str = "INFINITY_NPC_GAIN_RATE_PHASE";
+    const NAME: &str = "services::bounty::npc::tests::npc_gain_keeps_acceptance_rate_across_process_restart";
+    let phase = std::env::var(PHASE).unwrap_or_default();
+    if phase.is_empty() {
+        let root = std::env::temp_dir().join(format!("npc-gain-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let mut failed = None;
+        let child = crate::tests::catch_scenario(async {
+            for step in ["record", "settle"] {
+                let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", NAME, "--ignored", "--nocapture"]).env(PHASE, step)
+                    .env("INFINITY_NPC_GAIN_RATE_ROOT", &root).status().expect("rate child process");
+                if !status.success() { failed = Some(step); break; }
+            }
+        }).await;
+        let mut isolated = Ok(());
+        let cleanup = crate::tests::catch_scenario(async { isolated = isolate_rate_owner(&root).await; }).await;
+        if let Err(cleanup_panic) = cleanup {
+            eprintln!("rate child {failed:?}; cleanup panicked");
+            std::panic::resume_unwind(child.err().unwrap_or(cleanup_panic));
+        }
+        match (child, isolated) {
+            (Ok(()), Ok(())) => {
+                ensure!(failed.is_none(), "{} process failed", failed.unwrap());
+                return Ok(());
+            }
+            (Ok(()), Err(cleanup)) => return Err(anyhow!("rate child {failed:?} and cleanup failed: {cleanup:#}")),
+            (Err(panic), Ok(())) => std::panic::resume_unwind(panic),
+            (Err(panic), Err(cleanup)) => {
+                eprintln!("rate cleanup failed: {cleanup:#}");
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(std::env::var("INFINITY_NPC_GAIN_RATE_ROOT")?);
+    if phase == "settle" { crate::config::init_game(rate_config(0.2)).expect("settlement configuration"); }
+    let database = if phase == "settle" {
+        crate::config::tests::schema_downgrade_guard::database_config()
+    } else {
+        crate::config::tests::test_database()
+    };
+    let db = crate::db::Db::connect(&database).await?;
+    if phase == "record" {
+        let f = Fixture::real_system().await;
+        let recorded = async {
+            let t0 = crate::client::filetime_now();
+            std::fs::write(root.join("identity"), format!("{}\n{}\n{}\n", f.owner, f.account, t0))?;
+            db.execute("INSERT INTO game.npc_bounty_pools (character_id,system_id,batch_started_at,due_at,amount,kill_count,legacy_kill_count,security_gain_log) VALUES ($1,$2,$3,$4,'1.00',1,1,0)",
+                &[&f.owner, &f.system, &t0, &(t0 + 12_000_000_000)]).await?;
+            let world2 = crate::space::World::new(db.clone(), f.sde.clone(), 2);
+            world2.system(f.system).await?;
+            world2.with(f.system, move |s| s.add_npc_bounty(f.owner, 42, cents(100), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), t0 + 1)).await.unwrap().unwrap();
+            world2.flush_positions().await?;
+            let row = rows(&f, f.owner).await?.pop().ok_or_else(|| anyhow!("recorded pool missing"))?;
+            ensure!(row.legacy_kill_count == 1 && row.kill_count == 2, "restored legacy row was replaced: {row:?}");
+            ensure!(row.batch.started_at == t0, "recorded batch start drifted from the persisted identity");
+            let accepted_rate = crate::config::game().crimewatch.security_gain_npc_kill;
+            ensure!(accepted_rate != 0.2, "acceptance and settlement rates must differ");
+            std::fs::write(root.join("identity"), format!("{}\n{}\n{}\n{}\n{}", f.owner, f.account, row.batch.started_at, row.security_gain.storage().unwrap(), f.system))?;
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if recorded.is_err() { cleanup_pools(&f, f.owner).await; f.cleanup().await; }
+        return recorded;
+    }
+    let text = std::fs::read_to_string(root.join("identity"))?;
+    let (owner, _, started) = rate_identity_head(&text)?;
+    let stored: f64 = text.lines().nth(3).unwrap().parse()?;
+    let accepted = crate::npc_security::SecurityGain::from_storage(Some(stored)).unwrap();
+    let settled = async {
+        let world = crate::space::World::new(db.clone(), crate::tests::shared_sde(&db).await, 1);
+        settle_due(&db, &world, (owner, started), FUTURE).await.map_err(|e| anyhow!("settle: {e:?}"))?;
+        let security: f64 = db.query_one("SELECT security_status FROM game.characters WHERE character_id=$1", &[&owner]).await?.get("security_status");
+        let expected = 10.0 * crate::npc_security::SecurityGain::for_legacy(0.2, 1).merge(accepted).fraction();
+        ensure!((security - expected).abs() <= 1e-9, "mixed settlement repriced the accepted gain: {security} vs {expected}");
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    settled
 }

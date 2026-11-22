@@ -27,7 +27,7 @@ async fn target_loss_requires_live_source_and_current_generation() {
         let cx = Ctx { db, world, notify, char_id: 1, ship_id: 2, system_id: 1 };
         let sde = cx.world.sde().clone();
         let module_type = sde.types.iter().find(|ty| ty.effects().iter().any(|e| i64::from(e.effect_id) == effect.id)).unwrap().type_id;
-        let mut cycle = Cycle { cx, modules: vec![Module { id: module, type_id: module_type, flag: 0 }], effect,
+        let mut cycle = Cycle { cx, modules: vec![Module { id: module, type_id: module_type, flag: 0 }], presented_effect: effect.id, effect,
             target: Some(3), repeat: 1, stop: generation.clone(),
             owner: ActivationOwner { master: module, generation: generation.clone(), armed: true, combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },
             started: 0, charge_type: None, cycles: 0, duration_ms: 1.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
@@ -58,7 +58,7 @@ async fn target_loss_requires_live_source_and_current_generation() {
         assert!(cycle_source_current(&system, &cycle));
         assert!(cycle_target_lost(&system, &cycle));
         cycle.source_membership = Some(install(&mut system));
-        assert!(source_subject_current(&mut system, 2, 1, cycle.source_membership.unwrap(), &cycle.modules[0], cycle.effect.id, &generation));
+        assert!(source_subject_current(&mut system, 2, 1, cycle.source_membership.unwrap(), &cycle.modules[0], cycle.presented_effect, &generation));
         system.insert(ball(3, None));
         assert!(!cycle_target_lost(&system, &cycle));
         let mut system = System::default();
@@ -67,11 +67,11 @@ async fn target_loss_requires_live_source_and_current_generation() {
         assert!(!cycle_source_current(&system, &cycle));
         assert!(!cycle_target_lost(&system, &cycle));
         cycle.source_membership = Some(install(&mut system));
-        assert!(source_subject_current(&mut system, 2, 1, cycle.source_membership.unwrap(), &cycle.modules[0], cycle.effect.id, &generation));
+        assert!(source_subject_current(&mut system, 2, 1, cycle.source_membership.unwrap(), &cycle.modules[0], cycle.presented_effect, &generation));
         generation.store(false, Ordering::Relaxed);
         state().active.get_mut(&module).unwrap().stop = Arc::new(AtomicBool::new(false));
         assert!(!cycle.stop.load(Ordering::Relaxed));
-        assert!(!source_subject_current(&mut system, 2, 1, cycle.source_membership.unwrap(), &cycle.modules[0], cycle.effect.id, &generation));
+        assert!(!source_subject_current(&mut system, 2, 1, cycle.source_membership.unwrap(), &cycle.modules[0], cycle.presented_effect, &generation));
         assert!(!cycle_source_current(&system, &cycle));
         assert!(!cycle_target_lost(&system, &cycle));
     }).await;

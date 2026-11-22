@@ -52,7 +52,7 @@ async fn player_remote_phases_clamping_frozen_source_and_cancel() {
         let cx = Ctx { db: db.clone(), world: world.clone(), notify, char_id: f.source, ship_id: f.ship, system_id: 1 };
         let generation = crate::space::targeting::next_generation();
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
-            effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
+            presented_effect: effect.id, effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
             owner: ActivationOwner { master: f.module, generation: stop, armed: true,
                 combat_generations: vec![NativeCombatGeneration { module_id: f.module, generation, sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&world), system: 1 },
@@ -164,7 +164,7 @@ async fn full_remote_repair_refuses_and_driver_retires_activation() {
     fixture::set_locked_target(f.source, f.victim, true);
     let cx = Ctx { db: db.clone(), world: world.clone(), notify, char_id: f.source, ship_id: f.ship, system_id: 1 };
     let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
-        effect: effect.clone(), target: Some(f.victim), repeat: 1, stop: stop.clone(),
+        presented_effect: effect.id, effect: effect.clone(), target: Some(f.victim), repeat: 1, stop: stop.clone(),
         owner: ActivationOwner { master: f.module, generation: stop.clone(), armed: true,
             combat_generations: vec![NativeCombatGeneration { module_id: f.module, generation: crate::space::targeting::next_generation(), sequence: 0 }],
             pending_combat: None, world: Arc::downgrade(&world), system: 1 },
@@ -182,7 +182,7 @@ async fn full_remote_repair_refuses_and_driver_retires_activation() {
     state().active.insert(f.module, ActiveModule { char_id: f.source, stop: replacement.clone(), forced_inactive: false });
     state().activation_generation.insert(f.module, replacement.clone());
     let stale = Cycle { cx, modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
-        effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
+        presented_effect: effect.id, effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
         owner: ActivationOwner { master: f.module, generation: stop, armed: true,
             combat_generations: Vec::new(), pending_combat: None, world: Arc::downgrade(&world), system: 1 },
         started: 0, charge_type: None, cycles: 0, duration_ms: 1000.0, nominal_start: 0,

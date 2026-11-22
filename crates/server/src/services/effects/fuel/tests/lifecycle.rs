@@ -122,7 +122,7 @@ async fn scenario_run(scenario: Scenario, recorded: Arc<Mutex<Ids>>) {
     }).collect();
     let owner = ActivationOwner { master: ids.module, generation: generation.clone(), armed: true,
         combat_generations, pending_combat: None, world: Arc::downgrade(&world), system: 1 };
-    let cycle = Cycle { cx, modules, effect, target: None, repeat: 2, stop: generation, owner, started: 1, charge_type: None, cycles: 0, duration_ms: 500.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
+    let cycle = Cycle { cx, modules, presented_effect: effect.id, effect, target: None, repeat: 2, stop: generation, owner, started: 1, charge_type: None, cycles: 0, duration_ms: 500.0, nominal_start: 0, other: None, repair_amount: 0.0, illegal: false,
         source_membership: None, target_type: None, inputs: crate::services::effects::parameters::CycleInputs::default() };
     world.with(1, move |s| { let now = s.now_ms(); cycle_start(s, cycle, now); }).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {

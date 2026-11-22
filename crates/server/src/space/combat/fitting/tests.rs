@@ -7,6 +7,8 @@ use crate::space::tests::fit_delta::{assert_batch, attr_batches};
 use std::sync::Arc;
 
 mod drones;
+mod ship_stance;
+mod reactive_armor;
 
 fn hull() -> Ball {
     Ball { id: 1, type_id: 1, owner_id: 2, corp_id: 1, alliance_id: -1, char_id: Some(2),
@@ -271,9 +273,9 @@ fn install_fit(system: &mut System, ship: i64, fit: Fit) -> u64 {
     system.combat_membership_generation(ship).unwrap()
 }
 
-fn install_drone(system: &mut System, type_id: i32, fit: Fit) {
+fn install_drone(system: &mut System, type_id: i32, owner: i64, fit: Fit) {
     use crate::space::drone::{DroneEffects, DroneSpec};
-    system.insert(Ball { id: 5, type_id, char_id: None, owner_id: 2, ..hull() });
+    system.insert(Ball { id: 5, type_id, char_id: None, owner_id: owner, ..hull() });
     let spec = DroneSpec { type_id, bandwidth: 5.0, scan_resolution: 100.0, control_range: 1000.0,
         max_target_range: 1000.0, optimal_range: 100.0, orbit_range: 50.0, duration_ms: 1000.0, effect_id: Some(1) };
     let effects: DroneEffects = Arc::new(|_, _| None);
@@ -345,7 +347,7 @@ fn stale_gates_reject_and_due_expiry_fires_before_its_timer() {
     // prepare consumed: the queued kinematics write is the output fact.
     let mut drone_fit = crate::services::fit::attributes::tests::module_fit(sde.clone(), 1, 1, false);
     drone_fit.apply_character_inputs(&character(now - 2 * infinity_core::consts::FILETIME_SECOND, Some(expiry)));
-    install_drone(&mut system, 1, drone_fit);
+    install_drone(&mut system, 1, 2, drone_fit);
     assert!(system.ball(5).unwrap().signature_radius.is_none());
     assert!(system.fitted_module_online(1, 2, false));
     system.tick(1000);
@@ -368,7 +370,7 @@ fn publish_replaces_domain_on_ship_and_owned_drones_and_preserves_live_state() {
     let mut drone_fit = crate::services::fit::attributes::tests::module_fit(sde.clone(), 1, 1, true);
     drone_fit.include_drone(5, 1, vec![]);
     drone_fit.apply_character_inputs(&character(now, None));
-    install_drone(&mut system, 1, drone_fit);
+    install_drone(&mut system, 1, 2, drone_fit);
     assert!(system.set_condition_fraction(1, 0.5));
     let (_, seeded) = crate::services::combat::groups_health::fill_capacitor(1, 100.0, 1000.0, crate::client::filetime_now());
     system.upsert_projection(1, Projection { source_ship: 8, source_module: 9, source_type: 1,
@@ -556,4 +558,54 @@ async fn character_publications_cover_deadlines_and_merged_mutations() {
         assert!(system.with_combat_fit(1, |_, _, _| ()).is_some());
         assert!(attr_batches(&mut rx).is_empty());
     }
+}
+
+fn fast_talk(multiplier: f64) -> Fit {
+    let (sde, _) = rig();
+    let mut fit = Fit::for_space_type(sde, 1, vec![]);
+    let mut inputs = character(1, None);
+    inputs.attributes = Some(vec![(359, multiplier)]);
+    fit.apply_character_inputs(&inputs);
+    fit
+}
+
+#[test]
+fn resident_fast_talk_freezes_controller_and_refuses_missing_fit() {
+    use crate::lua::events::resources::FactOrigin;
+    let (_, registry) = rig();
+    let mut system = System::new(1, registry, 0);
+    let mut ship = hull();
+    ship.char_id = Some(2);
+    system.add_persistent_ship(ship);
+    let generation = install_fit(&mut system, 1, fast_talk(1.25));
+    let admitted = system.prepare_combat_source(1, None, None, None, FactOrigin::Natural, generation, 1, 1, |_| true).unwrap();
+    assert_eq!(admitted.npc_security_multiplier.unwrap().value(), 1.25);
+    let again = system.prepare_combat_source(1, None, None, None, FactOrigin::Natural, generation, 2, 1, |_| true).unwrap();
+    assert_eq!((again.actual_actor_character, again.activation), (admitted.actual_actor_character, admitted.activation));
+    assert_ne!(again.sequence, admitted.sequence);
+    system.actor_combat.remove(&1);
+    assert!(system.prepare_combat_source(1, None, None, None, FactOrigin::Natural, generation, 3, 1, |_| true).is_err());
+}
+
+#[test]
+fn published_fast_talk_values_and_delegated_controller_freeze() {
+    use crate::lua::events::resources::FactOrigin;
+    let (_, registry) = rig();
+    let mut system = System::new(1, registry, 0);
+    let mut ship = hull();
+    ship.char_id = Some(2);
+    system.add_persistent_ship(ship);
+    let generation = install_fit(&mut system, 1, fast_talk(1.0));
+    let untrained = system.prepare_combat_source(1, None, None, None, FactOrigin::Natural, generation, 1, 1, |_| true).unwrap();
+    let mut trained = character(2, None);
+    trained.attributes = Some(vec![(359, 1.5)]);
+    assert!(system.publish_character_inputs(1, 2, generation, &trained));
+    let admitted = system.prepare_combat_source(1, None, None, None, FactOrigin::Natural, generation, 2, 1, |_| true).unwrap();
+    assert!(admitted.npc_security_multiplier.unwrap().value() > untrained.npc_security_multiplier.unwrap().value());
+    install_drone(&mut system, 1, 8, fast_talk(9.0));
+    let drone_generation = system.combat_membership_generation(5).unwrap();
+    let drone = system.prepare_combat_source(5, None, None, None, FactOrigin::Natural, drone_generation, 1, 1, |_| true).unwrap();
+    let record = system.drone(5).unwrap();
+    assert_ne!(record.owner, record.controller_owner.unwrap());
+    assert_eq!((drone.actual_actor_character, drone.npc_security_multiplier.unwrap().value()), (Some(2), admitted.npc_security_multiplier.unwrap().value()));
 }

@@ -1,4 +1,4 @@
-//! `dogmaIM` RPC routing for `eve/client/script/dogma/` and `godma.py`.
+//! `dogmaIM` RPC routing for `eve/client/script/dogma/` and `godma.py`, including its module repair methods.
 //! Handlers use game item and dogma tables, SDE data and the space actor.
 //! Targeting on behalf of another object is not supported and is refused.
 //! State and gameplay mechanics remain in the delegated feature modules.
@@ -66,6 +66,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "StopOverload" => heat::rpc::handle(c, call.args, false, false).await,
         "OverloadRack" => heat::rpc::handle(c, call.args, true, true).await,
         "StopOverloadRack" => heat::rpc::handle(c, call.args, true, false).await,
+        "InitiateModuleRepair" => heat::paste::initiate(c, call.args).await,
+        "InitiateModuleRepairMany" => heat::paste::initiate_many(c, call.args).await,
+        "StopModuleRepair" => heat::paste::stop(c, call.args).await,
         "Activate" | "Deactivate" => {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let effect_name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();

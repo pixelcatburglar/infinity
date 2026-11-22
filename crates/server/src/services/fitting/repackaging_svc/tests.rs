@@ -8,6 +8,7 @@ use marshal::Value;
 
 mod scenarios;
 mod container_capacity;
+mod ship_stance;
 
 /// Scoped row state for refused repackaging: the supplied item keys with their
 /// current descendants, this fixture's related hangar outputs of the given

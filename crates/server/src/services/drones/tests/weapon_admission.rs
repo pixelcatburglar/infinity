@@ -2,7 +2,7 @@ use std::{future::Future, task::Poll, time::Duration};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
 use infinity_core::{consts::{*, dogma::*}};
-use crate::{services::{combat::ATTR_DAMAGE, effects::{registry, EffectKind, space_source::SourceGuard, weapons::{self, Missile}}, fit::{Fit, Key}}, space::drone::DroneOrder};
+use crate::{services::{combat::ATTR_DAMAGE, effects::{registry, EffectKind, space_source::SourceGuard, weapons::{self, missile::Missile}}, fit::{Fit, Key}}, space::drone::DroneOrder};
 use super::fixture::Fixture;
 
 mod missile_persistent;
@@ -16,14 +16,14 @@ async fn catch_scenario(future: impl Future<Output = Result<()>>) -> std::thread
     }).await
 }
 
-fn drone_type(f: &Fixture) -> Result<i32> {
+pub(in crate::services) fn drone_type(f: &Fixture) -> Result<i32> {
     f.sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_DRONE)
         && t.attribute(ATTR_DRONE_BANDWIDTH_USED).is_some_and(|v| v > 0.0)
         && t.effects().iter().any(|e| registry::resolve(&f.sde, e.effect_id).is_some_and(|e| e.kind == EffectKind::Turret)))
         .map(|t| t.type_id).ok_or_else(|| anyhow!("published turret drone unavailable"))
 }
 
-async fn launch(f: &mut Fixture, drone: i64) -> Result<()> {
+pub(in crate::services) async fn launch(f: &mut Fixture, drone: i64) -> Result<()> {
     let args = [Value::list([Value::tuple([Value::Int(drone), Value::Int(1)])]), Value::None, Value::Bool(false)];
     let Value::Dict(rows) = f.call("ship", "LaunchDrones", &args).await.ok().ok_or_else(|| anyhow!("launch refused"))? else { return Err(anyhow!("launch mapping")) };
     ensure!(rows == vec![(Value::Int(drone), Value::list([Value::Int(drone)]))], "launch failed: {rows:?}");
@@ -182,7 +182,7 @@ async fn missile_generation_is_validated_at_insertion() -> Result<()> {
             aoe_cloud: charge.attribute(ATTR_AOE_CLOUD_SIZE).unwrap(), aoe_velocity: charge.attribute(ATTR_AOE_VELOCITY).unwrap(),
             drf: charge.attribute(ATTR_AOE_DAMAGE_REDUCTION_FACTOR).unwrap(), velocity: charge.attribute(ATTR_MAX_VELOCITY).unwrap(),
             flight_time_ms: charge.attribute(ATTR_EXPLOSION_DELAY).unwrap(),
-            weapon: charge.type_id, illegal: false };
+            weapon: charge.type_id, illegal: false, dot: None };
         let guard = locked(&f, source, victim).await?;
         let (from, target) = f.world.with(f.system, move |s| Some((s.sampled_ball(source)?, s.sampled_ball(victim)?))).await.flatten().ok_or_else(|| anyhow!("missing drones"))?;
         let (tx_victim, mut rx_victim) = tokio::sync::mpsc::unbounded_channel();
@@ -199,7 +199,7 @@ async fn missile_generation_is_validated_at_insertion() -> Result<()> {
         ensure!(f.world.with(f.system, move |s| s.drone_order(source, owner, ship, DroneOrder::ReturnHome)).await == Some(true), "recall failed");
         ensure!(f.world.with(f.system, move |s| !guard.valid(s)).await == Some(true), "recall did not invalidate captured guard");
         let before = f.world.with(f.system, |s| s.balls().count()).await.ok_or_else(|| anyhow!("actor stopped"))?;
-        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from.clone(), target.clone(), f.owner, None, missile(), Some(guard), attempt).await.ok().ok_or_else(|| anyhow!("stale launch failed"))?;
+        weapons::missile::launch_missile(f.db.clone(), f.world.clone(), f.system, from.clone(), target.clone(), f.owner, None, missile(), Some(guard), attempt).await.ok().ok_or_else(|| anyhow!("stale launch failed"))?;
         ensure!(f.world.with(f.system, |s| s.balls().count()).await == Some(before), "stale missile inserted");
         ensure!(f.world.after(f.system, 1_000).await, "actor stopped");
         ensure!(f.world.with(f.system, move |s| s.balls().count() == before && s.ball(victim).is_some_and(|b| b.health == health_before)).await == Some(true), "stale launch changed actor or target health");
@@ -222,7 +222,7 @@ async fn missile_generation_is_validated_at_insertion() -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         f.world.register_pilot(f.owner, tx);
         let attempt = admitted(&f, current, source, from.type_id).await?;
-        weapons::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, missile(), Some(current), attempt).await.ok().ok_or_else(|| anyhow!("valid launch failed"))?;
+        weapons::missile::launch_missile(f.db.clone(), f.world.clone(), f.system, from, target, f.owner, None, missile(), Some(current), attempt).await.ok().ok_or_else(|| anyhow!("valid launch failed"))?;
         ensure!(f.world.with(f.system, |s| s.balls().count()).await == Some(before + 1), "valid missile not inserted");
         ensure!(f.world.with(f.system, move |s| s.drone_order(source, owner, ship, DroneOrder::ReturnHome)).await == Some(true), "post-launch recall failed");
         tokio::time::timeout(Duration::from_secs(35), async {

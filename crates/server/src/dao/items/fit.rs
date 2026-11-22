@@ -2,8 +2,10 @@
 //! This DAO has no direct client service; dogma evaluation and SDE category filtering remain in the caller.
 //! Brain reads use an explicit FILETIME and exclude expired boosters, including before cleanup.
 //! Shared item type lookup lives in `items::inventory`; activation and consumption are not handled here.
+//! `flagHiddenModifers` rows ship alongside ordinary fit flags as candidates;
+//! the loader decides whether they are the hull's recognized stance mode.
 use crate::db::{executor::Executor, Error};
-use infinity_core::consts::{FLAG_BOOSTER, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_IMPLANT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST};
+use infinity_core::consts::{FLAG_BOOSTER, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HIDDEN_MODIFIERS, FLAG_IMPLANT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST};
 use super::brain::BrainItem;
 use tokio_postgres::Row;
 
@@ -24,8 +26,8 @@ pub(crate) async fn drones(ex: &(impl Executor + ?Sized), char_id: i64, ship: i6
 
 pub(crate) async fn modules(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<Module>, Error> {
     Ok(ex.query("SELECT item_id, type_id, COALESCE(online, false) AS online, flag_id FROM game.items WHERE location_id = $1
-                 AND (flag_id BETWEEN $2 AND $3 OR flag_id BETWEEN $4 AND $5 OR flag_id BETWEEN $6 AND $7)",
-        &[&ship, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST]).await?.iter().map(Module::from_row).collect())
+                 AND (flag_id BETWEEN $2 AND $3 OR flag_id BETWEEN $4 AND $5 OR flag_id BETWEEN $6 AND $7 OR flag_id = $8)",
+        &[&ship, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST, &FLAG_HIDDEN_MODIFIERS]).await?.iter().map(Module::from_row).collect())
 }
 
 /// Owned hulls containing online fitting items, in hull lock order.

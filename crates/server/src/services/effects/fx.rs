@@ -8,7 +8,7 @@
 use super::lifecycle::Module;
 use super::registry::{Effect, EffectFlag};
 use crate::services::combat::Ctx;
-use crate::space::{special_fx, FxModule, system::presentation::{FxRetention, ModuleFx}};
+use crate::space::{special_fx, FxModule, System, system::presentation::{FxRetention, ModuleFx}};
 use marshal::Value;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -36,16 +36,22 @@ pub(super) fn weapon_fx(cx: &Ctx, modules: &[Module], effect: &Effect, target: O
     let is_offensive = effect.has(EffectFlag::Offensive);
     let generation = generation.clone();
     cx.world.post(system, move |s| {
-        for module in &modules {
-            s.publish_module_fx(master, &generation, ModuleFx {
-                module: FxModule { item: Some(module.id), type_id: module.type_id },
-                guid: guid.clone(),
-                charge,
-                offensive: is_offensive,
-                duration_ms,
-                repeat,
-                graphic_info: graphic_info.clone(),
-            }, start, FxRetention::Current);
-        }
+        publish_current_module_fx(s, &modules, &guid, charge, is_offensive, duration_ms, repeat, graphic_info, start, master, &generation);
     });
+}
+
+/// Publish one already-admitted Current effect for each module on the actor.
+/// The caller owns the post; this does not send work to the world itself.
+pub(super) fn publish_current_module_fx(s: &mut System, modules: &[Module], guid: &str, charge: Option<i32>, offensive: bool, duration_ms: f64, repeat: i64, graphic_info: Value, start: bool, master: i64, generation: &Arc<AtomicBool>) {
+    for module in modules {
+        s.publish_module_fx(master, generation, ModuleFx {
+            module: FxModule { item: Some(module.id), type_id: module.type_id },
+            guid: guid.to_owned(),
+            charge,
+            offensive,
+            duration_ms,
+            repeat,
+            graphic_info: graphic_info.clone(),
+        }, start, FxRetention::Current);
+    }
 }

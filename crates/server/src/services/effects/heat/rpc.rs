@@ -41,7 +41,7 @@ fn result_value(rack: bool, modules: &[(Module, i32)]) -> Value {
 fn supported(c: &Client, item: &Item) -> bool {
     c.sde.types.effects(item.type_id).iter().any(|entry| {
         entry.effect_id != EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER && registry::resolve(&c.sde, entry.effect_id)
-            .is_some_and(|effect| effect.manually_activatable() && registry::activation_in_scope(item.category_id, item.group_id, effect.kind)
+            .is_some_and(|effect| effect.manually_activatable() && registry::activation_in_scope(&c.sde, item.type_id, effect.kind)
                 && c.sde.dogma.effect(entry.effect_id).is_some_and(|row| matches!(row.effect_category, Some(1 | 2))))
     })
 }

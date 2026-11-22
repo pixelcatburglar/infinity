@@ -9,10 +9,12 @@
 //! captured root is still a singleton wreck or ordinary container sitting directly
 //! in the captured solar system, and it shares the impound reservation refusal.
 //! Enacted corporation blueprint locks and pending vote-case reservations also
-//! refuse destruction once for the whole verified closure.
+//! refuse destruction once for the whole verified closure. An explicitly
+//! selected hidden internal-modifier root is refused; it may only leave inside
+//! its hull's closure.
 use super::access::{corporate_custody, custody_allowed};
 use super::destination;
-use super::is_fitting_flag;
+use super::{is_fitting_flag, is_internal_modifier_flag};
 use super::movement::MoveEffect;
 use super::notifications::{notify_corp_item_removed, notify_item_removed};
 use super::reachability::{Endpoint, Reachability};
@@ -276,6 +278,11 @@ pub(in crate::services) async fn verify_closure<'tx>(
     }
     for item in &items {
         if Some(item.item_id) == prepared.active_ship { return Err(refuse()); }
+        // A hidden internal-modifier item may leave only inside its hull's
+        // closure; it is never an explicitly selected destruction root.
+        if prepared.roots.contains(&item.item_id) && is_internal_modifier_flag(item.flag_id) {
+            return Err(refuse());
+        }
         if operation == Operation::Destroy
             && sde.typelists.is_untrashable(item.type_id, item.group_id as i32, item.category_id as i32) {
             return Err(refuse());

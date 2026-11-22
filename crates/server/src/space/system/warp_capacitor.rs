@@ -16,8 +16,17 @@ impl System {
         let Some(ball) = self.balls.get(&ship) else { self.cancel_warp_intent(ship); return };
         if !ball.free || logical_ms <= ball.last_ms || ball.mass * f64::from(ball.agility) <= 0.0 || !ball.is_aligned_for_warp() { return; }
         let generation = (self.persistent_generation(ship), self.combat_membership_generation(ship));
-        let endpoint = ball.resolved_warp_endpoint();
         let pos = ball.pos;
+        if self.interdicted(ship) {
+            self.abort_pending_warp(ship, stamp, collisions);
+            return;
+        }
+        let mut endpoint = ball.resolved_warp_endpoint();
+        let mut caught = false;
+        if let Some(landing) = self.interdiction_landing(ship, pos, endpoint) {
+            endpoint = landing;
+            caught = true;
+        }
         let mass = ball.mass;
         let pilot = ball.char_id;
         let record = self.actor_combat.get(&ship);
@@ -37,13 +46,24 @@ impl System {
         });
         if !valid {
             tracing::error!(ship, "invalid warp capacitor state");
-            self.stop_unpaid_warp(ship, stamp, collisions);
+            self.abort_pending_warp(ship, stamp, collisions);
             return;
         }
         let (_, cost, capacity_tau) = values.unwrap();
+        // The final pre-payment/activate boundary: an admitted mode cancels
+        // the pending warp through the existing stop path with no debit and
+        // no WarpFX.
+        if crate::services::effects::active_cycle::mode_locked(self, ship) {
+            self.abort_pending_warp(ship, stamp, collisions);
+            return;
+        }
         if cost == 0.0 {
-            self.balls.get_mut(&ship).unwrap().activate_warp_to(stamp, endpoint);
-            self.warp_exits.get_mut(&ship).unwrap().pending = false;
+            if caught {
+                self.activate_shortened_warp(ship, stamp, endpoint);
+            } else {
+                self.balls.get_mut(&ship).unwrap().activate_warp_to(stamp, endpoint);
+                self.warp_exits.get_mut(&ship).unwrap().pending = false;
+            }
             return;
         }
         let (capacity, tau) = capacity_tau.unwrap();
@@ -55,23 +75,29 @@ impl System {
             }
         }
         if debit.drained == 0.0 {
-            self.stop_unpaid_warp(ship, stamp, collisions);
+            self.abort_pending_warp(ship, stamp, collisions);
         } else if debit.drained < cost {
             let shortened = add(pos, scale(sub(endpoint, pos), debit.drained / cost));
-            self.balls.get_mut(&ship).unwrap().activate_warp_to(stamp, shortened);
-            let intent = self.warp_exits.get_mut(&ship).unwrap();
-            intent.pending = false;
-            intent.full = false;
-            let arrival = intent.arrival.take();
-            if let Some(id) = arrival { self.release_warp_arrival(id); }
-            self.warp_corrections.push(ship);
+            self.activate_shortened_warp(ship, stamp, shortened);
+        } else if caught {
+            self.activate_shortened_warp(ship, stamp, endpoint);
         } else {
             self.balls.get_mut(&ship).unwrap().activate_warp_to(stamp, endpoint);
             self.warp_exits.get_mut(&ship).unwrap().pending = false;
         }
     }
 
-    fn stop_unpaid_warp(&mut self, ship: i64, stamp: i64, collisions: bool) {
+    fn activate_shortened_warp(&mut self, ship: i64, stamp: i64, endpoint: V3) {
+        self.balls.get_mut(&ship).unwrap().activate_warp_to(stamp, endpoint);
+        let intent = self.warp_exits.get_mut(&ship).unwrap();
+        intent.pending = false;
+        intent.full = false;
+        let arrival = intent.arrival.take();
+        if let Some(id) = arrival { self.release_warp_arrival(id); }
+        self.warp_corrections.push(ship);
+    }
+
+    fn abort_pending_warp(&mut self, ship: i64, stamp: i64, collisions: bool) {
         self.cancel_warp_intent(ship);
         self.apply_command(ship, stamp, collisions, |ball, stamp, _| {
             ball.stop();

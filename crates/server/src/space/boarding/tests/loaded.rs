@@ -35,6 +35,16 @@ async fn held_loaded_settles_at_dock_commit_and_releases_on_refusal() {
         let row = FreeShip { item_id: ship, type_id: kind, owner_id: owner, corporation_id: 1, alliance_id: -1, pos: [0.0; 3] };
         let prepared = balls::piloted(&db, sde.clone(), &row, owner, 0.0).await.ok().unwrap();
         world.with(system, move |s| prepared.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
+        let empty_ship = -ship;
+        let (loaded_membership, empty_membership) = world.with(system, { let sde = sde.clone(); move |s| {
+            let fit = Fit::for_space_type(sde, kind, vec![]);
+            let stats = ShipStats::from_fit(&fit, Key::Ship);
+            s.install_condition(empty_ship, Condition { now: stats.max, stats, shield_at: crate::client::filetime_now() }, fit);
+            (s.combat_membership_generation(ship).unwrap(), s.combat_membership_generation(empty_ship).unwrap())
+        }}).await.unwrap();
+        let mut held = quiesce_ship_loaded(&world, system, &[ship, empty_ship, i64::MAX]).await.unwrap();
+        assert_eq!((held.claimed_membership(ship), held.claimed_membership(empty_ship), held.claimed_membership(i64::MAX)), (Some(loaded_membership), Some(empty_membership), None));
+        world.with(system, move |s| { held.release_committed(s); s.actor_combat.remove(&empty_ship); }).await.unwrap();
         // Two payments leave a dirty absolute the boundary must settle.
         world.with(system, move |s| {
             let first = s.hold_loaded_use(ship, module).unwrap();
@@ -143,7 +153,7 @@ fn stale_incarnation_receipt_is_inert_and_pending_is_not_outstanding() {
     let incarnation = s.actor_combat[&7].loaded[&11].incarnation;
     s.publish_loaded_absolute(7, m7, vec![
         LoadedSeed { module: 11, flag: 27, type_id: Some(9), quantity: 4, pending: false }]);
-    let mut stale = HeldLoaded { world: std::sync::Weak::new(), system: 0, in_flight: false,
+    let mut stale = HeldLoaded { world: std::sync::Weak::new(), system: 0, in_flight: false, resident: vec![(7, m7)],
         slots: vec![HeldSlot { ship: 7, membership: m7, module: 11, flag: 27, incarnation, dirty: true }] };
     assert!(stale.invalidate(&mut s).is_empty() && s.unknown_loaded_keys().is_empty(),
         "a stale-incarnation receipt invalidates nothing");

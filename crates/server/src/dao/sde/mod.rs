@@ -9,6 +9,7 @@
 //! Repairable-ship recovery FSD configuration comes from `sde_native.repairabletypesconfig`,
 //! `sde_native.typerefurbishedcomponentconfig` and `sde_native.unrepairableitemsconfig`.
 //! Other SDE tables remain with their existing consumers until migrated.
+//! Command-burst modifier collections come from `sde_native.dbuffcollections`.
 //! The retail price and LP offer snapshots are the exceptions: they project `game.retail_prices` and `game.lp_offers` once at startup, the former after the startup upsert.
 pub(crate) mod crates;
 pub(crate) mod corporation_roles;
@@ -16,6 +17,7 @@ pub(crate) mod characters;
 pub(crate) mod compression;
 pub(crate) mod contribution_methods;
 pub(crate) mod corporations;
+pub(crate) mod dbuff;
 pub(crate) mod dogma;
 pub(crate) mod dungeons;
 pub(crate) mod dynamic_items;

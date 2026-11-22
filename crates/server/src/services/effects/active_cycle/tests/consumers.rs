@@ -2,7 +2,8 @@
 //! suppressor and emergency hull energizer through real Activate calls.
 use super::*;
 use crate::services::CallError;
-use infinity_core::consts::dogma::{ATTR_HULL_DAMAGE, ATTR_IS_ONLINE};
+use infinity_core::consts::dogma::{ATTR_DISALLOW_REPEATING_ACTIVATION, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_REACTIVATION_DELAY, ATTR_WARP_BUBBLE_IMMUNE, EFFECT_INTERDICTION_NULLIFIER_BONUS};
+use crate::services::fit::Key;
 
 /// Assault damage control and signature radius suppressor share one shape:
 /// start, bonus, list, end once, cool, refuse, admit after the delay.
@@ -91,5 +92,55 @@ async fn emergency_hull_energizer_burns_stays_burnt_and_refuses_reuse() {
         for (&(item, a), &base) in watched.iter().zip(&baseline) { assert_eq!(fitted_attr(&mut space.client, item, a).await, base, "refused burn applies no bonus to {a}"); }
         let after = combat::groups_health::capacitor_snapshot(db, &space.client.world, system, ship).await.unwrap().expect("capacitor").level;
         assert!(after >= cap, "refused burn must not debit the capacitor: before {cap}, after {after}");
+    }).await;
+}
+
+/// The nullifier runs exactly one real-SDE cycle and then its real
+/// 100-second cooldown, whatever repeat count the client sent; its
+/// `warpBubbleImmune` bonus raises rather than lowers the watched attribute.
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn nullifier_uses_single_cycle_and_sde_cooldown() {
+    scenario(EFFECT_INTERDICTION_NULLIFIER_BONUS, async |space, sde, db| {
+        let (system, module, ship) = (space.system, space.module, space.fixture.ship);
+        let type_id = module_type(sde, EFFECT_INTERDICTION_NULLIFIER_BONUS);
+        let row = sde.types.get(type_id).expect("nullifier module type");
+        let duration_attr = sde.dogma.effect(EFFECT_INTERDICTION_NULLIFIER_BONUS)
+            .and_then(|e| e.duration_attribute_id).expect("nullifier duration attribute");
+        let (duration, delay, disallow) = (
+            row.attribute(duration_attr).expect("SDE duration"),
+            row.attribute(ATTR_REACTIVATION_DELAY).expect("SDE reactivation delay"),
+            row.attribute(ATTR_DISALLOW_REPEATING_ACTIVATION).expect("SDE disallow flag"));
+        assert_eq!((duration, delay, disallow), (10_000.0, 100_000.0, 1.0), "real SDE nullifier timings");
+        // The shared scenario shrank all three for bounded tests; restore the
+        // real values so the assertions measure the production timings.
+        for (attribute, value) in [(duration_attr, duration), (ATTR_REACTIVATION_DELAY, delay), (ATTR_DISALLOW_REPEATING_ACTIVATION, disallow)] {
+            item_dogma::set_override(db, module, attribute, value).await.unwrap();
+        }
+        effects_fixture::publish_fit(db, &space.client.world, system, space.fixture.character, ship).await;
+        let activate = activate_args(space, &effect_name(sde, EFFECT_INTERDICTION_NULLIFIER_BONUS));
+        let watched = watched(sde, EFFECT_INTERDICTION_NULLIFIER_BONUS, module, ship);
+        assert_eq!(watched, vec![(ship, ATTR_WARP_BUBBLE_IMMUNE)], "nullifier raises only warpBubbleImmune");
+        // ShipGetInfo only emits attributes a type declares; warpBubbleImmune is
+        // observed on the actor's resident fit, the same read the field's own
+        // immunity check performs.
+        let immune_of = move |s: &mut crate::space::System| s.with_combat_fit(ship, |fit, _, _| fit.value(Key::Ship, ATTR_WARP_BUBBLE_IMMUNE));
+        let baseline = space.client.world.with(system, immune_of).await.flatten().expect("resident fit");
+        let _ = drain(&mut space.rx);
+        effects_fixture::dogma_call(&mut space.client, "Activate", &activate).await.ok().expect("activate");
+        until(&space.client.world, system, 5_000, || matches!(record(module), Record::Running)).await;
+        let ev = drain(&mut space.rx);
+        assert_eq!(godma(&ev, module, i64::from(EFFECT_INTERDICTION_NULLIFIER_BONUS), 1), 1, "start notification");
+        assert!(space.client.world.with(system, immune_of).await.flatten().expect("resident fit") > baseline, "immunity applies while running");
+        until(&space.client.world, system, 15_000, || matches!(record(module), Record::Cooling { .. })).await;
+        let ev = drain(&mut space.rx);
+        assert_eq!(godma(&ev, module, i64::from(EFFECT_INTERDICTION_NULLIFIER_BONUS), 0), 1, "one stop notification");
+        assert_eq!(godma(&ev, module, i64::from(EFFECT_INTERDICTION_NULLIFIER_BONUS), 1), 0, "no repeat start despite repeat=100");
+        assert_eq!(space.client.world.with(system, immune_of).await.flatten().expect("resident fit"), baseline, "immunity restores at the stop");
+        let Some(&combat::ActiveCycle::Cooling { stopped, deadline }) = combat::state().active_cycles.get(&module) else { panic!("cooling record") };
+        assert_eq!(deadline - stopped, 100_000, "cooling runs the real SDE delay");
+        let Err(CallError::User { msg, dict }) = effects_fixture::dogma_call(&mut space.client, "Activate", &activate).await else { panic!("cooling activation must refuse") };
+        assert_eq!(msg, messages::MSG_MODULE_REACTIVATION_DELAYED);
+        assert!(dict.iter().find(|(k, _)| k == "delay").and_then(|(_, v)| v.as_float()).is_some_and(|d| d > 0.0));
     }).await;
 }

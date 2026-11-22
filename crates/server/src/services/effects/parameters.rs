@@ -5,7 +5,9 @@
 //! projection operands one capture needs. No fit, key, database handle, live
 //! target state, guard, attempt or authorization snapshot is stored. An
 //! uncaptured `CycleInputs` holds only unallocated buffers; a consumer finding
-//! it has hit a wiring error, never a successful capture.
+//! it has hit a wiring error, never a successful capture. Command bursts
+//! capture the module's effective warfare-buff collections, duration and
+//! range into the same master packet.
 use std::sync::Arc;
 use crate::services::{CallError, combat::{ATTR_DAMAGE, targeting_charges::requires_loaded_charge}, fit::{Fit, Key}};
 use crate::services::inventory::hold_storage::HoldCapacity;
@@ -16,18 +18,18 @@ use crate::space::combat::loaded::LoadedPermit;
 use crate::space::V3;
 use infinity_core::consts::{dogma::ATTR_ACCESS_DIFFICULTY_BONUS, dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR,
     dogma::ATTR_AOE_VELOCITY, dogma::ATTR_CAPACITOR_BONUS, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITOR_NEED,
-    dogma::ATTR_DAMAGE_DELAY_DURATION, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_DOOMSDAY_AOE_DURATION, dogma::ATTR_DOOMSDAY_DAMAGE_CYCLE_TIME,
-    dogma::ATTR_DOOMSDAY_DAMAGE_RADIUS, dogma::ATTR_DOOMSDAY_DAMAGE_DURATION, dogma::ATTR_DOOMSDAY_ENERGY_NEUT_AMOUNT,
-    dogma::ATTR_DOOMSDAY_ENERGY_NEUT_RADIUS, dogma::ATTR_DOOMSDAY_ENERGY_NEUT_RESISTANCE_ID, dogma::ATTR_DOOMSDAY_ENERGY_NEUT_SIGNATURE_RADIUS,
-    dogma::ATTR_DOOMSDAY_IMMOBILITY_DURATION, dogma::ATTR_DOOMSDAY_NO_JUMP_OR_CLOAK_DURATION, dogma::ATTR_DOOMSDAY_WARNING_DURATION,
+    dogma::ATTR_DAMAGE_MULTIPLIER,
     dogma::ATTR_EMP_FIELD_RANGE, dogma::ATTR_REMOTE_RESISTANCE_ID,
     dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_ENTITY_MISSILE_TYPE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_FALLOFF,
-    dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER,
-    dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
-    dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER,
-    dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_POWER_TRANSFER_AMOUNT, dogma::ATTR_REACTIVATION_DELAY, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_TARGETING_DELAY,
+    dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER,
+    dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER,
+    dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
+    dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_POWER_TRANSFER_AMOUNT, dogma::ATTR_RECHARGE_RATE,
     dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_PER_CYCLE, dogma::ATTR_DAMAGE_MULTIPLIER_BONUS_MAX, dogma::EFFECT_TARGET_DISINTEGRATOR_ATTACK,
-    dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED, FLAG_CARGO};
+    dogma::EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT, dogma::EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT,
+    dogma::ATTR_TRACKING_SPEED};
+
+mod master;
 
 /// Fitted optimal and falloff pair shared by typed packets.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,8 +75,17 @@ pub(crate) struct MissileInputs {
     pub(crate) drf: f64,
     pub(crate) velocity: f64,
     pub(crate) flight_time_ms: f64,
+    /// Breacher pod DOT payload when the loaded charge carries dotMissileLaunching.
+    pub(crate) dot: Option<super::breacher::DotPayload>,
 }
 
+/// Flight values of one admitted festival shot. No damage, application or credit fields.
+#[derive(Clone, Copy)]
+pub(crate) struct FestivalInputs {
+    pub(crate) charge: i32,
+    pub(crate) velocity: f64,
+    pub(crate) lifetime_ms: f64,
+}
 /// A smartbomb's fitted radius and typed damage.
 pub(crate) struct AreaInputs {
     pub(crate) radius: f64,
@@ -183,10 +194,14 @@ pub(crate) struct CloakInputs {
     pub(crate) targeting_ms: i64,
 }
 
-/// Compression facility list and range.
+/// Compression facility list, range and the effective industrial-core
+/// requirement captured from the resident fit.
 pub(crate) struct CompressionInputs {
     pub(crate) list: i64,
     pub(crate) range: f64,
+    /// Effective `activationRequiresActiveIndustrialCore` (attribute 3265).
+    /// A positive value requires a live industrial or compact core.
+    pub(crate) core: f64,
 }
 
 /// Entosis link duration, range and the scoped would-be-active fact.
@@ -205,10 +220,23 @@ pub(crate) struct ActiveCycleInputs {
     pub(crate) hp: f64,
 }
 
+/// The adaptive armor hardener's captured packet: the clean first-cycle
+/// operand seed and the effective per-cycle resistance shift fraction.
+/// Repeats re-evaluate the shift but never re-seed.
+#[derive(Clone, Copy)]
+pub(crate) struct ReactiveArmorInputs {
+    /// The module's four raw armor-resonance operands captured with the old
+    /// generation's overlay already removed; `None` on every repeat capture.
+    pub(crate) seed: Option<[f64; 4]>,
+    /// Effective resistanceShiftAmount (SDE 1849) as a whole fraction.
+    pub(crate) shift: f64,
+}
+
 /// The per-member closed packet of families that execute every fitted member.
 pub(crate) enum MemberPacket {
     Turret(TurretInputs),
     Missile(MissileInputs),
+    Festival(FestivalInputs),
     Smartbomb(AreaInputs),
     Bomb(BombInputs),
     Vorton(VortonInputs),
@@ -343,6 +371,15 @@ pub(crate) enum MasterPacket {
     Entosis(EntosisInputs),
     /// Duration-bounded pure-modifier consumer values.
     ActiveCycle(ActiveCycleInputs),
+    CommandBurst(super::command_burst::CommandBurstInputs),
+    BreachControl(super::breach_control::BreachControlInputs),
+    /// Adaptive armor hardener cycle inputs.
+    ReactiveArmor(ReactiveArmorInputs),
+    /// The unscripted warp-disruption sphere's fitted field radius, consumed
+    /// once when the field is raised.
+    Field { radius: f64 },
+    /// Frozen interdiction-probe payload captured from the pinned definitions.
+    Probe(super::probes::ProbeInputs),
     /// A family with no extra captured values or a member-packet family.
     None,
 }
@@ -374,11 +411,14 @@ pub(crate) struct CycleInputs {
     /// validation failure consumed at the fuel stage.
     pub(crate) fuel: Result<Vec<(i32, i64)>, CallError>,
     pub(crate) aim: Option<SuperWeaponAim>,
+    /// Immutable probe payload definitions pinned at activation. `None` for
+    /// every other family and for a reused buffer that has not been filled.
+    pub(crate) probes: Option<std::sync::Arc<crate::lua::content::fields_deployables::Definitions>>,
 }
 
 impl Default for CycleInputs {
     fn default() -> Self {
-        Self { frame: None, members: Vec::new(), fuel: Ok(Vec::new()), aim: None }
+        Self { frame: None, members: Vec::new(), fuel: Ok(Vec::new()), aim: None, probes: None }
     }
 }
 
@@ -392,6 +432,9 @@ pub(crate) enum SourceInputs {
     Capacitor(CapacitorInputs),
     RemoteRepair(RepairInputs),
     DroneMining(DroneMiningInputs),
+    /// Salvage drone inputs: the effect range attribute and the drone's own
+    /// access difficulty bonus, both read from the drone's key.
+    DroneSalvage { range: f64, bonus: f64 },
 }
 
 /// A fitted weapon that fires without a loaded charge: an active Turret
@@ -439,6 +482,7 @@ fn module_missile(fit: &Fit, module: &Module) -> MissileInputs {
         drf: fit.value(key, ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
         velocity: fit.value(key, ATTR_MAX_VELOCITY).max(1.0),
         flight_time_ms: fit.value(key, ATTR_EXPLOSION_DELAY),
+        dot: super::breacher::capture_dot(fit, module),
     }
 }
 
@@ -457,6 +501,7 @@ fn entity_missile(fit: &Fit, key: Key) -> MissileInputs {
         drf: attr(ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
         velocity: (attr(ATTR_MAX_VELOCITY) * fit.value(key, ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER)).max(1.0),
         flight_time_ms: attr(ATTR_EXPLOSION_DELAY) * fit.value(key, ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER),
+        dot: None,
     }
 }
 
@@ -553,6 +598,11 @@ pub(super) fn capture_ecm(fit: &Fit, key: Key, effect: &Effect, duration_ms: f64
 
 fn fill_projection(fit: &Fit, key: Key, effect: &Effect, charge_type: Option<i32>, inputs: &mut ProjectionInputs) {
     inputs.ranges = ranges(fit, key, effect);
+    // A charge type that itself declares the running effect, like a focused
+    // warp script, already contributes its targetID rows in the module
+    // domain; snapshotting them again with the charge as source applies them
+    // twice and leaves the receiver an extra charge operand set.
+    let charge_type = charge_type.filter(|ty| !super::lifecycle::has_effect(fit.sde().types.effects(*ty), effect.id as i32));
     inputs.charge_type = charge_type;
     super::projected::snapshot(fit, key, effect, charge_type, &mut inputs.module_values, &mut inputs.charge_values);
 }
@@ -582,11 +632,17 @@ fn mining(fit: &Fit, cycle: &Cycle) -> MiningInputs {
 }
 
 /// The captured payload of one cycle member; `existing` keeps the projection
-/// operand buffers of a repeating cycle.
-fn member_packet(fit: &Fit, cycle: &Cycle, module: &Module, existing: MemberPacket) -> Result<MemberPacket, CallError> {
+/// operand buffers of a repeating cycle. `token` is the charge identity this
+/// same capture assigned to the member.
+fn member_packet(fit: &Fit, cycle: &Cycle, module: &Module, token: Option<ChargeToken>, existing: MemberPacket) -> Result<MemberPacket, CallError> {
     let key = Key::Module(module.id);
     Ok(match cycle.effect.kind {
         EffectKind::Turret => MemberPacket::Turret(module_turret(fit, module, &cycle.effect, direct_damage_weapon(fit, module, &cycle.effect))),
+        EffectKind::Missile if cycle.effect.festival.is_some() || super::festival::launcher_in_scope(fit.sde(), module.type_id) => {
+            let admission = cycle.effect.festival.ok_or_else(|| CallError::Internal(anyhow::anyhow!("festival launcher captured without admission")))?;
+            let flight = admission.capture(fit, module, token)?;
+            MemberPacket::Festival(flight)
+        }
         EffectKind::Missile => MemberPacket::Missile(module_missile(fit, module)),
         EffectKind::Smartbomb => MemberPacket::Smartbomb(area(fit, key)),
         EffectKind::Bomb => MemberPacket::Bomb(bomb(fit, module)),
@@ -615,71 +671,6 @@ fn member_packet(fit: &Fit, cycle: &Cycle, module: &Module, existing: MemberPack
     })
 }
 
-/// The captured payload of master-only families, or `None` when the kind has
-/// no additional begin parameters.
-fn master_packet(fit: &Fit, cycle: &Cycle, duration_ms: f64) -> Result<MasterPacket, CallError> {
-    let master = cycle.modules[0].id;
-    let key = Key::Module(master);
-    Ok(match cycle.effect.kind {
-        EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } => {
-            MasterPacket::Repair(repair(fit, cycle))
-        }
-        EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster => {
-            MasterPacket::Capacitor(capacitor(fit, key, Some(Key::Charge(master)), &cycle.effect, Key::Ship))
-        }
-        EffectKind::Ecm | EffectKind::BurstJammer => {
-            MasterPacket::Ecm(capture_ecm(fit, key, &cycle.effect, duration_ms.max(lifecycle::MIN_MODULE_DURATION_MS)))
-        }
-        EffectKind::Mining => MasterPacket::Mining(mining(fit, cycle)),
-        EffectKind::Salvage => MasterPacket::Salvage(SalvageInputs {
-            range: super::tractor::range(fit, &cycle.modules[0], &cycle.effect),
-            bonus: fit.value(key, ATTR_ACCESS_DIFFICULTY_BONUS),
-            capacity: HoldCapacity::capture(fit, FLAG_CARGO),
-        }),
-        EffectKind::Tractor => MasterPacket::Tractor(TractorInputs {
-            range: super::tractor::range(fit, &cycle.modules[0], &cycle.effect),
-            velocity: fit.value(key, ATTR_MAX_TRACTOR_VELOCITY) as f32,
-        }),
-        EffectKind::CargoScan | EffectKind::ShipScan => {
-            MasterPacket::Scan(ScanInputs { range: super::tractor::range(fit, &cycle.modules[0], &cycle.effect) })
-        }
-        EffectKind::Cloak => MasterPacket::Cloak(CloakInputs {
-            reactivation_ms: fit.value(key, ATTR_REACTIVATION_DELAY).max(0.0) as i64,
-            targeting_ms: fit.value(key, ATTR_TARGETING_DELAY).max(0.0) as i64,
-        }),
-        EffectKind::SuperWeapon => MasterPacket::SuperWeapon(SuperWeaponInputs {
-            warning_ms: fit.value(key, ATTR_DOOMSDAY_WARNING_DURATION),
-            damage_delay_ms: fit.value(key, ATTR_DAMAGE_DELAY_DURATION),
-            duration_ms: fit.value(key, ATTR_DOOMSDAY_DAMAGE_DURATION),
-            cycle_ms: fit.value(key, ATTR_DOOMSDAY_DAMAGE_CYCLE_TIME),
-            radius: fit.value(key, ATTR_DOOMSDAY_DAMAGE_RADIUS),
-            range: fit.value(key, ATTR_MAX_RANGE),
-            signature_radius: fit.value(key, ATTR_SIGNATURE_RADIUS),
-            damage: ATTR_DAMAGE.map(|attr| fit.value(key, attr).max(0.0)),
-            aoe_duration_ms: fit.value(key, ATTR_DOOMSDAY_AOE_DURATION),
-            neut_radius: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_RADIUS),
-            neut_amount: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_AMOUNT),
-            neut_signature_radius: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_SIGNATURE_RADIUS),
-            immobility_ms: fit.value(key, ATTR_DOOMSDAY_IMMOBILITY_DURATION),
-            no_jump_or_cloak_ms: fit.value(key, ATTR_DOOMSDAY_NO_JUMP_OR_CLOAK_DURATION),
-            resistance_id: fit.value(key, ATTR_DOOMSDAY_ENERGY_NEUT_RESISTANCE_ID) as i32,
-        }),
-        EffectKind::Compression => {
-            MasterPacket::Compression(super::compression::values(fit, master).map(|(list, range)| CompressionInputs { list, range }))
-        }
-        EffectKind::Entosis => MasterPacket::Entosis(EntosisInputs {
-            parameters: super::entosis::parameters(fit, &cycle.effect, master),
-            would_be_active: fit.module_state(master).is_some_and(|(_, active)| active),
-        }),
-        EffectKind::ProbeLaunch | EffectKind::Hacking | EffectKind::Online => {
-            return Err(CallError::Internal(anyhow::anyhow!("unsupported cycle kind {:?}", cycle.effect.kind)));
-        }
-        EffectKind::Modifiers if super::active_cycle::consumer(cycle.effect.id) => {
-            MasterPacket::ActiveCycle(super::active_cycle::capture(fit, master))
-        }
-        _ => MasterPacket::None,
-    })
-}
 
 /// Capture one cycle's real inputs from the resident fit, reusing the prior
 /// buffer's member and operand capacity.
@@ -689,7 +680,22 @@ pub(super) fn capture_cycle(fit: &Fit, cycle: &Cycle, stamp: FitStamp, mut reuse
         .map(|attr| fit.value(Key::Module(master), attr)).unwrap_or(cycle.duration_ms);
     let discharge = {
         let attr = cycle.effect.attribute(EffectAttribute::Discharge).unwrap_or(ATTR_CAPACITOR_NEED);
-        cycle.modules.iter().map(|module| fit.value(Key::Module(module.id), attr)).sum()
+        cycle.modules.iter().map(|module| {
+            let key = Key::Module(module.id);
+            // Client dogma/effects/environment.py:65-69: a focused script runs
+            // its own effect, whose discharge attribute the module type does
+            // not declare; the cycle cost then falls back to the module's
+            // capacitorNeed, already reduced by the script's otherID rows.
+            // Explicit type or override values, zero included, are honoured.
+            let attr = if matches!(cycle.effect.id as i32, EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT | EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT)
+                && !fit.type_has_attribute(key, attr)
+                && !fit.overrides(key).iter().any(|(attribute, _)| *attribute == attr) {
+                ATTR_CAPACITOR_NEED
+            } else {
+                attr
+            };
+            fit.value(key, attr)
+        }).sum()
     };
     let fuel = super::fuel::requirements(fit, &cycle.modules, std::mem::replace(&mut reuse.fuel, Ok(Vec::new())).unwrap_or_default());
     reuse.members.truncate(cycle.modules.len());
@@ -711,7 +717,7 @@ pub(super) fn capture_cycle(fit: &Fit, cycle: &Cycle, stamp: FitStamp, mut reuse
         member.charge_type = member.charge_token.map(|token| token.type_id);
         member.heat = super::heat::rack_index(module.flag)
             .map(|rack| (rack, fit.value(key, super::heat::ABSORPTION), fit.value(key, super::heat::HEAT_DAMAGE)));
-        member.packet = member_packet(fit, cycle, module, std::mem::replace(&mut member.packet, MemberPacket::None))?;
+        member.packet = member_packet(fit, cycle, module, member.charge_token, std::mem::replace(&mut member.packet, MemberPacket::None))?;
     }
     reuse.frame = Some(CycleFrame {
         duration_ms,
@@ -724,9 +730,10 @@ pub(super) fn capture_cycle(fit: &Fit, cycle: &Cycle, stamp: FitStamp, mut reuse
             fit.value(Key::Ship, super::heat::ATTENUATION[rack]),
             fit.value(Key::Ship, super::heat::GENERATION),
         )),
-        packet: master_packet(fit, cycle, duration_ms)?,
+        packet: master::master_packet(fit, cycle, duration_ms, reuse.probes.as_deref())?,
     });
     reuse.fuel = fuel;
+    reuse.probes = cycle.inputs.probes.clone();
     Ok(reuse)
 }
 
@@ -752,6 +759,10 @@ pub(crate) fn capture_source(fit: &Fit, key: Key, effect: &Effect, duration_ms: 
             })
         }
         EffectKind::Mining => SourceInputs::DroneMining(DroneMiningInputs { values: crate::services::mining::yield_values(fit, key) }),
+        EffectKind::Salvage => SourceInputs::DroneSalvage {
+            range: fit.value(key, effect.attribute(EffectAttribute::Range).unwrap_or(ATTR_MAX_RANGE)),
+            bonus: fit.value(key, ATTR_ACCESS_DIFFICULTY_BONUS),
+        },
         _ => return Err(CallError::Internal(anyhow::anyhow!("unsupported source effect kind {:?}", effect.kind))),
     })
 }

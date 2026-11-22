@@ -30,8 +30,7 @@ async fn bound_user(db: &(impl Executor + ?Sized), party: TradeParty, scope: ord
 }
 
 async fn security_tax(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &Sde, system: Option<i64>, party: TradeParty, order: &Order, notional: crate::isk::IskAmount, now: i64) -> Result<(), CallError> {
-    if system.and_then(|id| sde.map.system(id)).and_then(|s| s.security)
-        .is_some_and(|security| security >= crate::config::game().crimewatch.highsec_threshold) {
+    if system.is_some_and(|id| crate::services::crimewatch::highsec_system(sde, id)) {
         let tax = notional.checked_mul_ratio(SECURITY_TAX_NUMERATOR, SECURITY_TAX_DENOMINATOR).ok_or(crate::isk::AmountError)?;
         journal::debit(db, outbox, party.financial, tax, &journal_entry(party.issuer, REF_MARKET_SECURITY_TAX, party.financial.id, order.at.owner, Some(order.id), None, now, 0)).await?;
     }

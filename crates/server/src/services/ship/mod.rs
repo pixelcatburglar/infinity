@@ -23,6 +23,7 @@
 //! Stored ships retain their contents and condition; boarding leaves the old hull
 //! unpiloted in space, while storing replaces it with a capsule. Launch placement
 //! is server-selected surface-tangent geometry, not a captured retail offset.
+//! Ejecting leaves the hull unpiloted in space and puts the pilot in a capsule at its position.
 //!
 //! Movement commands apply at destiny boundaries; jump and docking waits and arrival cloak
 //! expiry use the actor tick. During the four-second jump wait, the source ballpark
@@ -34,6 +35,7 @@
 //! absolute point; direction commands project a point from the current position and send
 //! the raw direction. Accepting a dock or a gate or wormhole jump also cancels
 //! the missiles still inbound on that ship; the ship's own missiles keep their targets.
+//! A positive gate scramble status refuses a stargate jump after the range check.
 //! Movement, stop, accepted warp, docking and jumping cancel arrival cloak through the system actor.
 //! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
 //! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
@@ -51,7 +53,7 @@
 use super::{db_err, Call, CallError, CallResult};
 use super::identity::Identity;
 use crate::client::Client;
-use infinity_core::consts::{FILETIME_SECOND, UE_LOCID};
+use infinity_core::consts::{dogma::ATTR_GATE_SCRAMBLE_STATUS, FILETIME_SECOND, UE_LOCID};
 use crate::db::outbox::Outbox;
 use crate::lua::events::GameEvent;
 use crate::dao::{characters::ship as character_dao, items::ship as item_dao};
@@ -103,7 +105,7 @@ fn f(v: Option<&Value>) -> f64 {
 }
 
 
-/// Refuse docking and gate jumps while the pilot's weapons timer runs (crimewatch).
+/// Refuse docking, gate jumps and ejecting while the pilot's weapons timer runs (crimewatch).
 fn check_weapons_timer(char_id: i64, what: &str) -> Result<(), CallError> {
     match super::crimewatch::weapons_timer(char_id) {
         Some(until) => {
@@ -133,6 +135,9 @@ pub(crate) async fn dock<O: observer::DockObserver>(
     let accepted = world.with(system, move |s| {
         if space::sovereignty::links::blocks(s, ship) {
             return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
+        }
+        if super::effects::active_cycle::mode_locked(s, ship) {
+            return Err(super::notify_error(messages::effects::MODE_ACTION_BLOCKED));
         }
         let gap = s.ball(ship).zip(s.ball(station)).map(|(b, station)|
             space::dist(b.position_at(s.now_ms()), station.position_at(s.now_ms()))
@@ -176,6 +181,9 @@ pub(crate) async fn dock<O: observer::DockObserver>(
         }
         if char_id != 0 && s.pilot_ball(char_id).is_none_or(|ball| ball.id != ship) {
             return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
+        }
+        if super::effects::active_cycle::mode_locked(s, ship) {
+            return Err(super::notify_error(messages::effects::MODE_ACTION_BLOCKED));
         }
         let mut transition = s.begin_condition_transitions(&[ship]).ok_or_else(|| CallError::User {
             msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![],
@@ -245,6 +253,11 @@ async fn transfer_ship(c: &mut Client, system: i64, dest: i64, ship: i64, char_i
         if cloaked && space::sovereignty::links::blocks(s, ship) {
             return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED));
         }
+        // Ordinary cloaked transfers recheck the mode lock immediately
+        // before the condition transition; GM teleport never reaches here.
+        if cloaked && super::effects::active_cycle::mode_locked(s, ship) {
+            return Err(super::notify_error(messages::effects::MODE_ACTION_BLOCKED));
+        }
         let ball = s.pilot_ball(char_id).filter(|ball| ball.id == ship)
             .ok_or_else(|| super::notify_error(messages::MUST_BE_IN_SPACE))?.clone();
         let mut transition = s.begin_condition_transitions(&[ship])
@@ -294,15 +307,24 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
         .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?;
     let dest_system: i64 = dest.dest_solar_system_id;
 
-    // In range of the gate?
-    let gap = c.world.with(system, move |s| {
+    // In range of the gate, and not gate-scrambled? One actor turn reads both:
+    // the distance scalar first, then the ship's resident fit, so a missing
+    // combat record refuses nothing extra.
+    let (gap, gate_scrambled) = c.world.with(system, move |s| {
         let (b, gate) = (s.ball(ship)?, s.ball(from_gate)?);
-        Some(space::dist(b.position_at(s.now_ms()), gate.position_at(s.now_ms()))
+        let gap = space::dist(b.position_at(s.now_ms()), gate.position_at(s.now_ms()))
             - gate.radius as f64
-            - b.radius as f64)
-    }).await.flatten();
-    if gap.is_none_or(|g| g > JUMP_RANGE) {
+            - b.radius as f64;
+        let scrambled = s.with_combat_fit(ship, |fit, _, _|
+            fit.value(super::fit::Key::Ship, ATTR_GATE_SCRAMBLE_STATUS) > 0.0)
+            .unwrap_or(false);
+        Some((gap, scrambled))
+    }).await.flatten().unwrap_or((f64::MAX, false));
+    if gap > JUMP_RANGE {
         return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(JUMP_RANGE as i64))] });
+    }
+    if gate_scrambled {
+        return Err(CallError::User { msg: messages::MSG_GATE_SCRAMBLED.into(), dict: vec![] });
     }
     // Arrive a few kilometres off the destination gate, on a heading fixed per gate pair.
     let gate_pos: [f64; 3] = [dest.x, dest.y, dest.z];
@@ -337,6 +359,9 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         }
         if s.super_weapon_jump_cloak_until(ship).is_some_and(|until| until > s.now_ms()) {
             return Err(super::notify_error(messages::super_weapon::JUMP_LOCKED));
+        }
+        if super::effects::active_cycle::mode_locked(s, ship) {
+            return Err(super::notify_error(messages::effects::MODE_ACTION_BLOCKED));
         }
         s.uncloak(ship);
         s.command(ship, move |b, t, _| {
@@ -476,8 +501,16 @@ fn movement(identity: &Identity, world: &space::World, space_system: Option<i64>
         // A superweapon's immobility deadline refuses steering outright; the
         // arrival jump cloak stays since no command was accepted.
         if s.super_weapon_immobile_until(ship).is_some_and(|until| until > s.now_ms()) { return; }
+        // An admitted ship mode refuses steering at the posted admission and
+        // again inside the queued command: the mode may start between the
+        // enqueue and the action application, where the ball is temporarily
+        // removed, so the check reads the resident record by ship ID.
+        if super::effects::active_cycle::mode_locked(s, ship) { return; }
         s.drop_jump_cloak(ship);
-        s.command(ship, f);
+        s.command(ship, move |ball, stamp, s| {
+            if super::effects::active_cycle::mode_locked(s, ship) { return Vec::new(); }
+            f(ball, stamp, s)
+        });
     });
     Ok(Value::None)
 }
@@ -539,22 +572,24 @@ pub(super) async fn warp_pilot(db: &crate::db::Db, world: &space::World, system:
             WarpCommit::RetryProjection => continue,
             WarpCommit::Unavailable => return Ok(false),
             WarpCommit::EntosisBlocked if !is_fleet => return Err(super::notify_error(messages::effects::ENTOSIS_ACTION_BLOCKED)),
+            WarpCommit::ModeBlocked if !is_fleet => return Err(super::notify_error(messages::effects::MODE_ACTION_BLOCKED)),
             WarpCommit::Scrambled if !is_fleet => return Err(super::notify_error(messages::effects::WARP_SCRAMBLED)),
             WarpCommit::Immobile if !is_fleet => return Err(super::notify_error(messages::super_weapon::WARP_LOCKED)),
-            WarpCommit::EntosisBlocked | WarpCommit::Scrambled | WarpCommit::Immobile => return Ok(false),
+            WarpCommit::EntosisBlocked | WarpCommit::ModeBlocked | WarpCommit::Scrambled | WarpCommit::Immobile => return Ok(false),
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum WarpCommit { Queued, RetryProjection, Scrambled, Immobile, EntosisBlocked, Unavailable }
+pub(super) enum WarpCommit { Queued, RetryProjection, Scrambled, Immobile, EntosisBlocked, ModeBlocked, Unavailable }
 
 pub(super) fn commit_warp(s: &mut space::System, ship: i64, revision: u64, scrambled: bool,
     factor: i64, destination: WarpDestination, arrival: Option<WarpArrivalId>) -> WarpCommit {
+    if super::effects::active_cycle::mode_locked(s, ship) { return WarpCommit::ModeBlocked; }
     if space::sovereignty::links::blocks(s, ship) { return WarpCommit::EntosisBlocked; }
     if s.super_weapon_immobile_until(ship).is_some_and(|until| until > s.now_ms()) { return WarpCommit::Immobile; }
     if s.projection_revision(ship) != revision { return WarpCommit::RetryProjection; }
-    if scrambled { return WarpCommit::Scrambled; }
+    if scrambled || s.interdicted(ship) { return WarpCommit::Scrambled; }
     s.drop_jump_cloak(ship);
     if s.queue_warp(ship, factor, destination, arrival) { WarpCommit::Queued } else { WarpCommit::Unavailable }
 }
@@ -574,6 +609,7 @@ pub(in crate::services) mod boarding;
 mod configuration;
 mod cleaning;
 mod stored;
+mod eject;
 pub(crate) mod observer;
 pub(crate) mod ship;
 mod deployment;

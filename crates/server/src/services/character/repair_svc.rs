@@ -7,12 +7,13 @@
 //! Payment and full-quote comparison use wallet-cent precision; zero-cent charges are refused.
 //! Damage persistence and attribute-change construction are shared with the GM
 //! docked repair through `services::repair`; quotes and settlement stay here.
-//! Structure facilities and in-space paste repair are not modelled.
+//! Structure facilities are not modelled; in-space paste repair is `effects::heat::paste`.
 use super::*;
 use infinity_core::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_STARBASE, FLAG_HANGAR};
 use crate::dao::items::{dogma, parent_locks::{LockRequest, LockStrength}, repair};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
 use crate::services::{fit::{Fit, Key}, inventory::is_fitting_flag, market, notify_error, repair as shared_repair, wallets};
+use crate::services::repair::computed_base_price;
 use crate::sde::Sde;
 use std::sync::Arc;
 /// Client inventorycommon.const.categoryStructureModule.
@@ -68,21 +69,6 @@ fn total_cost(rows: &[Quote]) -> f64 {
     total
 }
 fn refuse() -> CallError { notify_error(infinity_core::messages::repair::INVALID) }
-/// Client inventoryUtil.GetComputedBasePrice(typeID, 1), including its material portion rule.
-fn computed_base_price(sde: &Sde, id: i32) -> f64 {
-    let Some(ty) = sde.types.get(id) else { return 0.0 };
-    let materials = ty.materials();
-    if materials.is_empty() {
-        let portion = ty.portion_size.unwrap_or(1).max(1) as f64;
-        return (ty.base_price.unwrap_or(0.0) / portion).trunc();
-    }
-    materials.iter().filter_map(|m| {
-        let material = sde.types.get(m.material_type_id)?;
-        let portion = material.portion_size.unwrap_or(0);
-        if portion <= 0 { return None; }
-        Some(m.quantity.unwrap_or(0) as f64 * (material.base_price.unwrap_or(0.0) / portion as f64).trunc() / portion as f64)
-    }).sum::<f64>().trunc()
-}
 
 fn fraction(payment: f64, total: f64, modules: bool) -> Option<f64> {
     if !payment.is_finite() || !total.is_finite() || payment <= 0.0 || total <= 0.0 { return None; }

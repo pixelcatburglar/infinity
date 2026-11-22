@@ -1,7 +1,7 @@
 //! Database-backed ancillary remote repair cycles through the dogma activation path.
 //! Uses published SDE modules and charges, game items and module charges; no UI is involved.
 use super::*;
-use infinity_core::consts::{dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER, dogma::ATTR_RELOAD_TIME, CATEGORY_CHARGE, dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, FLAG_CARGO};
+use infinity_core::consts::{dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_RELOAD_TIME, CATEGORY_CHARGE, dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, FLAG_CARGO};
 
 const RELOAD_MS: f64 = 1_000.0;
 const CARGO_QUANTITY: i32 = 100_000;
@@ -39,7 +39,8 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
     let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
         && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE, ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 10.0))
         && t.attribute([ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP][layer]).is_some_and(|v| v > raw_amount)
-        && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > raw_need)).expect("ship with sufficient health and capacitor").type_id;
+        && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > raw_need)
+        && t.attribute(ATTR_MAX_TARGET_RANGE).is_some_and(|v| v.is_finite() && v > 0.0)).expect("ship with sufficient health and capacitor").type_id;
     let system = 1;
     let f = create(&db, ship_type, module_type, system).await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
@@ -74,7 +75,6 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         }, fit)).await.unwrap();
         let db_before = crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap();
         assert!(db_before.is_empty());
-        state().targets.entry(f.source).or_default().insert(f.victim);
         let fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
         let base = fit.value(Key::Module(f.module), amount_attr);
         let bonus = fit.value(Key::Module(f.module), ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER);
@@ -86,13 +86,27 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         state().capacitor.insert(f.ship, (cap, filetime_now() + 60 * FILETIME_SECOND));
         let duration = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Duration).unwrap()).max(250.0) as u64;
         install_half(&test_world, system, f.ship, fit).await;
+        state().targets.entry(f.source).or_default().insert(f.victim);
+        let seeded = test_world.with(system, move |s| s.loaded_effective(f.ship, f.module)).await.unwrap();
+        if charged {
+            let (_, type_id, quantity, _) = seeded.expect("seeded charge is available");
+            assert_eq!((type_id, quantity), (charge_type, 1));
+        } else {
+            assert!(test_world.with(system, move |s| s.loaded_empty_proof(f.ship, f.module)).await.unwrap(), "uncharged slot is empty");
+        }
         let args = [Value::Int(f.module), Value::str(name), Value::Int(f.victim), Value::Int(1)];
         let kwargs = Value::Dict(vec![]);
         let call = Call { service: "dogmaIM", method: "Activate", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
-        assert!(crate::services::dogma::dispatch(&mut client, &call).await.is_ok());
+        crate::services::dogma::dispatch(&mut client, &call).await.expect("ancillary remote repair activation");
         assert!(test_world.after(system, 1500).await);
-        let remaining = crate::dao::items::charges::loaded(&test_db, f.ship, FLAG_FITTING_FIRST).await.unwrap();
-        assert!(remaining.is_none(), "last charge consumed or magazine empty");
+        let consumed = test_world.with(system, move |s| s.loaded_effective(f.ship, f.module)).await.unwrap();
+        if charged {
+            let (incarnation, type_id, _, _) = seeded.expect("seeded charge");
+            let (now, now_type, quantity, _) = consumed.expect("consumed slot stays available");
+            assert_eq!((now, now_type, quantity), (incarnation, type_id, 0));
+        } else {
+            assert!(test_world.with(system, move |s| s.loaded_empty_proof(f.ship, f.module)).await.unwrap(), "uncharged slot stays empty");
+        }
         let early = condition(&test_world, system, f.victim).await.now[layer];
         if layer == 0 {
             assert!((early - expected).abs() < expected.max(1.0) * 1e-8, "shield repair at cycle start: {early} != {expected}");
@@ -106,7 +120,27 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
         let repaired = condition(&test_world, system, f.victim).await.now[layer];
         assert!((repaired - expected).abs() < expected.max(1.0) * 1e-8, "repair amount: {repaired} != {expected}");
         assert!(crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap().is_empty());
+        let durable = crate::dao::items::charges::loaded(&test_db, f.ship, FLAG_FITTING_FIRST).await.unwrap();
+        if charged {
+            let row = durable.expect("checkpoint still holds the seeded charge");
+            assert_eq!((row.type_id, row.quantity), (charge_type, 1));
+        } else {
+            assert!(durable.is_none(), "uncharged slot stays absent");
+        }
         drop(checkpoint_gate);
+        let completed = if reload {
+            let original = seeded.expect("seeded charge").0;
+            let mut found = None;
+            for _ in 0..30 {
+                if !test_world.after(system, 500).await { break; }
+                let slot = test_world.with(system, move |s| s.loaded_effective(f.ship, f.module)).await.unwrap();
+                if state().reloading.get(&f.module).is_none() {
+                    found = slot.filter(|&(incarnation, type_id, quantity, pending)| incarnation != original && type_id == charge_type && quantity > 0 && !pending);
+                }
+                if found.is_some() { break; }
+            }
+            Some(found.expect("released reload producer completed a new incarnation"))
+        } else { None };
         test_world.flush_positions().await.unwrap();
         let rows = crate::dao::items::dogma::overrides(&test_db, f.victim).await.unwrap();
         let value = rows.iter().find(|r| r.attribute_id == [ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE][layer]).unwrap().value;
@@ -115,6 +149,10 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
             assert!((repaired..=max).contains(&value));
         } else {
             assert!((value - (max - repaired)).abs() < expected.max(1.0) * 1e-8);
+        }
+        if let Some(completed) = completed {
+            let stable = test_world.with(system, move |s| s.loaded_effective(f.ship, f.module)).await.unwrap();
+            assert_eq!(stable, Some(completed), "completed identity is stable after flush");
         }
         let loaded = crate::dao::items::charges::loaded(&test_db, f.ship, FLAG_FITTING_FIRST).await.unwrap();
         if reload {

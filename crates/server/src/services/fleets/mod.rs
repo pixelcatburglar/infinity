@@ -220,6 +220,27 @@ pub(crate) fn same_fleet(a: i64, b: i64) -> bool {
     state.of.get(&a).is_some_and(|&fleet| state.is_member(fleet, a) && state.is_member(fleet, b))
 }
 
+/// Live member character IDs of the source's fleet for command-burst
+/// admission, taken in one lock. The source must resolve to a fleet it is a
+/// live member of; reconnect reservations hold a seat but have no live
+/// receiver and are excluded. Sorted for deterministic actor filtering;
+/// range and visibility filtering belong to the receiving actor.
+pub(crate) fn command_burst_members(source_character: i64) -> Vec<i64> {
+    command_burst_members_from(&state(), source_character)
+}
+
+fn command_burst_members_from(state: &State, source_character: i64) -> Vec<i64> {
+    let Some(fleet_id) = state.of.get(&source_character).copied() else { return Vec::new() };
+    if !state.is_member(fleet_id, source_character) { return Vec::new() }
+    let Some(fleet) = state.fleets.get(&fleet_id) else { return Vec::new() };
+    let mut members: Vec<i64> = fleet.members.iter()
+        .filter(|(_, member)| member.reconnect.is_none())
+        .map(|(&char_id, _)| char_id)
+        .collect();
+    members.sort_unstable();
+    members
+}
+
 fn next_id() -> i64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }

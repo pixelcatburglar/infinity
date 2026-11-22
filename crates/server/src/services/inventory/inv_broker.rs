@@ -27,6 +27,20 @@ pub(super) async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         "ValidateItemListCanBeOpened" => return Some(super::reads::validate(c, call).await),
         "GetInventoryFromId" => {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            // Actor-recognized transient roots bind in the same shape and skip
+            // the database-only reservation and exploration checks.
+            let actor_identity = super::npc_loot::client_identity(c);
+            if let Some(system) = c.session.int("solarsystemid") {
+                match super::npc_loot::view(&c.world, &actor_identity, system, id).await {
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Ready(_) =>
+                        return Some(Ok(c.bind(INVENTORY, Value::tuple([Value::Int(id)])))),
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Denied =>
+                        return Some(Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))),
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) =>
+                        return { super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await; Some(Err(super::npc_loot::busy())) },
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {}
+                }
+            }
             if super::super::trade::is_trade_container(id) {
                 return Some(Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED)));
             }
@@ -65,9 +79,33 @@ pub(super) async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         "IsMyItemAtDockableLocation" => Value::Bool(true),
         // SplitStack(locationID, itemID, qty, ownerID): a new stack beside the old one.
         "SplitStack" => {
-            let _lock = super::super::market::lock().await;
             let item_id = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let qty = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            // The reverse index decides transient membership before the economy
+            // lock: an in-place split is a pure actor mutation with the same
+            // no-op shape for an invalid quantity.
+            let actor_identity = super::npc_loot::client_identity(c);
+            if let Some(system) = c.session.int("solarsystemid") {
+                match super::npc_loot::source(&c.world, &actor_identity, system, item_id,
+                    call.args.first().and_then(|v| v.as_int())).await {
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Ready(source) => {
+                        if qty <= 0 || qty >= source.item.quantity {
+                            return Some(Ok(Value::None));
+                        }
+                        let expected = source.wreck.identity.clone();
+                        let created = c.world.with(system, move |s| s.mutate_npc_loot(&actor_identity, &expected,
+                            crate::space::system::npc_wrecks::NpcLootMutation::Split { item: item_id, quantity: qty })).await
+                            .unwrap_or_else(|| Err(super::npc_loot::busy()));
+                        return Some(created.map(|id| id.map(Value::Int).unwrap_or(Value::None)));
+                    }
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Denied =>
+                        return Some(Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))),
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Busy(claim) =>
+                        return { super::npc_loot::reconcile_busy(&c.world, &c.sde, claim).await; Some(Err(super::npc_loot::busy())) },
+                    crate::space::system::npc_wrecks::NpcWreckLookup::Absent => {}
+                }
+            }
+            let _lock = super::super::market::lock().await;
             let Some(item) = (match load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err) {
                 Ok(items) => items.into_iter().next(),
                 Err(e) => return Some(Err(e)),

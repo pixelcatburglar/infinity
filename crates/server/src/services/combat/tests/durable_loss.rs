@@ -470,7 +470,7 @@ async fn loss_fault_leaves_captured_slot_unknown_until_fresh_reseed() {
     let module = items::creation::rookie_ship(&f.db, f.weapon_type, f.owner, f.ship, FLAG_HI_SLOT_FIRST).await.unwrap();
     crate::dao::items::combat::apply_loads(&f.db, f.ship, &[(module, FLAG_HI_SLOT_FIRST, charge_type, 8, 0)]).await.unwrap();
     let key = items::charges::LoadedSlotKey { ship: f.ship, module, flag: FLAG_HI_SLOT_FIRST };
-    let result = catch_scenario(async {
+    let result = catch_scenario(async { tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let fit = Fit::load_in_space(&f.db, &f.world, f.system, f.owner, f.ship).await.ok().unwrap();
         f.db.execute(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture loaded loss fault'; END $$"), &[]).await.unwrap();
         f.db.execute(&format!("CREATE TRIGGER {name} BEFORE UPDATE ON game.module_charges FOR EACH ROW WHEN (NEW.ship_id = {}) EXECUTE FUNCTION {function}()", f.ship), &[]).await.unwrap();
@@ -484,24 +484,45 @@ async fn loss_fault_leaves_captured_slot_unknown_until_fresh_reseed() {
         let hull = client.transaction().await.unwrap();
         crate::dao::items::ship::lock_reload_ship(&hull, f.ship).await.unwrap();
         let hull_pid: i32 = hull.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
+        let (mut queued_client, queued_connection) = crate::config::tests::test_database().to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(async move { let _ = queued_connection.await; });
+        let queued = queued_client.transaction().await.unwrap();
+        let queued_pid: i32 = queued.query_one("SELECT pg_backend_pid() AS pid", &[]).await.unwrap().get("pid");
         let mut hit = std::pin::pin!(f.hit(0, [1e30; 4], true));
         loop {
             std::future::poll_fn(|cx| { assert!(hit.as_mut().poll(cx).is_pending()); std::task::Poll::Ready(()) }).await;
             if f.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE 'SELECT item_id FROM game.items%') AS blocked", &[&hull_pid]).await.unwrap().get::<_, bool>("blocked") { break; }
             tokio::task::yield_now().await; }
+        {
+            let mut queued_lock = std::pin::pin!(crate::dao::items::ship::lock_reload_ship(&queued, f.ship));
+            loop {
+                std::future::poll_fn(|cx| { assert!(queued_lock.as_mut().poll(cx).is_pending()); std::task::Poll::Ready(()) }).await;
+                if f.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock' AND cardinality(pg_blocking_pids(pid)) > 0 AND query LIKE 'SELECT item_id FROM game.items%') AS blocked", &[&queued_pid]).await.unwrap().get::<_, bool>("blocked") { break; }
+                tokio::task::yield_now().await; }
+            hull.commit().await.unwrap();
+            queued_lock.await.unwrap();
+        }
+        // The loss transaction holds the hull lock from its early source freeze, so the
+        // queued waiter takes it on rollback and blocks the fresh reseed instead.
+        loop {
+            std::future::poll_fn(|cx| { assert!(hit.as_mut().poll(cx).is_pending()); std::task::Poll::Ready(()) }).await;
+            if f.db.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE 'SELECT item_id FROM game.items%') AS blocked", &[&queued_pid]).await.unwrap().get::<_, bool>("blocked") { break; }
+            tokio::task::yield_now().await; }
         assert_eq!(f.world.with(f.system, move |s| (s.unknown_loaded_keys().contains(&key), s.loaded_effective(f.ship, module).is_none())).await.unwrap(), (true, true));
-        hull.commit().await.unwrap();
+        let [(item, generation, token)] = f.world.with(f.system, move |s| s.pending_reconciliations()).await.unwrap()[..] else { panic!("expected one retained dying loss") };
+        assert!(f.world.with(f.system, move |s| s.player_loss_context(item, token, generation).is_some_and(|context| crate::poison::lock_or_exit(context.recovery_source.lock()).is_some())).await.unwrap());
+        queued.commit().await.unwrap();
         let error = hit.await.unwrap_err();
         assert!(format!("{error:?}").contains("fixture loaded loss fault"));
         assert!(crate::db::outbox::tests::events(&f.db, "ShipLost", f.owner).await.is_empty());
         assert_eq!(f.world.with(f.system, move |s| s.loaded_effective(f.ship, module)).await.unwrap().map(|v| (v.1, v.2)), Some((charge_type, 8)));
         f.db.execute(&format!("DROP TRIGGER {name} ON game.module_charges"), &[]).await.unwrap();
-        assert!(matches!(f.world.with(f.system, move |s| s.combat_phase(f.ship)).await.unwrap(), Some(crate::space::combat::CombatPhase::Dying { .. })));
-        let [(item, generation, token)] = f.world.with(f.system, move |s| s.pending_reconciliations()).await.unwrap()[..] else { panic!("expected one retained dying loss") };
-        assert!(f.world.with(f.system, move |s| s.player_loss_context(item, token, generation).is_some_and(|context| crate::poison::lock_or_exit(context.recovery_source.lock()).is_none())).await.unwrap());
+        assert_eq!(f.world.with(f.system, move |s| s.combat_phase(f.ship)).await.unwrap(), Some(crate::space::combat::CombatPhase::Live));
+        assert!(f.world.with(f.system, move |s| s.pending_reconciliations()).await.unwrap().is_empty());
+        assert!(f.world.with(f.system, move |s| s.unknown_loaded_keys().is_empty()).await.unwrap());
         assert_eq!(characters::selection::ship_id(&f.db, f.owner).await.unwrap(), Some(f.ship));
         assert!(crate::db::outbox::tests::events(&f.db, "ShipLost", f.owner).await.is_empty());
-        assert_eq!(f.db.query_one("SELECT count(*) AS killmail_count FROM game.killmails WHERE victim_item_id=$1", &[&f.ship]).await.unwrap().get::<_, i64>("killmail_count"), 0); }).await;
+        assert_eq!(f.db.query_one("SELECT count(*) AS killmail_count FROM game.killmails WHERE victim_item_id=$1", &[&f.ship]).await.unwrap().get::<_, i64>("killmail_count"), 0); }).await.expect("loss recovery barriers timed out") }).await;
     f.db.execute(&format!("DROP TRIGGER IF EXISTS {name} ON game.module_charges"), &[]).await.unwrap();
     f.db.execute("DELETE FROM game.module_charges WHERE ship_id=$1", &[&f.ship]).await.unwrap();
     f.db.execute(&format!("DROP FUNCTION IF EXISTS {function}()"), &[]).await.unwrap();

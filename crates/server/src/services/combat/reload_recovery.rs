@@ -25,13 +25,17 @@ pub(in crate::services) struct TakePreparation {
     lineages: BTreeMap<i64, Vec<crate::dao::items::deliveries::Ancestor>>,
     ancestors: Vec<i64>,
     refund: RefundPreparation,
+    /// The refund stacks this attempt's `settle_subtree` actually wrote, moved
+    /// out of the existing result so a whole-take caller can prove them.
+    receipts: Vec<crate::services::items::DepositReceipt>,
 }
 
 impl TakePreparation {
     pub(in crate::services) fn fresh_attempt(&self) -> Self {
         Self { root: self.root, closure: self.closure.clone(), pending: self.pending.clone(),
             endpoints: self.endpoints.clone(), lineages: self.lineages.clone(),
-            ancestors: self.ancestors.clone(), refund: self.refund.fresh_attempt() }
+            ancestors: self.ancestors.clone(), refund: self.refund.fresh_attempt(),
+            receipts: Vec::new() }
     }
 
     pub(in crate::services) async fn capture(db: &(impl Executor + ?Sized), sde: &Sde, root: i64) -> Result<Self, CallError> {
@@ -54,7 +58,7 @@ impl TakePreparation {
             lineages.insert(location, rows);
         }
         let refund = RefundPreparation::capture_pending(db, sde, &pending).await?;
-        Ok(Self { root, closure, pending, endpoints, lineages, ancestors: ancestors.into_iter().collect(), refund })
+        Ok(Self { root, closure, pending, endpoints, lineages, ancestors: ancestors.into_iter().collect(), refund, receipts: Vec::new() })
     }
 
     pub(in crate::services) fn endpoints(&self) -> &[crate::services::inventory::reachability::Endpoint] { &self.endpoints }
@@ -62,6 +66,16 @@ impl TakePreparation {
     pub(in crate::services) fn pending(&self) -> &[pending_reloads::PendingReload] { &self.pending }
     pub(in crate::services) fn ancestors(&self) -> &[i64] { &self.ancestors }
     pub(in crate::services) fn refund(&self) -> &RefundPreparation { &self.refund }
+
+    /// Keep the refund stacks `settle_subtree` actually returned for this attempt.
+    pub(in crate::services) fn record_receipts(&mut self, receipts: Vec<crate::services::items::DepositReceipt>) {
+        self.receipts = receipts;
+    }
+
+    /// Take this attempt's actual refund stacks; a fresh attempt starts empty.
+    pub(in crate::services) fn take_receipts(&mut self) -> Vec<crate::services::items::DepositReceipt> {
+        std::mem::take(&mut self.receipts)
+    }
 
     /// Recheck all captured reservation facts and the closure after acquiring locks.
     pub(in crate::services) async fn revalidate(&self, ex: &(impl Executor + ?Sized)) -> Result<(), CallError> {

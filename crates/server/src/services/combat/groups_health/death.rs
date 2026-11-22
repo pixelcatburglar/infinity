@@ -8,12 +8,16 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use crate::db::outbox::SourceKey;
 use crate::lua::events::{GameEvent, combat::BinaryAmount};
 use crate::space::{combat::FirstLethalSnapshot, snapshot::FactCheckpoint};
+use crate::runtime_watchdog;
 
 pub(crate) struct NpcDeathContext {
     frame: Option<Arc<FactCheckpoint>>,
     event: GameEvent,
     ball: Ball,
     had_unknown_commit: AtomicBool,
+    /// The ordinary wreck draw frozen once inside the first actor install;
+    /// retries reuse the same draft and its at-most-once bound IDs.
+    wreck: Option<super::wreck::PreparedNpcWreck>,
 }
 
 struct DeathEffect { key: String, fresh: bool }
@@ -49,21 +53,29 @@ async fn release(world: &World, system: i64, snapshot: &FirstLethalSnapshot) {
     world.with(system, move |s| { s.release_pending_combat(item, token, generation); }).await;
 }
 
-async fn finalize(world: &World, system: i64, snapshot: &FirstLethalSnapshot, frame: Option<Arc<FactCheckpoint>>, written: std::collections::HashSet<i64>) -> Result<bool, CallError> {
+async fn finalize(world: &World, system: i64, snapshot: &FirstLethalSnapshot, context: &Arc<NpcDeathContext>, written: std::collections::HashSet<i64>) -> Result<bool, CallError> {
     let (item, token, generation) = (snapshot.item_id, snapshot.token, snapshot.generation);
+    let context = context.clone();
     let removed = world.with(system, move |s| {
-        if let Some(frame) = frame { frame.acknowledge(s, &written); }
+        if let Some(frame) = &context.frame { frame.acknowledge(s, &written); }
         if s.combat_phase(item) != Some(crate::space::combat::CombatPhase::Dying { token })
             || s.combat_membership_generation(item) != Some(generation) { return false; }
         s.destroy_ball(item);
         s.finalize_dying(item, token, generation);
+        // The same actor turn that retires the NPC installs its frozen wreck;
+        // a repeated finalize never re-publishes.
+        if let Some(prepared) = &context.wreck { s.install_npc_wreck(prepared); }
         true
     }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("NPC death actor unavailable")))?;
     if removed { forget_target(world, item); }
     Ok(removed)
 }
 
-pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snapshot: Arc<FirstLethalSnapshot>, _new: [f64; 3]) -> Result<(), CallError> {
+pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snapshot: Arc<FirstLethalSnapshot>, new_hp: [f64; 3]) -> Result<(), CallError> {
+    runtime_watchdog::watch("npc-loss", "settle_npc_loss", settle_npc_loss_body(db, world, system, snapshot, new_hp)).await
+}
+
+async fn settle_npc_loss_body(db: Db, world: Arc<World>, system: i64, snapshot: Arc<FirstLethalSnapshot>, _new: [f64; 3]) -> Result<(), CallError> {
     let gate = world.lock_condition_snapshot(system).await.map_err(db_err);
     let mut gate = match gate { Ok(gate) => Some(gate), Err(error) => { release(&world, system, &snapshot).await; return Err(error); } };
     let item = snapshot.item_id;
@@ -81,14 +93,28 @@ pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snap
                 if s.combat_phase(item) != Some(crate::space::combat::CombatPhase::Dying { token })
                     || s.combat_membership_generation(item) != Some(generation) { return Ok(None); }
                 let ball = s.sampled_ball(item).ok_or_else(|| anyhow::anyhow!("NPC ball unavailable"))?;
+
+                // Freeze the ordinary wreck draw inside the first actor
+                // install only; retries and later paths reuse this draft.
+                let prepared = s.sde().and_then(|sde| super::wreck::prepare_npc_wreck(sde, &event, &ball));
                 let frame = crate::space::snapshot::capture_fact_checkpoint(s).map_err(|error| anyhow::anyhow!("NPC fact checkpoint refused: {error:?}"))?;
-                let context = Arc::new(NpcDeathContext { frame, event, ball, had_unknown_commit: AtomicBool::new(false) });
+                let context = Arc::new(NpcDeathContext { frame, event, ball, had_unknown_commit: AtomicBool::new(false), wreck: prepared });
                 Ok(s.install_npc_death_context(item, token, generation, context.clone()).then_some(context))
             }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("NPC death actor unavailable"))).and_then(|result| result.map_err(CallError::Internal));
             match result { Ok(context) => context, Err(error) => { release(&world, system, &snapshot).await; return Err(error); } }
         }
     };
     let Some(context) = context else { return Ok(()) };
+    // Every reserved root and stack ID must be bound before any
+    // progress::source, checkpoint or death transaction. A shortfall keeps
+    // the NPC Dying with its frozen draft, releases this attempt's in-flight
+    // marker and lets the existing retry + refill worker complete it later;
+    // nothing is re-drawn and no partial wreck is published.
+    match world.with(system, { let context = context.clone(); move |s| s.npc_wreck_bind_prepared(context.wreck.as_ref()) }).await {
+        Some(true) => {}
+        Some(false) => { release(&world, system, &snapshot).await; return Ok(()); }
+        None => { release(&world, system, &snapshot).await; return Err(CallError::Internal(anyhow::anyhow!("NPC death actor unavailable"))); }
+    }
     let key = death_key(&snapshot);
     let stored = match crate::dao::progress::source(&db, "business", key.as_str()).await {
         Ok(stored) => stored,
@@ -109,7 +135,7 @@ pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snap
                     return Err(CallError::Internal(anyhow::anyhow!("NPC death checkpoint incomplete")));
                 }
             }
-            finalize(&world, system, &snapshot, context.frame.clone(), std::collections::HashSet::new()).await?;
+            finalize(&world, system, &snapshot, &context, std::collections::HashSet::new()).await?;
             Ok(())
         }.await;
         if result.is_err() { release(&world, system, &snapshot).await; }
@@ -145,7 +171,7 @@ pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snap
             })
         },
         |written, outbox| async {
-            let removed = finalize(&world, system, &snapshot, context.frame.clone(), written.into_iter().collect()).await?;
+            let removed = finalize(&world, system, &snapshot, &context, written.into_iter().collect()).await?;
             // Actor finalization no longer needs the snapshot gate; rewards may take the economy lock.
             drop(gate.take());
             let mut fresh = false;
@@ -156,7 +182,10 @@ pub(crate) async fn settle_npc_loss(db: Db, world: Arc<World>, system: i64, snap
                 }
             }
             if removed && fresh {
-                let killer = match &context.event { GameEvent::NpcDestroyed { killer_id, .. } => *killer_id, _ => None };
+                let killer = snapshot.source.facts.and_then(|source| {
+                    let character_id = source.controller_entity()?.character_id?;
+                    Some(NpcKiller { character_id, multiplier: source.npc_security_multiplier? })
+                });
                 finish_npc_kill(&db, &world, system, item, context.ball.clone(), killer).await?;
             }
             Ok(())

@@ -1,7 +1,9 @@
 //! Hacking: the data and relic analyzer minigame (eve/client/script/ui/hacking).
 //!
 //! Activating an analyzer (`doHacking`) on a data or relic site container starts a game.
-//! Analyzer range uses ship and container positions sampled at the same system-actor time.
+//! Analyzer range, duration and virus values are the resident fit's, including
+//! skills, implants and command bursts. Range uses ship and container positions
+//! sampled at the same system-actor time.
 //! The client sends each click (hackingMgr.ClickedOnTile, UsedUtilityElement,
 //! UsedUtilityElementOnVirus, QuitHackingAttempt) and draws the turn's results from
 //! OnHackingTurnComplete([{eventID, eventData}]) (hackingcommon.hackingConstants).
@@ -18,7 +20,7 @@ use crate::client::Client;
 use crate::db::{Db, outbox::Notification};
 use crate::sde::{types::TypeData, Sde};
 use crate::services::{combat, effects::online::OnlinePolicy, identity::Identity};
-use infinity_core::consts::{dogma::{ATTR_MAX_RANGE, ATTR_REQUIRED_SKILLS}, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use infinity_core::consts::{dogma::{ATTR_DURATION, ATTR_MAX_RANGE, ATTR_REQUIRED_SKILLS}, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use infinity_core::messages;
 use crate::space::{dist, metres_to_km, NotifyTx, World};
 use marshal::Value;
@@ -70,12 +72,12 @@ const EVENT_HONEYPOT_STRENGTH: i64 = 306;
 const EVENT_HONEYPOT_HEALING: i64 = 307;
 const EVENT_DISTANCEINDICATOR: i64 = 308;
 
-const ATTR_DURATION: i32 = 73;
+/// SDE dgmAttributeTypes: virusCoherence.
 const ATTR_VIRUS_COHERENCE: i32 = 1909;
+/// SDE dgmAttributeTypes: virusStrength.
 const ATTR_VIRUS_STRENGTH: i32 = 1910;
+/// SDE dgmAttributeTypes: virusElementSlots.
 const ATTR_VIRUS_SLOTS: i32 = 1911;
-/// Hacking / Archaeology: +10 virus coherence per level.
-const COHERENCE_PER_SKILL_LEVEL: f64 = 10.0;
 const VIRUS_ID: i64 = 1;
 const BOARD: i64 = 8;
 /// Turns a durational utility subsystem lasts.
@@ -464,7 +466,6 @@ pub async fn start(
     };
     let (system, ship, char_id) = (cx.system_id, cx.ship_id, cx.char_id);
     let Some(container) = target else { return Ok(Value::None) };
-    let at = crate::client::filetime_now();
     let Some(site) = super::exploration::hack_target(container) else {
         return Err(notify_error(messages::ANALYZER_TARGET_MUST_BE_DATA_OR_RELIC));
     };
@@ -472,31 +473,29 @@ pub async fn start(
         return Err(notify_error(messages::HACK_CONTAINER_ALREADY_HACKED));
     }
     let Some(module_type) = crate::dao::items::hacking::analyzer(db, module, ship).await.map_err(db_err)? else { return Ok(Value::None) };
-    let attr = |id, default| sde.types.attribute(module_type, id).unwrap_or(default);
     let skill = match sde.types.get(module_type) {
         Some(ty) => required_analyzer_skill(ty)?,
         None => None,
     };
-    let range = attr(ATTR_MAX_RANGE, 6000.0);
-    let duration = attr(ATTR_DURATION, 5000.0);
     let needed = if site.relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
     if skill != Some(needed) {
         return Err(notify_error(if site.relic { messages::RELIC_CONTAINER_REQUIRES_RELIC_ANALYZER } else { messages::DATA_CONTAINER_REQUIRES_DATA_ANALYZER }));
     }
-    let Some(gap) = world.with(system, move |s| {
+    let Some((gap, values)) = world.with(system, move |s| {
         let (me, can) = (s.ball(ship)?, s.ball(container)?);
-        Some(dist(s.sample_position(ship)?, s.sample_position(container)?) - me.radius as f64 - can.radius as f64)
+        let gap = dist(s.sample_position(ship)?, s.sample_position(container)?) - me.radius as f64 - can.radius as f64;
+        let values = s.with_combat_fit(ship, |fit, _, _| [ATTR_MAX_RANGE, ATTR_DURATION, ATTR_VIRUS_COHERENCE, ATTR_VIRUS_STRENGTH, ATTR_VIRUS_SLOTS].map(|a| fit.value(crate::services::fit::Key::Module(module), a)))?;
+        Some((gap, values))
     }).await.flatten() else {
         return Err(CallError::User { msg: messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT.into(), dict: vec![] });
     };
+    let (range, duration) = (values[0], values[1]);
     if gap > range {
         return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
-    let skills = crate::services::skills::effective::snapshot_at(db, sde, char_id, at).await?;
-    let level = skills.level(needed) as f64;
-    let coherence = (attr(ATTR_VIRUS_COHERENCE, 40.0) + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
-    let strength = attr(ATTR_VIRUS_STRENGTH, 20.0).round() as i64;
-    let slots = attr(ATTR_VIRUS_SLOTS, 3.0).round().clamp(1.0, 6.0) as usize;
+    let coherence = values[2].round() as i64;
+    let strength = values[3].round() as i64;
+    let slots = values[4].round().clamp(1.0, 6.0) as usize;
 
     let mut next_id = 100;
     let (tiles, _) = board(site.tier, || {

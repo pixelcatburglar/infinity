@@ -2,12 +2,15 @@
 //! use the dogma Fit evaluator; stored condition is sampled from game.items.
 //! Live condition is owned by the system actor, not sampled here.
 //! A hull capacity mode change additionally republishes the owner's brain.
+//! An accepted stance switch rides the same boundary: its receipt joins the
+//! space patch, while a stored finish queues the owner's `OnStanceActive`.
 
 use std::sync::Arc;
 use infinity_core::consts::dogma::{ATTR_ARMOR_DAMAGE, ATTR_ARMOR_HP, ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_HULL_DAMAGE, ATTR_RECHARGE_RATE, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SHIELD_RECHARGE_RATE, ATTR_STRUCTURE_HP};
 use crate::db::{executor::Executor, outbox::Outbox};
 use crate::sde::Sde;
 use crate::services::{CallError, combat::{self, ConditionSeed}, fit::{Fit, Key}};
+use crate::services::ship_stance::{state::stance_active_args, StanceTransition};
 use super::{OnlineChanged, OnlineFences};
 
 pub(in crate::services) struct FittingBefore {
@@ -17,6 +20,15 @@ pub(in crate::services) struct FittingBefore {
     before: Fit,
     condition: Option<ConditionSeed>,
     membership: Option<(i64, u64)>,
+    stance: Option<StanceTransition>,
+}
+
+impl FittingBefore {
+    /// Attach the committed stance-switch receipt this boundary publishes;
+    /// only a real switch calls this, never initialization or ordinary fits.
+    pub(in crate::services) fn set_ship_stance(&mut self, change: StanceTransition) {
+        self.stance = Some(change);
+    }
 }
 
 pub(in crate::services) async fn capture(ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, fences: &OnlineFences, owner: i64, ship: i64) -> Result<FittingBefore, CallError> {
@@ -38,11 +50,12 @@ pub(in crate::services) async fn capture_from_fit(
             .ok_or_else(|| crate::services::notify_error(infinity_core::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
         (Some(combat::prepare_condition_with_fit(ex, ship, &before).await?), Some(hull.location_id))
     } else { (None, None) };
-    Ok(FittingBefore { owner, ship, location, before, condition, membership })
+    Ok(FittingBefore { owner, ship, location, before, condition, membership, stance: None })
 }
 pub(in crate::services) async fn finish<E: From<OnlineChanged>>(ex: &(impl Executor + ?Sized), mut boundary: FittingBefore, final_fit: Fit, outbox: &mut Outbox<E>) -> Result<(), CallError> {
     if let Some((system, generation)) = boundary.membership {
-        let patch = final_fit.into_committed_fitting(&boundary.before);
+        let mut patch = final_fit.into_committed_fitting(&boundary.before);
+        if let Some(stance) = boundary.stance { patch.set_ship_stance(stance); }
         outbox.operation(OnlineChanged::Fitting { system, ship: boundary.ship, owner: boundary.owner, generation, patch }.into());
         return Ok(());
     }
@@ -91,6 +104,9 @@ pub(in crate::services) async fn finish<E: From<OnlineChanged>>(ex: &(impl Execu
         Some(crate::services::dogma::brain::compile(&final_fit, boundary.owner, boundary.ship))
     } else { None };
     outbox.operation(OnlineChanged::StoredFitting { owner: boundary.owner, changes: notices, brain }.into());
+    if let Some(stance) = boundary.stance {
+        super::queue_notification(outbox, None, boundary.owner, "OnStanceActive", stance_active_args(boundary.ship, stance.new));
+    }
     Ok(())
 }
 

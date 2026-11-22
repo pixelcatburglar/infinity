@@ -19,6 +19,7 @@ mod hash;
 mod histogram;
 mod images;
 mod isk;
+mod npc_security;
 mod live_sessions;
 mod logging;
 mod lua;

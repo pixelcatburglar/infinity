@@ -23,12 +23,13 @@ use crate::space::combat::inputs::ChargeToken;
 use crate::space::combat::loaded::LoadedPermit;
 use crate::space::combat::CombatPhase;
 use crate::sde::Sde;
-use crate::space::{dist, now_ms, Ball, System, World, MODE_WARP};
+use crate::space::{dist, Ball, System, World, MODE_WARP};
 use marshal::Value;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 pub(in crate::services::effects) mod bank;
+pub(crate) mod missile;
 
 /// SDE signatureRadius default when the attribute metadata is unavailable.
 const DEFAULT_SIGNATURE_RADIUS: f64 = 100.0;
@@ -75,20 +76,33 @@ pub(super) fn next_missile_id() -> i64 {
     NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Pay one admitted loaded use through the actor: the member's captured
-/// permit and charge token debit one unit, remove an emptied node in the same
-/// turn and emit the quantity delta; any refusal releases the permit unpaid.
-pub(super) async fn consume_charge(cx: &Ctx, permit: Option<LoadedPermit>, token: Option<ChargeToken>) -> Option<i32> {
-    let Some(permit) = permit else { return None };
-    let flag = permit.flag;
+/// Pay one admitted loaded use inside the actor: the member's captured permit
+/// and charge token debit one unit and remove an emptied node in this same
+/// turn. A missing token or a refused payment releases the permit unpaid and
+/// returns nothing. The tuple is the slot flag, the paid type and the
+/// quantity left in the slot.
+pub(in crate::services::effects) fn consume_charge_in_actor(s: &mut System, permit: Option<LoadedPermit>, token: Option<ChargeToken>) -> Option<(i32, i32, i64)> {
+    let permit = permit?;
     let Some(token) = token else {
-        cx.world.post(cx.system_id, move |s| s.release_loaded_use(permit));
+        s.release_loaded_use(permit);
         return None;
     };
-    let (type_id, remaining) = cx.world.with(cx.system_id, move |s| match s.consume_fitted_loaded(permit, token) {
-        done @ Some(_) => done,
+    let flag = permit.flag;
+    match s.consume_fitted_loaded(permit, token) {
+        Some((type_id, remaining)) => Some((flag, type_id, remaining)),
         None => { s.release_loaded_use(permit); None }
-    }).await.flatten()?;
+    }
+}
+
+/// Pay one admitted loaded use through the actor and emit the quantity delta.
+/// Any refusal releases the permit unpaid.
+pub(super) async fn consume_charge(cx: &Ctx, permit: Option<LoadedPermit>, token: Option<ChargeToken>) -> Option<i32> {
+    let Some(permit) = permit else { return None };
+    let Some(token) = token else {
+        cx.world.post(cx.system_id, move |s| { let _ = consume_charge_in_actor(s, Some(permit), None); });
+        return None;
+    };
+    let (flag, type_id, remaining) = cx.world.with(cx.system_id, move |s| consume_charge_in_actor(s, Some(permit), Some(token))).await.flatten()?;
     cx.notify("OnModuleAttributeChanges", vec![quantity_change(cx.char_id, cx.ship_id, flag, type_id, remaining, remaining + 1)]);
     Some(type_id)
 }
@@ -189,6 +203,34 @@ pub(crate) fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot
     if let Some(ch) = target_pilot {
         world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("source", shooter, weapon, damage, quality, banked)]);
     }
+}
+
+/// Report one resolved hit after its optional loss receipt settles; `capacity`
+/// reports the attempt's capacity refusal first.
+pub(super) fn defer_hit_report(s: &mut System, world: std::sync::Weak<World>, label: i64, shooter: i64,
+    target: i64, shooter_pilot: Option<i64>, victim: Option<i64>, weapon: i32, dealt: f64,
+    receipt: Option<tokio::sync::oneshot::Receiver<Result<(), CallError>>>,
+    capacity: Option<PreparedCombatAttempt>)
+{
+    s.defer(async move {
+        let mut dealt = dealt;
+        if let Some(receipt) = receipt {
+            match receipt.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, missile = label, "missile loss settlement failed");
+                    dealt = 0.0;
+                }
+                Err(_) => {
+                    tracing::warn!(missile = label, "missile loss worker stopped");
+                    dealt = 0.0;
+                }
+            }
+        }
+        let Some(world) = world.upgrade() else { return };
+        if let Some(attempt) = capacity { attempt.report_capacity_refusal(); }
+        report_hit(&world, shooter, target, shooter_pilot, victim, weapon, dealt, HIT_NORMAL, false);
+    });
 }
 
 /// The shared fitted-source check inside the actor: master's activation
@@ -439,170 +481,10 @@ pub(super) async fn fire_turret(cx: &Ctx, inputs: &TurretInputs, module: &Module
         inputs.parameters, inputs.raw, None, spool, attempt).await
 }
 
-/// What a missile does when it arrives.
-pub(crate) struct Missile {
-    pub(crate) charge: i32,
-    pub(crate) raw: [f64; 4],
-    pub(crate) aoe_cloud: f64,
-    pub(crate) aoe_velocity: f64,
-    pub(crate) drf: f64,
-    pub(crate) velocity: f64,
-    /// Effective lifetime in fractional milliseconds from the applied launch.
-    pub(crate) flight_time_ms: f64,
-    pub(crate) weapon: i32,
-    pub(crate) illegal: bool,
-}
-
-
-/// Build the transient projectile ball shared by ordinary and Defender launches.
-fn build_projectile_ball(sde: &Sde, from: &Ball, target: &Ball, owner: i64, module: Option<i64>, m: &Missile) -> Result<Ball, CallError> {
-    let size = sde.types.get(m.charge)
-        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
-    let mut slim = vec![("sourceShipID", Value::Int(from.id))];
-    slim.push(("launchModules", Value::list(module.map(Value::Int))));
-    let launch_ms = now_ms();
-    Ok(Ball {
-        id: next_missile_id(),
-        type_id: m.charge,
-        owner_id: owner,
-        corp_id: from.corp_id,
-        alliance_id: -1,
-        char_id: None,
-        signature_radius: None,
-        mode: crate::space::MODE_STOP,
-        radius: size.radius.unwrap_or(1.0) as f32,
-        mass: size.mass.unwrap_or(1.0),
-        max_vel: m.velocity as f32,
-        agility: 1.0,
-        speed_fraction: 0.0,
-        pos: from.pos,
-        vel: [0.0; 3],
-        old_pos: from.pos, old_vel: [0.0; 3], segment_acceleration: None,
-        goto: target.pos,
-        follow_id: 0,
-        follow_range: 0.0,
-        free: true,
-        global: false,
-        massive: false,
-        interactive: false,
-        warp: crate::space::WarpState::default(),
-        last_ms: launch_ms,
-        interpolation_anchor_ms: launch_ms,
-        effect_stamp: 0,
-        cloak: 0,
-        cloak_until: 0,
-        health: [1.0; 3],
-        launcher: 0,
-        slim,
-    })
-}
-
-/// Launch a native-steered missile flight; the actor sweeps target contact and
-/// expires the flight at its frozen effective lifetime. A committed contact
-/// applies explosion radius and velocity against the target at that actor turn.
-pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile, guard: Option<super::space_source::SourceGuard>, mut attempt: PreparedCombatAttempt) -> Result<(), CallError> {
-    if !m.flight_time_ms.is_finite() || m.flight_time_ms <= 0.0 {
-        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {}", m.flight_time_ms)));
-    }
-    let missile = build_projectile_ball(world.sde(), &from, &target, owner, module, &m)?;
-    let missile_id = missile.id;
-    let flight_time_ms = m.flight_time_ms;
-    let shooter_id = from.id;
-    let target_id = target.id;
-    let facts = attempt.facts();
-    let shooter_pilot = facts.actual_actor_character;
-    let (aoe_cloud, aoe_velocity, drf, raw, weapon) =
-        (m.aoe_cloud, m.aoe_velocity, m.drf, m.raw, m.weapon);
-    let sde = world.sde().clone();
-    let world_ref = Arc::downgrade(&world);
-    let impact_db = db.clone();
-    world.system(system).await.map_err(CallError::Internal)?;
-    let Some((victim_pilot, target_generation)) = world.with(system, move |s| {
-        if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
-        Some((s.combat_owner(target_id), s.combat_membership_generation(target_id)?))
-    }).await.flatten() else { return Ok(()) };
-    let drone_admission = matches!(guard, Some(super::space_source::SourceGuard::Drone { .. }))
-        .then_some((shooter_pilot, victim_pilot));
-    let illegal = if let Some((Some(shooter), Some(victim))) = drone_admission {
-        crate::services::crimewatch::classify(&db, &world, system, shooter, victim).await?
-    } else { m.illegal };
-    let Some(()) = world.with(system, move |s| {
-        if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
-        if s.combat_membership_generation(target_id) != Some(target_generation) { return None; }
-        if drone_admission.is_some() && s.combat_owner(target_id) != victim_pilot { return None; }
-        s.drone_attack(shooter_id, target_id);
-        s.launch_missile(missile, target_id, shooter_id, flight_time_ms, move |s, contact| {
-            // The actor already resolved the flight's terminal. `Some` is the
-            // single committed contact: read the effective target state in this
-            // actor turn and apply damage in place. Everything else is a miss.
-            let applied = contact.and_then(|contact| {
-                if s.combat_membership_generation(contact.target) != Some(target_generation) { return None; }
-                let signature = target_signature(&sde, s.ball(contact.target)?);
-                let victim = s.combat_owner(contact.target);
-                Some((contact, signature, victim))
-            });
-            let Some((contact, signature, victim)) = applied else {
-                attempt.finish_in_actor(s);
-                let victim = (s.combat_membership_generation(target_id) == Some(target_generation))
-                    .then(|| s.combat_owner(target_id)).flatten();
-                s.defer(async move {
-                    if let Some(world) = world_ref.upgrade() {
-                        report_hit(&world, shooter_id, target_id, shooter_pilot, victim, weapon, 0.0, HIT_MISS, false);
-                    }
-                });
-                return;
-            };
-            let target_id = contact.target;
-            let scaled = missile_applied(signature, dist(contact.target_velocity, [0.0; 3]), aoe_cloud, aoe_velocity, drf);
-            let result = apply_damage_in_actor(s, &impact_db, system, target_id, raw.map(|d| d * scaled), DamageSource {
-                attacker_id: shooter_pilot, attacker_ball_id: Some(facts.entity.item_id),
-                source_ship_id: Some(facts.entity.item_id), source_ship_type: Some(facts.entity.type_id),
-                weapon_type_id: Some(weapon), facts: Some(facts), force_origin: None, illegal,
-            }, false);
-            attempt.disarm();
-            let (dealt, capacity, receipt) = match result {
-                Ok(Some((outcome, receipt))) => (outcome.dealt, false, receipt),
-                Ok(None) => (0.0, false, None),
-                Err(error) if crate::services::combat::capacity::is_refusal(&error) => (0.0, true, None),
-                Err(error) => {
-                    tracing::warn!(?error, missile = missile_id, "missile impact damage failed");
-                    (0.0, false, None)
-                }
-            };
-            s.defer(async move {
-                let mut dealt = dealt;
-                if let Some(receipt) = receipt {
-                    match receipt.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            tracing::warn!(?error, missile = missile_id, "missile loss settlement failed");
-                            dealt = 0.0;
-                        }
-                        Err(_) => {
-                            tracing::warn!(missile = missile_id, "missile loss worker stopped");
-                            dealt = 0.0;
-                        }
-                    }
-                }
-                let Some(world) = world_ref.upgrade() else { return };
-                if capacity { attempt.report_capacity_refusal(); }
-                report_hit(&world, shooter_id, target_id, shooter_pilot, victim, weapon, dealt, HIT_NORMAL, false);
-            });
-        });
-        Some(())
-    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))? else { return Ok(()) };
-    if let Some((Some(shooter), Some(victim))) = drone_admission {
-        if let Err(error) = crate::services::crimewatch::apply(&db, &world, system, shooter, victim, illegal).await {
-            tracing::warn!(?error, missile = missile_id, "missile aggression application failed");
-        }
-    }
-    Ok(())
-}
-
 pub(super) async fn fire_missile(cx: &Ctx, inputs: &MissileInputs, module: &Module, charge: i32, target: i64, illegal: bool, attempt: PreparedCombatAttempt) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
-    let missile = Missile {
+    let missile = missile::Missile {
         charge,
         raw: inputs.raw,
         aoe_cloud: inputs.aoe_cloud,
@@ -612,8 +494,9 @@ pub(super) async fn fire_missile(cx: &Ctx, inputs: &MissileInputs, module: &Modu
         flight_time_ms: inputs.flight_time_ms,
         weapon: module.type_id,
         illegal,
+        dot: inputs.dot,
     };
-    launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile, None, attempt).await
+    missile::launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile, None, attempt).await
 }
 
 /// Launch a no-damage Defender flight using an actor-local target reservation.
@@ -623,20 +506,11 @@ pub(super) async fn launch_defender(cx: &Ctx, inputs: &MissileInputs, module: &M
     let system_id = cx.system_id;
     let character_id = cx.char_id;
     let module_id = module.id;
-    let m = Missile {
-        charge,
-        raw: inputs.raw,
-        aoe_cloud: inputs.aoe_cloud,
-        aoe_velocity: inputs.aoe_velocity,
-        drf: inputs.drf,
-        velocity: inputs.velocity,
-        flight_time_ms: inputs.flight_time_ms,
-        weapon: module.type_id,
-        illegal: false,
-    };
-    if !m.flight_time_ms.is_finite() || m.flight_time_ms <= 0.0 {
+    let velocity = inputs.velocity;
+    let lifetime = inputs.flight_time_ms;
+    if !lifetime.is_finite() || lifetime <= 0.0 {
         super::defenders::release_target(cx, target_id).await;
-        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {}", m.flight_time_ms)));
+        return Err(CallError::Internal(anyhow::anyhow!("invalid missile flight time {lifetime}")));
     }
     let sde = cx.world.sde().clone();
     let mut pending_attempt = Some(attempt);
@@ -651,7 +525,7 @@ pub(super) async fn launch_defender(cx: &Ctx, inputs: &MissileInputs, module: &M
             if let Some(mut attempt) = pending_attempt.take() { attempt.finish_in_actor(s); }
             return None;
         };
-        let ball = match build_projectile_ball(&sde, &source, &target, character_id, Some(module_id), &m) {
+        let ball = match missile::build_projectile_ball(&sde, &source, &target, character_id, Some(module_id), charge, velocity) {
             Ok(ball) => ball,
             Err(_) => {
                 s.release_defender_target(target_id);
@@ -659,7 +533,6 @@ pub(super) async fn launch_defender(cx: &Ctx, inputs: &MissileInputs, module: &M
                 return None;
             }
         };
-        let lifetime = m.flight_time_ms;
         s.launch_defender(ball, target_id, target_token, ship_id, lifetime, move |s, _contact| {
             if let Some(mut attempt) = pending_attempt.take() { attempt.finish_in_actor(s); }
         });
@@ -697,7 +570,7 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>, att
                 let name = cx.world.sde().dogma.effect(id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
                 return Err(super::unsupported::refusal(Some(id), name, from.type_id));
             };
-            let missile = Missile {
+            let missile = missile::Missile {
                 charge,
                 raw: inputs.raw,
                 aoe_cloud: inputs.aoe_cloud,
@@ -707,9 +580,10 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>, att
                 flight_time_ms: inputs.flight_time_ms,
                 weapon: from.type_id,
                 illegal: false,
+                dot: inputs.dot,
             };
             let owner = cx.attacker.unwrap_or(from.owner_id);
-            launch_missile(cx.db.clone(), cx.world.clone(), cx.system, from, victim, owner, None, missile, Some(cx.guard), attempt).await
+            missile::launch_missile(cx.db.clone(), cx.world.clone(), cx.system, from, victim, owner, None, missile, Some(cx.guard), attempt).await
         }
         _ => Err(CallError::Internal(anyhow::anyhow!("weapon source captured without weapon inputs"))),
     }

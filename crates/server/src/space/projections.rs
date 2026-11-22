@@ -38,7 +38,7 @@ impl World {
 impl System {
     /// Snapshot the current incoming sources for one target.
     pub(crate) fn projections_on(&self, target: i64) -> Vec<Projection> {
-        let blocked = crate::space::sovereignty::links::assistance_blocked(self, target);
+        let blocked = crate::space::combat::assistance_blocked(self, target);
         self.projections.get(&target).into_iter().flatten().filter(|projection| {
             !blocked || projection.source_ship == target || !self.projection_sde.as_ref()
                 .and_then(|sde| sde.dogma.effect(projection.effect_id))
@@ -168,16 +168,7 @@ impl System {
                 record.fit.value(record.fit_key, ATTR_WARP_SCRAMBLE_STATUS) > 0.0)
             {
                 if let Some(generation) = generation {
-                    self.command(target, move |ball, stamp, system| {
-                        if system.combat_membership_generation(target) == Some(generation)
-                            && ball.mode == MODE_WARP && ball.effect_stamp < 0
-                        {
-                            ball.stop();
-                            vec![event(stamp, "Stop", vec![Value::Int(target)])]
-                        } else {
-                            Vec::new()
-                        }
-                    });
+                    self.stop_aligning_warp(target, generation);
                 }
             }
         } else {

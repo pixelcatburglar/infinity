@@ -1,8 +1,9 @@
-//! Trade restriction, direct skill purchase and compressor type lists from `sde_native.typelist`.
+//! Trade restriction, direct skill purchase, compressor and weapon target
+//! whitelist type lists from `sde_native.typelist`.
 //! Membership follows `evetypes/__init__.py:GetTypeIDsFromTypeList`; other lists are not loaded.
-//! Startup fails if any requested trade, purchase or compressor list is missing.
+//! Startup fails if any requested trade, purchase, compressor or whitelist list is missing.
 use std::collections::{HashMap, HashSet};
-use infinity_core::{consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE}};
+use infinity_core::{consts::{dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, dogma::ATTR_VALID_TARGET_WHITELIST, TYPE_LIST_SKILLS_AVAILABLE_FOR_PURCHASE}};
 use crate::{dao::sde::typelists as dao, db::Db};
 use super::types::Types;
 
@@ -23,9 +24,12 @@ pub(crate) struct TypeLists(HashMap<i64, dao::TypeList>);
 impl TypeLists {
     pub(crate) async fn load(db: &Db, types: &Types) -> anyhow::Result<Self> {
         let mut ids = HashSet::from(REQUIRED_LISTS);
-        for value in types.iter().filter_map(|ty| ty.attribute(ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST)) {
-            anyhow::ensure!(value.is_finite() && value > 0.0 && value.fract() == 0.0 && value < i64::MAX as f64, "invalid compressor type-list attribute: {value}");
-            ids.insert(value as i64);
+        for attr in [ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, ATTR_VALID_TARGET_WHITELIST] {
+            for value in types.iter().filter_map(|ty| ty.attribute(attr)) {
+                anyhow::ensure!(value.is_finite() && value > 0.0 && value.fract() == 0.0 && value < i64::MAX as f64,
+                    "invalid type-list attribute {attr}: {value}");
+                ids.insert(value as i64);
+            }
         }
         let keys: Vec<String> = ids.iter().map(ToString::to_string).collect();
         Self::from_rows(&ids, dao::load(db, &keys).await?)

@@ -34,12 +34,18 @@ impl System {
         if !self.actor_combat.is_empty() && !npc_cohort { return Some("actor_combat"); }
         let Some(sde) = self.sde() else { return Some("unsupported_scene"); };
         if !sde.map.is_public_system(self.id) { return Some("unsupported_scene"); }
+        // Any sealed claim (Claimed, parked or unknown) blocks unload even
+        // when its ball already left and only the tombstone index remains.
+        if self.npc_wreck_claims_pending() { return Some("npc_wreck_claims"); }
         if self.balls.values().any(|ball| {
             let celestial = sde.map.celestial(ball.id).is_some_and(|row| {
                 row.solar_system_id == Some(self.id) && row.type_id == Some(i64::from(ball.type_id))
                     && ball.mode == MODE_RIGID && ball.cloak == 0
             });
+            // Only an exact unclaimed transient NPC root exempts here; claimed,
+            // unknown or tombstoned roots keep blocking through the claim check.
             !celestial && self.rock_type(ball.id).is_none() && !(npc_cohort && self.brains.contains_key(&ball.id))
+                && !self.npc_wreck_discardable(ball.id)
         }) || self.rocks.keys().any(|id| self.rock_type(*id).is_none()) {
             return Some("dynamic_ball");
         }

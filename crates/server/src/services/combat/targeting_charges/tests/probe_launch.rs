@@ -55,3 +55,43 @@ async fn launch_probes_refuses_a_competing_loaded_hold_then_launches() {
     cleanup_ship(&db, Some(&*c.world), fixture).await.unwrap();
     // The launched probe stays in exploration's private state().probes — inert: unique char/system per fixture.
 }
+
+/// A forged `LaunchProbes` naming an interdiction sphere launcher, or a scan
+/// launcher whose loaded charge is not a scanner probe, is refused before any
+/// charge is consumed or scanner probe state is created.
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn launch_probes_rejects_non_scan_launcher_and_charge() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = crate::tests::shared_sde(&db).await;
+    let system = 910_010_i64;
+    let bubble_launcher = sde.types.iter().find(|ty| ty.published == Some(true) && ty.group_id == Some(589))
+        .expect("SDE bubble probe launcher").type_id;
+    let warp_probe = sde.types.iter().find(|ty| ty.published == Some(true) && ty.group_id == Some(548))
+        .expect("SDE warp disruption probe").type_id;
+    let scan_launcher = sde.types.iter().find(|ty| ty.published == Some(true)
+        && ty.group_id.and_then(|g| sde.types.group(g)).is_some_and(|g| g.lower_name.as_deref().is_some_and(|n| n.contains("scan probe launcher"))))
+        .expect("SDE scan probe launcher").type_id;
+    let ship_type = sde.types.iter().find(|ty| ty.published == Some(true) && ty.category_id == Some(infinity_core::consts::CATEGORY_SHIP)).unwrap().type_id;
+    let specs = [
+        ShipItemSpec { type_id: bubble_launcher, flag_id: 27, quantity: 1, singleton: true, online: true, attributes: &[] },
+        ShipItemSpec { type_id: scan_launcher, flag_id: 28, quantity: 1, singleton: true, online: true, attributes: &[] },
+    ];
+    let fixture = create_ship(&db, ship_type, ShipLocation::Space { system }, &specs).await.unwrap();
+    let (ship, bubble, scan) = (fixture.ship, fixture.items[0], fixture.items[1]);
+    crate::dao::items::combat::apply_loads(&db, ship, &[(bubble, 27, warp_probe, 4, 0), (scan, 28, warp_probe, 4, 0)]).await.unwrap();
+    let (mut c, _peer) = crate::services::tests::client(db.clone(), fixture.character).await;
+    c.session.apply(vec![("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system))]);
+    c.world.system(system).await.unwrap();
+    for (module, flag) in [(bubble, 27), (scan, 28)] {
+        let (kwargs, args) = (Value::Dict(vec![]), vec![Value::Int(module), Value::Int(1)]);
+        let call = Call { service: "dogmaIM", method: "LaunchProbes", args: &args, kwargs: &kwargs, bound: false, bind_params: None };
+        crate::services::exploration::launch_probes(&mut c, &call).await.unwrap();
+        assert_eq!(crate::dao::items::charges::loaded(&db, ship, flag).await.unwrap().unwrap().quantity, 4,
+            "module {module} must keep every charge");
+    }
+    assert!(!c.outbox.iter().any(|p| matches!(&p.destination, Address::Broadcast { broadcast_id, .. }
+        if broadcast_id.as_text().as_deref() == Some("OnNewProbe"))), "no scanner probe may be minted");
+    cleanup_ship(&db, Some(&*c.world), fixture).await.unwrap();
+}

@@ -1,4 +1,5 @@
-//! Immutable sovereignty, development-index, adaptation and daily content captured per Lua generation.
+//! Immutable sovereignty, development-index, adaptation, daily and
+//! fields-and-deployables content captured per Lua generation.
 //! Adaptation and index data come from a validated deployment bundle and daily data is authored JSON;
 //! retained daily packages preserve references validated at activation across SDE changes.
 //! Gateway handlers, progress settlement, node and mission gameplay are not implemented here.
@@ -6,6 +7,8 @@
 pub(crate) mod adaption;
 pub(super) mod bundle;
 pub(crate) mod daily_goals;
+pub(crate) mod fields_deployables;
+
 pub(crate) mod indices;
 mod policy;
 pub(crate) mod protocol;
@@ -27,6 +30,9 @@ const DAILY_GOALS_COMPILER_IDENTITY: &str = "daily-goals-policy-v1";
 const INDICES_COMPILER_IDENTITY: &str = "sovereignty-indices-v1";
 /// Server safety ceiling on message keys and the number of catalogue entries.
 const MESSAGE_CATALOGUE_LIMIT: usize = 256;
+/// Server-defined identity of the closed fields-and-deployables compiler.
+const FIELDS_DEPLOYABLES_COMPILER_IDENTITY: &str = "fields-deployables-v1";
+
 /// JSON integer-array representation overhead for the seven bounded files and metadata.
 const RETAINED_SIZE_FACTOR: usize = 40;
 
@@ -35,6 +41,7 @@ enum PackageDomain {
     Adaption(Arc<adaption::Definitions>),
     DailyGoals(Arc<daily_goals::model::Definitions>),
     SovereigntyIndices(Arc<indices::Definitions>),
+    FieldsDeployables(Arc<fields_deployables::Definitions>),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -83,6 +90,9 @@ impl Package {
     pub(super) fn adaption(&self) -> Option<&Arc<adaption::Definitions>> {
         match &self.domain { PackageDomain::Adaption(definitions) => Some(definitions), _ => None }
     }
+    pub(super) fn fields_deployables(&self) -> Option<&Arc<fields_deployables::Definitions>> {
+        match &self.domain { PackageDomain::FieldsDeployables(definitions) => Some(definitions), _ => None }
+    }
 }
 
 #[derive(Clone)]
@@ -111,6 +121,10 @@ impl PinnedPolicy {
             PackageDomain::Sovereignty(values) => Ok(values.checkpoint_ms),
             _ => Err(db_err(anyhow::anyhow!("checkpoint interval requires sovereignty policy"))),
         }
+    }
+    /// The pinned fields-and-deployables definitions, when this package is that domain.
+    pub(crate) fn fields_deployables(&self) -> Option<&Arc<fields_deployables::Definitions>> {
+        self.package.fields_deployables()
     }
     pub(crate) fn adaption(&self) -> Option<&Arc<adaption::Definitions>> {
         self.package.adaption()
@@ -178,7 +192,7 @@ impl PinnedPolicy {
 }
 
 fn compiler(namespace: &str) -> anyhow::Result<&'static str> {
-    match namespace { "sovereignty" => Ok(COMPILER_IDENTITY), "ship_adaption" => Ok(ADAPTION_COMPILER_IDENTITY), "daily_goals" => Ok(DAILY_GOALS_COMPILER_IDENTITY), indices::NAMESPACE => Ok(INDICES_COMPILER_IDENTITY), _ => anyhow::bail!("unsupported content namespace") }
+    match namespace { "sovereignty" => Ok(COMPILER_IDENTITY), "ship_adaption" => Ok(ADAPTION_COMPILER_IDENTITY), "daily_goals" => Ok(DAILY_GOALS_COMPILER_IDENTITY), indices::NAMESPACE => Ok(INDICES_COMPILER_IDENTITY), fields_deployables::NAMESPACE => Ok(FIELDS_DEPLOYABLES_COMPILER_IDENTITY), _ => anyhow::bail!("unsupported content namespace") }
 }
 
 fn messages(lua: &Lua, source: &[u8], config: &LuaConfig) -> mlua::Result<std::collections::BTreeMap<String, String>> {
@@ -277,6 +291,10 @@ fn build_package(lua: &Lua, row: Arc<crate::dao::lua_content::PackageRow>, confi
         if row.data.len() > maximum { return Err(mlua::Error::runtime("indices package exceeds size limit")); }
         let sde = match daily_validation { daily_goals::model::ValidationContext::Activation(sde) => Some(sde), daily_goals::model::ValidationContext::Retained => None };
         PackageDomain::SovereigntyIndices(Arc::new(indices::rebuild(lua, &row.source, &row.data, &row.version, config, sde)?))
+    } else if row.namespace == fields_deployables::NAMESPACE {
+        if row.data.len() > config.data_file_limit_bytes { return Err(mlua::Error::runtime("fields-deployables data exceeds size limit")); }
+        let sde = match daily_validation { daily_goals::model::ValidationContext::Activation(sde) => Some(sde), daily_goals::model::ValidationContext::Retained => None };
+        PackageDomain::FieldsDeployables(Arc::new(fields_deployables::compile(lua, &row.source, &row.data, &config, sde)?))
     } else {
         let maximum = config.data_file_limit_bytes.checked_mul(RETAINED_SIZE_FACTOR).ok_or_else(|| mlua::Error::runtime("invalid content limit"))?;
         if row.data.len() > maximum { return Err(mlua::Error::runtime("adaptation package exceeds size limit")); }
@@ -367,6 +385,7 @@ fn reuse(canonical: &CanonicalPackages, row: &crate::dao::lua_content::PackageRo
     match &package.domain {
         PackageDomain::DailyGoals(definitions) => definitions.validate(daily_goals::model::ValidationContext::Activation(sde)).map_err(|error| mlua::Error::runtime(error.to_string()))?,
         PackageDomain::SovereigntyIndices(definitions) => indices::validate(definitions, Some(sde))?,
+        PackageDomain::FieldsDeployables(definitions) => fields_deployables::validate(definitions, Some(sde))?,
         _ => {}
     }
     Ok(Some(package.clone()))
@@ -396,15 +415,16 @@ pub(super) fn register(lua: &Lua, register: &Table, definitions: Arc<Mutex<Conte
         let namespace = string(&spec, "key")?;
         let version = string(&spec, "content_version")?;
         let sovereignty = script == "sovereignty_content" && namespace == "sovereignty" && string(&spec, "state_schema")? == "sovereignty_policy_v1";
+        let fields = script == "fields_deployables" && namespace == fields_deployables::NAMESPACE && string(&spec, "state_schema")? == "fields_deployables_v1";
         let adaption = script == "ship_adaption_mgr" && namespace == "ship_adaption" && string(&spec, "state_schema")? == "ship_adaption_chip_v1";
         let daily = script == "daily_goals" && namespace == "daily_goals" && string(&spec, "state_schema")? == "daily_goals_v1";
         let indices = script == "sovereignty_indices" && namespace == indices::NAMESPACE && string(&spec, "state_schema")? == "sovereignty_indices_v1";
-        if !(sovereignty || adaption || daily || indices) || !matches!(spec.get::<Value>("schema_version")?, Value::Integer(1)) || version.is_empty() {
+        if !(sovereignty || adaption || daily || indices || fields) || !matches!(spec.get::<Value>("schema_version")?, Value::Integer(1)) || version.is_empty() {
             return Err(mlua::Error::runtime("unsupported content identity or schema"));
         }
         if !empty(spec.get("progress_rules")?)? { return Err(mlua::Error::runtime("content progress rules must be empty")); }
         let datasets: Table = spec.get("datasets")?;
-        if sovereignty || daily {
+        if sovereignty || daily || fields {
             if !empty(datasets)? { return Err(mlua::Error::runtime("authored content datasets must be empty")); }
         } else if indices {
             let mut names = Vec::new();
@@ -428,7 +448,7 @@ pub(super) fn register(lua: &Lua, register: &Table, definitions: Arc<Mutex<Conte
             if count != bundle::FAMILIES.len() || !bundle::FAMILIES.iter().all(|name| names.contains(*name)) { return Err(mlua::Error::runtime("missing content dataset")); }
         }
         let operations: Table = spec.get("operations")?;
-        let expected: &[&str] = if sovereignty { &["InitializeCapital", "CapitalLost", "SelfDestruct"] } else if daily { &["Assign", "Match", "Cascade", "Project"] } else if indices { &["Compile"] } else { &["InjectChips", "ChipExchange"] };
+        let expected: &[&str] = if sovereignty { &["InitializeCapital", "CapitalLost", "SelfDestruct"] } else if daily { &["Assign", "Match", "Cascade", "Project"] } else if indices || fields { &["Compile"] } else { &["InjectChips", "ChipExchange"] };
         let mut count = 0;
         for pair in operations.pairs::<Value, Value>() {
             let (index, name) = pair?;
@@ -451,6 +471,14 @@ pub(super) fn register(lua: &Lua, register: &Table, definitions: Arc<Mutex<Conte
         } else if daily {
             let source = bytes(&root, "content/daily_goals/policy.lua", config.data_file_limit_bytes)?;
             let data = bytes(&root, "content/daily_goals/data/daily_goals.json", config.data_file_limit_bytes)?;
+            let row = package_row(namespace.clone(), version, registration.clone(), source, data)?;
+            match reuse(&canonical, &row, &sde)? {
+                Some(package) => package,
+                None => Arc::new(share_row(&canonical, build_package(lua, row, &config, &sde, daily_goals::model::ValidationContext::Activation(&sde), None)?)),
+            }
+        } else if fields {
+            let source = bytes(&root, "content/fields_deployables/policy.lua", config.data_file_limit_bytes)?;
+            let data = bytes(&root, "content/fields_deployables/data/policy.json", config.data_file_limit_bytes)?;
             let row = package_row(namespace.clone(), version, registration.clone(), source, data)?;
             match reuse(&canonical, &row, &sde)? {
                 Some(package) => package,

@@ -88,3 +88,35 @@ fn ordinary_standoff_uses_object_clearance_or_clamped_point_range() {
         assert_eq!(ordinary_warp_standoff(object_radius, 50.0, min_range), expected);
     }
 }
+
+#[test]
+fn a_live_fitted_mode_refuses_a_prequeued_positive_cost_warp_without_debit() {
+    use crate::services::combat::groups_health::{self, Condition, ShipStats};
+    use crate::services::fit::attributes::tests::module_fit;
+    use crate::services::fit::Key;
+    use infinity_core::consts::dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, ATTR_WARP_CAPACITOR_NEED};
+    crate::tests::init_config();
+    let mut body = ship();
+    body.mode = MODE_STOP; body.effect_stamp = 0; body.vel = [body.max_vel as f64, 0.0, 0.0];
+    let mut s = System::new(0, std::sync::Arc::default(), 12_345);
+    s.insert(body);
+    let mut fit = module_fit(crate::sde::types::tests::combat_fixture(), 456, 1, true);
+    let patch = crate::services::fit::attributes::CommittedFitting::overridden_attributes(vec![(Key::Ship, ATTR_WARP_CAPACITOR_NEED, Some(0.000001)), (Key::Ship, ATTR_CAPACITOR_CAPACITY, Some(100.0)), (Key::Ship, ATTR_RECHARGE_RATE, Some(1_000.0))]);
+    assert!(fit.apply_committed_fitting(&patch) && fit.value(Key::Ship, ATTR_WARP_CAPACITOR_NEED) > 0.0);
+    let stats = ShipStats::from_fit(&fit, Key::Ship);
+    s.install_condition(123, Condition { now: stats.max, stats, shield_at: crate::client::filetime_now() }, fit);
+    assert!(s.queue_warp(123, 3000, WarpDestination::Exact([infinity_core::consts::AU, 20.0, 30.0]), None));
+    s.apply_scene_prefix(false);
+    assert!(s.actor_combat.get_mut(&123).expect("combat").fit.set_module_active(2, true));
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let membership = s.combat_membership_generation(123).unwrap_or(0);
+    crate::services::tests::fixture::install_running_mode(2, 123, 789, i64::from(infinity_core::consts::dogma::EFFECT_BASTION), membership, &generation);
+    let at = crate::client::filetime_now();
+    let (_, before) = groups_health::fill_capacitor(123, 100.0, 1_000.0, at);
+    s.tick(13_345);
+    assert_eq!(groups_health::fill_capacitor(123, 100.0, 1_000.0, at).0, before, "recharge accounted, no debit");
+    assert_eq!(s.ball(123).unwrap().mode, MODE_STOP);
+    assert!(!s.ball(123).unwrap().is_warping(), "no Warp start");
+    crate::services::effects::active_cycle::finish_module(&mut s, 123, 2);
+    crate::services::combat::forget_ship(123);
+}

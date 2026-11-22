@@ -1,12 +1,13 @@
 //! Salvage chance uses the positive high-is-good difficulty convention.
-use super::*;
+use super::recovery;
+use crate::dao::items::{creation, inventory, loading::{self, ItemQuery}, salvage};
 
 #[test]
 fn easier_wrecks_increase_chance_and_extremes_clamp() {
-    assert!((chance(5.0, 30.0) - 0.35).abs() < f64::EPSILON);
-    assert!((chance(25.0, -20.0) - 0.05).abs() < f64::EPSILON);
-    assert_eq!(chance(5.0, -20.0), 0.0);
-    assert_eq!(chance(80.0, 30.0), 1.0);
+    assert!((recovery::chance(5.0, 30.0) - 0.35).abs() < f64::EPSILON);
+    assert!((recovery::chance(25.0, -20.0) - 0.05).abs() < f64::EPSILON);
+    assert_eq!(recovery::chance(5.0, -20.0), 0.0);
+    assert_eq!(recovery::chance(80.0, 30.0), 1.0);
 }
 
 #[tokio::test]

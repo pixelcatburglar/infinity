@@ -60,7 +60,7 @@ fn in_range(gap: Option<f64>, operational_distance: Option<f64>) -> bool {
 }
 
 /// Evaluate an already-sampled physical root; visibility and ancestry remain caller responsibilities.
-pub(in crate::services) fn root_in_range(sde: &Sde, type_id: i32, flag: i32, active_ship: bool, gap: Option<f64>) -> bool {
+pub(crate) fn root_in_range(sde: &Sde, type_id: i32, flag: i32, active_ship: bool, gap: Option<f64>) -> bool {
     let Some(ty) = sde.types.get(type_id) else { return false };
     if ty.category_id == Some(CATEGORY_SHIP) {
         if active_ship { return gap.is_some(); }

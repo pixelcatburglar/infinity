@@ -51,7 +51,6 @@ fn validates_optional_polarity_without_storing_it() {
 fn rejects_malformed_ranges_and_mappings() {
     let mut cases = Vec::new();
     let mut v = definition(); v["attributeIDs"]["10"]["min"] = json!(0); cases.push(v);
-    let mut v = definition(); v["attributeIDs"]["10"]["min"] = json!(2); cases.push(v);
     let mut v = definition(); v["attributeIDs"]["10"]["max"] = json!("2"); cases.push(v);
     let mut v = definition(); v["attributeIDs"]["10"]["highIsGood"] = json!(2); cases.push(v);
     let mut v = definition(); v["attributeIDs"] = json!({}); cases.push(v);
@@ -83,4 +82,12 @@ fn excludes_extra_inputs_and_unknown_references() {
     assert!(missing_attribute.get(1).is_none());
     let duplicate = DynamicItems::index(vec![row(), row()], |_| true, |_| true);
     assert!(duplicate.get(1).is_none());
+    let mut reversed = definition();
+    reversed["attributeIDs"]["10"]["min"] = json!(2);
+    reversed["attributeIDs"]["10"]["max"] = json!(1.5);
+    let reversed_row = DynamicItemRow { key: Some("1".into()), data: reversed.to_string() };
+    let indexed = DynamicItems::index(vec![reversed_row], |_| true, |_| true);
+    let mutation = indexed.get(1).expect("reversed endpoints stay indexed");
+    assert_eq!(mutation.result_type(2), Some(4));
+    assert_eq!((mutation.attributes[&10].min, mutation.attributes[&10].max), (2.0, 1.5));
 }

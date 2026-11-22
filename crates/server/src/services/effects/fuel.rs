@@ -1,10 +1,11 @@
 //! Per-cycle consumption of effective dogma module fuel requirements.
 //! The hold order follows inventoryFlagsCommon.py GetBaysToCheck without priority bays;
-//! quantities live in game.items. Unsupported effect families remain unsupported.
+//! quantities live in game.items. `plan` and `spend` are shared by in-space paste repair.
+//! Unsupported effect families remain unsupported.
 use std::collections::BTreeMap;
 use marshal::Value;
 use infinity_core::{consts::{dogma::{ATTR_CONSUMPTION_QUANTITY, ATTR_CONSUMPTION_TYPE}, FLAG_CARGO, FLAG_COLONY_RESOURCES_HOLD, FLAG_SPECIALIZED_FUEL_BAY, GROUP_FUEL_BLOCK, GROUP_ICE_PRODUCT, IX_STACK_SIZE}, messages};
-use crate::{dao::{items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, ship}, trades}, db::outbox::{dispatch_sender, Outbox}, services::{combat::Ctx, db_err, fit::{Fit, Key}, inventory::notifications::{notify_item_change, notify_item_removed}, items::load_items, notify_error, CallError}};
+use crate::{dao::{items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, ship}, trades}, db::{executor::Executor, outbox::{dispatch_sender, Outbox}}, services::{combat::Ctx, db_err, fit::{Fit, Key}, inventory::notifications::{notify_item_change, notify_item_removed}, items::load_items, notify_error, CallError}};
 use super::lifecycle::Module;
 
 fn refusal() -> CallError { notify_error(messages::effects::INSUFFICIENT_FUEL) }
@@ -30,7 +31,7 @@ fn holds(group: Option<i32>) -> &'static [i32] {
     }
 }
 
-fn plan(requirements: &[(i32, i64)], items: &[Item], reserved: &[i64], sde: &crate::sde::Sde, owner: i64) -> Result<BTreeMap<i64, QuantityChange>, CallError> {
+pub(super) fn plan(requirements: &[(i32, i64)], items: &[Item], reserved: &[i64], sde: &crate::sde::Sde, owner: i64) -> Result<BTreeMap<i64, QuantityChange>, CallError> {
     let mut changes = BTreeMap::new();
     for &(type_id, mut remaining) in requirements {
         let group = sde.types.get(type_id).and_then(|ty| ty.group_id);
@@ -47,6 +48,19 @@ fn plan(requirements: &[(i32, i64)], items: &[Item], reserved: &[i64], sde: &cra
         if remaining != 0 { return Err(refusal()); }
     }
     Ok(changes)
+}
+
+/// Apply the planned stack changes and publish each touched stack; `short`
+/// is the caller's refusal when a stack no longer matches the plan.
+pub(super) async fn spend<X: Send>(ex: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, items: Vec<Item>, changes: &BTreeMap<i64, QuantityChange>, short: impl FnOnce() -> CallError) -> Result<(), CallError> {
+    if !quantities::apply(ex, changes).await.map_err(db_err)? { return Err(short()); }
+    for item in items {
+        if let Some(change) = changes.get(&item.item_id) {
+            if change.quantity.is_none() { notify_item_removed(outbox, item); }
+            else { notify_item_change(ex, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity))]).await?; }
+        }
+    }
+    Ok(())
 }
 
 /// Aggregate every module's positive requirement by type into the reused
@@ -84,13 +98,7 @@ pub(super) async fn consume_cycle(cx: &Ctx, requirements: &[(i32, i64)]) -> Resu
                 let ids: Vec<_> = items.iter().filter(|item| requirements.iter().any(|(id, _)| *id == item.type_id) && !item.singleton && item.quantity > 0).map(|item| item.item_id).collect();
                 let reserved = trades::reserved(tx, &ids).await.map_err(db_err)?;
                 let changes = plan(&requirements, &items, &reserved, &sde, owner)?;
-                if !quantities::apply(tx, &changes).await.map_err(db_err)? { return Err(refusal()); }
-                for item in items {
-                    if let Some(change) = changes.get(&item.item_id) {
-                        if change.quantity.is_none() { notify_item_removed(outbox, item); }
-                        else { notify_item_change(tx, &sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity))]).await?; }
-                    }
-                }
+                spend(tx, &sde, outbox, items, &changes, refusal).await?;
                 Ok(())
             })
         },

@@ -91,6 +91,8 @@ pub(crate) mod wallets;
 pub(crate) mod wars;
 mod world_tasks;
 pub(crate) mod ship_adaption;
+pub(crate) mod ship_stance;
+mod ship_stance_mgr;
 
 pub(crate) use combat::recover_pending_reloads;
 pub use exploration::unbury_sites;
@@ -422,6 +424,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = bannedwords::dispatch(call) { return r; }
             if let Some(r) = planet_mgr::dispatch(c, call) { return r; }
             if let Some(r) = ship_cosmetics_mgr::dispatch(c, call).await { return r; }
+            if let Some(r) = ship_stance_mgr::dispatch(c, call).await { return r; }
             if let Some(r) = crates::dispatch(c, call).await { return r; }
             if let Some(r) = alert::dispatch(c, call).await { return r; }
             if let Some(r) = event_log::dispatch(c, call).await { return r; }

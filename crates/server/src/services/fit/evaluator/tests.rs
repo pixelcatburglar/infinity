@@ -1,7 +1,7 @@
 use super::apply;
 
 mod resistance_floor;
-
+mod ship_stance;
 #[test]
 fn operations_and_stacking() {
     // 3 x 5% damage skill bonus (PostPercent, unpenalized) on 2.0
@@ -618,4 +618,23 @@ async fn expert_only_skills_apply_passives_once_and_expire() {
     assert!((mixed.value(Key::Char, NEGOTIATION_PERCENTAGE) - expected).abs() < 1e-9);
     assert!((fallback.value(Key::Char, NEGOTIATION_PERCENTAGE) - 1.05).abs() < 1e-9);
     fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[test]
+fn scoped_sources_split_modules_from_hull() {
+    use super::{scope_admits, Key, SourceScope::{All, Hull, Modules}};
+    use infinity_core::consts::{CATEGORY_MODULE, CATEGORY_SKILL, CATEGORY_SUBSYSTEM};
+    for source in [Key::Char, Key::Module(1), Key::Charge(1), Key::Skill(2), Key::Implant(3), Key::Projected(4)] {
+        assert!(scope_admits(All, source, Some(CATEGORY_SKILL)));
+        assert!(!scope_admits(Modules, source, Some(CATEGORY_SKILL)), "{source:?}");
+        assert!(!scope_admits(Hull, source, Some(CATEGORY_SKILL)), "{source:?}");
+    }
+    assert!(scope_admits(All, Key::Ship, None));
+    assert!(scope_admits(Modules, Key::Module(1), Some(CATEGORY_MODULE)));
+    assert!(!scope_admits(Modules, Key::Module(1), Some(CATEGORY_SUBSYSTEM)));
+    assert!(!scope_admits(Modules, Key::Ship, Some(CATEGORY_MODULE)));
+    assert!(scope_admits(Hull, Key::Ship, None));
+    assert!(scope_admits(Hull, Key::Ship, Some(CATEGORY_MODULE)));
+    assert!(scope_admits(Hull, Key::Module(1), Some(CATEGORY_SUBSYSTEM)));
+    assert!(!scope_admits(Hull, Key::Module(1), Some(CATEGORY_MODULE)));
 }

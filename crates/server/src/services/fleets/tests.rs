@@ -112,3 +112,43 @@ fn rename_requires_existing_structure() {
     assert_eq!(fleet.wings[0].name, "new wing");
     assert_eq!(fleet.wings[0].squads[0].name, "new squad");
 }
+
+#[test]
+fn command_burst_members_includes_live_source_and_live_members() {
+    let mut state = State::default();
+    let mut fleet = Fleet::new(30, vec![]);
+    fleet.initialized = true;
+    for char_id in [30, 10, 20] {
+        fleet.members.insert(char_id, Member::new(NONE_ID, NONE_ID, ROLE_MEMBER, JOB_NONE, 50));
+        state.of.insert(char_id, 60);
+    }
+    fleet.members.get_mut(&20).unwrap().reconnect = Some(ReconnectState {
+        generation: 1, deadline: Instant::now(), offered_session: None,
+    });
+    state.fleets.insert(60, fleet);
+    let mut other = Fleet::new(99, vec![]);
+    other.initialized = true;
+    other.members.insert(99, Member::new(NONE_ID, NONE_ID, ROLE_MEMBER, JOB_NONE, 50));
+    state.fleets.insert(40, other);
+    state.of.insert(99, 40);
+    assert_eq!(command_burst_members_from(&state, 30), vec![10, 30]);
+    assert_eq!(command_burst_members_from(&state, 99), vec![99]);
+}
+
+#[test]
+fn command_burst_members_rejects_missing_or_reconnecting_source() {
+    let mut state = State::default();
+    let mut fleet = Fleet::new(30, vec![]);
+    fleet.initialized = true;
+    fleet.members.insert(30, Member::new(NONE_ID, NONE_ID, ROLE_MEMBER, JOB_NONE, 50));
+    state.of.insert(30, 60);
+    state.fleets.insert(60, fleet);
+    assert!(command_burst_members_from(&state, 7).is_empty());
+    assert!(command_burst_members_from(&state, 30) == vec![30]);
+    state.fleets.get_mut(&60).unwrap().members.get_mut(&30).unwrap().reconnect = Some(ReconnectState {
+        generation: 1, deadline: Instant::now(), offered_session: None,
+    });
+    assert!(command_burst_members_from(&state, 30).is_empty());
+    state.of.insert(30, 70);
+    assert!(command_burst_members_from(&state, 30).is_empty());
+}

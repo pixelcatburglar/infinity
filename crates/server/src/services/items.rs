@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use marshal::Value;
 
-pub(in crate::services) fn enrich_item(sde: &Sde, row: loading::GameItem) -> Option<Item> {
+pub(crate) fn enrich_item(sde: &Sde, row: loading::GameItem) -> Option<Item> {
     let data = sde.types.get(row.type_id)?;
     Some(Item {
         item_id: row.item_id, type_id: row.type_id, owner_id: row.owner_id,

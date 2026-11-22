@@ -55,3 +55,22 @@ fn public_membership_requires_a_real_system_row() {
     }
     assert_eq!(map.public_systems().count(), 0);
 }
+
+#[test]
+fn empire_boundary_is_positive_security_only() {
+    let mut map = map_with(vec![]);
+    for (index, security) in [0.3, 0.0, -0.2].iter().enumerate() {
+        let id = index as i64 + 1;
+        map.systems.push(SolarSystem {
+            solar_system_id: id, name: None, constellation_id: None, region_id: None,
+            faction_id: None, security: Some(*security), x: None, y: None, z: None,
+        });
+        map.system_index.insert(id, index);
+    }
+    let sde = crate::sde::Sde { map, ..Default::default() };
+    // Client security-class boundary: empire space is strictly positive
+    // security; exactly zero, negative and unknown systems are not.
+    for (system, expected) in [(1, true), (2, false), (3, false), (i64::MAX, false)] {
+        assert_eq!(crate::services::crimewatch::empire_system(&sde, system), expected, "system {system}");
+    }
+}

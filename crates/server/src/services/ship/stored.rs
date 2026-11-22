@@ -2,9 +2,14 @@
 //! `menuFunctions.py` and `invItemFunctions.py` supply the host and stored item;
 //! game items and sampled system state determine custody and physical access.
 //! Client wrappers ignore the return; successful selection returns ship state,
-//! and launch returns the standard empty mutator result.
+//! and launch returns the standard empty mutator result. A launched
+//! stance-capable hull gains its persisted default stance inside the same
+//! transaction before its ball is prepared.
 //! As with undock, an uncertain post-commit outcome while the actor remains
 //! alive can leave a persisted ship invisible until the system reloads.
+//! Store and stored-ship boarding share the pilot registry's ship-change
+//! deadline, frozen at the admission turn and recorded only on commit; a hull
+//! retained in space keeps its sampled momentum. Launch is not a ship change.
 use super::{Call, CallError, Client};
 use infinity_core::consts::{CATEGORY_SHIP, FLAG_SHIP_HANGAR, GROUP_CAPSULE, TYPE_CAPSULE};
 use crate::dao::{characters::selection, items::loading::ItemQuery};
@@ -21,6 +26,9 @@ struct Current {
     host: Ball,
     corporation: i64,
     alliance: i64,
+    /// Ship-change deadline frozen at the admission turn; only Store and
+    /// Board consume it through the settlement.
+    ready_at: i64,
 }
 
 async fn current(c: &Client, call: &Call<'_>, host: i64, target: Option<i64>, reserve: bool,
@@ -34,20 +42,28 @@ async fn current(c: &Client, call: &Call<'_>, host: i64, target: Option<i64>, re
     let selected = selection::selected(&c.db, character, c.login.user_id).await.map_err(db_err)?.ok_or_else(unavailable)?;
     if selected.station_id.is_some() || selected.solar_system_id != system
         || selection::ship_id(&c.db, character).await.map_err(db_err)? != Some(old) { return Err(unavailable()); }
+    // Freeze the ship-change deadline at this admission turn; Store and
+    // Board record it through the shared settlement when they commit.
+    let change_at = crate::client::filetime_now();
     let (old, transition, host) = c.world.with(system, move |space| {
-        if !space.combat_session_current(character, expected.as_ref()) { return None; }
-        if target.is_some_and(|id| space.ball(id).is_some()) { return None; }
-        let pilot = space.pilot_ball(character).filter(|ball| ball.id == old && ball.owner_id == character && ball.char_id == Some(character))?;
-        if pilot.mode == MODE_WARP || pilot.cloak != 0 { return None; }
-        space.persistent_generation(old)?;
-        let old = space.sampled_ball(old)?;
-        let host = space.sampled_ball(host)?;
+        if !space.combat_session_current(character, expected.as_ref()) { return Err(unavailable()); }
+        if target.is_some_and(|id| space.ball(id).is_some()) { return Err(unavailable()); }
+        let (old, _) = if reserve { space.authorize_own_hull_exit(character, old) } else { space.authorize_own_hull(character, old) }.map_err(|_| unavailable())?;
+        let host = space.sampled_ball(host).ok_or_else(unavailable)?;
         if host.mode == MODE_WARP || host.cloak != 0 || !space.visible_to(character, host.id)
-            || !old.pos.iter().chain(host.pos.iter()).all(|value| value.is_finite()) { return None; }
-        let transition = if reserve { Some(space.begin_condition_transitions(&[old.id])?) } else { None };
-        Some((old, transition, host))
-    }).await.flatten().ok_or_else(unavailable)?;
-    Ok(Current { identity, system, old, transition, host, corporation: selected.corporation_id, alliance: selected.alliance_id.unwrap_or(-1) })
+            || !old.pos.iter().chain(host.pos.iter()).all(|value| value.is_finite()) { return Err(unavailable()); }
+        let transition = if reserve {
+            // Only a store or stored board is a ship change; launch is not and
+            // is never gated by the shared deadline.
+            if !expected.as_ref().is_some_and(|expected| space.ship_change_ready(character, expected.session_id, change_at)) {
+                return Err(notify_error(infinity_core::messages::ship::SHIP_CHANGE_NOT_READY));
+            }
+            Some(space.begin_condition_transitions(&[old.id]).ok_or_else(unavailable)?)
+        } else { None };
+        Ok((old, transition, host))
+    }).await.ok_or_else(unavailable)??;
+    Ok(Current { identity, system, old, transition, host, corporation: selected.corporation_id,
+        alliance: selected.alliance_id.unwrap_or(-1), ready_at: crate::space::session_change::ship_change_deadline(change_at) })
 }
 
 async fn stored_item(c: &Client, host: i64, item: i64) -> Result<crate::dao::items::loading::Item, CallError> {
@@ -107,7 +123,7 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
     if expected.as_ref().is_some_and(|session| session.character_id != character
         || session.user_id != Some(c.login.user_id) || session.session_id != c.session.sid
         || session.ship_id != c.session.int("shipid") || session.system_id != Some(bound_system) || session.station_id.is_some()) { return Err(unavailable()); }
-    let Current { identity, system, old, transition, host, corporation, alliance } =
+    let Current { identity, system, old, transition, host, corporation, alliance, ready_at } =
         current(c, call, host_id, target_id, operation != Operation::Launch, expected.clone()).await?;
     let mut transition = transition;
     if let Some(transition) = transition.as_mut() { transition.held_loaded = held_loaded; }
@@ -244,6 +260,10 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
                 let target_type = if operation == Operation::Store { TYPE_CAPSULE } else { item.type_id };
                 let target_row = row(target, target_type, destination_pos);
                 let prepared = if operation == Operation::Launch {
+                    // Launch never ran the reconcile that initializes a stance
+                    // hull, so the launched target gains its default mode item
+                    // and timing here before the unpiloted ball reads the slim.
+                    crate::services::ship_stance::state::ensure_initialized_tx(tx, &sde, outbox, &moved).await?;
                     super::balls::unpiloted(tx, sde, &target_row).await?
                 } else {
                     super::balls::piloted(tx, sde, &target_row, character, security).await?
@@ -281,7 +301,7 @@ async fn run(c: &mut Client, call: &Call<'_>, host_id: i64, target_id: Option<i6
         };
         let expected = expected.ok_or_else(unavailable)?;
         let selected = settle_space(c.world.clone(), db, c.sde.clone(), system, character, client, expected.clone(),
-            transition.ok_or_else(unavailable)?, market, gate.ok_or_else(unavailable)?, system_admission, plan,
+            ready_at, transition.ok_or_else(unavailable)?, market, gate.ok_or_else(unavailable)?, system_admission, plan,
             move |tx, outbox, states, facts| execute!(tx, outbox, states, facts)).await?;
         super::boarding::finish(c, selected, Some(system), Some(&expected)).await
     }

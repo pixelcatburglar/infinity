@@ -9,6 +9,7 @@ fn entity(id: i64, character: Option<i64>) -> CombatEntity {
 fn source(sequence: u64) -> CombatSource {
     let mut activation = [0; 16]; activation[15] = 1;
     CombatSource { actual_actor_character: Some(1), entity: entity(1, Some(1)), source_is_npc: false,
+        npc_security_multiplier: Some(crate::npc_security::FrozenMultiplier::new(1.0).unwrap()),
         controller_incarnation: Some([1; 16]), context: FactContext { corporation_id: None, alliance_id: None,
             faction_id: None, ship_id: Some(1), ship_type_id: Some(1), system_id: Some(1), station_id: None,
             origin: FactOrigin::Natural }, module_id: Some(2), effect_id: Some(3), weapon_type_id: None, activation, sequence }

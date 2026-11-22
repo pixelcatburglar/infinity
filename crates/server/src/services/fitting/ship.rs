@@ -1,5 +1,7 @@
 //! Owned ship assembly and GM hull creation.
 //! Uses game items and the SDE; foreign custody and structure access are unsupported.
+//! An assembled hull of a stance-capable type gains its default hidden mode item
+//! and never-switched timing inside the same transaction that assembles it.
 use crate::services::inventory::notifications::notify_item_change;
 use crate::services::{db_err, user_error, value_ids, Call, CallResult};
 use crate::dao::items::loading::ItemQuery;
@@ -103,6 +105,7 @@ async fn assemble_core(
                     return Err(crate::services::notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
                 }
                 let mut assembled = Vec::new();
+                let mut any_stance_hull = false;
                 let mut notified = std::collections::BTreeSet::new();
                 for (id, split) in actions {
                     let (item, remaining) = &sources[&id];
@@ -116,7 +119,15 @@ async fn assemble_core(
                     } else {
                         id
                     };
+                    any_stance_hull |= crate::sde::ship_stances::for_hull(item.type_id).is_some();
                     assembled.push(ship_id);
+                }
+                // The assembled hull rows are reloaded only when at least one
+                // produced type supports stances; other types skip the read.
+                if any_stance_hull {
+                    for hull in load_items(tx, sde, ItemQuery::Ids(&assembled)).await.map_err(db_err)? {
+                        crate::services::ship_stance::state::ensure_initialized_tx(tx, sde, outbox, &hull).await?;
+                    }
                 }
                 Ok(assembled)
 }
@@ -180,11 +191,25 @@ pub(in crate::services) async fn gm_spawn_ship(c: &mut Client, type_id: i32) -> 
     let distance = crate::config::game().gm.spawn_distance_m + f64::from(pilot.radius) + f64::from(radius);
     let pos = crate::space::add(pilot.pos, crate::space::scale(crate::services::rand_dir(), distance));
     let db = c.db.clone();
+    let sde = c.sde.clone();
+    let world = c.world.clone();
     let id = db.transaction(
-        move |tx, _: &mut Outbox| Box::pin(async move {
-            crate::dao::items::creation::positioned(tx, type_id, owner, system, pos).await.map_err(db_err)
-        }),
-        |id, _| async move { Ok(id) },
+        move |tx, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                let id = crate::dao::items::creation::positioned(tx, type_id, owner, system, pos).await.map_err(db_err)?;
+                // A stance-capable hull must carry its state before the
+                // unpiloted ball below reads the persisted slim field; other
+                // hull types keep the plain creation cost.
+                if crate::sde::ship_stances::for_hull(type_id).is_some() {
+                    let hull = load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
+                        .ok_or_else(|| db_err(anyhow::anyhow!("spawned ship missing")))?;
+                    crate::services::ship_stance::state::ensure_initialized_tx(tx, &sde, outbox, &hull).await?;
+                }
+                Ok(id)
+            })
+        },
+        |id, outbox| async move { crate::db::outbox::dispatch_world(id, outbox, &world) },
     ).await?;
     let row = crate::dao::items::space_ships::FreeShip {
         item_id: id, type_id, owner_id: owner, corporation_id: pilot.corp_id,

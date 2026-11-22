@@ -9,7 +9,13 @@ fn command_shapes_and_deduplication() {
     assert!(parse("CmdAssist", &[ids.clone(), Value::Int(42)]).is_err());
     assert!(parse("CmdReturnBay", &[Value::list([Value::Bool(true)])]).is_err());
     assert!(parse("CmdReturnBay", &[Value::Int(7)]).is_err());
-    assert!(parse("CmdEngage", &[ids, Value::Bool(true)]).is_err());
+    assert!(parse("CmdEngage", &[ids.clone(), Value::Bool(true)]).is_err());
+    assert_eq!(parse("CmdSalvage", &[ids.clone(), Value::None]).ok().unwrap().1, Command::Order(DroneOrder::Salvage(None)));
+    assert_eq!(parse("CmdSalvage", &[ids.clone(), Value::Int(9)]).ok().unwrap().1, Command::Order(DroneOrder::Salvage(Some(9))));
+    for args in [&[ids.clone()][..], &[ids.clone(), Value::Int(0)][..], &[ids.clone(), Value::Int(-4)][..],
+        &[ids.clone(), Value::Bool(true)][..], &[Value::Int(7), Value::Int(9)][..]] {
+        assert!(parse("CmdSalvage", args).is_err(), "{args:?}");
+    }
 }
 
 #[test]

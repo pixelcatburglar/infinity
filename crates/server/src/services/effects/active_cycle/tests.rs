@@ -9,6 +9,7 @@ use crate::services::effects::tests::fixture as effects_fixture;
 pub(super) use crate::services::effects::tests::fixture::{fitted_attr, module_online, ship_info_item};
 use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipFixture, ShipItemSpec, ShipLocation};
 use crate::services::CallResult;
+use crate::space::SceneDelivery;
 use infinity_core::consts::{self, CATEGORY_MODULE, CATEGORY_SHIP};
 use infinity_core::consts::dogma::{ATTR_CAPACITOR_CAPACITY, ATTR_CPU_OUTPUT, ATTR_DISALLOW_REPEATING_ACTIVATION,
     ATTR_POWER_OUTPUT, ATTR_RECHARGE_RATE};
@@ -41,7 +42,7 @@ fn admission_refuses_a_live_cooldown_and_expires_due_records() {
 fn stopped_fences_on_the_record_generation() {
     let (module, ship, now) = (43_001_i64, 8_i64, now_ms());
     let (a, b) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let running = |generation: &Arc<AtomicBool>, delay_ms: i64| ActiveCycle::Running { generation: generation.clone(), owner: 1, ship, effect: i64::from(EFFECT_ASSAULT_DAMAGE_CONTROL), start: now - 1_000, duration_ms: DURATION_MS, delay_ms, repeat: 0 };
+    let running = |generation: &Arc<AtomicBool>, delay_ms: i64| ActiveCycle::Running { generation: generation.clone(), owner: 1, ship, effect: i64::from(EFFECT_ASSAULT_DAMAGE_CONTROL), membership: 0, start: now - 1_000, duration_ms: DURATION_MS, delay_ms, repeat: 0 };
     let mut st = combat::State::default();
     st.active_cycles.insert(module, running(&a, 2_000));
     stopped(now, &mut st, module, &b);
@@ -56,7 +57,7 @@ fn stopped_fences_on_the_record_generation() {
     stopped(now, &mut st, module, &a);
     assert!(!st.active_cycles.contains_key(&module), "zero delay leaves no record");
     st.cycle_deadlines.clear(); let pending = Arc::new(AtomicBool::new(false));
-    st.active_cycles.insert(module, ActiveCycle::Pending { generation: pending.clone(), ship });
+    st.active_cycles.insert(module, ActiveCycle::Pending { generation: pending.clone(), ship, effect: i64::from(EFFECT_ASSAULT_DAMAGE_CONTROL) });
     stopped(now, &mut st, module, &pending);
     assert!(!st.active_cycles.contains_key(&module) && st.cycle_deadlines.is_empty(), "pending cancels without cooldown");
 }
@@ -68,9 +69,10 @@ fn register_replaces_a_cooling_record_and_drops_its_index() {
     st.active_cycles.insert(module, ActiveCycle::Cooling { stopped: 1, deadline: 2_000 });
     st.cycle_deadlines.insert((2_000, module));
     let generation = Arc::new(AtomicBool::new(false));
-    register(&mut st, module, ship, &generation);
+    register(&mut st, module, ship, i64::from(EFFECT_ASSAULT_DAMAGE_CONTROL), &generation);
     assert!(st.cycle_deadlines.is_empty());
-    assert!(matches!(st.active_cycles.get(&module), Some(ActiveCycle::Pending { generation: g, ship: s }) if Arc::ptr_eq(g, &generation) && *s == ship));
+    assert!(matches!(st.active_cycles.get(&module), Some(ActiveCycle::Pending { generation: g, ship: s, effect: e })
+        if Arc::ptr_eq(g, &generation) && *s == ship && *e == i64::from(EFFECT_ASSAULT_DAMAGE_CONTROL)));
 }
 
 /// The module's duration-bounded record in shared combat state.
@@ -109,7 +111,7 @@ pub(super) fn module_type(sde: &Sde, effect: i32) -> i32 {
     assert!(resolved.manually_activatable(), "consumer effect {effect} must be manually activatable");
     sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
         && t.effects().iter().any(|e| e.effect_id == effect)
-        && crate::services::effects::registry::activation_in_scope(i64::from(t.category_id.unwrap_or(0)), i64::from(t.group_id.unwrap_or(0)), resolved.kind))
+        && crate::services::effects::registry::activation_in_scope(sde, t.type_id, resolved.kind))
         .map(|t| t.type_id).expect("published module carrying the consumer effect")
 }
 
@@ -167,12 +169,19 @@ pub(super) struct InSpace {
     pub system: i64,
 }
 
-/// A role-0 NPC-corporation pilot in space, following the active-attribute
-/// pattern: create docked, move to space, skills from requirements, admit.
-pub(super) async fn in_space(db: &crate::db::Db, sde: &Arc<Sde>, module_type: i32, effect: i32) -> InSpace {
-    let system = sde.map.stations().find(|s| s.solar_system_id.is_some()
-        && sde.map.celestial(s.station_id).is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some()))
-        .and_then(|s| s.solar_system_id).expect("station with celestial");
+/// A role-0 NPC-corporation pilot in space. `None` keeps the first station
+/// system; `Some` admits that loaded system when it has positioned celestials.
+pub(super) async fn in_space(db: &crate::db::Db, sde: &Arc<Sde>, module_type: i32, effect: i32,
+    attrs: &[(i32, f64)], extra: &[ShipItemSpec<'_>], initial_system: Option<i64>) -> InSpace {
+    let system = match initial_system {
+        None => sde.map.stations().find(|s| s.solar_system_id.is_some()
+            && sde.map.celestial(s.station_id).is_some_and(|c| c.x.is_some() && c.y.is_some() && c.z.is_some()))
+            .and_then(|s| s.solar_system_id).expect("station with celestial"),
+        Some(system) => {
+            assert!(sde.map.celestials(system).any(|c| c.x.is_some() && c.y.is_some() && c.z.is_some()), "initial system celestials");
+            system
+        }
+    };
     let data = sde.types.get(module_type).expect("fixture module type");
     // The canFitShipGroup*/canFitShipType* restriction values on the module
     // name the hulls it may be fitted on.
@@ -185,9 +194,15 @@ pub(super) async fn in_space(db: &crate::db::Db, sde: &Arc<Sde>, module_type: i3
         .map(|t| t.type_id).expect("published hull the fixture module fits");
     let flag = crate::services::effects::fitting::rack(&sde.types, module_type).map(|(_, _, first)| first).expect("module rack");
     let duration = sde.dogma.effect(effect).and_then(|e| e.duration_attribute_id).expect("duration attribute");
-    let f = create_ship(db, hull, ShipLocation::Docked { station: 1 }, &[ShipItemSpec { type_id: module_type, flag_id: flag,
-        quantity: 1, singleton: true, online: true,
-        attributes: &[(duration, DURATION_MS), (ATTR_REACTIVATION_DELAY, DELAY_MS), (ATTR_DISALLOW_REPEATING_ACTIVATION, 1.0)] }]).await.unwrap();
+    let mut attributes = Vec::with_capacity(attrs.len() + 1);
+    if !attrs.iter().any(|(attribute, _)| *attribute == duration) {
+        attributes.push((duration, DURATION_MS));
+    }
+    attributes.extend_from_slice(attrs);
+    let mut specs = vec![ShipItemSpec { type_id: module_type, flag_id: flag,
+        quantity: 1, singleton: true, online: true, attributes: &attributes }];
+    specs.extend_from_slice(extra);
+    let f = create_ship(db, hull, ShipLocation::Docked { station: 1 }, &specs).await.unwrap();
     let x = sde.map.celestials(system).map(|c| c.x.expect("celestial x") + f64::from(sde.celestial_radius(c))).reduce(f64::max).expect("system celestials") + 5_000.0;
     db.execute("UPDATE game.items SET location_id=$2,x=$3,y=0,z=0 WHERE item_id=$1", &[&f.ship, &system, &x]).await.unwrap();
     db.execute("UPDATE game.characters SET ship_id=$2, solar_system_id=$3, station_id=NULL WHERE character_id=$1", &[&f.character, &f.ship, &system]).await.unwrap();
@@ -203,7 +218,7 @@ pub(super) async fn in_space(db: &crate::db::Db, sde: &Arc<Sde>, module_type: i3
     client.world.register_pilot(f.character, tx);
     client.world.set_online_session(f.character, infinity_core::session::OnlineSession::from_session(&client.session));
     // Grant the module and hull skill requirements through the GM path.
-    let required = [module_type, hull].into_iter().flat_map(|t| crate::services::skills::requirements::requirements(sde, t))
+    let required = [module_type, hull].into_iter().chain(extra.iter().map(|spec| spec.type_id)).flat_map(|t| crate::services::skills::requirements::requirements(sde, t))
         .fold(std::collections::BTreeMap::new(), |mut m, (s, l)| { m.entry(s).and_modify(|v: &mut i32| *v = (*v).max(l)).or_insert(l); m });
     crate::services::skills::gm::apply(&mut client, f.character, crate::services::skills::gm::Change::Set(required.into_iter().collect())).await.unwrap();
     effects_fixture::admit(db, &client.world, system, effects_fixture::ball(f.ship, hull, f.character, Some(f.character), x)).await;
@@ -227,10 +242,18 @@ pub(super) async fn teardown(db: &crate::db::Db, space: InSpace) {
 
 /// Fixture in space, the body under `catch_scenario`, torn down before a panic unwinds.
 pub(super) async fn scenario(effect: i32, body: impl std::ops::AsyncFnOnce(&mut InSpace, &Arc<Sde>, &crate::db::Db)) {
+    scenario_spec(effect, &[(ATTR_REACTIVATION_DELAY, DELAY_MS), (ATTR_DISALLOW_REPEATING_ACTIVATION, 1.0)], &[], body).await
+}
+
+/// `scenario` with explicit module attribute overrides and extra created items:
+/// modes drop the reactivation-delay and disallow-repeat overrides and may add
+/// `disallowEarlyDeactivation` or a second watched module.
+pub(super) async fn scenario_spec(effect: i32, attrs: &[(i32, f64)], extra: &[ShipItemSpec<'_>],
+    body: impl std::ops::AsyncFnOnce(&mut InSpace, &Arc<Sde>, &crate::db::Db)) {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = crate::tests::shared_sde(&db).await;
-    let mut space = in_space(&db, &sde, module_type(&sde, effect), effect).await;
+    let mut space = in_space(&db, &sde, module_type(&sde, effect), effect, attrs, extra, None).await;
     let result = crate::tests::catch_scenario(body(&mut space, &sde, &db)).await;
     teardown(&db, space).await;
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
@@ -241,5 +264,52 @@ pub(super) fn activate_args(space: &InSpace, name: &str) -> Vec<Value> {
     vec![Value::Int(space.module), Value::str(name), Value::None, Value::Int(100)]
 }
 
+/// Published module types whose default effects include `effect`, in type order.
+pub(super) fn published_links(sde: &Sde, effect: i32) -> Vec<i32> {
+    let mut links = sde.types.iter().filter(|ty| ty.published == Some(true) && ty.category_id == Some(CATEGORY_MODULE)
+        && ty.effects().iter().any(|linked| linked.effect_id == effect)).map(|ty| ty.type_id).collect::<Vec<_>>();
+    links.sort_unstable();
+    links
+}
+
+/// Current cargo quantity of one item; a missing row is empty.
+pub(super) async fn quantity(db: &crate::db::Db, item: i64) -> i64 {
+    db.query_opt("SELECT quantity FROM game.items WHERE item_id = $1", &[&item]).await.unwrap().map(|row| row.get("quantity")).unwrap_or(0)
+}
+
+/// The resident fit's rounded fuel requirement for one fitted module.
+pub(super) async fn effective_units(space: &InSpace, module: i64) -> i64 {
+    let (system, ship) = (space.system, space.fixture.ship);
+    space.client.world.with(system, move |s| s.resident_fit(ship, |fit, _| {
+        super::super::fuel::requirements(fit, &[super::super::lifecycle::Module { id: module, type_id: 0, flag: 0 }], Vec::new()).expect("effective fuel").into_iter().map(|(_, units)| units).sum()
+    })).await.unwrap().expect("resident fit")
+}
+
+/// The shared module activation used by the mode families.
+pub(super) async fn activate(space: &mut InSpace, name: &str, module: i64) {
+    effects_fixture::dogma_call(&mut space.client, "Activate", &[Value::Int(module), Value::str(name), Value::None, Value::Int(100)]).await.ok().expect("activate");
+}
+
+/// Count this module's current-effect starts or stops already queued. The
+/// batch unwrap is the shared scene decoder; this only counts its arguments.
+pub(super) fn fx_count(events: &mut tokio::sync::mpsc::UnboundedReceiver<SceneDelivery>, module: i64, start: i64) -> usize {
+    let mut count = 0;
+    while let Ok(delivery) = events.try_recv() {
+        if matches!(&delivery, SceneDelivery::Notify { event: "OnFleetStateChange", .. }) { continue; }
+        for event in crate::space::system::tests::events::destiny(delivery) {
+            let Value::Tuple(envelope) = event else { continue };
+            let Some(Value::Tuple(call)) = envelope.get(1) else { continue };
+            if call.first() != Some(&Value::str("OnSpecialFX")) { continue; }
+            let Some(Value::Tuple(args)) = call.get(1) else { continue };
+            if args.get(1) == Some(&Value::Int(module)) && args.get(7).and_then(Value::as_int) == Some(start) { count += 1; }
+        }
+    }
+    count
+}
+
 mod boundaries;
 mod consumers;
+mod bastion;
+mod industrial;
+mod triage;
+mod siege;

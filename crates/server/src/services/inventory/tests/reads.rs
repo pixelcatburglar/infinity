@@ -12,6 +12,7 @@ async fn contents_dispatch_and_native_charge_roundtrip() {
     let (mut client, _peer) = services::tests::client(db.clone(), fixture.character).await;
     let station = client.sde.map.stations().find(|s| s.solar_system_id.is_some()).unwrap().station_id;
     let system = client.sde.map.station(station).unwrap().solar_system_id.unwrap();
+    client.world.system(system).await.unwrap();
     let ship_type = client.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
     let charge_type = client.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_CHARGE)).unwrap().type_id;
     let module_type = client.sde.types.iter().find(|t| t.category_id == Some(infinity_core::consts::CATEGORY_MODULE)).unwrap().type_id;

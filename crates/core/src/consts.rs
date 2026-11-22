@@ -67,6 +67,9 @@ pub const FLAG_FLEET_HANGAR: i32 = 155;
 pub const FLAG_FRIGATE_ESCAPE_BAY: i32 = 179;
 /// Client inventorycommon/const.py `flagGeneralMiningHold`.
 pub const FLAG_GENERAL_MINING_HOLD: i32 = 134;
+/// Client inventorycommon/const.py `flagHiddenModifers` (original spelling):
+/// hidden tactical ship stance mode items.
+pub const FLAG_HIDDEN_MODIFIERS: i32 = 156;
 /// Client inventorycommon/const.py `flagMobileDepotHold`.
 pub const FLAG_MOBILE_DEPOT_HOLD: i32 = 183;
 /// Client inventorycommon/const.py `flagQuafeBay`.
@@ -367,6 +370,8 @@ pub const DRONE_STATE_MINING: i32 = 2;
 pub const DRONE_STATE_APPROACHING: i32 = 3;
 /// Client entityConst: departing drone activity.
 pub const DRONE_STATE_DEPARTING: i32 = 4;
+/// Client entityConst STATE_SALVAGING: salvaging drone activity.
+pub const DRONE_STATE_SALVAGING: i32 = 18;
 
 // SDE inventory type, group and category IDs.
 /// SDE invGroups and `inventorycommon/const.py` groupCharacter.

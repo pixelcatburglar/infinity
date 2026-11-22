@@ -159,7 +159,7 @@ async fn player_scrambler_lands_on_aligning_ship_before_warp_activation() {
             target: Some(f.victim), aim: None }).await.unwrap();
         let generation = crate::space::targeting::next_generation();
         let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: f.module, type_id: module_type, flag: FLAG_FITTING_FIRST }],
-            effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
+            presented_effect: effect.id, effect, target: Some(f.victim), repeat: 1, stop: stop.clone(),
             owner: ActivationOwner { master: f.module, generation: stop, armed: true,
                 combat_generations: vec![NativeCombatGeneration { module_id: f.module, generation, sequence: 0 }],
                 pending_combat: None, world: Arc::downgrade(&w), system: 1 },

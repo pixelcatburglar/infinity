@@ -184,6 +184,7 @@ fn actor_fitting_publication_keeps_intervening_capacitor_spend() {
 
 #[cfg(feature = "tests-combat")] #[test]
 fn super_weapon_guard_requires_live_generation_pilot_ball_and_module() {
+    crate::tests::init_config();
     let mut s = crate::space::System::new(1, std::sync::Arc::default(), 0);
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let module = -9_000_005_i64;

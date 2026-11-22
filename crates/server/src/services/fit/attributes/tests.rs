@@ -48,8 +48,26 @@ pub(crate) fn owner_fit(sde: std::sync::Arc<crate::sde::Sde>, ship: i64) -> Fit 
     fit
 }
 
+#[cfg(feature = "tests-space")]
+/// An owner fit whose module 2 carries a real charge node and loaded seed.
+pub(crate) fn charged_owner_fit(sde: std::sync::Arc<crate::sde::Sde>, ship: i64, charge: i32, quantity: i64) -> Fit {
+    let mut fit = owner_fit(sde, ship);
+    let incarnation = crate::space::targeting::next_generation();
+    fit.nodes.insert(Key::Charge(2), Node {
+        type_id: charge, data_position: fit.sde.types.position(charge), location: Location::Ship,
+        online: true, active: false, overloaded: false, projected_effect: None, projection_resistance_attribute: None, receiver: None,
+        charge_type: None, level: None, overrides: vec![], cargo_unlimited: false, charge_values: vec![],
+    });
+    fit.charge_incarnations.insert(2, incarnation);
+    fit.loaded_seeds.push(crate::space::combat::loaded::LoadedSeed {
+        module: 2, flag: 27, type_id: Some(charge), quantity, pending: false,
+    });
+    fit
+}
+
 #[cfg(feature = "tests-effects")] #[test]
 fn field_delta_preserves_runtime_and_unmodified_damage() {
+    crate::tests::init_config();
     let mut before = fit();
     let mut current = fit();
     let mut final_fit = fit();

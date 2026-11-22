@@ -775,9 +775,10 @@ fn scheduler_validation_rejects_invalid_limits() {
 #[cfg(feature = "tests-runtime")] mod combat_progress;
 #[cfg(feature = "tests-runtime")] mod client_write_timeout;
 #[cfg(feature = "tests-runtime")] mod resistance_floor;
-mod schema_downgrade_guard;
+pub(crate) mod schema_downgrade_guard;
 #[cfg(feature = "tests-runtime")] mod async_commit;
 #[cfg(feature = "tests-runtime")] mod idle_unload;
 #[cfg(feature = "tests-runtime")] mod loaded_snapshot;
 
 #[cfg(feature = "tests-runtime")] mod bounty_pool;
+#[cfg(feature = "tests-runtime")] mod npc_wreck_ids;

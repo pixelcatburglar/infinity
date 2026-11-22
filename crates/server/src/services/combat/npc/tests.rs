@@ -1,16 +1,21 @@
-//! Real-SDE regression: a behavior-carried NPC shield booster repairs on the
-//! existing shared local cycle, not the legacy entity attributes.
+//! Real-SDE regression: legacy and behavior-carried NPC local repairs match
+//! the SDE nominal rate on the existing shared cycle.
 use super::*;
 use crate::services::combat::tests::remote_repair_db::{ball, condition};
+
+async fn real_sde() -> (Db, Arc<Sde>) {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    (db, sde)
+}
 
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn behavior_shield_repair_uses_real_sde_rate() {
     const NPC_ID: i64 = i64::MIN + 561_899;
     const NPC_TYPE: i32 = 56189; // Stormbringer Disparu Troop.
-    crate::tests::init_config();
-    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
-    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let (db, sde) = real_sde().await;
     let data = sde.types.get(NPC_TYPE).expect("SDE carries the NPC type");
     assert!(data.effects().iter().any(|entry| entry.effect_id == infinity_core::consts::dogma::EFFECT_NPC_BEHAVIOR_SHIELD_BOOST));
     assert!(data.attribute(ATTR_ENTITY_SHIELD_BOOST_AMOUNT).is_none());
@@ -57,8 +62,40 @@ async fn behavior_shield_repair_uses_real_sde_rate() {
     result.unwrap();
 }
 
-/// The behavior rescale preserves the SDE nominal rate on the shared cycle:
-/// shorter and longer durations both scale; invalid input admits nothing.
+/// Real legacy and behavior types keep the shared cycle and each layer's own rate.
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn local_repairs_use_real_sde_rates() {
+    let (db, sde) = real_sde().await;
+    // shield amount/duration, armor amount/duration, then (shield, armor, cycle).
+    let samples = [
+        (3825, (Some(600.0), Some(10_000.0), Some(1270.0), Some(15_000.0), (900.0, 1270.0, 15_000.0))),
+        (2222, (Some(150.0), Some(5_000.0), Some(0.0), Some(10_000.0), (300.0, 0.0, 10_000.0))),
+        (85055, (None, None, Some(202.5), Some(4_500.0), (0.0, 225.0, 5_000.0))),
+        (13678, (Some(400.0), None, None, None, (400.0, 0.0, 5_000.0))),
+        (84460, (Some(100.0), Some(5_000.0), None, None, (100.0, 0.0, 5_000.0))),
+        (55016, (None, None, None, None, (100.0 / 3.0, 200.0 / 9.0, 5_000.0))),
+    ];
+    for (type_id, (shield, shield_ms, armor, armor_ms, expected)) in samples {
+        let data = sde.types.get(type_id).expect("SDE carries the NPC type");
+        assert_eq!((data.attribute(ATTR_ENTITY_SHIELD_BOOST_AMOUNT), data.attribute(ATTR_ENTITY_SHIELD_BOOST_DURATION),
+            data.attribute(ATTR_ENTITY_ARMOR_REPAIR_AMOUNT), data.attribute(ATTR_ENTITY_ARMOR_REPAIR_DURATION)),
+            (shield, shield_ms, armor, armor_ms));
+        let repairs = npc_stats(&db, &sde, type_id).await.unwrap().repairs;
+        assert!((repairs.0 - expected.0).abs() <= 1e-9 * expected.0.abs().max(1.0), "{type_id} shield");
+        assert!((repairs.1 - expected.1).abs() <= 1e-9 * expected.1.abs().max(1.0), "{type_id} armor");
+        assert_eq!(repairs.2, expected.2, "{type_id} cycle");
+    }
+    assert!(sde.types.effects(84460).iter().any(|entry| entry.effect_id == EFFECT_NPC_BEHAVIOR_SHIELD_BOOST));
+    assert!(sde.types.effects(3825).iter().all(|entry| entry.effect_id != EFFECT_NPC_BEHAVIOR_SHIELD_BOOST));
+    assert!(sde.types.attribute(84460, ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT).is_none());
+    assert_eq!((sde.types.attribute(55016, ATTR_BEHAVIOR_SHIELD_BOOSTER_AMOUNT), sde.types.attribute(55016, ATTR_BEHAVIOR_SHIELD_BOOSTER_DURATION),
+        sde.types.attribute(55016, ATTR_BEHAVIOR_ARMOR_REPAIRER_AMOUNT), sde.types.attribute(55016, ATTR_BEHAVIOR_ARMOR_REPAIRER_DURATION)),
+        (Some(20.0), Some(3_000.0), Some(20.0), Some(4_500.0)));
+}
+
+/// The shared rescale preserves the SDE nominal rate: shorter and longer
+/// durations both scale; invalid input admits nothing.
 #[test]
 fn behavior_cycle_amount_table() {
     const C: f64 = 5_000.0;
@@ -77,4 +114,8 @@ fn behavior_cycle_amount_table() {
         (Some(220.0), Some(0.0)), (Some(220.0), Some(-1.0)), (Some(220.0), Some(f64::INFINITY))] {
         assert_eq!(behavior_cycle_amount(amount, duration, C), None);
     }
+    // A typical short legacy duration grows onto the longer shared cycle.
+    assert_eq!(behavior_cycle_amount(Some(600.0), Some(10_000.0), 15_000.0), Some(900.0));
+    // Overflow stays unadmitted so the caller can keep its original amount.
+    assert_eq!(behavior_cycle_amount(Some(f64::MAX), Some(1.0), f64::MAX), None);
 }

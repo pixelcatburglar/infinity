@@ -6,7 +6,8 @@
 //! while an empty name is sent unchanged.
 //! Prepared piloted and unpiloted hulls publish their condition only when installed.
 //! Unpiloted hulls have no pilot or security status; every prepared hull carries
-//! its persisted dirt timestamp and player-kill count on the slim item.
+//! its persisted dirt timestamp and player-kill count on the slim item, and a
+//! stance-capable hull also carries its persisted `shipStance` tuple.
 //! Piloted preparations also read the persistent GM NPC-ignore flag of the
 //! piloting character and install it onto the actor's pilot entry.
 
@@ -78,8 +79,11 @@ pub(super) async fn selected(identity: &Identity, db: &Db, world: &space::World,
     let security = crimewatch::security_status(db, char_id).await?;
     let condition = combat::prepare_condition_with_fit(db, ship_id, &fit).await?;
     let appearance = super::appearance::prepare(db, sde, ship_id, crate::client::filetime_now()).await?;
-    let ball = build(sde, ship_id, appearance.type_id, char_id, identity.corp_id,
+    let mut ball = build(sde, ship_id, appearance.type_id, char_id, identity.corp_id,
         alliance_id.unwrap_or(-1), Some(char_id), pos, &fit, condition.fractions(), Some(security), appearance.name, appearance.dirt_timestamp, appearance.player_kills)?;
+    if let Some(value) = crate::services::ship_stance::state::slim_field(db, sde, ship_id, appearance.type_id).await? {
+        ball.slim.push(("shipStance", value));
+    }
     let skin = skin_prepared(db, sde, ship_id, appearance.type_id, Some(char_id)).await?;
     let npc_ignored = crate::dao::characters::npc_control::get(db, char_id).await.map_err(db_err)?
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("selected character missing")))?;
@@ -91,8 +95,11 @@ pub(crate) async fn unpiloted(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ship
     let fit = Fit::load_unpiloted(ex, sde.clone(), ship.item_id).await?;
     let condition = combat::prepare_condition_with_fit(ex, ship.item_id, &fit).await?;
     let appearance = super::appearance::prepare(ex, &sde, ship.item_id, crate::client::filetime_now()).await?;
-    let ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
+    let mut ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
         ship.alliance_id, None, ship.pos, &fit, condition.fractions(), None, appearance.name, appearance.dirt_timestamp, appearance.player_kills)?;
+    if let Some(value) = crate::services::ship_stance::state::slim_field(ex, &sde, ship.item_id, ship.type_id).await? {
+        ball.slim.push(("shipStance", value));
+    }
     let skin = skin_prepared(ex, &sde, ship.item_id, ship.type_id, None).await?;
     Ok(PreparedShip { ball, npc_ignored: false, condition, fit, skin })
 }
@@ -102,8 +109,11 @@ pub(crate) async fn piloted(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ship: 
     let fit = Fit::load(ex, sde.clone(), character, ship.item_id).await?;
     let condition = combat::prepare_condition_with_fit(ex, ship.item_id, &fit).await?;
     let appearance = super::appearance::prepare(ex, &sde, ship.item_id, crate::client::filetime_now()).await?;
-    let ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
+    let mut ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
         ship.alliance_id, Some(character), ship.pos, &fit, condition.fractions(), Some(security), appearance.name, appearance.dirt_timestamp, appearance.player_kills)?;
+    if let Some(value) = crate::services::ship_stance::state::slim_field(ex, &sde, ship.item_id, ship.type_id).await? {
+        ball.slim.push(("shipStance", value));
+    }
     let skin = skin_prepared(ex, &sde, ship.item_id, ship.type_id, Some(character)).await?;
     let npc_ignored = crate::dao::characters::npc_control::get(ex, character).await.map_err(db_err)?
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("piloted ship owner character missing")))?;

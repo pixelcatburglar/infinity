@@ -37,6 +37,11 @@ explicitly excluded groups are denied, rather than admitting only a client-side
 allowlist. A recognised kind is not necessarily an implemented behaviour.
 Unsupported or out-of-scope activations are visibly refused, including those
 with modifier data; they are never treated as a generic animation.
+The same boundary runs the shared security-class check. A module carrying
+`disallowInHighSec` refuses in high-security space; a module carrying
+`disallowInEmpireSpace` (Bomb Launcher I/II, Defender Launcher I and the
+warp disruption field generator) refuses in every positive-security
+(empire) system, low-security included, with `CantInEmpireSpace`.
 
 Unsupported attempts are logged and recorded once per effect name and type ID
 per process. A GM with the existing slash role can use `/effects unsupported`
@@ -130,6 +135,11 @@ change, drone propagation and output rebase still run. Each emitted row
 also records a DEBUG event carrying the source module, affected item,
 attribute and both values for deployed verification.
 
+`ShipGetInfo` includes effective attributes introduced by fitting modifiers,
+including runtime collections, even when absent from the type values and
+item overrides. Live capacitor, damage, heat, disintegrator ramps and
+adaptive armor readouts retain their authority over the snapshot.
+
 In space the same before/final emitter publishes the piloted ship's
 effective attributes on `OnModuleAttributeChanges`, keyed to the ship and
 its fitted modules, when other actor mutations change them: projection
@@ -198,23 +208,30 @@ behaviour; modules whose active effect is not a turret are unaffected.
 | Capacitor boosters, neutralizers, nosferatu, capacitor transfer and fueled local repair | Supported through the shared lifecycle. Charged ancillary shield boosters bypass capacitor discharge without an amount multiplier; fueled ancillary armor repair pays normal capacitor and uses its fitted charge multiplier. Uncharged ancillary repairs use their normal capacitor cost and base amount. |
 | Modifier-only and online effects | Supported through the modifier and online paths, subject to validation and scope. |
 | Hacking and probe launch | Classified for existing exploration paths; classification alone does not guarantee every item or call path. |
-| Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. |
+| Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. A warp disruption field generator still presents `warpDisruptSphere` to the client while a loaded focused script runs its own projected scram or disruption effect, captured once from the module without re-applying the script's own rows; when the script's discharge attribute is absent from the module the cost falls back to its capacitor need, 60 GJ per six-second cycle on an unbonused WDFG I before fitted modifiers. The module's `disallowAssistance` attribute blocks incoming remote assistance while the scripted activation runs, the same restriction as on the unscripted generator. |
+| Warp disruption field generator (unscripted sphere) | Activating `warpDisruptSphere` without a loaded script raises a ship-sourced warp-disruption field at the fitted effect-range radius (attribute 103): a ship intersecting the field cannot enter warp, a ship still aligning when the field rises is cancelled, and a warp activation whose entry point lies within 500 km of its original destination lands at that entry point instead. A positive fitted or innate `warpBubbleImmune` passes. The field follows the source's sampled position, retires with the activation or when the source leaves the scene, is transient actor state and publishes the SDE field animation with `graphicInfo.range`. The generator's mass, max-velocity and signature-radius penalties apply while it runs. While the generator is active its `disallowAssistance` attribute refuses incoming remote assistance onto the source ship (remote repairs, capacitor injections and assistance-flagged projections are refused) and assistance projections already present drop when the first cycle publishes the module's active bit, resuming when the generator retires. |
 | Remote shield, armor and hull repair | Locked ships and NPCs use fitted amounts and range/falloff, rechecked at application. Server policy applies shield at cycle start and armor and hull at cycle end. Ancillary variants use the same charge, reload and capacitor rules as local ancillary repairs. Mutadaptive remote armor repair is refused. No Crimewatch assistance flags are applied. |
 | ECM and burst jammers | Targeted and area jamming use the shared lifecycle, fitted sensor strengths and actor-owned jam lifetimes. |
 | NPC remote shield, armor and hull repair | NPCs assist the most damaged eligible ally in their spawn group or ownership set, using fitted SDE repair amounts. |
 | Smartbombs, bombs and Vorton weapons | Area pulses, delayed bomb impacts and chained Vorton hits use the shared lifecycle and damage paths. Vorton hits apply the shared missile application per target; no tracking or hit roll is involved. In-range missiles and bombs also take the pulse's base damage after source admission, with no friendly filter; a destroyed bomb does not detonate. |
-| Cloak, micro jump drive and compression | Actor-owned cloak visibility, queued micro jump movement and fitted compression availability use the shared lifecycle. Micro jump range uses fitted dogma when the module type has a range row; otherwise it uses the client 100 km distance. Invalid fitted ranges are rejected. |
+| Cloak, micro jump drive and compression | Actor-owned cloak visibility, queued micro jump movement and fitted compression availability use the shared lifecycle. Micro jump range uses fitted dogma when the module type has a range row; otherwise it uses the client 100 km distance. Invalid fitted ranges are rejected. A positive fitted `activationRequiresActiveIndustrialCore` admits the facility only while the same ship has a genuinely running industrial or compact core; a missing or zero requirement keeps the previous admission. Retiring the last such core withdraws that facility. |
+| Micro jump field generator | After one spool cycle the source ship and up to the fitted cap of eligible piloted ships inside the fitted radius move by the source's heading displacement; the source is not counted in the cap, and a surplus of candidates is sampled without replacement. Carried ships keep their velocity. Capital field generators are refused. |
 | Salvage, tractor, cargo, ship and survey scanners, automatic and passive targeting | Supported through their shared lifecycle families. Survey results come from the separately triggered modern `miningScanMgr.perform_scan` RPC, not a pushed module result. |
 | Precursor disintegrator spool | Supported for fitted players, banks and NPCs through the shared lifecycle and one pure ramp: base at bind, fitted per-cycle step, fitted cap, reset on a replaced incarnation. A bound NPC shot that cannot fire, target loss and a damage-free resident fit each end the ramp and its beam. |
-| Burst jamming and probe launch | Visibly refused by this lifecycle. |
-| Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
+| Interdiction sphere launcher | Activating `useMissiles` on a bubble-probe launcher (group 589) runs the probe-launch family while notifications keep the presented effect. One loaded compatible charge is consumed and one stationary damageable probe is born. Warp probes raise a field on their own ball for their dogma lifetime; a stasis probe fires one delayed pulse and then removes itself. Scanning `probeLaunching` stays on the exploration path. |
+| Ordinary festival launcher | A published group-501 Festival Launcher or Display Launcher activates through the existing `dogmaIM.Activate` `useMissiles` request. Before aggression the actor admits the full resident charge token: a published group-500 charge whose default effect is snowBallLaunching and whose metadata is neither offensive nor assistance. The resolved effect stays 101 and missile-kind, with that admission attached; notifications and the nonoffensive animation keep effect 101. Each accepted repeat pays one loaded unit and inserts one native projectile in the same actor turn. Contact, expiry, invalidation and area destruction use the existing flight terminal; the finish callback does no gameplay work. There is no combat attempt, damage, repair, retaliation, Crimewatch, hit or miss. A reload, unload or different charge identity ends the old activation. The last unit removes that charge node and the next repeat stops. The launcher is a singleton, so a resolved bank with another member is refused. Direct snowBallLaunching, structure launchers, unpublished types and melted charges stay refused. |
+| Burst jamming | Visibly refused by this lifecycle. |
+| Command bursts (armor, shield, skirmish, information, mining) | Shared lifecycle, charge-sensitive: each cycle consumes one charge and lands the module's effective warfareBuff collections on the source ship and on every fleet member's ship within surface range as timed runtime modifier sources; per-source skylines with strict expiry, SDE Maximum/Minimum fold through the shared evaluator for every collection alike; `OnDbuffUpdated`/`OnFleetBoosted`; transient `WarfareLinkSphere*`/`WarfareLink*` FX; landed buffs are not revoked when the source leaves; directional scan range (2465) and hacking virus coherence (2468) are read from the resident fit by ConeScan and hacking start, and analyzer/salvager range and salvager duration (2465/2481) reach those modules through the fit; probe strength and deviation collections 2464/2466 are consumed through the resident fit by the shared dogma evaluator, and probe scanning applies no extra multiplier. |
+| Adaptive armor hardener | A running `adaptiveArmorHardener` adapts at the end of each paid cycle, never at the midpoint. The tally is armor hit points that got through the ship's resistances and were clipped by the armor still remaining; shield-only, hull-only, resistance-free flat damage, a refused or replayed hit, and a hit that would destroy the ship do not enter it. The two least-damaged channels, and every channel that took no armor damage, each give up to the module's fitted shift; the damaged channels share that amount equally. A cycle whose tally is empty keeps the current profile. The profile is ephemeral: a manual stop's last paid cycle still adapts, then stop, offlining, refit, a replaced module, a new ship membership and a stargate jump return the fitted baseline, and nothing is stored. The module tooltip and the ship armor rows use the same profile. The shipped client effect only declares the four armor-resonance operands, so this redistribution is the server's own; public developer material describes the same end-of-cycle idea with different arithmetic, and this server does not copy either. No client walkthrough was run for sustained single-type damage, an unbroken shield, an empty cycle, cycle-end module and ship values, or a stop, restart and stargate jump. Passing the server tests does not show that the client displays those values. |
+| Explicitly excluded capital, structure and other out-of-scope groups | The remaining excluded capital and structure effects are refused even when an effect has modifiers. Published siege, ordinary and Stellian triage, and the industrial and compact cores are admitted as ship modes. Siege XL missile modifier rows stay ordinary data: XL torpedo, XL cruise and rapid torpedo launchers remain outside activation scope. |
 
 ## Duration-bounded activations
 
-Three pure-modifier consumers run a bounded activation instead of a repeating
+Four pure-modifier consumers run a bounded activation instead of a repeating
 cycle: the assault damage control (`moduleBonusAssaultDamageControl`), the
-emergency hull energizer (`emergencyHullEnergizer`) and the signature radius
-suppressor (`targetSpectrumBreakerBonus`). Each activation carries one
+emergency hull energizer (`emergencyHullEnergizer`), the signature radius
+suppressor (`targetSpectrumBreakerBonus`) and the interdiction nullifier
+(`interdictionNullifierBonus`). Each activation carries one
 module-item keyed record: `Pending` until the actor accepts it (no bonus,
 effect animation or cooldown), `Running` for the fitted duration, then
 `Cooling` for the module's fitted `moduleReactivationDelay`. Duration and
@@ -233,10 +250,97 @@ The energizer additionally burns its own module to its effective hit points
 once per activation; the damage stays after the effect ends, that Running
 activation is not offlined by the burnt reconcile, and an unrepaired module
 is refused by the existing burnt validation. The suppressor reduces the
-ship's signature radius only; it does not break target locks. Records live in
+ship's signature radius only; it does not break target locks. The nullifier
+runs its real single SDE cycle and a hundred-second
+`moduleReactivationDelay`, applying the ship's `warpBubbleImmune` bonus only
+while it runs. Records live in
 shared combat memory only; surviving refits, ship swaps, system changes and
 logout need no database work on the running path and are cleared on server
 restart.
+
+## Ship modes
+
+Bastion (`moduleBonusBastionModule`, effect 6658) and Sacribis
+(`moduleBonusSacribisBastion`, effect 11692) use the same tracked record as
+the duration-bounded consumers, but they stay on the ordinary repeating
+cycle. `Pending` carries no fitted bonus, Godma start or effect animation.
+The first acceptance, in the same actor turn, sets the fitted active bit,
+publishes one Godma start and one current effect animation, binds the hull's
+combat membership, and queues one native Stop. The fitted-active publication
+is the one kinematics rebase. Later cycles reuse that generation; they do not
+register again, emit another start, or stop the ship again.
+
+While the admitted module stays online and active, the ship cannot steer,
+warp, dock, jump, cloak or take a micro jump. A manual Deactivate keeps
+those restrictions until the current cycle retires. Ordinary offline and
+removal of that module are refused while its effective
+`disallowEarlyDeactivation` stays positive; another module on the same fit
+is not. Heat burnout and destruction still force the module offline. A
+normal stop, a forced stop and a dropped activation consume the record once.
+A later activation of the same module is not cleared by the old generation.
+The six published Bastion and Sacribis module types come from the loaded SDE
+links. Ordinary weapons stay usable. The records are runtime memory and are
+not resumed after a restart. No client walkthrough of the mode animation is
+claimed.
+
+Industrial (`industrialCoreEffect2`, effect 4575) and compact
+(`industrialCompactCoreEffect2`, effect 8119) cores use that same mode
+lifecycle. Their modifiers, fuel and duration come from the resident fit and
+the loaded SDE. Each accepted cycle consumes its rounded cargo fuel through
+the existing fuel transaction; insufficient fuel leaves the mode inactive.
+The eight published linked module types are discovered from the loaded SDE.
+A compressor captures its effective `activationRequiresActiveIndustrialCore`
+(attribute 3265). When that value is positive, validation and the true actor
+start both require a current admitted industrial or compact core on the same
+ship. Pending, cooling, forced-inactive and replaced records are not a live
+core. An ordinary requested stop keeps the core until it actually retires. At the core's actual retirement, the same membership immediately
+withdraws a compressor that is still online, active and positive: the fitted
+active bit and advertised facility go away in that turn. The compressor's own
+cycle then publishes its Godma stop and effect retirement on its real clock.
+A missing or zero requirement keeps the compressor's previous behavior. A
+compressor admitted at zero and later changed to a positive requirement is
+withdrawn with the core. Manual `CompressItemInSpace`
+conversion is unchanged. Cargo fuel remains a per-consumption business
+transaction; the mode and facility records add no durable write.
+
+Ordinary triage (`moduleBonusTriageModule`, effect 6581) and Stellian triage
+(`moduleBonusStellianTriageModule`, effect 12248) use that same repeating mode
+lifecycle. Their modifiers, fuel and duration come from the resident fit and
+the loaded SDE. The published consumers are Triage Module I (type 27951),
+Triage Module II (type 4294) and Stellian Triage Module I (type 87527). Legacy
+`triageMode` (4839) and `triageMode7` (4893) stay unsupported. Ordinary triage
+raises the ship's max locked targets and suppresses owner-drone damage.
+Stellian triage has no max-lock row and a zero drone-damage operand, so its
+drones stay usable. Stellian also declares `disallowInHighSec` and refuses
+activation in high-security space. Incoming repair, assistance and ECM stay
+numeric resistances; neither mode sets shield or armor immunity. A manual stop
+keeps the fitted bonus until the paid cycle retires. The first fuel shortage
+publishes no start, and a shortage on a later cycle retires the running
+generation. Forced offline retires that generation without the ordinary stop
+wait. A replaced generation's terminal cannot clear the successor. The records
+are runtime memory and are not resumed after a restart.
+
+Siege (`moduleBonusSiegeModule`, effect 6582) uses that same repeating mode.
+The loaded SDE links four published modules: Siege Module I, Siege Module II,
+Strategos' Modified Siege Module and Abyssal Siege Module. The Abyssal module
+is a real `CreateDynamicItem` result. Its duration, fuel and early-deactivation
+values are the source module's inherited attributes, not the sparse result
+template. The legacy siege seed (effect 4877) and the unpublished QA prototype
+are not admitted. Each accepted cycle consumes its fitted cargo fuel through
+the existing fuel transaction. A manual stop keeps the paid benefit and
+restrictions until that generation retires. A repeat shortage retires the
+generation without starting an unpaid cycle. Eject, boarding and storing the
+active hull share one refusal while a fitted module's effective
+`disallowEarlyDeactivation` stays positive; forced loss and departure do not.
+The mode's already-supported XL turret and capital local-repair modifiers
+reach those consumers on their next capture. Its XL missile rows do not:
+those launcher groups remain outside activation scope. The self-burning
+capital invulnerability module stays unsupported. No client
+walkthrough and no performance pass are claimed.
+
+Mutation attribute ranges retain both source endpoints in their declared
+direction. Either endpoint may be larger; the server samples between them
+without treating reversed numeric order as malformed data.
 
 ## Module map
 
@@ -250,6 +354,15 @@ All paths below are under `crates/server/src/`.
   `propulsion.rs`, `mining.rs`, `ecm.rs`, `projected.rs`, `aoe.rs`, `bombs.rs`,
   `vorton.rs`, `cloak.rs`, `mjd.rs`, `compression.rs`, `tractor.rs`,
   `scan.rs`, `targeting.rs` and `salvage.rs`; `hacking.rs` serves hacking.
+  `command_burst.rs` is the sole command-burst producer and
+  `command_burst_fx.rs` the sole owner of its transient link and sphere
+  effect names.
+- `services/fit/runtime.rs` holds the neutral runtime-modifier identities and
+  the per-collection aggregate fold; `sde/dbuff.rs` loads the immutable dbuff
+  collections (startup `sde_native.dbuffcollections`, 457 rows);
+  `space/dbuff.rs` keeps the actor's timed source skylines, `expiry + 1`
+  timers and scene-exit cleanup. Resident-fit application lands through
+  `space/combat/inputs.rs`'s shared receipt.
 - `services/effects/environment.rs` and `notify.rs`: effect environment and
   notification payloads; the shared `OnSpecialFX` encoder lives in
   `space/mod.rs`. `unsupported.rs` owns refusal diagnostics.
@@ -280,11 +393,17 @@ All paths below are under `crates/server/src/`.
   Python-only modifiers.
 
 Salvage yield tables do not ship with the client: the server substitutes a
-configurable random selection from published Salvaged Materials types, and
-preserves loose wreck contents in a positioned cargo container. The committed
-salvage outcome is authoritative; live container publication is best effort and
-failures are warned, with no automatic recovery. Tractor beams follow to surface
-contact and restore the target's movement properties on stop.
+configurable random selection from published Salvaged Materials types. A fitted
+salvager and a salvage drone share one recovery transaction. Chance and yields
+are frozen for each attempt. Successful materials persist in the real cargo of
+the ship or the drone. A temporary source does not delete a root that has no
+row and does not read that root's database children; remaining ordinary loot
+stays in the actor's replacement container. A persistent source keeps its
+existing persistent claim and container path, including the existing
+best-effort limit on live publication. That limit is not an NPC recovery that
+repeats or a cold rebuild. Tractor beams read only the actor ball, static data
+and the real source generation and range. A target that moves away still uses
+the existing stop and follower cleanup.
 Bomb and micro-jump heading follows moving velocity; when stationary it uses
 the last GOTO direction, then the existing negative Z direction.
 
@@ -341,18 +460,33 @@ pending boundaries or subsequent cycles, which may generate heat again.
 Old or delayed heat damage samples covered by the reset are discarded without
 stopping an ongoing cycle; an activation that is genuinely invalid still fails.
 
+Nanite repair paste (type 28668) repairs module heat damage in space: the
+module button's Repair entry calls `InitiateModuleRepair` or
+`InitiateModuleRepairMany`, and `StopModuleRepair` ends it early. One
+transaction charges the paste stacks in the cargo hold only, following the
+client's `GetBaysToCheck` and `FindNumUnitsToRepairModule` formula
+`ceil(damage * computedBasePrice / hp * shipBrokenModuleRepairCostMultiplier /
+pasteBasePrice)`. A system actor timer finishes the repair after
+`damage / moduleRepairRate` minutes; an early stop or leaving space settles
+the elapsed share instead, capped at the paid amount with no refund. A module
+under repair cannot be activated or put online, a running module cannot start
+a repair, and a burnt module stays offline after being repaired. Repairs in
+progress are process state and are lost on restart; the paste was already
+consumed.
+
 Rack heat, priming and overload are runtime-only: they reset on docking, jump,
 logoff, leaving the ship or server restart, but persist through warp. Reset on
 docking is server policy, unlike the public wiki's docked cooling behaviour.
-NPC overload, paste repair, tether repair and structure repair are unsupported.
+NPC overload, tether repair and structure repair are unsupported.
 
 ## Drones
 
 Drones share the sequential NPC/drone worker, effect registry and Fit evaluator.
 Their persistent inventory item ID is also their space ball ID; drones have no
 pilot character ID. Position and damage are persisted lazily. Orders, control
-and pending mining yield exist only at runtime; reconnecting to drones is not
-supported. An owner may order an uncontrolled owned drone to ReturnBay: its
+and pending mining yield exist only at runtime; cargo a salvage drone has
+recovered is durable inventory. Reconnecting to drones is not supported.
+An owner may order an uncontrolled owned drone to ReturnBay: its
 truthful owned state suppresses the client's manual Scoop option. Abandoned or
 stateless drones can be manually scooped.
 
@@ -385,8 +519,23 @@ An Assist or Guard cycle clears its delegated order when the delegate leaves the
 
 Mining drones physically carry pending intent to the ship; asteroid extraction
 and hold delivery commit together at contact. A full hold changes neither.
-Drone deaths do not grant NPC rewards. Salvage drone commands are unsupported,
-and remote assistance does not generate Crimewatch assistance flags.
+Drone deaths do not grant NPC rewards, and remote assistance does not generate
+Crimewatch assistance flags.
+
+Salvage drones run the same wreck recovery as the salvager module. `CmdSalvage`
+takes an optional target: an explicit locked wreck is worked once, while a
+`None` target selects the owner's nearest visible wreck to the mother ship at
+command time and reselects it at each work boundary; that standing automatic
+intent survives a one-shot explicit order and is cleared by any non-salvage
+order, control loss or abandon. A successful end commits the yield to the
+drone's own cargo first; the drone then flies home and the real children move
+into the ship's cargo hold at contact, so the ship never holds materials the
+drone did not first carry. Salvage-drone stop-and-hold delivery is the closest
+faithful substitute for the unshipped original behaviour: a full hold at
+contact, at return-to-bay or at scoop, and cargo owned by someone else, refuse
+the whole move: root and children stay in space, the pilot hears the refusal
+once, and only the next player command retries; there is no automatic jettison,
+ownership change or timed retry.
 
 ## NPC capacitor assistance
 
@@ -402,16 +551,19 @@ eligibility and range. NPC assistance does not generate Crimewatch flags.
 
 ## NPC local repair
 
-An NPC repairs shield and armor on one shared timer captured at spawn. Legacy
-`entityShieldBoost*` and `entityArmorRepair*` amounts keep their per-cycle
-values and the cycle keeps its five-second floor; only longer legacy
-durations raise it. A type that instead carries `npcBehaviorShieldBooster`
+An NPC repairs shield and armor on one shared timer captured at spawn. The
+cycle keeps its five-second floor; only longer legacy durations raise it. A
+finite positive legacy `entityShieldBoost*` or `entityArmorRepair*` amount is
+rescaled at spawn by the shared cycle over that layer's own finite positive
+duration, so the admitted amount matches the SDE nominal rate. A missing,
+non-finite or non-positive duration, or a non-finite conversion, keeps the
+original legacy amount. A type that instead carries `npcBehaviorShieldBooster`
 (SDE 6990) or `npcBehaviorArmorRepairer` (SDE 6884) supplies that layer's
 amount only when no finite positive legacy amount exists: the behavior amount
-is scaled by the shared cycle over its own duration at spawn, preserving the
-SDE nominal rate through the existing `npc_repair` actor path. Missing,
-non-finite or non-positive behavior amounts or durations leave the layer at
-its legacy value.
+is scaled the same way over its own duration. Missing, non-finite or
+non-positive behavior amounts or durations leave the layer at its legacy
+value. Shield and armor still share that one timer; independent burst timing
+is not supported.
 
 ## Electronic jamming
 
@@ -475,7 +627,8 @@ duration.
 
 Transient effects are never recorded for replay: turret and missile shots
 and launches, smartbomb, bomb and burst-jammer pulses, Vorton chain strikes,
-per-shot NPC effects, jump, cloak and warp transitions, explosions and the
+per-shot NPC effects, micro jump field engagements, jump, cloak and warp
+transitions, explosions and the
 native missile-launch effect. Private GM preview effects are not part of the
 public replay, and no animation is synthesized for a module that has no real
 effect to report.
@@ -597,6 +750,39 @@ drops a completed lock that fails the check, sends the usual lost payloads
 and removes the matching outgoing projections; pending attempts are decided
 only by their own deadlines. Always-present scene membership never extends
 range. NPC targeting rules are unchanged.
+
+## Ship stances
+
+Six hulls expose tactical stances through the client's `shipmode/` protocol:
+Confessor, Svipul, Jackdaw, Hecate, Skua and Anhinga. The current stance is a
+real hidden mode item the hull carries at `inventorycommon/const.py`
+`flagHiddenModifers` (156); `game.ship_stances` records only the previous
+stance key, the accepted switch time and the next admitted switch time, all in
+FILETIME. `shipStanceMgr.SetShipStance` replaces the mode item and applies it
+immediately in one transaction; the next switch waits out a deadline computed
+from the hull's effective `stanceSwitchTime` attribute (1985) as evaluated
+before the switch, so Skua's shorter SDE value applies. A request for the
+current stance succeeds without touching the item, the timing or any
+notification, even mid-cooldown.
+
+The mode item is an ordinary passive-effect source for the shared Fit
+evaluator: its SDE modifiers apply to the ship, its modules and its charges
+under the normal stacking rules, and no fake online or activation state is
+used. The owner sees the real singleton row in `List` of flag 156, and every
+prepared ball carries the persisted `shipStance` slim tuple
+`(oldStanceID, time, newStanceID)`; a committed switch additionally notifies
+the owner with `OnStanceActive` and patches the live ball's slim. Assembly,
+GM hull creation and spawn, boarding, stored-ship launch, persistent-ship
+loading and the owner's first hidden list each initialize the default mode
+and timing inside their own transaction when absent. The state survives
+relog, jumps, system unload and restart. Repackaging deletes the mode item
+and clears the timing so a later assembly returns the default, and a loss
+drops both without listing the item in the killmail, valuation or recovery
+manifest.
+
+Anhinga's modes change the hull's effective micro-jump reactivation attribute
+(669) through the same Fit, but the mode's reactivation delay is not enforced:
+the duration-bounded mechanism covers only its four registered consumers.
 
 ## Weapon accuracy and application
 
@@ -796,6 +982,85 @@ squared value, fitted tracking, optimal signature, target signature, optimal, fa
 chance. Values have at least 17 significant digits for hand evaluation of the
 native formula. Both balls are sampled together, and the source Fit includes
 incoming projections. This is a diagnostic, not a client UI comparison or a shot.
+
+### Breacher pods
+
+The Tholos and Cenotaph breacher pod launchers (group 4807, `useMissiles`)
+load SCARAB pods (group 4808, `dotMissileLaunching`). At activation the
+module's `validTargetWhitelist` attribute names a type list
+(`BreacherPodValidTargets`): the locked target's type must be a member,
+which admits ship and structure categories minus the excluded groups; any
+other locked target is refused with a notification. The client performs no
+local check, so this gate runs in activation validation.
+
+A pod flies like an ordinary missile: same projectile ball, same steering,
+the same interception and departure cancellation rules, and it can be shot
+down. Contact never resolves typed damage; the launch's combat attempt
+finishes as a zero-damage miss report and the contact instead registers a
+damage-over-time application on the target's system actor, carrying the
+attacker, the source ship and its combat membership generation, the
+launcher module, the launcher type and the fitted expiry, per-tick maximum
+damage and per-tick HP fraction (`dotDuration`, `dotMaxDamagePerTick` times
+the module damage multiplier, and `dotMaxHPPercentagePerTick` clamped to
+`[0, 100]`). Registration notifies the victim pilot and the attacker with
+`OnDotVictimUpdated`, a `(targetID, set(DotApplicationInfo))` pair encoded
+as a Python `set` of `dotWeapons.common.dotAppInfo.DotApplicationInfo`
+instances.
+
+Each registered target re-arms a one-second actor timer
+(`dotRegistry.py` `DOT_TICK_RATE_SEC`). A tick drops expired applications
+and every application whose source is gone (a different piloted ball or a
+changed combat membership) then evaluates the client's
+`dotUtil.GetEffectiveDamage` for each survivor,
+`int(min(ratio * (shieldMax + armorMax + hullMax), maxDamage))`, multiplied
+by the target's `breacherPodDamageResistance`. Only the single strongest
+application deals damage that tick, with the currently active application
+winning ties; nothing stacks. Damage is flat: it ignores the target's
+resonances through `Absorption::Flat` and spills shield, armor and hull
+through the shared `apply_damage` authority, keeping contributions,
+killmails and loss settlement on the one path. An active-application switch
+re-notifies both pilots, every tick reports `OnDamageMessage` to both
+sides, and the slim field `dotHpPercentageApplied` (`100 * dealt / total`)
+republishes on a change past the client's 0.001 tolerance. The last
+application leaving a target deletes the field and sends the empty set.
+
+Applications are actor-transient: docking, gating, logging off, unloading,
+or a ship or pod-source death takes the ball out of the actor and removes
+the entry, while an in-system warp keeps it (the ball stays). A source ship
+leaving the actor or swapping ships withdraws its applications at once;
+the shared damage authority requires a live source each settlement, unlike
+retail, which may continue ticking after the source departs. Nothing is
+persisted and nothing survives a restart. Skill-scaled pod attributes are
+already effective at registration, and any producer of
+`breacherPodDamageResistance` applies to the tick without further work.
+
+### Breach Control
+
+`moduleBonusBreacherPodDamageControl` (effect 12916) is the disposable damage
+control of the breacher pod ships. One accepted activation pays its fitted
+capacitor, then in a single transaction writes module damage equal to the
+module's effective hit points, offlines the module and publishes the fitting
+boundary; after commit it lands the module's
+`breacherPodActivatedDamageReceivedPercentage` as a timed runtime source on
+the ship's dbuff collection 2600, which folds into the ship's
+`breacherPodDamageResistance` for the module's effective duration. The landed
+source is actor-transient: it expires on its own deadline independent of the
+module, leaves with the receiver and never survives a restart. The committed
+burnout never rolls back. If the ship has left or changed hands the landing
+is only skipped with a warning, and a burnt module refuses online and
+activation until repaired.
+
+## NPC-kill security gain
+
+Fast Talk changes only the positive security gain of an NPC kill. Attack
+admission reads the controlling pilot's effective character attribute 359
+(`securityStatusKillBonus`) once from that pilot's resident fit and freezes
+it with the combat source. The accepted bounty record then freezes
+`min(base rate * multiplier, 1)` from the configured NPC-kill rate. Death,
+payout and a departed or changed fit never reread the skill. A source with
+no player controller does not require the attribute. Unpaid kills from before
+the generation cutover keep their original count and are priced with the rate
+of the process that actually settles them.
 
 ## Further effect details
 

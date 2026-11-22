@@ -112,6 +112,12 @@ pub struct CombatConfig {
     pub resonance_floor: f64,
     /// Seconds from a character's first unpaid NPC bounty kill to its durable payout.
     pub bounty_payout_interval_secs: i64,
+    /// Item-ID block size reserved per running system for transient NPC
+    /// wreck/loot roots; always fits one complete natural generation.
+    pub npc_wreck_id_block_size: i64,
+    /// Cooldown between failed ID-block refills for the same system actor;
+    /// an admission cooldown, not a gameplay timer.
+    pub npc_wreck_id_retry_ms: i64,
 }
 
 impl Default for CombatConfig {
@@ -127,6 +133,8 @@ impl Default for CombatConfig {
             progress_pending_batches: 4,
             resonance_floor: 0.05,
             bounty_payout_interval_secs: 1200,
+            npc_wreck_id_block_size: 4096,
+            npc_wreck_id_retry_ms: 1000,
         }
     }
 }
@@ -145,6 +153,13 @@ impl CombatConfig {
         anyhow::ensure!(self.resonance_floor.is_finite() && self.resonance_floor > 0.0 && self.resonance_floor <= 1.0, "combat.resonance_floor={} is outside its valid domain", self.resonance_floor);
         super::positive_duration("combat.bounty_payout_interval_secs", self.bounty_payout_interval_secs, FILETIME_SECOND)?;
         anyhow::ensure!(self.lock_time_min_secs <= self.lock_time_max_secs, "combat.lock_time_min_secs={} exceeds combat.lock_time_max_secs={}", self.lock_time_min_secs, self.lock_time_max_secs);
+        anyhow::ensure!(self.npc_wreck_id_block_size >= 3, "combat.npc_wreck_id_block_size={} cannot hold one complete NPC wreck generation", self.npc_wreck_id_block_size);
+        anyhow::ensure!(usize::try_from(self.npc_wreck_id_block_size).is_ok()
+            && self.npc_wreck_id_block_size.checked_mul(i64::try_from(std::mem::size_of::<i64>()).unwrap_or(0)).is_some(),
+            "combat.npc_wreck_id_block_size={} exceeds an allocatable ID block", self.npc_wreck_id_block_size);
+        anyhow::ensure!(self.npc_wreck_id_retry_ms > 0
+            && crate::space::now_ms().checked_add(self.npc_wreck_id_retry_ms).is_some(),
+            "combat.npc_wreck_id_retry_ms={} exceeds the representable deadline", self.npc_wreck_id_retry_ms);
         Ok(())
     }
 }

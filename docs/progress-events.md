@@ -92,6 +92,9 @@ Source replay receipts cover live pilots and their owned native sources.
 Departure or retirement reclaims them at a rare boundary or checkpoint;
 a pending transferred source retains its metadata. There is no separate
 4,096-receipt cap.
+Body combat activations use runtime-only identities independent of resident membership;
+reserved attempts keep their original identity through retirement and checkpointing.
+An in-process sleeping NPC retains its body activation and ledger together.
 
 `WarpScrambleApplied` records successful projection upserts and refreshes as
 cycles, and records actual activation intervals. A continuous refresh does not
@@ -110,8 +113,10 @@ removed in the same actor turn and no future duration is credited.
 killer when known. A pending NPC death commits its facts before the NPC is
 removed; mining and canonical NPC death facts are committed with their
 authoritative source transactions, so a failed transaction cannot lose them.
-NPC rewards and wrecks retain their existing separate policy; the death fact
-does not guarantee exactly-once rewards or wreck creation.
+The canonical death fact stays in that original transaction. Ordinary loot is
+frozen only in the current actor context and is projected into memory once
+after that context's commit is confirmed. It is not rebuilt from the journal
+in a cold actor or after a restart. This is not a global exactly-once reward.
 
 `LossSettled` records the committed player loss and frozen participants;
 `PlayerKillCredited` records positive participant contributions. The final blow
@@ -173,9 +178,17 @@ site saves preserve claimed containers. Signature dungeon types use the durable
 site's SDE dungeon definition ID when available; unknown dungeon types and
 character factions remain null rather than being inferred.
 
-Wreck salvage is journaled once per successful durable wreck claim, in the same
-transaction as loot preservation and salvage deposit. Failed cycles, full cargo
-and repeated claims produce no fact. World removal happens after commit.
+`WreckSalvaged` is written once, in the same transaction as the materials are
+acquired. After that commit, remaining ordinary loot from a temporary source
+stays in the actor's replacement container. A persistent source still keeps
+its loot in the same transaction. A failed cycle, full cargo or repeated claim
+produces no second fact. World removal happens after commit.
+
+An NPC pickup follows the existing `ItemsMoved` canonical operation source.
+After the fence, the exact payload is the proof. An unknown outcome does not
+release the old source, and there is no extra nonce that makes independent
+calls idempotent.
+
 Ordinary loyalty earnings are positive natural mission rewards, journaled with
 the guarded mission completion and issuer-keyed balance update. GM adjustments,
 store purchases, corporation spending and Heraldry are not ordinary earnings;

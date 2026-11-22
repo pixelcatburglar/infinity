@@ -172,6 +172,20 @@ fn system_security(world: &World, system: i64) -> f64 {
     world.sde().map.system(system).and_then(|s| s.security).unwrap_or(0.0)
 }
 
+/// Whether `system` is high-security space under `config.crimewatch.highsec_threshold`;
+/// unknown systems and missing security rows are not high-sec.
+pub(crate) fn highsec_system(sde: &crate::sde::Sde, system: i64) -> bool {
+    sde.map.system(system).and_then(|s| s.security)
+        .is_some_and(|security| security >= crate::config::game().crimewatch.highsec_threshold)
+}
+
+/// Whether `system` is empire space on the client's security-class boundary:
+/// any positive security. Unknown systems and missing security rows are not
+/// empire space; the high-sec policy threshold does not apply here.
+pub(crate) fn empire_system(sde: &crate::sde::Sde, system: i64) -> bool {
+    sde.map.system(system).and_then(|s| s.security).is_some_and(|security| security > 0.0)
+}
+
 /// Move a pilot's security status `fraction` of the way to `toward` (+10 or -10).
 async fn shift_security<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, fraction: f64, toward: f64) -> Result<f64, CallError> {
     let new = crate::dao::characters::crimewatch::shift_security(db, char_id, fraction, toward).await.map_err(db_err)?;
@@ -317,6 +331,14 @@ fn cancel_concord(character: i64) {
 /// Whether `ticket` is still the live reservation for its character.
 fn concord_ticket_current(ticket: ConcordTicket) -> bool {
     state().concord.get(&ticket.character) == Some(&ticket.generation)
+}
+
+/// Whether an outstanding CONCORD response ticket is bound for `character`.
+/// The reserved ticket is the only pursuit authority: suspect, criminal or
+/// security status alone say nothing about an inbound response, and no
+/// faction-police producer exists to consult.
+pub(crate) fn concord_pursuit(character: i64) -> bool {
+    state().concord.contains_key(&character)
 }
 
 /// Resolve the effective flag without hiding a still-active criminal or suspect.
@@ -475,20 +497,20 @@ async fn write_killmail<X: Send>(
     Ok((kill_id, isk_lost, price, observed_at))
 }
 
-/// Aggregate security gain for `n` NPC kills at rate `r`: one multiplicative
-/// step of `1-(1-r)^n`, written as `-expm1(n*ln1p(-r))` for small-rate stability.
-pub(crate) fn npc_gain_fraction(r: f64, n: u64) -> f64 {
-    if n == 0 || r <= 0.0 { return 0.0; }
-    if r >= 1.0 { return 1.0; }
-    -((n as f64) * (-r).ln_1p()).exp_m1()
-}
-
-/// Settle one character's aggregated NPC kill security gain in the caller's
-/// transaction: a single security UPDATE and notice for the whole batch.
-pub(crate) async fn settle_npc_kills<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, character: i64, count: u64) -> Result<(), CallError> {
-    if count == 0 { return Ok(()); }
-    let fraction = npc_gain_fraction(crate::config::game().crimewatch.security_gain_npc_kill, count);
-    shift_security(db, outbox, character, fraction, 10.0).await?;
+/// Settle one character's mixed NPC security gain in the caller's transaction:
+/// legacy kills use this process's validated rate, already accepted new gain
+/// stays frozen, and the result is one security UPDATE and notice.
+pub(crate) async fn settle_npc_gain<X: Send>(
+    ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, character: i64,
+    total_count: u64, legacy_count: u64, new_gain: crate::npc_security::SecurityGain,
+) -> Result<(), CallError> {
+    if total_count == 0 { return Ok(()); }
+    if legacy_count > total_count {
+        return Err(CallError::Internal(anyhow::anyhow!("npc bounty legacy count exceeds its total")));
+    }
+    let legacy = crate::npc_security::SecurityGain::for_legacy(
+        crate::config::game().crimewatch.security_gain_npc_kill, legacy_count);
+    shift_security(ex, outbox, character, legacy.merge(new_gain).fraction(), 10.0).await?;
     Ok(())
 }
 

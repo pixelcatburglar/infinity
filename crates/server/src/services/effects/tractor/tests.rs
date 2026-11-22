@@ -29,4 +29,8 @@ fn tractor_range_uses_surface_gap_and_rejects_missing_and_invalid_targets() {
     assert!(!in_range(&s, 1, 1, 10.0));
     assert!(!in_range(&s, 1, 3, 10.0));
     assert!(!in_range(&s, 1, 2, f64::NAN));
+    // A transient actor-owned wreck is an ordinary ball: it tracts identically.
+    s.npc_wreck_install_ids(vec![10]);
+    let transient = s.npc_wreck_spawn(1, 1, 1, [12.0, 0.0, 0.0], 1.0, None, vec![]).expect("reserved ids");
+    assert!(in_range(&s, 1, transient, 10.0));
 }

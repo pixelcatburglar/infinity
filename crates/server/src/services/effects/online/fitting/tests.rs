@@ -78,3 +78,31 @@ async fn ordinary_dispatch_warns_and_continues_after_notify_failure() {
     assert_eq!(result.unwrap(), 9);
     assert_eq!(calls, ["first", "OnModuleAttributeChanges", "last"]);
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn stored_finish_queues_owner_stance_event_after_the_fitting_operation() {
+    use crate::services::tests::fixture::{cleanup_ship, create_ship, ShipLocation};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = std::sync::Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let f = create_ship(&db, 34317, ShipLocation::Docked { station: 1 }, &[]).await.unwrap();
+    let fences = online::OnlineFences::single(0, f.ship, None);
+    let before = super::Fit::load(&db, sde.clone(), f.character, f.ship).await.unwrap();
+    let mut boundary = super::capture_from_fit(&db, &sde, &fences, f.character, f.ship, before).await.unwrap();
+    boundary.set_ship_stance(crate::services::ship_stance::StanceTransition {
+        old: 1, new: 2, switched_at: 7, new_item: 9 });
+    let final_fit = super::Fit::load(&db, sde.clone(), f.character, f.ship).await.unwrap();
+    let mut outbox = Outbox::<OnlineChanged>::default();
+    super::finish(&db, boundary, final_fit, &mut outbox).await.unwrap();
+    let entries = outbox.into_entries();
+    assert_eq!(entries.len(), 2);
+    let crate::db::outbox::Effect::Operation(OnlineChanged::StoredFitting { owner, .. }) = &entries[0]
+        else { panic!("expected the terminal stored fitting") };
+    assert_eq!(*owner, f.character);
+    let crate::db::outbox::Effect::Notification(Notification::Pilot { char_id, event, args }) = &entries[1]
+        else { panic!("expected the owner stance event") };
+    assert_eq!((*char_id, event.as_str()), (f.character, "OnStanceActive"));
+    assert_eq!(args[..], [Value::Int(f.ship), Value::Int(2)]);
+    cleanup_ship(&db, None, f).await.unwrap();
+}

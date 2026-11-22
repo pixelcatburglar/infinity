@@ -175,14 +175,14 @@ async fn npc_bounty_pending_blocks_final_stop_until_thawed() {
     world.system(id).await.unwrap();
     // A frozen batch keeps new kills pending; neither dirty nor pending state
     // may pass the final idle-stop check.
-    world.with(id, move |s| s.add_npc_bounty(owner, 1, crate::isk::IskAmount::from_cents(10).unwrap(), 1_000_000)).await.unwrap().unwrap();
+    world.with(id, move |s| s.add_npc_bounty(owner, 1, crate::isk::IskAmount::from_cents(10).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), 1_000_000)).await.unwrap().unwrap();
     {
         let shared = world.bounties.character(owner);
         let mut meta = crate::poison::lock_or_exit(shared.meta.lock());
         let batch = meta.batch.unwrap();
         meta.frozen = Some(std::sync::Arc::new(crate::services::bounty::npc::Payout::new(batch, vec![id])));
     }
-    world.with(id, move |s| s.add_npc_bounty(owner, 1, crate::isk::IskAmount::from_cents(5).unwrap(), 1_000_001)).await.unwrap().unwrap();
+    world.with(id, move |s| s.add_npc_bounty(owner, 1, crate::isk::IskAmount::from_cents(5).unwrap(), crate::npc_security::FrozenMultiplier::new(1.0).unwrap(), 1_000_001)).await.unwrap().unwrap();
     assert!(world.with(id, |s| s.bounty_checkpoint_pending()).await.unwrap());
     let old = world.running(id).unwrap();
     let gate = Arc::downgrade(&old.gate);

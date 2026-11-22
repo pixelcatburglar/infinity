@@ -1,7 +1,8 @@
 //! Production Board regressions using initialized game data and the real SDE.
-//! Mirrors clientDogmaLocation.MakeShipActive; no foreign custody is modelled.
+//! Mirrors clientDogmaLocation.MakeShipActive. Foreign custody cases live in `foreign`.
 mod refusals;
 mod transitions;
+mod foreign;
 
 use std::sync::Arc;
 use infinity_core::{consts::{CATEGORY_SHIP, FLAG_HANGAR}};
@@ -60,6 +61,7 @@ async fn board_call(c: &mut Client, target: i64, context: Value) -> crate::servi
 
 async fn cleanup(db: &Db, account: i64, owner: i64) {
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        tx.execute("DELETE FROM game.pending_reloads WHERE owner_id=$1", &[&owner]).await?;
         tx.execute("DELETE FROM game.skills WHERE character_id=$1", &[&owner]).await?;
         tx.execute("DELETE FROM game.item_attributes WHERE item_id IN (SELECT item_id FROM game.items WHERE owner_id=$1)", &[&owner]).await?;
         tx.execute("UPDATE game.characters SET ship_id=NULL WHERE character_id=$1", &[&owner]).await?;
@@ -100,7 +102,7 @@ async fn station_board_switch_refresh_and_refusals() {
         let world = World::new(test_db.clone(), sde.clone(), 1);
         let mut c = client(test_db.clone(), sde, world, account).await;
         c.session.apply(vec![("userid", Value::Int(account)), ("charid", Value::Int(owner)), ("shipid", Value::Int(old)), ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system))]);
-        c.world.register_pilot(owner, c.notify_tx.clone());
+        crate::space::session_change::test_support::register_elapsed(&c.world, owner, c.notify_tx.clone());
         c.world.set_online_session(owner, infinity_core::session::OnlineSession::from_session(&c.session));
         let scope = [old, target, i64::MAX];
         let snapshot = board_state(&test_db, &[owner], &scope).await;
@@ -149,7 +151,7 @@ async fn gm_spawn_then_board_preserves_old_hull_across_restart() {
         world.with(system, move |s| pilot.install(s, |s, ball| s.add_ship(ball))).await.unwrap();
         let mut c = client(test_db.clone(), sde.clone(), world.clone(), account).await;
         c.session.apply(vec![("userid", Value::Int(account)), ("charid", Value::Int(owner)), ("shipid", Value::Int(old)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
-        world.register_pilot(owner, c.notify_tx.clone());
+        crate::space::session_change::test_support::register_elapsed(&world, owner, c.notify_tx.clone());
         world.set_online_session(owner, infinity_core::session::OnlineSession::from_session(&c.session));
         world.observe(system, c.login.client_id, old, c.destiny_tx.clone()).await.unwrap();
         let target = crate::services::fitting::ship::gm_spawn_ship(&mut c, kind).await.unwrap();

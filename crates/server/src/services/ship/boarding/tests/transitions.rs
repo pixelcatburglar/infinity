@@ -64,11 +64,18 @@ async fn capsule_and_ship_transitions_preserve_independent_hulls() {
         assert!(!frame.is_committed(&test_db).await.unwrap());
         let mut c = client(test_db.clone(), sde.clone(), world.clone(), account).await;
         c.session.apply(vec![("userid", Value::Int(account)), ("charid", Value::Int(owner)), ("shipid", Value::Int(old)), ("solarsystemid", Value::Int(system)), ("solarsystemid2", Value::Int(system))]);
-        world.register_pilot(owner, c.notify_tx.clone());
+        crate::space::session_change::test_support::register_elapsed(&world, owner, c.notify_tx.clone());
         world.set_online_session(owner, infinity_core::session::OnlineSession::from_session(&c.session));
         world.observe(system, c.login.client_id, old, c.destiny_tx.clone()).await.unwrap();
         let ids = [old, first, second, cargo[0], cargo[1], cargo[2]];
         for (from, target) in [(old, first), (first, second)] {
+            if from != old {
+                let before = board_state(&test_db, &[owner], &ids).await;
+                let early = board_call(&mut c, target, Value::Int(from)).await;
+                assert!(early.as_ref().is_err_and(crate::space::session_change::test_support::ship_change_cooldown));
+                assert_eq!(board_state(&test_db, &[owner], &ids).await, before);
+                crate::space::session_change::test_support::wait_for_ship_change().await;
+            }
             fourtuple(board_call(&mut c, target, Value::Int(from)).await.ok().expect("space Board"));
             assert_eq!(c.session.int("shipid"), Some(target));
             assert_eq!(crate::dao::characters::selection::ship_id(&test_db, owner).await.unwrap(), Some(target));

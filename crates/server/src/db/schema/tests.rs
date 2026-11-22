@@ -1,6 +1,7 @@
 //! The startup schema guard end to end: recorded applications, supplied schema
 //! variants, refusal of an older recorded schema, and rollback isolation.
 use super::*;
+mod npc_bounties;
 use crate::config::tests::test_database;
 use crate::db::{Db, Transaction, GAME_SCHEMA};
 

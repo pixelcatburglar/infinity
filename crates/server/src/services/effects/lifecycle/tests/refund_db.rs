@@ -59,7 +59,7 @@ async fn refused_charge_consumption_refunds_debit() {
         // finite count drops and the same use can be admitted again.
         let effect = crate::services::effects::registry::resolve(&sde, infinity_core::consts::dogma::EFFECT_POWER_BOOSTER).expect("booster effect");
         let stop = Arc::new(AtomicBool::new(false));
-        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: module_type, flag }], effect,
+        let mut cycle = Cycle { cx: cx.clone(), modules: vec![Module { id: module_id, type_id: module_type, flag }], presented_effect: effect.id, effect,
             target: None, repeat: 1, stop: stop.clone(),
             owner: ActivationOwner { master: module_id, generation: stop, armed: false,
                 combat_generations: Vec::new(), pending_combat: None, world: std::sync::Weak::new(), system: 0 },

@@ -8,14 +8,17 @@
 //! to the drone's own node: the owner, never the operating GM or delegate, is
 //! authenticated and notified. Every other live fit-attribute change (a
 //! committed patch, a module flag or overload write, a character, projection
-//! or owner-package replacement, a propagated ship input, a consumed
-//! character deadline) publishes through one receipt per call:
-//! `begin_fit_delta` snapshots before the shared expiry gate and
+//! or owner-package replacement, a runtime modifier source change, a
+//! propagated ship input, a consumed character deadline) publishes through
+//! one receipt per call: `begin_fit_delta` snapshots before the shared
+//! expiry gate and
 //! `finish_fit_delta` compares the final fit and emits through
 //! `publish_fit_delta`, which dedups (owner, item, attribute). A ship
 //! publication carries only Ship and Module rows; a resident drone's own
 //! receipt publishes only its own `Key::Drone` rows to the real owner, never
-//! the copied owner ship domain.
+//! the copied owner ship domain. A committed stance-switch receipt emits the
+//! owner's `OnStanceActive` and the scene `shipStance` slim update once; a
+//! redelivered `new_item` already in the resident fit emits neither.
 use super::inputs::{FitDeltaBefore, FitDeltaSources};
 use super::{CombatPhase, System};
 use infinity_core::consts::dogma::{ATTR_ARMOR_DAMAGE, ATTR_ARMOR_HP, ATTR_CAPACITOR_CAPACITY,
@@ -26,6 +29,7 @@ use crate::services::combat::groups_health::{fill_capacitor, rebase_capacitor};
 use crate::services::effects::{heat::{self, FittingHeatCleanup}, notify::attribute_change,
     projection::Projection};
 use crate::services::fit::{attributes::CommittedFitting, character::CharacterInputs, Key};
+use crate::services::fit::reactive_armor::ARMOR_RESONANCE;
 use crate::sde::Sde;
 use marshal::Value;
 use infinity_core::session::OnlineSession;
@@ -83,6 +87,16 @@ fn projection_seed_attrs(sde: &Sde, projections: &[Projection], seeds: &mut BTre
         if let Some(charge) = projection.charge_type { effect_seed_attrs(sde, charge, seeds); }
         if let Some(effect) = sde.dogma.effect(projection.effect_id) {
             seeds.extend(effect.modifiers().iter().map(|modifier| modifier.modified));
+        }
+    }
+}
+
+/// Seed the target attributes of resolved runtime source changes: every
+/// `modified` attribute of each named dbuff collection.
+fn runtime_seed_attrs(sde: &Sde, collections: impl Iterator<Item = i32>, seeds: &mut BTreeSet<i32>) {
+    for id in collections {
+        if let Some(collection) = sde.dbuffs.get(id) {
+            seeds.extend(collection.modifiers.iter().map(|m| m.modifier.modified));
         }
     }
 }
@@ -187,14 +201,29 @@ impl System {
         let mut original = 0;
         if owner.is_some() {
             let ship_receiver = matches!(fit_key, Key::Ship);
-            let mut candidates = record.fit.fitting_candidates(&record.fit);
-            if let FitDeltaSources::Fitting(patch) = sources {
-                // A copied Ship/Module destination is never a drone's
-                // receiving key; the patch's attribute destinations remap
-                // onto the own drone key instead.
-                candidates.extend(patch.candidates().iter()
-                    .map(|&(key, attr)| (if ship_receiver { key } else { fit_key }, attr)));
-            }
+            // An adaptive armor publication pairs exactly its eight module/
+            // ship armor rows; a due character deadline needs the ordinary
+            // full enumeration for every unrelated moved attribute.
+            let bounded_armor = match sources {
+                FitDeltaSources::ReactiveArmor(module)
+                    if !record.fit.next_character_expiry().is_some_and(|deadline| deadline <= at) => Some(module),
+                _ => None,
+            };
+            let mut candidates = if let Some(module) = bounded_armor {
+                ARMOR_RESONANCE.into_iter()
+                    .flat_map(|attr| [(Key::Module(module), attr), (Key::Ship, attr)])
+                    .collect()
+            } else {
+                let mut candidates = record.fit.fitting_candidates(&record.fit);
+                if let FitDeltaSources::Fitting(patch) = sources {
+                    // A copied Ship/Module destination is never a drone's
+                    // receiving key; the patch's attribute destinations remap
+                    // onto the own drone key instead.
+                    candidates.extend(patch.candidates().iter()
+                        .map(|&(key, attr)| (if ship_receiver { key } else { fit_key }, attr)));
+                }
+                candidates
+            };
             // Receiving authority: ship rows stay Ship/Module, a resident
             // drone publishes only its own key.
             candidates.retain(|&(key, _)| match fit_key {
@@ -205,37 +234,44 @@ impl System {
             candidates.dedup();
             before = record.fit.fitting_values(&candidates);
             original = before.len();
-            let mut seeds = BTreeSet::new();
-            let sde = record.fit.sde();
-            if record.fit.next_character_expiry().is_some_and(|deadline| deadline <= at) {
-                character_seed_attrs(sde, &record.fit.character_inputs(), &mut seeds);
-            }
-            match sources {
-                FitDeltaSources::Character(inputs) => character_seed_attrs(sde, inputs, &mut seeds),
-                FitDeltaSources::Projections(projections) => projection_seed_attrs(sde, projections, &mut seeds),
-                FitDeltaSources::Owner(inputs) => {
-                    let (character, nodes) = inputs.notification_sources();
-                    character_seed_attrs(sde, character, &mut seeds);
-                    for (type_id, charge_type, effect_id) in nodes {
-                        effect_seed_attrs(sde, type_id, &mut seeds);
-                        if let Some(charge) = charge_type { effect_seed_attrs(sde, charge, &mut seeds); }
-                        if let Some(effect) = effect_id.and_then(|id| sde.dogma.effect(id)) {
-                            seeds.extend(effect.modifiers().iter().map(|modifier| modifier.modified));
-                        }
-                    }
+            // The eight armor rows are the whole bounded receipt. A due
+            // deadline already took the full enumeration above, so only that
+            // path still pairs incoming seed attributes with every receiver.
+            if bounded_armor.is_none() {
+                let mut seeds = BTreeSet::new();
+                let sde = record.fit.sde();
+                if record.fit.next_character_expiry().is_some_and(|deadline| deadline <= at) {
+                    character_seed_attrs(sde, &record.fit.character_inputs(), &mut seeds);
                 }
-                _ => {}
+                match sources {
+                    FitDeltaSources::Character(inputs) => character_seed_attrs(sde, inputs, &mut seeds),
+                    FitDeltaSources::Projections(projections) => projection_seed_attrs(sde, projections, &mut seeds),
+                    FitDeltaSources::Runtime(changes) => runtime_seed_attrs(sde, changes.iter().map(|c| c.collection_id), &mut seeds),
+                    FitDeltaSources::Owner(inputs) => {
+                        let (character, nodes, runtime) = inputs.notification_sources();
+                        character_seed_attrs(sde, character, &mut seeds);
+                        for (type_id, charge_type, effect_id) in nodes {
+                            effect_seed_attrs(sde, type_id, &mut seeds);
+                            if let Some(charge) = charge_type { effect_seed_attrs(sde, charge, &mut seeds); }
+                            if let Some(effect) = effect_id.and_then(|id| sde.dogma.effect(id)) {
+                                seeds.extend(effect.modifiers().iter().map(|modifier| modifier.modified));
+                            }
+                        }
+                        runtime_seed_attrs(sde, runtime.iter().map(|s| s.collection_id), &mut seeds);
+                    }
+                    _ => {}
+                }
+                let mut receivers = vec![fit_key];
+                if ship_receiver {
+                    receivers.extend(record.fit.fitted_modules().map(|(item, _)| Key::Module(item)));
+                }
+                let mut extra: Vec<(Key, i32)> = receivers.into_iter()
+                    .flat_map(|key| seeds.iter().map(move |&attr| (key, attr)))
+                    .filter(|pair| candidates.binary_search(pair).is_err())
+                    .collect();
+                extra.sort_unstable();
+                before.extend(record.fit.fitting_values(&extra));
             }
-            let mut receivers = vec![fit_key];
-            if ship_receiver {
-                receivers.extend(record.fit.fitted_modules().map(|(item, _)| Key::Module(item)));
-            }
-            let mut extra: Vec<(Key, i32)> = receivers.into_iter()
-                .flat_map(|key| seeds.iter().map(move |&attr| (key, attr)))
-                .filter(|pair| candidates.binary_search(pair).is_err())
-                .collect();
-            extra.sort_unstable();
-            before.extend(record.fit.fitting_values(&extra));
         }
         Some(FitDeltaBefore { item, fit_key, owner, membership, drone_generation,
             old_condition, old_cap, old_tau, old_shield_max, old_shield_tau, before, original })
@@ -305,17 +341,24 @@ impl System {
         let old_cargo = self.actor_combat[&ship].fit
             .override_state(Key::Ship, infinity_core::consts::dogma::ATTR_CAPACITY);
         for chunk in cleanup { heat::apply_fitting_cleanup(self, chunk); }
-        let (motion, brain) = {
+        let (motion, brain, stance) = {
             let record = self.actor_combat.get_mut(&ship).unwrap();
+            // The mode item lands with the patch; a receipt whose new item is
+            // already resident is a duplicate delivery and emits no events.
+            let stance = patch.ship_stance()
+                .filter(|transition| record.fit.module_state(transition.new_item).is_none());
             record.fit.apply_committed_fitting(&patch);
             record.fit_revision = record.fit_revision.saturating_add(1);
+            // The mechanic dies with the module binding the patch removed;
+            // unrelated character, projection and overload deltas keep it.
+            record.reconcile_reactive_armor();
             let motion = crate::services::effects::propulsion::kinematics(&record.fit, Key::Ship);
             // A raw cargo-mode change republishes the brain even when the
             // numeric wire value is unchanged; the owner, not the operating
             // GM, is told.
             let brain = (record.fit.override_state(Key::Ship, infinity_core::consts::dogma::ATTR_CAPACITY) != old_cargo)
                 .then(|| crate::services::dogma::brain::compile(&record.fit, owner, ship));
-            (motion, brain)
+            (motion, brain, stance)
         };
         // Controlled drones share the owner's ship domain; the same committed
         // delta lands on their resident copies without touching their own
@@ -339,6 +382,17 @@ impl System {
             if self.actor_combat[&ship].fit.module_state(module).is_none_or(|(online, _)| !online) {
                 crate::services::effects::active_cycle::finish_module(self, ship, module);
             }
+        }
+        if let Some(stance) = stance {
+            self.notify_pilot(owner, "OnStanceActive",
+                crate::services::ship_stance::state::stance_active_args(ship, stance.new));
+            let slim = crate::services::ship_stance::state::stance_slim_value(
+                Some(stance.old), stance.switched_at, stance.new);
+            self.command(ship, move |ball, stamp, _| {
+                ball.slim.retain(|(key, _)| *key != "shipStance");
+                ball.slim.push(("shipStance", slim));
+                vec![crate::space::event(stamp, "OnSlimItemChange", vec![Value::Int(ship), ball.slim_item()])]
+            });
         }
         true
     }

@@ -17,6 +17,7 @@ fn source(sequence: u64) -> CombatSource {
         context: FactContext { corporation_id: None, alliance_id: None, faction_id: None,
             ship_id: Some(10), ship_type_id: Some(1), system_id: Some(1), station_id: None, origin: FactOrigin::Natural },
         module_id: Some(20), effect_id: Some(30), weapon_type_id: None, source_is_npc: false,
+        npc_security_multiplier: Some(crate::npc_security::FrozenMultiplier::new(1.0).unwrap()),
         controller_incarnation: Some(incarnation(7, 10)),
         activation: incarnation(7, 1), sequence }
 }

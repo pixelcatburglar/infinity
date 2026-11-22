@@ -98,11 +98,12 @@ pub(super) async fn publish_start(cx: &Ctx, cycle: &Cycle) -> bool {
     let module = cycle.modules[0].clone();
     let generation = cycle.stop.clone();
     let effect = cycle.effect.clone();
+    let presented = cycle.presented_effect;
     let (target, other, started, duration, repeat, charge) =
         (cycle.target, cycle.other.clone(), cycle.started, cycle.duration_ms, cycle.repeat, cycle.charge_type);
     world.with(cx.system_id, move |s| {
         if !links::publish_start(s, module.id, &generation) { return false; }
-        super::notify::ship_effect(&cx, module.id, effect.id, target, other, true, started, duration, repeat);
+        super::notify::ship_effect(&cx, module.id, presented, target, other, true, started, duration, repeat);
         if let Some(guid) = effect.guid.as_deref().and_then(|guid| guid.split(',').next()) {
             s.publish_module_fx(module.id, &generation, ModuleFx {
                 module: crate::space::FxModule { item: Some(module.id), type_id: module.type_id },

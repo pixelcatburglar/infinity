@@ -27,7 +27,7 @@ fn snapshot() -> FirstLethalSnapshot {
 fn npc_killer_requires_real_frozen_controller() {
     let mut s = snapshot();
     let npc = CombatSource { actual_actor_character: None, entity: entity(5, None), context: context(), source_is_npc: true,
-        controller_incarnation: None, module_id: None, effect_id: None, weapon_type_id: None, activation: [5; 16], sequence: 1 };
+        npc_security_multiplier: None, controller_incarnation: None, module_id: None, effect_id: None, weapon_type_id: None, activation: [5; 16], sequence: 1 };
     s.source.facts = Some(npc);
     assert!(matches!(death_event(&s, 1, 0.0).unwrap(), GameEvent::NpcDestroyed { killer_id: None, killer: None, .. }));
     let mut drone = npc;
@@ -44,7 +44,7 @@ fn npc_killer_requires_real_frozen_controller() {
 fn lethal_events_are_layer_only_and_keep_original_settlement() {
     let mut s = snapshot();
     let source = CombatSource { actual_actor_character: None, entity: entity(5, None), context: context(), source_is_npc: true,
-        controller_incarnation: None, module_id: None, effect_id: None, weapon_type_id: None, activation: [5; 16], sequence: 7 };
+        npc_security_multiplier: None, controller_incarnation: None, module_id: None, effect_id: None, weapon_type_id: None, activation: [5; 16], sequence: 7 };
     let mut amount = ExactBinarySum::default();
     assert!(amount.try_add(0.5));
     s.pending_damage = Some(PendingDamage { settlement: crate::lua::events::combat::SettlementId {
@@ -261,13 +261,26 @@ async fn npc_death_releases_snapshot_gate_before_rewards() {
         .expect("SDE requires a ship hull with structure").type_id;
     let fixture = crate::services::tests::fixture::create(&db).await.unwrap();
     let (owner, system) = (fixture.character, 1_000_000_000_000_i64 + fixture.character);
+    let fast_talk = sde.types.iter().find(|skill| skill.category_id == Some(infinity_core::consts::CATEGORY_SKILL)
+        && skill.modifiers(&sde.dogma, 359).any(|(_, modifier)| modifier.domain == "charID" && modifier.modified == 359))
+        .expect("SDE Fast Talk modifies character attribute 359");
+    let rank = fast_talk.attribute(infinity_core::consts::dogma::ATTR_SKILL_TIME_CONSTANT).expect("Fast Talk rank");
     let ship = crate::dao::items::creation::positioned(&db, ship_type, owner, system, [0.0; 3]).await.unwrap();
     let npc = 9_000_000_000_000_i64 + fixture.character;
     let world = World::new(db.clone(), sde.clone(), 1);
     world.add_ship(system, ball(ship, ship_type, Some(owner))).await.unwrap();
-    let fit = Fit::load(&db, sde.clone(), owner, ship).await.ok().expect("load attacker fit");
+    let untrained_fit = Fit::load(&db, sde.clone(), owner, ship).await.ok().expect("load untrained fit");
+    let untrained_value = untrained_fit.value(crate::services::fit::Key::Char, 359);
+    crate::dao::skills::training::set_level(&db, owner, fast_talk.type_id, 5, crate::services::skills::formulas::sp_for_level(rank, 5)).await.unwrap();
+    let fit = Fit::load(&db, sde.clone(), owner, ship).await.ok().expect("load trained fit");
+    let trained_value = fit.value(crate::services::fit::Key::Char, 359);
+    assert!(fit.value(crate::services::fit::Key::Skill(fast_talk.type_id), infinity_core::consts::dogma::ATTR_SKILL_LEVEL) == 5.0 && trained_value > untrained_value, "level 5 must exceed level 0");
     let condition = crate::services::combat::prepare_condition_with_fit(&db, ship, &fit).await.ok().expect("load attacker condition");
-    world.with(system, move |s| s.install_condition(ship, condition.into_condition(), fit)).await.unwrap();
+    let published = world.with(system, move |s| {
+        s.install_condition(ship, condition.into_condition(), fit);
+        s.with_combat_fit(ship, |fit, _, _| fit.value(crate::services::fit::Key::Char, 359))
+    }).await.unwrap();
+    assert_eq!(published, Some(trained_value));
     world.add_ship(system, ball(npc, npc_row.type_id, None)).await.unwrap();
     let (cleared_tx, cleared_rx) = tokio::sync::oneshot::channel::<()>();
     let installed = world.with(system, move |s| {
@@ -286,12 +299,18 @@ async fn npc_death_releases_snapshot_gate_before_rewards() {
             let generation = s.combat_membership_generation(ship).expect("attacker combat membership");
             let facts = s.prepare_combat_source(ship, None, None, Some(ship_type), FactOrigin::Natural, generation, 1, 1,
                 move |s| s.pilot_ball(owner).is_some_and(|b| b.id == ship)).expect("real attacker source");
+            assert_eq!(facts.npc_security_multiplier.unwrap().value(), trained_value);
+            let mut changed = crate::services::fit::character::CharacterInputs::default();
+            changed.attributes = Some(vec![(359, untrained_value)]);
+            assert!(s.publish_character_inputs(ship, owner, generation, &changed));
+            assert_eq!(s.with_combat_fit(ship, |fit, _, _| fit.value(crate::services::fit::Key::Char, 359)), Some(untrained_value));
             s.apply_damage(npc, [1e30, 0.0, 0.0, 0.0], crate::services::combat::damage::DamageSource {
                 attacker_id: Some(owner), attacker_ball_id: Some(ship), source_ship_id: Some(ship),
                 source_ship_type: Some(ship_type), facts: Some(facts), ..Default::default() }, false).unwrap()
         }).await.unwrap().expect("lethal hit admitted");
         let snapshot = outcome.first_lethal.expect("first lethal snapshot");
-        assert_eq!(snapshot.source.facts.and_then(|f| f.actual_actor_character), Some(owner));
+        assert_eq!(snapshot.source.facts.and_then(|f| f.npc_security_multiplier).unwrap().value(), trained_value);
+        let expected_gain = crate::npc_security::SecurityGain::for_kill(crate::config::game().crimewatch.security_gain_npc_kill, snapshot.source.facts.unwrap().npc_security_multiplier.unwrap());
         key = death_key(&snapshot).as_str().to_owned();
         task = Some(tokio::spawn(settle_npc_loss(db.clone(), world.clone(), system, snapshot.clone(), outcome.new)));
         tokio::time::timeout(WAIT, cleared_rx).await.expect("NPC cleared signal").unwrap();
@@ -306,20 +325,30 @@ async fn npc_death_releases_snapshot_gate_before_rewards() {
         joined.expect("death settlement joins").unwrap().unwrap();
         world.flush_positions().await.unwrap();
         let started: i64 = db.query_one("SELECT batch_started_at FROM game.npc_bounty_pools WHERE character_id=$1", &[&owner]).await.unwrap().get("batch_started_at");
+        let stored = db.query_one("SELECT security_gain_log, legacy_kill_count FROM game.npc_bounty_pools WHERE character_id=$1", &[&owner]).await.unwrap();
+        let stored_gain = crate::npc_security::SecurityGain::from_storage(stored.get("security_gain_log")).unwrap();
+        let legacy: i64 = stored.get("legacy_kill_count");
+        assert_eq!((stored_gain, legacy), (expected_gain, 0));
+        world.with(system, move |s| { s.remove_ball(ship); }).await.unwrap();
         crate::services::bounty::npc::settle_due(&db, &world, (owner, started), i64::MAX / 4).await.unwrap();
         assert_eq!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap(), expected);
-        let wrecks = db.query("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3",
-            &[&owner, &system, &wreck_type]).await.unwrap();
+        let security: f64 = db.query_one("SELECT security_status FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap().get("security_status");
+        let expected_security = 10.0 * expected_gain.fraction();
+        assert!((security - expected_security).abs() <= 1e-9, "payout repriced frozen gain: {security} vs {expected_security}");
+        // The natural wreck is transient actor state: exactly one ball bound
+        // to the launcher, and neither the root nor its loot writes a row.
+        let wrecks = world.with(system, move |s| s.balls().filter(|b| b.type_id == wreck_type)
+            .map(|b| (b.id, b.slim.clone())).collect::<Vec<_>>()).await.unwrap();
         let [wreck] = wrecks.as_slice() else { panic!("expected exactly one owned wreck") };
-        let wreck: i64 = wreck.get("item_id");
-        assert!(world.with(system, move |s| s.ball(wreck).is_some_and(|b| b.slim.iter()
-            .any(|(k, v)| *k == "launcherID" && *v == Value::Int(npc)))).await.unwrap());
+        let (wreck, slim) = (wreck.0, &wreck.1);
+        assert!(slim.iter().any(|(k, v)| *k == "launcherID" && *v == Value::Int(npc)));
+        assert_eq!(db.query_one("SELECT count(*) AS c FROM game.items WHERE item_id=$1 OR location_id=$1",
+            &[&wreck]).await.unwrap().get::<_, i64>("c"), 0);
         settle_npc_loss(db.clone(), world.clone(), system, snapshot, outcome.new).await.unwrap();
         assert_eq!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap(), expected);
-        let wrecks = db.query("SELECT item_id FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3",
-            &[&owner, &system, &wreck_type]).await.unwrap();
-        let [again] = wrecks.as_slice() else { panic!("expected the same single wreck") };
-        assert_eq!(again.get::<_, i64>("item_id"), wreck);
+        let again = world.with(system, move |s| s.balls().filter(|b| b.type_id == wreck_type)
+            .map(|b| b.id).collect::<Vec<_>>()).await.unwrap();
+        assert_eq!(again, vec![wreck], "a repeated finalize never re-publishes the same draft");
     }).await;
     if let Some(mut handle) = task {
         if tokio::time::timeout(WAIT, &mut handle).await.is_err() { handle.abort(); let _ = handle.await; }

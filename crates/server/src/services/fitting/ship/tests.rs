@@ -3,6 +3,7 @@ use infinity_core::consts::{IX_SINGLETON, IX_STACK_SIZE};
 use marshal::Value;
 
 mod spawn;
+mod ship_stance;
 
 #[test]
 fn repeated_assembly_conserves_hulls_and_stops_after_conversion() {

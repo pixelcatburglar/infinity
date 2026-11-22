@@ -12,7 +12,7 @@ mod remote_facts;
 mod actor_fit;
 mod civilian_weapon;
 mod active_attributes;
-
+mod reactive_armor;
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn identity_lifecycle_requires_explicit_space_ship_and_character() {
@@ -419,4 +419,84 @@ fn ball_leaving_removes_lockout_and_missing_or_stale_source_cannot_arm() {
     assert!(!s.arm_super_weapon_firing(sw_spec(7, 42, 9_000_016, &stale, 30_000, 300_000)));
     crate::services::combat::state().active.remove(&9_000_015);
     crate::services::combat::state().active.remove(&9_000_016);
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn scripted_effect_substitutes_only_sphere_with_loaded_script() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Sde::load(&db).await.unwrap();
+    use crate::services::effects::JammingType;
+    use infinity_core::consts::dogma::{EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT, EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT, EFFECT_WARP_DISRUPT};
+    let projected_candidates = |ty: i32| sde.types.effects(ty).iter()
+        .filter(|row| matches!(registry::kind(&sde, row.effect_id), Some(EffectKind::Projected { .. })))
+        .count();
+    for (script, effect_id, jamming) in [
+        (45010, i64::from(EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT), JammingType::Scramble),
+        (29003, i64::from(EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT), JammingType::Disrupt)] {
+        assert_eq!(projected_candidates(script), 1, "script {script} has exactly one resolvable projected effect");
+        assert_eq!(scripted_effect(&sde, EFFECT_WARP_DISRUPT_SPHERE, Some(script)).map(|effect| (effect.id, effect.kind)),
+            Some((effect_id, EffectKind::Projected { jamming })));
+    }
+    assert_eq!(scripted_effect(&sde, EFFECT_WARP_DISRUPT_SPHERE, None).map(|effect| (effect.id, effect.kind)),
+        Some((i64::from(EFFECT_WARP_DISRUPT_SPHERE), EffectKind::Interdiction)), "a scriptless sphere resolves its own kind");
+    let scriptless = sde.types.iter().find(|ty| ty.category_id == Some(infinity_core::consts::CATEGORY_CHARGE) && projected_candidates(ty.type_id) == 0)
+        .expect("charge type without a resolvable projected effect").type_id;
+    assert_eq!(scripted_effect(&sde, EFFECT_WARP_DISRUPT_SPHERE, Some(scriptless)).map(|effect| (effect.id, effect.kind)),
+        Some((i64::from(EFFECT_WARP_DISRUPT_SPHERE), EffectKind::Interdiction)));
+    assert_eq!(scripted_effect(&sde, EFFECT_WARP_DISRUPT, Some(45010)).map(|effect| effect.id),
+        Some(i64::from(EFFECT_WARP_DISRUPT)), "ordinary effects resolve without substitution");
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn security_class_check_refuses_empire_modules() {
+    use crate::services::tests::fixture::{create_ship, cleanup_ship, ShipItemSpec, ShipLocation};
+    use infinity_core::consts::{dogma::ATTR_DISALLOW_IN_EMPIRE_SPACE, dogma::ATTR_HI_SLOTS, FLAG_HI_SLOT_FIRST};
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = crate::tests::shared_sde(&db).await;
+    // SDE types: Warp Disruption Field Generator I, Bomb Launcher I/II and
+    // Defender Launcher I all carry disallowInEmpireSpace.
+    let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)
+        && t.attribute(ATTR_HI_SLOTS).is_some_and(|slots| slots >= 4.0)).expect("four-slot hull").type_id;
+    let specs = [28654, 27914, 4256, 44102].iter().enumerate().map(|(slot, type_id)| ShipItemSpec {
+        type_id: *type_id, flag_id: FLAG_HI_SLOT_FIRST + slot as i32,
+        quantity: 1, singleton: true, online: true, attributes: &[],
+    }).collect::<Vec<_>>();
+    let ship_fixture = create_ship(&db, hull, ShipLocation::Space { system: 1 }, &specs).await.unwrap();
+    let (ship_id, character, modules) = (ship_fixture.ship, ship_fixture.character, ship_fixture.items.clone());
+    let threshold = crate::config::game().crimewatch.highsec_threshold;
+    let (empire_low, empire_high, negative) = (
+        sde.map.systems().find(|s| s.security.is_some_and(|v| v > 0.0 && v < threshold)).expect("SDE low-security system").solar_system_id,
+        sde.map.systems().find(|s| s.security.is_some_and(|v| v >= threshold)).expect("SDE high-security system").solar_system_id,
+        sde.map.systems().find(|s| s.security.is_some_and(|v| v < 0.0)).expect("SDE negative-security system").solar_system_id,
+    );
+    // Empire space is the client's positive-security boundary, not the
+    // configured high-sec threshold; unknown and non-positive systems are not.
+    // The real SDE holds no exactly-zero record; the exact-zero boundary is
+    // covered by sde::map::tests::empire_boundary_is_positive_security_only.
+    for (system, empire) in [(empire_low, true), (empire_high, true), (negative, false), (i64::MAX, false)] {
+        assert_eq!(crate::services::crimewatch::empire_system(&sde, system), empire, "system {system}");
+    }
+    let outcome = crate::tests::catch_scenario(async {
+        let fit = Fit::load(&db, sde.clone(), character, ship_id).await.unwrap();
+        for (type_id, module) in [28654, 27914, 4256, 44102].iter().zip(&modules) {
+            assert!(sde.types.attribute(*type_id, ATTR_DISALLOW_IN_EMPIRE_SPACE).is_some_and(|v| v > 0.0));
+            assert!(fit.value(Key::Module(*module), ATTR_DISALLOW_IN_EMPIRE_SPACE) > 0.0);
+            for system in [empire_low, empire_high] {
+                let Err(CallError::User { msg, dict }) = security_class_check(&sde, &fit, *module, system)
+                    else { panic!("module {type_id} admitted in empire system {system}") };
+                assert_eq!(msg, messages::MSG_CANT_IN_EMPIRE_SPACE);
+                assert!(dict.is_empty());
+            }
+            for system in [negative, i64::MAX] {
+                assert!(security_class_check(&sde, &fit, *module, system).is_ok(),
+                    "module {type_id} refused in non-empire system {system}");
+            }
+        }
+    }).await;
+    cleanup_ship(&db, None, ship_fixture).await.unwrap();
+    outcome.unwrap();
 }

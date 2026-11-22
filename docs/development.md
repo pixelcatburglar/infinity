@@ -42,6 +42,7 @@ Its framing and connection unit tests live beside their owners under `crates/wir
   A listed stem covers both `P.rs` and the `P/` directory, and matches whole path components only, so `ship_adaption` is not part of `ship`. Domains are physical path partitions, not feature areas: the tests of the skills service belong to `tests-skills`, but the matching data access is `tests-storage`, the gateway module is `tests-gateway`, the static data is `tests-sde`, and a GM command entry under `services/slash` is `tests-slash`. A test mounted across directories belongs to its actual source file's path, not the mounting module's name. A cross-layer change selects the union of the domains it touches; for example a change spanning the skills service, its dao, the gateway skill plans, the SDE definitions and the GM entry point selects `tests-skills,tests-storage,tests-gateway,tests-sde,tests-slash`. Domains never enable each other. One deliberate exception: `images/tests.rs` is mixed-domain — its socket-bound request tests are `tests-runtime` while the CDN checkpoint test that exercises the verified retail catalogue is `tests-sde`, and the file's parent mount is `any(tests-runtime, tests-sde)`.
 
   Domain size is measured by the total lines in physical test source files, including helpers, comments and blank lines. Each physical file is counted once and assigned to its path owner; no domain may exceed 15% of the total lines. This is not a count of registered tests.
+  The shared ship-change deadline is tested directly on the live pilot registry in `tests-space`. Board, Store, BoardStored and Eject fixtures register through the past fixture clock in `space/session_change/test_support.rs`, compiled for `tests-space` and `tests-ships`; they do not sleep or bypass the admission check. The CONCORD ticket check is in `tests-combat`: a reserved response ticket is pursuit, and a suspect flag alone is not. Foreign boarding custody and its proof are in `tests-ships`; the lock completion race against a reserved transition is in `tests-combat`.
 
   To compile only the tests of one domain, keep the usual test-lane overrides and select the feature:
 
@@ -130,10 +131,11 @@ Its framing and connection unit tests live beside their owners under `crates/wir
 
 - **Snapshot gate order.** Operations that need both the economy lock and a
   system snapshot gate acquire the economy lock first and never wait for it
-  while holding the snapshot gate. NPC death settlement holds the snapshot
-  gate through death-context capture, checkpoint commit and actor
-  finalization, then releases it before map statistics, bounty, wreck and
-  loot processing.
+  while holding the snapshot gate. An NPC death context freezes the ordinary
+  draw and its reserved item IDs. Without those IDs the death journal business
+  does not start. After the death commit is confirmed, the same actor
+  finalization turn installs the temporary wreck. The snapshot gate is released
+  before the existing map and bounty paths.
 
 - **NPC bounty pools.** Kills mutate actor-owned pools under the short shared
   batch mutex only; pools join the periodic snapshot, dock/transfer/logout and
@@ -141,6 +143,39 @@ Its framing and connection unit tests live beside their owners under `crates/wir
   the batch, captures every live source and keeps the complete proven durable
   preimage; the character row lock fences each proof transaction. A snapshot
   carrying bounty rows must commit Default, never LossTolerant.
+
+  Ordinary NPC wrecks and their uncollected loot belong only to the current
+  solar-system actor. Opening, towing, splitting or merging them does not
+  create item rows. Taking loot persists only the quantity taken, through the
+  existing item transaction. Successful salvage persists its materials and
+  keeps any uncollected ordinary loot in a temporary replacement container.
+  These temporary roots refuse deposits of already-persistent items; historical
+  wrecks, exploration containers and ordinary GM-created containers retain
+  their existing behavior. Uncollected contents are discarded when the actor
+  unloads or the server restarts, and no expiry timer or journal-based
+  restoration is added.
+
+  The ordinary root and its uncollected loot stay in the actor as fresh plain
+  items. They do not join the ship snapshot, sleep, or a shutdown flush. Real
+  sequence IDs are reserved in a batch and published only after that batch's
+  commit is confirmed. A batch may contain gaps, and unused IDs are never
+  recycled. A successful take claims the source, arms loaded holds before
+  market and other gates, and inserts only the taken slice in the existing
+  item transaction; destination permission, capacity and fit are unchanged.
+  Dispatch records the actor disposition before notifying anyone.
+
+  After an ambiguous commit or a cancellation the source stays closed. The
+  next real business operation proves itself with the same database
+  transaction fence and the complete canonical payload. Current cargo quantity
+  or a missing root row is not that proof, and an old move is not rerun.
+  Splitting, merging, renaming and a pure memory cleanup use no database.
+  Salvage materials are still acquired in an immediate business transaction.
+  A mixed cleanup deletes memory only after its persistent part commits.
+
+  An ordinary wreck and its loot add no SQL per kill, and a tractor cycle adds
+  none. The item-ID batch worker is a separate cost. Every NPC death still
+  uses the existing journal, checkpoint and map SQL, so a kill is not free of
+  database work. Reward idempotence and player loss are unchanged.
 
   Drone launch holds the economy lock without a snapshot gate and retains an
   existing singleton's pre-transaction fitting snapshot through retries until
@@ -155,6 +190,10 @@ Its framing and connection unit tests live beside their owners under `crates/wir
   and clone jumps follow this order; existing helper-level checks may reacquire
   that same character row. Existing inventory lock plans retain their
   hull-before-nonhull ordering and final lock strengths.
+  In a piloted loss the victim hull row lock and the frozen original loss source
+  precede any checkpoint or loaded write; the full loss lock set rechecks the
+  same shape, and a rolled-back attempt still proves the source for the rollback
+  that returns the victim to Live.
 
 - **Inventory item locks.** For affected hull and ordinary-container contents
   operations, capture the complete set of existing write targets and lineage

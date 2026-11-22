@@ -319,7 +319,7 @@ impl System {
             self.finish_combat_attempt(&facts);
             return;
         }
-        let completion = crate::services::combat::damage::apply_area_damage_in_actor(
+        let completion = crate::services::combat::damage::area::apply_area_damage_in_actor(
             self, &db, system, spec.weapon_type, &mut victims,
             DamageApplication::Signature { raw: spec.damage, signature_radius: spec.signature_radius },
             facts, &sde, true);

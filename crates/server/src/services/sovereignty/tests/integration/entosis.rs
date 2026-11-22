@@ -355,7 +355,9 @@ async fn run(f: &Fixture) {
         let target = s.sampled_ball(hub).unwrap();
         let source = s.sampled_ball(ids.ships[2]).unwrap();
         let outside = [target.pos[0] + range + f64::from(target.radius) + f64::from(source.radius) + 1_000.0, target.pos[1], target.pos[2]];
+        let (capital_radius, helper_radius) = (f64::from(source.radius), f64::from(s.sampled_ball(ids.ships[0]).unwrap().radius));
         position_ship(s, ids.ships[2], outside);
+        position_ship(s, ids.ships[0], [outside[0] + capital_radius + helper_radius + 100.0, outside[1], outside[2]]);
     }).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         while r.world.with(system, move |s| links::blocks(s, ids.ships[2])).await.unwrap() {

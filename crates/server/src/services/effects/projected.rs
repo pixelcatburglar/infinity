@@ -72,7 +72,7 @@ async fn insert(world: &Arc<World>, system: i64, source: i64, target: i64, modul
             if !state.active.get(&module).is_some_and(|active| Arc::ptr_eq(&active.stop, generation)) { return Ok(None); }
         }
         if guard.is_some_and(|guard| !guard.valid(s)) { return Ok(None); }
-        if assistance && source != target && crate::space::sovereignty::links::assistance_blocked(s, target) { return Ok(None); }
+        if assistance && source != target && crate::space::combat::assistance_blocked(s, target) { return Ok(None); }
         let Some((a, b)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return Ok(None) };
         let gap = (dist(a.pos, b.pos) - f64::from(a.radius) - f64::from(b.radius)).max(0.0);
         let strength = range_multiplier(gap, optimal, falloff);

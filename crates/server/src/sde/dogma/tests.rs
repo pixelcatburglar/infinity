@@ -23,3 +23,4 @@ pub(crate) fn overload_fixture() -> Dogma {
     Dogma { effects: vec![effect], effect_ids: [(OVERLOAD_EFFECT, 0)].into_iter().collect(),
         ..Default::default() }
 }
+
